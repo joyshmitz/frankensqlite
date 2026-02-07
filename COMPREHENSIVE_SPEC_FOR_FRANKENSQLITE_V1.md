@@ -10489,7 +10489,7 @@ pub trait RtreeGeometry: Send + Sync {
 The R-tree query engine calls the geometry callback for each node in the
 tree during descent, pruning branches where the callback returns `Exclude`.
 
-**Geopoly extension:** Built on top of R-tree, provides polygon operations:
+**Geopoly extension:** Built on top of R*-tree, provides polygon operations:
 - `geopoly_overlap(P1, P2)` -- test if two polygons overlap
 - `geopoly_within(P1, P2)` -- test if P1 is within P2
 - `geopoly_area(P)` -- compute polygon area
@@ -11873,14 +11873,22 @@ P "days", the probability that any two of N transactions share a page is:
 P(any conflict among N txns) ~ 1 - e^{-N(N-1)W^2 / (2P)}
 ```
 
-This matches the birthday paradox formula `P ~ 1 - e^{-n^2/(2*365)}` with
-the substitution `n = N*W` effective items and `365 = P` possible values,
-divided by the within-transaction correlation factor.
+This is the birthday paradox with `N(N-1)/2` pairwise comparisons, each
+having `W^2/P` collision probability per pair. The N(N-1) term (not N^2)
+reflects that a transaction cannot conflict with itself.
 
-**Intuition:** Conflicts become likely when `N * W ~ sqrt(P)`. For a
-database with P = 1,000,000 pages, conflicts become probable when
-`N * W ~ 1,000`. So 10 transactions each writing 100 pages, or 100
-transactions each writing 10 pages, will start seeing conflicts.
+**Interpreting the threshold:** Conflicts become *non-negligible* (not
+"likely") near `N * W ~ sqrt(P)`. For P = 1,000,000 pages:
+
+- N=10, W=100 (N*W=1,000): exponent = 10*9*10000/(2*1e6) = 0.045,
+  so P(conflict) ~ 4.4% — noticeable but not probable.
+- N=10, W=370 (N*W=3,700): exponent ~ 0.62, P(conflict) ~ 46%.
+- N=100, W=10: exponent = 100*99*100/(2*1e6) = 0.495,
+  P(conflict) ~ 39%.
+
+For P(conflict) > 50%, the exponent must exceed ln(2) ~ 0.693, requiring
+`N(N-1)W^2 > 1.386P`. The sqrt(P) threshold marks where conflicts start
+appearing at low single-digit percentages, not where they become probable.
 
 ### 18.4 Non-Uniform Page Access: Zipf Distribution
 
