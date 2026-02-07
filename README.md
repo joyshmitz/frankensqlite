@@ -198,13 +198,12 @@ The SSI check fires before the first-committer-wins check. This means write skew
 
 ### MVCC Visibility Rules
 
-A page version `V` is visible to snapshot `S` if and only if all three conditions hold:
+A page version `V` is visible to snapshot `S` if and only if both conditions hold:
 
-1. `V.created_by <= S.high_water_mark` (committed before the snapshot was taken)
-2. `V.created_by` is not in `S.in_flight` (the creating transaction had finished when the snapshot was taken)
-3. `V` is the newest version satisfying (1) and (2) (older qualifying versions are shadowed)
+1. `V.commit_seq <= S.high` (the version was committed before the snapshot was taken)
+2. `V` is the newest version satisfying (1) (older qualifying versions are shadowed)
 
-These rules produce snapshot isolation: each transaction sees a frozen view of the database as of its start time, regardless of concurrent commits happening around it.
+These rules produce snapshot isolation: each transaction sees a frozen view of the database as of its start time, regardless of concurrent commits happening around it. Because visibility depends only on the monotonic `CommitSeq` counter (not on an in-flight set), the check is a single integer comparison — O(1) with no bitmap or Bloom filter required.
 
 ### MVCC Core Data Structures
 
@@ -213,21 +212,27 @@ These rules produce snapshot isolation: each transaction sees a frozen view of t
 /// Allocated from an AtomicU64 with SeqCst ordering.
 struct TxnId(u64);
 
-/// A frozen view of which transactions are committed.
-/// Captured at BEGIN. Uses RoaringBitmap for O(1) membership
-/// tests and compressed storage (replacing SortedVec + BloomFilter).
+/// Monotonically increasing commit sequence number (global "commit clock").
+/// Assigned by the sequencer at COMMIT time.
+struct CommitSeq(u64);
+
+/// A frozen view of the database at BEGIN time.
+/// Visibility is a single integer comparison: V.commit_seq <= S.high.
+/// No in-flight bitmap or Bloom filter is needed.
 struct Snapshot {
-    high_water_mark: TxnId,
-    in_flight: RoaringBitmap,
+    high: CommitSeq,
+    schema_epoch: SchemaEpoch,
 }
 
 /// A single versioned copy of a database page.
-/// Versions form a singly-linked list, newest to oldest.
+/// Versions are bump-allocated in a VersionArena (not heap-allocated).
+/// The chain is linked via arena indices, not Box pointers.
 struct PageVersion {
     pgno: PageNumber,
-    created_by: TxnId,
+    commit_seq: CommitSeq,
+    created_by: TxnToken,  // (txn_id, txn_epoch) — debug/audit only, not used for visibility
     data: PageData,
-    prev: Option<Box<PageVersion>>,
+    prev_idx: Option<VersionIdx>,  // index into VersionArena
 }
 
 /// Exclusive page-level write locks. Sharded into 64 buckets
@@ -700,9 +705,9 @@ Ghost entries (B1/B2) store only the cache key, not page data. They let ARC lear
 3. Prefer **superseded versions** (a newer committed version exists that is visible to all active snapshots).
 4. Dual eviction trigger: fires when page count exceeds capacity OR `total_bytes` exceeds `max_bytes` (from `PRAGMA cache_size`).
 
-### Visibility Bloom Filter
+### Visibility Check
 
-Each `Snapshot` includes a Bloom filter over its `in_flight` set for O(1) amortized visibility checks. For small in-flight sets (< 8 transactions), binary search on the `RoaringBitmap` is used instead. Parameters scale with transaction concurrency: n=10 transactions need only 12 bytes; n=1000 need ~1.2 KB.
+With CommitSeq-based snapshots, visibility is a single integer comparison (`V.commit_seq <= S.high`) — O(1) with no auxiliary data structure. No in-flight bitmap or Bloom filter is needed. This is a direct consequence of the monotonic commit clock design: the sequencer assigns `CommitSeq` values at commit time, so a snapshot taken at `high = N` sees exactly those versions with `commit_seq <= N`.
 
 ---
 
@@ -1684,22 +1689,21 @@ timeout. There is nothing to tune.
 Claim: Every transaction observes a consistent snapshot — it sees either
 all or none of any other transaction's writes, never a partial set.
 
-Proof: For reading transaction T_r with snapshot S_r, and any writer T_w
-that created versions {V_1, ..., V_k}:
+Proof: For reading transaction T_r with snapshot S_r (where S_r.high is
+the CommitSeq at T_r's BEGIN), and any writer T_w that committed with
+commit_seq C_w and created versions {V_1, ..., V_k}:
 
-    visible(V_i, S_r) =
-        T_w.txn_id ≤ S_r.high_water_mark
-        AND T_w.txn_id ∉ S_r.in_flight
-        AND T_w.txn_id ∈ committed_txns
+    visible(V_i, S_r) = (C_w <= S_r.high)
 
-    All three conditions depend ONLY on T_w.txn_id, not on i.
+    This condition depends ONLY on C_w and S_r.high, not on i.
+    All versions of T_w share the same commit_seq C_w (assigned atomically
+    by the sequencer).
     ∴ visible(V_i, S_r) has the same truth value for all i ∈ {1,...,k}.
 
     Exhaustive cases:
-    • T_w began after snapshot  → sees NONE  (txn_id > high_water_mark)
-    • T_w was active at snapshot → sees NONE  (txn_id ∈ in_flight)
-    • T_w aborted               → sees NONE  (txn_id ∉ committed_txns)
-    • T_w committed before snapshot → sees ALL
+    • T_w committed after snapshot → sees NONE  (C_w > S_r.high)
+    • T_w not yet committed       → sees NONE  (commit_seq = 0, never <= S_r.high)
+    • T_w committed before snapshot → sees ALL  (C_w <= S_r.high)
 
     In no case does T_r see a strict subset of T_w's writes.
     Snapshot S_r is immutable (INV-5), so this truth value doesn't change
@@ -1731,21 +1735,22 @@ Claim: Garbage collection never removes a version any active or future
 transaction could need.
 
 Setup:
-    gc_horizon = min(T.txn_id : T ∈ active_transactions)
+    gc_horizon = min(T.begin_seq : T ∈ active_transactions)
+        where begin_seq is the CommitSeq observed at T's BEGIN.
     Version V of page P is reclaimable iff:
-        V.created_by < gc_horizon
+        V.commit_seq < gc_horizon
         AND ∃ V' in version_chain(P):
-            V'.created_by > V.created_by
-            AND V'.created_by ≤ gc_horizon
-            AND V'.created_by ∈ committed_txns
+            V'.commit_seq > V.commit_seq
+            AND V'.commit_seq ≤ gc_horizon
 
 Proof:
-    For any active T_a: T_a.snapshot.high_water_mark ≥ T_a.txn_id ≥ gc_horizon
-    The superseding V' satisfies V'.created_by ≤ gc_horizon ≤ T_a.txn_id
-    ∴ V' is committed before T_a began, visible to T_a's snapshot.
-    Since V'.created_by > V.created_by, resolve(P, T_a.snapshot) returns V'
+    For any active T_a: T_a.snapshot.high = T_a.begin_seq ≥ gc_horizon
+    The superseding V' satisfies V'.commit_seq ≤ gc_horizon ≤ T_a.snapshot.high
+    ∴ V' is visible to T_a's snapshot (V'.commit_seq ≤ S.high).
+    Since V'.commit_seq > V.commit_seq, resolve(P, T_a.snapshot) returns V'
     or newer — never V.
-    Same argument holds for future transactions.  QED ∎
+    Same argument holds for future transactions (their begin_seq ≥ gc_horizon).
+    QED ∎
 ```
 
 **Theorem 5: Memory Boundedness**

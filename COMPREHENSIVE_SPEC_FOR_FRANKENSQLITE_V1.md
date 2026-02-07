@@ -4158,6 +4158,16 @@ visibility point:
 - Once durable, the commit's versions share a single `commit_seq` and become
   visible simultaneously to any snapshot with `snapshot.high >= commit_seq`.
 
+*Memory ordering constraint (normative):* The global `commit_seq` counter
+MUST be incremented with `Release` ordering AFTER all version chain updates
+for the committing transaction are visible (i.e., version chain head pointers
+are updated with at least `Release` stores). Readers MUST load `commit_seq`
+with `Acquire` ordering before traversing version chains. This ensures that
+a reader who observes the new `commit_seq` value is guaranteed to see the
+corresponding version chain entries. Without this ordering, a reader could
+take a snapshot that includes `commit_seq = N` but traverse stale version
+chains that do not yet reflect commit N's versions, violating INV-6.
+
 *Violation consequence:* Partial visibility means a reader could see some of
 a transaction's writes but not others, observing an inconsistent state. For
 example, a transfer between two accounts might show the debit but not the
@@ -5393,6 +5403,15 @@ After `ssi_validate_and_publish(T)` computes `has_in_rw` and `has_out_rw` for
 the committing transaction `T` (§5.7.3), `T` MUST abort if both are true,
 unless refinement + merge (§5.10) eliminate one side of the rw evidence.
 
+**Note (deliberate overapproximation):** The formal dangerous structure
+definition (above) additionally requires `(T1 committed OR T3 committed)`.
+The pivot abort rule omits this check intentionally: at T2's commit time,
+the committed status of T1 and T3 may change concurrently (race window).
+The conservative rule `has_in_rw AND has_out_rw` is a strict overapproximation
+that trades a bounded increase in false positive aborts for the elimination of
+a subtle TOCTOU race. The decision-theoretic analysis (below) shows this
+overapproximation is cost-effective given the asymmetric loss ratio.
+
 **Eager abort marking (optional optimization):**
 
 When a committing transaction observes an edge that makes some other active
@@ -5647,7 +5666,8 @@ impl PageLockTable {
     /// Release all locks held by a transaction.
     /// Iterates the per-transaction lock set, touching only relevant shards.
     pub fn release_all(&self, locks: &HashSet<PageNumber>, txn_id: TxnId) {
-        // Group by shard to minimize lock acquisitions
+        // Iterate per-page; each page touches its own shard lock.
+        // A production implementation MAY group by shard to reduce lock acquisitions.
         for pgno in locks {
             let mut table = self.shard(*pgno).lock();
             if let Entry::Occupied(e) = table.entry(*pgno) {
