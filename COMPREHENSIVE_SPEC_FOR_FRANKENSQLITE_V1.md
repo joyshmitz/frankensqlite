@@ -4695,48 +4695,65 @@ exists T1, T2, T3 :
 ```
 Transaction (SSI extensions) := {
     ...existing fields...
-    has_incoming_rw : bool,   -- some other transaction created a rw edge TO this txn
-    has_outgoing_rw : bool,   -- some other transaction created a rw edge FROM this txn
-    rw_in_from      : HashSet<TxnId>,  -- transactions that have rw edges to this txn
-    rw_out_to       : HashSet<TxnId>,  -- transactions that this txn has rw edges to
+    has_in_rw        : bool,         -- some other transaction created a rw edge TO this txn
+    has_out_rw       : bool,         -- some other transaction created a rw edge FROM this txn
+    rw_in_from       : Vec<TxnToken>,-- (in-process) sources of incoming rw edges
+    rw_out_to        : Vec<TxnToken>,-- (in-process) targets of outgoing rw edges
+    edges_emitted    : Vec<ObjectId>,-- emitted `DependencyEdge` objects (always persisted as ECS)
+    marked_for_abort : bool,         -- optional: eager abort optimization
 }
 ```
 
-**Detection algorithm pseudocode:**
+**Commit-time detection + proof emission pseudocode (witness plane):**
 
 ```
 on_commit(T):
-    // T is about to commit. Check if T is a pivot in a dangerous structure.
-    if T.has_incoming_rw AND T.has_outgoing_rw:
-        // T is the pivot (T2 in T1 -rw-> T2 -rw-> T3).
-        // Check if any T1 (source of incoming rw) and T3 (target of outgoing rw)
-        // form a genuine dangerous structure.
-        for T1_id in T.rw_in_from:
-            T1 = transaction(T1_id)
-            if T1.state == Committed OR T1.state == Active:
-                for T3_id in T.rw_out_to:
-                    T3 = transaction(T3_id)
-                    if T3.state == Committed:
-                        // Dangerous structure confirmed: T1 -rw-> T -rw-> T3
-                        // T3 committed, T1 committed or still active.
-                        // Must abort to prevent anomaly.
-                        abort(T)
-                        return Err(SQLITE_BUSY_SNAPSHOT)
+    // A monotonic ordering stamp for edges/proofs. This is an observation of the commit clock;
+    // it is not required to equal T.commit_seq (which exists only if T commits).
+    obs_seq = shm.commit_seq.load()
 
-    // Also check: is T the T3 in someone else's dangerous structure?
-    // When T commits, it might complete a dangerous structure where
-    // some active pivot T2 now has both incoming and outgoing rw edges
-    // with committed endpoints.
-    for T2_id in T.rw_in_from:
-        T2 = transaction(T2_id)
-        if T2.state == Active AND T2.has_incoming_rw AND T2.has_outgoing_rw:
-            // T2 might be a pivot. But we only abort T2 at T2's commit time.
-            // Mark T2 for eager abort (optimization: abort early rather than
-            // waiting for T2 to attempt commit).
-            T2.marked_for_abort = true
+    // Phase A: publish witnesses (sound evidence) + hot-plane unions.
+    (read_witnesses, write_witnesses) = emit_witnesses(T)
 
-    // Passed SSI check. Proceed with normal commit.
-    proceed_with_commit(T)
+    // Phase B: candidate discovery + refinement (hot plane + cold backstop).
+    T.has_in_rw = false
+    T.has_out_rw = false
+    T.rw_in_from = []
+    T.rw_out_to = []
+    T.edges_emitted = []
+
+    for each write_bucket in write_witnesses:
+        for each candidate_reader R in candidates_from_hot_or_cold(readers, write_bucket):
+            if intersects(refine(R.read_witness_for(write_bucket)), T.write_keys_for(write_bucket)):
+                edge_id = emit DependencyEdge { from=R, to=T, key_basis=write_bucket, observed_by=T, observation_seq=obs_seq }
+                T.edges_emitted.push(edge_id)
+                T.rw_in_from.push(R)
+                T.has_in_rw = true
+
+    for each read_bucket in read_witnesses:
+        for each candidate_writer W in candidates_from_hot_or_cold(writers, read_bucket):
+            if intersects(T.read_keys_for(read_bucket), refine(W.write_witness_for(read_bucket))):
+                edge_id = emit DependencyEdge { from=T, to=W, key_basis=read_bucket, observed_by=T, observation_seq=obs_seq }
+                T.edges_emitted.push(edge_id)
+                T.rw_out_to.push(W)
+                T.has_out_rw = true
+
+    // Phase C: merge escape hatch may tighten keys and eliminate spurious edges.
+    try_merge_escape_hatch(T)  // see §5.10
+
+    // Phase D: dangerous structure rule (conservative pivot abort).
+    if T.has_in_rw AND T.has_out_rw:
+        // Conservative: abort pivot if there exists a committed endpoint on either side.
+        // (Exact policy may be refined later; correctness first.)
+        if exists R in T.rw_in_from where state(R) in {Active, Committed}
+           AND exists W in T.rw_out_to where state(W) == Committed:
+            emit AbortWitness(T, evidence = {read_witnesses, write_witnesses, edges_emitted, ...})
+            abort(T)
+            return Err(SQLITE_BUSY_SNAPSHOT)
+
+    // Phase E: commit succeeds. Emit proof-carrying record.
+    commit(T)
+    emit CommitProof(T, evidence = {read_witnesses, write_witnesses, edges_emitted, ...})
 ```
 
 **When to abort T2 (the pivot) vs T3 (the unsafe): Decision-Theoretic Policy**
@@ -4763,14 +4780,11 @@ Based on the PostgreSQL 9.1+ implementation (Ports, 2012):
   false positive (retry the transaction) is much lower than the cost of a
   missed anomaly (data corruption).
 - **Overhead:** <7% throughput reduction compared to plain Snapshot Isolation,
-  measured on TPC-C. The overhead comes from maintaining SSI witness evidence
-  (read/write witnesses, bucket indices) and
+  measured on TPC-C. The overhead comes from maintaining SIREAD locks and
   checking for dangerous structures.
-- **Memory:** SSI tracking grows proportionally to the number of active
-  transactions times keys read. Under PostgreSQL's row-level granularity,
-  this can be significant; with FrankenSQLite's default `WitnessKey = Page(pgno)`
-  it is much smaller, and with `Cell`/`ByteRange` refinement it remains bounded
-  by bucket/summary policies.
+- **Memory:** SIREAD lock table grows proportionally to the number of active
+  transactions times pages read. Under PostgreSQL's row-level granularity,
+  this can be significant; at page granularity, it is much smaller.
 
 **How SSI maps to page granularity in FrankenSQLite:**
 
@@ -4779,14 +4793,12 @@ SSI at page granularity is coarser than PostgreSQL's row-level SSI. This means:
   rows on the same page will appear to have an rw-antidependency even if
   they are logically independent. The false positive rate will be higher than
   PostgreSQL's 0.5%.
-- **Less overhead:** Fewer tracked keys (one per page, not one per row).
-  Hot-plane updates are O(levels) atomic OR operations; cold-plane evidence is
-  compacted into segments and is not scanned on the hot path except as a
-  correctness backstop.
+- **Less overhead:** Fewer SIREAD lock entries (one per page, not one per
+  row). The SIREAD lock table is smaller and faster to scan.
 - **Mitigation:** The algebraic write merging mechanism (Section 3.4.5) can
   refine page-level conflicts to byte-level, reducing false positives for
   the write side. For the read side, future work could add cell-level
-  witness keys within B-tree pages.
+  SIREAD tracking within B-tree pages.
 
 **Decision-Theoretic SSI Abort Policy (Alien-Artifact Discipline).**
 
@@ -4853,7 +4865,7 @@ should not depend on precise knowledge of hard-to-estimate quantities.
 
 **Why this matters beyond "just use the conservative rule":**
 1. It provides a formal framework for the Layer 3 refinement (Section 0.2,
-   bullet 4). When cell-level witness keys are added, `P(anomaly|evidence)`
+   bullet 4). When cell-level SIREAD tracking is added, `P(anomaly|evidence)`
    drops for same-page-different-row conflicts, and the decision framework
    naturally produces fewer aborts without changing the threshold.
 2. It enables **adaptive victim selection**. If algebraic write merging
@@ -4887,7 +4899,7 @@ ssi_fp_monitor.observe(is_false_positive);
 
 If the e-process exceeds `1/alpha = 100`, the false positive rate is
 significantly above the 5% budget. This triggers an alert (not an
-automatic response) suggesting that cell-level witness keys should be
+automatic response) suggesting that cell-level SIREAD tracking should be
 prioritized for the hot pages causing the most false positives.
 
 **Conformal calibration of page-level coarseness overhead:**
