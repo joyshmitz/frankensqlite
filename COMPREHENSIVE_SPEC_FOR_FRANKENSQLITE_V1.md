@@ -2943,7 +2943,9 @@ at the end of a test.
 - **INV-2 (Lock Exclusivity)**: No two active transactions hold the same page lock
 - **INV-3 (Version Chain Order)**: Versions are ordered by descending CommitSeq
 - **INV-4 (Write Set Consistency)**: Write set only contains locked pages
+- **INV-5 (Snapshot Stability)**: A transaction's snapshot (`high` field) is immutable after capture
 - **INV-6 (Commit Atomicity)**: Committed transaction's pages all become visible
+- **INV-7 (Serialized Mode Exclusivity)**: At most one serialized writer active at any time
 
 If an e-process detects a violation, it provides a **proof certificate** that
 the invariant was violated, including the exact sequence of operations that
@@ -3119,9 +3121,12 @@ if inv2_eprocess.rejected {
 
 After 1000 operations with no violations, `E_1000 ~ 1.0` (fluctuates around 1
 due to the martingale property). If a bug causes even a single violation, the
-e-value jumps by a factor of `(1 + 0.5 * (1 - 0.001)) ~ 1.5` and continues
-growing with each subsequent violation, rapidly crossing the rejection
-threshold of `1/0.05 = 20`.
+e-value jumps by a factor of `(1 + lambda * (1 - p_0))`. For INV-2's actual
+config (lambda=0.999, p_0=1e-9, alpha=1e-6), this is approximately `2.0`,
+and the rejection threshold is `1/alpha = 1,000,000`. Even a single violation
+causes rapid e-value growth; a handful of violations crosses the threshold.
+(Pedagogical shorthand: with lambda=0.5, p_0=0.001, alpha=0.05, the jump
+would be ~1.5 with threshold 20 -- but those are not the actual INV-2 params.)
 
 ### 4.4 Mazurkiewicz Trace Monoid -- Systematic Interleaving
 
@@ -8889,8 +8894,8 @@ else:
   overflow_bytes = payload_size - local
 ```
 
-For 4096-byte page, 0 reserved: table leaf max_local = 4061, index max_local = 1001.
-(Index: `(usable - 12) * 64 / 255 - 23` = `4084 * 64 / 255 - 23` = `1024 - 23` = 1001,
+For 4096-byte page, 0 reserved: table leaf max_local = 4061, index max_local = 1002.
+(Index: `(usable - 12) * 64 / 255 - 23` = `4084 * 64 / 255 - 23` = `1025 - 23` = 1002,
 using integer division.)
 
 **Overflow page format:**
@@ -11330,18 +11335,25 @@ E-process configuration for MVCC invariants:
 | INV-2 (Lock Exclusivity) | Max concurrent holders per page | <= 1 | Any count > 1 |
 | INV-3 (Version Chain Order) | Chain order violations per 1K ops | 0 | Any violation |
 | INV-4 (Write Set Consistency) | Unlocked writes per 1K ops | 0 | Any unlocked write |
+| INV-5 (Snapshot Stability) | Snapshot mutation events per txn | 0 | Any snapshot.high change during a transaction's lifetime |
 | INV-6 (Commit Atomicity) | Partial visibility observations | 0 | Any partial observation |
+| INV-7 (Serialized Mode Exclusivity) | Concurrent serialized writers | <= 1 | Any count > 1 |
 | INV-SSI-FP (SSI False Positives) | Abort false positive rate | <= 0.05 | E_t >= 100 (1/alpha) |
 
-E-processes use Ville's inequality: the process `E_t = prod(1 + lambda_i *
-(X_i - mu_0))` where lambda_i is the betting fraction and X_i is the
-observed statistic. If `E_t >= 1/alpha`, reject the null hypothesis (system
-is correct) at significance level alpha. For invariant monitoring,
-alpha = 0.001 provides a < 0.1% false alarm rate.
+**Hard invariants vs. statistical metrics:** INV-1 through INV-7 are hard
+invariants (must NEVER be violated). For these, simple `assert!` or
+`debug_assert!` checks with zero tolerance are more appropriate than
+e-processes: assertions have zero false-alarm rate, zero computational
+overhead in release builds, and immediate failure with a stack trace.
+E-processes are the correct tool for **statistical** quality metrics like
+INV-SSI-FP (where the null hypothesis is "false positive rate <= threshold"
+and we need sequential monitoring to detect drift). Using e-processes for
+hard invariants adds unnecessary complexity and introduces a non-zero false
+alarm rate (alpha).
 
-The key advantage over traditional assertions: e-processes can be checked
-at ANY point during execution, not just at the end. An invariant violation
-is detected as soon as it occurs, not after the test completes.
+**Recommendation:** Use `debug_assert!` for INV-1 through INV-7 in
+production code. Reserve e-processes for INV-SSI-FP and other rate-based
+metrics where sequential hypothesis testing adds genuine value.
 
 ### 17.6 Fuzz Test Specifications
 
