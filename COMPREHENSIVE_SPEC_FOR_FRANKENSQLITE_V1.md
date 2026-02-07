@@ -8758,6 +8758,23 @@ page size. Must be a power of 2 in the range [512, 65536].
 [Reserved space: reserved_per_page bytes at very end]
 ```
 
+**Page header field layout:**
+
+```
+Offset  Size  Field
+  0       1   Page type: 0x02 (index interior), 0x05 (table interior),
+              0x0A (index leaf), 0x0D (table leaf)
+  1       2   First freeblock offset (big-endian u16; 0 if no freeblocks)
+  3       2   Number of cells on this page (big-endian u16)
+  5       2   Cell content area start offset (big-endian u16; 0 means 65536)
+  7       1   Fragmented free bytes count
+  8       4   Right-most child pointer (INTERIOR PAGES ONLY; absent on leaf)
+```
+
+Interior pages (0x02, 0x05) have a 12-byte header; leaf pages (0x0A, 0x0D)
+have an 8-byte header. The extra 4 bytes on interior pages hold the
+right-most child page number.
+
 **Page 1 special case:** Page 1 has the 100-byte database header before the
 B-tree page header. Cell pointer offsets on page 1 account for this prefix.
 The usable start of page 1 is at byte 100.
@@ -12290,6 +12307,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.8 (Asupersync-first hardening: structured regions + cancel protocol + bounded masking/commit sections + obligation discipline + supervision tree + resilience combinators + deterministic repro bundles; RaptorQ accuracy fixes: near-optimal wording, XOR-delta vs erasure-coding separation, compatibility-mode PRAGMA persistence moved to `.wal-fec` sidecar)*
+*Document version: 1.9 (Spec hardening: decoupled commit marker protocol; cross-process lock table CAS discipline; deterministic rebase safety constraints; ECS compaction; e-process family-wise control; symbol sizing + overhead clarity)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
