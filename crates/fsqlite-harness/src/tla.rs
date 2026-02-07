@@ -33,11 +33,11 @@ pub enum TlaValue {
     /// String literal.
     Str(String),
     /// TLA+ sequence literal `<<...>>`.
-    Seq(Vec<TlaValue>),
+    Seq(Vec<Self>),
     /// TLA+ set literal `{...}`.
-    Set(Vec<TlaValue>),
+    Set(Vec<Self>),
     /// TLA+ record literal `[k |-> v, ...]`.
-    Record(BTreeMap<String, TlaValue>),
+    Record(BTreeMap<String, Self>),
 }
 
 impl TlaValue {
