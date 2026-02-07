@@ -11002,7 +11002,7 @@ else:
 
 For 4096-byte page, 0 reserved: table leaf max_local = 4061, index max_local = 1002.
 (Index: `(usable - 12) * 64 / 255 - 23` = `4084 * 64 / 255 - 23` = `1025 - 23` = 1002,
-using integer division.)
+using integer division: `4084 * 64 = 261376`, `261376 / 255 = 1025` (truncated; remainder 1).)
 
 **Overflow page format:**
 ```
@@ -13092,6 +13092,9 @@ core: 3,000, public api: 1,000, func: 2,000).
 - `crates/fsqlite-wal/src/raptorq.rs`: Self-healing WAL with RaptorQ repair
   symbols (Section 3.4.1)
 - Transaction support: BEGIN/COMMIT/ROLLBACK, savepoint stack
+- Page-level encryption (§15, replacing SEE): XChaCha20-Poly1305 with envelope
+  DEK/KEK, Argon2id key derivation, nonce/tag in reserved bytes, AAD swap
+  resistance, PRAGMA key/rekey API
 
 **Acceptance criteria:**
 - Persistence: Create table, insert data, close connection, reopen, data
@@ -13109,6 +13112,9 @@ core: 3,000, public api: 1,000, func: 2,000).
 - Savepoints: SAVEPOINT, RELEASE, ROLLBACK TO with nested savepoints
 - Round-trip: Create database with FrankenSQLite, read with C sqlite3 (and
   vice versa), verify data integrity
+- Encryption: PRAGMA key creates encrypted database, data unreadable without
+  key, PRAGMA rekey changes passphrase without re-encrypting pages, AAD
+  prevents page swaps across databases
 - Target: 1,500+ tests
 
 **Dependencies:** Phase 4 complete (persistence needs pager under VDBE).
@@ -13116,10 +13122,11 @@ core: 3,000, public api: 1,000, func: 2,000).
 **Risk areas:** WAL checksum compatibility is critical for file format
 interop. The checksum algorithm is non-standard and byte-order-dependent.
 Mitigation: generate test WAL files with C SQLite and verify FrankenSQLite
-reads them correctly.
+reads them correctly. Encryption nonce management must be correct under
+concurrent writers and crash recovery.
 
-**Estimated complexity:** ~10,000 LOC (pager: 3,000, wal: 5,000,
-raptorq integration: 2,000).
+**Estimated complexity:** ~12,000 LOC (pager: 3,000, wal: 5,000,
+raptorq integration: 2,000, encryption: 2,000).
 
 ### Phase 6: MVCC Concurrent Writers with SSI
 
