@@ -55,7 +55,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **MVCC** | Multi-Version Concurrency Control. Transactions see a consistent snapshot while writers create new versions. |
 | **SSI** | Serializable Snapshot Isolation. Extends SI to detect write skew via rw-antidependency tracking. |
 | **ECS** | Erasure-Coded Stream. The universal persistence substrate: objects encoded as RaptorQ symbols. |
-| **ObjectId** | Content-addressed identifier: `Trunc128(BLAKE3("fsqlite:ecs:v1" || canonical_object_header || payload_hash))`, 16 bytes. Canonical full digest is BLAKE3-256; the 128-bit truncation is for storage efficiency. |
+| **ObjectId** | Content-addressed identifier: `Trunc128(BLAKE3("fsqlite:ecs:v1" || canonical_object_header || payload_hash))`, 16 bytes. Canonical full digest is BLAKE3-256; the 128-bit truncation is for storage efficiency. Birthday-bound collision resistance is ~2^64 operations — sufficient for FrankenSQLite's expected object population (well under 2^40) but NOT equivalent to 128-bit security. |
 | **CommitCapsule** | Atomic unit of commit state in Native mode: intent log, page deltas, SSI witnesses. |
 | **CommitMarker** | The durable "this commit exists" record in Native mode: `(commit_seq, commit_time_unix_ns, capsule_object_id, proof_object_id, prev_marker, integrity_hash)`. |
 | **CommitSeq** | Monotonically increasing `u64` commit sequence number (global "commit clock" for ordering). |
@@ -68,6 +68,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **EpochId** | Monotonically increasing `u64` epoch for distributed coordination and validity windows (asupersync `epoch`). Used for key rotation, tiered-storage policy transitions, and cross-process barriers. |
 | **SymbolValidityWindow** | Epoch interval `[from_epoch, to_epoch]` used to accept/reject symbols/segments under key rotation and retention policies. |
 | **RemoteCap** | Asupersync capability token required for remote tier (L3) fetch/upload or remote compute. |
+| **SymbolAuthMasterKeyCap** | Capability token (via `Cx`) that provides the per-database secret material used to derive epoch-scoped symbol authentication keys when page encryption is disabled. Required to enable `PRAGMA fsqlite.symbol_auth = on` in non-encrypted deployments. |
 | **IdempotencyKey** | Stable identifier used to deduplicate remote requests under retries (remote fetch/upload/compaction publish). |
 | **Saga** | Structured multi-step operation with deterministic compensations; used for compaction and tier eviction so cancellation never leaves partial state. |
 | **Region** | Asupersync structured concurrency scope: a tree of owned tasks. Region close implies quiescence (no live children, all finalizers run, all obligations resolved). |
@@ -157,7 +158,8 @@ It targets:
 ### 1.2 The Two Innovations
 
 **Innovation 1: MVCC Concurrent Writers.** SQLite's single biggest limitation
-is the `WAL_WRITE_LOCK` at `wal.c:3698` -- a single exclusive lock byte that
+is the `WAL_WRITE_LOCK` in `wal.c` (function `sqlite3WalBeginWriteTransaction`;
+line numbers shift by SQLite version) -- a single exclusive lock byte that
 serializes ALL writers. FrankenSQLite replaces this with page-level MVCC
 versioning, allowing transactions that touch different pages to commit in full
 parallel. This is the PostgreSQL concurrency model applied at page granularity.
@@ -181,7 +183,7 @@ model rather than a silent corruption or a "panic and pray" failure mode.
 
 ### 1.4 Constraints
 
-- **Edition 2024**, nightly toolchain required
+- **Edition 2024**, nightly toolchain required (see `rust-toolchain.toml`)
 - **`unsafe_code = "forbid"`** -- no escape hatches
 - **Clippy pedantic + nursery at deny level** -- with specific documented allows
 - **23 crates** in workspace under `crates/`
@@ -266,7 +268,9 @@ of simultaneously active reader locks via `WAL_NREADER` in the wal-index shared
 memory (default: 5). It still allows only ONE writer at a time. The
 `WAL_WRITE_LOCK` (byte 120 of the WAL index shared memory) is an exclusive
 advisory lock. Any connection attempting to write while another holds this lock
-receives `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` in the fork-protection case).
+receives `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` when a reader-turned-writer
+discovers its snapshot has been invalidated by a WAL reset/rewind event, e.g.
+during checkpoint/restart).
 
 For applications with mixed read/write workloads across different tables or
 different regions of the same table, this is a needless bottleneck. Two users
@@ -390,7 +394,8 @@ RaptorQ improves upon the original Raptor code (RFC 5053) in several ways:
 it uses GF(256) arithmetic for the HDPC constraints instead of GF(2), which
 dramatically improves the failure probability at low overhead. Where Raptor
 codes over GF(2) have a ~5-10% failure rate when decoding with exactly K
-symbols, RaptorQ achieves ~1% failure rate (RFC 6330 Annex B: for most K
+symbols (Shokrollahi, "Raptor Codes", IEEE Trans. Info. Theory, 2006;
+exact rate varies with K), RaptorQ achieves ~1% failure rate (RFC 6330 Annex B: for most K
 values, P_fail(K) < 0.01). With just one additional symbol (K+1 received),
 the failure rate drops to approximately 10^-4. With two additional symbols
 (K+2), it drops to approximately 10^-7. This near-perfect recovery rate is
@@ -3515,15 +3520,23 @@ transaction holds a lock. We define the observation function:
 ```rust
 /// Check INV-2 at the current instant.
 /// Returns true (violation) if any page has two holders, false otherwise.
-fn observe_lock_exclusivity(lock_table: &PageLockTable) -> bool {
+struct ActiveTxnInfo {
+    state: TxnState,
+    page_locks: Vec<PageNumber>,
+}
+
+fn observe_lock_exclusivity(
+    lock_table: &PageLockTable,
+    active_transactions: &HashMap<TxnId, ActiveTxnInfo>,
+) -> bool {
     // The lock table maps PageNumber -> TxnId.
     // By construction, HashMap allows only one value per key.
     // But we additionally verify against the per-transaction lock sets:
     let mut page_holders: HashMap<PageNumber, Vec<TxnId>> = HashMap::new();
-    for txn in active_transactions.values() {
+    for (txn_id, txn) in active_transactions {
         if txn.state == TxnState::Active {
             for &pgno in &txn.page_locks {
-                page_holders.entry(pgno).or_default().push(txn.txn_id);
+                page_holders.entry(pgno).or_default().push(*txn_id);
             }
         }
     }
@@ -3532,11 +3545,21 @@ fn observe_lock_exclusivity(lock_table: &PageLockTable) -> bool {
             return true; // VIOLATION
         }
     }
+    // Cross-check internal consistency: every lock_table entry must be present
+    // in the transaction's lock set (no "ghost" or leaked locks).
+    for (&pgno, &holder) in lock_table.iter() {
+        let Some(txn) = active_transactions.get(&holder) else {
+            return true; // VIOLATION (lock held by unknown txn)
+        };
+        if txn.state != TxnState::Active || !txn.page_locks.contains(&pgno) {
+            return true; // VIOLATION (lock_table and txn lock set disagree)
+        }
+    }
     false // no violation
 }
 
 // In the test loop, after each operation:
-let violated = observe_lock_exclusivity(&lock_table);
+let violated = observe_lock_exclusivity(&lock_table, &active_transactions);
 inv2_eprocess.observe(violated);
 if inv2_eprocess.rejected {
     panic!(
@@ -4111,11 +4134,14 @@ The blocking pool uses a min/max thread model:
   | SATA SSD      | ~100us             | 1-2                         |
   | NVMe SSD      | ~15us              | 1-2 (kernel parallelism)    |
 
-  For single-file database workloads, the device serializes requests
-  internally. The benefit of >1 blocking thread is overlap with CPU work
-  (CRC computation while another read is in-flight), not increased I/O
-  bandwidth. Defaults: **SATA/HDD: 2**, **NVMe: 4**. Auto-detected via
-  `statfs()` heuristic; overridable with `PRAGMA fsqlite.blocking_pool_threads`.
+  For single-file database workloads, HDD and SATA SSD serialize requests
+  internally (single command queue). The benefit of >1 thread is overlap
+  with CPU work (CRC computation while another read is in-flight), not
+  increased I/O bandwidth. NVMe devices support multiple hardware queues
+  and internal parallelism, so additional threads yield actual I/O
+  concurrency. Defaults: **HDD: 2**, **SATA SSD: 2**, **NVMe: 4**.
+  Auto-detected via `statfs()` heuristic; overridable with
+  `PRAGMA fsqlite.blocking_pool_threads`.
 
 - **Idle timeout: 10 seconds (derived from survival analysis)** -- minimizes
   `L_spawn * P(arrival < t) + L_idle * t * P(no_arrival < t)` where
@@ -8289,7 +8315,11 @@ We separate three concerns with three hash functions:
 - We do NOT use XXH3 for content addressing. It is not cryptographic.
 - We do NOT roll our own crypto. Security uses asupersync's vetted primitives.
 - BLAKE3 is the bridge: fast enough for object-granularity identity, strong
-  enough for collision resistance in this context.
+  enough for collision resistance in this context. Note: 128-bit truncation
+  gives ~2^64 birthday-bound collision resistance, not 2^128. This is
+  adequate for the expected object population (< 2^40 objects per database)
+  but means ObjectId should NOT be relied upon as a security guarantee
+  against adversarial collision attacks.
 
 ### 7.4 Page-Level Integrity
 
@@ -10151,6 +10181,7 @@ pub enum Expr {
     IsNull { expr: Box<Expr>, not: bool, span: Span },
     Raise { action: RaiseAction, message: Option<String>, span: Span },
     JsonAccess { expr: Box<Expr>, path: Box<Expr>, arrow: JsonArrow, span: Span },
+    RowValue(Vec<Expr>, Span),         // row value: (a, b) for multi-column comparisons (SQLite 3.15+)
     Placeholder(PlaceholderType, Span),
 }
 ```
@@ -10242,6 +10273,39 @@ INSERT INTO table VALUES (?, ?)
   Variable   2, 3            # bind param 2 -> r3
   MakeRecord 2, 2, 4         # pack r2..r3 into record r4
   Insert     0, 4, 1         # insert record r4 with rowid r1
+  Close      0
+  Halt       0, 0
+  <end>:
+```
+
+**UPDATE -> VDBE opcodes:**
+```
+UPDATE table SET col = ? WHERE rowid = ?
+  Init       0, <end>
+  Transaction 0, 1           # begin write transaction
+  Variable   1, 1            # bind new value -> r1
+  Variable   2, 2            # bind rowid -> r2
+  OpenWrite  0, <root>, 0    # open cursor 0 for writing
+  NotExists  0, <done>, 2    # if rowid r2 not found, skip
+  Column     0, 0, 3         # read existing col0 into r3 (if needed for index updates)
+  MakeRecord 1, 1, 4         # pack r1 into new record r4
+  Insert     0, 4, 2, REPLACE  # overwrite record at rowid r2 with r4
+  <done>:
+  Close      0
+  Halt       0, 0
+  <end>:
+```
+
+**DELETE -> VDBE opcodes:**
+```
+DELETE FROM table WHERE rowid = ?
+  Init       0, <end>
+  Transaction 0, 1           # begin write transaction
+  Variable   1, 1            # bind rowid -> r1
+  OpenWrite  0, <root>, 0    # open cursor 0 for writing
+  NotExists  0, <done>, 1    # if rowid r1 not found, skip
+  Delete     0, 0            # delete row at current cursor position
+  <done>:
   Close      0
   Halt       0, 0
   <end>:
@@ -13768,7 +13832,7 @@ from spec, never translate line-by-line).
 | `sqliteInt.h` | Main internal header | ~250KB | All struct definitions (Btree, BtCursor, Pager, Wal, Vdbe, Mem, Table, Index, Column, Expr, Select, etc.), all `#define` constants, all function prototypes. This is the Rosetta Stone. |
 | `btree.c` | B-tree engine | 11,568 | Page format parsing, cell format, cursor movement algorithms (moveToChild, moveToRoot, moveToLeftmost, moveToRightmost), insert/delete with rebalancing, overflow page management, freelist operations. Focus on `balance_nonroot` (~1,200 lines) as the most complex function. |
 | `pager.c` | Page cache | 7,834 | Pager state machine (OPEN, READER, WRITER_LOCKED, WRITER_CACHEMOD, WRITER_DBMOD, WRITER_FINISHED, ERROR), journal format, hot journal detection, page reference counting, cache eviction policy. |
-| `wal.c` | WAL subsystem | 4,621 | WAL header/frame format, checksum algorithm implementation, WAL index (wal-index) hash table structure, checkpoint algorithm, the critical `WAL_WRITE_LOCK` at line 3698 that FrankenSQLite replaces with MVCC. |
+| `wal.c` | WAL subsystem | 4,621 | WAL header/frame format, checksum algorithm implementation, WAL index (wal-index) hash table structure, checkpoint algorithm, the critical `WAL_WRITE_LOCK` in `sqlite3WalBeginWriteTransaction` (line numbers shift by SQLite version) that FrankenSQLite replaces with MVCC. |
 | `vdbe.c` | VDBE interpreter | 9,316 | The giant switch statement dispatching all opcodes. Each case is the authoritative definition of what that opcode does. Extract: register manipulation, cursor operations, comparison semantics, NULL handling per opcode. |
 | `select.c` | SELECT compilation | 8,972 | How SELECT is compiled to VDBE opcodes: result column processing, FROM clause flattening, subquery handling, compound SELECT, DISTINCT, ORDER BY, LIMIT. |
 | `where.c` | WHERE optimization | 7,858 | Index selection algorithm, cost estimation, OR optimization, skip-scan, automatic index creation. The `WhereTerm`, `WhereLoop`, and `WherePath` structures define the optimizer's search space. |
