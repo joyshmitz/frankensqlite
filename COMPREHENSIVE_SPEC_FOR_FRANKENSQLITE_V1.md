@@ -10104,7 +10104,9 @@ SELECT [DISTINCT | ALL] result-column [, result-column]*
 - Table-valued function: `FROM json_each(col)` or `FROM generate_series(1,100)`
 - Multiple tables (implicit CROSS JOIN): `FROM t1, t2`
 
-**JOIN types** (all produce VDBE nested-loop or hash join opcodes):
+**JOIN types** (all produce VDBE nested-loop opcodes; Bloom filter opcodes
+`OP_FilterAdd`/`OP_Filter` may additionally be emitted for early rejection,
+but SQLite has no hash join):
 - `INNER JOIN ... ON expr` / `JOIN ... ON expr`
 - `LEFT [OUTER] JOIN ... ON expr`
 - `RIGHT [OUTER] JOIN ... ON expr` (SQLite 3.39+)
@@ -10173,8 +10175,10 @@ index to check for duplicates before emitting rows.
 
 **LIMIT and OFFSET:** LIMIT takes a non-negative integer expression. OFFSET
 takes a non-negative integer expression. The alternative form
-`LIMIT count, offset` (offset as second argument) is supported for
-backward compatibility. Negative LIMIT means unlimited. Negative OFFSET
+`LIMIT offset, count` (offset as **first** argument, count as second —
+following MySQL convention) is supported for backward compatibility.
+SQLite's documentation calls this ordering "counter-intuitive" and
+recommends the explicit `OFFSET` keyword form instead. Negative LIMIT means unlimited. Negative OFFSET
 is treated as zero.
 
 ### 12.2 INSERT
@@ -10363,6 +10367,10 @@ REFERENCES parent-table [(parent-column)]
   [[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]]
 ```
 
+**Note on MATCH:** SQLite parses `MATCH` clauses but does not enforce them.
+All foreign key constraints are handled as if `MATCH SIMPLE` were specified,
+regardless of the declared match type. FrankenSQLite inherits this behavior.
+
 Foreign key enforcement requires `PRAGMA foreign_keys = ON` (off by
 default for backward compatibility).
 
@@ -10458,8 +10466,10 @@ ALTER TABLE table-name ADD COLUMN column-def;
 ALTER TABLE table-name DROP COLUMN column-name;
 ```
 
-DROP COLUMN (SQLite 3.35+) rewrites the table if the column is not the
-last column and is referenced by indexes or constraints.
+DROP COLUMN (SQLite 3.35+) always rewrites the table to purge the dropped
+column's data. The command fails if the column is part of the PRIMARY KEY,
+has a UNIQUE constraint, is referenced by an index, appears in a CHECK or
+foreign key constraint, or is the only column in the table.
 
 **DROP statements:**
 ```sql
@@ -11010,8 +11020,8 @@ every function call.
 
 #### 14.1.1 Scalar Functions
 
-**json(X)** -> text. Validates and minifies JSON text X. Returns NULL if
-X is not valid JSON. Converts JSONB to text JSON.
+**json(X)** -> text. Validates and minifies JSON text X. **Throws an error**
+(not NULL) if X is not well-formed JSON or JSONB. Converts JSONB to text JSON.
 
 **json_valid(X [, FLAGS])** -> integer. Returns 1 if X is well-formed JSON
 (or JSONB if FLAGS=2), 0 otherwise. FLAGS bitmask (SQLite 3.45+):
@@ -13129,7 +13139,7 @@ Current VDBE processes one row at a time (Volcano model). Vectorized
 execution processes batches of rows through each operator:
 - Column-at-a-time processing enables SIMD utilization
 - Better CPU cache behavior (fewer instruction cache misses)
-- Applicable to full table scans, aggregations, and hash joins
+- Applicable to full table scans, aggregations, and nested-loop joins
 - Expected speedup: 2-5x for analytical queries, negligible for point lookups
 - Challenge: must maintain row-at-a-time semantics for triggers and
   RETURNING clause
