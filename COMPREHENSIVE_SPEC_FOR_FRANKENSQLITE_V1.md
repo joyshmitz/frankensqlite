@@ -63,7 +63,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **OTI** | Object Transmission Information. RaptorQ metadata needed for decoding: (F, Al, T, Z, N). |
 | **DecodeProof** | Auditable witness artifact produced by the RaptorQ decoder when repairing or failing to repair (lab/debug). |
 | **Cx** | Capability context (asupersync). Threads cancellation via `is_cancel_requested()` / `checkpoint()`, progress via `checkpoint_with()`, budgets/deadlines via `Budget` and scoped budgets, and type-level restriction via `Cx::restrict::<NewCaps>()`. |
-| **Budget** | Asupersync resource budget (product semiring) carried by `Cx`: `{ deadline: Option<Time>, poll_quota: u32, cost_quota: Option<u64>, priority: u8 }`. Combined via `meet`: deadline/poll/cost = `min` (tighter wins), priority = `max` (higher wins). Budget exhaustion requests cancellation (deadline/budget). |
+| **Budget** | Asupersync resource budget (product meet-semilattice) carried by `Cx`: `{ deadline: Option<Time>, poll_quota: u32, cost_quota: Option<u64>, priority: u8 }`. Combined via `meet`: deadline/poll/cost = `min` (tighter wins), priority = `max` (higher wins). Budget exhaustion requests cancellation (deadline/budget). |
 | **Outcome** | Asupersync 4-valued result lattice for concurrent tasks: `Ok < Err < Cancelled < Panicked`. Used for supervision and combinators; FrankenSQLite maps outcomes into SQLite error codes at API boundaries. |
 | **Region** | Asupersync structured concurrency scope: a tree of owned tasks. Region close implies quiescence (no live children, all finalizers run, all obligations resolved). |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
@@ -2666,7 +2666,7 @@ Every FrankenSQLite operation accepts `&Cx`. This enables:
   "stalled task" detection. FrankenSQLite maps `ErrorKind::Cancelled` to the most
   precise SQLite error code for the context (default: `SQLITE_INTERRUPT`).
 - **Deadline propagation (budgets)**: time budgets are expressed as `Budget` deadlines
-  and enforced via region/scope budgets. Budgets are a **product semiring**
+  and enforced via region/scope budgets. Budgets are a **product meet-semilattice**
   (deadline + poll quota + cost quota + priority) with `meet` (∧) semantics:
   constraints tighten by `min` and priority tightens by `max`. When tightening a
   budget, callers MUST compute `effective = cx.budget().meet(child)` and then use
@@ -3452,8 +3452,12 @@ a posterior distribution over the **run length** `r_t` (number of observations
 since the last change point):
 
 ```
-P(r_t | x_{1:t}) ∝ P(x_t | r_t, x_{t-r_t:t-1}) * P(r_t | r_{t-1}) * P(r_{t-1} | x_{1:t-1})
+P(r_t | x_{1:t}) ∝ Σ_{r_{t-1}} P(x_t | r_t, x_{t-r_t:t-1}) * P(r_t | r_{t-1}) * P(r_{t-1} | x_{1:t-1})
 ```
+
+(Note the summation over `r_{t-1}`: the previous run length must be
+marginalized out. Without this sum, `r_{t-1}` would be a free variable.
+This is the standard Adams & MacKay (2007) recursion.)
 
 where:
 - `P(x_t | r_t, ...)` is the predictive probability under the current regime
@@ -7859,24 +7863,24 @@ pub trait Vfs: Send + Sync {
 pub trait VfsFile: Send + Sync {
     /// Close the file handle and release all resources.
     /// After close(), no other methods may be called.
-    fn close(&mut self) -> Result<()>;
+    fn close(&mut self, cx: &Cx) -> Result<()>;
 
     /// Read `buf.len()` bytes from the file at the given byte offset.
     /// Returns the number of bytes actually read (may be less than
     /// buf.len() if the file is shorter than offset + buf.len()).
     /// Short reads zero-fill the remainder of buf.
-    fn read(&mut self, buf: &mut [u8], offset: u64) -> Result<usize>;
+    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize>;
 
     /// Write `buf` to the file at the given byte offset.
     /// The file is extended if necessary.
-    fn write(&mut self, buf: &[u8], offset: u64) -> Result<()>;
+    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()>;
 
     /// Truncate the file to exactly `size` bytes.
-    fn truncate(&mut self, size: u64) -> Result<()>;
+    fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()>;
 
     /// Sync file contents to durable storage.
     /// `flags`: SYNC_NORMAL or SYNC_FULL (FULL also syncs metadata).
-    fn sync(&mut self, flags: SyncFlags) -> Result<()>;
+    fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()>;
 
     /// Return the current file size in bytes.
     fn file_size(&self) -> Result<u64>;
@@ -7889,10 +7893,10 @@ pub trait VfsFile: Send + Sync {
     /// # Errors
     /// - `FrankenError::Busy` if the lock cannot be acquired (another
     ///   process holds a conflicting lock).
-    fn lock(&mut self, level: LockLevel) -> Result<()>;
+    fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()>;
 
     /// Release or downgrade a file lock.
-    fn unlock(&mut self, level: LockLevel) -> Result<()>;
+    fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()>;
 
     /// Check whether another process holds a RESERVED lock.
     /// Used to determine if a write transaction is in progress elsewhere.
