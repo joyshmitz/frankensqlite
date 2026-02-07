@@ -11,5 +11,10 @@ rust-version.workspace = true
 fsqlite = { workspace = true }
 fsqlite-error = { workspace = true }
 
+[dev-dependencies]
+asupersync = { path = "/dp/asupersync", default-features = false }
+proptest = { workspace = true }
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
