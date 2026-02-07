@@ -50,8 +50,11 @@ pub trait Vfs: Send + Sync {
 
     /// Generate a random byte sequence for temporary file naming.
     ///
-    /// Fills `buf` with random bytes. The default implementation uses the
-    /// system random number generator.
+    /// Fills `buf` with bytes suitable for temporary file naming.
+    ///
+    /// The default implementation is deterministic (xorshift) for reproducible
+    /// tests; real VFS implementations should override this and use OS-provided
+    /// randomness to avoid collisions.
     fn randomness(&self, cx: &Cx, buf: &mut [u8]) {
         // Default: fill with pseudo-random bytes using a simple xorshift.
         // Real VFS implementations should use OS-provided randomness.

@@ -164,7 +164,7 @@ impl HotBucket {
         for (word_idx, w) in readers.iter().enumerate() {
             let mut bits = w.load(Ordering::Acquire);
             while bits != 0 {
-                let lsb = bits & (!bits + 1);
+                let lsb = bits & bits.wrapping_neg();
                 let bit = lsb.trailing_zeros();
                 let Ok(word) = u64::try_from(word_idx) else {
                     continue;
@@ -286,7 +286,7 @@ impl HotBucket {
         for (word_idx, w) in readers.iter().enumerate() {
             let mut bits = w.load(Ordering::Acquire);
             while bits != 0 {
-                let lsb = bits & (!bits + 1);
+                let lsb = bits & bits.wrapping_neg();
                 let bit = lsb.trailing_zeros();
                 let Ok(word) = u32::try_from(word_idx) else {
                     continue;
@@ -432,16 +432,19 @@ fn dpor_outgoing_edges_cover_committed_and_freed_writers() {
 
                 // Commit-time outgoing edge discovery:
                 yield_now().await;
-                let out_edges = {
+                let (out_edges, w_commit_seq_at_check) = {
                     let s = state_t.lock();
-                    discover_outgoing_edges(begin_seq, &read_pages, &s.commit_index)
+                    let out_edges =
+                        discover_outgoing_edges(begin_seq, &read_pages, &s.commit_index);
+                    let w_commit_seq = s.commit_index.get(&1).copied();
+                    drop(s);
+                    (out_edges, w_commit_seq)
                 };
-                let mut s = state_t.lock();
-                s.snapshot("T commit", &bucket_t);
+                state_t.lock().snapshot("T commit", &bucket_t);
 
                 // If a writer committed after our begin and touched page 1 before we committed,
                 // out_edges must be non-empty (no false negatives).
-                if let Some(w_commit_seq) = s.commit_index.get(&1).copied() {
+                if let Some(w_commit_seq) = w_commit_seq_at_check {
                     if w_commit_seq > begin_seq {
                         assert!(
                             out_edges.contains(&w_commit_seq),
@@ -600,9 +603,17 @@ fn dpor_incoming_edges_cover_committed_pivots_via_committed_readers_index() {
 
                 // Commit-time incoming edge discovery:
                 yield_now().await;
-                let in_edges = {
+                let (in_edges, r_committed_after_snapshot) = {
                     let s = state_t.lock();
-                    discover_incoming_edges(begin_seq, &write_pages, &s.committed_readers)
+                    let in_edges =
+                        discover_incoming_edges(begin_seq, &write_pages, &s.committed_readers);
+                    let r_after = s
+                        .committed_readers
+                        .iter()
+                        .find(|e| e.txn_id == 1)
+                        .is_some_and(|r| r.commit_seq > begin_seq);
+                    drop(s);
+                    (in_edges, r_after)
                 };
 
                 // Apply the committed-pivot T3 rule: if any committed edge source has has_in_rw,
@@ -614,23 +625,22 @@ fn dpor_incoming_edges_cover_committed_pivots_via_committed_readers_index() {
                     }
                 }
 
-                let mut s = state_t.lock();
-                s.snapshot(format!("T outcome {outcome:?}"), &bucket_t);
+                state_t
+                    .lock()
+                    .snapshot(format!("T outcome {outcome:?}"), &bucket_t);
 
                 // If R committed after our snapshot and read a page we wrote, T must abort
                 // because R is a committed pivot (X -rw-> R -rw-> T).
-                if let Some(r) = s.committed_readers.iter().find(|e| e.txn_id == 1) {
-                    if r.commit_seq > begin_seq {
-                        assert!(
-                            in_edges.iter().any(|c| c.txn_id == 1),
-                            "missing incoming edge source txn_id=1"
-                        );
-                        assert_eq!(
-                            outcome,
-                            TxnOutcome::Aborted,
-                            "committed pivot must force abort"
-                        );
-                    }
+                if r_committed_after_snapshot {
+                    assert!(
+                        in_edges.iter().any(|c| c.txn_id == 1),
+                        "missing incoming edge source txn_id=1"
+                    );
+                    assert_eq!(
+                        outcome,
+                        TxnOutcome::Aborted,
+                        "committed pivot must force abort"
+                    );
                 }
             })
             .expect("spawn T");

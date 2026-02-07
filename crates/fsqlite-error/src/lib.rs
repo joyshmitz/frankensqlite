@@ -298,7 +298,7 @@ impl FrankenError {
     pub const fn error_code(&self) -> ErrorCode {
         match self {
             Self::DatabaseNotFound { .. } | Self::CannotOpen { .. } => ErrorCode::CantOpen,
-            Self::DatabaseLocked { .. } => ErrorCode::Locked,
+            Self::DatabaseLocked { .. } => ErrorCode::Busy,
             Self::DatabaseCorrupt { .. } | Self::WalCorrupt { .. } => ErrorCode::Corrupt,
             Self::NotADatabase { .. } => ErrorCode::NotADb,
             Self::DatabaseFull => ErrorCode::Full,

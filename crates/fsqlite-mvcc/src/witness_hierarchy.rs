@@ -170,8 +170,14 @@ impl WitnessHotIndexManifestV1 {
             }
         })?;
 
+        let entries_plus_overflow = u64::from(capacity)
+            .checked_add(1)
+            .ok_or(WitnessSizingError::ArithmeticOverflow)?;
+        let entries_bytes = bytes_per_entry
+            .checked_mul(entries_plus_overflow)
+            .ok_or(WitnessSizingError::ArithmeticOverflow)?;
         let total_bytes = HotWitnessIndexSizingV1::HEADER_BYTES_ALIGNED
-            .checked_add(bytes_per_entry.saturating_mul(u64::from(capacity) + 1))
+            .checked_add(entries_bytes)
             .ok_or(WitnessSizingError::ArithmeticOverflow)?;
 
         Ok(Self {
