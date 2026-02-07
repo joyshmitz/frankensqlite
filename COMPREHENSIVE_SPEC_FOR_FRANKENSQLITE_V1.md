@@ -3940,8 +3940,10 @@ PageVersion := {
 -- Theorem 5 (Section 5.5) bounds version chain length to R * D + 1 where
 -- R is the write rate and D is the duration above the GC horizon. For
 -- typical workloads (R=100 writes/sec, D=0.1s), chains are <= 11 entries.
--- A SmallVec<[PageVersion; 8]> inline buffer covers the common case with
--- zero heap allocation; the arena handles the overflow case.
+-- The per-page version chain head table (mapping PageNumber -> VersionIdx)
+-- can use SmallVec<[VersionIdx; 8]> to inline the most recent chain heads
+-- without heap allocation; when a page has more than 8 retained versions,
+-- the overflow indices are already in the arena's dense Vec storage.
 --
 -- Reclamation: when GC advances the horizon and prunes old versions,
 -- arena slots are added to a free list for reuse. Epoch-based reclamation
@@ -4000,8 +4002,8 @@ Transaction := {
     write_keys  : HashSet<WitnessKey>,
 
     -- SSI state (computed at commit for Concurrent mode):
-    has_in_rw   : bool,    -- some other txn read what this txn wrote (incoming rw edge)
-    has_out_rw  : bool,    -- this txn read what some other txn later wrote (outgoing rw edge)
+    has_in_rw   : bool,    -- some other txn R read a key that this txn later wrote (R -rw-> this; incoming edge)
+    has_out_rw  : bool,    -- this txn read a key that some other txn W later wrote (this -rw-> W; outgoing edge)
 }
 
 IntentOp := (see §5.10.1)
@@ -4009,6 +4011,25 @@ IntentOp := (see §5.10.1)
 CommitIndex := ShardedHashMap<PageNumber, CommitSeq>
     -- Maps each page to the latest commit_seq that modified it.
     -- Used by First-Committer-Wins validation without scanning commit history.
+
+CommitLog := AppendOnlyVec<CommitRecord>
+    -- Ordered by commit time (CommitSeq). Append is O(1).
+    -- Lookup by CommitSeq: since CommitSeq is monotonically increasing and
+    --   assigned sequentially, offset = commit_seq - base_commit_seq gives
+    --   direct index, O(1).
+    -- GC truncates the front when all transactions below the horizon
+    --   have been reclaimed, using a VecDeque or circular buffer.
+    -- NOT BTreeMap: TxnIds are assigned at BEGIN and committed in arbitrary
+    --   order, so a BTreeMap<TxnId, _> would not be sorted by commit time.
+    --   A dense array ordered by CommitSeq is strictly superior for monotonic
+    --   keys, with O(1) append and cache-friendly sequential access.
+
+CommitRecord := {
+    txn_id     : TxnId,
+    commit_seq : CommitSeq,                    -- explicit for robustness after GC truncation
+    pages      : SmallVec<[PageNumber; 8]>,    -- most commits touch few pages
+    timestamp  : Instant,
+}
 ```
 
 ### 5.2 Invariants
@@ -4634,13 +4655,17 @@ TxnSlot := {
     lease_expiry    : AtomicU64,     -- Unix timestamp (seconds) of lease expiry
     begin_seq       : AtomicU64,     -- CommitSeq observed at BEGIN (snapshot backbone for SSI overlap)
     commit_seq      : AtomicU64,     -- CommitSeq when committed; 0 if not committed
-    snapshot_high   : AtomicU64,     -- snapshot high commit sequence (debug/audit; equals begin_seq for commit-seq snapshots)
+    snapshot_high   : AtomicU64,     -- snapshot high commit sequence; equals begin_seq for commit-seq snapshots.
+                                   -- Intentionally redundant with begin_seq: this field exists for debug/audit
+                                   -- diagnostics (inspect snapshot boundaries via shm tools without deriving
+                                   -- from begin_seq). Implementations MUST populate it from the same
+                                   -- commit_seq.load() used for begin_seq to avoid GC safety issues.
     state           : AtomicU8,      -- 0=Free, 1=Active, 2=Committing, 3=Committed, 4=Aborted
     mode            : AtomicU8,      -- 0=Serialized, 1=Concurrent
     has_in_rw       : AtomicBool,    -- SSI: has incoming rw-antidependency
     has_out_rw      : AtomicBool,    -- SSI: has outgoing rw-antidependency
     write_set_pages : AtomicU32,     -- count of pages in write set (for GC sizing)
-    _padding        : [u8; 7],       -- pad to 64 bytes (cache-line aligned)
+    _padding        : [u8; 64],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
 }
 ```
 
@@ -5009,20 +5034,12 @@ This yields bounded memory and bounded per-operation cost without per-txn clears
 
 #### 5.6.5 GC Coordination
 
-The `gc_horizon` in shared memory is advanced by the commit sequencer:
-
-```
-update_gc_horizon():
-    // NOTE: `gc_horizon` is a monotonically *increasing* safe-point in CommitSeq
-    // space: `min(begin_seq)` across all active transactions. Since `begin_seq`
-    // is derived from the monotonically increasing `commit_seq` counter, this
-    // horizon never decreases.
-    //
-    // To avoid races and partial views across processes, `gc_horizon` is
-    // authoritative only when advanced by the commit sequencer (below). Other
-    // processes treat it as read-only state.
-    return
-```
+The `gc_horizon` in shared memory is a monotonically *increasing* safe-point
+in CommitSeq space: `min(begin_seq)` across all active transactions. Since
+`begin_seq` is derived from the monotonically increasing `commit_seq` counter,
+this horizon never decreases. To avoid races and partial views across
+processes, `gc_horizon` is authoritative only when advanced by the commit
+sequencer. Other processes treat it as read-only state.
 
 **GC scheduling policy (Alien-Artifact Discipline):**
 
@@ -5361,8 +5378,8 @@ exists T1, T2, T3 :
 ```
 Transaction (SSI extensions) := {
     ...existing fields...
-    has_in_rw       : bool,                -- some transaction created an rw edge TO this txn
-    has_out_rw      : bool,                -- this txn created an rw edge TO some txn
+    has_in_rw       : bool,                -- some other txn R read a key that this txn later wrote (R -rw-> this; incoming edge)
+    has_out_rw      : bool,                -- this txn read a key that some other txn W later wrote (this -rw-> W; outgoing edge)
     rw_in_from      : HashSet<TxnToken>,   -- (optional) sources of incoming edges
     rw_out_to       : HashSet<TxnToken>,   -- (optional) targets of outgoing edges
     edges_emitted   : Vec<ObjectId>,       -- edges emitted/observed during validation
@@ -5464,8 +5481,11 @@ where:
 **Optimal decision:** Abort if:
 
 ```
-P(anomaly | evidence) * 0 + P(safe | evidence) * L_fp
-    > P(anomaly | evidence) * L_miss + P(safe | evidence) * 0
+E[Loss | commit] = P(anomaly | evidence) * L_miss + P(safe | evidence) * 0
+E[Loss | abort]  = P(anomaly | evidence) * 0     + P(safe | evidence) * L_fp
+
+Abort when E[Loss | commit] > E[Loss | abort]:
+  P(anomaly) * L_miss > (1 - P(anomaly)) * L_fp
 
 => abort if P(anomaly | evidence) > L_fp / (L_fp + L_miss)
 => abort if P(anomaly | evidence) > 1/1001 ≈ 0.001
@@ -5869,10 +5889,9 @@ pub enum CommitResponse {
 
 The coordinator processes commits sequentially. Each commit involves:
 
-1. **Validation**: Scan the commit log for conflicts.
-   - Cost: O(W * C) where W = write set size, C = commits since snapshot.
-   - Typical: W = 10 pages, C = 10 concurrent commits. Each check is a
-     hash lookup: ~50ns. Total: 10 * 10 * 50ns = 5us.
+1. **Validation**: Check CommitIndex for first-committer-wins conflicts.
+   - Cost: O(W) where W = write set size. Each page requires one
+     CommitIndex hash lookup: ~50ns. Typical: W = 10 pages. Total: 10 * 50ns = 500ns.
    - Let `T_validate` denote this cost.
 
 2. **WAL append**: Write page frames + repair symbols sequentially.
@@ -5889,22 +5908,22 @@ The coordinator processes commits sequentially. Each commit involves:
 Total per-commit latency:
 ```
 T_commit = T_validate + T_wal + T_publish
-         = 5us + 70us + 1us
-         = ~76us
+         = 0.5us + 70us + 1us
+         = ~71.5us
 ```
 
 Throughput (single coordinator, no batching):
 ```
-Throughput = 1 / T_commit = 1 / 76us ~ 13,000 commits/sec
+Throughput = 1 / T_commit = 1 / 71.5us ~ 14,000 commits/sec
 ```
 
 With group commit batching (amortize fsync across N concurrent commits):
 ```
 T_commit_batched = T_validate + T_wal_write + T_fsync/N + T_publish
-                 = 5us + 20us + 50us/N + 1us
+                 = 0.5us + 20us + 50us/N + 1us
 
-For N = 10:  T_commit = 31us  -> Throughput ~ 32,000 commits/sec
-For N = 50:  T_commit = 27us  -> Throughput ~ 37,000 commits/sec
+For N = 10:  T_commit = 26.5us  -> Throughput ~ 37,700 commits/sec
+For N = 50:  T_commit = 22.5us  -> Throughput ~ 44,400 commits/sec
 ```
 
 **Batching optimization: coalescing multiple commits into a single WAL sync:**
@@ -6036,6 +6055,14 @@ updated since its snapshot, we attempt **deterministic rebase**:
 4. **If replay succeeds** without violating B-tree invariants or constraints:
    commit proceeds with the rebased page deltas.
 5. **If replay fails** (true conflict, constraint violation): abort/retry.
+
+**Limitation (Blind Writes):** The `IntentOp` structure currently captures the
+*result* of an update (`new_record`), not the expression logic. Therefore,
+deterministic rebase effectively merges **blind writes** (e.g., two users updating
+different columns, or inserting different rows) but cannot automatically merge
+arithmetic read-modify-write operations (e.g., `SET c = c + 1`) if the base value
+changed. Such conflicts will be detected and aborted. Future work may add
+`IntentOp::UpdateExpression` to enable AST-based merge logic.
 
 This is "merge by re-execution", not "merge by bytes". It gives us *row-level
 concurrency effects* without storing row-level MVCC metadata.
@@ -6554,8 +6581,9 @@ integrity. This must be implemented exactly for file format compatibility.
 
 ```rust
 /// Compute SQLite WAL checksum, chaining from (s1_init, s2_init).
-/// `native_cksum` is true if WAL magic is 0x377f0682 on big-endian
-/// or 0x377f0683 on little-endian (i.e., checksums use native byte order).
+/// `native_cksum` is true if WAL magic matches 0x377f0682 in native byte order.
+/// If the read magic is 0x82067f37 (byte swapped), then `native_cksum` is false
+/// and the input data must be interpreted with non-native endianness.
 pub fn wal_checksum(
     data: &[u8],
     s1_init: u32,
@@ -6699,6 +6727,13 @@ Header byte offset 20 set to 16 (reserved space = 16).
 
 This is compatible with C SQLite (reserved space is opaque to it). Default is
 OFF for maximum compatibility.
+
+**Interoperability Warning:** While C SQLite can *read* databases with reserved
+space checksums (it ignores the bytes), it will *write* zeros (or preserved garbage)
+to the reserved space when modifying pages. This invalidates the FrankenSQLite
+checksum. Therefore, if `PRAGMA page_checksum = ON` is used, the database should
+be treated as **Read-Only** by legacy C SQLite clients to avoid "corruption"
+reports when FrankenSQLite next reads the modified pages.
 
 **Verification points in the hot path:**
 - Every disk read: compute XXH3, store in CachedPage
@@ -8192,10 +8227,9 @@ parse_statement()              -> Statement
 | 6 | &, \|, <<, >> | Left |
 | 7 | +, - | Left |
 | 8 | *, /, % | Left |
-| 9 | \|\| (concat) | Left |
+| 9 | \|\| (concat), ->, ->> (JSON) | Left |
 | 10 | COLLATE | Left |
-| 11 | ~ (bitwise not), + (unary), - (unary) | Right |
-| 12 (highest) | ->, ->> (JSON) | Left |
+| 11 (highest) | ~ (bitwise not), + (unary), - (unary) | Right |
 
 **Error recovery strategy:** On parse error, the parser:
 1. Records the error (token, expected alternatives, source span).
@@ -10157,6 +10191,11 @@ encryption using the reserved-space-per-page field in the database header:
       format is not a crypto keystore; do not overload unrelated header bytes).
   - **Instant rekey (O(1)):** `PRAGMA rekey = 'new_passphrase'` re-derives `KEK'`
     and rewrites only `wrap(DEK, KEK')`. Bulk page data is not re-encrypted.
+  - **Transitioning from Plaintext:** Enabling encryption on an existing database
+    (`PRAGMA key = ...` where none existed) requires `reserved_bytes >= 40`.
+    Standard SQLite databases have 0 reserved bytes. Therefore, the first encryption
+    enablement MUST trigger a full `VACUUM` to rewrite pages with the new layout.
+    Subsequent rekeys are O(1).
 
 - **Page algorithm:** Pages are encrypted with **XChaCha20-Poly1305** using the
   `DEK` (AEAD).
