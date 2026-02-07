@@ -23,7 +23,7 @@
 
 **The Solution:** FrankenSQLite reimplements SQLite from scratch in safe Rust with two architectural innovations:
 
-1. **MVCC Concurrent Writers.** The single-writer lock is replaced with page-level Multi-Version Concurrency Control. Multiple writers commit simultaneously as long as they touch different pages. Serializable Snapshot Isolation (SSI) prevents write skew by default. Algebraic write merging resolves 30-50% of same-page conflicts at byte granularity, further reducing contention.
+1. **MVCC Concurrent Writers.** The single-writer lock is replaced with page-level Multi-Version Concurrency Control. Multiple writers commit simultaneously as long as they touch different pages. Serializable Snapshot Isolation (SSI) prevents write skew by default. A safe write-merge ladder (intent replay + structured page patches) resolves commuting same-page conflicts without row-level MVCC metadata; raw byte-range XOR merges are forbidden for SQLite structured pages.
 
 2. **RaptorQ-Pervasive Durability.** Every persistent layer is infused with RFC 6330 fountain codes via asupersync's production-grade RaptorQ implementation. WAL frames carry repair symbols for self-healing after torn writes. Snapshot transfer uses rateless coding for bandwidth-optimal replication over lossy networks. Data loss becomes a mathematical near-impossibility rather than a failure mode to mitigate.
 
@@ -72,7 +72,7 @@ Databases created by FrankenSQLite open in C SQLite and vice versa. No migration
 
 ### 5. Serializable Snapshot Isolation (SSI) by Default
 
-`BEGIN CONCURRENT` provides full SERIALIZABLE isolation, not merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") prevents write skew: no committed transaction may have both an incoming and outgoing rw-antidependency edge. PostgreSQL has shipped SSI since 2011 with less than 7% throughput overhead. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew. When two writers touch the same page, the first to commit wins. The second gets `SQLITE_BUSY` and retries. Deadlocks are impossible by construction (eager page locking, no wait-for cycles).
+`BEGIN CONCURRENT` provides full SERIALIZABLE isolation, not merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") prevents write skew: no committed transaction may have both an incoming and outgoing rw-antidependency edge. PostgreSQL has shipped SSI since 2011 with less than 7% throughput overhead. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew. When two writers touch the same page, FCW detects base drift; commuting conflicts may be resolved by the safe merge ladder, otherwise the loser retries with `SQLITE_BUSY_SNAPSHOT`. Deadlocks are impossible by construction (eager page locking, no wait-for cycles).
 
 ### 6. Strong Types Over Runtime Checks
 
@@ -181,17 +181,16 @@ Transaction C and D both reach COMMIT:
      │
      └── No → proceed to step 2
   │
-  2. Page-Level First-Committer-Wins
-     │
-     ├── Both touch leaf page 47 (same B-tree leaf)?
-     │   ├── Yes → First to lock page 47 wins. Second gets SQLITE_BUSY.
-     │   │         Deadlock impossible (eager locking, no wait-for cycles).
-     │   │
-     │   └── If algebraic write merging is enabled (PRAGMA raptorq_write_merge = ON):
-     │       └── Attempt deterministic rebase of loser's intent log against
-     │           current committed state. If replay succeeds → both commit.
-     │
-     └── No (different leaf pages) → Both proceed and commit independently.
+	  2. Page-Level First-Committer-Wins
+	     │
+	     ├── Both touch leaf page 47 (same B-tree leaf)?
+	     │   ├── Yes → First to lock page 47 wins. Loser hits base drift at commit.
+	     │   │         If PRAGMA fsqlite.write_merge = SAFE, attempt the merge ladder
+	     │   │         (intent replay + structured patches). If merge succeeds → both
+	     │   │         commit; otherwise loser aborts/retries.
+	     │   │         Deadlock impossible (eager locking, no wait-for cycles).
+	     │
+	     └── No (different leaf pages) → Both proceed and commit independently.
 ```
 
 The SSI check fires before the first-committer-wins check. This means write skew is caught even when the conflicting transactions touch disjoint pages, because SSI tracks read dependencies (via the `SireadTable`) across all pages.
@@ -262,9 +261,9 @@ enum IntentOp {
 2. **INV-2 (Page lock exclusivity):** At most one active transaction holds the exclusive lock on any given page.
 3. **INV-3 (Version chain ordering):** In every version chain, newer versions have strictly higher `created_by` TxnIds.
 
-### Algebraic Write Merging and Intent Logs
+### Safe Write Merging and Intent Logs
 
-Standard page-level MVCC produces false conflicts when two transactions modify different rows that happen to live on the same B-tree leaf page. Algebraic write merging reduces these false conflicts by 30-50% without introducing row-level MVCC metadata.
+Standard page-level MVCC produces false conflicts when two transactions modify different rows that happen to live on the same B-tree leaf page. The safe write-merge ladder (§5.10 in the spec) reduces aborts from commuting same-page conflicts without introducing row-level MVCC metadata.
 
 Each writing transaction records a semantic intent log (`Vec<IntentOp>`) describing what it intended to do at the B-tree level. When a transaction reaches commit and discovers a page was modified since its snapshot, a **deterministic rebase** replays the intent log against the current committed state:
 
@@ -279,10 +278,9 @@ A strict safety ladder governs merge strategy selection at commit time:
 |----------|----------|-----------|
 | 1 | Deterministic rebase replay | Intent logs commute at B-tree level (preferred) |
 | 2 | Structured page patch merge | Cell-disjoint modifications on same page |
-| 3 | Sparse XOR merge | Byte-range disjointness proven via GF(256) patches |
-| 4 | Abort/retry | True conflict; no safe merge possible |
+| 3 | Abort/retry | True conflict; no safe merge possible |
 
-Algebraic write merging is gated behind `PRAGMA raptorq_write_merge = ON` (off by default). When enabled, intent logs are recorded automatically during writes and evaluated at commit time.
+Merge policy is controlled by `PRAGMA fsqlite.write_merge = OFF | SAFE | LAB_UNSAFE`. `SAFE` enables intent replay + structured patches; raw byte-range XOR merge is forbidden for SQLite structured pages.
 
 ### Garbage Collection
 
@@ -747,7 +745,7 @@ async caller
   ← Result<Rows>
 ```
 
-Write transactions submit commit requests through an MPSC channel to a single write coordinator task. This serializes commit validation (SSI check + first-committer-wins + optional algebraic merge) and WAL appends without holding a lock across the entire commit. Each request includes a `oneshot::Sender<Result<()>>` so the caller can `.await` the result.
+Write transactions submit commit requests through an MPSC channel to a single write coordinator task. This serializes commit validation (SSI check + first-committer-wins + safe merge ladder) and WAL appends without holding a lock across the entire commit. Each request includes a `oneshot::Sender<Result<()>>` so the caller can `.await` the result.
 
 ---
 
@@ -1278,7 +1276,7 @@ P = 100,000 pages, W = 50 pages/txn, N = 8 writers:
 
     Pairwise:  P(conflict) ≈ 1 - e^(-2500/100000) ≈ 0.025  (2.5%)
     Per-txn:   P(any conflict for one txn) ≈ 1 - (1-0.025)^7 ≈ 0.16  (16%)
-    With algebraic merge (40% reduction): effective P_abort ≈ 0.10
+    With safe merge ladder resolving f_merge=0.40 of detected conflicts (empirical): effective P_abort ≈ 0.10
     After one retry (geometric): P_abort ≈ 0.01
 
     TPS ≈ N × (1 - P_abort) / T_txn ≈ 8 × 0.99 / T_txn
@@ -1297,13 +1295,13 @@ Conflict probability under Zipf:
     P(conflict, Zipf) ≈ 1 - Π_k (1 - p(k))^{n_k}
 ```
 
-Zipf concentrates conflicts on hot pages (the top 1% of pages absorb 20-40% of writes for s ≈ 1.0). This is exactly where algebraic write merging pays off most — hot pages have many distinct cells, so byte-disjoint merges are common.
+Zipf concentrates conflicts on hot pages (the top 1% of pages absorb 20-40% of writes for s ≈ 1.0). This is exactly where safe write merging pays off most when intents commute (e.g., distinct-key inserts landing on the same hot leaf).
 
 **Result:** At typical database sizes and concurrency levels, page-level MVCC delivers near-linear scaling. The birthday paradox model lets you predict your conflict rate from three numbers: page count, write set size, and writer count.
 
 ### GF(256) Arithmetic: The Algebra of Erasure Coding
 
-Every RaptorQ operation — encoding, decoding, repair, algebraic write merging — bottoms out in arithmetic over **GF(2⁸)**, the Galois field with 256 elements. Each byte is a field element. This is where the "algebra" in "algebraic write merging" comes from.
+Every RaptorQ operation — encoding, decoding, repair — bottoms out in arithmetic over **GF(2⁸)**, the Galois field with 256 elements. Each byte is a field element. FrankenSQLite also reuses this algebraic substrate for patch encoding and history compression.
 
 ```
 The field GF(2⁸) = GF(2)[x] / p(x), where:
@@ -1444,76 +1442,35 @@ Example: K=1000 pages, p=5% loss, N=10 replicas
 
 **Result:** RaptorQ gives FrankenSQLite durability guarantees that are mathematically provable, not just empirically tested. The 20% storage overhead buys durability measured in thousands of nines.
 
-### Algebraic Write Merging: Proof of Correctness
+### Safe Write Merge Ladder (Intent + Structured Patches)
 
-When two transactions modify different rows that happen to live on the same B-tree leaf page, standard page-level MVCC declares a false conflict. **Algebraic write merging** resolves this by treating pages as vectors over GF(2) and checking whether the modifications have disjoint support.
+When two transactions modify the same physical page, strict page-level FCW would
+abort one. FrankenSQLite can sometimes do better: if the *intent* operations
+commute (e.g., inserts into distinct keys), the loser can be rebased onto the
+latest committed snapshot and still produce a correct state.
 
-```
-Model:
-    Page P as a vector in GF(2)^n   where n = page_size × 8 (bit-level)
-    P_0 = original committed page
-    T1 produces P_1 = P_0 ⊕ D_1    where D_1 = P_1 XOR P_0 (the "delta")
-    T2 produces P_2 = P_0 ⊕ D_2    where D_2 = P_2 XOR P_0
+While XOR-deltas compose linearly as byte vectors, **byte-disjointness is not a
+safe merge rule for SQLite structured pages** (B-tree pages, overflow pages,
+freelist pages, pointer-map pages). Internal pointers and defragmentation can
+make two disjoint byte writes semantically dependent, causing lost updates.
 
-    Define support: supp(D) = { i : D[i] ≠ 0 }
+**Counterexample (B-tree lost update):**
+- `T1` moves a cell from offset X to Y and updates the cell pointer array to Y.
+- `T2` updates the cell payload bytes at the old offset X.
+- The byte supports can be disjoint, yet the merged page points at Y (old value)
+  and `T2`'s update at X becomes unreachable garbage.
 
-Merge condition:
-    supp(D_1) ∩ supp(D_2) = ∅    (byte-disjoint modifications)
-
-If disjoint:
-    P_merged = P_0 ⊕ D_1 ⊕ D_2
-```
-
-**Proof of correctness (by cases on each bit position i):**
-
-```
-Case 1: i ∉ supp(D_1), i ∉ supp(D_2)
-    P_merged[i] = P_0[i] ⊕ 0 ⊕ 0 = P_0[i]              ✓ unchanged
-
-Case 2: i ∈ supp(D_1), i ∉ supp(D_2)
-    P_merged[i] = P_0[i] ⊕ D_1[i] ⊕ 0 = P_1[i]         ✓ T1's write
-
-Case 3: i ∉ supp(D_1), i ∈ supp(D_2)
-    P_merged[i] = P_0[i] ⊕ 0 ⊕ D_2[i] = P_2[i]         ✓ T2's write
-
-Case 4: i ∈ supp(D_1) ∩ supp(D_2)
-    Cannot occur — supports are disjoint.                  QED ∎
-```
-
-**Key algebraic properties:**
-
-```
-1. Associative:   (P_0 ⊕ D_1) ⊕ D_2 = P_0 ⊕ (D_1 ⊕ D_2)
-2. Commutative:   D_1 ⊕ D_2 = D_2 ⊕ D_1
-3. Self-inverse:  D ⊕ D = 0
-4. N-way:         P_merged = P_0 ⊕ D_1 ⊕ D_2 ⊕ ... ⊕ D_N
-                  for pairwise disjoint supports
-```
-
-**Practical impact:**
-
-```
-Byte-level sufficiency corollary:
-    byte_supp(D) = { j : D[j*8..(j+1)*8] ≠ 0x00 }
-    If byte_supp(D_1) ∩ byte_supp(D_2) = ∅, the merge is valid.
-
-For a page with C = 40 cells:
-    P(byte conflict | page conflict) ≈ avg_cell_size / page_size ≈ 1/C ≈ 2.5%
-
-INSERT-heavy workloads: 30-60% conflict reduction
-UPDATE-heavy workloads: 10-20% conflict reduction
-```
-
-The merge is attempted only after the deterministic rebase replay (intent log level) fails. A strict safety ladder ensures the system never applies a merge it can't prove correct:
+Therefore, merge is only allowed via the SAFE ladder:
 
 | Priority | Strategy | Safety Guarantee |
 |----------|----------|-----------------|
-| 1 | Deterministic rebase replay | Intent logs commute at B-tree level |
-| 2 | Structured page patch merge | Cell-disjoint modifications proven |
-| 3 | Sparse XOR merge | Byte-range disjointness via GF(256) patches |
-| 4 | Abort/retry | True conflict; no safe merge possible |
+| 1 | Deterministic rebase replay | Re-executes intent ops against current committed snapshot |
+| 2 | Structured page patch merge | Disjoint by `cell_key_digest`; header ops serialized; invariants checked |
+| 3 | Abort/retry | No safe merge possible |
 
-**Result:** Algebraic write merging turns a class of false positives (page-level conflicts between row-level disjoint writes) into successful concurrent commits, without introducing row-level MVCC metadata or breaking the file format.
+Merge policy: `PRAGMA fsqlite.write_merge = OFF | SAFE | LAB_UNSAFE`. `SAFE`
+enables only the ladder above; raw byte-range XOR merging is forbidden for
+SQLite structured pages.
 
 ### Three-Tier Checksum Architecture
 
@@ -1713,7 +1670,10 @@ commit_seq C_w and created versions {V_1, ..., V_k}:
 **Theorem 3: First-Committer-Wins**
 
 ```
-Claim: If two transactions both write page P, at most one commits successfully.
+Claim: Under strict FCW (no merge), if two transactions both write page P, at
+most one commits successfully. With the SAFE merge ladder enabled, both may
+commit only if the conflict is resolved semantically (intent replay / structured
+patch) producing a state equivalent to some serial ordering.
 
 Proof (two cases):
     Case A — Concurrent lock contention:
@@ -1723,9 +1683,12 @@ Proof (two cases):
     Case B — Sequential (T1 commits and releases before T2 acquires):
         T2 acquires lock on P and writes it.
         At commit validation, T2 discovers T1 committed P after T2's snapshot.
-        Unless algebraic merge is possible and succeeds, T2 must abort.
+        If PRAGMA fsqlite.write_merge = SAFE and the merge ladder succeeds,
+        T2 commits with rebased/merged deltas; otherwise T2 aborts/retries.
 
-    In both cases, at most one transaction's write to P survives.  QED ∎
+    In all cases, the final committed page version is well-defined: either one
+    writer's changes survive (abort path) or a single merged page incorporates
+    both writers in a serializable way.  QED ∎
 ```
 
 **Theorem 4: GC Safety (no premature version reclamation)**
@@ -2048,7 +2011,7 @@ FrankenSQLite follows a 9-phase implementation plan. Each phase has specific **v
 | 3 | **Trees and Parsing** | B-tree engine, SQL parser, AST, property-based tests |
 | 4 | **Query Engine** | VDBE bytecode VM, code generation, basic query execution |
 | 5 | **Persistence** | WAL implementation, crash recovery, file format compatibility |
-| 6 | **Concurrency** | MVCC engine, SSI, algebraic write merging, garbage collection |
+| 6 | **Concurrency** | MVCC engine, SSI, safe write merge ladder, garbage collection |
 | 7 | **SQL Completeness** | Query planner, window functions, CTEs, triggers, views |
 | 8 | **Extensions** | FTS5, R-tree, JSON1, session, ICU, misc extensions |
 | 9 | **Conformance** | 95%+ compatibility with C SQLite, benchmarks, hardening |
@@ -2204,7 +2167,7 @@ cargo bench --bench parser_throughput
 - **No loadable extensions.** All extensions are compiled in. Dynamic `dlopen`-based loading is not planned.
 - **No WASM target yet.** The VFS trait abstracts all OS operations, and a `WasmVfs` implementation is planned but not yet built. Browser/edge deployment via WebAssembly is a future goal.
 - **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. ARC eviction and GC mitigate this but introduce background work.
-- **No row-level locking.** Two transactions modifying different rows on the same page still conflict at the page level. Algebraic write merging reduces false conflicts by 30-50% when enabled, but does not eliminate them entirely. This is a deliberate tradeoff for file format compatibility.
+- **No row-level locking.** Two transactions modifying different rows on the same page can still conflict at the page level. The safe write-merge ladder can resolve commuting conflicts, but non-commuting conflicts still abort/retry. This is a deliberate tradeoff for file format compatibility.
 - **Encryption adds per-page overhead.** The per-page 24-byte nonce and 16-byte tag (40 bytes total) consume reserved space in each page. Databases created with encryption cannot be read without the key, even by C SQLite.
 - **Native mode databases are not directly readable by C SQLite.** The ECS commit stream format is FrankenSQLite-specific. Compatibility export (`compat/foo.db`) materializes a standard SQLite file on demand.
 
@@ -2219,7 +2182,7 @@ A: Yes. FrankenSQLite reads and writes the standard SQLite file format byte-for-
 A: WAL frames carry transaction IDs. The WAL index maps `(page_number, txn_id)` to frame offsets. Checkpoint respects active snapshots, writing back only pages whose versions are no longer needed by any reader.
 
 **Q: What happens when two writers conflict on the same page?**
-A: The first to acquire the page lock wins. The second gets `SQLITE_BUSY` immediately (no waiting, no deadlocks). The application retries, exactly as with existing SQLite busy handling.
+A: If the page lock is held, the second writer gets `SQLITE_BUSY` immediately (no waiting, no deadlocks). If both reach commit on the same page, FCW detects base drift; commuting conflicts may be resolved by the safe merge ladder when enabled, otherwise the loser aborts/retries with `SQLITE_BUSY_SNAPSHOT`.
 
 **Q: Why not use `unsafe` for performance-critical paths?**
 A: Safe Rust with proper data structures is fast. The type system prevents entire categories of bugs that would require extensive testing to catch in C. The performance ceiling of safe Rust is more than sufficient for a database engine.
