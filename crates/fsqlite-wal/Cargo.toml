@@ -1,0 +1,17 @@
+[package]
+name = "fsqlite-wal"
+version = "0.1.0"
+description = "Write-ahead logging"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+fsqlite-error = { workspace = true }
+fsqlite-vfs = { workspace = true }
+fsqlite-pager = { workspace = true }
+
+[lints]
+workspace = true
