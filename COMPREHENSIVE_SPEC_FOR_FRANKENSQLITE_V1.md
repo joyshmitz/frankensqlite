@@ -6344,9 +6344,15 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    witness-plane registrations for the transaction are pinned to a single epoch
    generation (prevents reader-induced epoch livelock; §5.6.4.8).
 
-   **Phase 3 (publish):** Store the real TxnId into `txn_id` with Release
-   ordering. Only after this store is the slot visible to other processes as
-   a live transaction.
+	   **Phase 3 (publish):** Publish the real TxnId with a CAS:
+	   `CAS(txn_id, TXN_ID_CLAIMING -> real_txn_id, AcqRel, Acquire)`.
+	   Only after this CAS succeeds is the slot visible to other processes as a
+	   live transaction.
+	   
+	   **If the CAS fails:** Some other actor (cleanup) reclaimed the slot while
+	   this transaction was stalled in Phase 2. The transaction MUST abort and
+	   restart slot acquisition. A plain store is forbidden here because it can
+	   clobber a reclaimed slot and corrupt cross-process state.
 
    **Why sentinel:** Without the two-phase protocol, there is a TOCTOU window
    between the CAS(0 → real_txn_id) and the field initialization. During this
@@ -6502,15 +6508,17 @@ cleanup_orphaned_slots():
                 slot.txn_id = 0    // Free the slot (Release ordering, LAST)
 ```
 
-The three-phase acquire protocol (Phase 1) MUST set `claiming_timestamp`
-**after** the successful CAS, not before:
+The three-phase acquire protocol MUST set `claiming_timestamp` **after** the
+successful Phase 1 CAS, not before. It MUST be set using CAS(0 -> now) so no
+actor can extend the timeout window by overwriting a previously-seeded value:
 
 ```
 // Phase 1: claim the slot
 if !slot.txn_id.CAS(0, TXN_ID_CLAIMING):
     continue  // slot taken by another process
 // CAS succeeded — we exclusively own this slot now.
-slot.claiming_timestamp = unix_timestamp()  // set AFTER CAS
+// Seed the timeout clock without overwriting a cleanup-seeded timestamp.
+slot.claiming_timestamp.CAS(0, unix_timestamp())
 // Phase 2: initialize fields (pid, pid_birth, lease_expiry, etc.)
 // Phase 3: publish real TxnId
 ```
@@ -9027,21 +9035,38 @@ pub struct CachedPage {
     pub wal_frame: Option<u32>,   // WAL frame number if from WAL
 }
 
-/// The MVCC-aware ARC cache.
-///
-/// IMPLEMENTATION NOTE (Extreme Optimization Discipline):
-/// The Megiddo & Modha (FAST '03) ARC algorithm is specified here as the
-/// logical model. The PHYSICAL implementation SHOULD use the CAR (Clock
-/// with Adaptive Replacement) variant by Bansal & Modha (FAST '04),
-/// which replaces the four LinkedHashMaps with two circular clock buffers
-/// and two ghost hash sets:
+	/// The MVCC-aware ARC cache.
+	///
+	/// IMPLEMENTATION NOTE (Extreme Optimization Discipline):
+	/// The Megiddo & Modha (FAST '03) ARC algorithm is specified here as the
+	/// POLICY model (T1/T2/B1/B2/p state and transitions in §6.3–§6.4).
+	///
+	/// Physical implementations:
+	/// - **Exact ARC (recommended baseline):** implement §6.3–§6.4 literally, but
+	///   DO NOT use pointer-heavy `LinkedHashMap` in the hot path. Prefer:
+	///   `HashMap<CacheKey, NodeIdx> + slab-allocated intrusive doubly-linked lists`
+	///   for T1/T2 to preserve exact LRU semantics with good locality.
+	/// - **CAR (optional optimization):** the Clock with Adaptive Replacement
+	///   variant by Bansal & Modha (FAST '04). CAR is a CLOCK approximation of ARC's
+	///   recency ordering inside T1/T2 using reference bits and clock hands. It
+	///   reduces pointer churn and improves cache locality, but it is a DIFFERENT
+	///   algorithm: hits set reference bits rather than moving nodes to MRU.
+	///
+	/// If CAR is used, implementations MUST implement CAR explicitly (not by
+	/// transliterating the LRU list operations in §6.3–§6.4) and MUST validate that
+	/// its hit/miss behavior is within an acceptable envelope on canonical DB
+	/// workloads (scan+hotset, Zipfian, mixed OLTP+scan; §6.11).
+	///
+	/// CAR physical layout sketch (one possible implementation):
+	/// - Two circular clock buffers for T1 and T2 with per-slot reference bits.
+	/// - B1/B2 remain as hash sets of CacheKey (metadata only).
 ///
 ///   - T1 clock: contiguous array of CachedPage slots with reference bits.
 ///     Scanning for eviction is a sequential memory sweep (cache-friendly).
 ///   - T2 clock: same structure for frequency-favored pages.
 ///   - B1/B2: remain as HashSets of CacheKey (metadata only, small).
 ///
-/// Why CAR over linked-list ARC:
+	/// Why CAR over naive linked-list ARC:
 ///   - LinkedHashMap has 2 pointers per entry (prev/next) plus HashMap
 ///     overhead. For 2000-page cache: 32KB wasted on link pointers alone.
 ///   - Every ARC operation (insert, promote, evict) mutates linked list
@@ -9054,8 +9079,10 @@ pub struct CachedPage {
 ///     Pinned pages are simply skipped by the clock hand (not removed
 ///     from the array, avoiding ABA problems).
 ///
-/// The struct below is the LOGICAL specification. The physical layout uses
-/// clock buffers internally but exposes identical semantics.
+	/// The struct below names the LOGICAL ARC state variables. The physical
+	/// representation MAY differ (intrusive lists for exact ARC, clock buffers for
+	/// CAR) as long as the eviction constraints and adaptivity requirements are
+	/// satisfied.
 ///
 /// CONCURRENCY: All ArcCache operations (REQUEST, REPLACE, promote, evict)
 /// mutate multiple internal collections atomically. The cache MUST be
@@ -9122,7 +9149,23 @@ REPLACE(cache, target_key):
 
     prefer_t1 = |T1| > 0 AND (|T1| > p OR (|T1| == p AND target_key IN B2))
 
-    if prefer_t1 AND rotations_t1 < |T1|:
+    // "prefer_t1" is a hint, not a mandate. If the preferred list is empty or
+    // exhausted (all pinned/unflushable candidates), we MUST fall back to the
+    // other list to ensure termination and liveness.
+    if prefer_t1:
+      if rotations_t1 < |T1|:
+        goto TRY_T1
+      if rotations_t2 < |T2|:
+        goto TRY_T2
+      continue
+    else:
+      if rotations_t2 < |T2|:
+        goto TRY_T2
+      if rotations_t1 < |T1|:
+        goto TRY_T1
+      continue
+
+    TRY_T1:
       // Evict the LRU page of T1 (recency list)
       candidate = T1.front()
       if candidate.ref_count > 0:
@@ -9141,7 +9184,8 @@ REPLACE(cache, target_key):
       B1.push_back(evicted_key)    // remember in ghost list
       total_bytes -= evicted_page.byte_size
       return
-    else if |T2| > 0 AND rotations_t2 < |T2|:
+
+    TRY_T2:
       // Evict the LRU page of T2 (frequency list)
       candidate = T2.front()
       if candidate.ref_count > 0:
@@ -9157,10 +9201,6 @@ REPLACE(cache, target_key):
       B2.push_back(evicted_key)
       total_bytes -= evicted_page.byte_size
       return
-    else:
-      // Preferred list is exhausted (all pinned/failed candidates) or empty.
-      // Fall through and retry: the safety valve will eventually trigger.
-      continue
 ```
 
 **Async integration (normative):** In FrankenSQLite, all file I/O is dispatched
@@ -11805,17 +11845,21 @@ can satisfy it:
 - IN (`col IN (...)`): usable, expanded to multiple equality probes.
 - LIKE (`col LIKE 'prefix%'`): usable if prefix is constant.
 
-**Join ordering:** For N tables:
-- N <= 8: exhaustive search of all N! orderings (at most 40,320).
-- N > 8: greedy algorithm -- at each step, add the table that has the lowest
-  estimated join cost with the already-joined set.
-(Note: C SQLite's NGQP uses a bounded best-first search that maintains the
-`mxChoice` best partial paths at each step — it is O(mxChoice*N), not
-exhaustive. `mxChoice` varies by join complexity (1 for simple, up to
-`SQLITE_DEFAULT_MXCHOICE=18` for multi-table). The term "N Nearest Neighbors"
-is not used in the SQLite source; the algorithm is implemented in
-`wherePathSolver()` in `where.c`. The simpler exhaustive/greedy split here is
-FrankenSQLite's initial strategy.)
+**Join ordering:** Use a bounded best-first search (beam search) in the style of
+C SQLite's NGQP (`wherePathSolver()` in `where.c`).
+
+- Maintain up to `mxChoice` best partial join paths at each level (lowest
+  estimated cost).
+- `mxChoice` is a tuning knob derived from join complexity:
+  - 1 for single-table.
+  - 5 for two-table.
+  - 12 or 18 for 3+ tables (star-query heuristic may raise to 18; see
+    `computeMxChoice` in SQLite's `where.c`).
+- Complexity: `O(mxChoice * N)` join-order exploration (not `N!`).
+
+This is the V1 strategy (there is no exhaustive `N!` search path). The phrase
+"N Nearest Neighbors" is not used in the SQLite source; beam search is the
+actual implementation model.
 
 ### 10.6 Code Generation
 
