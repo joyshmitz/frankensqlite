@@ -6388,6 +6388,15 @@ pub struct CachedPage {
 ///
 /// The struct below is the LOGICAL specification. The physical layout uses
 /// clock buffers internally but exposes identical semantics.
+///
+/// CONCURRENCY: All ArcCache operations (REQUEST, REPLACE, promote, evict)
+/// mutate multiple internal collections atomically. The cache MUST be
+/// protected by a `Mutex<ArcCache>` (or `parking_lot::Mutex` for fast
+/// uncontended paths). Individual CachedPage fields (ref_count, dirty) use
+/// atomics for lock-free read-side access, but structural mutations to
+/// T1/T2/B1/B2/p/index require the mutex. With the CAR physical
+/// implementation, the mutex-held critical section is short (clock sweep
+/// is sequential over a dense array).
 pub struct ArcCache {
     /// T1: pages accessed exactly once recently (recency-favored).
     /// Physical: CircularClockBuffer<CachedPage> with reference bit.
@@ -7631,10 +7640,14 @@ Modules:
 
 **`fsqlite`** (~1,000 LOC estimated)
 
-Public API facade. Re-exports:
+Public API facade. `Database` is the primary user-facing type (wraps
+`Connection` from `fsqlite-core` with convenience methods). Re-exports:
 
 ```rust
-pub use fsqlite_core::{Connection, Statement, Row, Transaction};
+/// `Database` wraps `Connection` with `open()`, `open_in_memory()`, etc.
+/// This is the canonical public type; `Connection` is the internal name.
+pub struct Database(Connection);
+pub use fsqlite_core::{Statement, Row, Transaction};
 pub use fsqlite_types::{SqliteValue, PageNumber};
 pub use fsqlite_error::{FrankenError, ErrorCode, Result};
 pub use fsqlite_vfs::{Vfs, VfsFile, MemoryVfs};
@@ -8031,10 +8044,22 @@ pub trait ScalarFunction: Send + Sync {
 
 /// An aggregate function with step/finalize semantics.
 /// Equivalent to xStep + xFinal in sqlite3_create_function.
+///
+/// TYPE ERASURE NOTE: The FunctionRegistry stores
+/// `Arc<dyn AggregateFunction<State = Box<dyn Any + Send>>>`. Since
+/// `Box<dyn Any + Send>` does NOT implement `Default`, we use a factory
+/// method `initial_state()` instead of the `Default` bound. Concrete
+/// implementations use a type-erasing wrapper (`AggregateAdapter<F>`)
+/// that internally creates the concrete state type and wraps it in
+/// `Box<dyn Any + Send>`.
 pub trait AggregateFunction: Send + Sync {
-    /// Aggregate accumulator state. Created via Default::default() at the
+    /// Aggregate accumulator state. Created via `initial_state()` at the
     /// start of each aggregation group.
-    type State: Default + Send;
+    type State: Send;
+
+    /// Create initial accumulator state for a new aggregation group.
+    /// Replaces `Default::default()` to support type-erased storage.
+    fn initial_state(&self) -> Self::State;
 
     /// Process one row. Called once per row in the group.
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()>;
@@ -8050,7 +8075,10 @@ pub trait AggregateFunction: Send + Sync {
 /// A window function with step/inverse/value/finalize semantics.
 /// Equivalent to xStep + xInverse + xValue + xFinal.
 pub trait WindowFunction: Send + Sync {
-    type State: Default + Send;
+    type State: Send;  // uses initial_state() factory, same as AggregateFunction
+
+    /// Create initial accumulator state for a new window partition/group.
+    fn initial_state(&self) -> Self::State;
 
     /// Add a row to the window frame.
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()>;
