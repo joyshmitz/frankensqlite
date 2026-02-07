@@ -2615,7 +2615,7 @@ tuning:
 |------------|-------------------|-----------|
 | `CommitCapsule` | `min(page_size, 4096)` | Aligns encoding with page boundaries; `u16`-bounded |
 | `IndexSegment` | 1280–4096 bytes | Metadata-heavy; smaller symbols reduce tail loss impact |
-| `CheckpointChunk` | 1024–4096 bytes | MTU-safe for UDP symbol emission; large objects use larger K/more blocks rather than huge T |
+| `CheckpointChunk` | 1024–4096 bytes | MTU-aware (prefer <=1366 on UDP); large objects use larger K/more blocks rather than huge T |
 | `PageHistory` | page_size (4096) | Natural alignment with page boundaries |
 
 All sizing is versioned in `RootManifest` so replicas decode correctly.
