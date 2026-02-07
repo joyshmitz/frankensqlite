@@ -1,0 +1,3 @@
+[submodule "legacy_sqlite_code/sqlite"]
+	path = legacy_sqlite_code/sqlite
+	url = https://github.com/sqlite/sqlite
