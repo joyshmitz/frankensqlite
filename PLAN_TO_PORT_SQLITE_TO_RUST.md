@@ -786,7 +786,7 @@ The C SQLite source files most relevant to this port, with approximate sizes:
 
 | File | Purpose | Size |
 |------|---------|------|
-| `legacy_sqlite_code/sqlite/src/sqliteInt.h` | Master internal header: ALL core data structures (sqlite3, Vdbe, BtCursor, Parse, Select, Expr, Table, Column, Index, etc.) | ~250 KB |
+| `legacy_sqlite_code/sqlite/src/sqliteInt.h` | Main internal header: ALL core data structures (sqlite3, Vdbe, BtCursor, Parse, Select, Expr, Table, Column, Index, etc.) | ~250 KB |
 | `legacy_sqlite_code/sqlite/src/btree.c` | B-tree storage engine: cursor operations, cell management, page balancing, overflow, freelist | 11,568 lines |
 | `legacy_sqlite_code/sqlite/src/btreeInt.h` | B-tree internal structures: MemPage, BtCursor, BtShared, CellInfo | ~600 lines |
 | `legacy_sqlite_code/sqlite/src/pager.c` | Page cache, transaction management, journal I/O, pager state machine | 7,834 lines |
