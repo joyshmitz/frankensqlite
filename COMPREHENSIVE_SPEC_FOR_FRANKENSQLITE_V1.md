@@ -8836,7 +8836,7 @@ rebase replay:
    physical-row identity. Therefore, if a concurrent commit deletes a row and a
    later insert reuses the same rowid, replay will update the current row at that
    key. This matches the semantics of executing the UPDATE at the commit-time base
-   snapshot; it is not a corruption bug.
+   snapshot (serial order: delete/insert then update); it is not a corruption bug.
 3. For each `(col_idx, rebase_expr)` in `column_updates`: evaluate `rebase_expr`
    against the new base row's column values. `ColumnRef(i)` resolves to column `i`
    of the new base row, not the original snapshot row.
@@ -14446,9 +14446,10 @@ encryption using the reserved-space-per-page field in the database header:
 - **Storage in reserved bytes:** The per-page nonce (24B) and Poly1305 tag (16B)
   are stored in the page reserved space (requires `reserved_bytes >= 40`).
 
-- **DatabaseId (required):** On database creation, generate a random 128-bit
-  `DatabaseId` and store it durably alongside `wrap(DEK, KEK)`. `DatabaseId` MUST
-  be stable for the lifetime of the database (including across `PRAGMA rekey`).
+- **DatabaseId (required):** On database creation, generate a random 16-byte
+  `DatabaseId` (opaque bytes, not a host-endian integer) and store it durably
+  alongside `wrap(DEK, KEK)`. `DatabaseId` MUST be stable for the lifetime of
+  the database (including across `PRAGMA rekey`).
 
 - **AAD (swap resistance):** AEAD additional authenticated data MUST include
   `(page_number, database_id)` so ciphertext cannot be replayed or swapped across
