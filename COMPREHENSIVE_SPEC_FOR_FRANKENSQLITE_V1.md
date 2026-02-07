@@ -6476,7 +6476,13 @@ REPLACE(cache, target_key):
         rotations += 1
         continue
       if candidate.dirty:
-        flush_to_wal(candidate)    // must persist before eviction
+        if flush_to_wal(candidate).is_err():
+          // WAL write failed (disk full, I/O error). Skip this candidate
+          // rather than evicting an unflushed dirty page (data loss).
+          // flush_dirty_page() restores the dirty flag on failure (§6.6).
+          T1.rotate_front_to_back()
+          rotations += 1
+          continue
       (evicted_key, evicted_page) = T1.pop_front()
       B1.push_back(evicted_key)    // remember in ghost list
       total_bytes -= evicted_page.byte_size
@@ -6490,7 +6496,10 @@ REPLACE(cache, target_key):
         rotations += 1
         continue
       if candidate.dirty:
-        flush_to_wal(candidate)
+        if flush_to_wal(candidate).is_err():
+          T2.rotate_front_to_back()
+          rotations += 1
+          continue
       (evicted_key, evicted_page) = T2.pop_front()
       B2.push_back(evicted_key)
       total_bytes -= evicted_page.byte_size
@@ -10020,6 +10029,9 @@ direct column reference (not an expression).
 
 ### 13.2 Math Functions (SQLite 3.35+)
 
+In C SQLite, these require the `-DSQLITE_ENABLE_MATH_FUNCTIONS` compile flag
+(enabled by default since 3.35.0). FrankenSQLite always includes them.
+
 All math functions return NULL for NULL input. For domain errors (e.g.,
 sqrt of negative), the behavior depends on the function.
 
@@ -10506,6 +10518,7 @@ tree during descent, pruning branches where the callback returns `Exclude`.
 - `geopoly_group_bbox(P)` -- aggregate bounding box
 - `geopoly_regular(X, Y, R, N)` -- regular N-gon at center (X,Y) radius R
 - `geopoly_ccw(P)` -- ensure counter-clockwise winding
+- `geopoly_xform(P, A, B, C, D, E, F)` -- affine transformation
 
 Polygons are stored as binary blobs in the format: 4-byte header (type +
 vertex count) followed by pairs of 32-bit float coordinates.
