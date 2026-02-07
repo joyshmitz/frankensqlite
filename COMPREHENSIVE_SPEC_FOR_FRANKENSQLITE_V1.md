@@ -55,14 +55,14 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **MVCC** | Multi-Version Concurrency Control. Transactions see a consistent snapshot while writers create new versions. |
 | **SSI** | Serializable Snapshot Isolation. Extends SI to detect write skew via rw-antidependency tracking. |
 | **ECS** | Erasure-Coded Stream. The universal persistence substrate: objects encoded as RaptorQ symbols. |
-| **ObjectId** | Content-addressed identifier: 128-bit `Trunc128(BLAKE3("fsqlite:ecs:v1" \|\| canonical_encoding(object)))` (16 bytes). |
+| **ObjectId** | Content-addressed identifier: `BLAKE3(canonical_encoding(object))`, 32 bytes. |
 | **CommitCapsule** | Atomic unit of commit state in Native mode: intent log, page deltas, SSI witnesses. |
 | **CommitMarker** | The durable "this commit exists" record: capsule ObjectId + prev-marker chain. |
 | **CommitSeq** | Monotonically increasing `u64` commit sequence number (global "commit clock" for ordering). |
 | **RaptorQ** | RFC 6330 fountain code: K source symbols → unlimited encoding symbols, recoverable from any K' ≈ K. |
 | **OTI** | Object Transmission Information. RaptorQ metadata needed for decoding: (F, Al, T, Z, N). |
 | **DecodeProof** | Auditable witness artifact produced by the RaptorQ decoder when repairing or failing to repair (lab/debug). |
-| **Cx** | Capability context (asupersync). Threads cancellation + budgets via `checkpoint`, structured concurrency via `Scope`, and compile-time capability restriction via `CapSet` + `Cx::restrict`. |
+| **Cx** | Capability context (asupersync). Threads cancellation, deadlines, and capability narrowing through every operation. |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
 | **TxnId** | Monotonically increasing `u64` transaction identifier. `TxnId::ZERO` represents the on-disk baseline. |
 | **TxnEpoch** | Monotonically increasing `u32` generation counter for a reused TxnSlot (prevents stale slot-id interpretation). |
@@ -1127,7 +1127,7 @@ WalFecGroupMeta := {
     k_source       : u32,        // K
     r_repair       : u32,        // R
     oti            : OTI,        // decoding params (symbol size, block partitioning)
-    object_id      : [u8; 16],   // ObjectId (128-bit) of CompatWalCommitGroup (content-addressed)
+    object_id      : [u8; 32],   // ObjectId of CompatWalCommitGroup (content-addressed)
     page_numbers   : Vec<u32>,   // length = K; maps ISI 0..K-1 -> Pgno
     checksum       : u64,        // xxh3_64 of all preceding fields
 }
@@ -2517,29 +2517,21 @@ FrankenSQLite's needs:
 
 Every FrankenSQLite operation accepts `&Cx`. This enables:
 
-- **Cooperative cancellation + progress checkpoints**: Long-running queries call
-  `cx.checkpoint()?` at VDBE instruction boundaries (and in tight loops). On
-  cancellation, return `SQLITE_INTERRUPT`. For cheap polling, use
-  `cx.is_cancel_requested()`.
-- **Deadlines / budgets**: Time constraints live in `Budget` and are propagated
-  through `Scope` (`cx.scope()` / `cx.scope_with_budget(...)`) and `scope!`
-  (asupersync `proc-macros`). For ergonomic wrappers, use
-  `asupersync::time::timeout(duration, fut)` around operations that must fail
-  fast under wall-clock time.
-- **Compile-time capability restriction**: Use `cap::CapSet<SPAWN, TIME, RANDOM,
-  IO, REMOTE>` plus `cx.restrict::<NewCaps>()` to prevent capability escalation.
-  Narrowing (dropping effects) is monotone; widening is a compile error. This
-  gates *effects* (spawn/time/random/io/remote). Memory budgets are modeled
-  separately and are not part of asupersync's capability row.
+- **Cooperative cancellation**: Long-running queries check `cx.is_cancelled()`
+  at VDBE instruction boundaries. `SQLITE_INTERRUPT` on cancellation.
+- **Deadline propagation**: `cx.with_deadline(duration)` automatically cancels
+  operations that exceed their time budget.
+- **Compile-time capability narrowing**: Functions that should not perform I/O
+  accept `&Cx<NoIo>`. Functions that should not allocate accept `&Cx<NoBudget>`.
+  The type system prevents capability escalation.
 
 **Integration pattern:**
 ```rust
 fn execute_query(cx: &Cx, stmt: &PreparedStatement) -> Result<Rows> {
     for opcode in &stmt.program {
-        cx.checkpoint()?;  // cancellation + progress checkpoint
+        cx.check_cancelled()?;  // cooperatively yield to cancellation
         dispatch_opcode(cx, opcode)?;
     }
-    Ok(Rows::empty())
 }
 ```
 
@@ -2567,17 +2559,16 @@ type ComputeCaps = cap::CapSet<false, false, false, false, false>; // Parser/pla
 /// Connection::execute_query has full capabilities.
 /// It is the outermost entry point from the public API.
 pub fn execute_query(cx: &Cx<FullCaps>, sql: &str) -> Result<Rows> {
-    let cx_compute = cx.restrict::<ComputeCaps>();     // restrict to ComputeCaps
-    let ast = parse_sql(&cx_compute, sql)?;
-    let plan = plan_query(&cx_compute, &ast)?;
-    let program = codegen(&cx_compute, &plan)?;
+    let ast = parse_sql(cx.narrow(), sql)?;          // narrow to ComputeCaps
+    let plan = plan_query(cx.narrow(), &ast)?;        // narrow to ComputeCaps
+    let program = codegen(cx.narrow(), &plan)?;       // narrow to ComputeCaps
     execute_program(cx, &program)                     // full caps: needs I/O for page reads
 }
 
 /// The parser accepts only ComputeCaps. It cannot perform I/O.
 /// This is a compile-time guarantee, not a runtime check.
 fn parse_sql(cx: &Cx<ComputeCaps>, sql: &str) -> Result<Ast> {
-    cx.checkpoint()?;  // cancellation + progress checkpoint
+    cx.check_cancelled()?;  // cancellation is always available
     // cx.blocking_io(...)  -- COMPILE ERROR: ComputeCaps lacks IO
     let lexer = Lexer::new(sql);
     Parser::parse(cx, lexer)
@@ -2585,11 +2576,11 @@ fn parse_sql(cx: &Cx<ComputeCaps>, sql: &str) -> Result<Ast> {
 
 /// The VFS layer accepts StorageCaps: it can do I/O and timers
 /// but cannot spawn tasks or make remote calls.
-fn read_page(cx: &Cx<StorageCaps>, file: &mut impl VfsFile, pgno: PageNumber) -> Result<PageData> {
-    cx.checkpoint()?;
+fn read_page(cx: &Cx<StorageCaps>, file: &impl VfsFile, pgno: PageNumber) -> Result<PageData> {
+    cx.check_cancelled()?;
     let offset = u64::from(pgno.get() - 1) * u64::from(page_size);
     let mut buf = vec![0u8; page_size as usize];
-    file.read(&mut buf, offset)?;
+    file.read_at(cx, offset, &mut buf)?;
     Ok(PageData::from(buf))
 }
 ```
@@ -2602,7 +2593,8 @@ Connection::execute(cx: &Cx<All>)
     -> BtreeCursor::move_to(cx: &Cx<StorageCaps>)
       -> MvccPager::get_page(cx: &Cx<StorageCaps>)
         -> ArcCache::fetch(cx: &Cx<StorageCaps>)
-          -> asupersync::runtime::spawn_blocking_io(|| { VfsFile::read(...) })
+          -> VfsFile::read_at(cx: &Cx<StorageCaps>)
+            -> BlockingPool::spawn_blocking(cx, || { pread64(...) })
 ```
 
 At each level, capabilities can only be narrowed, never widened. The VDBE
@@ -4666,111 +4658,6 @@ emit_witnesses() -> (read_witnesses: Vec<ObjectId>, write_witnesses: Vec<ObjectI
 updates the hot-plane `HotWitnessIndex` buckets (shared memory) as a monotonic
 union.
 
-**Witness plane objects (canonical, ECS-native):**
-
-The witness plane is defined in terms of explicit ECS object types. These are
-not optional "debug logs": they are required for cross-process correctness,
-self-healing, and proof-carrying replication.
-
-**KeySummary (sound evidence):**
-
-`KeySummary` MUST contain no false negatives for the subset it claims to cover.
-False positives are allowed (they only increase abort rate).
-
-Deterministic representations:
-
-- `ExactKeys`: sorted `WitnessKey` encodings
-- `HashedKeySet`: sorted `KeyHash` values (`xxh3_64(WitnessKeyBytes)`)
-- `PageBitmap`: roaring bitmap of pages
-- `CellBitmap`: roaring bitmap of packed `(page, cell_tag)` into `u64`
-- `Chunked`: multiple chunks with per-chunk digests (for large sets)
-
-**ReadWitness / WriteWitness:**
-
-```text
-ReadWitness {
-  txn           : TxnToken,
-  begin_seq     : CommitSeq,
-  witness_level : u8,
-  range_prefix  : u64,
-  key_summary   : KeySummary,
-  emitted_at    : u64,
-}
-
-WriteWitness {
-  txn           : TxnToken,
-  begin_seq     : CommitSeq,
-  witness_level : u8,
-  range_prefix  : u64,
-  key_summary   : KeySummary,
-  emitted_at    : u64,
-  write_kind    : {Intent, Final},
-}
-```
-
-**WitnessDelta / WitnessIndexSegment (cold-plane index, rebuildable):**
-
-```text
-WitnessDelta {
-  txn           : TxnToken,
-  begin_seq     : CommitSeq,
-  kind          : {Read, Write},
-  level         : u8,
-  range_prefix  : u64,
-  participation : {Present},          -- union-only
-  refinement    : Option<KeySummary>, -- optional
-  emitted_at    : u64,
-}
-
-WitnessIndexSegment {
-  segment_id        : u64,
-  level             : u8,
-  range_prefix      : u64,
-  readers           : RoaringBitmap<TxnId>,
-  writers           : RoaringBitmap<TxnId>,
-  covered_begin_seq : CommitSeq,
-  covered_end_seq   : CommitSeq,
-}
-```
-
-**DependencyEdge / CommitProof / AbortWitness:**
-
-```text
-DependencyEdge {
-  kind            : RWAntiDependency,
-  from            : TxnToken,
-  to              : TxnToken,
-  key_basis       : {level: u8, range_prefix: u64, refinement: Option<KeySummaryDigest>},
-  observed_by     : TxnToken,
-  observation_seq : CommitSeq,
-}
-
-CommitProof {
-  txn                : TxnToken,
-  begin_seq           : CommitSeq,
-  commit_seq          : CommitSeq,
-  has_in_rw           : bool,
-  has_out_rw          : bool,
-  read_witnesses      : [ObjectId],
-  write_witnesses     : [ObjectId],
-  index_segments_used : [ObjectId],
-  edges_emitted       : [ObjectId],
-  merge_witnesses     : [ObjectId],            -- optional
-  abort_policy        : {AbortPivot, AbortYoungest, Custom},
-}
-
-AbortWitness {
-  txn            : TxnToken,
-  begin_seq      : CommitSeq,
-  abort_reason   : {SsiPivot, Busy, ExplicitRollback, ...},
-  evidence       : {read_witnesses, write_witnesses, index_segments_used, edges_emitted, merge_witnesses},
-  diagnostic_msg : String,                     -- deterministic message (no wall clock)
-}
-```
-
-**MergeWitness** is specified in §5.10: it records disjointness basis + deltas
-and the merged page digest, and is an ECS object so replicas can verify it.
-
 **The dangerous structure:**
 
 SSI detects serialization anomalies by identifying "dangerous structures" --
@@ -4797,7 +4684,7 @@ Formally, the dangerous structure exists when:
 ```
 exists T1, T2, T3 :
     rw_edge(T1, T2) AND rw_edge(T2, T3)
-    AND T2.has_incoming_rw AND T2.has_outgoing_rw
+    AND T2.has_in_rw AND T2.has_out_rw
     AND (T1 committed OR T3 committed)
 ```
 
@@ -4808,48 +4695,70 @@ exists T1, T2, T3 :
 ```
 Transaction (SSI extensions) := {
     ...existing fields...
-    has_incoming_rw : bool,   -- some other transaction created a rw edge TO this txn
-    has_outgoing_rw : bool,   -- some other transaction created a rw edge FROM this txn
-    rw_in_from      : HashSet<TxnId>,  -- transactions that have rw edges to this txn
-    rw_out_to       : HashSet<TxnId>,  -- transactions that this txn has rw edges to
+    has_in_rw        : bool,         -- some other transaction created a rw edge TO this txn
+    has_out_rw       : bool,         -- some other transaction created a rw edge FROM this txn
+    rw_in_from       : Vec<TxnToken>,-- (in-process) sources of incoming rw edges
+    rw_out_to        : Vec<TxnToken>,-- (in-process) targets of outgoing rw edges
+    edges_emitted    : Vec<ObjectId>,-- emitted `DependencyEdge` objects (always persisted as ECS)
+    marked_for_abort : bool,         -- optional: eager abort optimization
 }
 ```
 
-**Detection algorithm pseudocode:**
+Cross-process note: in shared memory we keep only the boolean flags
+(`TxnSlot.has_in_rw` / `TxnSlot.has_out_rw`) plus ordering (`begin_seq`,
+`commit_seq`). The full edge sets are persisted as `DependencyEdge` ECS objects
+and referenced from `CommitProof` / `AbortWitness`.
+
+**Commit-time detection + proof emission pseudocode (witness plane):**
 
 ```
 on_commit(T):
-    // T is about to commit. Check if T is a pivot in a dangerous structure.
-    if T.has_incoming_rw AND T.has_outgoing_rw:
-        // T is the pivot (T2 in T1 -rw-> T2 -rw-> T3).
-        // Check if any T1 (source of incoming rw) and T3 (target of outgoing rw)
-        // form a genuine dangerous structure.
-        for T1_id in T.rw_in_from:
-            T1 = transaction(T1_id)
-            if T1.state == Committed OR T1.state == Active:
-                for T3_id in T.rw_out_to:
-                    T3 = transaction(T3_id)
-                    if T3.state == Committed:
-                        // Dangerous structure confirmed: T1 -rw-> T -rw-> T3
-                        // T3 committed, T1 committed or still active.
-                        // Must abort to prevent anomaly.
-                        abort(T)
-                        return Err(SQLITE_BUSY_SNAPSHOT)
+    // A monotonic ordering stamp for edges/proofs. This is an observation of the commit clock;
+    // it is not required to equal T.commit_seq (which exists only if T commits).
+    obs_seq = shm.commit_seq.load()
 
-    // Also check: is T the T3 in someone else's dangerous structure?
-    // When T commits, it might complete a dangerous structure where
-    // some active pivot T2 now has both incoming and outgoing rw edges
-    // with committed endpoints.
-    for T2_id in T.rw_in_from:
-        T2 = transaction(T2_id)
-        if T2.state == Active AND T2.has_incoming_rw AND T2.has_outgoing_rw:
-            // T2 might be a pivot. But we only abort T2 at T2's commit time.
-            // Mark T2 for eager abort (optimization: abort early rather than
-            // waiting for T2 to attempt commit).
-            T2.marked_for_abort = true
+    // Phase A: publish witnesses (sound evidence) + hot-plane unions.
+    (read_witnesses, write_witnesses) = emit_witnesses(T)
 
-    // Passed SSI check. Proceed with normal commit.
-    proceed_with_commit(T)
+    // Phase B: candidate discovery + refinement (hot plane + cold backstop).
+    T.has_in_rw = false
+    T.has_out_rw = false
+    T.rw_in_from = []
+    T.rw_out_to = []
+    T.edges_emitted = []
+
+    for each write_bucket in write_witnesses:
+        for each candidate_reader R in candidates_from_hot_or_cold(readers, write_bucket):
+            if intersects(refine(R.read_witness_for(write_bucket)), T.write_keys_for(write_bucket)):
+                edge_id = emit DependencyEdge { from=R, to=T, key_basis=write_bucket, observed_by=T, observation_seq=obs_seq }
+                T.edges_emitted.push(edge_id)
+                T.rw_in_from.push(R)
+                T.has_in_rw = true
+
+    for each read_bucket in read_witnesses:
+        for each candidate_writer W in candidates_from_hot_or_cold(writers, read_bucket):
+            if intersects(T.read_keys_for(read_bucket), refine(W.write_witness_for(read_bucket))):
+                edge_id = emit DependencyEdge { from=T, to=W, key_basis=read_bucket, observed_by=T, observation_seq=obs_seq }
+                T.edges_emitted.push(edge_id)
+                T.rw_out_to.push(W)
+                T.has_out_rw = true
+
+    // Phase C: merge escape hatch may tighten keys and eliminate spurious edges.
+    try_merge_escape_hatch(T)  // see §5.10
+
+    // Phase D: dangerous structure rule (conservative pivot abort).
+    if T.has_in_rw AND T.has_out_rw:
+        // Conservative: abort pivot if there exists a committed endpoint on either side.
+        // (Exact policy may be refined later; correctness first.)
+        if exists R in T.rw_in_from where state(R) in {Active, Committed}
+           AND exists W in T.rw_out_to where state(W) == Committed:
+            emit AbortWitness(T, evidence = {read_witnesses, write_witnesses, edges_emitted, ...})
+            abort(T)
+            return Err(SQLITE_BUSY_SNAPSHOT)
+
+    // Phase E: commit succeeds. Emit proof-carrying record.
+    commit(T)
+    emit CommitProof(T, evidence = {read_witnesses, write_witnesses, edges_emitted, ...})
 ```
 
 **When to abort T2 (the pivot) vs T3 (the unsafe): Decision-Theoretic Policy**
