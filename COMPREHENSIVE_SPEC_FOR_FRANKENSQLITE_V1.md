@@ -8772,6 +8772,23 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// Return true if the cursor is positioned past the last entry.
     fn eof(&self) -> bool;
 }
+
+/// Callback trait for WAL checkpoint: the WAL layer calls this to write
+/// checkpointed pages back to the database file. Defined in `fsqlite-pager`
+/// to break the pager<->wal compile-time cycle. `fsqlite-wal` receives
+/// `&dyn CheckpointPageWriter` at runtime from `fsqlite-core` (§8.2.5).
+pub trait CheckpointPageWriter: Send {
+    /// Write `data` to page `pgno` in the database file.
+    /// Called during checkpoint to transfer WAL frames back to the main DB.
+    fn write_page(&mut self, cx: &Cx, pgno: PageNumber, data: &[u8]) -> Result<()>;
+
+    /// Truncate the database file to `n_pages` pages.
+    /// Called when the WAL contains a commit record with a smaller DB size.
+    fn truncate(&mut self, cx: &Cx, n_pages: u32) -> Result<()>;
+
+    /// Sync the database file to durable storage after checkpoint writes.
+    fn sync(&mut self, cx: &Cx) -> Result<()>;
+}
 ```
 
 ### 9.2 Function Traits
@@ -13210,6 +13227,7 @@ Every phase must pass all applicable gates before proceeding to the next.
 - Conformance: 95%+ pass rate across 1,000+ golden files
 - Benchmarks: single-writer within 3x of C SQLite
 - Benchmarks: no regression (conformal p-value > 0.01) compared to Phase 8
+- Replication: database replicates correctly under 10% packet loss within 1.2x of no-loss time (matches Phase 9 acceptance criteria §16.9)
 
 ---
 
