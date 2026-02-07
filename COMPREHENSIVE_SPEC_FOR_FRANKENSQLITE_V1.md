@@ -1333,15 +1333,18 @@ any configuration that violates this bound.
 **Reliability note (normative guidance):** IP fragmentation amplifies loss:
 when a single symbol is split across many Ethernet frames, losing any one frame
 drops the entire symbol. Therefore, for MTU-constrained networks, implementations
-SHOULD choose a symbol size that avoids fragmentation entirely (e.g., `T <= 1366`
-for Ethernet MTU 1500 with the 8-byte header above), or use RFC 6330 sub-blocking
-to achieve an MTU-safe `T`.
+SHOULD choose a symbol size that avoids fragmentation entirely (e.g., `T <= 1464`
+for Ethernet MTU 1500 minus 20-byte IPv4 header, 8-byte UDP header, and the
+8-byte replication header above), or use RFC 6330 sub-blocking to achieve an
+MTU-safe `T`.
 
-For MTU-constrained networks (e.g., standard Ethernet MTU = 1500 bytes),
-the symbol size T can be reduced by sub-dividing each page into sub-symbols.
-A 4096-byte page becomes 3 sub-symbols of 1400 bytes each (with 4096 - 4200
-= -104 bytes padding, so actually 3 sub-symbols of 1366 bytes to fit). This
-is handled transparently by the sub-blocking mechanism of RFC 6330.
+For pages larger than the MTU budget (e.g., a 4096-byte page on standard
+Ethernet), RFC 6330 sub-blocking splits the symbol into sub-symbols that each
+fit in a single packet. For example, with a 1464-byte MTU budget the page is
+divided into `ceil(4096 / 1464) = 3` sub-symbols of 1366 bytes each
+(3 × 1366 = 4098 ≥ 4096, with 2 bytes of zero-padding in the last
+sub-symbol). This is handled transparently by the sub-blocking mechanism
+of RFC 6330.
 
 **Receiver State Machine**
 
@@ -4516,17 +4519,19 @@ When symbol authentication (`auth_tag`) is enabled (§3.5.2), the verification
 key MUST be derived as a deterministic function of `(master_key, ecs_epoch)`:
 
 ```
-K_epoch = KDF(master_key, "fsqlite:symbol-auth:v1" || le_u64(ecs_epoch))
+K_epoch = BLAKE3_KEYED(master_key, "fsqlite:symbol-auth:epoch:v1" || le_u64(ecs_epoch))
 ```
 
 **Master key source (normative):**
-- **Production:** `master_key` MUST be derived from the database's encryption
-  `DEK` with domain separation (so a page-encryption key cannot be misused as a
-  transport-auth key without intent):
+- **Production (preferred):** If page encryption is enabled, `master_key` MUST
+  be derived from the database's encryption `DEK` with domain separation (so a
+  page-encryption key cannot be misused as a transport-auth key without
+  intent):
   `master_key = BLAKE3_KEYED(DEK, "fsqlite:symbol-auth-master:v1")`.
-- If page encryption is disabled and the transport is not already authenticated
-  (TLS), then `PRAGMA fsqlite.symbol_auth = on` MUST fail (no silent insecure
-  authentication).
+- **Production (no encryption):** If page encryption is disabled and
+  `symbol_auth = on`, the caller MUST provide a `SymbolAuthMasterKeyCap`
+  (or equivalent) through `Cx`. Without an explicit key capability, enabling
+  `symbol_auth` MUST fail (no ambient keys).
 - **Lab runtime:** `master_key` MUST be derived deterministically from the seed
   so traces are replay-stable.
 
@@ -14210,6 +14215,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.23 (Write-merge hardening: add IntentFootprint + I_intent trace-normalized commutativity rules; formalize parse->merge->repack lens law and canonical repack requirement; require MergeCertificate proof payloads + verifier + circuit breaker; add PolicyController spec (expected loss + e-process guardrails + BOCPD regime triggers).)*
+*Document version: 1.24 (Round 7 audit: missing JSON functions added (jsonb, json_array_length, json_error_position, json_pretty, jsonb_* variants); FTS5 config §14.2.7 added (merge/storage/maintenance commands, contentless-delete, fts5vocab, secure-delete); Case IV eviction safety valve added; flush_to_wal→flush_dirty_page naming harmonized; SSI overhead corrected to 3–7% OLTP / 10–20% microbenchmark with Ports&Grittner citation; Budget "product meet-semilattice" corrected to mixed meet/join lattice; write skew example arithmetic fixed (-80 not -30); unsafe_code="forbid" vs _mm_prefetch contradiction resolved via helper crate; SQLite 3.52.0 noted as forward target; line count corrected to ~238K; NGQP characterized as N3 bounded algorithm not backtracking; parse.y description corrected with Lemon departure note; VDBE p5 "upper 8 bits zero" claim relaxed; cost model formulas improved with ANALYZE note and covering index seek.)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
