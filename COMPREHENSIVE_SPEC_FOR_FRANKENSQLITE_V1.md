@@ -4033,6 +4033,11 @@ PageVersion := {
     prev_idx   : Option<VersionIdx>,        -- index into VersionArena (NOT Box pointer)
 }
 
+-- NOTE: The XXH3-128 hash for integrity checking (Section 7.2) is stored
+-- in CachedPage, NOT in PageVersion. CachedPage wraps PageVersion and adds
+-- the hash field. PageVersion is the version-chain payload; CachedPage is
+-- the buffer pool entry.
+
 -- PERFORMANCE (Extreme Optimization Discipline):
 -- Version chains MUST NOT use heap-allocated linked lists (Box<PageVersion>).
 -- Pointer-chasing through N heap allocations at N random addresses is the
@@ -12001,16 +12006,20 @@ P(byte conflict) ~ P(page conflict) * (avg_cell_size / page_size)
                  ~ P(page conflict) * (1/C)
 ```
 
-For a page with 40 cells, this is a ~97.5% reduction in effective conflicts.
-However, this only applies when both transactions are pure insertions to
-the same leaf page. Updates that modify cell content may have overlapping
-byte ranges even for different logical rows (due to cell pointer array
-modifications, free block list updates, etc.).
+For a page with 40 cells, this gives a ~97.5% theoretical upper bound
+assuming two uniformly-random cell-only insertions with no shared page
+metadata. In practice, this upper bound is rarely achieved because:
+- The cell pointer array (2 bytes per cell, at the front of the page)
+  is modified by all insertions, creating a shared conflict region.
+- Free block list and content area offset are shared metadata.
+- B-tree cell allocation is not uniformly random (new cells pack toward
+  the content area boundary).
 
 **Realistic estimate:** For INSERT-heavy workloads, algebraic merge reduces
 effective conflict rate by 30-60%. For UPDATE-heavy workloads, the reduction
 is smaller (10-20%) because updates are more likely to modify shared
-page-level structures (cell pointer array reordering).
+page-level structures (cell pointer array reordering). These figures are
+empirical targets to be validated (see §18.6).
 
 ### 18.8 Throughput Model
 
@@ -12043,6 +12052,20 @@ For the typical case (medium DB, moderate writers):
 This shows that for medium-to-large databases, MVCC concurrent writers
 achieve near-linear scaling up to ~8 writers. Beyond that, conflict rates
 grow quadratically (birthday paradox) and throughput plateaus.
+
+**Retry policy (required for completeness):**
+- Maximum retry count: configurable, default 5. After exhausting retries,
+  return `SQLITE_BUSY` to the application.
+- Backoff strategy: immediate first retry (conflict likely resolved by the
+  commit that caused it), then exponential backoff with jitter
+  (base 1ms, max 100ms) for subsequent retries.
+- Fairness: no priority inversion — retried transactions do NOT acquire
+  higher priority. If starvation is detected (same transaction aborted
+  3+ times), the next attempt acquires a brief exclusive advisory lock
+  to guarantee forward progress.
+- Transaction timeout: configurable via `PRAGMA busy_timeout`. If the
+  cumulative retry wait exceeds the timeout, return `SQLITE_BUSY`
+  without further retries.
 
 ---
 
