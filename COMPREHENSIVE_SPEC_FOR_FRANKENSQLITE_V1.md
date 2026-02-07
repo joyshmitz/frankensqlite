@@ -2237,9 +2237,9 @@ read_page_with_repair(pgno: PageNumber) -> Result<PageData>:
 
     // Read repair symbols for this group
     for r in 0..group.repair:
-        repair_data = read_repair_symbol_from_db_fec(group, r)
-        if verify_symbol_record_envelope(repair_data):
-            available_symbols.append((group.size + r, repair_data.symbol_data))    // ISI = K + r
+        repair_rec = read_repair_symbol_from_db_fec(group, r)  // SymbolRecord
+        if verify_symbol_record_envelope(repair_rec) && repair_rec.object_id == meta.object_id && repair_rec.oti == meta.oti:
+            available_symbols.append((group.size + r, repair_rec.symbol_data))    // ISI = K + r
 
     if available_symbols.len() >= group.size:
         // Enough symbols to decode
@@ -2285,6 +2285,7 @@ DbFecGroupMeta := {
     group_size     : u32,        // K (source pages)
     r_repair       : u32,        // R
     oti            : OTI,        // decoding params (symbol size, block partitioning)
+    object_id      : [u8; 16],   // ObjectId of this group snapshot (content-addressed)
 
     // Independent per-source validation (required for safe repair):
     // xxh3_128 of each source page's on-disk bytes for this group snapshot.
@@ -2301,6 +2302,8 @@ DbFecGroupMeta := {
 **DbFecGroupMeta invariants (normative):**
 - `source_page_xxh3_128.len() == group_size`
 - `page_size` MUST match the associated `.db`'s page size.
+- `object_id` MUST equal:
+  `Trunc128(BLAKE3("fsqlite:compat:db-fec-group:v1" || canonical(DbFecGroupMeta_without_checksum)))`.
 - Readers MUST ignore any `DbFecGroupMeta` whose `db_gen_digest` does not match
   the current `DbFecHeader.db_gen_digest` (stale/foreign sidecar guard).
 
@@ -2317,6 +2320,10 @@ DbFecGroupMeta := {
     code's linearity (advanced; optional).
   In either case, the resulting `DbFecGroupMeta` + repair symbols MUST match
   the exact `.db` bytes that are durable after the checkpoint.
+- Repair `SymbolRecord`s written for a group MUST use `object_id == DbFecGroupMeta.object_id`
+  and `oti == DbFecGroupMeta.oti`. Readers MUST ignore repair records that do not
+  match the active group's `object_id`/`oti` (prevents mixing symbols from different
+  group snapshots).
 
 **Interaction with B-tree Page Types**
 
@@ -5312,20 +5319,29 @@ PageLockTable := ShardedHashMap<PageNumber, TxnId>  -- exclusive write locks
     -- For S=64, W=16: P ≈ 1 - e^(-240/128) ≈ 0.85 (85% chance of at least
     -- one collision). For S=64, W=8: P ≈ 0.36. For S=64, W=4: P ≈ 0.09.
     --
-    -- Under ZIPFIAN page access (which Section 17.3 uses for benchmarking),
-    -- collisions are WORSE because hot pages cluster into hot shards.
-    -- The effective shard count is S_eff = S / skew_factor where skew_factor
-    -- depends on the Zipfian parameter s (for s=1.0, roughly 4x concentration
-    -- on the top 10% of shards, so S_eff ≈ 16 for S=64).
+    -- Under skewed page access, collisions are WORSE because hot pages cluster
+    -- into hot shards. We quantify this with the same second-moment machinery as
+    -- §18.4.1:
+    --
+    -- Let q(shard) be the probability that a random lock acquisition hashes to
+    -- `shard`. Define shard collision mass:
+    --   M2_shard := Σ_shard q(shard)^2
+    -- and effective shard count:
+    --   S_eff := 1 / M2_shard
+    --
+    -- Uniform hashing gives q=1/S so M2_shard=1/S and S_eff=S. Skew reduces S_eff.
+    -- The system SHOULD estimate M2_shard online by feeding `shard_id(pgno)` into
+    -- the same bounded F2 sketch used for write-set collision mass (§18.4.1.3).
     --
     -- The expected lock hold time per shard access is ~50ns (HashMap lookup
     -- under parking_lot::Mutex). Expected wait time when contended:
     --   E[wait] ≈ (W/S) * t_hold ≈ (16/64) * 50ns = 12.5ns (uniform)
-    --   E[wait] ≈ (W/S_eff) * t_hold ≈ (16/16) * 50ns = 50ns (Zipfian)
+    --   E[wait] ≈ (W/S_eff) * t_hold ≈ (16/16) * 50ns = 50ns (skewed)
     --
-    -- S=64 is adequate for W <= 32 under uniform access, W <= 16 under
-    -- Zipfian. For higher concurrency, increase S to 256 (via PRAGMA).
-    -- Monitored at runtime via the BOCPD contention stream (Section 4.8).
+    -- S=64 is adequate for W <= 32 under uniform access, W <= 16 under common
+    -- skew patterns. For higher concurrency, increase S to 256 (via PRAGMA).
+    -- Monitored at runtime via the BOCPD contention stream (Section 4.8) and
+    -- the shard collision mass estimate (M2_shard_hat).
 
 SSIWitnessPlane := (see §5.6.4)
     -- The RaptorQ-native witness plane replaces any ephemeral SIREAD lock table:
@@ -15245,17 +15261,17 @@ instrumentation:
   `write_set(txn)` (pages written).
 - Maintain counters per fixed window (e.g., 10 seconds) per BOCPD regime:
   - `txn_count`: number of observed write transactions in the window.
-  - A bounded heavy-hitters structure over `pgno` for incidence counts
-    `c_pgno := #txns whose write_set contains pgno` (top-K + "other").
-  - A bounded tail sketch for the second moment of non-heavy-hitter pages
-    (see §18.4.1.3).
+  - A bounded second-moment sketch state for estimating `F2 := Σ c_pgno^2`
+    (required; §18.4.1.3), where `c_pgno := #txns whose write_set contains pgno`.
+  - A bounded heavy-hitters summary over `pgno` (recommended, for explainability
+    only; §18.4.1.3.2). Heavy hitters MUST NOT be required for computing `M2_hat`.
 - Determinism requirements:
   - Ranking ties MUST break by `pgno`.
   - Any hash/sketch randomization MUST be explicitly seeded from
     `(db_epoch, regime_id, window_id)` and MUST be recorded in the evidence
     ledger when the estimate is used for a policy decision (§4.16.1).
 
-##### 18.4.1.3 Estimator A (Recommended): Head+Tail Second-Moment (F2) Estimate
+##### 18.4.1.3 Estimator A (Required): Deterministic Second-Moment (F2) Sketch
 
 We need an online estimate of:
 
@@ -15265,32 +15281,154 @@ M2 = Σ (c_pgno / txn_count)^2 = ( Σ c_pgno^2 ) / txn_count^2
 
 where `c_pgno` is the per-window incidence count defined above.
 
-**Head+tail split (required):**
-- **Head:** exact `c_pgno` counts for the top-K pages (heavy hitters).
-- **Tail:** estimate `F2_tail := Σ_{pgno not in head} c_pgno^2` using a bounded
-  second-moment sketch (AMS/CountSketch family).
-
-Then:
+Define:
 
 ```
-M2_hat = ( Σ_{pgno in head} c_pgno^2 + F2_tail_hat ) / txn_count^2
+F2 := Σ c_pgno^2
+```
+
+Then `M2 = F2 / txn_count^2`. Estimator A provides a bounded-memory estimate
+`F2_hat`, and thus:
+
+```
+M2_hat = F2_hat / txn_count^2
 P_eff_hat = 1 / M2_hat
 ```
+
+`P_eff_hat` MUST be treated as advisory and computed with a guard:
+- If `txn_count == 0`, define `M2_hat = 0` and omit `P_eff_hat` (or treat it as
+  +infinity).
+- If `M2_hat == 0`, omit `P_eff_hat` (+infinity).
+
+###### 18.4.1.3.1 AMS F2 Sketch (Normative Default)
+
+The default implementation MUST use an AMS-style second-moment sketch:
+
+- Choose `R` sign hash functions `s_r(pgno) ∈ {+1, -1}` and maintain signed
+  accumulators `z_r` for `r = 1..R`:
+
+```
+z_r := Σ_{pgno} s_r(pgno) * c_pgno
+```
+
+- Update rule (per window/regime):
+  - For each observed transaction, iterate the de-duplicated `write_set(txn)`.
+  - For each `pgno ∈ write_set(txn)` and each `r ∈ 1..R`, perform:
+
+```
+z_r += s_r(pgno)
+```
+
+- End-of-window estimator:
+
+```
+F2_hat_r := z_r^2
+F2_hat   := median_r(F2_hat_r)
+M2_hat   := F2_hat / txn_count^2
+```
+
+**Hash/sign function (normative):**
+
+Each sign hash `s_r` MUST be derived from a deterministic per-window seed:
+
+```
+seed_r := Trunc64(BLAKE3("fsqlite:m2:ams:v1" || db_epoch || regime_id || window_id || r))
+h := mix64(seed_r XOR pgno_u64)
+sign_r(pgno) := if (h & 1) == 0 then +1 else -1
+```
+
+Where `mix64` is a fast, deterministic 64-bit mixing function (cryptographic
+strength is NOT required). A canonical choice is SplitMix64 finalization:
+
+```
+mix64(x):
+  z = x + 0x9E3779B97F4A7C15
+  z = (z XOR (z >> 30)) * 0xBF58476D1CE4E5B9
+  z = (z XOR (z >> 27)) * 0x94D049BB133111EB
+  return z XOR (z >> 31)
+```
+
+Any equivalent construction is acceptable iff it is deterministic under
+`LabRuntime` for a given trace+seed and provides adequate mixing for collision
+sketching.
+
+**Parameter constraints (normative):**
+- `R` MUST be a small constant (target 8-32). Default `R = 12`.
+- `z_r` accumulation and `z_r^2` MUST NOT overflow. Implementations SHOULD
+  accumulate in `i128` and square into `u128`, shrinking windows if necessary.
 
 **Sketch constraints (normative):**
 - Memory MUST be bounded with small constants (target: O(1 KiB) to O(16 KiB)
   per regime).
-- Update cost MUST be bounded (target: O(d) per `pgno` update, with small `d`).
+- Update cost MUST be bounded (target: O(R) per `pgno` update, with small `R`).
 - Under `LabRuntime`, the sketch MUST be deterministic for a given seed and
   trace.
+
+**Validation (required):** In lab mode, the harness MUST include a validator
+that computes exact `F2` for small windows and asserts `F2_hat` tracks it within
+declared tolerances across deterministic traces. The tolerance/params MUST be
+recorded in the perf notes when used for policy decisions.
+
+###### 18.4.1.3.2 Heavy-Hitter Decomposition (Recommended, Explainability)
+
+Heavy hitters are not required for `M2_hat`, but they are extremely useful for
+explainability (where is the collision mass coming from?) and for debugging
+hot-page pathologies.
+
+The engine SHOULD maintain a bounded heavy-hitters summary for incidence counts
+using a SpaceSaving-style algorithm with deterministic tie-breaking:
+
+```
+Entry := { pgno: PageNumber, count_hat: u64, err: u64 }
+```
+
+**Parameter constraints (normative):**
+- `K` MUST be a small constant (target 32-256). Default `K = 64`.
+
+On each incidence update for `pgno` (one per transaction per page):
+- If `pgno` already exists in the table: `count_hat += 1`.
+- Else if table has < K entries: insert `{pgno, 1, 0}`.
+- Else: let `m` be the entry with minimal `count_hat` (ties broken by minimal
+  `pgno`). Replace `m` with `{pgno, m.count_hat + 1, m.count_hat}`.
+
+This yields a bounded-error estimate with:
+
+```
+count_hat - err <= c_pgno <= count_hat
+```
+
+**Head/tail decomposition (recommended):**
+
+Let `H` be the heavy-hitter entry set. Define:
+
+```
+F2_head_upper := Σ_{e in H} e.count_hat^2
+F2_head_lower := Σ_{e in H} max(e.count_hat - e.err, 0)^2
+F2_tail_hat   := max(F2_hat - F2_head_lower, 0)
+```
+
+and the corresponding collision-mass contributions:
+
+```
+head_contrib_upper := F2_head_upper / txn_count^2
+head_contrib_lower := F2_head_lower / txn_count^2
+tail_contrib_hat   := F2_tail_hat / txn_count^2
+```
+
+This is intentionally conservative: subtracting `F2_head_lower` avoids
+over-subtracting when heavy-hitter estimates are uncertain.
 
 **Explainability (required):** When `M2_hat` influences a decision, the evidence
 ledger MUST include:
 - `txn_count`, window duration, and `regime_id`,
-- `K` and the top-K pages with `(pgno, c_pgno, contrib := c_pgno^2/txn_count^2)`,
-- `head_contrib := Σ_head c_pgno^2/txn_count^2`,
-- `tail_contrib := F2_tail_hat/txn_count^2`,
-- sketch parameters + seed derivation inputs.
+- `F2_hat`, `M2_hat`, and (if defined) `P_eff_hat`,
+- sketch parameters (`R`, seed derivation inputs, sketch version string),
+- if heavy hitters are enabled: `K` and the heavy-hitter entries with
+  `(pgno, count_hat, err, contrib_upper := count_hat^2/txn_count^2)`,
+  plus `(head_contrib_lower, head_contrib_upper, tail_contrib_hat)`.
+
+**Ledger ordering (deterministic):** Heavy-hitter entries in the ledger MUST be
+sorted by `(count_hat desc, pgno asc)`.
 
 ##### 18.4.1.4 Estimator B (Optional): Zipf `s_hat` (Interpretability Only)
 
@@ -15378,9 +15516,13 @@ To validate the probabilistic model against actual conflict rates:
    - `conflicts_merged_structured`: conflicts resolved by structured patch merge
    - `conflicts_aborted`: conflicts that caused transaction abort/retry
    - `total_commits`: total commit attempts
+   - `writers_active`: histogram (or time series) of active concurrent writers
+     observed at commit attempt time for the same window/regime. This is the
+     `N_active` input used in the `p_drift` and retry models (§18.7, §18.8).
    - `pages_per_commit`: histogram of write set sizes (`W`) per commit attempt
    - `pages_per_commit_m2`: derived `E[W^2]` from the histogram (required; split-driven
-     heavy tails make `E[W^2]` more predictive than `E[W]` for conflicts)
+     heavy tails make `W` and commit cost heavy-tailed. `E[W^2]` is used for
+     tail-latency and cost budgeting and to contextualize spikes in `M2_hat`.)
    - `write_set_m2_hat`: per-window/regime collision mass estimate `M2_hat` with
      head/tail breakdown (§18.4.1.3)
    - `write_set_peff_hat`: derived `P_eff_hat = 1/M2_hat` (recommended)
@@ -15429,46 +15571,76 @@ not byte disjointness.
 
 **Effective abort reduction model:**
 
-Let `f_merge` be the empirically-measured fraction of detected FCW conflicts
-that are resolved by the SAFE merge ladder (rebase + structured patches). Then:
+Let `p_drift` be the probability that a commit attempt detects FCW base drift
+(at least one page in `write_set(txn)` was updated since the transaction's
+snapshot). Let `f_merge` be the empirically-measured fraction of detected FCW
+base-drift events that are resolved by the SAFE merge ladder (rebase +
+structured patches). Then:
 
 ```
-P_abort_eff ≈ P_conflict * (1 - f_merge)
+P_abort_attempt ≈ p_drift * (1 - f_merge)
 ```
 
-`f_merge` is workload-dependent and must be measured (see §18.6), not assumed.
+`p_drift` and `f_merge` are workload-dependent and MUST be measured (see §18.6),
+not assumed. For planning, an approximate model for `p_drift` in an `N`-writer
+regime is:
+
+```
+p_pair  ≈ 1 - exp(-M2_hat)            // base-drift probability for a random pair
+p_drift ≈ 1 - (1 - p_pair)^(N-1)
+       = 1 - exp(-(N-1) * M2_hat)     // when using p_pair := 1 - exp(-M2_hat)
+```
+
+This approximation is intentionally conservative: real conflict events are not
+independent, and structural bursts can transiently increase `M2_hat`. When used
+for policy decisions (retry/merge budgeting), the controller MUST record the
+values it used (`N`, `M2_hat`, `f_merge`) in the evidence ledger (§4.16.1).
 
 ### 18.8 Throughput Model
 
 The committed transactions per second (TPS) under contention:
 
 ```
-TPS = N * (1 - P_abort) * (1 / T_txn)
+TPS ≈ N * (1 - P_abort_attempt) * (1 / T_attempt)
 
 where:
   N = number of concurrent writers
-  P_abort = probability a transaction must abort and retry
-  T_txn = average transaction duration (seconds)
+  P_abort_attempt = probability a commit attempt aborts and retries due to conflicts
+                   not resolved by the SAFE merge ladder
+  T_attempt = average transaction attempt duration (seconds), including validation
+              and any work that must be repeated on retry
 ```
 
-P_abort depends on the conflict rate and the number of retries:
+**Tail awareness (required):** `T_attempt` is typically heavy-tailed because
+write-set size `W` is heavy-tailed (splits and index fanout touch multiple
+pages; §18.5). Any policy that reasons about throughput or tail latency MUST
+use the measured `pages_per_commit` histogram and derived moments (including
+`E[W^2]`; §18.6), not assume a constant `W`.
+
+`P_abort_attempt` depends on the base-drift rate and merge yield. The probability
+of surfacing `SQLITE_BUSY` to the application (`P_abort_final`) depends on the
+retry policy and budget (§18.8, below):
 
 ```
-P_abort_first_attempt ~ 1 - product_{j != i} (1 - P(conflict with T_j))
-P_abort_after_K_retries ~ P_abort_first^K  (geometric retry)
+P_abort_attempt ≈ p_drift * (1 - f_merge)     // §18.7
+P_abort_final   depends on the retry policy (expected loss; below)
 ```
 
 For the typical case (medium DB, moderate writers):
 - P = 100,000 pages, W = 50 pages/txn, N = 8 writers
-- P(pairwise conflict) ~ 1 - e^(-50^2/100000) ~ 0.025
-- P(any conflict for one txn) ~ 1 - (1-0.025)^7 ~ 0.16
-- With safe merge ladder resolving f_merge=0.40 of detected conflicts (empirical): effective P_abort ~ 0.10
-- With one retry: P_abort ~ 0.01
-- TPS ~ 8 * 0.99 / T_txn
+- Under uniform writes, M2 = W^2/P = 0.025 (use measured `M2_hat` in practice)
+- p_drift ~ 1 - exp(-(N-1)*M2) = 1 - exp(-7*0.025) ~ 0.16
+- With SAFE merge ladder resolving f_merge=0.40 of detected drift (empirical):
+  P_abort_attempt ~ 0.16 * (1 - 0.40) ~ 0.10
+- With one retry under a stationary approximation: P_abort_final ~ 0.01
+- Throughput impact comes from retries even when final failure is rare:
+  expected attempts per successful commit is ~`1/(1 - P_abort_attempt)`,
+  so TPS ≈ 8 * 0.90 / T_attempt
 
 This shows that for medium-to-large databases, MVCC concurrent writers
 achieve near-linear scaling up to ~8 writers. Beyond that, conflict rates
-grow quadratically (birthday paradox) and throughput plateaus.
+grow like `C(N,2) * M2_hat` (birthday paradox under skew; §18.4.1) and
+throughput plateaus.
 
 **Retry policy (required for completeness):**
 
@@ -15513,6 +15685,15 @@ not assume a shape that the workload violates.
 
 This keeps the policy explainable and robust: it learns the empirical success
 curve without assuming it is Zipf, exponential, or stationary across regimes.
+
+**Conditioning on contention (recommended):** Success probability depends on
+contention. The engine MAY maintain separate Beta posteriors for a small number
+of deterministic contention buckets, e.g. keyed by:
+- `N_active` (active writers in the window/regime), and/or
+- `M2_hat` (write-set collision mass; §18.4.1).
+
+Buckets MUST be finite and bounded (target: <= 16), MUST be deterministic under
+`LabRuntime`, and MUST be recorded in the evidence ledger when used.
 
 **Hazard-model smoothing (optional, alien-artifact):**
 
@@ -15624,6 +15805,9 @@ from spec, never translate line-by-line).
 | `vdbe.c` | VDBE interpreter | 9,316 | The giant switch statement dispatching all opcodes. Each case is the authoritative definition of what that opcode does. Extract: register manipulation, cursor operations, comparison semantics, NULL handling per opcode. |
 | `select.c` | SELECT compilation | 8,972 | How SELECT is compiled to VDBE opcodes: result column processing, FROM clause flattening, subquery handling, compound SELECT, DISTINCT, ORDER BY, LIMIT. |
 | `where.c` | WHERE optimization | 7,858 | Index selection algorithm, cost estimation, OR optimization, skip-scan, automatic index creation. The `WhereTerm`, `WhereLoop`, and `WherePath` structures define the optimizer's search space. |
+| `wherecode.c` | WHERE codegen | 2,936 | Code generation for WHERE loops (`WhereLoop` → VDBE opcodes), loop initialization, and constraint code emission. |
+| `whereexpr.c` | WHERE expression analysis | 1,943 | Expression analysis and WHERE-term handling that feeds the optimizer/codegen split across the WHERE subsystem. |
+| `whereInt.h` | WHERE internal header | 668 | WHERE subsystem internal structs, flags, and helper macros shared by `where.c`/`wherecode.c`/`whereexpr.c`. |
 | `parse.y` | LEMON grammar | 2,160 | The authoritative SQL grammar. Every production rule defines a valid SQL construct. Use as the reference for the recursive descent parser. |
 | `tokenize.c` | SQL tokenizer | 899 | Token types, keyword recognition, string/number/blob literal parsing, comment handling. |
 | `func.c` | Built-in functions | 3,461 | Implementation of all scalar and aggregate functions. Edge case behaviors (NULL handling, type coercion, overflow) are defined here. |

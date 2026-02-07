@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use asupersync::lab::{DporExplorer, ExplorerConfig};
+use asupersync::lab::{DporExplorer, ExplorerConfig, LabConfig, LabRuntime};
 use asupersync::runtime::yield_now;
 use parking_lot::Mutex;
 use proptest::prelude::*;
@@ -485,6 +485,57 @@ fn dpor_outgoing_edges_cover_committed_and_freed_writers() {
         "DPOR exploration found violations: {:#?}",
         report.violations
     );
+}
+
+#[test]
+fn chaos_cancel_does_not_leak_hot_witness_epoch_lock() {
+    // This is not a correctness proof: it is a liveness/safety guardrail.
+    // Under cancellation injection we should never leave a per-bucket lock held.
+    for seed in 0_u64..16 {
+        let mut rt = LabRuntime::new(
+            LabConfig::new(seed)
+                .with_light_chaos()
+                .worker_count(2)
+                .max_steps(50_000),
+        );
+        let root = rt
+            .state
+            .create_root_region(asupersync::types::Budget::INFINITE);
+
+        let bucket = Arc::new(HotBucket::new(10));
+
+        let bucket_a = Arc::clone(&bucket);
+        let (t_a, _) = rt
+            .state
+            .create_task(root, asupersync::types::Budget::INFINITE, async move {
+                bucket_a.register_read(1, 10).await;
+            })
+            .expect("spawn A");
+
+        let bucket_b = Arc::clone(&bucket);
+        let (t_b, _) = rt
+            .state
+            .create_task(root, asupersync::types::Budget::INFINITE, async move {
+                bucket_b.register_read(2, 10).await;
+            })
+            .expect("spawn B");
+
+        let mut sched = rt
+            .scheduler
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sched.schedule(t_a, 0);
+        sched.schedule(t_b, 0);
+        drop(sched);
+
+        rt.run_until_quiescent();
+
+        assert_eq!(
+            bucket.epoch_lock.load(Ordering::Acquire),
+            0,
+            "epoch lock leaked under chaos cancellation (seed={seed})"
+        );
+    }
 }
 
 #[test]
