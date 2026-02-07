@@ -5561,8 +5561,8 @@ PageNumber  := NonZeroU32                   -- 1-based page number
 TableId     := NonZeroU32                   -- B-tree root page number for a table (schema-epoch scoped)
 IndexId     := NonZeroU32                   -- B-tree root page number for an index (schema-epoch scoped)
 
-PageBuf     := owned, page-aligned buffer handle, length = page_size
-PageData    := PageBuf                      -- page content (full-page images); must be page-aligned (§1.5, §4.10)
+PageBuf     := owned, page-sized buffer handle, length = page_size
+PageData    := PageBuf                      -- page content (full-page images)
 
 Snapshot := {
     high            : CommitSeq,            -- all commits with commit_seq <= high are visible
@@ -6096,6 +6096,50 @@ begin(manager, begin_kind) -> Result<Transaction>:
         serialized_write_lock_held,
         ...
     })
+
+acquire_and_publish_txn_slot(manager, txn_id, mode) -> Result<(u32, TxnEpoch, Snapshot)>:
+    // Wrapper for the three-phase TxnSlot acquire protocol (§5.6.2).
+    //
+    // REQUIRED:
+    // - claim a slot BEFORE snapshot capture (horizon safety; §5.6.5),
+    // - set begin_seq/snapshot_high from the SAME snapshot.high,
+    // - publish txn_id with CAS(claim_word -> real_txn_id), then clear claiming_timestamp.
+    shm = manager.shm
+    claim_word = encode_claiming(txn_id)
+    for slot_idx in 0..shm.max_txn_slots:
+        slot = &shm.txn_slots[slot_idx]
+        if !slot.txn_id.CAS(0, claim_word, AcqRel, Acquire):
+            continue
+        // Phase 1 succeeded: seed CLAIMING timeout clock.
+        slot.claiming_timestamp.CAS(0, unix_timestamp())
+
+        // Phase 2: initialize required fields (see §5.6.2 for full list).
+        slot.txn_epoch.fetch_add(1, AcqRel)  // wrap permitted
+        snap = load_consistent_snapshot(manager)
+        slot.begin_seq.store(snap.high, Release)
+        slot.snapshot_high.store(snap.high, Release)
+        slot.commit_seq.store(0, Relaxed)
+        slot.state.store(Active, Release)
+        slot.mode.store(mode, Release)
+        slot.has_in_rw.store(false, Relaxed)
+        slot.has_out_rw.store(false, Relaxed)
+        slot.marked_for_abort.store(false, Relaxed)
+        slot.write_set_pages.store(0, Relaxed)
+        slot.cleanup_txn_id.store(0, Relaxed)
+        slot.pid.store(current_pid(), Relaxed)
+        slot.pid_birth.store(process_birth_id(), Relaxed)
+        slot.lease_expiry.store(unix_timestamp() + LEASE_DURATION_SECS, Relaxed)
+        if mode == Concurrent:
+            slot.witness_epoch.store(HotWitnessIndex.epoch.load(Acquire), Release)
+        else:
+            slot.witness_epoch.store(0, Release)
+
+        // Phase 3: publish the real TxnId (CAS, never store).
+        if !slot.txn_id.CAS(claim_word, txn_id, AcqRel, Acquire):
+            return Err(SQLITE_BUSY)  // slot was reclaimed while we were stalled; caller retries begin
+        slot.claiming_timestamp.store(0, Release)
+        return Ok((slot_idx, slot.txn_epoch.load(Acquire), snap))
+    return Err(SQLITE_BUSY)
 ```
 
 **Read (both modes):**
@@ -6145,12 +6189,13 @@ write_page(manager, T, pgno, new_data) -> Result<()>:
         // page lock so we never overlap.
         check_serialized_writer_exclusion(manager.shm)?
 
-        lock_result = page_lock_table.try_acquire(pgno, T.txn_id)
-        if lock_result = AlreadyHeld(other): return Err(SQLITE_BUSY)
-        T.page_locks.insert(pgno)
-        // Cross-process visibility: record that we now hold at least one page lock.
-        // This is used by Serialized writer acquisition to avoid overlapping writers.
-        if let Some(slot_id) = T.slot_id:
+        page_lock_table.try_acquire(pgno, T.txn_id)?
+        newly_locked = T.page_locks.insert(pgno)
+        // Cross-process hint/metric: `write_set_pages` is monotone within a txn and
+        // is reset when the TxnSlot is freed. It is NOT the correctness source of
+        // truth for lock ownership (the lock tables are). It MUST be idempotent per
+        // (txn, page) to avoid inflating counts on repeated writes.
+        if newly_locked && let Some(slot_id) = T.slot_id:
             manager.shm.txn_slots[slot_id].write_set_pages.fetch_add(1, Relaxed)
 
         // NOTE: SSI witnesses are emitted by semantic layers (VDBE/B-tree) that
@@ -6184,7 +6229,7 @@ commit(manager, T) -> Result<()>:
                 T.state = Committed{commit_seq}
                 release_page_locks(T)
                 if T.serialized_write_lock_held:
-                    release_serialized_writer_exclusion(manager.shm, T.txn_id)
+                    release_serialized_writer_exclusion(manager, T.txn_id)
                 return Ok(())
 
             Conflict(_pages, _seq) =>
@@ -6545,7 +6590,7 @@ without unbounded blocking.
 iteration O(1)). Snapshot capture is O(1): it reads the current `commit_seq` and
 `schema_epoch` and stores them in the immutable `Snapshot` (INV-5). The capture
 MUST be self-consistent (see `load_consistent_snapshot()` in §5.4; it is still
-O(1), just two `commit_seq` loads). For `BeginKind::Immediate` / `Exclusive`,
+O(1), bounded by a small constant number of atomic loads under a seqlock). For `BeginKind::Immediate` / `Exclusive`,
 acquiring Serialized writer exclusion may:
 - fail immediately with `SQLITE_BUSY` (or wait under busy-timeout) if Concurrent
   writers are active (§5.8), and otherwise
@@ -6648,7 +6693,10 @@ SharedMemoryLayout := {
     txn_slot_offset  : u64,            -- byte offset to TxnSlot array
     committed_readers_offset: u64,     -- byte offset to RecentlyCommittedReadersRing region (§5.6.2.1)
     committed_readers_bytes : u64,     -- reserved bytes for the ring (fixed per layout version)
-    checksum         : u64,            -- xxhash3 of header fields
+	    layout_checksum  : u64,            -- xxh3_64 of immutable layout metadata fields
+	                                       -- (magic/version/page_size/max_txn_slots/offsets/bytes); excludes
+	                                       -- dynamic atomics (counters, epochs, leases). Written once at
+	                                       -- initialization and validated on map.
     _padding         : [u8; 64],       -- align to cache line
     // --- TxnSlot array follows at txn_slot_offset ---
     // --- RecentlyCommittedReadersRing follows at committed_readers_offset ---
@@ -6660,6 +6708,14 @@ SharedMemoryLayout := {
 The shared-memory file is created on first access and mapped by every
 process that opens the database. All fields after the header use atomic
 operations.
+
+**Rust safety constraint (normative):** Workspace members forbid `unsafe`
+(`#![forbid(unsafe_code)]`). Therefore, implementations MUST NOT "reinterpret
+cast" a `&[u8]` mapping into `&SharedMemoryLayout` inside this repository.
+Shared-memory access MUST be performed via safe external abstractions that
+encapsulate any required `unsafe` outside this repo (e.g., a safe mmap crate
+plus offset-based typed accessors). The layout above is the byte-level contract;
+the code MUST treat it as offsets, not as a Rust `repr(C)` struct.
 
 **Alignment requirement (normative):** Every `AtomicU64` field in the mapped
 shared-memory region MUST be naturally aligned (8-byte alignment). The layout
@@ -6683,9 +6739,11 @@ memory layout.
   ordering (§5.8).
 - **DDL publication ordering (normative):** If a commit advances `schema_epoch`,
   the coordinator MUST store the new `schema_epoch` (Release) **before**
-  publishing the corresponding `commit_seq` (Release). This ensures that any
-  transaction that observes the new `commit_seq` with an Acquire load also
-  observes the schema epoch change, preventing mixed snapshots.
+  publishing the corresponding `commit_seq` (Release) within the same
+  `snapshot_seq` seqlock window. This ensures any reader that observes the new
+  `commit_seq` also observes the schema epoch change. (Mixed `(high, schema_epoch)`
+  pairs are prevented by `snapshot_seq` + `load_consistent_snapshot`, not by this
+  ordering alone.)
 - Other fields MAY use `SeqCst` when simplicity is worth the cost; otherwise
   use `Acquire/Release` where required by invariants and `Relaxed` only for
   diagnostics counters.
@@ -6866,11 +6924,11 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    In particular, `begin_seq`/`snapshot_high` MUST be set before the slot can
    influence GC and witness-epoch advancement decisions (§5.6.4.8, §5.6.5).
 
-   Minimum required initialization:
-   - increment `txn_epoch` (wrap permitted),
-   - `snap = shm.commit_seq.load(Acquire)`,
-   - set `begin_seq = snap` and `snapshot_high = snap` (from the SAME `snap`),
-   - set `mode` (Serialized or Concurrent) for this transaction,
+	   Minimum required initialization:
+	   - increment `txn_epoch` (wrap permitted),
+	   - `snap = load_consistent_snapshot(...)` (seqlock; §5.4),
+	   - set `begin_seq = snap.high` and `snapshot_high = snap.high` (from the SAME snapshot),
+	   - set `mode` (Serialized or Concurrent) for this transaction,
    - clear `commit_seq = 0`, clear SSI flags/counters (`has_in_rw/has_out_rw/marked_for_abort/write_set_pages = 0`),
    - clear `cleanup_txn_id = 0` (must never leak across slot reuse),
    - set `pid`, `pid_birth`, `lease_expiry`, and `state = Active`.
@@ -7449,6 +7507,14 @@ Transactions MAY hold locks in either table. This is safe because:
    Normal `release()` calls should eventually drive the draining table to
    quiescence. Read-only transactions MUST NOT block rebuild (they do not touch
    the lock table).
+
+   **Coordinator liveness rule (normative):** If the process performing rebuild
+   is also the commit sequencer/coordinator, it MUST treat drain+clear as
+   background maintenance and MUST NOT block commit publication waiting for
+   lock-quiescence. In particular, it MUST NOT enter a tight wait loop of the
+   form "while any owner_txn != 0 { sleep/poll }" on the commit critical path.
+   It MAY poll drain progress between commit batches or when the commit queue is
+   empty.
 
    During drain, the rebuilder SHOULD run `cleanup_orphaned_slots()` so orphaned
    holders cannot stall quiescence.
@@ -8942,7 +9008,7 @@ Concurrent-mode write paths MUST check this indicator before acquiring page lock
 **Indicator check algorithm (normative):**
 
 ```
-check_serialized_writer_exclusion() -> Result<()>:
+check_serialized_writer_exclusion(shm) -> Result<()>:
   tok = shm.serialized_writer_token.load(Acquire)
   if tok == 0:
     return Ok(())
@@ -11567,7 +11633,7 @@ Layer 9 (apps):       fsqlite-cli      fsqlite-harness
 The foundational types crate with zero internal dependencies.
 
 Key types and modules:
-- `page.rs`: `PageNumber` (NonZeroU32), `PageData` (Vec<u8>), `PageSize` (validated power of 2)
+- `page.rs`: `PageNumber` (NonZeroU32), `PageBuf`/`PageData` (page-aligned; §5.1, §4.10), `PageSize` (validated power of 2)
 - `value.rs`: `SqliteValue` enum (Null, Integer(i64), Real(f64), Text(String), Blob(Vec<u8>))
 - `opcode.rs`: `Opcode` enum with all 190+ VDBE opcodes, plus `OpcodeInfo` metadata
 - `serial.rs`: `SerialType` (u64), serial type encoding/decoding, content size formulas
