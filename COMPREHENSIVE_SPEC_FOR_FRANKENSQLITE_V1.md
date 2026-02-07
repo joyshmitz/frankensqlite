@@ -6000,7 +6000,27 @@ cleanup_orphaned_slots():
     now = unix_timestamp()
     for slot in txn_slots:
         if slot.txn_id == TXN_ID_CLEANING:
-            continue  // another process is resetting this slot
+            // Another process is resetting this slot. If it crashed mid-reset,
+            // the slot can become permanently stuck. Treat this like CLAIMING:
+            // if CLEANING persists beyond the timeout, reclaim and free.
+            if slot.claiming_timestamp == 0:
+                slot.claiming_timestamp.CAS(0, now)
+                continue
+            if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
+                // Best-effort reclaim: clear fields again and free the slot.
+                slot.begin_seq = 0
+                slot.snapshot_high = 0
+                slot.witness_epoch = 0
+                slot.has_in_rw = false
+                slot.has_out_rw = false
+                slot.marked_for_abort = false
+                slot.write_set_pages = 0
+                slot.pid = 0
+                slot.pid_birth = 0
+                slot.lease_expiry = 0
+                slot.claiming_timestamp = 0
+                slot.txn_id = 0  // Free the slot (Release ordering, LAST)
+            continue
         if slot.txn_id == TXN_ID_CLAIMING:
             // Slot is being claimed by another process (Phase 1 of acquire).
             //
@@ -6806,17 +6826,25 @@ maintain the standard `foo.db-shm` WAL-index:
 
 3. **Maintain reader marks + reader locks.** FrankenSQLite readers MUST
    participate in SQLite's WAL reader protocol, not just its metadata:
-   - A FrankenSQLite reader MUST acquire and hold a legacy `WAL_READ_LOCK(i)`
-     (shared lock on the corresponding `aLock` byte in `foo.db-shm`; see §11.10)
-     before writing `aReadMark[i]`.
-   - It MUST write `aReadMark[i]` while holding `WAL_READ_LOCK(i)`.
-   - It MUST hold `WAL_READ_LOCK(i)` for the full lifetime of the snapshot,
-     releasing it only when the snapshot ends.
+   - Slot claim + mark update MUST follow SQLite's lock discipline:
+     - Acquire `WAL_READ_LOCK(i)` **EXCLUSIVE** (byte `aLock[3+i]` in `foo.db-shm`; §11.10),
+       then write/update `aReadMark[i]` while holding the EXCLUSIVE lock.
+     - Downgrade to a **SHARED** `WAL_READ_LOCK(i)` for the full lifetime of the
+       snapshot, releasing it only when the snapshot ends.
+     This matches SQLite's invariants: the lock (not just the mark value) is what
+     legacy checkpointers consult to decide which marks are live.
    This is non-negotiable: legacy checkpointers consult the read locks to decide
    which `aReadMark` entries are live. Updating `aReadMark` without holding the
    matching `WAL_READ_LOCK(i)` can cause overwritten frames and silent corruption.
-   If no `WAL_READ_LOCK(i)` slot is available, the reader MUST return `SQLITE_BUSY`
-   (or wait per busy-timeout).
+   If no `WAL_READ_LOCK(i)` slot is available (cannot obtain EXCLUSIVE on any
+   slot that would be required for the snapshot), the reader MUST return
+   `SQLITE_BUSY` (or wait per busy-timeout).
+
+   **Interop limitation (explicit):** The legacy WAL-index format provides only
+   5 reader marks/locks (`aReadMark[0..4]`). This bounds the number of distinct
+   concurrently-active WAL snapshots that can be represented to legacy tooling.
+   FrankenSQLite's "hundreds of readers" story applies to Native mode and to
+   non-legacy coordination; Compatibility mode inherits this legacy constraint.
 
 4. **Checkpoint coordination.** Checkpoint logic (§7.5) MUST update
    `nBackfill` in the standard `WalCkptInfo` during backfill.
@@ -8605,28 +8633,29 @@ target key was found in B2.
 ```
 REPLACE(cache, target_key):
   // target_key is the page that triggered this replacement (for tie-breaking)
-  rotations = 0
+  rotations_t1 = 0
+  rotations_t2 = 0
   loop:
-    // Safety valve (MUST be checked FIRST, before branching into T1/T2).
-    // If we have rotated through ALL entries in both T1 and T2 and every
-    // page is pinned, we are overcommitted. Allow temporary growth beyond
+    // Safety valve (MUST be checked FIRST).
+    // If we have proven there is no evictable victim in either list (all pinned
+    // and/or unflushable), we are overcommitted. Allow temporary growth beyond
     // capacity rather than deadlock.
     //
-    // CRITICAL: This check was previously placed AFTER the T1/T2 branches
-    // as dead code -- both branches `return` on successful eviction or
-    // `continue` on pinned pages, so control never reached the old
-    // position. With all pages pinned, the loop would spin forever in
-    // whichever branch was selected, never reaching the safety valve.
-    if rotations >= |T1| + |T2|:
+    // CRITICAL: It is not sufficient to count rotations across (T1+T2) while
+    // always selecting the same list. A pinned/failing preferred list MUST NOT
+    // prevent eviction from the other list.
+    if rotations_t1 >= |T1| AND rotations_t2 >= |T2|:
       capacity_overflow += 1
       return  // caller inserts without evicting
 
-    if |T1| > 0 AND (|T1| > p OR (|T1| == p AND target_key IN B2)):
+    prefer_t1 = |T1| > 0 AND (|T1| > p OR (|T1| == p AND target_key IN B2))
+
+    if prefer_t1 AND rotations_t1 < |T1|:
       // Evict the LRU page of T1 (recency list)
       candidate = T1.front()
       if candidate.ref_count > 0:
         T1.rotate_front_to_back()  // skip pinned; try next
-        rotations += 1
+        rotations_t1 += 1
         continue
       if candidate.dirty:
         if flush_dirty_page(candidate).is_err():
@@ -8634,29 +8663,32 @@ REPLACE(cache, target_key):
           // rather than evicting an unflushed dirty page (data loss).
           // flush_dirty_page() restores the dirty flag on failure (§6.6).
           T1.rotate_front_to_back()
-          rotations += 1
+          rotations_t1 += 1
           continue
       (evicted_key, evicted_page) = T1.pop_front()
       B1.push_back(evicted_key)    // remember in ghost list
       total_bytes -= evicted_page.byte_size
       return
-    else:
+    else if |T2| > 0 AND rotations_t2 < |T2|:
       // Evict the LRU page of T2 (frequency list)
-      if |T2| == 0: panic("cache underflow: no evictable pages")
       candidate = T2.front()
       if candidate.ref_count > 0:
         T2.rotate_front_to_back()
-        rotations += 1
+        rotations_t2 += 1
         continue
       if candidate.dirty:
         if flush_dirty_page(candidate).is_err():
           T2.rotate_front_to_back()
-          rotations += 1
+          rotations_t2 += 1
           continue
       (evicted_key, evicted_page) = T2.pop_front()
       B2.push_back(evicted_key)
       total_bytes -= evicted_page.byte_size
       return
+    else:
+      // Preferred list is exhausted (all pinned/failed candidates) or empty.
+      // Fall through and retry: the safety valve will eventually trigger.
+      continue
 ```
 
 **Dirty flush under mutex (design note):** The `flush_dirty_page()` calls above
@@ -12256,6 +12288,15 @@ DELETE, SELECT). Each statement can reference `OLD`, `NEW`, and
 When enabled, a trigger can cause itself to fire again. Maximum recursion
 depth is controlled by `SQLITE_MAX_TRIGGER_DEPTH` (default 1000).
 
+**Implementation directive (Rust safety):** Trigger execution MUST NOT use Rust
+call-stack recursion. It MUST be implemented with an explicit, heap-allocated
+frame stack (e.g., a `Vec<VdbeFrame>` of nested VDBE frames/subprograms) so the
+depth limit is enforced deterministically and cannot cause a stack overflow in
+safe Rust. In addition to the depth limit, the engine MUST enforce a
+capability-budgeted memory ceiling for nested frames via `Cx` (e.g., total
+register-file bytes across frames); exceeding the budget MUST fail cleanly
+(`SQLITE_NOMEM` or `SQLITE_LIMIT`), not crash.
+
 ### 12.9 DDL: Other
 
 **ALTER TABLE:**
@@ -14454,8 +14495,18 @@ schedule-sensitive, and we use distribution-free calibration and anytime-valid
 monitors from asupersync's lab toolkit.
 
 1. **Baseline establishment:** Run each benchmark scenario across
-   `N_base >= 30` deterministic schedule seeds and record the chosen statistic
-   (median/p95/p99 latency, throughput, alloc counts, syscall counts).
+   `N_base >= ceil(M / alpha_total)` deterministic schedule seeds and record
+   the chosen statistic (median/p95/p99 latency, throughput, alloc counts,
+   syscall counts). For the canonical configuration (M=12 metrics,
+   alpha_total=0.01, Bonferroni), this requires `N_base >= 1200`. For a
+   faster development loop, use a relaxed configuration (M=12,
+   alpha_total=0.10) requiring only `N_base >= 120`.
+   **Rationale:** split conformal prediction at per-metric alpha requires
+   `n >= ceil(1/alpha) - 1` calibration samples. Under Bonferroni with M
+   metrics, per-metric alpha = alpha_total/M. With too few samples (e.g.,
+   n=30 at alpha=0.0008), the conformal bound degenerates to the sample
+   maximum, achieving only `n/(n+1)` coverage (~96.8% for n=30) — far
+   below the 99.92% required by the per-metric alpha.
 2. **Split conformal "no regression" bound (distribution-free):** For each
    metric, compute an upper prediction bound `U_alpha` from baseline samples
    using split conformal quantiles (as in `asupersync::lab::conformal`):
