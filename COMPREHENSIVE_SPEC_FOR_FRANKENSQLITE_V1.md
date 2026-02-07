@@ -328,7 +328,7 @@ cannot silently downgrade.
   `safe_gc_seq` horizons.
 - PostgreSQL has proven SSI viable in production since 2011 with <7% overhead
   and ~0.5% false positive abort rate. At page granularity, our false positive
-  rate will be somewhat higher, but algebraic write merging (Section 5.10)
+  rate will be somewhat higher, but the safe write-merge ladder (Section 5.10)
   compensates by turning many apparent conflicts into successful merges.
 - Starting with SSI from day one means we never ship a correctness regression.
   We can always *reduce* abort rates later (finer witness keys + refinement,
@@ -389,7 +389,7 @@ exactly-K decoding; that overstates the guarantee by ~100x. Our V1 policy
 The RFC 6330 specification defines behavior for source blocks containing up
 to 56,403 source symbols (K_max = 56403). Each symbol is a contiguous block
 of T octets. For FrankenSQLite, T = page_size (typically 4096 bytes), so a
-single source block can cover up to 56,403 pages, or approximately 220MB of
+single source block can cover up to 56,403 pages, or ~220 MiB (231 MB) of
 database content. Larger databases are partitioned into multiple source blocks
    (see Section 3.4.3).
 
@@ -4369,6 +4369,14 @@ corresponding version chain entries. Without this ordering, a reader could
 take a snapshot that includes `commit_seq = N` but traverse stale version
 chains that do not yet reflect commit N's versions, violating INV-6.
 
+*Cross-process note:* The Acquire/Release ordering above governs the
+in-process buffer pool. Cross-process visibility is handled by the WAL layer
+(§11.9): WAL frames are durable on disk before the WAL index (shared memory)
+is updated. A reader in another process loads the WAL index with Acquire
+semantics (via `mmap` + memory barriers or `read()`) and then reads WAL
+frames from the file, which are guaranteed to be present because the writer
+flushed them before updating the index.
+
 *Violation consequence:* Partial visibility means a reader could see some of
 a transaction's writes but not others, observing an inconsistent state. For
 example, a transfer between two accounts might show the debit but not the
@@ -4784,6 +4792,13 @@ reclaimable by GC Safety (Theorem 4). Total retained versions per page:
 this is ~20MB per hot page. In practice, most pages are not written by every
 transaction, so actual memory usage is much lower.
 
+**Caveat (non-steady-state):** Theorem 5 assumes constant `R` and `D`. Under
+burst workloads (e.g., batch import at `R = 10,000 commits/s`) or long-running
+analytics queries (`D = 30s`), the bound grows proportionally. For production
+capacity planning, use the p99.9 of observed `D` and peak `R` with a 2x safety
+margin. If version chain length exceeds the configured threshold, the adaptive
+GC controller (§5.6.3) increases GC frequency to compensate.
+
 ---
 
 **Theorem 6 (Liveness):** Every transaction either commits or aborts in
@@ -4899,7 +4914,10 @@ TxnSlot := {
     has_out_rw      : AtomicBool,    -- SSI: has outgoing rw-antidependency
     marked_for_abort: AtomicBool,    -- SSI: eager pivot abort signal (optimization)
     write_set_pages : AtomicU32,     -- count of pages in write set (for GC sizing)
-    _padding        : [u8; 64],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
+    claiming_timestamp: AtomicU64,   -- unix timestamp when Phase 1 CAS set TXN_ID_CLAIMING;
+                                   -- used by cleanup to detect stuck CLAIMING slots (§5.6.2).
+                                   -- Written BEFORE the Phase 1 CAS; zeroed when slot is freed.
+    _padding        : [u8; 56],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
 }
 ```
 
@@ -4946,15 +4964,34 @@ orphaned (lease expires, and the owning process is no longer alive). Any process
 this and clean up:
 
 ```
+const CLAIMING_TIMEOUT_SECS: u64 = 5;  // no valid Phase 1->Phase 2 takes 5s
+
 cleanup_orphaned_slots():
     now = unix_timestamp()
     for slot in txn_slots:
         if slot.txn_id == TXN_ID_CLAIMING:
             // Slot is being claimed by another process (Phase 1 of acquire).
-            // Only clean up if lease has expired AND process is dead — same
-            // as for normal slots. The sentinel is treated as a valid txn_id
-            // for cleanup purposes.
-            pass  // fall through to the same lease check below
+            //
+            // CRITICAL: If a process crashes between Phase 1 (CAS 0 ->
+            // TXN_ID_CLAIMING) and Phase 2 (write pid/lease_expiry), the
+            // slot's pid/pid_birth/lease_expiry fields are STALE (they
+            // belong to the previous occupant, or are zero for a fresh slot).
+            // We MUST NOT rely on those fields for CLAIMING-state cleanup.
+            //
+            // Instead, use a dedicated timeout: if the slot has been in
+            // CLAIMING state for longer than CLAIMING_TIMEOUT_SECS, the
+            // claimer is presumed dead. 5 seconds is orders of magnitude
+            // longer than any valid Phase 1 -> Phase 2 transition (~μs).
+            if slot.claiming_timestamp != 0
+               AND now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
+                if slot.txn_id.CAS(TXN_ID_CLAIMING, 0):
+                    slot.pid = 0
+                    slot.pid_birth = 0
+                    slot.lease_expiry = 0
+                    slot.claiming_timestamp = 0
+                continue  // skip the lease/liveness check — fields are stale
+            else:
+                continue  // CLAIMING recently; give the claimer time
         if slot.txn_id != 0 AND slot.lease_expiry < now:
             // Lease expired -- check whether the owning process still exists.
             // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
@@ -4969,10 +5006,30 @@ cleanup_orphaned_slots():
                 release_page_locks_for(old_txn_id)
                 slot.state = Aborted
                 slot.commit_seq = 0
-                slot.txn_id = 0    // Free the slot (Release ordering)
+                slot.pid = 0             // Zero stale metadata to prevent
+                slot.pid_birth = 0       // future CLAIMING-crash scenarios
+                slot.lease_expiry = 0    // from reading ghost values.
+                slot.claiming_timestamp = 0
+                slot.txn_id = 0    // Free the slot (Release ordering, LAST)
+```
+
+The three-phase acquire protocol (Phase 1) MUST set `claiming_timestamp`
+atomically with the CAS:
+
+```
+// Phase 1: claim the slot
+slot.claiming_timestamp = unix_timestamp()  // set BEFORE CAS
+if !slot.txn_id.CAS(0, TXN_ID_CLAIMING):
+    continue  // slot taken by another process
+// Phase 2: initialize fields (pid, pid_birth, lease_expiry, etc.)
+// Phase 3: publish real TxnId
 ```
 
 `process_alive(pid, pid_birth)` is platform-specific:
+- **MUST return `false` immediately if `pid == 0`.** On Unix, `kill(0, 0)`
+  signals the calling process's entire process group (POSIX §3.3.2), not
+  PID 0. It returns success because the group exists, which would
+  incorrectly prevent cleanup of zero-initialized or freed slots.
 - Unix: use `kill(pid, 0)` to check existence (treat `EPERM` as "alive"), AND
   verify the process start time matches `pid_birth` (prevents PID reuse bugs).
 - Windows: check process handle liveness and creation time.
@@ -5598,9 +5655,12 @@ ssi_validate_and_publish(T):
   //    incoming rw edge (T_other.has_in_rw = true), then T_other is now
   //    a confirmed pivot and must be aborted.
   //
-  //    Implementation: scan out_edges (where T is the "T3" that wrote
-  //    over what T_other read). For each such T_other:
-  for T_other in out_edges.source_txns():    // T_other -rw-> T (T_other read, T wrote)
+  //    Implementation: scan in_edges (which represent R -rw-> T: some R
+  //    read a page that T later wrote). For each such R, R now has an
+  //    outgoing rw edge, so set R.has_out_rw = true. If R also has an
+  //    incoming edge (R.has_in_rw), then R is a pivot: T_x -> R -> T.
+  for T_other in in_edges.source_txns():    // T_other -rw-> T (T_other read, T wrote)
+      T_other.has_out_rw = true              // T_other now has an outgoing rw edge to T
       if T_other.has_in_rw:
           // T_other is now a pivot: T_x -> T_other -> T (and T is committing)
           T_other.marked_for_abort = true     // eager abort optimization
@@ -5630,12 +5690,14 @@ T1 -rw-> T2 -rw-> T3
 where:
 - `T1` read something that `T2` later wrote (T1 -rw-> T2)
 - `T2` read something that `T3` later wrote (T2 -rw-> T3)
-- `T3` committed before `T1` in the serialization order
+- At least one of `T1` or `T3` has already committed
 
-This implies a cycle: `T1` must precede `T2` (because `T1` did not see `T2`'s
-write), `T2` must precede `T3` (same reason), but `T3` must precede `T1`
-(because `T3` committed first and `T1` should have seen its write but did not,
-due to snapshot isolation).
+This implies a potential cycle: `T1` must precede `T2` (because `T1` did not
+see `T2`'s write), `T2` must precede `T3` (same reason), but if `T3` committed
+before `T1`'s snapshot, then `T3` should precede `T1` in the serial order,
+closing the cycle. The condition `(T1 committed OR T3 committed)` ensures that
+the cycle is unavoidable -- if both are still active, the system could still
+reorder them to avoid the anomaly.
 
 Formally, the dangerous structure exists when:
 ```
@@ -8814,7 +8876,7 @@ parse_statement()              -> Statement
 | 1 (lowest) | OR | Left |
 | 2 | AND | Left |
 | 3 | NOT (prefix) | Right |
-| 4 | =, ==, !=, <>, IS, IS NOT, IN, LIKE, GLOB, BETWEEN, MATCH, REGEXP | Left |
+| 4 | =, ==, !=, <>, IS, IS NOT, IN, LIKE, GLOB, BETWEEN, MATCH, REGEXP, ISNULL, NOTNULL, NOT NULL | Left |
 | 5 | <, <=, >, >= | Left |
 | 6 | ESCAPE | Right |
 | 7 | &, \|, <<, >> | Left |
@@ -9660,9 +9722,10 @@ The DO UPDATE SET clause can reference both `excluded.*` and the original
 table columns.
 
 **RETURNING clause** (SQLite 3.35+): Returns the rows actually inserted,
-including any default values, autoincrement values, and trigger-generated
-modifications. Each returned row has columns matching the result-column
-list. The RETURNING clause is processed after triggers.
+including any default values and autoincrement values. The returned values
+reflect BEFORE-trigger modifications (since those run before the DML) but
+do NOT reflect AFTER-trigger modifications. Each returned row has columns
+matching the result-column list.
 
 **Multi-row VALUES:** `VALUES (1,'a'), (2,'b'), (3,'c')` inserts three
 rows atomically within the same statement. The VDBE generates a loop over
@@ -10003,23 +10066,24 @@ Full expression grammar including all operators by precedence (highest first):
 
 | Precedence | Operators | Assoc |
 |-----------|-----------|-------|
-| 1 (highest) | `COLLATE` (postfix collation override) | Left |
-| 2 | `~` (bitwise NOT), unary `+`, unary `-` | Right |
+| 1 (highest) | `~` (bitwise NOT), unary `+`, unary `-` | Right |
+| 2 | `COLLATE` (postfix collation override) | Left |
 | 3 | `\|\|` (string concat), `->`, `->>` (JSON extract) | Left |
 | 4 | `*`, `/`, `%` | Left |
 | 5 | `+`, `-` | Left |
 | 6 | `<<`, `>>`, `&`, `\|` | Left |
 | 7 | `ESCAPE` | Right |
 | 8 | `<`, `<=`, `>`, `>=` | Left |
-| 9 | `=`, `==`, `!=`, `<>`, `IS`, `IS NOT`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`, `IN`, `LIKE`, `GLOB`, `MATCH`, `REGEXP`, `BETWEEN` | Left |
+| 9 | `=`, `==`, `!=`, `<>`, `IS`, `IS NOT`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`, `IN`, `LIKE`, `GLOB`, `MATCH`, `REGEXP`, `BETWEEN`, `ISNULL`, `NOTNULL`, `NOT NULL` | Left |
 | 10 | `NOT` (prefix logical negation -- lower than comparisons: `NOT x = y` parses as `NOT (x = y)`) | Right |
 | 11 | `AND` | Left |
 | 12 (lowest) | `OR` | Left |
 
 **IMPORTANT:** `NOT` is NOT at the same precedence as unary `~`/`+`/`-`.
 In SQLite, `NOT x = y` means `NOT (x = y)`, not `(NOT x) = y`. This
-matches the SQLite source grammar (parse.y) and documentation. `COLLATE`
-binds tighter than everything: `-x COLLATE NOCASE` is `-(x COLLATE NOCASE)`.
+matches the SQLite source grammar (parse.y) and documentation. Unary
+operators bind tighter than `COLLATE`: `-x COLLATE NOCASE` parses as
+`(-x) COLLATE NOCASE`, not `-(x COLLATE NOCASE)`.
 
 **Special expression forms:**
 - `CAST(expr AS type-name)` -- explicit type conversion
@@ -12824,6 +12888,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.12 (JSONB node types corrected with float5/reserved; JSONB size claim fixed; R\*-Tree naming; FTS3/4 feature matrix; birthday paradox examples fixed; Zipf formula rewritten; byte-level conflict clarified; retry policy; PageVersion xxh3 clarified; math compile flag; geopoly\_xform)*
+*Document version: 1.13 (Write-merge hardening: forbid raw byte-disjoint XOR merge on SQLite structured pages; SAFE merge ladder clarified (intent replay + structured patches); PRAGMA fsqlite.write_merge added; commit pseudocode + conflict model updated)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
