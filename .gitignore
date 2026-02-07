@@ -1,0 +1,46 @@
+# Rust / Cargo build artifacts
+/target/
+**/target/
+
+# Cargo lock is committed (workspace contains binary crate fsqlite-cli)
+# Cargo.lock
+
+# Editor and IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+.zed/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Rust-specific
+**/*.rs.bk
+
+# Profiling and coverage
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+coverage/
+
+# Benchmarking output
+criterion/
+
+# Fuzz corpus and artifacts
+fuzz/corpus/
+fuzz/artifacts/
+
+# Debug and log files
+*.log
+
+# Snapshot testing review artifacts
+*.snap.new
+
+# Claude Code / AI agent ephemeral files
+.claude/

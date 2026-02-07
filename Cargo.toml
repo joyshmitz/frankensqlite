@@ -1,0 +1,103 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+    "crates/fsqlite-types",
+    "crates/fsqlite-error",
+    "crates/fsqlite-vfs",
+    "crates/fsqlite-pager",
+    "crates/fsqlite-wal",
+    "crates/fsqlite-mvcc",
+    "crates/fsqlite-btree",
+    "crates/fsqlite-ast",
+    "crates/fsqlite-parser",
+    "crates/fsqlite-planner",
+    "crates/fsqlite-vdbe",
+    "crates/fsqlite-func",
+    "crates/fsqlite-ext-fts3",
+    "crates/fsqlite-ext-fts5",
+    "crates/fsqlite-ext-rtree",
+    "crates/fsqlite-ext-json",
+    "crates/fsqlite-ext-session",
+    "crates/fsqlite-ext-icu",
+    "crates/fsqlite-ext-misc",
+    "crates/fsqlite-core",
+    "crates/fsqlite",
+    "crates/fsqlite-cli",
+    "crates/fsqlite-harness",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/frankensqlite"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cast_precision_loss = { level = "allow", priority = 1 }
+doc_markdown = { level = "allow", priority = 1 }
+missing_const_for_fn = { level = "allow", priority = 1 }
+uninlined_format_args = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }
+module_name_repetitions = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }
+option_if_let_else = { level = "allow", priority = 1 }
+
+[workspace.dependencies]
+# Internal crates
+fsqlite-types = { path = "crates/fsqlite-types" }
+fsqlite-error = { path = "crates/fsqlite-error" }
+fsqlite-vfs = { path = "crates/fsqlite-vfs" }
+fsqlite-pager = { path = "crates/fsqlite-pager" }
+fsqlite-wal = { path = "crates/fsqlite-wal" }
+fsqlite-mvcc = { path = "crates/fsqlite-mvcc" }
+fsqlite-btree = { path = "crates/fsqlite-btree" }
+fsqlite-ast = { path = "crates/fsqlite-ast" }
+fsqlite-parser = { path = "crates/fsqlite-parser" }
+fsqlite-planner = { path = "crates/fsqlite-planner" }
+fsqlite-vdbe = { path = "crates/fsqlite-vdbe" }
+fsqlite-func = { path = "crates/fsqlite-func" }
+fsqlite-ext-fts3 = { path = "crates/fsqlite-ext-fts3" }
+fsqlite-ext-fts5 = { path = "crates/fsqlite-ext-fts5" }
+fsqlite-ext-rtree = { path = "crates/fsqlite-ext-rtree" }
+fsqlite-ext-json = { path = "crates/fsqlite-ext-json" }
+fsqlite-ext-session = { path = "crates/fsqlite-ext-session" }
+fsqlite-ext-icu = { path = "crates/fsqlite-ext-icu" }
+fsqlite-ext-misc = { path = "crates/fsqlite-ext-misc" }
+fsqlite-core = { path = "crates/fsqlite-core" }
+fsqlite = { path = "crates/fsqlite" }
+fsqlite-cli = { path = "crates/fsqlite-cli" }
+fsqlite-harness = { path = "crates/fsqlite-harness" }
+
+# External dependencies
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+bitflags = "2.9"
+smallvec = "1.13"
+memchr = "2.7"
+parking_lot = "0.12"
+sha2 = "0.10"
+
+# Dev dependencies
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.6"
+insta = { version = "1.42", features = ["json", "yaml"] }
+tempfile = "3.17"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
