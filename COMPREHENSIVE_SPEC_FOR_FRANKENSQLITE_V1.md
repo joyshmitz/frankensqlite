@@ -7701,10 +7701,24 @@ rebase replay:
 3. For each `(col_idx, rebase_expr)` in `column_updates`: evaluate `rebase_expr`
    against the new base row's column values. `ColumnRef(i)` resolves to column `i`
    of the new base row, not the original snapshot row.
-4. Produce the updated row record from the new base row with the evaluated column
-   updates applied. Emit as a page delta.
-5. Type affinity coercion follows standard SQLite rules (§3.1 of the SQLite file
+4. Type affinity coercion follows standard SQLite rules (§3.1 of the SQLite file
    format documentation). NULL propagation follows SQL semantics.
+5. Produce the updated row record from the new base row with the evaluated column
+   updates applied. Emit as a page delta.
+6. **Index regeneration (critical):** Any `IndexDelete`/`IndexInsert` ops in the
+   original intent log that are associated with this `UpdateExpression` (same
+   `table`, same `rowid`) carry stale key bytes derived from the original snapshot
+   and MUST be discarded during rebase. Instead, the rebase engine MUST regenerate
+   index operations from the schema:
+   a. For each secondary index covering any column in `column_updates`:
+      compute the old index key from the *new base row's* column values and the
+      new index key from the *updated row's* column values.
+   b. If old key ≠ new key: emit `IndexDelete(index, old_key, rowid)` followed by
+      `IndexInsert(index, new_key, rowid)`.
+   c. If old key == new key: no index operation needed (the column change did not
+      affect this index's key).
+   The rebase engine has access to the schema (needed for affinity coercion in
+   step 4) and MUST use it to enumerate affected indexes.
 
 **VDBE codegen rules for `UpdateExpression` emission (normative):**
 
@@ -7716,6 +7730,9 @@ with the row read in `footprint.reads`) when ALL of:
   so the full statement semantics are preserved.
 - The WHERE clause resolves to a point lookup by rowid or integer primary key
   (not a range scan, not a secondary index scan with multiple candidates).
+- No SET clause targets the rowid or INTEGER PRIMARY KEY column. Modifying the
+  primary key changes the row's position in the B-tree (semantically a DELETE +
+  INSERT) and cannot be expressed as a column-level `UpdateExpression`.
 - All SET expressions pass `expr_is_rebase_safe()` (§5.10.1): pure, deterministic,
   no subqueries, no non-deterministic functions.
 - The transaction has no prior explicit read of the same row (via SELECT or
@@ -7900,9 +7917,12 @@ For SAFE merges, an additional restriction applies:
   implicit column reads are captured in `RebaseExpr` and are NOT in `footprint.reads`,
   so this condition is satisfied.)
 
-**`UpdateExpression` commutativity refinement:** Two `UpdateExpression` ops `a, b`
-targeting the same `(table, key)` are independent iff their `column_updates` sets
-are disjoint by `ColumnIdx`:
+**`UpdateExpression` commutativity refinement:** `SemanticKeyRef` is row-granularity,
+so two `UpdateExpression` ops on the same `(table, key)` have `Writes(a) ∩ Writes(b)
+≠ ∅` at the `SemanticKeyRef` level. This refinement overrides the base `Writes`
+disjointness condition for pairs of `UpdateExpression` ops with a column-level check:
+two `UpdateExpression` ops `a, b` targeting the same `(table, key)` are independent
+iff their `column_updates` sets are disjoint by `ColumnIdx`:
 - `columns_written(a) ∩ columns_written(b) = ∅`
 
 where `columns_written(x) := { col_idx | (col_idx, _) in x.column_updates }`.
@@ -14773,6 +14793,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.24 (Round 7 audit: missing JSON functions added (jsonb, json_array_length, json_error_position, json_pretty, jsonb_* variants); FTS5 config §14.2.7 added (merge/storage/maintenance commands, contentless-delete, fts5vocab, secure-delete); Case IV eviction safety valve added; flush_to_wal→flush_dirty_page naming harmonized; SSI overhead corrected to 3–7% OLTP / 10–20% microbenchmark with Ports&Grittner citation; Budget "product meet-semilattice" corrected to mixed meet/join lattice; write skew example arithmetic fixed (-80 not -30); unsafe_code="forbid" vs _mm_prefetch contradiction resolved via helper crate; SQLite 3.52.0 noted as forward target; line count corrected to ~238K; NGQP characterized as N3 bounded algorithm not backtracking; parse.y description corrected with Lemon departure note; VDBE p5 "upper 8 bits zero" claim relaxed; cost model formulas improved with ANALYZE note and covering index seek.)*
+*Document version: 1.25 (Round 8 audit: conformal control for group-commit batch sizing; durability "living bounds" (Bayes posterior + conservative p_upper) integrated into the durability contract; TxnSlot lease semantics corrected (heartbeat, not txn deadline) + `txn_max_duration` derived via survival analysis for Theorem 5; retry policy reframed as optimal stopping / Gittins-index threshold; workload-adaptive compaction policy via MDP; online Zipf s estimation added; PAC-Bayes harness bound for page-level SSI false positives; PolicyController VOI budgeting clarified.)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
