@@ -2131,6 +2131,46 @@ DbFecHeader := {
 The group lookup function `find_page_group_from_db_fec(pgno)` MUST be computed
 from `DbFecHeader` and MUST NOT depend on page 1 bytes.
 
+**Compatibility `.db-fec` physical layout (required; O(1) seek):**
+
+`foo.db-fec` is not an append-only log. It is a deterministic, random-access
+sidecar so the read path can locate the relevant group metadata without scanning.
+
+Layout:
+
+1. `DbFecHeader` at byte offset 0.
+2. Immediately after the header, a fixed segment for the page-1 group:
+   - `DbFecGroupMeta(start_pgno=1, group_size=1, r_repair=header_page_r_repair)`
+   - followed by `header_page_r_repair` repair `SymbolRecord`s (ESIs `K..K+R-1`).
+3. After that, fixed-size segments for full groups of size `G=default_group_size`
+   starting at page 2:
+   - for group `g` (0-based), `start_pgno = 2 + g*G`
+   - segment contains:
+     - `DbFecGroupMeta(start_pgno, group_size=K_g, r_repair=default_r_repair)`
+     - followed by `default_r_repair` repair `SymbolRecord`s
+
+Where `K_g = min(G, db_size_pages - start_pgno + 1)` and `db_size_pages` is
+derived from the `.db` file length (`stat(db).len / page_size`) so it does not
+depend on page 1 contents.
+
+**Segment offset computation (normative):**
+
+- Let `SEG1_LEN` be the byte length of the page-1 segment (derivable from
+  `DbFecHeader` and `SymbolRecord` size with `T=page_size`).
+- Let `SEGG_LEN` be the byte length of a full group segment with `K=G` and
+  `R=default_r_repair`.
+
+Then for any page `pgno >= 2`, the segment offset is:
+
+```
+g = (pgno - 2) / G
+segment_off = sizeof(DbFecHeader) + SEG1_LEN + g * SEGG_LEN
+```
+
+The last group may have `K_g < G` and thus a shorter `DbFecGroupMeta`, but its
+segment MUST still start at the computed `segment_off`. This keeps offsets for
+all groups stable and seekable.
+
 **Critical correctness hazard (mutable pages; normative):**
 
 Erasure repair symbols for a group are a function of **all** source pages in the
@@ -2314,6 +2354,17 @@ DbFecGroupMeta := {
   `.db-fec` is updated for the affected page groups before it performs any WAL
   operation that would discard the newest committed version of those pages
   (`RESTART` / `TRUNCATE`), per the WAL truncation safety rule above.
+- **Crash-consistent group update (required):** Updating a group segment MUST use
+  a "meta-is-commit-record" discipline:
+  1. Write the new repair `SymbolRecord`s for the group (with the new `object_id`)
+     to their deterministic offsets in `.db-fec`.
+  2. `fdatasync`/`fsync` `.db-fec` MAY be deferred/batched, but the write order
+     MUST be preserved.
+  3. Write the new `DbFecGroupMeta` last (its checksum acts as the commit record).
+  4. `fsync` `.db-fec` before performing any WAL truncation that would rely on
+     the updated group for durability.
+  Readers MUST treat any group meta with invalid checksum as absent, and MUST
+  ignore any repair symbol whose `object_id`/`oti` does not match the active meta.
 - The checkpointer MAY compute group repair symbols by:
   - full recomputation: read the K source pages for the group and re-encode, or
   - incremental update: apply deltas to existing repair symbols using the
