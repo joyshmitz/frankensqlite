@@ -1,596 +1,849 @@
-# Plan to Port SQLite to Rust (FrankenSQLite)
+# Plan to Port SQLite to Rust
 
-## Overview
+## 1. Scope
 
-FrankenSQLite is a clean-room Rust reimplementation of SQLite 3.52.0, which comprises approximately 218,000 lines of C code in its amalgamation form. The goal is not a line-by-line translation but a principled reimplementation that leverages Rust's type system, memory safety guarantees, and concurrency primitives to produce a database engine that is fully compatible with SQLite's file format and SQL dialect while introducing a key architectural innovation: MVCC page-level versioning for truly concurrent writers.
+### What We Are Building
 
-SQLite's existing concurrency model permits unlimited concurrent readers but only a single writer at a time, enforced by file-level locking. FrankenSQLite replaces this with a multi-version concurrency control scheme operating at page granularity, allowing multiple writers to proceed in parallel as long as they do not modify the same pages. This unlocks significant throughput improvements for write-heavy workloads without sacrificing the simplicity and reliability that make SQLite the most widely deployed database engine in the world.
+FrankenSQLite is a **clean-room Rust reimplementation** of SQLite version 3.52.0.
+The reference C codebase is approximately 218,000 lines of C (core library, not
+counting test code or generated amalgamation). FrankenSQLite targets full SQL
+compatibility, file format round-trip interoperability with C SQLite, and a
+strictly safe Rust implementation (`unsafe_code = "forbid"` at workspace level).
 
-The target is full SQLite compatibility including all major extensions (FTS3/4/5, R-tree, JSON1, Session, ICU), the interactive CLI shell, and binary-level file format compatibility so that existing SQLite databases can be opened, read, and written by FrankenSQLite without any migration step.
+The project is organized as a Cargo workspace of **23 crates** under the
+`crates/` directory, following the same layout conventions used in the
+`frankentui` project.
 
-## Scope
+### The Key Innovation: MVCC Concurrent Writers
 
-### In Scope
+SQLite's single biggest architectural limitation is its write concurrency model.
+In WAL mode, a single exclusive lock byte (`WAL_WRITE_LOCK` at `wal.c:3698`)
+serializes all writers. Any connection attempting to write while another holds
+this lock receives `SQLITE_BUSY` and must retry.
 
-- **Complete SQL parser**: A hand-written recursive descent parser replacing the LEMON-generated `parse.y` used by C SQLite. The parser will produce a strongly-typed AST covering the full SQLite SQL dialect including CTEs, window functions, UPSERT, RETURNING, and all pragma statements.
-- **Full VDBE bytecode interpreter**: Reimplementation of the Virtual Database Engine with all 190+ opcodes. The VDBE is the heart of SQLite's execution model; every SQL statement is compiled to a program of VDBE opcodes that are then interpreted. FrankenSQLite will maintain opcode-level compatibility to ease testing and debugging.
-- **B-tree storage engine**: Complete implementation of SQLite's B-tree and B+tree structures with page-level operations. This includes interior pages, leaf pages, overflow pages, free-list management, and auto-vacuum support.
-- **WAL with MVCC-aware concurrent writers**: The Write-Ahead Log implementation will be extended to support multiple concurrent writers through page-level versioning. The WAL format will remain compatible with SQLite's WAL format for reader compatibility.
-- **All extensions**:
-  - FTS3/FTS4/FTS5 (full-text search with tokenizers, ranking, and auxiliary functions)
-  - R-tree (spatial indexing)
-  - JSON1 (JSON path queries, modification, and aggregation)
-  - Session (changeset/patchset generation and application)
-  - ICU (Unicode-aware collation and case folding)
-  - Miscellaneous functions (generate_series, csv, fileio, completion, etc.)
-- **CLI shell**: An interactive database shell built using frankentui, providing equivalent functionality to the `sqlite3` command-line tool including dot-commands, import/export, and query formatting.
-- **Conformance test suite**: A comprehensive test suite that runs against both FrankenSQLite and C SQLite to verify behavioral compatibility, targeting 95%+ compatibility on the SQLite test corpus.
+FrankenSQLite replaces this with **MVCC page-level versioning**:
 
-### Out of Scope (Initial Release)
+- **Multiple concurrent writers.** Two transactions modifying different B-tree
+  pages proceed in full parallel with zero contention.
+- **Snapshot isolation.** Each transaction captures a consistent point-in-time
+  view at BEGIN. Long-running readers never block writers.
+- **Page-level conflict detection.** When two transactions modify the same page,
+  the conflict is detected eagerly at write time (not deferred to commit).
+  First-committer-wins semantics with immediate `SQLITE_BUSY` for the second
+  writer -- no deadlocks are possible.
+- **Unlimited concurrent readers.** No `aReadMark[5]` limit. Any number of
+  readers can hold independent snapshots simultaneously.
+- **WAL append serialization.** The expensive part (B-tree modifications) runs
+  in parallel. Only the cheap part (sequential WAL frame appends) is serialized
+  via a mutex, preserving correctness with minimal contention.
 
-- **TCL test harness compatibility**: SQLite's primary test suite is written in TCL. Porting the TCL harness itself is out of scope; instead, we will build a Rust-native conformance suite that tests the same behaviors.
-- **Loadable extension API (dlopen)**: The initial release will not support dynamically loading shared library extensions at runtime. All extensions will be compiled in.
-- **Windows VFS**: The initial Virtual File System implementation will target Unix (Linux and macOS) only. Windows support will follow in a subsequent release.
-- **WebAssembly target**: Compiling FrankenSQLite to WASM for browser or edge deployment is a future goal but not part of the initial release.
+This design is similar in spirit to PostgreSQL's MVCC, but operates at page
+granularity rather than tuple granularity, matching the B-tree page-oriented
+storage architecture.
 
-## Architecture
-
-The project is organized as a Cargo workspace containing 23 crates under the `crates/` directory. This modular structure enforces clean dependency boundaries, enables parallel compilation, and allows individual components to be tested and documented in isolation.
-
-```
-frankensqlite/
-├── Cargo.toml                  # workspace root
-├── crates/
-│   ├── frankensqlite/          # public API facade (re-exports)
-│   ├── core/                   # fundamental types, error codes, constants
-│   ├── vfs/                    # Virtual File System abstraction
-│   ├── vfs-unix/               # Unix VFS implementation (open, read, write, lock, sync)
-│   ├── pager/                  # page cache and page management
-│   ├── wal/                    # Write-Ahead Log
-│   ├── mvcc/                   # MVCC page versioning, snapshot management, conflict detection
-│   ├── btree/                  # B-tree and B+tree implementation
-│   ├── schema/                 # schema representation, sqlite_master parsing
-│   ├── lexer/                  # SQL tokenizer/lexer
-│   ├── parser/                 # recursive descent SQL parser
-│   ├── ast/                    # typed AST nodes for all SQL statements
-│   ├── analyzer/               # semantic analysis, name resolution, type checking
-│   ├── planner/                # query planner and optimizer
-│   ├── vdbe/                   # bytecode definitions, compiler, interpreter
-│   ├── func/                   # built-in SQL functions (core, date/time, math, aggregate)
-│   ├── fts5/                   # FTS5 full-text search extension
-│   ├── fts3/                   # FTS3/FTS4 full-text search extensions
-│   ├── rtree/                  # R-tree spatial index extension
-│   ├── json/                   # JSON1 extension
-│   ├── session/                # Session extension (changesets)
-│   ├── icu/                    # ICU Unicode extension
-│   └── shell/                  # CLI shell application
-├── tests/                      # integration and conformance tests
-└── benches/                    # benchmarks
-```
-
-### Key Architectural Principles
-
-- **All async I/O via asupersync**: The asupersync crate provides the async runtime, channels, and synchronization primitives used throughout FrankenSQLite. All file I/O, inter-thread communication, and timer-based operations go through asupersync, ensuring a consistent and testable async model.
-- **TUI via frankentui**: The interactive CLI shell is built on frankentui, which provides terminal rendering, input handling, line editing, and syntax highlighting.
-- **Unsafe code forbidden at workspace level**: The workspace-level `Cargo.toml` sets `#![forbid(unsafe_code)]` as a default. Any crate that genuinely requires unsafe (such as `vfs-unix` for raw syscalls) must explicitly opt in with a documented justification. The vast majority of the codebase will be safe Rust.
-- **Zero-copy where possible**: Page buffers, string slices, and blob data use borrowing and arena allocation to minimize copying. The pager hands out `&[u8]` references to pinned page buffers rather than copying page contents.
-- **Strong typing over runtime checks**: SQL types, opcode arguments, page numbers, and error codes are represented as distinct Rust types (newtypes, enums) rather than bare integers, catching misuse at compile time.
-
-## Phases
-
-### Phase 1: Bootstrap & Spec Extraction
-
-**Duration**: 2 weeks
-**Goal**: Set up the workspace, extract specifications from SQLite source, and establish foundational types.
-
-Deliverables:
-- Cargo workspace with all 23 crate stubs created and compiling
-- CI pipeline running `cargo check`, `cargo clippy`, `cargo fmt --check`, and `cargo test`
-- `core` crate with:
-  - All SQLite error codes as a Rust enum (`SQLITE_OK`, `SQLITE_ERROR`, `SQLITE_BUSY`, etc.)
-  - Page size constants and limits
-  - File format magic bytes and header structure
-  - Type affinity definitions
-  - Collation sequence identifiers
-- Specification documents extracted from SQLite source comments and documentation:
-  - File format specification (header, pages, cells, overflow, freelist)
-  - WAL format specification (header, frames, checkpoints)
-  - VDBE opcode catalog with semantics
-  - B-tree invariants and algorithms
-- `Result<T>` type alias and error conversion traits
-
-### Phase 2: Core Types & Storage Foundation
-
-**Duration**: 3 weeks
-**Goal**: Implement the VFS abstraction, pager, and page cache.
-
-Deliverables:
-- `vfs` crate:
-  - `Vfs` trait with methods for open, delete, access, full_pathname, randomness, sleep, current_time
-  - `VfsFile` trait with methods for read, write, truncate, sync, file_size, lock, unlock, check_reserved_lock
-  - Lock level enum: None, Shared, Reserved, Pending, Exclusive
-  - In-memory VFS implementation for testing
-- `vfs-unix` crate:
-  - Full Unix VFS implementation using POSIX file I/O
-  - Advisory locking via `fcntl(F_SETLK)`
-  - `fsync` / `fdatasync` for durability
-  - Shared memory for WAL index (`mmap` of `-shm` file)
-- `pager` crate:
-  - Page cache with configurable size (default 2000 pages)
-  - LRU eviction policy with dirty-page write-back
-  - Page acquisition: `get_page(pgno) -> &Page`
-  - Page modification: `write_page(pgno) -> &mut Page`
-  - Journal/WAL integration points (stubbed)
-  - Page reference counting
-- Database header parsing and validation (first 100 bytes)
-- Unit tests for VFS operations, page cache eviction, and header parsing
-
-### Phase 3: B-Tree & SQL Parser
-
-**Duration**: 5 weeks
-**Goal**: Implement the B-tree storage engine and the complete SQL parser.
-
-Deliverables:
-- `btree` crate:
-  - B+tree for table storage (integer keys, data in leaves)
-  - B-tree for index storage (arbitrary keys, no data)
-  - Cell parsing and serialization (record format with type codes and serial types)
-  - Page splitting and merging (maintaining balance)
-  - Overflow page chains for large records
-  - Cursor abstraction: `BtCursor` with `move_to`, `next`, `previous`, `insert`, `delete`
-  - Free-list management (trunk pages and leaf pages)
-  - Interior page binary search
-  - Support for WITHOUT ROWID tables (index-organized tables)
-- `lexer` crate:
-  - Hand-written tokenizer producing token stream
-  - All SQLite token types: keywords (150+), operators, literals, identifiers
-  - String literal handling (single-quoted, with escape sequences)
-  - Blob literal handling (X'...')
-  - Numeric literal handling (integer, float, hex)
-  - Identifier quoting (double-quotes, backticks, square brackets)
-  - Comment handling (single-line `--` and multi-line `/* */`)
-  - Position tracking for error reporting
-- `parser` crate:
-  - Recursive descent parser for all SQLite SQL statements
-  - SELECT (with joins, subqueries, compound operators UNION/INTERSECT/EXCEPT)
-  - INSERT (with DEFAULT VALUES, ON CONFLICT/UPSERT, RETURNING)
-  - UPDATE (with FROM clause, RETURNING)
-  - DELETE (with RETURNING)
-  - CREATE TABLE/INDEX/VIEW/TRIGGER
-  - ALTER TABLE (ADD COLUMN, RENAME COLUMN, RENAME TABLE, DROP COLUMN)
-  - DROP TABLE/INDEX/VIEW/TRIGGER
-  - All expression types: arithmetic, comparison, logical, CASE, CAST, BETWEEN, IN, EXISTS, subquery, function call, window function, collate, aggregate
-  - PRAGMA statements
-  - ATTACH/DETACH
-  - BEGIN/COMMIT/ROLLBACK/SAVEPOINT/RELEASE
-  - EXPLAIN and EXPLAIN QUERY PLAN
-  - CREATE VIRTUAL TABLE
-- `ast` crate:
-  - Strongly-typed AST nodes for every statement and expression type
-  - Visitor pattern for AST traversal and transformation
-  - Pretty-printer for AST-to-SQL round-tripping
-- `schema` crate:
-  - Parsing of `sqlite_master` table entries
-  - Schema object representation (Table, Index, View, Trigger)
-  - Column definition with type affinity, constraints, default values
-  - Index column list with collation and sort order
-- Unit tests: parser round-trip tests, B-tree insert/delete/search tests
-
-### Phase 4: VDBE & Query Pipeline
-
-**Duration**: 5 weeks
-**Goal**: Implement the VDBE bytecode interpreter, query planner, and public API.
-
-Deliverables:
-- `vdbe` crate:
-  - Opcode enum with all 190+ opcodes
-  - `VdbeOp` struct: opcode, p1, p2, p3, p4, p5
-  - Register file: `Vec<Value>` with dynamic typing
-  - Value type: Null, Integer(i64), Real(f64), Text(String), Blob(Vec<u8>)
-  - Bytecode compiler from AST to VDBE program
-  - Bytecode interpreter main loop (`step()` function)
-  - Core opcodes implemented:
-    - Control flow: Init, Goto, If, IfNot, Halt, Return, Gosub
-    - Comparison: Eq, Ne, Lt, Le, Gt, Ge, Compare, Jump
-    - Arithmetic: Add, Subtract, Multiply, Divide, Remainder
-    - String: Concat, Length, Substr, Upper, Lower, Trim
-    - Column access: Column, Rowid, MakeRecord, ResultRow
-    - Cursor operations: OpenRead, OpenWrite, Rewind, Next, Prev, Seek, SeekGE, SeekGT, SeekLE, SeekLT, NotFound, Found, Insert, Delete, IdxInsert, IdxDelete
-    - Aggregation: AggStep, AggFinal, AggValue
-    - Transaction: Transaction, Commit, Rollback, Savepoint, AutoCommit
-    - Sort: SorterOpen, SorterInsert, SorterSort, SorterNext, SorterData
-    - Miscellaneous: Null, Integer, String8, Blob, Variable, Move, Copy, SCopy, NotNull, IsNull, Once, Cast, Affinity, Function
-  - `EXPLAIN` output formatter
-- `planner` crate:
-  - Basic query planner (single-table scans, index selection)
-  - Join ordering (nested loop joins)
-  - WHERE clause analysis and index usability detection
-  - ORDER BY optimization (index-satisfying sorts vs. sorter)
-  - LIMIT/OFFSET pushdown
-  - Subquery flattening (basic cases)
-  - Correlated subquery detection
-- `func` crate:
-  - All core functions: abs, char, coalesce, glob, hex, ifnull, iif, instr, last_insert_rowid, length, like, likelihood, likely, lower, ltrim, max, min, nullif, printf/format, quote, random, randomblob, replace, round, rtrim, sign, soundex, substr/substring, total_changes, trim, typeof, unicode, unlikely, upper, zeroblob
-  - All aggregate functions: avg, count, group_concat, max, min, sum, total
-  - Date/time functions: date, time, datetime, julianday, strftime, unixepoch, timediff
-  - Math functions: acos, asin, atan, atan2, ceil, cos, degrees, exp, floor, ln, log, log2, mod, pi, pow, radians, sin, sqrt, tan, trunc
-- `frankensqlite` crate (public API facade):
-  - `Connection::open(path)`, `Connection::open_in_memory()`
-  - `connection.execute(sql, params)` for statements without results
-  - `connection.query(sql, params)` returning row iterator
-  - `connection.prepare(sql)` returning prepared statement
-  - `Statement::bind()`, `Statement::step()`, `Statement::column_*()`, `Statement::reset()`
-  - `Row` type with column access by index and name
-  - Parameter binding: positional (`?`), numbered (`?NNN`), named (`:name`, `@name`, `$name`)
-  - Transaction API: `connection.transaction()` returning RAII guard
-  - Pragma support
-  - Backup API
-  - Busy handler and busy timeout
-- Integration tests: execute queries end-to-end, verify results against expected output
-
-### Phase 5: Persistence, WAL & Transactions
-
-**Duration**: 4 weeks
-**Goal**: Implement durable persistence, WAL, and full transaction support.
-
-Deliverables:
-- `wal` crate:
-  - WAL file format: 32-byte header, 24-byte frame headers, page data
-  - WAL writer: append frames atomically
-  - WAL reader: read pages from WAL with frame lookup via WAL index
-  - WAL index (shared memory hash table): mapping from page number to WAL frame
-  - Checkpoint modes: PASSIVE, FULL, RESTART, TRUNCATE
-  - WAL checksum verification (big-endian, cumulative)
-  - Recovery: rebuild WAL index from WAL file on open
-- Rollback journal support (legacy mode):
-  - Journal file creation and management
-  - Hot journal detection and rollback on open
-  - Journal modes: DELETE, TRUNCATE, PERSIST, MEMORY, OFF
-- Transaction implementation:
-  - BEGIN DEFERRED / IMMEDIATE / EXCLUSIVE
-  - COMMIT and ROLLBACK
-  - Savepoints: SAVEPOINT name / RELEASE name / ROLLBACK TO name
-  - Nested savepoint stack
-  - Auto-commit mode
-  - Statement journaling for statement-level rollback
-- Crash recovery:
-  - Hot journal rollback
-  - WAL recovery (replay committed frames, discard uncommitted)
-  - Integrity checking (PRAGMA integrity_check)
-  - Database file lock recovery
-- Sync and durability:
-  - PRAGMA synchronous = OFF / NORMAL / FULL / EXTRA
-  - PRAGMA journal_mode switching
-  - Atomic commit protocol (lock escalation: SHARED -> RESERVED -> PENDING -> EXCLUSIVE)
-- Stress tests: concurrent readers during checkpoint, crash simulation, power-loss simulation
-
-### Phase 6: MVCC Concurrent Writers
-
-**Duration**: 6 weeks
-**Goal**: Implement the key innovation -- MVCC page-level versioning for concurrent writers. This is the most architecturally novel phase and the one that differentiates FrankenSQLite from C SQLite.
-
-Deliverables:
-- `mvcc` crate:
-  - **Transaction ID allocation**: monotonically increasing 64-bit transaction IDs, atomic counter
-  - **Page version chains**: each page maintains a linked list of versions, each tagged with the transaction ID that created it. Readers see the version visible to their snapshot; writers create new versions.
-  - **Snapshot management**: when a transaction begins, it records the current transaction ID as its snapshot point. All reads within that transaction see only page versions committed before the snapshot point.
-  - **Conflict detection**: at commit time, check whether any page written by this transaction was also written by a transaction that committed after this transaction's snapshot point. If so, abort with SQLITE_BUSY (first-committer-wins).
-  - **Eager page locking**: when a transaction first writes to a page, it acquires a lightweight lock on that page number. If the lock is already held by another active writer, the transaction receives SQLITE_BUSY immediately. This prevents deadlocks (no wait-for cycles possible because locks are acquired eagerly, one at a time).
-  - **WAL append serialization**: WAL frame appends are serialized via a mutex. This is acceptable because WAL appends are sequential writes and thus cheap. The mutex is held only for the duration of the memcpy + write syscall.
-  - **Garbage collection**: a background task periodically scans version chains and removes versions that are no longer visible to any active snapshot. The oldest active snapshot ID is tracked; versions older than this can be collected.
-  - **Read scalability**: readers never block and never acquire locks. Unlimited concurrent readers (no `aReadMark[5]` limit from C SQLite's WAL implementation).
-  - **Checkpoint integration**: checkpointing now must account for multiple version chains. The checkpoint writes the latest committed version of each dirty page back to the main database file, but only pages whose versions are no longer needed by any active reader.
-- Integration with pager:
-  - `pager::get_page()` now returns the version visible to the calling transaction's snapshot
-  - `pager::write_page()` now creates a new version tagged with the calling transaction's ID
-  - Page cache now indexes by (page_number, version) instead of just page_number
-- Integration with WAL:
-  - WAL frames now carry transaction IDs
-  - WAL index maps (page_number, txn_id) -> frame_offset
-  - Checkpoint must respect active snapshots
-- Deadlock freedom proof:
-  - Document the invariant: locks are acquired in page-number order within a transaction, and eager acquisition means no transaction ever waits while holding a lock
-  - Property-based tests with arbitrary transaction interleavings
-- Performance targets:
-  - 100 concurrent writers, each inserting 100 rows into separate tables: no SQLITE_BUSY errors
-  - 100 concurrent writers, each inserting into the SAME table: graceful degradation, SQLITE_BUSY on page conflicts, no crashes, no corruption
-  - Read throughput unaffected by concurrent writers
-
-### Phase 7: Advanced Query Planner & Full VDBE
-
-**Duration**: 5 weeks
-**Goal**: Implement advanced query optimization features and the remaining VDBE opcodes for full SQL coverage.
-
-Deliverables:
-- Advanced planner features:
-  - Cost-based optimization using table statistics (sqlite_stat1, sqlite_stat4)
-  - Multi-index OR optimization (OR-by-union)
-  - Covering index detection and index-only scans
-  - Automatic index creation for uncorrelated subqueries
-  - Skip-scan optimization for leading-column mismatches
-  - WHERE clause term decomposition and transitive closure
-  - LIKE/GLOB optimization using index prefixes
-  - Partial index awareness
-  - Expression index support
-- Window functions:
-  - OVER clause: PARTITION BY, ORDER BY, frame specification (ROWS, RANGE, GROUPS)
-  - Built-in window functions: row_number, rank, dense_rank, ntile, lag, lead, first_value, last_value, nth_value
-  - Aggregate functions as window functions (sum, avg, count, min, max over windows)
-  - Frame types: UNBOUNDED PRECEDING, N PRECEDING, CURRENT ROW, N FOLLOWING, UNBOUNDED FOLLOWING
-  - EXCLUDE clause: CURRENT ROW, GROUP, TIES, NO OTHERS
-- Common Table Expressions (CTEs):
-  - Non-recursive CTEs (WITH clause)
-  - Recursive CTEs (WITH RECURSIVE)
-  - CTE materialization vs. inlining optimization
-  - Multiple CTEs in a single query
-- Triggers:
-  - BEFORE, AFTER, INSTEAD OF triggers
-  - INSERT, UPDATE, DELETE triggers
-  - Row-level triggers with OLD and NEW references
-  - WHEN clause filtering
-  - Trigger recursion (PRAGMA recursive_triggers)
-  - Cascading trigger execution
-- Views:
-  - View definition storage and retrieval
-  - View expansion during query planning
-  - Updatable views (via INSTEAD OF triggers)
-- Remaining VDBE opcodes:
-  - Bloom filter opcodes: FilterAdd, Filter
-  - Sequence opcodes: Sequence, NewRowid
-  - Virtual table opcodes: VOpen, VFilter, VNext, VColumn, VRename, VUpdate
-  - Authorization opcodes: before each operation
-  - Trace/profile callbacks
-
-### Phase 8: Extensions
-
-**Duration**: 6 weeks
-**Goal**: Implement all major SQLite extensions.
-
-Deliverables:
-- `fts5` crate (Full-Text Search 5):
-  - FTS5 virtual table implementation
-  - Tokenizers: unicode61 (default), ascii, porter (stemming), trigram
-  - Full-text index structure (b-tree of terms -> document lists)
-  - MATCH queries with boolean operators (AND, OR, NOT, NEAR)
-  - Column filters in MATCH expressions
-  - Prefix queries
-  - Ranking functions: bm25 (default), custom ranking via auxiliary functions
-  - highlight() and snippet() auxiliary functions
-  - FTS5 content tables (external content, contentless)
-  - Incremental merge and optimization
-  - FTS5 vocab virtual table
-- `fts3` crate (Full-Text Search 3/4):
-  - FTS3 and FTS4 virtual table implementations
-  - Tokenizers: simple, porter, unicode61, icu
-  - matchinfo(), offsets(), snippet() functions
-  - Enhanced query syntax (FTS4)
-  - Compress/uncompress hooks (FTS4)
-  - Languageid support (FTS4)
-- `rtree` crate (R-Tree Spatial Index):
-  - R-tree virtual table for N-dimensional rectangles
-  - Range queries (overlap and containment)
-  - Custom R-tree queries via callback geometry
-  - GeoJSON integration
-  - R*tree variant with improved splitting
-- `json` crate (JSON1):
-  - json(value) - validate and minify
-  - json_array(), json_object() - construction
-  - json_extract() / -> / ->> operators - extraction
-  - json_insert(), json_replace(), json_set(), json_remove() - modification
-  - json_type(), json_valid() - introspection
-  - json_each(), json_tree() - table-valued functions
-  - json_group_array(), json_group_object() - aggregation
-  - json_patch() - RFC 7396 merge patch
-  - JSONB binary format support
-- `session` crate (Session Extension):
-  - Change tracking (INSERT, UPDATE, DELETE)
-  - Changeset generation and application
-  - Patchset generation (more compact, no original values for UPDATE)
-  - Conflict resolution callbacks
-  - Changeset inversion
-  - Changeset concatenation
-  - Rebasing (for collaborative editing)
-  - Changeset iteration and filtering
-- `icu` crate (ICU Extension):
-  - Unicode-aware LIKE operator
-  - ICU collation sequences
-  - Unicode case folding (upper/lower)
-  - ICU regex support
-  - Integration with system ICU library or bundled ICU data
-- Miscellaneous extensions:
-  - generate_series(start, stop, step) table-valued function
-  - csv virtual table (read CSV files as tables)
-  - fileio functions (readfile, writefile, lsdir)
-  - completion(prefix, wholeline) for shell tab-completion
-  - dbstat virtual table (page-level storage analysis)
-  - stmt virtual table (prepared statement introspection)
-  - sha1/sha256/sha3 functions
-  - decimal extension (arbitrary-precision decimal arithmetic)
-  - ieee754 extension (floating-point introspection)
-  - uuid extension (UUID generation and formatting)
-
-### Phase 9: CLI Shell & Conformance
-
-**Duration**: 4 weeks
-**Goal**: Build the interactive CLI shell and achieve full conformance with C SQLite.
-
-Deliverables:
-- `shell` crate:
-  - Interactive SQL prompt with readline-style editing via frankentui
-  - Multi-line statement detection (continue until `;`)
-  - Dot-commands:
-    - `.backup`, `.bail`, `.cd`, `.changes`, `.check`, `.clone`
-    - `.databases`, `.dbconfig`, `.dbinfo`, `.dump`, `.echo`
-    - `.eqp`, `.excel`, `.exit`/`.quit`, `.expert`, `.explain`
-    - `.filectrl`, `.fullschema`, `.headers`, `.help`
-    - `.import`, `.indexes`, `.limit`, `.lint`, `.load`, `.log`
-    - `.mode` (ascii, box, column, csv, html, insert, json, line, list, markdown, quote, table, tabs, tcl)
-    - `.nullvalue`, `.once`, `.open`, `.output`, `.parameter`
-    - `.print`, `.progress`, `.prompt`, `.read`, `.recover`
-    - `.restore`, `.save`, `.scanstats`, `.schema`, `.selftest`
-    - `.separator`, `.sha3sum`, `.shell`, `.show`, `.stats`
-    - `.tables`, `.testcase`, `.timeout`, `.timer`, `.trace`
-    - `.vfsinfo`, `.vfslist`, `.vfsname`, `.width`
-  - Output formatting for all 14 output modes
-  - SQL syntax highlighting in the prompt
-  - History file (~/.frankensqlite_history)
-  - Tab completion for table names, column names, SQL keywords, and dot-commands
-  - Init file (~/.frankensqliterc)
-  - Batch mode (read SQL from stdin or file)
-  - Signal handling (Ctrl-C to cancel query, Ctrl-D to exit)
-- Conformance test suite:
-  - SQL Logic Tests (SLT) runner compatible with the sqllogictest format
-  - Tests ported from SQLite's test suite covering:
-    - Basic CRUD operations
-    - All join types (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL)
-    - Subqueries (scalar, table, EXISTS, IN)
-    - Aggregate queries with GROUP BY and HAVING
-    - Window functions
-    - CTEs (recursive and non-recursive)
-    - UPSERT (INSERT ON CONFLICT)
-    - RETURNING clause
-    - All data types and type affinity
-    - NULL handling
-    - Collation sequences (BINARY, NOCASE, RTRIM)
-    - CAST expressions
-    - Date/time functions
-    - JSON functions
-    - Full-text search
-    - R-tree queries
-    - Foreign keys
-    - Triggers (BEFORE, AFTER, INSTEAD OF)
-    - Views
-    - ALTER TABLE
-    - VACUUM
-    - REINDEX
-    - ANALYZE
-    - ATTACH/DETACH
-    - Savepoints
-    - WAL mode operations
-    - Concurrent reader/writer scenarios
-  - Target: 95%+ compatibility with C SQLite behavior
-  - Known incompatibilities documented with rationale
-- Benchmarks:
-  - Micro-benchmarks:
-    - Single-row INSERT throughput (rows/sec)
-    - Point SELECT by rowid (queries/sec)
-    - Range SELECT with index (rows/sec)
-    - Aggregate queries (sum, count, avg over 1M rows)
-    - FTS5 search throughput (queries/sec)
-  - Macro-benchmarks:
-    - TPC-C-like workload adapted for SQLite
-    - Mixed read/write workload with configurable ratios
-    - Large import (1M+ rows via INSERT or .import)
-    - Large export (.dump, CSV export)
-  - MVCC-specific benchmarks:
-    - Concurrent writers scaling (1, 2, 4, 8, 16, 32, 64, 128 writers)
-    - Reader throughput under write load
-    - MVCC overhead vs. single-writer mode
-    - Garbage collection impact on latency
-  - Comparison benchmarks against C SQLite 3.52.0
-
-## Key Design Decisions
-
-### MVCC at Page Granularity (Not Row or Table)
+### Why Page-Level Granularity
 
 Page-level MVCC was chosen as the sweet spot between complexity and concurrency:
 
-- **Row-level MVCC** (as in PostgreSQL) would require fundamental changes to the record format, a visibility map, and per-row transaction metadata. This would break file-format compatibility and add significant space overhead. It would also require vacuum/MVCC cleanup analogous to PostgreSQL's VACUUM, which is a source of operational complexity.
-- **Table-level MVCC** would be too coarse. Two writers inserting into different parts of the same table would conflict unnecessarily. Since SQLite is often used with just a few tables, table-level locking would provide little benefit over the existing single-writer model.
-- **Page-level MVCC** maps naturally to SQLite's B-tree structure. Each page is the unit of I/O and caching, so versioning at this level adds no new abstraction. Writers to different parts of the same B-tree (different leaf pages) can proceed in parallel. Only when two writers modify the same leaf page (or the same interior page due to a split) do they conflict.
+- **Row-level MVCC** (as in PostgreSQL) would require fundamental changes to the
+  record format, a visibility map, and per-row transaction metadata. This would
+  break file-format compatibility and add significant space overhead.
+- **Table-level MVCC** would be too coarse. Two writers inserting into different
+  parts of the same table would conflict unnecessarily. Since SQLite is often
+  used with just a few tables, table-level locking would provide little benefit
+  over the existing single-writer model.
+- **Page-level MVCC** maps naturally to SQLite's B-tree structure. Each page is
+  the unit of I/O and caching, so versioning at this level adds no new
+  abstraction. Writers to different parts of the same B-tree (different leaf
+  pages) can proceed in parallel.
 
-### Snapshot Isolation with First-Committer-Wins
+### Target Behavior
 
-When two transactions conflict (they both wrote to the same page), the first to commit succeeds and the second is aborted with SQLITE_BUSY. This is simpler than first-updater-wins (which requires tracking read sets) and avoids the complexity of optimistic validation. Applications already handle SQLITE_BUSY by retrying, so this fits the existing SQLite programming model.
+- Read and write standard SQLite database files (format compatible with C SQLite)
+- Support the full SQL dialect recognized by SQLite 3.52.0
+- Implement all major extensions (FTS3/4/5, R-tree, JSON1, Session, ICU, misc)
+- Provide a drop-in interactive CLI shell replacement
+- Achieve 95%+ conformance against a golden-file test suite derived from C SQLite
 
-### Eager Page Locking (No Deadlocks Possible)
+---
 
-When a transaction first writes to a page, it immediately attempts to acquire an exclusive lock on that page number. If the lock is held by another active writer, SQLITE_BUSY is returned immediately (no waiting). This design makes deadlocks impossible by construction:
+## 2. Exclusions
 
-- A transaction never waits while holding a page lock
-- Therefore, there can be no wait-for cycle
-- Therefore, there is no deadlock
+The following components of the C SQLite codebase are explicitly **not ported**:
 
-This is a deliberately simple design. Waiting with timeouts or deadlock detection would add complexity for marginal throughput gains. In practice, page conflicts in SQLite workloads are rare because different writers typically touch different leaf pages.
+### Amalgamation Build System
 
-### WAL Append Serialized via Mutex (Cheap Sequential Writes)
+SQLite's distribution model relies on a generated amalgamation (`sqlite3.c` +
+`sqlite3.h`) produced by a custom TCL build script. FrankenSQLite uses a
+standard Cargo workspace with 23 crates and has no need for source
+concatenation.
 
-The WAL file is append-only during normal operation. Appending frames to the WAL is serialized via a single mutex. This might sound like a bottleneck, but it is not in practice because:
+### TCL Test Harness
 
-- WAL appends are sequential writes, which are very fast on any storage medium
-- The critical section is tiny: write frame header (24 bytes) + page data (typically 4096 bytes) + update WAL index
-- The mutex is uncontended most of the time because the actual transaction work (B-tree traversal, record serialization, conflict detection) happens outside the critical section
+The C SQLite test suite is written in TCL (~90,000+ lines of test scripts).
+FrankenSQLite replaces this with:
+- Native Rust `#[test]` functions in each crate
+- Property-based tests via `proptest`
+- Snapshot tests via `insta`
+- Fuzz tests via `cargo-fuzz`
+- A dedicated conformance harness (`fsqlite-harness`) that compares output
+  against C SQLite golden files
 
-This is vastly simpler than a lock-free WAL append protocol and provides sufficient throughput for SQLite's target workloads.
+### LEMON Parser Generator
 
-### Unlimited Concurrent Readers (No aReadMark Limit)
+SQLite uses a custom LALR parser generator called LEMON to produce a push-down
+automaton from the `parse.y` grammar (1,963 lines). FrankenSQLite instead uses
+a **hand-written recursive descent parser** with Pratt precedence for
+expressions. This provides better error messages, simpler maintenance, and
+avoids the need for a code generation step.
 
-C SQLite's WAL implementation uses a fixed-size array of 5 read marks (`aReadMark[WAL_NREADER]`) in shared memory. This limits concurrent readers to 5 (or more precisely, to 5 distinct snapshot points). FrankenSQLite replaces this with a dynamically-sized reader registry, allowing unlimited concurrent readers. Each reader registers its snapshot transaction ID; the oldest active snapshot ID is used to determine which WAL frames and page versions can be safely cleaned up.
+### Loadable Extension API (.so/.dll Loading)
 
-## Dependencies
+SQLite supports runtime-loaded shared library extensions via
+`sqlite3_load_extension()`. FrankenSQLite compiles all extensions directly into
+their respective crates and links them at build time. There is no dynamic
+loading mechanism. Extensions are enabled or disabled via Cargo feature flags.
 
-### First-Party Dependencies
+### Legacy File Format Quirks
 
-- **asupersync**: Async runtime, channels, synchronization primitives, timers. Provides `spawn`, `sleep`, `Mutex`, `RwLock`, `Condvar`, `channel`, `select`. Used throughout for all async operations and inter-thread coordination.
-- **frankentui**: Terminal UI library for the CLI shell. Provides terminal raw mode, input event handling, line editor with history, syntax highlighting, and styled text rendering.
+The SQLite file format has accumulated backward-compatibility quirks from the
+pre-3.0 era (2004). FrankenSQLite targets schema format number 4 (the current
+format) and does not implement support for:
+- Schema format numbers 1, 2, or 3
+- Legacy typeAffinity mappings from SQLite 2.x
+- DESC index encoding variations from early format versions
 
-### Third-Party Dependencies
+### Obsolete VFS Implementations
 
-- **thiserror** (1.x): Derive macro for `std::error::Error` implementations. Used in every crate for ergonomic error type definitions.
-- **serde** (1.x) + **serde_json**: Serialization framework. Used for JSON extension, configuration files, and test fixture serialization.
-- **bitflags** (2.x): Macro for defining bitflag types. Used for page flags, column flags, index flags, and various option sets throughout the codebase.
-- **parking_lot** (0.12.x): Fast, compact mutex and rwlock implementations. Used for internal synchronization where async is not needed (page cache locks, schema cache, etc.).
-- **sha2** (0.10.x): SHA-256 implementation for `.sha3sum` command and integrity verification.
-- **memchr** (2.x): Optimized byte search. Used in the lexer for fast scanning, in FTS tokenizers, and in various string processing operations.
-- **smallvec** (1.x): Stack-allocated small vectors. Used for VDBE register windows, short column lists, and other small collections that rarely exceed a fixed size, avoiding heap allocation in the common case.
+The C SQLite source includes VFS implementations for operating systems that
+are no longer relevant:
+- **OS/2** (`os_os2.c`) -- IBM OS/2, discontinued
+- **VxWorks** -- real-time OS specific paths in `os_unix.c`
+- **Windows CE** (`os_win.c` conditional sections) -- discontinued platform
+
+FrankenSQLite implements:
+- `UnixVfs` -- POSIX file I/O via `asupersync::BlockingPool`
+- `MemoryVfs` -- in-memory storage for testing and ephemeral databases
+
+Windows VFS support may be added in the future as a separate crate but is not
+in scope for initial delivery.
+
+### Shared-Cache Mode
+
+SQLite's shared-cache mode (`SQLITE_OPEN_SHAREDCACHE`) allows multiple
+connections within the same process to share a single page cache and B-tree
+instance, using table-level locking for concurrency. This mode is deprecated
+in modern SQLite and is architecturally superseded by FrankenSQLite's MVCC
+design, which provides superior concurrency without the complexity and
+limitations of shared-cache table locks.
+
+---
+
+## 3. Phases
+
+### Phase 1: Bootstrap and Spec Extraction
+
+**Goal:** Create the workspace scaffold, write specification documents, and
+establish the project infrastructure.
+
+**Work items:**
+- Create workspace `Cargo.toml` with `resolver = "2"`, `edition = "2024"`,
+  `unsafe_code = "forbid"`, and `clippy::pedantic = "deny"` +
+  `clippy::nursery = "deny"`
+- Create `rust-toolchain.toml` (nightly channel)
+- Scaffold all 23 crate directories with stub `Cargo.toml` and `src/lib.rs`
+- Write `EXISTING_SQLITE_STRUCTURE.md` (complete behavior extraction from C
+  source: all data structures from `sqliteInt.h`, SQL grammar from `parse.y`,
+  all 190+ VDBE opcodes from `vdbe.c`, B-tree page format, WAL frame format,
+  database file header, all PRAGMA behaviors, all built-in functions, extension
+  APIs)
+- Write `PROPOSED_ARCHITECTURE.md` (Rust design: MVCC detail, trait hierarchy,
+  crate dependency graph, async integration patterns, query pipeline, file
+  format compatibility, testing strategy)
+- Write `PLAN_TO_PORT_SQLITE_TO_RUST.md` (this document)
+- Update `AGENTS.md` for the FrankenSQLite project
+
+**Acceptance criteria:**
+- `cargo check --workspace` completes with zero errors
+- `cargo clippy --workspace --all-targets -- -D warnings` produces zero warnings
+- `cargo fmt --all -- --check` passes
+- All three specification documents are complete and reviewed
+
+---
+
+### Phase 2: Core Types and Storage Foundation
+
+**Goal:** Implement the foundational type system and the lowest layers of the
+storage stack (VFS, pager, page cache).
+
+**Work items:**
+- `fsqlite-types`: `PageNumber(u32)`, `PageSize`, `PageData`, `SqliteValue`
+  enum (Null, Integer(i64), Float(f64), Text(String), Blob(Vec<u8>)), all 190+
+  VDBE opcodes as an enum, `SQLITE_MAX_*` limit constants, serial type
+  encoding, bitflag types (OpenFlags, SyncFlags, LockLevel)
+- `fsqlite-error`: `FrankenError` enum using `thiserror`, error codes matching
+  SQLite result codes, `StructuredError` with source location
+- `fsqlite-vfs`: `Vfs` and `VfsFile` traits, `MemoryVfs` implementation,
+  `UnixVfs` implementation with `asupersync` blocking I/O
+- `fsqlite-pager`: Pager state machine, page cache with LRU eviction,
+  dirty page tracking
+
+**Acceptance criteria:**
+- `cargo check --workspace` clean
+- `cargo clippy -- -D warnings` clean
+- Memory VFS stores and retrieves pages correctly
+- 200+ unit tests passing
+
+---
+
+### Phase 3: B-Tree and SQL Parser
+
+**Goal:** Implement the B-tree storage engine and the SQL parsing pipeline.
+
+**B-Tree work (`fsqlite-btree`):**
+Port from `btree.c` (11,568 lines) and `btreeInt.h`:
+- `cursor.rs` -- BtCursor with page stack traversal (max depth 20)
+- `cell.rs` -- Cell format parsing (INTKEY tables, BLOBKEY indexes)
+- `balance.rs` -- Page splitting (balance_nonroot, balance_deeper)
+- `overflow.rs` -- Overflow page chains
+- `free_list.rs` -- Free page management (trunk + leaf pages)
+- `payload.rs` -- BtreePayload read/write with overflow handling
+
+**SQL Parser work (`fsqlite-parser` + `fsqlite-ast`):**
+Hand-written recursive descent replacing LEMON-generated parser:
+- `lexer.rs` -- Tokenizer (from `tokenize.c`, 899 lines) with
+  `memchr`-accelerated scanning, zero-copy token spans
+- `parser.rs` -- Main parser with Pratt precedence for expressions
+- `keyword.rs` -- Perfect hash keyword lookup (150+ SQL keywords)
+- AST types for all SQL statements (SELECT, INSERT, UPDATE, DELETE, CREATE,
+  DROP, ALTER, PRAGMA, ATTACH/DETACH, BEGIN/COMMIT/ROLLBACK, EXPLAIN, etc.)
+
+**Acceptance criteria:**
+- B-tree integrity check passes after 10,000 random inserts
+- Parser handles 95%+ of the SQLite SQL grammar
+- 500+ tests passing
+
+---
+
+### Phase 4: VDBE and Query Pipeline
+
+**Goal:** Implement the bytecode virtual machine, query planner, code generator,
+and public API to enable end-to-end SQL execution.
+
+**VDBE work (`fsqlite-vdbe`):**
+Port from `vdbe.c` (9,316 lines):
+- Core fetch-execute loop with match-based opcode dispatch
+- 50+ critical opcodes first: Transaction, OpenRead, OpenWrite, Seek*, Column,
+  Insert, Delete, Goto, If, ResultRow, MakeRecord, Halt, Function
+- `mem.rs` -- Mem/sqlite3_value with type affinity conversions
+- `sort.rs` -- External merge sort for ORDER BY
+
+**Query Planner (`fsqlite-planner`):**
+Port from `resolve.c`, `where.c`, `wherecode.c`, `whereexpr.c`:
+- Name resolution (table and column binding)
+- Index selection and cost estimation
+- Basic join ordering (greedy heuristic)
+
+**Core Assembly (`fsqlite-core`):**
+- `connection.rs` -- sqlite3 struct equivalent
+- `prepare.rs` -- SQL text -> parsed AST -> VDBE bytecode
+- `schema.rs` -- Schema cache management
+- SELECT/INSERT/UPDATE/DELETE code generation
+
+**Public API (`fsqlite`):**
+- `Connection::open`, `Connection::open_in_memory`
+- `Connection::execute`, `Connection::prepare`
+- `Statement::query_map`, `Statement::query_row`
+- `Row::get::<T>(index)` with `FromSql` trait
+- `Transaction` with commit/rollback
+
+**Acceptance criteria:**
+- End-to-end execution: CREATE TABLE, INSERT, SELECT with WHERE/ORDER BY/LIMIT
+- 1,000+ tests passing
+
+---
+
+### Phase 5: Persistence, WAL, and Transactions
+
+**Goal:** Implement durable storage with file-backed persistence, WAL mode, and
+full transaction semantics.
+
+**Persistence:**
+- Unix VFS with POSIX file locking (fcntl advisory locks)
+- Rollback journal mode (DELETE, TRUNCATE, PERSIST, MEMORY, OFF)
+- Database file format compatibility (read C SQLite files, write files C SQLite
+  can read)
+
+**WAL (`fsqlite-wal`):**
+- WAL frame writing and reading (32-byte WAL header, 24-byte frame headers)
+- WAL index (page-to-frame-offset hash mapping via shared memory / `-shm` file)
+- Checkpoint modes: PASSIVE, FULL, RESTART, TRUNCATE
+- Crash recovery (scan WAL, replay committed frames, discard uncommitted)
+- Snapshot isolation for readers
+
+**Transactions:**
+- BEGIN DEFERRED / IMMEDIATE / EXCLUSIVE
+- COMMIT and ROLLBACK
+- Savepoints: SAVEPOINT name / RELEASE name / ROLLBACK TO name
+- Auto-commit mode
+- Statement journaling for statement-level rollback
+- PRAGMA journal_mode, synchronous, cache_size
+
+**Acceptance criteria:**
+- Create database, close, reopen, read back data correctly
+- WAL mode: concurrent readers + single writer
+- Crash recovery: kill mid-transaction, verify database consistency on reopen
+- File format round-trip with C SQLite (create with one, read with the other)
+- 1,500+ tests passing
+
+---
+
+### Phase 6: MVCC Concurrent Writers
+
+**This is the architectural centerpiece that makes FrankenSQLite different
+from SQLite.**
+
+**Goal:** Replace the single-writer WAL model with MVCC page-level versioning
+to enable truly concurrent writers.
+
+**Core MVCC types (`fsqlite-mvcc`):**
+- `version_store.rs` -- Page version chains (copy-on-write per page)
+- `transaction.rs` -- TxnId (atomic u64 counter), transaction lifecycle
+- `visibility.rs` -- Snapshot isolation visibility rules:
+  - A page version V is visible to snapshot S if and only if:
+    1. `V.created_by <= S.high_water_mark`
+    2. `V.created_by NOT IN S.in_flight`
+    3. V is the most recent version satisfying conditions (1) and (2)
+- `conflict.rs` -- Page-level lock table (`BTreeMap<PageNumber, TxnId>`) +
+  first-committer-wins validation
+- `gc.rs` -- GC horizon = `min(active_txn_ids)`, truncate old versions that
+  have been superseded by committed versions below the horizon
+- `mvcc_wal.rs` -- MVCC-aware WAL with per-transaction frame groups
+- `page_version.rs` -- `PageVersion { pgno, created_by: TxnId, data, prev }`
+
+**MVCC-aware page access:**
+- `MvccPager::get_page(pgno, snapshot)` replaces `sqlite3PagerGet()` with a
+  three-tier lookup: buffer pool -> WAL index -> database file
+- `MvccPager::write_page(pgno, txn)` replaces `sqlite3PagerWrite()` with page
+  lock acquisition, copy-on-write versioning, and write set recording
+
+**Buffer pool:**
+- `BTreeMap<(PageNumber, TxnId), CachedPage>` -- multiple versions of same page
+  coexist in the cache
+- LRU eviction of unreferenced, clean, superseded versions
+- Default capacity: 2,000 pages (~8MB at 4KB page size)
+- Dirty pages never evicted until flushed to WAL
+
+**Asupersync integration:**
+- All file I/O via `BlockingPool` (1 min, 4 max threads)
+- `Cx` capability context for cooperative cancellation at VDBE instruction
+  boundaries
+- `asupersync::sync::RwLock` for `active_transactions` map
+- `asupersync::channel::mpsc` (two-phase reserve/commit) for write coordinator
+  commit pipeline
+- `asupersync::channel::oneshot` for commit response
+
+**Acceptance criteria:**
+- Two connections insert into different tables simultaneously -- no blocking
+- Two connections insert into same table, different pages -- both succeed
+- Same-page conflict: second committer gets proper error
+- 100 concurrent writers x 100 rows each -- all 10,000 rows present after
+  completion
+- Snapshot isolation: long-running reader sees consistent state despite
+  concurrent commits
+- GC reclaims memory after long-running readers close
+- Under 2x overhead vs single-writer for non-contended workloads
+- 2,000+ tests passing
+
+---
+
+### Phase 7: Advanced Query Planner and Full VDBE
+
+**Goal:** Complete the query optimizer and implement all remaining VDBE opcodes
+and SQL features.
+
+**Work items:**
+- Complete WHERE clause optimization (index selection, range scans, OR
+  optimization, skip-scan, LIKE/GLOB prefix optimization)
+- Join ordering (nested loop join, hash join for large tables)
+- Subquery flattening and correlated subqueries
+- All 190+ VDBE opcodes (including Bloom filter, virtual table, authorization)
+- Window functions (ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, NTILE,
+  FIRST_VALUE, LAST_VALUE, NTH_VALUE; frame types ROWS/RANGE/GROUPS)
+- Common table expressions (WITH, WITH RECURSIVE)
+- ANALYZE statistics (sqlite_stat1, sqlite_stat4)
+- Foreign key enforcement
+- Triggers (BEFORE, AFTER, INSTEAD OF; INSERT, UPDATE, DELETE; recursive)
+- Views (definition, expansion, updatable via INSTEAD OF triggers)
+- ALTER TABLE (RENAME TABLE, RENAME COLUMN, ADD COLUMN, DROP COLUMN)
+- VACUUM and REINDEX
+
+**Acceptance criteria:**
+- TPC-B benchmark within 3x of C SQLite performance
+- EXPLAIN output matches C SQLite for common query patterns
+- 3,000+ tests passing
+
+---
+
+### Phase 8: Extensions
+
+**Goal:** Implement all major SQLite extensions, each in its own feature-gated
+crate.
+
+| Extension | Crate | C Source Reference | Key Components |
+|-----------|-------|--------------------|----------------|
+| JSON1 | `fsqlite-ext-json` | `ext/misc/json.c` (171KB) | `json()`, `json_extract()`, `json_set()`, `json_remove()`, `json_each` vtable, `json_tree` vtable, `json_group_array()`, `json_group_object()`, `json_patch()`, JSONB binary format |
+| FTS5 | `fsqlite-ext-fts5` | `ext/fts5/` (29K LOC) | Tokenizers (unicode61, ascii, porter, trigram), inverted index, BM25 ranking, `highlight()`, `snippet()`, content/contentless modes, vocab vtable |
+| FTS3/4 | `fsqlite-ext-fts3` | `ext/fts3/` (21K LOC) | Compatibility layer, `matchinfo()`, `offsets()`, `snippet()`, enhanced query syntax (FTS4), compress/uncompress, languageid |
+| R-Tree | `fsqlite-ext-rtree` | `ext/rtree/` (7K LOC) | Spatial index, range queries, geopoly functions, custom geometry callbacks |
+| Session | `fsqlite-ext-session` | `ext/session/` (13K LOC) | Change tracking, changeset/patchset generation and application, conflict resolution, inversion, concatenation, rebasing |
+| ICU | `fsqlite-ext-icu` | `ext/icu/` | Unicode-aware collation, case folding, FTS tokenizer |
+| Misc | `fsqlite-ext-misc` | `ext/misc/` | `generate_series`, `carray`, `dbstat`, `dbpage`, `completion`, `csv`, decimal, ieee754, uuid |
+
+**Acceptance criteria:**
+- FTS5 queries return correct ranked results
+- JSON functions match C SQLite output for all documented behaviors
+- Each extension independently enableable via Cargo feature flags
+- 3,500+ tests passing
+
+---
+
+### Phase 9: CLI Shell and Conformance
+
+**Goal:** Deliver a production-quality interactive CLI and achieve verified
+conformance against C SQLite.
+
+**CLI (`fsqlite-cli`):**
+Interactive shell built with `frankentui`:
+- Dot-commands: `.tables`, `.schema`, `.mode`, `.import`, `.dump`, `.headers`,
+  `.explain`, `.backup`, `.databases`, `.dbinfo`, `.indexes`, `.fullschema`,
+  `.stats`, `.timer`, `.width`, `.separator`, `.nullvalue`, `.output`, `.once`,
+  `.read`, `.open`, `.save`, `.restore`, `.quit`
+- Output modes: ascii, box, column, csv, html, insert, json, line, list,
+  markdown, quote, table, tabs
+- Tab completion for table names, column names, SQL keywords, and dot-commands
+- SQL syntax highlighting
+- Command history with persistence (`~/.frankensqlite_history`)
+- Init file support (`~/.frankensqliterc`)
+- Batch mode (read SQL from stdin or file)
+- Signal handling (Ctrl-C to cancel query, Ctrl-D to exit)
+
+**Conformance suite (`fsqlite-harness`):**
+- Execute identical SQL against both FrankenSQLite and C sqlite3
+- Compare output row-by-row (order-sensitive for ORDER BY, order-insensitive
+  otherwise)
+- Error code matching (same error for same malformed input)
+- Type affinity and NULL handling verification
+- Golden file storage in `conformance/golden/`
+- Target: 95%+ conformance across 1,000+ test SQL files
+- Known incompatibilities documented with rationale
+
+**Benchmarks:**
+- `benches/btree_insert.rs` -- insertion throughput
+- `benches/btree_lookup.rs` -- point lookup latency
+- `benches/parser_throughput.rs` -- statements parsed per second
+- `benches/mvcc_contention.rs` -- concurrent writer throughput (1-128 writers)
+- `benches/tpc_b.rs` -- TPC-B-like mixed workload
+- `benches/concurrent_rw.rs` -- mixed read/write with varying ratios
+- `benches/wal_checkpoint.rs` -- checkpoint speed under load
+
+**Acceptance criteria:**
+- CLI usable as a drop-in sqlite3 replacement for interactive use
+- 95%+ conformance against golden file suite
+- Documented benchmark results with comparison to C SQLite
+- 4,000+ tests passing across the entire workspace
+
+---
+
+### Verification Gate (All Phases)
+
+Every phase must pass this gate before proceeding:
+
+1. `cargo check --workspace` -- zero errors
+2. `cargo clippy --workspace --all-targets -- -D warnings` -- zero warnings
+3. `cargo fmt --all -- --check` -- correctly formatted
+4. `cargo test --workspace` -- all tests pass
+5. `cargo bench --workspace` -- no performance regressions (Phase 4+)
+
+Additional verification for Phase 6+:
+
+6. Stress test: 100 threads x 100 writes -- all rows present, no corruption
+7. Long-running reader + concurrent writer: snapshot consistency verified
+8. Kill-and-recover: data integrity after forced process termination
+9. Memory growth under sustained MVCC load: GC keeps version count bounded
+
+---
+
+## 4. Crate Map
+
+All 23 crates, their roles, and their dependency relationships:
+
+| # | Crate | Role | Internal Dependencies | External Dependencies |
+|---|-------|------|-----------------------|-----------------------|
+| 1 | `fsqlite-types` | Shared type definitions: PageNumber, SqliteValue, TxnId, Opcode enum, SQLITE_MAX_* limits, serial types, bitflags | (none -- leaf crate) | (none) |
+| 2 | `fsqlite-error` | Error types: FrankenError enum, ErrorCode, StructuredError with source spans, Result alias | (none -- leaf crate) | `thiserror` |
+| 3 | `fsqlite-ast` | Abstract syntax tree node types: Statement, Expr, SelectCore, JoinClause, DDL, DML, visitor pattern, pretty-printer | `fsqlite-types` | (none) |
+| 4 | `fsqlite-vfs` | Virtual filesystem abstraction: Vfs + VfsFile traits, UnixVfs (asupersync I/O), MemoryVfs | `fsqlite-types`, `fsqlite-error` | (none) |
+| 5 | `fsqlite-pager` | Page cache and I/O layer: pager state machine, dirty page tracking, LRU eviction, journal integration | `fsqlite-types`, `fsqlite-error`, `fsqlite-vfs` | (none) |
+| 6 | `fsqlite-wal` | Write-ahead log: WAL frame I/O, WAL index hash table, checkpoint (PASSIVE/FULL/RESTART/TRUNCATE), crash recovery | `fsqlite-types`, `fsqlite-error`, `fsqlite-vfs`, `fsqlite-pager` | (none) |
+| 7 | `fsqlite-mvcc` | MVCC concurrency control: page version chains, TxnId allocation, snapshot isolation, page lock table, conflict detection, garbage collection, MVCC-aware WAL, buffer pool | `fsqlite-types`, `fsqlite-error`, `fsqlite-pager`, `fsqlite-wal` | `parking_lot` |
+| 8 | `fsqlite-btree` | B-tree storage engine: cursor traversal, cell parsing, page balancing/splitting, overflow chains, freelist management, integrity checking | `fsqlite-types`, `fsqlite-error`, `fsqlite-pager` | (none) |
+| 9 | `fsqlite-parser` | SQL lexer and recursive descent parser: tokenizer, Pratt expression parsing, keyword lookup | `fsqlite-types`, `fsqlite-error`, `fsqlite-ast` | `memchr` |
+| 10 | `fsqlite-planner` | Query planning and optimization: name resolution, WHERE analysis, index selection, cost estimation, join ordering | `fsqlite-types`, `fsqlite-error`, `fsqlite-ast` | (none) |
+| 11 | `fsqlite-vdbe` | Virtual database engine (bytecode VM): fetch-execute loop, 190+ opcode handlers, Mem values with type affinity, external merge sort, register file | `fsqlite-types`, `fsqlite-error`, `fsqlite-pager`, `fsqlite-btree` | (none) |
+| 12 | `fsqlite-func` | Built-in functions: scalar (abs, length, substr, ...), aggregate (count, sum, avg, ...), window (row_number, rank, ...), date/time, math, function registry | `fsqlite-types`, `fsqlite-error` | (none) |
+| 13 | `fsqlite-ext-fts3` | FTS3/FTS4 full-text search extension | `fsqlite-types`, `fsqlite-error` | (none) |
+| 14 | `fsqlite-ext-fts5` | FTS5 full-text search extension: tokenizers, inverted index, BM25, highlight, snippet | `fsqlite-types`, `fsqlite-error` | (none) |
+| 15 | `fsqlite-ext-rtree` | R-tree spatial index + geopoly extension | `fsqlite-types`, `fsqlite-error` | (none) |
+| 16 | `fsqlite-ext-json` | JSON1 extension: json(), json_extract(), json_set(), json_each/json_tree virtual tables, JSONB | `fsqlite-types`, `fsqlite-error` | (none) |
+| 17 | `fsqlite-ext-session` | Session extension: changeset/patchset generation and application, conflict resolution | `fsqlite-types`, `fsqlite-error` | (none) |
+| 18 | `fsqlite-ext-icu` | ICU collation extension: Unicode-aware collation sequences, FTS tokenizer | `fsqlite-types`, `fsqlite-error` | (none) |
+| 19 | `fsqlite-ext-misc` | Miscellaneous extensions: generate_series, carray, dbstat, dbpage, completion, csv, decimal, uuid | `fsqlite-types`, `fsqlite-error` | (none) |
+| 20 | `fsqlite-core` | Engine orchestration: connection management, prepare/compile pipeline, schema cache, DDL/DML code generation, PRAGMA handling | `fsqlite-types`, `fsqlite-error`, `fsqlite-vfs`, `fsqlite-pager`, `fsqlite-wal`, `fsqlite-mvcc`, `fsqlite-btree`, `fsqlite-ast`, `fsqlite-parser`, `fsqlite-planner`, `fsqlite-vdbe`, `fsqlite-func` | (none) |
+| 21 | `fsqlite` | Public API facade: Connection, Statement, Row, Transaction, FromSql/ToSql traits, high-level ergonomic interface | `fsqlite-types`, `fsqlite-error`, `fsqlite-core` | (none) |
+| 22 | `fsqlite-cli` | Interactive REPL shell: dot-commands, output formatting, tab completion, syntax highlighting, command history | `fsqlite`, `fsqlite-error` | `frankentui` |
+| 23 | `fsqlite-harness` | Conformance test runner: execute SQL against FrankenSQLite and C SQLite, compare output, golden file management | `fsqlite`, `fsqlite-error` | (none) |
+
+### Dependency Graph (Layered)
+
+```
+Layer 0 (leaves):     fsqlite-types    fsqlite-error
+Layer 1 (storage):    fsqlite-vfs      fsqlite-ast
+Layer 2 (cache):      fsqlite-pager    fsqlite-parser     fsqlite-func
+Layer 3 (log):        fsqlite-wal      fsqlite-planner
+Layer 4 (btree):      fsqlite-btree
+Layer 5 (vm):         fsqlite-vdbe
+Layer 6 (mvcc):       fsqlite-mvcc
+Layer 7 (ext):        fsqlite-ext-{fts3,fts5,rtree,json,session,icu,misc}
+Layer 8 (core):       fsqlite-core
+Layer 9 (api):        fsqlite
+Layer 10 (apps):      fsqlite-cli      fsqlite-harness
+```
+
+### Full Dependency Tree
+
+```
+fsqlite-cli
+  +-- fsqlite
+  |     +-- fsqlite-core
+  |           +-- fsqlite-vdbe
+  |           |     +-- fsqlite-btree
+  |           |     |     +-- fsqlite-pager
+  |           |     |     |     +-- fsqlite-vfs
+  |           |     |     |     |     +-- fsqlite-types
+  |           |     |     |     |     +-- fsqlite-error
+  |           |     |     |     +-- fsqlite-types
+  |           |     |     |     +-- fsqlite-error
+  |           |     |     +-- fsqlite-types
+  |           |     |     +-- fsqlite-error
+  |           |     +-- fsqlite-pager
+  |           |     +-- fsqlite-types
+  |           |     +-- fsqlite-error
+  |           +-- fsqlite-planner
+  |           |     +-- fsqlite-ast
+  |           |     |     +-- fsqlite-types
+  |           |     +-- fsqlite-types
+  |           |     +-- fsqlite-error
+  |           +-- fsqlite-parser
+  |           |     +-- fsqlite-ast
+  |           |     +-- fsqlite-types
+  |           |     +-- fsqlite-error
+  |           |     +-- memchr (external)
+  |           +-- fsqlite-mvcc
+  |           |     +-- fsqlite-wal
+  |           |     |     +-- fsqlite-pager
+  |           |     |     +-- fsqlite-vfs
+  |           |     |     +-- fsqlite-types
+  |           |     |     +-- fsqlite-error
+  |           |     +-- fsqlite-pager
+  |           |     +-- fsqlite-types
+  |           |     +-- fsqlite-error
+  |           |     +-- parking_lot (external)
+  |           +-- fsqlite-func
+  |           |     +-- fsqlite-types
+  |           |     +-- fsqlite-error
+  |           +-- fsqlite-ext-json
+  |           +-- fsqlite-ext-fts5
+  |           +-- fsqlite-ext-rtree
+  |           +-- (other extensions...)
+  |           +-- fsqlite-wal
+  |           +-- fsqlite-vfs
+  |           +-- fsqlite-btree
+  |           +-- fsqlite-pager
+  |           +-- fsqlite-ast
+  |           +-- fsqlite-types
+  |           +-- fsqlite-error
+  +-- fsqlite-error
+
+fsqlite-harness
+  +-- fsqlite
+  +-- fsqlite-error
+```
+
+---
+
+## 5. Dependencies
+
+### Runtime Dependencies
+
+| Crate | Version | Used By | Rationale |
+|-------|---------|---------|-----------|
+| `asupersync` | path dep (`/dp/asupersync`) | `fsqlite-vfs`, `fsqlite-mvcc`, `fsqlite-core` | Async runtime, blocking thread pool for file I/O, sync primitives (Mutex, RwLock, Semaphore), MPSC/oneshot channels. Project requirement -- no tokio. |
+| `frankentui` | path dep (`/dp/frankentui`) | `fsqlite-cli` | Terminal UI framework for the interactive shell (syntax highlighting, tab completion, key handling, styled text rendering). |
+| `thiserror` | 2.x | `fsqlite-error` | Derive macro for ergonomic error type definitions with automatic `Display` and `From` impls. |
+| `serde` | 1.x | `fsqlite-types`, `fsqlite-ext-json` | Serialization/deserialization for JSON extension output and potential config serialization. |
+| `serde_json` | 1.x | `fsqlite-ext-json` | JSON parsing and generation for the JSON1 extension functions. |
+| `tracing` | 0.1.x | multiple | Structured logging and diagnostic instrumentation throughout the engine. |
+| `bitflags` | 2.x | `fsqlite-types` | Type-safe bitflag definitions for OpenFlags, SyncFlags, and other flag sets. |
+| `smallvec` | 1.x | `fsqlite-vdbe`, `fsqlite-btree` | Stack-allocated small vectors for register files, cell arrays, and other bounded collections to reduce heap allocations in hot paths. |
+| `memchr` | 2.x | `fsqlite-parser` | SIMD-accelerated byte scanning for fast tokenizer keyword and delimiter detection. |
+| `parking_lot` | 0.12.x | `fsqlite-mvcc` | High-performance mutex and RwLock for the page lock table and MVCC version store. Lower overhead than std locks. |
+| `sha2` | 0.10.x | `fsqlite-wal` | SHA-256 checksumming for WAL frame integrity verification (supplementing SQLite's CRC-based checksums). |
 
 ### Development Dependencies
 
-- **criterion**: Benchmarking framework for micro and macro benchmarks.
-- **tempfile**: Temporary file and directory creation for tests.
-- **proptest**: Property-based testing for B-tree invariants, MVCC conflict detection, parser round-trips, and transaction interleaving.
-- **tracing** + **tracing-subscriber**: Structured logging for debugging and performance analysis during development.
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `criterion` | 0.8.x | Statistical benchmarking framework for performance regression testing. |
+| `proptest` | 1.x | Property-based testing for B-tree operations, parser edge cases, MVCC invariants, and transaction interleaving. |
+| `insta` | 1.x | Snapshot testing for parser AST output, EXPLAIN bytecode output, and query plan representations. |
+| `tempfile` | 3.x | Temporary file and directory creation for integration tests that exercise persistence and WAL. |
 
-## Verification
+### Workspace Configuration
 
-### Continuous Integration
+```toml
+[workspace.package]
+edition = "2024"
+license = "MIT"
 
-Every pull request and every commit to the main branch triggers the full CI pipeline:
+[workspace.lints.rust]
+unsafe_code = "forbid"
 
-- `cargo fmt --all --check` -- enforce consistent formatting
-- `cargo clippy --workspace --all-targets -- -D warnings` -- zero warnings policy
-- `cargo check --workspace` -- type checking across all crates
-- `cargo test --workspace` -- unit and integration tests
-- `cargo test --workspace --release` -- release-mode tests (catches UB from optimizations)
-- `cargo doc --workspace --no-deps` -- documentation builds without errors
+[workspace.lints.clippy]
+pedantic = "deny"
+nursery = "deny"
 
-### Conformance Suite
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+```
 
-The conformance test suite is the primary quality gate. It runs every SQL statement from the test corpus against both FrankenSQLite and C SQLite 3.52.0, comparing results:
+---
 
-- Exact result set matching (order-sensitive for ORDER BY queries, order-insensitive otherwise)
-- Error code matching (same error for same malformed input)
-- Type affinity matching (same types returned for same expressions)
-- NULL handling matching
-- Floating-point comparison with epsilon tolerance where appropriate
-- Target: 95%+ compatibility, with every known incompatibility documented and justified
+## 6. Testing Strategy
 
-### Stress Tests
+### Unit Tests (Per-Crate)
 
-- **100 threads x 100 writes**: 100 threads each perform 100 INSERT operations concurrently. Verify no data corruption, no lost writes, correct row counts, and that MVCC conflict resolution works correctly under load.
-- **Reader-writer mix**: 50 reader threads performing continuous SELECTs while 50 writer threads perform continuous INSERTs/UPDATEs. Verify that readers always see a consistent snapshot and that no reader ever sees partial transaction state.
-- **Checkpoint under load**: Continuous writes while periodic checkpoints occur. Verify that checkpointing does not corrupt the database and that readers are not blocked.
-- **Long-running transactions**: One reader holds a snapshot open for an extended period while many writers commit. Verify that the old snapshot remains readable and that garbage collection correctly preserves needed versions.
+Every crate contains `#[test]` modules exercising individual components in
+isolation. Trait dependencies are satisfied with mock implementations.
+
+**Coverage targets by crate:**
+- `fsqlite-types`: Serialization round-trips, varint encoding/decoding, value
+  type conversions, serial type encoding/decoding
+- `fsqlite-error`: Error construction, display formatting, error code mapping
+- `fsqlite-vfs`: MemoryVfs read/write/truncate/lock, UnixVfs file operations
+- `fsqlite-pager`: Page cache eviction, dirty page tracking, pager state
+  transitions, journal integration
+- `fsqlite-wal`: Frame encoding/decoding, WAL index operations, checkpoint
+  correctness, recovery from partial writes
+- `fsqlite-mvcc`: Visibility rule correctness, conflict detection, GC
+  reclaimability, snapshot consistency, page lock table semantics
+- `fsqlite-btree`: Cell parsing, page splitting/merging, cursor traversal,
+  overflow chains, freelist, integrity checking
+- `fsqlite-parser`: Token stream verification, AST structure for all statement
+  types, error recovery, edge cases
+- `fsqlite-planner`: Name resolution, index selection, cost model calculations
+- `fsqlite-vdbe`: Individual opcode semantics, type affinity conversions, sort
+  correctness
+- `fsqlite-func`: All built-in function return values and edge cases
+- Extensions: Each function and virtual table independently tested
+
+### Integration Tests
+
+Located in `tests/` at workspace root and within `fsqlite-core`. These test the
+full pipeline from SQL text to result rows:
+
+- **DDL tests**: CREATE TABLE/INDEX/VIEW/TRIGGER, ALTER TABLE, DROP
+- **DML tests**: INSERT, UPDATE, DELETE with various WHERE clauses
+- **Query tests**: SELECT with joins, subqueries, aggregation, window functions,
+  CTEs
+- **Transaction tests**: BEGIN/COMMIT/ROLLBACK, savepoints, auto-commit
+- **Persistence tests**: Write, close, reopen, verify (using `tempfile`)
+- **WAL tests**: Concurrent reader/writer scenarios
+- **MVCC tests**: Concurrent writer scenarios, conflict detection, snapshot
+  isolation
+
+### Property-Based Tests (proptest)
+
+- **B-tree invariant testing**: Random sequences of insert/delete/lookup
+  operations must maintain B-tree ordering invariants and page structure
+  validity.
+- **Parser round-trip**: Parse SQL, pretty-print AST, re-parse -- the two ASTs
+  must be structurally equivalent.
+- **MVCC linearizability**: Random interleaving of concurrent transactions must
+  produce results consistent with some serial ordering.
+- **Record format**: Random SqliteValue sequences must survive encode/decode
+  round-trip.
+
+### Fuzz Tests (cargo-fuzz)
+
+Targeted at components that process untrusted input:
+- SQL parser (arbitrary byte strings as SQL input)
+- Record decoder (arbitrary byte strings as record data)
+- B-tree page decoder (arbitrary byte strings as page content)
+- WAL frame decoder (arbitrary byte strings as WAL content)
+
+### Conformance Harness (`fsqlite-harness`)
+
+The golden-file conformance system:
+
+1. **Generation**: Run SQL scripts against the C `sqlite3` binary, capture
+   stdout/stderr as golden files stored in `conformance/golden/`.
+2. **Verification**: Run the same SQL scripts against `fsqlite`, compare output
+   row-by-row against golden files.
+3. **Reporting**: Produce a conformance matrix showing pass/fail/skip per test
+   file, with diff output for failures.
+4. **Target**: 95%+ pass rate across 1,000+ test SQL files.
+
+### File Format Round-Trip
+
+A key test category creates databases with the C SQLite library, reads them
+with FrankenSQLite (and vice versa), and verifies identical query results.
+This ensures file format compatibility is maintained. Includes byte-level
+comparison of page contents for known datasets.
+
+### Concurrency Stress Tests (Phase 6+)
+
+- 100 threads x 100 writes: verify all 10,000 rows present, no corruption
+- Long-running reader + concurrent writer: snapshot consistency
+- Kill-and-recover: data integrity after forced process termination
+- Memory growth under sustained MVCC load: GC keeps version count bounded
+- Checkpoint under concurrent write load: no corruption, no reader blocking
 
 ### Crash Recovery Verification
 
-- **Power-loss simulation**: Use `fallocate` and `ftruncate` to simulate incomplete writes at every possible byte boundary during WAL append and checkpoint operations. Verify that the database recovers correctly and no committed data is lost.
-- **Kill-9 testing**: Run a write workload, send SIGKILL at random points, restart and verify database integrity with `PRAGMA integrity_check`.
-- **Bit-flip testing**: Introduce random bit flips in the WAL and database files, verify that FrankenSQLite detects the corruption (via checksums) and reports it rather than silently returning wrong results.
+- **Power-loss simulation**: Simulate incomplete writes at every possible byte
+  boundary during WAL append and checkpoint. Verify recovery correctness.
+- **Kill-9 testing**: Run write workload, send SIGKILL at random points,
+  restart and verify with `PRAGMA integrity_check`.
+- **Bit-flip testing**: Random bit flips in WAL and database files; verify
+  checksum detection rather than silent wrong results.
 
-### Performance Regression Testing
+### Cumulative Test Count Targets
 
-- Benchmark suite runs nightly on dedicated hardware
-- Results compared against previous runs with 5% regression threshold
-- Key metrics tracked: INSERT throughput, SELECT throughput, concurrent writer scaling, WAL checkpoint latency, FTS5 query latency
-- Comparison against C SQLite 3.52.0 on the same hardware and workloads
+| Phase | Cumulative Tests |
+|-------|-----------------|
+| Phase 1 | Workspace compiles, specification complete |
+| Phase 2 | 200+ |
+| Phase 3 | 500+ |
+| Phase 4 | 1,000+ |
+| Phase 5 | 1,500+ |
+| Phase 6 | 2,000+ |
+| Phase 7 | 3,000+ |
+| Phase 8 | 3,500+ |
+| Phase 9 | 4,000+ |
+
+---
+
+## 7. Risk Assessment
+
+### High Risk
+
+| Risk | Impact | Likelihood | Mitigation |
+|------|--------|------------|------------|
+| **MVCC overhead exceeds budget.** Page-level versioning adds memory and CPU cost per page access. If overhead exceeds 2x for non-contended workloads, the concurrency benefit may not justify the cost. | High | Medium | Benchmark continuously from Phase 6. Buffer pool eviction of superseded versions keeps memory bounded. Page lock table uses `BTreeMap` (not `HashMap`) for cache-friendly access patterns. Profile and optimize hot paths with `criterion`. |
+| **B-tree balancing correctness.** The page splitting/merging algorithms in `btree.c` are among the most complex and subtle code in SQLite (~4,000 lines for balance_nonroot alone). Correctness bugs here corrupt data silently. | High | Medium | Extensive property-based testing with `proptest` (random insert/delete sequences). Integrity check function runs after every test. Compare B-tree structure against C SQLite for identical insertion sequences. |
+| **File format incompatibility.** Subtle encoding differences (varint edge cases, cell pointer alignment, overflow threshold calculations) could produce files that C SQLite rejects or misreads. | High | Medium | Golden-file round-trip tests: create with FrankenSQLite, read with C SQLite (and vice versa). Byte-level comparison of page contents for known datasets. Test with databases up to 1GB. |
+
+### Medium Risk
+
+| Risk | Impact | Likelihood | Mitigation |
+|------|--------|------------|------------|
+| **Parser coverage gaps.** SQLite's grammar has accumulated many extensions and edge cases over 20+ years. A hand-written parser may miss obscure syntax accepted by the LEMON-generated parser. | Medium | High | Use `parse.y` as the authoritative grammar reference. Fuzz the parser with SQL extracted from real-world applications. Conformance harness catches syntax acceptance differences. |
+| **WAL crash recovery correctness.** Incorrect WAL replay after a crash can lose committed transactions or apply uncommitted ones. | High | Low | Simulate crashes at every possible point in the commit sequence (before WAL write, after WAL write but before checkpoint, mid-checkpoint). Verify database integrity and transaction atomicity after recovery. |
+| **Query planner regression.** Different plan choices than C SQLite could cause dramatic performance differences for specific query patterns, even if the average is acceptable. | Medium | Medium | Start with a conservative planner that mimics C SQLite's heuristics. Use EXPLAIN comparison tests. Add ANALYZE support early. |
+| **Extension behavioral differences.** Extensions like FTS5 and JSON1 have large surface areas with many edge cases in ranking, tokenization, and JSON path evaluation. | Medium | Medium | Conformance harness with extension-specific test SQL files. Port existing extension test cases from the C source tree. |
+| **MVCC GC stalls.** If garbage collection does not keep pace with version creation under high write throughput, memory usage grows unboundedly. | Medium | Medium | Configurable GC interval via PRAGMA. GC runs in background without blocking writers. Monitor version chain length and buffer pool size. Alert when approaching capacity. |
+
+### Low Risk
+
+| Risk | Impact | Likelihood | Mitigation |
+|------|--------|------------|------------|
+| **Nightly Rust breakage.** Using nightly channel means compiler updates can break builds. | Low | Medium | Pin toolchain in `rust-toolchain.toml`. Update periodically with full test suite. Avoid depending on unstable features likely to change. |
+| **asupersync API changes.** asupersync is an internal library that may evolve. | Low | Low | Isolate asupersync usage behind internal abstraction layers. VFS trait already provides this isolation for file I/O. |
+| **Deadlock in MVCC.** Despite the eager-locking design intended to prevent deadlocks, subtle bugs could introduce waiting cycles. | High | Low | Deadlock freedom is structural (no transaction ever waits while holding a page lock). Property-based tests with arbitrary transaction interleavings verify this invariant. Timeouts as a safety net. |
+
+---
+
+## 8. Key Reference Files
+
+The C SQLite source files most relevant to this port, with approximate sizes:
+
+### Core Engine
+
+| File | Purpose | Size |
+|------|---------|------|
+| `legacy_sqlite_code/sqlite/src/sqliteInt.h` | Master internal header: ALL core data structures (sqlite3, Vdbe, BtCursor, Parse, Select, Expr, Table, Column, Index, etc.) | ~250 KB |
+| `legacy_sqlite_code/sqlite/src/btree.c` | B-tree storage engine: cursor operations, cell management, page balancing, overflow, freelist | 11,568 lines |
+| `legacy_sqlite_code/sqlite/src/btreeInt.h` | B-tree internal structures: MemPage, BtCursor, BtShared, CellInfo | ~600 lines |
+| `legacy_sqlite_code/sqlite/src/pager.c` | Page cache, transaction management, journal I/O, pager state machine | 7,834 lines |
+| `legacy_sqlite_code/sqlite/src/wal.c` | Write-ahead logging: WAL frame format, WAL index, checkpoint, recovery. **WAL_WRITE_LOCK at line 3698** -- the lock we are replacing with MVCC. | 4,621 lines |
+| `legacy_sqlite_code/sqlite/src/vdbe.c` | VDBE bytecode interpreter: the main execution loop with 190+ opcode case handlers | 9,316 lines |
+| `legacy_sqlite_code/sqlite/src/vdbeInt.h` | VDBE internal structures: Vdbe, VdbeOp, Mem, VdbeCursor | ~700 lines |
+| `legacy_sqlite_code/sqlite/src/vdbeaux.c` | VDBE auxiliary: program construction, Mem operations, column cache | ~5,000 lines |
+| `legacy_sqlite_code/sqlite/src/vdbeapi.c` | VDBE public API: step(), column_*(), finalize() | ~2,000 lines |
+
+### SQL Parsing and Planning
+
+| File | Purpose | Size |
+|------|---------|------|
+| `legacy_sqlite_code/sqlite/src/parse.y` | LEMON parser grammar: the authoritative SQL grammar definition | 1,963 lines |
+| `legacy_sqlite_code/sqlite/src/tokenize.c` | SQL tokenizer: character classification, string/number/identifier scanning | 899 lines |
+| `legacy_sqlite_code/sqlite/src/select.c` | SELECT statement compilation: join processing, subquery flattening, compound SELECT | 8,972 lines |
+| `legacy_sqlite_code/sqlite/src/where.c` | WHERE clause optimization: index selection, cost estimation, skip-scan | 7,858 lines |
+| `legacy_sqlite_code/sqlite/src/wherecode.c` | WHERE code generation: translates WHERE plan into VDBE bytecode | ~3,500 lines |
+| `legacy_sqlite_code/sqlite/src/whereexpr.c` | WHERE expression analysis: term extraction, OR optimization | ~2,000 lines |
+| `legacy_sqlite_code/sqlite/src/resolve.c` | Name resolution: column and table binding | ~2,000 lines |
+| `legacy_sqlite_code/sqlite/src/expr.c` | Expression handling: evaluation, comparison, code generation | ~6,500 lines |
+
+### DML and DDL
+
+| File | Purpose | Size |
+|------|---------|------|
+| `legacy_sqlite_code/sqlite/src/insert.c` | INSERT code generation | ~2,500 lines |
+| `legacy_sqlite_code/sqlite/src/update.c` | UPDATE code generation | ~1,500 lines |
+| `legacy_sqlite_code/sqlite/src/delete.c` | DELETE code generation | ~1,200 lines |
+| `legacy_sqlite_code/sqlite/src/build.c` | DDL: CREATE/DROP TABLE/INDEX/VIEW/TRIGGER, ALTER TABLE | ~5,000 lines |
+| `legacy_sqlite_code/sqlite/src/trigger.c` | Trigger compilation and execution | ~1,200 lines |
+| `legacy_sqlite_code/sqlite/src/pragma.c` | PRAGMA command handling | ~3,000 lines |
+
+### VFS and OS Interface
+
+| File | Purpose | Size |
+|------|---------|------|
+| `legacy_sqlite_code/sqlite/src/os_unix.c` | Unix VFS: file I/O, advisory locking, mmap, shared memory | ~9,000 lines |
+| `legacy_sqlite_code/sqlite/src/os.c` | OS abstraction layer: VFS registration, default VFS selection | ~400 lines |
+
+### Extensions
+
+| File/Directory | Purpose | Size |
+|----------------|---------|------|
+| `legacy_sqlite_code/sqlite/ext/fts5/` | FTS5 full-text search | ~29,000 lines total |
+| `legacy_sqlite_code/sqlite/ext/fts3/` | FTS3/FTS4 full-text search | ~21,000 lines total |
+| `legacy_sqlite_code/sqlite/ext/rtree/` | R-tree spatial index + geopoly | ~7,000 lines total |
+| `legacy_sqlite_code/sqlite/ext/misc/json.c` | JSON1 extension | ~171 KB |
+| `legacy_sqlite_code/sqlite/ext/session/` | Session/changeset extension | ~13,000 lines total |
+| `legacy_sqlite_code/sqlite/ext/icu/` | ICU Unicode collation | ~500 lines |
+
+### External Reference (asupersync)
+
+| File | Purpose | Size |
+|------|---------|------|
+| `/dp/asupersync/src/database/sqlite.rs` | Asupersync's existing SQLite wrapper (API reference) | ~800 lines |
+| `/dp/asupersync/src/sync/` | Mutex, RwLock, Semaphore, Pool primitives | ~1,500 lines |
+| `/dp/asupersync/src/channel/mpsc.rs` | Two-phase reserve/commit MPSC channel | ~500 lines |
+| `/dp/beads_rust/src/error/mod.rs` | Reference error pattern (thiserror usage) | ~300 lines |
+| `/dp/frankentui/Cargo.toml` | Reference workspace layout and conventions | -- |
