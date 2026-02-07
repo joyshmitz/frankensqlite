@@ -8038,6 +8038,12 @@ rebase replay:
    format documentation). NULL propagation follows SQL semantics.
 5. Produce the updated row record from the new base row with the evaluated column
    updates applied. Emit as a page delta.
+6. **Constraint checks (normative):** The replay engine MUST enforce the same
+   row-level constraint semantics as normal execution for the updated row:
+   - **NOT NULL** constraints for the target table.
+   - **CHECK** constraints for the target table (a CHECK that evaluates to
+     false fails; true or NULL passes, per SQLite semantics).
+   If any constraint fails, rebase MUST abort (true conflict/violation).
 6. **Index regeneration (critical):** Any `IndexDelete`/`IndexInsert` ops in the
    original intent log that are associated with this `UpdateExpression` (same
    `table`, same `rowid`) carry stale key bytes derived from the original snapshot
@@ -8055,12 +8061,18 @@ rebase replay:
 
 **VDBE codegen rules for `UpdateExpression` emission (normative):**
 
-The code generator emits an `UpdateExpression` intent (instead of a materialized `Update`
-with the row read in `footprint.reads`) when ALL of:
-- The target table has no triggers (BEFORE/AFTER/INSTEAD) and no foreign-key
-  actions that would require executing additional statements. If triggers or FK
-  actions are present, the statement MUST fall back to a materialized `Update`
-  so the full statement semantics are preserved.
+The code generator emits an `UpdateExpression` intent (instead of a materialized
+`Update` with the row read in `footprint.reads`) when ALL of:
+- The target table has no triggers (BEFORE/AFTER/INSTEAD).
+- **Foreign keys (V1 restriction):** The target table MUST NOT participate in
+  any foreign key constraints (as child or parent). Foreign key enforcement
+  requires additional semantic reads/writes that are not represented in
+  `RebaseExpr` and would otherwise be bypassed by commit-time replay. If any
+  foreign keys apply, the statement MUST fall back to a materialized `Update`.
+- **CHECK constraints (V1 restriction):** If the target table has CHECK
+  constraints, each CHECK expression MUST be accepted by `expr_is_rebase_safe()`
+  so it can be re-evaluated deterministically during replay (step 6 above).
+  Otherwise, fall back to a materialized `Update`.
 - The WHERE clause resolves to a point lookup by rowid or integer primary key
   (not a range scan, not a secondary index scan with multiple candidates).
 - No SET clause targets the rowid or INTEGER PRIMARY KEY column. Modifying the
