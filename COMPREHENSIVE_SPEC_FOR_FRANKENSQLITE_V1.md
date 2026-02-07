@@ -5483,11 +5483,14 @@ Formal (commit clock): forall C1, C2 :
     commit(C1) happens-before commit(C2) => commit_seq(C1) < commit_seq(C2)
 ```
 
-*Enforcement:* `TxnManager::next_txn_id` is an `AtomicU64` incremented with
-`fetch_add(1, SeqCst)`, but the published TxnId is `raw + 1` (§5.4) so `TxnId=0`
-is unrepresentable for any live transaction (0 is reserved for shared-memory
-sentinels). Sequential consistency ordering guarantees that no two calls return
-the same raw value, and therefore the resulting TxnIds are strictly increasing.
+*Enforcement:* `TxnManager::next_txn_id` is an `AtomicU64` advanced by a CAS loop
+that increments by 1 and rejects reserved sentinel values (§5.4). Each successful
+CAS publishes a unique TxnId, and the underlying counter only ever increases, so
+TxnIds are strictly increasing. If the counter would wrap into `TxnId=0` or the
+reserved shared-memory sentinels (`TXN_ID_CLAIMING`, `TXN_ID_CLEANING`; §5.6.2),
+the engine MUST fail fast with `FATAL_TXN_ID_OVERFLOW` rather than publishing an
+illegal TxnId into shared memory.
+
 `CommitSeq` is assigned only by the commit sequencer in the serialized commit
 section, so committed transactions have a strict total order.
 
@@ -6213,7 +6216,7 @@ SharedMemoryLayout := {
                                        -- Typical: 16 processes * 16 concurrent queries = 256 slots.
                                        -- Memory cost: 256 * sizeof(TxnSlot) ≈ 256 * 128B = 32KB.
                                        -- Exceeding capacity returns SQLITE_BUSY (not silent failure).
-    next_txn_id      : AtomicU64,      -- global TxnId counter (fetch_add)
+    next_txn_id      : AtomicU64,      -- global TxnId counter (allocated via CAS loop; §5.4)
     commit_seq       : AtomicU64,      -- published commit_seq high-water mark (latest DURABLE commit)
                                        -- NOTE: This is NOT a commit_seq allocator.
                                        -- Native mode: advanced by the marker sequencer only AFTER the
@@ -15352,7 +15355,7 @@ collision concentration of write sets and use it for:
 - BOCPD regime detection for skew shifts (§4.8),
 - shard sizing for lock tables / hot indices (when applicable).
 
-##### 18.4.1.1 Primary Quantity: Collision Mass (M2) and Effective Page Pool
+##### 18.4.1.1 Primary Quantity: Collision Mass (M2) and Effective Collision Pool
 
 Let `q(pgno)` be the probability that a random writing transaction includes page
 `pgno` in its commit-time `write_set(txn)` within a given time window / BOCPD
@@ -15362,7 +15365,7 @@ regime. Define the **collision mass** (second moment):
 M2 := Σ_{pgno} q(pgno)^2
 ```
 
-and the **effective page pool size**:
+and the **effective collision pool size** (transaction-level):
 
 ```
 P_eff := 1 / M2
@@ -15374,6 +15377,11 @@ Under the uniform model with fixed write-set size `W`, `q(pgno)=W/P`, so
 ```
 P(any conflict among N txns) ~ 1 - exp(-C(N,2) * M2)
 ```
+
+**Interpretation note:** `P_eff` plays the role of the "year length" `P` in the
+birthday-paradox formula *for transactions* (each transaction is a multi-page
+write set). It MUST NOT be interpreted as an estimate of the database's physical
+page count.
 
 This formulation is intentionally model-free: it does not assume Zipf, and it
 captures hot-page concentration directly (structural events + hot leaves).
