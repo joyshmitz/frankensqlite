@@ -7658,7 +7658,11 @@ For each publish request:
    `marker_id` is the integrity hash of the record.
 6. **FSYNC barrier (post-marker):** Issue `fdatasync` on the marker stream.
    The client MUST NOT receive a success response until this completes.
-7. **Respond:** Notify the client of success (or conflict/abort).
+7. **Publish commit_seq:** Update the shared-memory `commit_seq` high-water mark
+   (§5.6.1) with a `Release` store of the committed `commit_seq`. This MUST
+   occur only after the marker is durable (step 6), so other processes never
+   observe a `commit_seq` that does not exist in the marker stream.
+8. **Respond:** Notify the client of success (or conflict/abort).
 
 #### 7.11.3 Background Work (Not in Critical Section)
 
