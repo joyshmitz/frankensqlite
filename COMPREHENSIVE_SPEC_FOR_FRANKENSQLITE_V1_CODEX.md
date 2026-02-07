@@ -31,7 +31,7 @@ If this file conflicts with `AGENTS.md`, `Cargo.toml`, `rust-toolchain.toml`, or
 5. Core Data Model (Formal-ish, Testable)
 6. ECS Storage Substrate (Objects, Symbols, Physical Layout)
 7. Concurrency: MVCC + SSI (Serializable by Default)
-8. Algebraic Write Merging (Conflict Reduction Without Row MVCC)
+8. Safe Write Merging (Intent + Structured Patches)
 9. Durability: Coded Commit Stream (Protocol + Recovery + Compaction)
 10. The Radical Index: RaptorQ-Coded Index Segments (Lookup, Repair, Rebuild)
 11. Caching & Acceleration (ARC, Bloom/Quotient Filters, Hot Paths)
@@ -198,7 +198,7 @@ This is the database engine reframed as information theory:
 - **Recovery** becomes: “if some symbols are corrupt/missing, can we decode the object anyway?”
 - **Indexing** becomes: “can we represent index state as encoded objects too, so indices are self-healing and replication-native?”
 
-This is “RaptorQ in every pore”: not only for snapshot shipping, but for WAL, WAL index, page versions, and even conflict reduction via algebraic delta merging.
+This is “RaptorQ in every pore”: not only for snapshot shipping, but for WAL, WAL index, page versions, and MVCC history compression via delta patches.
 
 ---
 
@@ -403,7 +403,7 @@ Where `PageDelta` is not necessarily “a full page image”. It can be:
 
 - full page image (baseline)
 - sparse byte-range patch (preferred)
-- algebraic delta (GF(256) vector / XOR patch), enabling merge (see §8)
+- algebraic delta (GF(256) vector / XOR patch) for encoding/history compression (merge eligibility is semantic/structured; see §8)
 
 The capsule is encoded into RaptorQ symbols and persisted/distributed via ECS.
 
@@ -785,7 +785,7 @@ This must be validated under `asupersync::LabRuntime` schedule exploration.
 
 ### 7.9 Relationship To Mergeable Writes
 
-Write-write conflicts are not binary. Section §8 defines algebraic patches and safe merges.
+Write-write conflicts are not binary. Section §8 defines safe write merging via intent replay and structured page patches.
 
 Policy:
 
@@ -905,14 +905,14 @@ This upgrade is driven by data:
 
 ---
 
-## 8. Algebraic Write Merging (Conflict Reduction Without Row MVCC)
+## 8. Safe Write Merging (Intent + Structured Patches)
 
 Page-level MVCC can still conflict on hot pages. We want to reduce false conflicts **without** upgrading to row-level MVCC metadata (which would break file format and cost space).
 
 We exploit two “merge planes”:
 
 1. **Logical plane (preferred):** merge *intent-level* B-tree operations that commute (e.g., inserts into distinct keys).
-2. **Physical plane (fallback):** merge *byte-level* patches when we can prove disjointness + invariant preservation.
+2. **Physical plane (fallback):** merge *structured page patches* keyed by stable identifiers (e.g., `cell_key_digest`). Raw byte-disjoint XOR merge is forbidden for SQLite structured pages.
 
 RaptorQ alignment:
 
@@ -963,27 +963,15 @@ Determinism requirement:
 
 - The replay engine MUST be deterministic for a given `(intent_log, base_snapshot)` under lab runtime (no dependence on wall-clock, iteration order, hash randomization, etc.).
 
-### 8.3 Physical Merge: GF(256) Sparse XOR Patches (When Safe)
+### 8.3 Physical Merge: Structured Page Patches
 
-Physical merge is useful for tiny, local, obviously-disjoint changes.
+Physical merge is the fallback when base drift is detected and deterministic rebase (§8.2)
+does not apply or does not succeed.
 
-Model:
-
-- A page is a vector `p ∈ GF(256)^n`.
-- A sparse XOR patch is a vector `Δ` with support in a set of ranges.
-- Apply: `p' = p ⊕ Δ`.
-
-Merge condition:
-
-```
-disjoint(ΔA, ΔB) := support(ΔA) ∩ support(ΔB) = ∅
-merge(ΔA, ΔB) := ΔA ⊕ ΔB
-```
-
-When disjoint, merges commute and associate. This gives us:
-
-- merge without ordering assumptions
-- a clean algebra that matches the coding field
+Encoding note: XOR/`GF(256)` deltas are a useful *representation* for page history compression,
+but for SQLite structured pages, merge eligibility is never decided by raw byte-range
+disjointness. Physical merge must be expressed as a `StructuredPagePatch` keyed by stable
+identifiers (e.g., `cell_key_digest`) with explicit invariant checks.
 
 ### 8.4 StructuredPagePatch: Make Safety Explicit
 
@@ -1002,7 +990,7 @@ StructuredPagePatch {
   // Default: conflict. Future: structured merge with proofs.
   free_ops: Vec<FreeSpaceOp>,
 
-  // Escape hatch (debug only): explicit byte ranges with declared invariants
+  // Forbidden for SQLite structured pages; debug-only for explicitly-opaque pages
   raw_xor_ranges: Vec<RangeXorPatch>,
 }
 ```
@@ -1018,11 +1006,14 @@ When a txn `U` reaches commit:
 1. Run serializability rule (§7) first. If `U` is a pivot → abort.
 2. For each page in `write_set(U)`:
    - if base unchanged → OK
-   - else attempt merge:
+   - else attempt SAFE merge ladder (default):
      1. try deterministic rebase replay (preferred)
      2. else try structured patch merge (if supported for those ops)
-     3. else try sparse XOR merge (only if ranges declared merge-safe)
-     4. else abort/retry
+     3. else abort/retry
+
+Policy knob: `PRAGMA fsqlite.write_merge = OFF | SAFE | LAB_UNSAFE`. `SAFE` never allows raw
+byte-range XOR merging for SQLite structured pages; `LAB_UNSAFE` is a debug facility for
+explicitly-opaque pages only.
 
 This yields a strict safety ladder: we only take merges we can justify.
 

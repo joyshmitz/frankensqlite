@@ -2330,6 +2330,46 @@ CommitMarkerRecord := {
 - an `ObjectId`-compatible identifier (128-bit BLAKE3) suitable for use in
   `RootManifest.current_commit` and `CommitMarker.prev_marker`.
 
+**Density invariant (normative, required for O(1) seeks):**
+
+- Within any marker segment, the record at slot index `i` (0-based) MUST be the
+  marker for `commit_seq = start_commit_seq + i`.
+- The marker stream MUST NOT have gaps in `commit_seq` for committed markers.
+  If record `commit_seq = N` exists, then every `commit_seq < N` MUST also have
+  a record (except before genesis).
+
+This is not an aesthetic choice: the O(1) seek formula below is only correct if
+the on-disk marker stream is a dense array in `commit_seq` order.
+
+**CommitSeq allocation (native mode, gap-free, crash-safe):**
+
+`commit_seq` MUST be derived from the **physical marker stream tip** inside the
+same cross-process serialized section used to append the marker record.
+Implementations MUST NOT allocate `commit_seq` from an in-memory counter that
+can advance without a durably appended marker (e.g., `AtomicU64::fetch_add` in
+shared memory) because a crash after allocation but before marker persistence
+would create a permanent gap and break O(1) indexing.
+
+The allocator for the next commit sequence number is:
+
+```
+// Inside the marker-append lock / commit section.
+let n_records = floor((segment_file_len_bytes - sizeof(MarkerSegmentHeader)) / record_size);
+next_commit_seq = start_commit_seq + n_records;
+```
+
+**Torn tail handling (normative):**
+
+- If a marker segment ends with a partial record (i.e.,
+  `(segment_file_len_bytes - sizeof(MarkerSegmentHeader)) % record_size != 0`),
+  those trailing bytes MUST be treated as a torn-write tail and MUST be ignored
+  for `commit_seq` allocation. Recovery MAY truncate them.
+- If the last complete record fails `record_xxh3` verification, recovery MUST
+  treat it (and any subsequent records in the segment) as corrupt/torn and MUST
+  ignore it for `commit_seq` allocation. (The simplest safe policy: scan forward
+  from the segment start until the first invalid record; the valid prefix is
+  authoritative.)
+
 **O(1) seek by commit_seq (normative):**
 
 Given a target `commit_seq`, the reader locates the segment containing it
@@ -4249,9 +4289,20 @@ Formal (commit clock): forall C1, C2 :
 *Enforcement:* `TxnManager::next_txn_id` is an `AtomicU64` incremented with
 `fetch_add(1, SeqCst)`. Sequential consistency ordering guarantees that no two
 calls return the same value, and the values are strictly increasing.
-`CommitSeq` is assigned only by the commit sequencer via an `AtomicU64`
-`fetch_add(1, SeqCst)` (or an equivalent serialized allocator), so committed
-transactions have a strict total order.
+`CommitSeq` is assigned only by the commit sequencer in the serialized commit
+section, so committed transactions have a strict total order.
+
+**Native mode (marker stream):** `CommitSeq` allocation MUST be gap-free and
+MUST be derived from the physical marker stream tip under the marker-append
+lock (§3.5.4.1). Implementations MUST NOT allocate `CommitSeq` from an
+in-memory counter that can advance without a durably appended marker record,
+because a crash after allocation but before persistence would create a gap and
+break O(1) marker indexing.
+
+**Compatibility mode (WAL):** `CommitSeq` advances only after the WAL commit
+record is durably published (post-fsync). The engine MAY cache the current
+high-water `CommitSeq` in an `AtomicU64` for snapshot capture, but it MUST
+never get ahead of the durable publication point.
 
 *Violation consequence:* If TxnIds are reused or non-monotone, snapshot
 visibility becomes undefined. A transaction could see a "future" version as
@@ -4650,6 +4701,15 @@ because releasing a page lock mid-transaction would allow another transaction
 to acquire it, potentially violating first-committer-wins when the outer
 transaction later tries to re-write the page.
 
+**SSI witness interaction:** Similarly, SSI witness keys (read/write
+registrations in the hot plane) are NOT rolled back on `ROLLBACK TO`. Once a
+read or write is registered in the `HotWitnessIndex` bitset, it remains set
+for the lifetime of the enclosing transaction. This is a safe overapproximation:
+retaining stale witness entries can only increase false positive aborts, never
+cause false negatives (missed anomalies). Rolling back witnesses would risk
+missing a genuine rw-antidependency if the transaction later re-reads or
+re-writes the same pages.
+
 ### 5.5 Safety Proofs
 
 **Theorem 1 (Deadlock Freedom):** The MVCC system is deadlock-free.
@@ -4872,7 +4932,12 @@ SharedMemoryLayout := {
                                        -- Memory cost: 256 * sizeof(TxnSlot) ≈ 256 * 128B = 32KB.
                                        -- Exceeding capacity returns SQLITE_BUSY (not silent failure).
     next_txn_id      : AtomicU64,      -- global TxnId counter (fetch_add)
-    commit_seq       : AtomicU64,      -- global commit sequence counter
+    commit_seq       : AtomicU64,      -- published commit_seq high-water mark (latest DURABLE commit)
+                                       -- NOTE: This is NOT a commit_seq allocator.
+                                       -- Native mode: advanced by the marker sequencer only AFTER the
+                                       -- marker record is durably appended (§7.11.2) and MUST match the
+                                       -- physical marker stream tip (§3.5.4.1). It MUST NOT get ahead of
+                                       -- the marker stream (no gaps).
     schema_epoch     : AtomicU64,      -- monotonic schema epoch (mirror of RootManifest.schema_epoch)
     gc_horizon       : AtomicU64,      -- safe GC horizon commit_seq (min active begin_seq) across all processes
     lock_table_offset: u64,            -- byte offset to PageLockTable region
@@ -4888,7 +4953,14 @@ SharedMemoryLayout := {
 
 The shared-memory file is created on first access and mapped by every
 process that opens the database. All fields after the header use atomic
-operations (SeqCst ordering for correctness, Relaxed for read-only counters).
+operations.
+
+**Memory ordering (normative):**
+- `commit_seq` stores MUST use `Release` ordering at the commit publication
+  point; `commit_seq` loads for snapshot capture MUST use `Acquire` ordering.
+- Other fields MAY use `SeqCst` when simplicity is worth the cost; otherwise
+  use `Acquire/Release` where required by invariants and `Relaxed` only for
+  diagnostics counters.
 
 #### 5.6.2 TxnSlot: Per-Transaction Cross-Process State
 
@@ -9485,12 +9557,18 @@ Header (136 bytes):
                notUsed0(u32) at offset 132
 
 Hash table segments (32 KB each):
-  First segment:  covers up to 4062 frames (reduced by the 136-byte header).
-                  [0..16248]:     Page number array: 4062 entries x 4 bytes
-                  [16248..32632]: Hash table: 8192 slots x 2 bytes
+  Physical layout: page-number array (u32[4096]) at bytes [0..16384) and
+  hash table (ht_slot[8192], u16) at bytes [16384..32768) in ALL segments.
+  In the first segment, the 136-byte header overlaps the first 34 u32
+  page-number slots, leaving 4062 usable entries (wal.c compile-time assert).
+
+  First segment:  covers up to 4062 frames.
+                  [0..136):       Header (overlaps first 34 page-number slots)
+                  [136..16384):   Page number array: 4062 entries x 4 bytes
+                  [16384..32768): Hash table: 8192 slots x 2 bytes
   Subsequent:     covers up to 4096 frames (full 32 KB region).
-                  [0..16384]:     Page number array: 4096 entries x 4 bytes
-                  [16384..32768]: Hash table: 8192 slots x 2 bytes
+                  [0..16384):     Page number array: 4096 entries x 4 bytes
+                  [16384..32768): Hash table: 8192 slots x 2 bytes
   Hash function: (page_number * 383) & 8191, linear probing.
   -- NOT simple modulo. The prime multiplier 383 (HASHTABLE_HASH_1 in C
   -- SQLite) provides much better distribution for sequential page numbers.
@@ -9542,7 +9620,8 @@ on Unicode code points regardless of encoding.
 - Maximum: 65536 bytes
 - Must be a power of 2
 - The value 1 at header offset 16-17 encodes 65536 (since 65536 > u16::MAX)
-- Page size is set at database creation and cannot be changed (except by VACUUM INTO)
+- Page size is set at database creation and cannot be changed except by
+  `PRAGMA page_size = N; VACUUM;` (only when NOT in WAL mode) or `VACUUM INTO`
 - FrankenSQLite default: 4096 (matches modern filesystem block size and SSD page size)
 
 ### 11.14 Rollback Journal Format
@@ -9566,8 +9645,11 @@ Journal Page Records (repeated page_count times):
   [4 bytes: checksum]
 ```
 
-**Checksum:** `sum of every 200th byte of the page data, starting from
-byte offset (page_size - 200), wrapping around, plus the random nonce`.
+**Checksum:** `nonce + data[page_size-200] + data[page_size-400] + ... + data[k]`
+where k is the smallest value `>= 0` in the arithmetic sequence. The loop
+starts at offset `page_size - 200`, decrements by 200 each step, and stops
+when the offset would go below zero (pager.c `pager_cksum()`). For 4096-byte
+pages: 20 bytes summed (offsets 3896, 3696, ..., 96).
 
 **Hot journal recovery:** On open, if a journal file exists, is non-empty,
 and the database's reserved lock is not held, it is a "hot journal." Recovery
@@ -12888,6 +12970,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.13 (Write-merge hardening: forbid raw byte-disjoint XOR merge on SQLite structured pages; SAFE merge ladder clarified (intent replay + structured patches); PRAGMA fsqlite.write_merge added; commit pseudocode + conflict model updated)*
+*Document version: 1.14 (Round 4 audit fixes: SSI T3 rule pseudocode bug fix (out_edges→in_edges, add has_out_rw set); dangerous structure informal description corrected; operator precedence table fixed (COLLATE/unary swap, ISNULL/NOTNULL/NOT NULL added); RETURNING clause timing corrected (pre-AFTER-trigger, not post-trigger); cross-process INV-6 visibility note; Theorem 5 burst caveat; savepoint SSI witness interaction; ~220 MiB precision fix)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
