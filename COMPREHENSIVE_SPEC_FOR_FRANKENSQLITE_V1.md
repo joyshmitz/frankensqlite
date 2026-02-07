@@ -2333,7 +2333,7 @@ CommitMarkerRecord := {
   capsule_object_id  : [u8; 16],
   proof_object_id    : [u8; 16],
   prev_marker_id     : [u8; 16],  -- 0 for genesis
-  marker_id          : [u8; 16],  -- BLAKE3_128 of all preceding fields in this record
+  marker_id          : [u8; 16],  -- domain-separated BLAKE3-128 of record prefix (see MarkerId definition)
   record_xxh3        : u64,       -- xxhash3 of all preceding fields in this record
 }
 ```
@@ -8642,6 +8642,32 @@ pub trait VfsFile: Send + Sync {
     /// Bit flags indicating device properties: IOCAP_ATOMIC, IOCAP_SAFE_APPEND,
     /// IOCAP_SEQUENTIAL, etc. Used to optimize sync behavior.
     fn device_characteristics(&self) -> u32;
+
+    // --- Shared-memory methods (required for WAL mode) ---
+
+    /// Map a region of shared memory. `region` is a 0-based index of 32KB
+    /// regions. If `extend` is true and the region does not exist, create it.
+    /// Returns a mutable pointer to the mapped region.
+    /// (Equivalent to sqlite3_io_methods.xShmMap)
+    fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool)
+        -> Result<*mut u8>;
+
+    /// Acquire or release a shared-memory lock.
+    /// `offset` and `n` define a range of lock slots.
+    /// `flags`: SHM_LOCK | (SHM_SHARED | SHM_EXCLUSIVE).
+    /// (Equivalent to sqlite3_io_methods.xShmLock)
+    fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32)
+        -> Result<()>;
+
+    /// Memory barrier for shared memory -- ensures all prior SHM writes are
+    /// visible to other processes before subsequent reads.
+    /// (Equivalent to sqlite3_io_methods.xShmBarrier)
+    fn shm_barrier(&self);
+
+    /// Unmap all shared-memory regions. If `delete` is true, also delete
+    /// the underlying SHM file.
+    /// (Equivalent to sqlite3_io_methods.xShmUnmap)
+    fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()>;
 }
 
 /// MVCC-aware page access. The primary interface for B-tree and VDBE layers.
@@ -8654,6 +8680,13 @@ pub trait VfsFile: Send + Sync {
 /// # Lifetime Relationships
 /// The MvccPager outlives all Transactions it creates. Transaction holds
 /// a reference (via Arc) to the MvccPager's internal state.
+///
+/// **Type placement note:** The `Transaction` type referenced below MUST be
+/// defined in `fsqlite-pager` (or `fsqlite-types`), NOT in `fsqlite-mvcc`.
+/// Otherwise `fsqlite-pager` (L2) would depend on `fsqlite-mvcc` (L3),
+/// creating a circular dependency since `fsqlite-mvcc` depends on
+/// `fsqlite-pager`. The concrete `Transaction` struct in `fsqlite-mvcc`
+/// implements a pager-level `TransactionHandle` trait defined here.
 mod sealed { pub trait Sealed {} } // private to the defining crate
 
 pub trait MvccPager: sealed::Sealed + Send + Sync {
@@ -8703,21 +8736,29 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
 pub trait BtreeCursorOps: sealed::Sealed {
     /// Position the cursor at or near the given key.
     /// Returns the cursor's final position relative to the key.
-    fn move_to(&mut self, key: &[u8]) -> Result<CursorPosition>;
+    fn move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<CursorPosition>;
+
+    /// Position the cursor at the first (smallest key) entry.
+    /// Returns false if the tree is empty. (VDBE: OP_Rewind)
+    fn first(&mut self, cx: &Cx) -> Result<bool>;
+
+    /// Position the cursor at the last (largest key) entry.
+    /// Returns false if the tree is empty. (VDBE: OP_Last)
+    fn last(&mut self, cx: &Cx) -> Result<bool>;
 
     /// Advance to the next entry. Returns false if no more entries.
-    fn next(&mut self) -> Result<bool>;
+    fn next(&mut self, cx: &Cx) -> Result<bool>;
 
     /// Move to the previous entry. Returns false if at the beginning.
-    fn prev(&mut self) -> Result<bool>;
+    fn prev(&mut self, cx: &Cx) -> Result<bool>;
 
     /// Insert a key/data pair at the cursor's current position.
     /// May trigger page splits (balance operations).
-    fn insert(&mut self, key: &[u8], data: &[u8]) -> Result<()>;
+    fn insert(&mut self, cx: &Cx, key: &[u8], data: &[u8]) -> Result<()>;
 
     /// Delete the entry at the cursor's current position.
     /// May trigger page merges.
-    fn delete(&mut self) -> Result<()>;
+    fn delete(&mut self, cx: &Cx) -> Result<()>;
 
     /// Read the key of the current entry.
     fn key(&self) -> Result<&[u8]>;
@@ -8833,13 +8874,17 @@ pub trait WindowFunction: Send + Sync {
 pub trait VirtualTable: Send + Sync {
     type Cursor: VirtualTableCursor;
 
-    /// Create or connect to a virtual table.
-    /// `args` contains the module arguments from the CREATE VIRTUAL TABLE statement.
+    /// Create a new virtual table (called for CREATE VIRTUAL TABLE).
+    /// Distinct from `connect`: `create` may create backing storage.
+    /// Default: delegates to `connect` (eponymous tables).
+    fn create(db: &Database, args: &[&str]) -> Result<Self> where Self: Sized {
+        Self::connect(db, args)
+    }
+
+    /// Connect to an existing virtual table (called on subsequent opens).
     fn connect(db: &Database, args: &[&str]) -> Result<Self> where Self: Sized;
 
-    /// Inform SQLite about the best index strategy for a given set of constraints.
-    /// The planner calls this to determine which indexes are available and
-    /// their estimated costs.
+    /// Inform the planner about available indexes and their estimated costs.
     fn best_index(&self, info: &mut IndexInfo) -> Result<()>;
 
     /// Open a new cursor for scanning the virtual table.
@@ -8847,6 +8892,44 @@ pub trait VirtualTable: Send + Sync {
 
     /// Disconnect from the virtual table (drop the instance).
     fn disconnect(&mut self) -> Result<()>;
+
+    /// Destroy the virtual table and its backing storage (DROP VIRTUAL TABLE).
+    /// Default: delegates to `disconnect`.
+    fn destroy(&mut self) -> Result<()> { self.disconnect() }
+
+    /// Perform INSERT, UPDATE, or DELETE on the virtual table.
+    /// `args[0]` = old rowid (None for INSERT), `args[1]` = new rowid,
+    /// `args[2..]` = column values. Returns the new rowid for INSERT.
+    /// Without this method, virtual tables are read-only.
+    fn update(&mut self, _args: &[SqliteValue]) -> Result<Option<i64>> {
+        Err(FrankenError::ReadOnly)
+    }
+
+    /// Begin a transaction on this virtual table.
+    fn begin(&mut self) -> Result<()> { Ok(()) }
+
+    /// Sync phase of two-phase commit.
+    fn sync(&mut self) -> Result<()> { Ok(()) }
+
+    /// Commit the current transaction.
+    fn commit(&mut self) -> Result<()> { Ok(()) }
+
+    /// Rollback the current transaction.
+    fn rollback(&mut self) -> Result<()> { Ok(()) }
+
+    /// Rename the virtual table.
+    fn rename(&mut self, _new_name: &str) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
+    /// Create a savepoint (n = savepoint depth).
+    fn savepoint(&mut self, _n: i32) -> Result<()> { Ok(()) }
+
+    /// Release a savepoint.
+    fn release(&mut self, _n: i32) -> Result<()> { Ok(()) }
+
+    /// Rollback to a savepoint.
+    fn rollback_to(&mut self, _n: i32) -> Result<()> { Ok(()) }
 }
 
 /// A cursor for iterating over a virtual table.
@@ -8998,6 +9081,10 @@ impl FunctionRegistry {
     /// Look up an aggregate function.
     pub fn find_aggregate(&self, name: &str, num_args: i32)
         -> Option<Arc<dyn AggregateFunction<State = Box<dyn Any + Send>>>> { ... }
+
+    /// Look up a window function.
+    pub fn find_window(&self, name: &str, num_args: i32)
+        -> Option<Arc<dyn WindowFunction<State = Box<dyn Any + Send>>>> { ... }
 }
 ```
 

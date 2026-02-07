@@ -1092,16 +1092,17 @@ and possibly:
 
 ### 9.4 Commit Objects: Capsule + Marker (Atomicity by Construction)
 
-We define two durable object types:
+We define:
 
-1. `CommitCapsule`: the payload (what changed + evidence).
-2. `CommitMarker`: the atomic “this commit exists” record.
+1. `CommitCapsule`: the coded payload (what changed + evidence references).
+2. `CommitProof`: a small coded evidence object persisted by the sequencer.
+3. `CommitMarkerRecord`: a fixed-size record appended to the marker stream (the commit clock).
 
 **Atomicity rule:**
 
-- A commit is committed iff its marker is committed.
-- A marker MUST reference exactly one capsule (by object id).
-- Recovery MUST ignore any capsule without a committed marker.
+- A commit is committed iff its `CommitMarkerRecord` is durably appended to the marker stream.
+- A marker record MUST reference exactly one capsule (by object id) and its proof.
+- Recovery MUST ignore any capsule/proof without a committed marker record.
 
 #### CommitCapsule (V1 payload)
 
@@ -1115,15 +1116,17 @@ Capsule contains:
 
 During recovery/apply, the `commit_seq` from the marker is associated with the capsule and used as the “created_by” identifier for any committed versions it publishes.
 
-#### CommitMarker (V1 payload)
+#### CommitMarkerRecord (V1 marker stream record)
 
 Marker contains:
 
 - `commit_seq`
+- `commit_time_unix_ns` (monotonic)
 - `capsule_object_id`
-- `prev_marker` pointer (hash-chain for linear history; like a linked list)
-- optional `checkpoint_generation`
-- integrity hash
+- `proof_object_id`
+- `prev_marker_id` pointer (hash-chain for linear history; like a linked list)
+- `marker_id` (BLAKE3-128 over the record prefix; domain separated)
+- `record_xxh3` (fast corruption check)
 
 The marker stream is append-only and totally ordered; it is the “commit clock”.
 
@@ -1141,11 +1144,16 @@ Protocol for txn `T`:
 3. Persist symbols to local symbol logs (and optionally stream to replicas) until the durability policy is satisfied:
    - local: persist ≥`K_total + margin` symbols (where `K_total = ObjectParams.total_source_symbols()`)
    - quorum: persist/ack ≥`K_total + margin` symbols across M replicas (asupersync quorum combinator)
-4. Create `CommitMarkerBytes(commit_seq, capsule_object_id, prev_marker, ...)`.
-   - `commit_seq` is allocated at this point.
-5. Encode/persist the marker as an ECS object as well, and append its id to the marker stream.
-6. Return success to the client.
-7. Index segments and caches update asynchronously.
+4. Submit `(capsule_object_id, write_set_summary, txn_identity)` to the WriteCoordinator.
+5. WriteCoordinator (serialized, tiny I/O):
+   - validate (FCW + SSI re-check)
+   - allocate `commit_seq` + monotonic `commit_time_unix_ns`
+   - persist `CommitProof`
+   - fsync barrier (referents durable)
+   - append fixed-size `CommitMarkerRecord` to marker stream
+   - fsync marker stream
+   - respond success to the client
+6. Index segments and caches update asynchronously.
 
 **Critical ordering:** marker publication MUST happen after capsule durability is satisfied. If marker is durable but capsule is not decodable, we violated our core contract.
 
