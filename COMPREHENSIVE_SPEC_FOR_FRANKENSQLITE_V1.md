@@ -7429,8 +7429,11 @@ Modules:
   Encoding on commit, decoding during recovery.
 
 Dependency rationale: needs `fsqlite-vfs` for WAL file and SHM file access;
-needs `fsqlite-pager` for page cache interaction during checkpoint; needs
-`asupersync` for RaptorQ codec.
+needs `asupersync` for RaptorQ codec. Does NOT depend on `fsqlite-pager`
+(V1.7 errata: the previous wal -> pager edge created a compile-time cycle;
+checkpoint page-write access is now injected at runtime via
+`&dyn CheckpointPageWriter`, defined in `fsqlite-pager`, passed by
+`fsqlite-core` during checkpoint orchestration).
 
 **`fsqlite-mvcc`** (~3,000 LOC estimated)
 
@@ -11775,7 +11778,7 @@ from spec, never translate line-by-line).
 
 | File | Purpose | Lines | What to Extract |
 |------|---------|-------|-----------------|
-| `sqliteInt.h` | Master header | ~250KB | All struct definitions (Btree, BtCursor, Pager, Wal, Vdbe, Mem, Table, Index, Column, Expr, Select, etc.), all `#define` constants, all function prototypes. This is the Rosetta Stone. |
+| `sqliteInt.h` | Main internal header | ~250KB | All struct definitions (Btree, BtCursor, Pager, Wal, Vdbe, Mem, Table, Index, Column, Expr, Select, etc.), all `#define` constants, all function prototypes. This is the Rosetta Stone. |
 | `btree.c` | B-tree engine | 11,568 | Page format parsing, cell format, cursor movement algorithms (moveToChild, moveToRoot, moveToLeftmost, moveToRightmost), insert/delete with rebalancing, overflow page management, freelist operations. Focus on `balance_nonroot` (~1,200 lines) as the most complex function. |
 | `pager.c` | Page cache | 7,834 | Pager state machine (OPEN, READER, WRITER_LOCKED, WRITER_CACHEMOD, WRITER_DBMOD, WRITER_FINISHED, ERROR), journal format, hot journal detection, page reference counting, cache eviction policy. |
 | `wal.c` | WAL subsystem | 4,621 | WAL header/frame format, checksum algorithm implementation, WAL index (wal-index) hash table structure, checkpoint algorithm, the critical `WAL_WRITE_LOCK` at line 3698 that FrankenSQLite replaces with MVCC. |
