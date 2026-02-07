@@ -153,7 +153,9 @@ It targets:
 - Full SQL dialect compatibility with C SQLite
 - File format round-trip interoperability (read/write standard `.sqlite` files)
 - Safe Rust (`unsafe_code = "forbid"` at workspace level)
-- 95%+ conformance against a golden-file test suite
+- **100% behavioral parity target** against a golden-file test suite (Oracle =
+  C sqlite3). Any intentional divergence MUST be explicitly documented and
+  annotated in the harness with rationale.
 
 ### 1.2 The Two Innovations
 
@@ -247,6 +249,14 @@ patterns. The following constraints are non-negotiable for hot-path code:
   is NOT part of the `unsafe_code = "forbid"` workspace lint scope. No-op fallback
   on architectures without prefetch intrinsics.
 
+- **VFS platform operations.** The `fsqlite-vfs` crate requires `unsafe` for
+  platform-specific operations (mmap for shared memory, mlock, madvise, direct
+  I/O flags). Like the prefetch helper crate, `fsqlite-vfs` is excluded from the
+  workspace-level `unsafe_code = "forbid"` lint scope and uses
+  `#![allow(unsafe_code)]` at the crate level. All unsafe operations are
+  encapsulated behind safe public types (e.g., `ShmRegion` wraps mmap'd shared
+  memory with bounds-checked accessor methods).
+
 - **Avoid allocation in the read path.** Cache lookups, version checks, and
   index resolution MUST be allocation-free in the common case. Hot-path
   structures (e.g., active transaction sets) should use stack-allocated
@@ -311,11 +321,21 @@ cannot silently downgrade.
 
 ### 2.4 The Solution: Layered Isolation
 
-**Layer 1 (Ship first): Exact SQLite compatibility mode.**
-- `BEGIN` / `BEGIN DEFERRED` / `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE`: These
-  acquire the traditional WAL write lock equivalent. Writers are serialized.
-  This provides exact C SQLite SERIALIZABLE semantics. Zero risk of write skew.
-- This is the default mode. Existing SQLite applications work unchanged.
+**Layer 1 (Default): SQLite behavioral compatibility mode (single-writer, WAL semantics).**
+- `BEGIN` / `BEGIN DEFERRED`: DEFERRED. No writer-exclusion lock is acquired at
+  `BEGIN`. Readers do not block readers. On the first write attempt, the
+  transaction MUST upgrade to a Serialized writer by acquiring the global write
+  mutex (§5.4) and then proceed as the single writer.
+- `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE`: Acquire the global write mutex at
+  `BEGIN` (writer-intent). This provides the usual "single writer" behavior
+  while allowing concurrent readers (WAL semantics).
+- This is the default mode. **Within FrankenSQLite**, existing SQLite
+  applications observe SERIALIZABLE behavior for writer interactions (writers
+  are serialized) without sacrificing concurrent readers.
+- **Interop boundary:** When running Hybrid SHM (`foo.db.fsqlite-shm`), legacy
+  SQLite processes are supported as readers only; legacy writers are excluded
+  and will observe `SQLITE_BUSY` while the coordinator is alive (§5.6.6.1,
+  §5.6.7).
 
 **Layer 2: MVCC concurrent mode with SSI (Serializable by Default).**
 - `BEGIN CONCURRENT`: New non-standard syntax (matching SQLite's own
@@ -3911,8 +3931,16 @@ let sections: Vec<Section> = completed_txns.iter().map(|txn| {
     }
 }).collect();
 
-// Check the sheaf condition: overlapping sections must agree (pseudocode)
-let result = fsqlite_harness::sheaf::check_consistency(&sections, &global_version_chains);
+// Check the sheaf condition: overlapping sections must agree.
+//
+// NOTE: This is a lab-only verification lens. We do NOT require a bespoke
+// `fsqlite_harness::sheaf` module in V1. Instead, the harness SHOULD adapt
+// asupersync's sheaf utilities (or an equivalent formally-defined checker) to
+// operate on recorded MVCC observations.
+let result = asupersync::trace::distributed::sheaf::check_consistency(
+    &sections,
+    &global_version_chains,
+);
 assert!(result.is_consistent(), "Sheaf violation: {}", result.obstruction());
 ```
 
@@ -4827,10 +4855,26 @@ PageVersion := {
 -- worst possible pattern for CPU cache utilization (Section 1.5 mandates
 -- "no pointer chasing in hot paths").
 --
--- Instead, all PageVersion nodes live in a VersionArena: a contiguous,
--- pre-allocated Vec<PageVersion> with bump allocation. VersionIdx is a u32
--- index into this arena. Traversing a version chain of length L touches
--- L entries in a dense array -- mostly sequential memory access.
+-- Instead, all PageVersion nodes live in a VersionArena: a dense,
+-- append-only arena. VersionIdx is a u32 "slot number" interpreted as:
+--   chunk = idx / ARENA_CHUNK
+--   off   = idx % ARENA_CHUNK
+-- Traversing a version chain of length L touches L entries in dense chunk
+-- storage (mostly sequential memory access within chunks).
+--
+-- CONCURRENCY (normative): The VersionArena MUST define an explicit
+-- synchronization regime. V1 uses a single-writer / multi-reader model:
+-- - Single-writer: only the commit sequencer/coordinator allocates and frees
+--   VersionIdx slots (publication already has a serialized step; §5.9).
+-- - Multi-reader: readers may resolve VersionIdx concurrently.
+-- - Synchronization: VersionArena MUST be wrapped in a readers-writer lock
+--   (e.g., `parking_lot::RwLock`). Readers MUST dereference VersionIdx only
+--   while holding a read guard; the coordinator mutates the arena only while
+--   holding a write guard. Implementations MUST NOT hand out raw pointers or
+--   references that outlive the guard.
+--
+-- MEMORY STABILITY (normative): The arena MUST be chunked so that appending new
+-- versions cannot reallocate/move previously published PageVersion storage.
 --
 -- Theorem 5 (Section 5.5) bounds version chain length to R * D + 1 where
 -- R is the write rate and D is the duration above the GC horizon. For
@@ -4838,15 +4882,18 @@ PageVersion := {
 -- The per-page version chain head table (mapping PageNumber -> VersionIdx)
 -- can use SmallVec<[VersionIdx; 8]> to inline the most recent chain heads
 -- without heap allocation; when a page has more than 8 retained versions,
--- the overflow indices are already in the arena's dense Vec storage.
+-- the overflow indices are already in the arena's dense chunk storage.
 --
--- Reclamation: when GC advances the horizon and prunes old versions,
--- arena slots are added to a free list for reuse. Epoch-based reclamation
--- (crossbeam-epoch) ensures no reader holds a stale VersionIdx during GC.
+-- Reclamation: when GC advances the horizon and prunes old versions, arena
+-- slots are added to a free list for reuse. Because VersionIdx dereference is
+-- required to occur under a VersionArena read guard (see CONCURRENCY above),
+-- GC runs under the write guard and cannot race any reader dereference.
+
+ARENA_CHUNK := 4096  -- power-of-two recommended (fast div/mod; cache-friendly)
 
 VersionArena := {
-    slots    : Vec<PageVersion>,       -- dense storage, cache-friendly
-    free_list: Vec<VersionIdx>,        -- recycled slots from GC
+    chunks    : Vec<Vec<PageVersion>>, -- each chunk reserves ARENA_CHUNK and never grows beyond it
+    free_list : Vec<VersionIdx>,       -- recycled slots from GC
     high_water: VersionIdx,            -- bump pointer for new allocations
 }
 
@@ -4891,6 +4938,7 @@ Transaction := {
     page_locks  : HashSet<PageNumber>,
     state       : {Active, Committed{commit_seq}, Aborted{reason}},
     mode        : {Serialized, Concurrent},
+    serialized_write_lock_held: bool,       -- true iff this txn currently holds the global write mutex
 
     -- Witness-plane SSI evidence (Section 5.6.4):
     read_keys   : HashSet<WitnessKey>,
@@ -5098,22 +5146,24 @@ credit, temporarily "losing" money.
 
 **INV-7 (Serialized Mode):** If `T.mode = Serialized`, then T holds the
 global write mutex for the duration of its write operations. At most one
-Serialized-mode writer is active at any time.
+Serialized-mode writer holds the mutex at any time. DEFERRED (read-only)
+Serialized transactions do not acquire the mutex until their first write.
 
 ```
 Formal: forall T1, T2 :
-    T1.mode = Serialized AND T2.mode = Serialized
-    AND T1.state = Active AND T2.state = Active
+    T1.serialized_write_lock_held
+    AND T2.serialized_write_lock_held
     AND T1 != T2
     => FALSE
 ```
 
-*Enforcement:* `begin(mode=Serialized)` acquires `manager.global_write_mutex`
-before returning. The mutex is held until `commit()` or `abort()` releases it.
-Since Rust's `Mutex` allows at most one holder, at most one Serialized
-transaction is active.
+*Enforcement:* The global write mutex is acquired either at `BEGIN IMMEDIATE /
+BEGIN EXCLUSIVE` or at the first write attempt of a DEFERRED Serialized
+transaction (§5.4). Once acquired, it is held until `commit()` or `abort()`
+releases it. Since Rust's `Mutex` allows at most one holder, at most one
+Serialized writer can be active.
 
-*Violation consequence:* If two Serialized transactions run simultaneously,
+*Violation consequence:* If two Serialized writers run simultaneously,
 the system no longer provides SERIALIZABLE isolation in Serialized mode. This
 breaks backward compatibility with C SQLite's guarantee that writers are
 serialized.
@@ -5164,16 +5214,26 @@ What each transaction sees when reading `P1`:
 
 **Begin:**
 ```
-begin(manager, mode) -> Transaction:
+BeginKind := {Deferred, Immediate, Exclusive, Concurrent}
+
+begin(manager, begin_kind) -> Transaction:
     txn_id = manager.next_txn_id.fetch_add(1, SeqCst)
     txn_epoch = 0  // in-process; cross-process uses TxnSlot.epoch (Section 5.6.2)
     snapshot = Snapshot {
         high: manager.commit_seq.load(Acquire),
         schema_epoch: manager.schema_epoch.load(),
     }
-    if mode == Serialized:
-        manager.global_write_mutex.lock()  // exact SQLite compat
-    return Transaction { txn_id, txn_epoch, snapshot, mode, ... }
+    serialized_write_lock_held = false
+    mode = if begin_kind == Concurrent { Concurrent } else { Serialized }
+    if begin_kind == Immediate || begin_kind == Exclusive:
+        // Writer-intent at BEGIN (SQLite IMMEDIATE/EXCLUSIVE semantics).
+        manager.global_write_mutex.lock()
+        serialized_write_lock_held = true
+    return Transaction {
+        txn_id, txn_epoch, snapshot, mode,
+        serialized_write_lock_held,
+        ...
+    }
 ```
 
 **Read (both modes):**
@@ -5187,10 +5247,15 @@ read_page(T, pgno) -> PageData:
 
 **Write:**
 ```
-write_page(T, pgno, new_data) -> Result<()>:
+write_page(manager, T, pgno, new_data) -> Result<()>:
     if T.mode == Serialized:
-        // Already hold global write mutex; no page lock needed
-        // (but still track in write_set for WAL append)
+        // DEFERRED upgrade: if we haven't taken writer exclusion yet, take it now.
+        // This preserves concurrent readers (SQLite DEFERRED behavior).
+        if !T.serialized_write_lock_held:
+            manager.global_write_mutex.lock()  // exact SQLite compat (writer only)
+            T.serialized_write_lock_held = true
+        // No page lock needed (mutex provides writer exclusion), but still track
+        // in write_set for WAL append.
     else: // Concurrent mode
         lock_result = page_lock_table.try_acquire(pgno, T.txn_id)
         if lock_result = AlreadyHeld(other): return Err(SQLITE_BUSY)
@@ -5212,7 +5277,7 @@ write_page(T, pgno, new_data) -> Result<()>:
 
 **Commit:**
 ```
-commit(T) -> Result<()>:
+commit(manager, T) -> Result<()>:
     // Schema epoch check (merge safety; see §5.10).
     if current_schema_epoch() != T.snapshot.schema_epoch:
         abort(T)
@@ -5250,7 +5315,7 @@ commit(T) -> Result<()>:
             Ok(commit_seq) =>
                 T.state = Committed{commit_seq}
                 release_page_locks(T)
-                if T.mode == Serialized:
+                if T.mode == Serialized && T.serialized_write_lock_held:
                     manager.global_write_mutex.unlock()
                 return Ok(())
 
@@ -5301,8 +5366,11 @@ must be started).
                     Serialized Mode              Concurrent Mode
                     ===============              ===============
 
-BEGIN:              Acquire global_write_mutex   No global lock
-                    Capture snapshot             Capture snapshot
+BEGIN:              Capture snapshot             Capture snapshot
+                    No mutex for DEFERRED        No global lock
+                    (take global_write_mutex at
+                     BEGIN IMMEDIATE/EXCLUSIVE
+                     or on first write)
 
 READ:               resolve(P, snapshot)         resolve(P, snapshot)
                     (identical)                  (identical)
@@ -5315,9 +5383,10 @@ COMMIT:             No validation needed         SSI check: abort if pivot
                     (mutex ensures serial)       First-committer-wins check
                     WAL append                   FCW check + merge ladder (§5.10)
                     Release global_write_mutex   WAL append
-                                                 Release page locks
+                    (if held)                    Release page locks
 
 ABORT:              Release global_write_mutex   Release all page locks
+                    (if held)
                     Discard write_set            Discard write_set
                                                  Witness evidence is monotonic; aborted
                                                  witnesses are ignored and later GC'd
@@ -5559,16 +5628,20 @@ without unbounded blocking.
 
 **Begin:** `fetch_add` on an `AtomicU64` completes in O(1). Snapshot capture is
 O(1): it reads the current `commit_seq` and `schema_epoch` and stores them in
-the immutable `Snapshot` (INV-5). For Serialized mode, `global_write_mutex.lock()`
-may wait, but only for the duration of another Serialized transaction, which by
-inductive hypothesis completes in finite time.
+the immutable `Snapshot` (INV-5). For `BeginKind::Immediate` / `Exclusive`,
+acquiring `global_write_mutex` may wait, but only for the duration of another
+Serialized writer, which by inductive hypothesis completes in finite time. For
+`BeginKind::Deferred`, no mutex is acquired at BEGIN; the mutex MAY be acquired
+later at the first write attempt under the same bound.
 
 **Read:** `resolve()` walks the version chain, which has bounded length
 (Theorem 5). Each visibility check is O(1) (`commit_seq <= snapshot.high`). Total
 time is bounded.
 
-**Write:** `try_acquire` is non-blocking (returns immediately with `Ok` or
-`Err`). Copy-on-write is O(page_size). Total time is bounded.
+**Write:** In Concurrent mode, `try_acquire` is non-blocking (returns immediately
+with `Ok` or `Err`). Copy-on-write is O(page_size). In Serialized mode, the first
+write in a DEFERRED transaction may acquire `global_write_mutex` (upgrade); this
+wait is bounded as in Begin. Total time is bounded.
 
 **Commit (Concurrent mode):** Commit-time checks are bounded:
 - SSI witness-plane candidate discovery is O(#buckets + #candidates) (hot index
@@ -5689,10 +5762,19 @@ TxnSlot := {
     write_set_pages : AtomicU32,     -- count of pages in write set (for GC sizing)
     claiming_timestamp: AtomicU64,   -- unix timestamp when Phase 1 CAS set TXN_ID_CLAIMING;
                                    -- used by cleanup to detect stuck CLAIMING slots (§5.6.2).
-                                   -- Written BEFORE the Phase 1 CAS; zeroed when slot is freed.
-    _padding        : [u8; 52],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
+                                   -- Written AFTER the successful Phase 1 CAS; zeroed when slot is freed.
+    _padding        : [u8; 48],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
+                                   -- Layout: 80 bytes of fields with repr(C) alignment (2B gap after mode
+                                   -- for witness_epoch align, 1B gap after marked_for_abort for
+                                   -- write_set_pages align) + 48B padding = 128B total.
 }
 ```
+
+**Platform requirement (normative):** Concurrent mode relies on 64-bit atomic
+operations in shared memory (`AtomicU64` in the `FSQLSHM` header/TxnSlots). This
+requires a target that supports 64-bit atomics (`cfg(target_has_atomic = "64")`
+in Rust, or equivalent). If 64-bit atomics are unavailable, `BEGIN CONCURRENT`
+MUST be rejected (or not compiled), and only Serialized mode is supported.
 
 **Slot lifecycle:**
 1. **Acquire (atomic, TOCTOU-safe):** Process scans TxnSlot array for a slot
@@ -5776,8 +5858,13 @@ cleanup_orphaned_slots():
             // CLAIMING state for longer than CLAIMING_TIMEOUT_SECS, the
             // claimer is presumed dead. 5 seconds is orders of magnitude
             // longer than any valid Phase 1 -> Phase 2 transition (~μs).
-            if slot.claiming_timestamp != 0
-               AND now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
+            if slot.claiming_timestamp == 0:
+                // The claimer writes claiming_timestamp after the CAS (§5.6.2).
+                // If it crashed immediately after claiming, the timestamp may
+                // still be 0. Seed the timeout clock without touching other fields.
+                slot.claiming_timestamp.CAS(0, now)
+                continue
+            if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
                 if slot.txn_id.CAS(TXN_ID_CLAIMING, 0):
                     slot.pid = 0
                     slot.pid_birth = 0
@@ -5808,16 +5895,23 @@ cleanup_orphaned_slots():
 ```
 
 The three-phase acquire protocol (Phase 1) MUST set `claiming_timestamp`
-atomically with the CAS:
+**after** the successful CAS, not before:
 
 ```
 // Phase 1: claim the slot
-slot.claiming_timestamp = unix_timestamp()  // set BEFORE CAS
 if !slot.txn_id.CAS(0, TXN_ID_CLAIMING):
     continue  // slot taken by another process
+// CAS succeeded — we exclusively own this slot now.
+slot.claiming_timestamp = unix_timestamp()  // set AFTER CAS
 // Phase 2: initialize fields (pid, pid_birth, lease_expiry, etc.)
 // Phase 3: publish real TxnId
 ```
+
+**Rationale:** Writing `claiming_timestamp` before the CAS is a race: if the
+CAS fails (slot already claimed by another process), we have corrupted that
+process's `claiming_timestamp`. Since the CAS establishes exclusive ownership,
+all field writes (including `claiming_timestamp`) MUST occur after the CAS
+succeeds.
 
 `process_alive(pid, pid_birth)` is platform-specific:
 - **MUST return `false` immediately if `pid == 0`.** On Unix, `kill(0, 0)`
@@ -5861,8 +5955,15 @@ PageLockEntry := {
 **Acquire (linear probing with atomic insertion):**
 
 0. If the table is under rebuild (`rebuild_lease_expiry >= now` AND owner is alive),
-   `try_acquire` MUST fail with `SQLITE_BUSY` (or wait per busy-timeout). `release`
-   MUST continue to function during rebuild drain (see §5.6.3.1).
+   `try_acquire` MUST fail **immediately** with `SQLITE_BUSY`. It MUST NOT
+   block/spin inside the lock-table implementation (deadlock freedom; §5.5
+   Theorem 1). `release` MUST continue to function during rebuild drain (see
+   §5.6.3.1).
+   **Liveness rule (normative):** If a transaction currently holds *any* page
+   locks and observes `SQLITE_BUSY` due to rebuild, it MUST abort/rollback
+   (releasing its page locks) rather than waiting, so the rebuild can drain to
+   lock-quiescence. Busy-timeout waiting, if enabled, MUST occur only when the
+   caller holds no page locks.
 1. Start at `idx = hash(page_number) & (capacity - 1)`.
 2. Probe:
    - If `entries[idx].page_number == page_number`:
@@ -5878,7 +5979,7 @@ PageLockEntry := {
        may observe `(page_number=P, owner_txn=0)` and acquire via CAS. A plain
        store would clobber that winner.
        If this CAS fails, another process raced and acquired the lock; return
-       `SQLITE_BUSY` (or wait per busy-timeout). The acquirer MUST NOT continue
+       `SQLITE_BUSY`. The acquirer MUST NOT continue
        probing to insert a second copy of `page_number` elsewhere.
    - Else: advance `idx = (idx + 1) & (capacity - 1)`.
 
@@ -5932,8 +6033,8 @@ sequencer is unavailable, but only one rebuild may be in progress.
 **Protocol (normative):**
 1. Acquire rebuild lease.
 2. Freeze new acquisitions: while rebuild lease is active, `try_acquire` MUST
-   fail with `SQLITE_BUSY` (or wait per busy-timeout). `release` MUST continue
-   to function.
+   fail with `SQLITE_BUSY` (non-blocking; busy-timeout is a caller policy).
+   `release` MUST continue to function.
 3. Drain to **lock-quiescence**: wait until there are no outstanding lock
    holders in the PageLockTable, i.e., until:
    - `forall entry in entries: entry.owner_txn == 0`.
@@ -5952,18 +6053,23 @@ and the table is not left partially cleared.
 
 **Load factor analysis (Extreme Optimization Discipline):**
 
-Linear probing has expected probe length `1/(1 - alpha)` where `alpha = N/C`
-is the load factor (N = `page_number != 0` entries, C = capacity).
-Worst-case probe
-chain length grows as `O(log C)` with high probability for uniform hashing,
-but under Zipfian page access, primary clustering degrades performance:
+Linear probing has expected probe length (Knuth, Vol. 3):
+- **Successful search:** `0.5 * (1 + 1/(1 - alpha))`
+- **Unsuccessful search (insert):** `0.5 * (1 + (1/(1 - alpha))^2)`
 
-| Load factor | Expected probes (uniform) | Expected probes (Zipfian s=1) |
-|-------------|--------------------------|-------------------------------|
-| 0.25        | 1.33                     | ~2.0                          |
-| 0.50        | 2.00                     | ~4.0                          |
-| 0.75        | 4.00                     | ~12.0                         |
-| 0.90        | 10.00                    | ~40.0+                        |
+where `alpha = N/C` is the load factor (N = `page_number != 0` entries,
+C = capacity). The often-cited `1/(1 - alpha)` is for **uniform (random)
+probing**, not linear probing; linear probing suffers from primary clustering
+which makes it worse. Worst-case probe chain length grows as `O(log C)` with
+high probability for uniform hashing, but under Zipfian page access, primary
+clustering degrades performance further:
+
+| Load factor | Unsuccessful probes (linear) | Unsuccessful probes (Zipfian s=1) |
+|-------------|-----------------------------|------------------------------------|
+| 0.25        | 1.39                        | ~2.0                               |
+| 0.50        | 2.50                        | ~5.0                               |
+| 0.75        | 8.50                        | ~20.0                              |
+| 0.90        | 50.50                       | ~100+                              |
 
 **Maximum load factor policy:** If `N > 0.70 * C`, new lock acquisitions
 return `SQLITE_BUSY` rather than degrading to pathological probe chains.
@@ -6469,9 +6575,13 @@ indexed by a hierarchical hot index (shared memory) plus a compacted cold index
 
 An rw-antidependency edge `R -rw-> W` exists iff:
 
-1. `R` and `W` overlap in time (neither is strictly after the other starts).
+1. `R` and `W` are **concurrent**: neither committed before the other's
+   snapshot was taken (`W.commit_seq > R.begin_seq` AND `R.commit_seq > W.begin_seq`,
+   or equivalently, their active lifetimes overlap in the commit-sequence order).
+   The relevant notion is snapshot-based concurrency, not wall-clock overlap.
 2. There exists a `WitnessKey K` such that `R` read `K` under its snapshot and
-   `W` wrote `K` (logically) before `R` committed.
+   `W` wrote `K` with a commit not visible to `R`'s snapshot (i.e.,
+   `W.commit_seq > R.begin_seq`).
 
 `WitnessKey` is the canonical "thing you read or wrote" key space (§5.6.4.3).
 Falling back to `Page(pgno)` is always correct; finer keys reduce false positives
@@ -6660,11 +6770,38 @@ ssi_validate_and_publish(T):
   // - T holds the necessary page locks / write intents for its write set.
 
   // 1) Emit witnesses (ECS) + update hot index (SHM).
+  //    This must happen before the read-only fast path because read witnesses
+  //    are needed even for read-only transactions (other writers use them for
+  //    rw-antidependency discovery).
   (read_wits, write_wits) = T.emit_witnesses()
 
-  // 2) Discover incoming and outgoing rw-antidependencies (superset via hot plane).
-  in_edges  = discover_incoming_edges(T, write_wits)
-  out_edges = discover_outgoing_edges(T, read_wits)
+  // 2) Fast path: read-only transactions (empty write set) can never be the
+  //    pivot in a dangerous structure (pivot requires both incoming AND outgoing
+  //    rw edges, and outgoing requires a write). Skip SSI validation entirely.
+  if T.write_set is empty:
+      return (read_wits, [], [], [])
+
+  // 3) Discover incoming and outgoing rw-antidependencies.
+  //    IMPORTANT: The hot plane (SHM bitset) only tracks ACTIVE transactions.
+  //    Transactions that committed and freed their TxnSlot are no longer visible
+  //    in the hot plane. To avoid false negatives:
+  //
+  //    - discover_outgoing_edges MUST also consult the commit_index (CommitLog)
+  //      for transactions that committed AFTER T.begin_seq (i.e., transactions
+  //      whose writes are not visible to T's snapshot but which wrote keys that
+  //      T read). Without this, a committed-and-freed writer's rw-antidependency
+  //      with T goes undetected.
+  //
+  //    - discover_incoming_edges MUST also consult the recently_committed_readers
+  //      index (§5.6.2.1) for transactions that committed AFTER T.begin_seq and
+  //      whose read witnesses overlap with T's write set. Without this, a
+  //      committed-and-freed reader's rw-antidependency with T goes undetected,
+  //      potentially allowing a dangerous structure (X -> R_committed -> T) to
+  //      be missed entirely. This is the symmetric problem to the outgoing-edge
+  //      gap: PostgreSQL retains SIREAD locks until all concurrent transactions
+  //      have finished; FrankenSQLite MUST provide equivalent coverage.
+  in_edges  = discover_incoming_edges(T, write_wits)   // checks hot plane + recently_committed_readers
+  out_edges = discover_outgoing_edges(T, read_wits)    // checks hot plane + commit_index
 
   T.has_in_rw  = (in_edges not empty)
   T.has_out_rw = (out_edges not empty)
@@ -7184,14 +7321,17 @@ exclusive with respect to Concurrent-mode writers.
     `SQLITE_BUSY` (or wait under the configured busy-timeout), because allowing
     concurrent writers would violate the SQLite single-writer contract.
 - While any Concurrent-mode writer is Active (holds any page locks):
-  - `BEGIN` in Serialized mode MUST fail with `SQLITE_BUSY` (or wait under
-    busy-timeout). It MUST NOT proceed to write without excluding Concurrent
-    writers.
+  - Acquiring the Serialized writer exclusion (i.e., `BEGIN IMMEDIATE`,
+    `BEGIN EXCLUSIVE`, or DEFERRED upgrade on first write) MUST fail with
+    `SQLITE_BUSY` (or wait under busy-timeout). It MUST NOT proceed to write
+    without excluding Concurrent writers. (DEFERRED read-only begins remain
+    permitted; only the writer upgrade is excluded.)
 
 **Implementation hook (cross-process):** The shared-memory coordination region
-maintains a single `serialized_writer` indicator (token + lease) that is set at
-`BEGIN SERIALIZED` and cleared at commit/abort. Concurrent-mode write paths must
-check this indicator before acquiring page locks.
+maintains a single `serialized_writer` indicator (token + lease) that is set
+when a Serialized transaction acquires writer exclusion (at `BEGIN IMMEDIATE /
+EXCLUSIVE` or at DEFERRED upgrade on first write) and is cleared at commit/abort.
+Concurrent-mode write paths MUST check this indicator before acquiring page locks.
 
 This design avoids a correctness pitfall where a Serialized writer could modify
 pages without participating in page-level exclusion, which would undermine
@@ -8482,15 +8622,14 @@ PRAGMA cache_size = N:
         cache.max_bytes = N * page_size
     if N < 0:
         cache.max_bytes = |N| * 1024    // |N| KiB
-        cache.capacity = max(10, cache.max_bytes / page_size)
+        cache.capacity = cache.max_bytes / page_size
     if N == 0:
-        // SQLite treats 0 as "reset to compile-time default" (SQLITE_DEFAULT_CACHE_SIZE,
-        // which is -2000, meaning 2000 KiB). The effective page count is then
-        // max(10, 2000*1024 / page_size). For 4096-byte pages: max(10, 500) = 500.
-        // For 1024-byte pages: max(10, 2000) = 2000. The minimum of 10 pages
-        // is enforced by sqlite3BtreeSetCacheSize() (btree.c).
-        cache.max_bytes = 2000 * 1024   // 2000 KiB (compile-time default)
-        cache.capacity = max(10, cache.max_bytes / page_size)
+        // PRAGMA cache_size = 0 sets the cache size to 0 pages. There is
+        // NO special "reset to default" logic in SQLite; the compile-time
+        // default (SQLITE_DEFAULT_CACHE_SIZE = -2000) is only applied at
+        // database open time.
+        cache.capacity = 0
+        cache.max_bytes = 0
 ```
 
 **Default:** Compile-time default is -2000 (= 2000 KiB). For 4096-byte pages
@@ -8954,12 +9093,15 @@ digests, and compact write-set summaries.
    intent log, page deltas, snapshot basis, and the witness-plane ObjectId
    references from step (3).
 5. **Encode:** RaptorQ-encode capsule bytes into symbols (systematic + repair).
-6. **Persist capsule symbols (CONCURRENT I/O):** The committing transaction
-   writes symbols to local symbol logs (and optionally streams to replicas)
-   until the durability policy is satisfied. This happens **before** acquiring
-   the commit sequencing critical section:
-   - Local: persist ≥ `K_total + margin` symbols.
-   - Quorum: persist/ack ≥ `K_total + margin` symbols across M replicas.
+6. **Write capsule symbols (CONCURRENT I/O):** The committing transaction
+   writes symbols to local symbol log files (and optionally streams to replicas).
+   This happens **before** acquiring the commit sequencing critical section:
+   - Local: write ≥ `K_source + R` symbols (where `K_source` = source symbols,
+     `R` = repair symbols per §3.4.3) to the current symbol log segment.
+     The writer does NOT fsync here; actual local durability is deferred to the
+     coordinator's FSYNC_1 (§7.11.2 step 4) for group-commit batching.
+   - Quorum: persist/ack ≥ `K_source + R` symbols across M replicas. Remote
+     replicas MUST fsync before acking (remote durability is not deferred).
 7. **Submit to WriteCoordinator:** Send a tiny publish request over a two-phase
    MPSC channel (§4.5) containing:
    - `capsule_object_id` (16B)
@@ -8980,7 +9122,8 @@ For each publish request:
    This step is cancellable: if the database is shutting down, the coordinator
    MAY respond `Aborted { SQLITE_INTERRUPT }` before entering the commit section.
 
-   **SSI Re-validation (Race Protection):** If `request.mode == Concurrent`,
+   **SSI Re-validation (Race Protection):** If the requesting transaction's
+   `TxnSlot.mode == Concurrent` (looked up via `request.txn`),
    the coordinator MUST re-check the `TxnSlot.has_in_rw` and `TxnSlot.has_out_rw`
    flags (or `SSI_Epoch`) for the requesting transaction. A concurrent commit
    could have created a Dangerous Structure after the writer's local validation.
@@ -9001,12 +9144,16 @@ For each publish request:
 3. **Persist `CommitProof` (small):** Build and publish a `CommitProof` ECS
    object containing `commit_seq` and evidence references. Record its
    `proof_object_id`.
-4. **FSYNC barrier (pre-marker):** Issue `fdatasync` (or platform equivalent)
-   on the symbol log files and proof object storage. This ensures capsule
-   symbols and CommitProof are durable on the storage medium BEFORE the
+4. **FSYNC barrier (pre-marker, group commit point):** Issue `fdatasync` (or
+   platform equivalent) on the current symbol log segment file(s) and proof
+   object storage. This is the group-commit durability point: writers from
+   step 6 of §7.11.1 wrote symbols without fsyncing; this single fdatasync
+   makes all pending capsule symbols AND the CommitProof durable BEFORE the
    marker references them. Without this barrier, write reordering (common on
    NVMe with volatile write caches) can make the marker durable while its
    referents are not — an irrecoverable corruption on crash.
+   If multiple publish requests are batched (§4.5), a single fdatasync covers
+   all of their capsule symbols.
 5. **Persist marker (tiny):** Append a `CommitMarkerRecord` (§3.5.4.1) to the
    marker stream. This is the atomic "this commit exists" step (fixed-size,
    88 bytes in V1). `prev_marker_id` links to the previous marker, and
@@ -9026,9 +9173,9 @@ For each publish request:
 **Critical ordering (TWO fsync barriers, normative):**
 
 ```
-capsule symbols [persisted by committing txn, step 6 of §7.11.1]
-    → CommitProof [persisted, step 3 above]
-    → FSYNC_1 (step 4)      ← ensures referents are durable
+capsule symbols [written (not fsynced) by committing txn, step 6 of §7.11.1]
+    → CommitProof [written, step 3 above]
+    → FSYNC_1 (step 4)      ← group-commit: ensures capsule + proof are durable
     → marker [persisted, step 5]
     → FSYNC_2 (step 6)      ← ensures marker is durable
     → shm.commit_seq publish (step 7)
@@ -9653,11 +9800,15 @@ must_use_candidate = { level = "allow", priority = 1 }
 option_if_let_else = { level = "allow", priority = 1 }
 
 [profile.release]
-opt-level = "z"        # Optimize for size (lean binary for distribution)
+opt-level = 3          # Full optimization (database engine needs throughput, not min size)
 lto = true             # Whole-program optimization
 codegen-units = 1      # Single codegen unit for maximum optimization
 panic = "abort"        # No unwinding overhead
 strip = true           # Strip debug info from release binary
+
+[profile.release-perf]
+inherits = "release"
+opt-level = 3          # Throughput characterization/profile runs
 
 [profile.dev]
 opt-level = 1          # Mild optimization for acceptable test speed
@@ -9826,10 +9977,19 @@ pub trait VfsFile: Send + Sync {
 
     /// Map a region of shared memory. `region` is a 0-based index of 32KB
     /// regions. If `extend` is true and the region does not exist, create it.
-    /// Returns a mutable pointer to the mapped region.
+    /// Returns a safe `ShmRegion` handle wrapping the mapped region.
+    ///
+    /// # Safety note
+    /// The underlying mmap returns a raw pointer. The `ShmRegion` wrapper
+    /// (defined in `fsqlite-vfs`) encapsulates the `unsafe` dereference
+    /// behind a safe API (`read_u32(offset)`, `write_u32(offset, val)`,
+    /// `as_slice()`, `as_mut_slice()`). The `fsqlite-vfs` crate is listed
+    /// in the `unsafe_code` exception set (see §1.4) alongside the
+    /// prefetch helper crate, because VFS implementations inherently
+    /// require platform-specific unsafe operations (mmap, mlock, madvise).
     /// (Equivalent to sqlite3_io_methods.xShmMap)
     fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool)
-        -> Result<*mut u8>;
+        -> Result<ShmRegion>;
 
     /// Acquire or release a shared-memory lock.
     /// `offset` and `n` define a range of lock slots.
@@ -9908,14 +10068,36 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
 
 /// Cursor operations over a B-tree.
 ///
+/// SQLite has two fundamentally different B-tree types:
+/// - **Table B-trees** (intkey): keyed by i64 rowid. `pKey` is NULL;
+///   `nKey` carries the rowid. Leaf cells store a rowid + record payload.
+/// - **Index B-trees** (blobkey): keyed by a serialized record (the index
+///   columns concatenated in SQLite record format). `pKey` points to the
+///   serialized key; `nKey` is its byte length.
+///
+/// C SQLite exposes separate functions for the two types:
+/// `sqlite3BtreeTableMoveTo(BtCursor*, i64 intKey)` vs
+/// `sqlite3BtreeIndexMoveto(BtCursor*, UnpackedRecord*)`.
+/// We mirror this split to prevent type confusion.
+///
 /// # Thread Safety
 /// NOT Send or Sync. A cursor is bound to a single transaction and
 /// should only be used from one thread at a time. The VDBE execution
 /// loop is single-threaded per statement.
 pub trait BtreeCursorOps: sealed::Sealed {
-    /// Position the cursor at or near the given key.
+    // --- Seek methods (type-specific) ---
+
+    /// Position an *index* cursor at or near the given serialized key.
     /// Returns the cursor's final position relative to the key.
-    fn move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<CursorPosition>;
+    /// (Equivalent to sqlite3BtreeIndexMoveto)
+    fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<CursorPosition>;
+
+    /// Position a *table* cursor at or near the given rowid.
+    /// Returns the cursor's final position relative to the rowid.
+    /// (Equivalent to sqlite3BtreeTableMoveTo)
+    fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<CursorPosition>;
+
+    // --- Navigation (cursor-type-agnostic) ---
 
     /// Position the cursor at the first (smallest key) entry.
     /// Returns false if the tree is empty. (VDBE: OP_Rewind)
@@ -9931,21 +10113,34 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// Move to the previous entry. Returns false if at the beginning.
     fn prev(&mut self, cx: &Cx) -> Result<bool>;
 
-    /// Insert a key/data pair at the cursor's current position.
+    // --- Mutation (type-specific) ---
+
+    /// Insert a serialized record into an *index* B-tree.
+    /// The key is the full serialized record (index columns + rowid).
     /// May trigger page splits (balance operations).
-    fn insert(&mut self, cx: &Cx, key: &[u8], data: &[u8]) -> Result<()>;
+    fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()>;
+
+    /// Insert a row into a *table* (intkey) B-tree.
+    /// `rowid` is the integer primary key; `data` is the record payload
+    /// (header + body per §11 record format).
+    /// May trigger page splits (balance operations).
+    fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()>;
 
     /// Delete the entry at the cursor's current position.
     /// May trigger page merges.
     fn delete(&mut self, cx: &Cx) -> Result<()>;
 
-    /// Read the key of the current entry.
-    fn key(&self) -> Result<&[u8]>;
+    // --- Accessors ---
 
-    /// Read the data (payload) of the current entry.
-    fn data(&self) -> Result<&[u8]>;
+    /// Read the full cell payload of the current entry.
+    /// For table B-trees: returns the record payload (not the rowid).
+    /// For index B-trees: returns the serialized key.
+    fn payload(&self) -> Result<&[u8]>;
 
-    /// Read the rowid of the current entry (for intkey tables).
+    /// Read the rowid of the current entry.
+    /// For table B-trees: the integer primary key.
+    /// For index B-trees: extracted from the trailing field of the
+    /// serialized key (index records always end with the rowid).
     fn rowid(&self) -> Result<i64>;
 
     /// Return true if the cursor is positioned past the last entry.
@@ -10661,10 +10856,13 @@ can satisfy it:
 - N <= 8: exhaustive search of all N! orderings (at most 40,320).
 - N > 8: greedy algorithm -- at each step, add the table that has the lowest
   estimated join cost with the already-joined set.
-(Note: C SQLite's NGQP uses a bounded "N Nearest Neighbors" (N3) algorithm
-that maintains the N best partial paths at each step — it is O(K*N), not
-exhaustive. N varies by join complexity (1 for simple, 5–18 for multi-table).
-The simpler exhaustive/greedy split here is FrankenSQLite's initial strategy.)
+(Note: C SQLite's NGQP uses a bounded best-first search that maintains the
+`mxChoice` best partial paths at each step — it is O(mxChoice*N), not
+exhaustive. `mxChoice` varies by join complexity (1 for simple, up to
+`SQLITE_DEFAULT_MXCHOICE=18` for multi-table). The term "N Nearest Neighbors"
+is not used in the SQLite source; the algorithm is implemented in
+`wherePathSolver()` in `where.c`. The simpler exhaustive/greedy split here is
+FrankenSQLite's initial strategy.)
 
 ### 10.6 Code Generation
 
@@ -10785,18 +10983,28 @@ cursor positions) are allocated once and held for the statement's lifetime.
 Subqueries and CTEs use the VDBE coroutine mechanism:
 
 ```
-InitCoroutine  r_yield, <cte_end>, <cte_start>
+// InitCoroutine P1=r_yield, P2=<done>, P3=<cte_body>
+// Sets r_yield = &cte_body, then falls through (P2=0) or jumps to P2.
+// Typical layout (P2=0, fall-through to outer query):
+
+InitCoroutine  r_yield, 0, <cte_body>
+  // ... outer query: Yield r_yield pulls next row from CTE body
+  //     (Yield swaps PCs: saves current PC into r_yield, jumps to old r_yield)
+  Goto <done>
+<cte_body>:
   // ... CTE body: produces rows, each ending with Yield r_yield
-  EndCoroutine r_yield
-<cte_start>:
-  // ... outer query: when it needs a row, executes Yield r_yield
-  //     which transfers control to the CTE body
-<cte_end>:
+  //     (Yield swaps PCs back to outer query)
+  EndCoroutine r_yield    // final return to outer query; marks exhaustion
+<done>:
 ```
 
 The `Yield` opcode swaps program counters between the outer query and the
-coroutine. This allows the CTE to produce rows on-demand without materializing
-the entire result set into a temporary table.
+coroutine: it saves the current PC into `r_yield` and jumps to the previously
+saved PC. `EndCoroutine` performs one final swap back to the caller. This
+allows the CTE to produce rows on-demand without materializing the entire
+result set into a temporary table. (Note: the exact layout varies by
+compilation phase; WITH RECURSIVE and subquery flattening may use different
+P2 targets.)
 
 ---
 
@@ -11378,6 +11586,35 @@ EXCLUDE := EXCLUDE { NO OTHERS | CURRENT ROW | GROUP | TIES }
 Default frame: `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` when
 ORDER BY is present; `RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
 FOLLOWING` when ORDER BY is absent.
+
+**FILTER clause** (SQLite 3.30+): Both aggregate and window function calls
+support an optional `FILTER (WHERE expr)` clause that restricts which rows
+are fed to the function:
+```sql
+SELECT count(*) FILTER (WHERE status = 'active') FROM users;
+SELECT sum(amount) FILTER (WHERE type = 'credit') OVER (ORDER BY date) FROM txns;
+```
+The FILTER clause is semantically equivalent to wrapping the argument in a
+CASE expression: `sum(CASE WHEN type='credit' THEN amount END)`, but is more
+readable and is required for SQL standard conformance.
+
+**NULLS FIRST / NULLS LAST** (SQLite 3.30+): The `ordering-term` syntax is:
+```sql
+ordering-term := expr [COLLATE collation-name] [ASC | DESC] [NULLS {FIRST | LAST}]
+```
+Default: `NULLS FIRST` for ASC, `NULLS LAST` for DESC (SQLite's historical
+behavior; NULLs sort as smaller than any other value). Specifying `NULLS LAST`
+with ASC or `NULLS FIRST` with DESC overrides this default.
+
+**Date/time keyword constants:** `current_time`, `current_date`, and
+`current_timestamp` are special keyword tokens that parse as zero-argument
+built-in functions and return the current time as text strings in UTC:
+- `current_time` -> `'HH:MM:SS'`
+- `current_date` -> `'YYYY-MM-DD'`
+- `current_timestamp` -> `'YYYY-MM-DD HH:MM:SS'`
+
+These are evaluated once per statement (not per row) via `sqlite3StmtCurrentTime()`
+(which calls `sqlite3OsCurrentTimeInt64()` in the VFS).
 
 **DISTINCT processing:** Implemented via a temporary B-tree index for
 deduplication. The VDBE uses `OP_Found` / `OP_NotFound` on the temp
@@ -11984,11 +12221,14 @@ Default Y is spaces.
 **trim(X [, Y])** -> text. Removes characters in Y from both sides of X.
 
 **max(X, Y, ...)** -> any. Returns the argument with the maximum value.
-Uses the standard SQLite comparison rules. NULL arguments are ignored
-(returns NULL only if all arguments are NULL). When used as a scalar
-function (not aggregate), handles 2+ arguments.
+Uses the standard SQLite comparison rules. **If ANY argument is NULL,
+returns NULL immediately** (this is the scalar multi-argument form; the
+aggregate `max(X)` over a column ignores NULLs per SQL standard). When
+used as a scalar function (not aggregate), handles 2+ arguments.
 
 **min(X, Y, ...)** -> any. Returns the argument with the minimum value.
+Same NULL semantics as scalar `max()`: **if ANY argument is NULL, returns
+NULL immediately**. The aggregate `min(X)` over a column ignores NULLs.
 
 **nullif(X, Y)** -> any. Returns NULL if X = Y, otherwise returns X.
 
@@ -13015,7 +13255,7 @@ parser depends on types for AST nodes).
 
 **Risk areas:**
 - B-tree balance is the most algorithmically complex code in SQLite.
-  `balance_nonroot` alone is ~1,200 lines of C. Incorrect balancing causes
+  `balance_nonroot` alone is ~800 lines of C (lines 8230-9033 in btree.c). Incorrect balancing causes
   silent data corruption. Mitigation: extensive proptest with invariant
   checking after every operation (cell count, key ordering, child pointers,
   freespace accounting).
@@ -13311,7 +13551,8 @@ behavior for conformance.
 
 **Acceptance criteria:**
 - CLI: All sqlite3 dot-commands that have meaningful equivalents
-- Conformance: 95%+ pass rate across all golden files
+- Conformance: **100% parity target** across all golden files (with any
+  intentional divergences explicitly documented and annotated in the harness)
 - Benchmarks: single-writer within 3x of C SQLite, multi-writer (non-
   contended) shows linear scaling up to 4 cores
 - Replication: 10% packet loss, database replicates correctly within 1.2x
@@ -14311,7 +14552,8 @@ from spec, never translate line-by-line).
 
 - **AUTOINCREMENT vs rowid reuse:** Without AUTOINCREMENT, deleted rowids
   CAN be reused. `max(rowid)+1` is used for new rows, but if the maximum
-  rowid is `SQLITE_MAX_ROWID` (2^63-1), SQLite tries random rowids.
+  rowid is `MAX_ROWID` (2^63-1; see `vdbe.c` `OP_NewRowid`'s `MAX_ROWID`),
+  SQLite tries random rowids.
 
 - **LIKE is case-insensitive for ASCII only.** The built-in LIKE does not
   handle Unicode case folding. `'a' LIKE 'A'` is true, but `'ä' LIKE 'Ä'`
@@ -14334,7 +14576,7 @@ from spec, never translate line-by-line).
 | File | Purpose | Lines | What to Extract |
 |------|---------|-------|-----------------|
 | `sqliteInt.h` | Main internal header | 5,882 | All struct definitions (Btree, BtCursor, Pager, Wal, Vdbe, Mem, Table, Index, Column, Expr, Select, etc.), all `#define` constants, all function prototypes. This is the Rosetta Stone. |
-| `btree.c` | B-tree engine | 11,568 | Page format parsing, cell format, cursor movement algorithms (moveToChild, moveToRoot, moveToLeftmost, moveToRightmost), insert/delete with rebalancing, overflow page management, freelist operations. Focus on `balance_nonroot` (~1,200 lines) as the most complex function. |
+| `btree.c` | B-tree engine | 11,568 | Page format parsing, cell format, cursor movement algorithms (moveToChild, moveToRoot, moveToLeftmost, moveToRightmost), insert/delete with rebalancing, overflow page management, freelist operations. Focus on `balance_nonroot` (~800 lines, lines 8230-9033) as the most complex function. |
 | `pager.c` | Page cache | 7,834 | Pager state machine (OPEN, READER, WRITER_LOCKED, WRITER_CACHEMOD, WRITER_DBMOD, WRITER_FINISHED, ERROR), journal format, hot journal detection, page reference counting, cache eviction policy. |
 | `wal.c` | WAL subsystem | 4,621 | WAL header/frame format, checksum algorithm implementation, WAL index (wal-index) hash table structure, checkpoint algorithm, the critical `WAL_WRITE_LOCK` in `sqlite3WalBeginWriteTransaction` (line numbers shift by SQLite version) that FrankenSQLite replaces with MVCC. |
 | `vdbe.c` | VDBE interpreter | 9,316 | The giant switch statement dispatching all opcodes. Each case is the authoritative definition of what that opcode does. Extract: register manipulation, cursor operations, comparison semantics, NULL handling per opcode. |
@@ -14656,7 +14898,8 @@ Every phase must pass all applicable gates before proceeding to the next.
 - R*-Tree: spatial query returns correct results for 50 bounding box queries
 
 **Phase 9 gates:**
-- Conformance: 95%+ pass rate across 1,000+ golden files
+- Conformance: **100% parity target** across 1,000+ golden files (with any
+  intentional divergences explicitly documented and annotated in the harness)
 - Benchmarks: single-writer within 3x of C SQLite
 - Benchmarks: no regression (candidate statistic <= conformal upper bound U_alpha with alpha=0.01, per §17.8 methodology) compared to Phase 8
 - Replication: database replicates correctly under 10% packet loss within 1.2x of no-loss time (matches §16, Phase 9 acceptance criteria)
@@ -14715,11 +14958,13 @@ entire database engine -- including the B-tree, VDBE, MVCC system, and
 all extensions -- is memory-safe by construction.
 
 **5. Full Compatibility.** FrankenSQLite reads and writes standard SQLite
-database files. It targets 95%+ conformance against golden-file tests
-comparing output with C sqlite3. The SQL dialect, type affinity system,
-VDBE instruction set, file format, and WAL format all match SQLite 3.52.0.
-It aims to be a near-drop-in replacement for the sqlite3 CLI and library,
-targeting 95%+ behavioral compatibility while deliberately omitting deprecated
+database files. It targets **100% behavioral parity** against golden-file
+tests comparing output with C sqlite3 for the supported surface. Any
+intentional divergence MUST be explicitly documented and annotated in the
+harness with rationale. The SQL dialect, type affinity system, VDBE
+instruction set, file format, and WAL format all match SQLite 3.52.0. It aims
+to be a near-drop-in replacement for the sqlite3 CLI and library, targeting
+**100% parity** while deliberately omitting deprecated
 or security-sensitive features (loadable extensions, shared-cache mode, legacy
 schema formats 1-3; see §15).
 
