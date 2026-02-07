@@ -2500,7 +2500,7 @@ policy (K/R), and repair story.
 
 | Subsystem | ECS Object Type | Symbol Policy | Repair Story |
 |-----------|----------------|---------------|--------------|
-| Commits | `CommitCapsule` + `CommitMarker` | T = `min(page_size, 4096)`, R = 20% default | Decode from surviving symbols; `DecodeProof` in lab/debug |
+| Commits | `CommitCapsule` + `CommitProof` (coded) + `CommitMarkerRecord` (marker stream) | Capsule/Proof: T = `min(page_size, 4096)`, R = 20% default; Marker: 88B fixed records | Capsule/Proof: decode from surviving symbols; Marker: torn-tail ignore + `record_xxh3` + hash-chain audit |
 | Checkpoints | `CheckpointChunk` | T = 4096–65535B, R = policy-driven | Chunked snapshot objects; rebuild from marker stream if lost |
 | Indices | `IndexSegment` (Page, Object, Manifest) | T = 1280–4096B, R = 20% default | Decode or rebuild-from-marker-scan |
 | Page storage | `PageHistory` | T = page_size, R = per-group | Decode from group symbols; on-the-fly repair on read |
@@ -9574,8 +9574,9 @@ freeblock (0 if last) and a 2-byte size. Minimum freeblock size is 4 bytes.
 lost to fragmentation -- individual 1-3 byte gaps between cells or at the
 end of freeblocks that are too small to form their own freeblock entry (the
 minimum freeblock size is 4 bytes, so gaps of 1-3 bytes cannot be tracked).
-If this count reaches 60 or more, the page is defragmented (cells are
-compacted toward the end of the page).
+The total number of bytes in fragments may not exceed 60 in a well-formed
+page. If an insertion would cause the count to exceed 60, the page is
+defragmented first (cells are compacted toward the end of the page).
 
 ### 11.2.1 Varint Encoding
 
@@ -9618,7 +9619,7 @@ would need 10 bytes.
 ```
 [payload_size: varint]    -- total bytes of payload
 [rowid: varint]           -- integer primary key
-[payload: bytes]          -- first min(payload_size, local_max) bytes
+[payload: bytes]          -- first local_bytes bytes (see §11.4 overflow calc)
 [overflow_pgno: u32BE]    -- only if payload overflows
 ```
 
@@ -9631,7 +9632,7 @@ would need 10 bytes.
 **Index leaf cell (page type 0x0A):**
 ```
 [payload_size: varint]    -- total bytes of payload
-[payload: bytes]          -- first min(payload_size, local_max) bytes
+[payload: bytes]          -- first local_bytes bytes (see §11.4 overflow calc)
 [overflow_pgno: u32BE]    -- only if payload overflows
 ```
 
@@ -9639,7 +9640,7 @@ would need 10 bytes.
 ```
 [left_child: u32BE]       -- 4-byte page number of left child
 [payload_size: varint]    -- total bytes of payload
-[payload: bytes]          -- first min(payload_size, local_max) bytes
+[payload: bytes]          -- first local_bytes bytes (see §11.4 overflow calc)
 [overflow_pgno: u32BE]    -- only if payload overflows
 ```
 
@@ -13241,6 +13242,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.16 (Round 6 audit fixes: shm commit_seq reconciliation on open; SharedPageLockTable tombstone rebuild lease + quiescence barrier; Compatibility-mode legacy writer exclusion + hybrid SHM discipline; HotWitnessIndex epoch swap locking; deterministic rebase clarified as observable-behavior (not byte layout) + V1 restrictions)*
+*Document version: 1.17 (Round 7 audit fixes: marker stream byte-exact header/record math + marker_id domain separation; SharedPageLockTable: forbid per-unlock key deletion (key-stable release) and correct rebuild accounting; compaction publish ordering (segments before locator); CommitMarkerRecord size corrected to 88B; permeation map clarified (coded capsule/proof vs uncoded marker stream))*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
