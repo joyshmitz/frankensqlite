@@ -4866,8 +4866,9 @@ pre-defined safe envelope.
 - **Regime detection (BOCPD):** change-point posterior for workload/health streams
   (§4.8).
 - **Local telemetry:** latency histograms, queue depths, symbol fetch success,
-  merge accept/reject counts, etc. (All telemetry is advisory; correctness never
-  depends on it.)
+  merge accept/reject counts, write-set collision mass estimates (`M2_hat`,
+  `P_eff_hat`; §18.4.1), retry outcomes (§18.8), etc. (All telemetry is advisory;
+  correctness never depends on it.)
 
 **Monitoring is also a policy (VOI budgeting, recommended):**
 
@@ -8120,7 +8121,10 @@ pub struct CommitRequest {
     pub mode: TxnMode,
     /// Pages to be committed: page number -> new page data.
     pub write_set: HashMap<PageNumber, PageData>,
-    /// Intent log for deterministic rebase merge (Section 5.10).
+    /// Intent log for audit/merge certificates (Section 5.10). Any deterministic
+    /// rebase/merge MUST already have been applied by the sender to produce the
+    /// final `write_set`; the coordinator MUST NOT interpret this log to perform
+    /// rebase or index-key regeneration inside its serialized commit section.
     pub intent_log: Vec<IntentOp>,
     /// Page locks held (for release after commit).
     pub page_locks: HashSet<PageNumber>,
@@ -8445,6 +8449,15 @@ updated since its snapshot, we attempt **deterministic rebase**:
    commit proceeds with the rebased page deltas.
 5. **If replay fails** (true conflict, constraint violation): abort/retry.
 
+**Execution placement (normative):** Deterministic rebase MUST run in the
+committing transaction's context *before* entering the WriteCoordinator /
+sequencer commit section (§5.9, §7.11). The coordinator's serialized section
+MUST NOT perform B-tree traversal, expression evaluation, or index-key
+regeneration. It may validate merge certificates and page-set summaries, but it
+must remain a sequencer/persister, not a recursive transaction executor. This
+preserves Native mode's "tiny sequencer" invariant and prevents Compatibility
+mode's WAL critical section from ballooning.
+
 **Safety Constraint (Refined Read-Dependency Check):** Rebase safety depends on
 distinguishing two categories of reads:
 
@@ -8490,16 +8503,35 @@ rebase replay:
    original intent log that are associated with this `UpdateExpression` (same
    `table`, same `rowid`) carry stale key bytes derived from the original snapshot
    and MUST be discarded during rebase. Instead, the rebase engine MUST regenerate
-   index operations from the schema:
-   a. For each secondary index covering any column in `column_updates`:
-      compute the old index key from the *new base row's* column values and the
-      new index key from the *updated row's* column values.
-   b. If old key ≠ new key: emit `IndexDelete(index, old_key, rowid)` followed by
-      `IndexInsert(index, new_key, rowid)`.
-   c. If old key == new key: no index operation needed (the column change did not
-      affect this index's key).
+   index operations from the schema and the rebased row images:
+   a. Enumerate the table's secondary indexes from the schema (including
+      ordinary indexes, expression indexes, UNIQUE indexes, and partial indexes).
+      The engine MAY skip an index only if it can prove the index's key and
+      partial predicate are independent of the updated columns.
+   b. For each index, compute participation for the **base** row and the
+      **updated** row:
+      - Ordinary/expression indexes: participation is always true.
+      - Partial indexes: evaluate the index WHERE predicate against the row;
+        participation is true iff the predicate is true (SQLite semantics).
+   c. If participation is true, compute the index key bytes by evaluating the
+      index key definition against the row:
+      - Ordinary index: use the indexed column values.
+      - Expression index: evaluate the index expressions.
+      Key construction MUST apply SQLite affinity + collation rules for that
+      index, and MUST match the normal VDBE/B-tree index encoding.
+   d. Emit index ops:
+      - If base participates and updated does not: emit `IndexDelete(index, old_key, rowid)`.
+      - If base does not participate and updated does: emit `IndexInsert(index, new_key, rowid)`.
+      - If both participate:
+        - If `old_key != new_key`: emit delete then insert.
+        - If `old_key == new_key`: no op.
+   e. **Uniqueness (normative):** For UNIQUE indexes, `IndexInsert` MUST enforce
+      uniqueness against the new committed base snapshot. If a conflicting key
+      exists for a different rowid, rebase MUST abort with the appropriate
+      constraint error (true conflict), not "merge" the violation.
    The rebase engine has access to the schema (needed for affinity coercion in
-   step 4) and MUST use it to enumerate affected indexes.
+   step 4) and MUST use it to enumerate indexes and evaluate index predicates/
+   expressions deterministically.
 
 **VDBE codegen rules for `UpdateExpression` emission (normative):**
 
@@ -10718,7 +10750,9 @@ pub trait VfsFile: Send + Sync {
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool>;
 
     /// Return the sector size of the underlying storage device.
-    /// Typically 512 (HDD) or 4096 (SSD). Used for WAL frame alignment.
+    /// Typically 512 (HDD) or 4096 (SSD). Used for choosing direct-I/O alignment
+    /// and sizing native logs/sidecars. Compatibility `.wal` frames are not
+    /// sector-aligned (§1.5).
     fn sector_size(&self) -> u32;
 
     /// Return device characteristics flags.
@@ -10733,13 +10767,14 @@ pub trait VfsFile: Send + Sync {
     /// Returns a safe `ShmRegion` handle wrapping the mapped region.
     ///
     /// # Safety note
-    /// The underlying mmap returns a raw pointer. The `ShmRegion` wrapper
-    /// (defined in `fsqlite-vfs`) encapsulates the `unsafe` dereference
-    /// behind a safe API (`read_u32(offset)`, `write_u32(offset, val)`,
-    /// `as_slice()`, `as_mut_slice()`). The `fsqlite-vfs` crate is listed
-    /// in the `unsafe_code` exception set (see §1.4) alongside the
-    /// prefetch helper crate, because VFS implementations inherently
-    /// require platform-specific unsafe operations (mmap, mlock, madvise).
+    /// Workspace members forbid `unsafe` (§1.4). Therefore VFS implementations
+    /// MUST use a safe mmap/locking API (e.g., asupersync-provided safe SHM
+    /// mapping, or external crates like `memmap2`/`rustix` that encapsulate
+    /// `unsafe` internally) so no `unsafe` is required inside this repository.
+    ///
+    /// `ShmRegion` MUST NOT expose raw pointers. It MUST provide safe accessors
+    /// (`as_slice()`, `as_mut_slice()`, and typed read/write helpers) whose
+    /// borrow semantics prevent references from outliving the mapping.
     /// (Equivalent to sqlite3_io_methods.xShmMap)
     fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool)
         -> Result<ShmRegion>;
@@ -14865,7 +14900,8 @@ We operate under a strict loop: Baseline -> Profile -> Prove behavior unchanged 
 
 *Macro:*
 - **Multi-writer scaling:** Throughput vs N concurrent writers (1 to 64).
-- **Conflict rate:** Abort rate vs Zipf skew parameter.
+- **Conflict rate:** Abort rate vs measured write-set collision mass (`M2_hat`,
+  `P_eff_hat`; §18.4.1). (Optionally also record Zipf `s_hat` for interpretability.)
 - **Scan vs Random:** Cache policy sensitivity (ARC vs LRU).
 - **Replication:** Convergence time under 5%, 10%, 25% packet loss.
 
@@ -15131,21 +15167,26 @@ substantial (~35-40%), not where they first appear.
 
 ### 18.4 Non-Uniform Page Access: Zipf Distribution
 
-Real workloads are NOT uniform. B-tree access patterns follow approximately
-a Zipf distribution because:
+Real workloads are NOT uniform. However, the **conflict model is about the
+distribution of pages in write sets** (pages written at commit), not the read
+path. Many pages are read-hot but write-cold (e.g., the B-tree root is read on
+every operation but written only on structural changes).
 
-1. **Root page:** Every B-tree operation reads the root page. For writes
-   that modify the tree structure (splits, merges), the root page is also
-   written.
+B-tree *write sets* are skewed for several reasons:
 
-2. **Internal pages:** Higher-level internal pages are accessed more
-   frequently than lower-level ones (they fan out to many leaf pages).
+1. **Structural hot pages (rare but catastrophic):** Root/internal pages are
+   written during splits/merges/balance. This concentrates conflict mass when
+   structural events occur.
 
-3. **Hot leaf pages:** In many workloads, recent inserts cluster on a few
-   "hot" leaf pages (e.g., auto-increment keys always hit the rightmost leaf).
+2. **Internal pages:** Higher-level internal pages are more likely to be written
+   than lower-level ones when structure changes (they fan out to many leaf pages).
 
-For Zipf-distributed access with parameter s, the probability of accessing
-page ranked k is:
+3. **Hot leaf pages:** Many workloads concentrate writes on a small set of leaf
+   pages (e.g., auto-increment rowids hit the rightmost leaf, or locality in key
+   space).
+
+For Zipf-like skew with parameter `s`, the probability of selecting a page of
+rank `k` (ranked by *write-set incidence*) is:
 
 ```
 p(k) = (1/k^s) / H(P,s)
@@ -15153,21 +15194,110 @@ p(k) = (1/k^s) / H(P,s)
 where H(P,s) = sum_{i=1}^{P} 1/i^s  (generalized harmonic number)
 ```
 
-#### 18.4.1 Estimating the Zipf Parameter s Online (Policy Input)
+#### 18.4.1 Estimating Write-Set Skew Online (Policy Input)
 
-The conflict model depends on the skew parameter `s`. It MUST NOT be treated as
-a magic constant. The engine SHOULD estimate `s` online from observed page
-access frequencies and feed the estimate into:
-- shard sizing for lock tables and hot indices,
+The conflict model depends on the *shape* of the write-set distribution. No skew
+parameter is a magic constant. The engine SHOULD estimate, per BOCPD regime, the
+collision concentration of write sets and use it for:
 - contention predictions (abort rate expectations),
-- BOCPD regime detection for skew shifts.
+- retry/merge budget decisions (§18.8; §5.10),
+- BOCPD regime detection for skew shifts (§4.8),
+- shard sizing for lock tables / hot indices (when applicable).
 
-**Data collection (bounded, deterministic):**
-- Maintain a bounded heavy-hitters summary of page accesses (top-K pages) per
-  time window (e.g., 10 seconds), plus an "other" bucket.
-- Rank pages by observed frequency within the window (ties broken by pgno).
+##### 18.4.1.1 Primary Quantity: Collision Mass (M2) and Effective Page Pool
 
-**Estimator (recommended): discrete Zipf MLE**
+Let `q(pgno)` be the probability that a random writing transaction includes page
+`pgno` in its commit-time `write_set(txn)` within a given time window / BOCPD
+regime. Define the **collision mass** (second moment):
+
+```
+M2 := Σ_{pgno} q(pgno)^2
+```
+
+and the **effective page pool size**:
+
+```
+P_eff := 1 / M2
+```
+
+Under the uniform model with fixed write-set size `W`, `q(pgno)=W/P`, so
+`M2=W^2/P` and `P_eff=P/W^2`. The birthday-paradox approximation becomes:
+
+```
+P(any conflict among N txns) ~ 1 - exp(-C(N,2) * M2)
+```
+
+This formulation is intentionally model-free: it does not assume Zipf, and it
+captures hot-page concentration directly (structural events + hot leaves).
+
+**Normative policy input:** When any policy uses conflict predictions (retry,
+merge ladders, or admission control), it MUST use `M2_hat` (an online estimate
+of `M2`) rather than assuming a fixed `s`.
+
+##### 18.4.1.2 Data Collection (Bounded, Deterministic)
+
+All estimation MUST be based on **write-set incidence**, not read-path
+instrumentation:
+
+- At each commit attempt (including aborted attempts), obtain the de-duplicated
+  `write_set(txn)` (pages written).
+- Maintain counters per fixed window (e.g., 10 seconds) per BOCPD regime:
+  - `txn_count`: number of observed write transactions in the window.
+  - A bounded heavy-hitters structure over `pgno` for incidence counts
+    `c_pgno := #txns whose write_set contains pgno` (top-K + "other").
+  - A bounded tail sketch for the second moment of non-heavy-hitter pages
+    (see §18.4.1.3).
+- Determinism requirements:
+  - Ranking ties MUST break by `pgno`.
+  - Any hash/sketch randomization MUST be explicitly seeded from
+    `(db_epoch, regime_id, window_id)` and MUST be recorded in the evidence
+    ledger when the estimate is used for a policy decision (§4.16.1).
+
+##### 18.4.1.3 Estimator A (Recommended): Head+Tail Second-Moment (F2) Estimate
+
+We need an online estimate of:
+
+```
+M2 = Σ (c_pgno / txn_count)^2 = ( Σ c_pgno^2 ) / txn_count^2
+```
+
+where `c_pgno` is the per-window incidence count defined above.
+
+**Head+tail split (required):**
+- **Head:** exact `c_pgno` counts for the top-K pages (heavy hitters).
+- **Tail:** estimate `F2_tail := Σ_{pgno not in head} c_pgno^2` using a bounded
+  second-moment sketch (AMS/CountSketch family).
+
+Then:
+
+```
+M2_hat = ( Σ_{pgno in head} c_pgno^2 + F2_tail_hat ) / txn_count^2
+P_eff_hat = 1 / M2_hat
+```
+
+**Sketch constraints (normative):**
+- Memory MUST be bounded with small constants (target: O(1 KiB) to O(16 KiB)
+  per regime).
+- Update cost MUST be bounded (target: O(d) per `pgno` update, with small `d`).
+- Under `LabRuntime`, the sketch MUST be deterministic for a given seed and
+  trace.
+
+**Explainability (required):** When `M2_hat` influences a decision, the evidence
+ledger MUST include:
+- `txn_count`, window duration, and `regime_id`,
+- `K` and the top-K pages with `(pgno, c_pgno, contrib := c_pgno^2/txn_count^2)`,
+- `head_contrib := Σ_head c_pgno^2/txn_count^2`,
+- `tail_contrib := F2_tail_hat/txn_count^2`,
+- sketch parameters + seed derivation inputs.
+
+##### 18.4.1.4 Estimator B (Optional): Zipf `s_hat` (Interpretability Only)
+
+Zipf is a useful *story* and a useful synthetic workload generator, but it is
+not a correctness or policy axiom. If a Zipf fit is desired for interpretability
+or benchmark generation, the engine MAY estimate a Zipf parameter `s_hat` from
+the ranked heavy-hitter counts within each window/regime.
+
+**Estimator (optional): discrete Zipf MLE**
 
 For ranks `k = 1..K` with counts `c_k`, let `n = Σ_k c_k`. The Zipf log-likelihood is:
 
@@ -15187,29 +15317,32 @@ H'(K,s) = - Σ_{i=1}^{K} (log i)/i^s
 change). Emit `(s_hat, window_n, regime_id)` into telemetry and the evidence
 ledger when used for policy decisions.
 
-With s ~ 0.8-1.2 (typical for database workloads), the conflict probability
-increases significantly compared to the uniform model. For N concurrent
-transactions each writing W pages drawn from the Zipf distribution, the
-probability that no two transactions collide on page k is approximately:
+**Connecting Zipf to conflicts (approximate):** If we assume each transaction
+writes `W` pages on average (use `W := E[W]` for the current window/regime) by
+drawing from `p(k)` (with replacement; `W << P`), then the probability a
+transaction includes rank-`k` page is `q(k) ≈ W * p(k)` (for non-hot pages).
+Under the birthday-paradox approximation:
 
 ```
-P(no conflict on page k) ~ e^{-C(N,2) * p(k)^2}
-
-P(any conflict) ~ 1 - product_{k=1}^{P} e^{-C(N,2) * p(k)^2}
-                = 1 - e^{-C(N,2) * sum_k p(k)^2}
+P(any conflict among N txns) ~ 1 - exp(-C(N,2) * M2)
+M2 ≈ Σ_k q(k)^2 ≈ W^2 * Σ_k p(k)^2
 ```
 
-where C(N,2) = N(N-1)/2 is the number of transaction pairs and p(k) is
-the probability each transaction writes page k. For the uniform model,
-`sum_k p(k)^2 = P * (W/P)^2 = W^2/P`, recovering the formula in §18.3.
-For Zipf, `sum_k p(k)^2 = W^2 * sum_k 1/(k^{2s} * H(P,s)^2)
-= W^2 * H(P,2s) / H(P,s)^2`, which is dominated by the hot pages
-(small k), concentrating conflict mass on the root and upper-level
-B-tree pages.
+For Zipf, `Σ_k p(k)^2 = H(P,2s)/H(P,s)^2`, so:
 
-**Numerical comparison (P=1M, N=10, W=100):**
-- Uniform: P(conflict) ~ 36%
-- Zipf s=1.0: P(conflict) ~ 60-80% (hot-page concentration effect)
+```
+M2 ≈ W^2 * H(P,2s) / H(P,s)^2
+```
+
+This is a *crude* model: real write sets are not i.i.d. draws, and structural
+writes are bursty. This is why §18.4.1.3 requires measuring `M2_hat` directly
+from observed `write_set(txn)` incidence.
+
+**Numerical comparison (use measured M2):** Let `P=1,000,000`, `N=10`, `W=100`
+(mean write-set size in the window/regime).
+Uniform gives `M2=W^2/P=0.01` so `P(conflict) ~ 1 - exp(-45*0.01) ~ 36%`.
+If skew/structural bursts inflate `M2` by 3x (common when hot pages dominate),
+`M2=0.03` and `P(conflict) ~ 1 - exp(-45*0.03) ~ 74%`.
 
 ### 18.5 B-Tree Hotspot Analysis
 
@@ -15237,23 +15370,40 @@ in the no-split case, ~12-20 in the split case.
 
 To validate the probabilistic model against actual conflict rates:
 
-1. **Instrumentation:** Add counters to the MVCC commit path:
+1. **Instrumentation (required):** Add counters to the MVCC commit / retry path:
    - `conflicts_detected`: total FCW base-drift conflicts (commit-index says base changed)
    - `conflicts_merged_rebase`: conflicts resolved by deterministic rebase (intent replay)
    - `conflicts_merged_structured`: conflicts resolved by structured patch merge
    - `conflicts_aborted`: conflicts that caused transaction abort/retry
    - `total_commits`: total commit attempts
-   - `pages_per_commit`: histogram of write set sizes
+   - `pages_per_commit`: histogram of write set sizes (`W`) per commit attempt
+   - `pages_per_commit_m2`: derived `E[W^2]` from the histogram (required; split-driven
+     heavy tails make `E[W^2]` more predictive than `E[W]` for conflicts)
+   - `write_set_m2_hat`: per-window/regime collision mass estimate `M2_hat` with
+     head/tail breakdown (§18.4.1.3)
+   - `write_set_peff_hat`: derived `P_eff_hat = 1/M2_hat` (recommended)
+   - `merge_rung_attempts`: counts of attempts per merge rung
+     (`rebase`, `structured_patch`, `abort`) plus per-rung cost histograms
+     (CPU time, bytes written, allocations)
+   - `retry_attempts`: histogram of retry counts per transaction/statement and
+     `retry_wait_ms` histogram (for `p_succ(t | evidence)` calibration; §18.8)
+   - `conflicts_by_page_kind` (recommended): breakdown of conflicts_detected by
+     page kind (btree leaf/internal/root/overflow/freelist/pointer-map/opaque)
 
 2. **Benchmark workloads:**
    - Uniform random: INSERT with random keys into large table
    - Sequential: INSERT with auto-increment keys
-   - Zipf: INSERT with Zipf-distributed keys (s = 0.99)
+   - Zipf-like skew: INSERT with Zipf-distributed keys (s = 0.99) + varying index counts
+   - Structural bursts: workloads that periodically force splits/merges (to probe
+     tail behavior in `W` and conflict spikes)
    - Mixed: 80% read, 20% write across 4 tables
 
 3. **Comparison:** Plot actual conflict rate vs model prediction. Expected
-   result: uniform model matches uniform workload within 10%, Zipf model
-   matches skewed workloads within 20%.
+   result: uniform model matches uniform workloads within ~10%. For skewed
+   workloads, the `M2_hat`-based prediction (§18.4.1.1) SHOULD match within
+   ~20% once `M2_hat` is computed over the same window/regime as the measured
+   conflicts. Zipf `s_hat` is interpretability-only and MUST NOT be treated as
+   a required fit target.
 
 ### 18.7 Impact of Safe Write Merging
 
@@ -15342,6 +15492,53 @@ The controller chooses an action `a ∈ {FailNow} ∪ {RetryAfter(t)}` minimizin
 E[Loss(FailNow)]         = C_fail
 E[Loss(RetryAfter(t))]   = t + C_try + (1 - p_succ(t)) * C_fail
 ```
+
+**Estimating `p_succ(t | evidence)` (required):**
+
+`p_succ(t | evidence)` MUST be estimated per BOCPD regime from observed retry
+outcomes (and MUST be deterministic under `LabRuntime`). The default estimator
+SHOULD be non-parametric over a finite candidate set of wait times `T` so we do
+not assume a shape that the workload violates.
+
+**Discrete Beta-Bernoulli model (recommended default):**
+- Choose a finite action set `T = {t0, t1, ..., tm}` (e.g., `0, 1ms, 2ms, 5ms,
+  10ms, 20ms, 50ms, 100ms`, clamped by `T_budget`).
+- For each `t ∈ T`, maintain a Beta posterior `Beta(α_t, β_t)` for success.
+- On each retry attempt with wait `t`, observe `y ∈ {0,1}` (success/failure) and
+  update: `α_t += y`, `β_t += (1 - y)`.
+- Use `p_hat(t) = α_t / (α_t + β_t)` (or a conservative posterior quantile) as
+  `p_succ(t)` in the expected-loss calculation.
+
+This keeps the policy explainable and robust: it learns the empirical success
+curve without assuming it is Zipf, exponential, or stationary across regimes.
+
+**Hazard-model smoothing (optional, alien-artifact):**
+
+If a continuous model is desired for closed-form reasoning, the engine MAY fit a
+deterministic exponential hazard curve to the discrete `p_hat(t)` values:
+
+```
+p_succ(t) = 1 - exp(-λ * t)
+```
+
+Using `λ_hat`, the (unconstrained) minimizer of `t + C_try + (1 - p_succ(t)) * C_fail`
+under this model is:
+
+```
+t* = 0                                 if λ_hat * C_fail <= 1
+t* = (1/λ_hat) * ln(λ_hat * C_fail)    otherwise
+```
+
+Implementations MAY then clamp `t*` to `[0, T_budget]` and round to the nearest
+candidate `t ∈ T`.
+
+**Evidence ledger (required):** Any decision that chooses `RetryAfter(t)` MUST
+emit an evidence ledger entry (§4.16.1) including:
+- the candidate set `T`,
+- `p_hat(t)` (and `α_t, β_t` if using Beta-Bernoulli; `λ_hat` if using hazard smoothing),
+- expected loss per candidate,
+- the chosen action, and
+- the active regime id / change-point context (if any).
 
 The argmin yields an **optimal stopping** rule ("retry while the expected
 benefit exceeds the marginal cost"). With a Beta-Bernoulli model for success
