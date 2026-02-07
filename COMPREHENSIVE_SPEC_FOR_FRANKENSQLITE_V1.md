@@ -14338,7 +14338,9 @@ raptorq integration: 2,000, encryption: 2,000).
   optimization via temp index, LIKE prefix optimization, skip-scan
   for composite indexes with leading column not constrained
 - Join ordering: cost-based with cardinality estimation from sqlite_stat1,
-  greedy algorithm for > 8 tables, exhaustive search for <= 8 tables
+  beam search (best-first path solver) with mxChoice candidates per level:
+  1 for single-table, 5 for two-table, 12 or 18 for 3+ tables (star-query
+  heuristic increases to 18; see `computeMxChoice` in where.c)
 - All 190+ VDBE opcodes implemented
 - Window function execution: frame management, ROWS/RANGE/GROUPS modes,
   EXCLUDE clause, partition-by sorting
