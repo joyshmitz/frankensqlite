@@ -7,6 +7,7 @@ pub mod cache_aligned;
 pub mod core_types;
 pub mod invariants;
 pub mod lifecycle;
+pub mod shared_lock_table;
 pub mod shm;
 pub mod witness_hierarchy;
 pub mod xor_delta;
@@ -28,6 +29,10 @@ pub use invariants::{
     SerializedWriteMutex, TxnManager, VersionStore, idx_to_version_pointer, visible,
 };
 pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
+pub use shared_lock_table::{
+    AcquireResult, DEFAULT_TABLE_CAPACITY, DrainStatus, RebuildLeaseError,
+    RebuildResult as SharedRebuildResult, SharedPageLockTable,
+};
 pub use shm::{SharedMemoryLayout, ShmSnapshot};
 pub use witness_hierarchy::{
     HotWitnessIndexDerivationV1, HotWitnessIndexSizingV1, WitnessHierarchyConfigV1,

@@ -964,7 +964,7 @@ mod tests {
         let after = ep.current;
 
         let jump_factor = after / before;
-        let expected_factor = 1.0 + 0.999 * (1.0 - 1e-9);
+        let expected_factor = 0.999_f64.mul_add(1.0 - 1e-9, 1.0);
 
         assert!(
             (jump_factor - expected_factor).abs() < 1e-6,
@@ -1021,14 +1021,15 @@ mod tests {
         let p0 = 0.001;
         let alpha = 0.001;
 
-        // Test at several violation rates.
-        let violation_rates = [0.005, 0.01, 0.05, 0.1];
+        // Test at several deterministic violation periods.
+        // p1 = 1/period, so these correspond to p1 in {0.005, 0.01, 0.05, 0.1}.
+        let periods: [usize; 4] = [200, 100, 20, 10];
 
-        for &p1 in &violation_rates {
+        for &period in &periods {
+            let p1 = 1.0 / period as f64;
             let mut mixture = MixtureEProcess::new("test_mixture", p0, alpha, 16);
 
-            // Deterministic: violate every (1/p1)-th observation.
-            let period = (1.0 / p1) as usize;
+            // Deterministic: violate every `period`th observation.
             let total_obs = 5000;
 
             for i in 0..total_obs {
@@ -1201,21 +1202,18 @@ mod tests {
 
         for &(inv, expected_p0, expected_lambda, expected_alpha) in cases {
             let config = inv.config();
-            assert_eq!(
-                config.p0,
-                expected_p0,
+            assert!(
+                (config.p0 - expected_p0).abs() <= f64::EPSILON,
                 "bead_id={TEST_BEAD_ID} {}: p0 mismatch",
                 inv.name()
             );
-            assert_eq!(
-                config.lambda,
-                expected_lambda,
+            assert!(
+                (config.lambda - expected_lambda).abs() <= f64::EPSILON,
                 "bead_id={TEST_BEAD_ID} {}: lambda mismatch",
                 inv.name()
             );
-            assert_eq!(
-                config.alpha,
-                expected_alpha,
+            assert!(
+                (config.alpha - expected_alpha).abs() <= f64::EPSILON,
                 "bead_id={TEST_BEAD_ID} {}: alpha mismatch",
                 inv.name()
             );
@@ -1506,21 +1504,18 @@ mod tests {
             MvccInvariant::CommitAtomicity,
         ] {
             let config = inv.config();
-            assert_eq!(
-                config.p0,
-                1e-6,
+            assert!(
+                (config.p0 - 1e-6).abs() <= f64::EPSILON,
                 "bead_id={MONITOR_BEAD_ID} {} p0 mismatch",
                 inv.name()
             );
-            assert_eq!(
-                config.lambda,
-                0.9,
+            assert!(
+                (config.lambda - 0.9).abs() <= f64::EPSILON,
                 "bead_id={MONITOR_BEAD_ID} {} lambda mismatch",
                 inv.name()
             );
-            assert_eq!(
-                config.alpha,
-                0.001,
+            assert!(
+                (config.alpha - 0.001).abs() <= f64::EPSILON,
                 "bead_id={MONITOR_BEAD_ID} {} alpha mismatch",
                 inv.name()
             );
@@ -1557,7 +1552,8 @@ mod tests {
 
     #[test]
     fn test_e2e_invariant_monitors_catch_injected_violations() {
-        let seed = 0xBADC_0DE_u64;
+        let seed = 0x0BAD_C0DE_u64;
+        let seed_mod = usize::try_from(seed % 7).expect("seed mod 7 must fit into usize");
 
         // Baseline run: no violations for all monitors.
         let mut baseline = create_mvcc_monitors();
@@ -1577,7 +1573,7 @@ mod tests {
         for ep in &mut bug_run {
             for i in 0..3_000 {
                 // Deterministic replayable pattern (~14.3% violation rate).
-                let violated = (i + (seed as usize % 7)) % 7 == 0;
+                let violated = (i + seed_mod) % 7 == 0;
                 ep.observe(violated);
             }
 
@@ -1887,10 +1883,10 @@ mod tests {
 
     #[test]
     fn test_inv1_through_inv7_100_threads() {
-        let handles = (0..100)
+        let handles = (0_u64..100)
             .map(|tid| {
                 std::thread::spawn(move || {
-                    let base = 10_000_u64 * (tid as u64 + 1);
+                    let base = 10_000_u64 * (tid + 1);
                     let sample = HardInvariantSample {
                         prev_txn_id: base,
                         current_txn_id: base + 1,

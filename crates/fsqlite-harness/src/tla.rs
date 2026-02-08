@@ -266,14 +266,14 @@ pub fn are_independent(lhs: &MvccAction, rhs: &MvccAction) -> bool {
             MvccActionKind::Write { page_id: lhs_page },
             MvccActionKind::Write { page_id: rhs_page },
         ) => lhs_page != rhs_page,
-        (MvccActionKind::Write { page_id }, MvccActionKind::Commit { write_set })
-        | (MvccActionKind::Commit { write_set }, MvccActionKind::Write { page_id }) => {
-            !write_set.contains(page_id)
-        }
-        (MvccActionKind::Commit { write_set }, MvccActionKind::Read { page_id })
-        | (MvccActionKind::Read { page_id }, MvccActionKind::Commit { write_set }) => {
-            !write_set.contains(page_id)
-        }
+        (
+            MvccActionKind::Write { page_id } | MvccActionKind::Read { page_id },
+            MvccActionKind::Commit { write_set },
+        )
+        | (
+            MvccActionKind::Commit { write_set },
+            MvccActionKind::Write { page_id } | MvccActionKind::Read { page_id },
+        ) => !write_set.contains(page_id),
     }
 }
 

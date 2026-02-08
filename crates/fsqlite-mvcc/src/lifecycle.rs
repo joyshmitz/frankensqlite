@@ -2588,9 +2588,10 @@ mod tests {
         }
         m.commit(&mut writer).unwrap();
         for page in [901_u32, 902, 903] {
-            assert!(m
-                .read_page(&mut old_reader, PageNumber::new(page).unwrap())
-                .is_none());
+            assert!(
+                m.read_page(&mut old_reader, PageNumber::new(page).unwrap())
+                    .is_none()
+            );
         }
 
         let mut stale = m.begin(BeginKind::Concurrent).unwrap();

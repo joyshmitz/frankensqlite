@@ -1273,7 +1273,7 @@ mod tests {
                 assert_eq!(name, "max");
                 match args {
                     FunctionArgs::List(v) => assert_eq!(v.len(), 2),
-                    _ => panic!("expected arg list"),
+                    FunctionArgs::Star => panic!("expected arg list"),
                 }
             }
             other => panic!("expected FunctionCall, got {other:?}"),

@@ -861,7 +861,9 @@ mod tests {
         assert_eq!(recovery.locate_checkpoint(), CommitSeq::ZERO);
 
         // Steps 3-4: replay from genesis with 5 markers
-        let markers: Vec<_> = (1..=5).map(|i| make_marker(i, i as u8)).collect();
+        let markers: Vec<_> = (1_u64..=5)
+            .map(|i| make_marker(i, u8::try_from(i).expect("marker id fits in u8")))
+            .collect();
         recovery.replay_markers(&markers, |_| CapsuleDecodeOutcome::Systematic);
 
         // Step 5: finalize
@@ -893,8 +895,8 @@ mod tests {
         assert_eq!(recovery.locate_checkpoint(), CommitSeq::new(100));
 
         // Replay markers 101-105 (after checkpoint)
-        let markers: Vec<_> = (101..=105)
-            .map(|i| make_marker(i, (i % 256) as u8))
+        let markers: Vec<_> = (101_u64..=105)
+            .map(|i| make_marker(i, u8::try_from(i % 256).expect("i % 256 fits in u8")))
             .collect();
         recovery.replay_markers(&markers, |_| CapsuleDecodeOutcome::Systematic);
 
@@ -915,7 +917,9 @@ mod tests {
         };
         recovery.load_root_manifest(manifest);
 
-        let markers: Vec<_> = (1..=3).map(|i| make_marker(i, i as u8)).collect();
+        let markers: Vec<_> = (1_u64..=3)
+            .map(|i| make_marker(i, u8::try_from(i).expect("marker id fits in u8")))
+            .collect();
 
         // Marker 2 requires RaptorQ repair
         recovery.replay_markers(&markers, |oid| {
@@ -945,7 +949,9 @@ mod tests {
         };
         recovery.load_root_manifest(manifest);
 
-        let markers: Vec<_> = (1..=3).map(|i| make_marker(i, i as u8)).collect();
+        let markers: Vec<_> = (1_u64..=3)
+            .map(|i| make_marker(i, u8::try_from(i).expect("marker id fits in u8")))
+            .collect();
 
         // Marker 2 fails to decode
         recovery.replay_markers(&markers, |oid| {

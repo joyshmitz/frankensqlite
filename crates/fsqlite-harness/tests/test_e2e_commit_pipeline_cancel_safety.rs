@@ -3,7 +3,7 @@ mod commit_pipeline;
 
 use std::collections::{BTreeSet, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 
@@ -64,7 +64,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
 
 fn deterministic_cancel_plan(total_writers: usize, cancelled_writers: usize) -> Vec<CancelPoint> {
     let mut chosen = BTreeSet::new();
-    let mut seed = 0xA11C_E55_u64;
+    let mut seed = 0x0A11_CE55_u64;
 
     while chosen.len() < cancelled_writers {
         seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -87,6 +87,7 @@ fn deterministic_cancel_plan(total_writers: usize, cancelled_writers: usize) -> 
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_e2e_commit_pipeline_cancel_safety() {
     let total_writers = 50_usize;
     let cancelled_writers = 20_usize;
@@ -110,6 +111,9 @@ fn test_e2e_commit_pipeline_cancel_safety() {
 
     let (pipeline, receiver) = CommitPipeline::with_default_capacity();
 
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+
     let coordinator = thread::spawn(move || {
         let cx = test_cx();
         let mut seen_txn_ids = Vec::with_capacity(expected_messages);
@@ -117,13 +121,18 @@ fn test_e2e_commit_pipeline_cancel_safety() {
             let request = block_on(receiver.recv(&cx)).expect("coordinator should not hang");
             seen_txn_ids.push(request.txn_id);
         }
+        ready_tx
+            .send(())
+            .expect("coordinator should signal drained messages");
+        done_rx
+            .recv()
+            .expect("coordinator should wait for post-drain checks");
         seen_txn_ids
     });
 
     let mut worker_threads = Vec::with_capacity(total_writers);
-    for writer_id in 0..total_writers {
+    for (writer_id, &cancel_point) in cancel_plan.iter().enumerate().take(total_writers) {
         let sender = pipeline.sender().clone();
-        let cancel_point = cancel_plan[writer_id];
 
         worker_threads.push(thread::spawn(move || {
             let cx = test_cx();
@@ -170,13 +179,29 @@ fn test_e2e_commit_pipeline_cancel_safety() {
         match worker.join().expect("writer thread should complete") {
             WorkerOutcome::Committed => committed_count = committed_count.saturating_add(1),
             WorkerOutcome::CancelledBeforeSend => {
-                cancelled_before_send_observed = cancelled_before_send_observed.saturating_add(1)
+                cancelled_before_send_observed = cancelled_before_send_observed.saturating_add(1);
             }
             WorkerOutcome::CancelledAfterSend => {
-                cancelled_after_send_observed = cancelled_after_send_observed.saturating_add(1)
+                cancelled_after_send_observed = cancelled_after_send_observed.saturating_add(1);
             }
         }
     }
+
+    ready_rx
+        .recv()
+        .expect("coordinator should drain expected messages");
+
+    // Capacity recovery / no ghost permits: we can reserve/drop exactly C permits after the storm.
+    let recovery_cx = test_cx();
+    for _ in 0..pipeline.capacity() {
+        let permit = block_on(pipeline.sender().reserve(&recovery_cx))
+            .expect("slot should be fully recovered after cancellations");
+        drop(permit);
+    }
+
+    done_tx
+        .send(())
+        .expect("coordinator should be unblocked after recovery checks");
 
     let received_txn_ids = coordinator
         .join()
@@ -194,11 +219,5 @@ fn test_e2e_commit_pipeline_cancel_safety() {
     let unique_ids: HashSet<u64> = received_txn_ids.iter().copied().collect();
     assert_eq!(unique_ids.len(), received_txn_ids.len());
 
-    // Capacity recovery / no ghost permits: we can reserve/drop exactly C permits after the storm.
-    let recovery_cx = test_cx();
-    for _ in 0..pipeline.capacity() {
-        let permit = block_on(pipeline.sender().reserve(&recovery_cx))
-            .expect("slot should be fully recovered after cancellations");
-        drop(permit);
-    }
+    // Receiver is dropped after coordinator join; reserve() would observe Disconnected().
 }

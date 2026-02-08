@@ -66,14 +66,14 @@ fn test_e2e_commit_pipeline_cancel_safety() {
     }
 
     let coordinator = thread::spawn(move || {
-        let mut received = Vec::new();
-        while received.len() < 30 {
+        let mut collected = Vec::new();
+        while collected.len() < 30 {
             let request = receiver
                 .try_recv_for(Duration::from_secs(1))
                 .expect("coordinator should not hang while messages remain");
-            received.push(request.txn_id);
+            collected.push(request.txn_id);
         }
-        received
+        collected
     });
 
     let mut sent_count = 0_usize;
@@ -88,10 +88,10 @@ fn test_e2e_commit_pipeline_cancel_safety() {
         }
     }
 
-    let received = coordinator.join().expect("coordinator join");
+    let collected = coordinator.join().expect("coordinator join");
     assert_eq!(cancelled_after_send_count, 5);
     assert_eq!(sent_count, 30, "30 messages should be sent total");
-    assert_eq!(received.len(), 30, "all sent commits must be received");
+    assert_eq!(collected.len(), 30, "all sent commits must be received");
 
     // No ghost entries: occupancy must return to zero.
     assert_eq!(

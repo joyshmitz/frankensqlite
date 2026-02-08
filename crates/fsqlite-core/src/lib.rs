@@ -11,7 +11,9 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::{ObjectId, Oti, PayloadHash, Region, SymbolRecord, SymbolRecordFlags};
+use fsqlite_types::{
+    ObjectId, Oti, PayloadHash, Region, SymbolRecord, SymbolRecordFlags, gf256_mul_byte,
+};
 use tracing::{debug, error};
 
 const MAX_BALANCED_BG_CPU: usize = 16;
@@ -282,24 +284,6 @@ pub fn symbol_addmul_assign(dst: &mut [u8], coeff: u8, src: &[u8]) -> Result<Wid
             Ok(WideChunkLayout::for_len(dst.len()))
         }
     }
-}
-
-/// Scalar GF(256) multiply with irreducible polynomial `0x11d`.
-#[must_use]
-pub fn gf256_mul_byte(mut a: u8, mut b: u8) -> u8 {
-    let mut out = 0_u8;
-    while b != 0 {
-        if (b & 1) != 0 {
-            out ^= a;
-        }
-        let carry = (a & 0x80) != 0;
-        a <<= 1;
-        if carry {
-            a ^= 0x1D;
-        }
-        b >>= 1;
-    }
-    out
 }
 
 /// Compute xxhash3 + blake3 on a contiguous input buffer.

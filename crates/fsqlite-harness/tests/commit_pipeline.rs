@@ -105,10 +105,10 @@ fn test_two_phase_reserve_then_send() {
     let permit = block_on(pipeline.sender().reserve(&cx)).expect("reserve should succeed");
     permit.send(CommitRequest::new(1, 0, vec![1, 2, 3]));
 
-    let received = block_on(receiver.recv(&cx)).expect("receiver should get commit request");
-    assert_eq!(received.txn_id, 1);
-    assert_eq!(received.reserve_order, 0);
-    assert_eq!(received.payload, vec![1, 2, 3]);
+    let got = block_on(receiver.recv(&cx)).expect("receiver should get commit request");
+    assert_eq!(got.txn_id, 1);
+    assert_eq!(got.reserve_order, 0);
+    assert_eq!(got.payload, vec![1, 2, 3]);
 }
 
 #[test]
@@ -187,8 +187,17 @@ fn test_backpressure_blocks_at_capacity() {
 
 #[test]
 fn test_fifo_ordering_under_contention() {
-    let cx = test_cx();
     let (pipeline, receiver) = CommitPipeline::new(16);
+    let receiver_join = thread::spawn(move || {
+        let receiver_cx = test_cx();
+        let mut observed_order = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let request =
+                block_on(receiver.recv(&receiver_cx)).expect("receiver should read all commits");
+            observed_order.push(request.reserve_order);
+        }
+        observed_order
+    });
 
     let order_counter = Arc::new(AtomicU64::new(0));
     let mut joins = Vec::new();
@@ -216,11 +225,7 @@ fn test_fifo_ordering_under_contention() {
         join.join().expect("writer thread must complete");
     }
 
-    let mut observed_order = Vec::new();
-    for _ in 0..100 {
-        let request = block_on(receiver.recv(&cx)).expect("receiver should read all commits");
-        observed_order.push(request.reserve_order);
-    }
+    let observed_order = receiver_join.join().expect("receiver thread must complete");
 
     let expected_order: Vec<u64> = (0_u64..100).collect();
     assert_eq!(observed_order, expected_order);

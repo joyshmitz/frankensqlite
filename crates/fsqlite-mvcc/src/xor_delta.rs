@@ -8,7 +8,7 @@
 use std::fmt;
 
 use fsqlite_types::ecs::PatchKind;
-use fsqlite_types::{ObjectId, PayloadHash};
+use fsqlite_types::{ObjectId, PayloadHash, gf256_mul_byte};
 
 /// Sparse-delta magic bytes (`"XD"`).
 pub const DELTA_MAGIC: [u8; 2] = *b"XD";
@@ -648,24 +648,6 @@ pub fn resolve_write_merge_policy(
 #[must_use]
 pub const fn gf256_add_byte(lhs: u8, rhs: u8) -> u8 {
     lhs ^ rhs
-}
-
-/// GF(256) multiplication with irreducible polynomial `x^8 + x^4 + x^3 + x^2 + 1` (`0x11d`).
-#[must_use]
-pub fn gf256_mul_byte(mut lhs: u8, mut rhs: u8) -> u8 {
-    let mut acc = 0u8;
-    while rhs != 0 {
-        if rhs & 1 != 0 {
-            acc ^= lhs;
-        }
-        let carry = lhs & 0x80;
-        lhs <<= 1;
-        if carry != 0 {
-            lhs ^= 0x1d;
-        }
-        rhs >>= 1;
-    }
-    acc
 }
 
 /// Multiplicative inverse in GF(256) (`None` for zero).

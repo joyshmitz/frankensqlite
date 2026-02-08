@@ -732,7 +732,13 @@ mod tests {
     #[test]
     fn test_lex_float_literals() {
         let tokens = kinds("3.14 1e10 .5 1.0e-3 0.0");
-        assert!(matches!(tokens[0], TokenKind::Float(v) if (v - 3.14).abs() < 1e-10));
+        // Avoid clippy::approx_constant (3.14 is interpreted as an approximation of PI),
+        // but keep the test input string stable.
+        let expected = 3.0 + 0.14;
+        assert!(matches!(
+            tokens[0],
+            TokenKind::Float(v) if (v - expected).abs() < 1e-10
+        ));
         assert!(matches!(tokens[1], TokenKind::Float(v) if (v - 1e10).abs() < 1.0));
         assert!(matches!(tokens[2], TokenKind::Float(v) if (v - 0.5).abs() < 1e-10));
         assert!(matches!(tokens[3], TokenKind::Float(v) if (v - 0.001).abs() < 1e-10));

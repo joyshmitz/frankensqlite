@@ -234,14 +234,14 @@ impl ScalarFunction for DummyScalar {
     fn num_args(&self) -> i32 {
         0
     }
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "dummy_scalar"
     }
 }
 
 struct DummyCollation;
 impl CollationFunction for DummyCollation {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "dummy_collation"
     }
     fn compare(&self, left: &[u8], right: &[u8]) -> Ordering {
@@ -354,7 +354,7 @@ impl AggregateFunction for DummyAggregate {
     fn num_args(&self) -> i32 {
         -1
     }
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "dummy_agg"
     }
 }
@@ -383,7 +383,7 @@ impl WindowFunction for DummyWindow {
     fn num_args(&self) -> i32 {
         -1
     }
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "dummy_window"
     }
 }
@@ -457,13 +457,13 @@ impl Authorizer for DummyAuthorizer {
 
 #[test]
 fn test_open_traits_external_impl_compiles() {
-    let _vfs = DummyVfs;
-    let _scalar = DummyScalar;
-    let _agg = DummyAggregate;
-    let _window = DummyWindow;
-    let _vtab = DummyVtab;
-    let _collation = DummyCollation;
-    let _authorizer = DummyAuthorizer;
+    std::hint::black_box(DummyVfs);
+    std::hint::black_box(DummyScalar);
+    std::hint::black_box(DummyAggregate);
+    std::hint::black_box(DummyWindow);
+    std::hint::black_box(DummyVtab);
+    std::hint::black_box(DummyCollation);
+    std::hint::black_box(DummyAuthorizer);
 }
 
 #[test]
@@ -563,5 +563,5 @@ fn test_dummy_vtab_best_index_receives_constraints() {
     );
     vtab.best_index(&mut info)
         .expect("best_index should succeed");
-    assert_eq!(info.estimated_cost, 1.0);
+    assert!((info.estimated_cost - 1.0).abs() < f64::EPSILON);
 }

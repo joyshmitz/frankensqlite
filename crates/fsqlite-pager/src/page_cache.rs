@@ -18,9 +18,6 @@ use fsqlite_vfs::VfsFile;
 
 use crate::page_buf::{PageBuf, PageBufPool};
 
-pub mod arc_cache;
-pub use arc_cache::{AccessOutcome, ArcCache, CacheKey, CachedPage};
-
 // ---------------------------------------------------------------------------
 // PageCache
 // ---------------------------------------------------------------------------

@@ -22,10 +22,10 @@ fn test_reserve_then_send_succeeds() {
     let seq = permit.reservation_seq();
     permit.send(req(seq));
 
-    let received = receiver
+    let got = receiver
         .try_recv_for(Duration::from_millis(100))
         .expect("request should be received");
-    assert_eq!(received.txn_id, seq);
+    assert_eq!(got.txn_id, seq);
 }
 
 #[test]
@@ -44,10 +44,9 @@ fn test_reserve_blocks_at_capacity() {
     let _a = sender.reserve();
     let _b = sender.reserve();
 
-    let sender_clone = sender.clone();
     let (tx, rx) = std_mpsc::channel();
     thread::spawn(move || {
-        let permit = sender_clone.try_reserve_for(Duration::from_millis(20));
+        let permit = sender.try_reserve_for(Duration::from_millis(20));
         tx.send(permit.is_none())
             .expect("channel send in reserve timeout test");
     });

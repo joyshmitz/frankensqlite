@@ -249,6 +249,7 @@ impl GroupCommitCoordinator {
 
     /// Access the underlying controller for diagnostics.
     #[must_use]
+    #[allow(dead_code)]
     pub const fn controller(&self) -> &ConformalBatchController {
         &self.controller
     }
@@ -322,4 +323,337 @@ fn rounded_sqrt_ratio(numerator: u64, denominator: u64) -> usize {
 fn square_ratio_less_or_equal(candidate: u64, numerator: u64, denominator: u64) -> bool {
     let lhs = u128::from(candidate) * u128::from(candidate) * u128::from(denominator);
     lhs <= u128::from(numerator)
+}
+
+// ── Unit Tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BEAD_ID: &str = "bd-3go.5";
+
+    // ── CommitRequest tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_commit_request_fields() {
+        let req = CommitRequest::new(42, 7, vec![1, 2, 3]);
+        assert_eq!(req.txn_id, 42, "bead_id={BEAD_ID} txn_id");
+        assert_eq!(req.reserve_order, 7, "bead_id={BEAD_ID} reserve_order");
+        assert_eq!(req.payload, vec![1, 2, 3], "bead_id={BEAD_ID} payload");
+    }
+
+    #[test]
+    fn test_commit_request_eq() {
+        let a = CommitRequest::new(1, 0, vec![10]);
+        let b = CommitRequest::new(1, 0, vec![10]);
+        let c = CommitRequest::new(2, 0, vec![10]);
+        assert_eq!(a, b, "bead_id={BEAD_ID} identical requests");
+        assert_ne!(a, c, "bead_id={BEAD_ID} different txn_id");
+    }
+
+    // ── Capacity derivation tests ──────────────────────────────────────
+
+    #[test]
+    fn test_default_capacity_is_16() {
+        assert_eq!(
+            DEFAULT_COMMIT_CHANNEL_CAPACITY, 16,
+            "bead_id={BEAD_ID} spec §4.5 requires default capacity of 16"
+        );
+    }
+
+    #[test]
+    fn test_resolve_capacity_none() {
+        assert_eq!(
+            resolve_commit_channel_capacity(None),
+            DEFAULT_COMMIT_CHANNEL_CAPACITY,
+            "bead_id={BEAD_ID} None→default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_capacity_zero() {
+        assert_eq!(
+            resolve_commit_channel_capacity(Some(0)),
+            DEFAULT_COMMIT_CHANNEL_CAPACITY,
+            "bead_id={BEAD_ID} 0→default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_capacity_custom() {
+        assert_eq!(
+            resolve_commit_channel_capacity(Some(32)),
+            32,
+            "bead_id={BEAD_ID} custom value"
+        );
+    }
+
+    // ── Little's Law capacity formula tests ────────────────────────────
+
+    #[test]
+    fn test_little_law_spec_derivation() {
+        // §4.5: At burst 4× peak (148K/sec), t_commit=40µs, jitter 250%
+        // burst_multiplier=1 because lambda already includes the 4× burst.
+        let c = little_law_capacity(148_000, 40, 1, 250);
+        assert_eq!(c, 15, "bead_id={BEAD_ID} Little's Law §4.5");
+        assert!(
+            DEFAULT_COMMIT_CHANNEL_CAPACITY >= c,
+            "bead_id={BEAD_ID} default covers burst"
+        );
+    }
+
+    #[test]
+    fn test_little_law_zero_lambda() {
+        assert_eq!(
+            little_law_capacity(0, 40, 1, 250),
+            1,
+            "bead_id={BEAD_ID} zero lambda"
+        );
+    }
+
+    #[test]
+    fn test_little_law_zero_latency() {
+        assert_eq!(
+            little_law_capacity(148_000, 0, 1, 250),
+            1,
+            "bead_id={BEAD_ID} zero latency"
+        );
+    }
+
+    // ── Pipeline construction tests ────────────────────────────────────
+
+    #[test]
+    fn test_pipeline_default_capacity() {
+        let (pipeline, _rx) = CommitPipeline::with_default_capacity();
+        assert_eq!(
+            pipeline.capacity(),
+            DEFAULT_COMMIT_CHANNEL_CAPACITY,
+            "bead_id={BEAD_ID}"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_custom_capacity() {
+        let (pipeline, _rx) = CommitPipeline::new(64);
+        assert_eq!(pipeline.capacity(), 64, "bead_id={BEAD_ID}");
+    }
+
+    #[test]
+    fn test_pipeline_from_pragma_some() {
+        let (pipeline, _rx) = CommitPipeline::from_pragma(Some(32));
+        assert_eq!(pipeline.capacity(), 32, "bead_id={BEAD_ID}");
+    }
+
+    #[test]
+    fn test_pipeline_from_pragma_none() {
+        let (pipeline, _rx) = CommitPipeline::from_pragma(None);
+        assert_eq!(
+            pipeline.capacity(),
+            DEFAULT_COMMIT_CHANNEL_CAPACITY,
+            "bead_id={BEAD_ID}"
+        );
+    }
+
+    // ── GroupCommitCoordinator tests ───────────────────────────────────
+
+    #[test]
+    fn test_group_commit_initial_batch() {
+        let mut coordinator = GroupCommitCoordinator::new(16);
+        let batch = coordinator.observe_and_plan_batch(2_000, 5, 128);
+        assert!(
+            (1..=16).contains(&batch),
+            "bead_id={BEAD_ID} initial batch={batch} must be in [1,C]"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_n_opt_near_capacity() {
+        // N_opt = sqrt(2000/5) = sqrt(400) = 20, clamped to C=16.
+        let mut coordinator = GroupCommitCoordinator::new(16);
+        for _ in 0..128 {
+            let _ = coordinator.observe_and_plan_batch(2_000, 5, 128);
+        }
+        let batch = coordinator.observe_and_plan_batch(2_000, 5, 128);
+        assert!(
+            batch >= 14,
+            "bead_id={BEAD_ID} batch={batch} should converge near capacity"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_respects_available() {
+        let mut coordinator = GroupCommitCoordinator::new(64);
+        for _ in 0..128 {
+            let _ = coordinator.observe_and_plan_batch(10_000, 5, 3);
+        }
+        let batch = coordinator.observe_and_plan_batch(10_000, 5, 3);
+        assert!(
+            batch <= 3,
+            "bead_id={BEAD_ID} batch={batch} must not exceed available"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_zero_available() {
+        let mut coordinator = GroupCommitCoordinator::new(16);
+        coordinator.controller.observe_samples(2_000, 5);
+        let batch = coordinator.controller.next_batch_size(0);
+        assert_eq!(batch, 0, "bead_id={BEAD_ID} zero available→zero batch");
+    }
+
+    #[test]
+    fn test_group_commit_batch_always_in_bounds() {
+        let mut coordinator = GroupCommitCoordinator::new(16);
+        for fsync in [100, 500, 2_000, 10_000, 100_000] {
+            for validate in [1, 5, 50, 500] {
+                for _ in 0..32 {
+                    let batch = coordinator.observe_and_plan_batch(fsync, validate, 128);
+                    assert!(
+                        (1..=16).contains(&batch),
+                        "bead_id={BEAD_ID} batch={batch} out of bounds for fsync={fsync} validate={validate}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── ConformalBatchController tests ──────────────────────────────────
+
+    #[test]
+    fn test_conformal_regime_shift_detection() {
+        let mut ctrl = ConformalBatchController::new(16);
+        // Fill with stable 2ms samples.
+        for _ in 0..128 {
+            ctrl.observe_samples(2_000, 5);
+        }
+        assert_eq!(
+            ctrl.regime_shift_resets(),
+            0,
+            "bead_id={BEAD_ID} no shift under stable input"
+        );
+        // Inject 5× regime change.
+        for _ in 0..128 {
+            ctrl.observe_samples(10_000, 5);
+        }
+        assert!(
+            ctrl.regime_shift_resets() >= 1,
+            "bead_id={BEAD_ID} should detect regime shift"
+        );
+    }
+
+    #[test]
+    fn test_conformal_no_false_shift_under_stable_input() {
+        let mut ctrl = ConformalBatchController::new(16);
+        for _ in 0..512 {
+            ctrl.observe_samples(2_000, 5);
+        }
+        assert_eq!(
+            ctrl.regime_shift_resets(),
+            0,
+            "bead_id={BEAD_ID} stable input must not trigger shift"
+        );
+    }
+
+    #[test]
+    fn test_conformal_batch_size_adapts_upward() {
+        let mut ctrl = ConformalBatchController::new(64);
+        // Establish baseline with 2ms fsync / 500µs validate.
+        for _ in 0..128 {
+            ctrl.observe_samples(2_000, 500);
+        }
+        let before = ctrl.conformal_batch_size();
+        // Shift to 10ms fsync (same validate).
+        for _ in 0..128 {
+            ctrl.observe_samples(10_000, 500);
+        }
+        let after = ctrl.conformal_batch_size();
+        assert!(
+            after > before,
+            "bead_id={BEAD_ID} batch should increase: before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn test_conformal_resets_calibration_on_shift() {
+        let mut ctrl = ConformalBatchController::new(16);
+        for _ in 0..128 {
+            ctrl.observe_samples(2_000, 5);
+        }
+        let resets_before = ctrl.regime_shift_resets();
+        // 5× jump should trigger reset.
+        for _ in 0..128 {
+            ctrl.observe_samples(10_000, 5);
+        }
+        assert!(
+            ctrl.regime_shift_resets() > resets_before,
+            "bead_id={BEAD_ID} calibration must reset on shift"
+        );
+    }
+
+    // ── Internal helper tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_upper_quantile_single_element() {
+        let mut samples = VecDeque::new();
+        samples.push_back(42);
+        assert_eq!(upper_quantile(&samples, 9, 10), 42);
+    }
+
+    #[test]
+    fn test_upper_quantile_empty() {
+        let samples = VecDeque::new();
+        assert_eq!(upper_quantile(&samples, 9, 10), 1);
+    }
+
+    #[test]
+    fn test_upper_quantile_ten_elements() {
+        let samples: VecDeque<u64> = (1..=10).collect();
+        // 90th percentile of [1..=10]: index = (9*9 + 9)/10 = 9 → value 10.
+        let q = upper_quantile(&samples, 9, 10);
+        assert!(q >= 9, "bead_id={BEAD_ID} q90={q} expected >= 9");
+    }
+
+    #[test]
+    fn test_rounded_sqrt_ratio_perfect_square() {
+        // sqrt(400/1) = 20
+        assert_eq!(rounded_sqrt_ratio(400, 1), 20);
+    }
+
+    #[test]
+    fn test_rounded_sqrt_ratio_non_trivial() {
+        // sqrt(2000/5) = sqrt(400) = 20
+        assert_eq!(rounded_sqrt_ratio(2_000, 5), 20);
+    }
+
+    #[test]
+    fn test_rounded_sqrt_ratio_zero_numerator() {
+        assert_eq!(rounded_sqrt_ratio(0, 5), 1);
+    }
+
+    #[test]
+    fn test_rounded_sqrt_ratio_zero_denominator() {
+        assert_eq!(rounded_sqrt_ratio(100, 0), usize::MAX);
+    }
+
+    // ── E2E-style coordinator test ─────────────────────────────────────
+
+    #[test]
+    fn test_e2e_coordinator_sustained_load() {
+        // Under sustained load with t_fsync=2ms, t_validate=5µs,
+        // coordinator batch size should stay near optimal (16, clamped).
+        let mut coordinator = GroupCommitCoordinator::new(DEFAULT_COMMIT_CHANNEL_CAPACITY);
+        let mut high_count = 0_usize;
+        for _ in 0..256 {
+            let batch = coordinator.observe_and_plan_batch(2_000, 5, 128);
+            assert!((1..=16).contains(&batch));
+            if batch >= 14 {
+                high_count += 1;
+            }
+        }
+        assert!(
+            high_count >= 200,
+            "bead_id={BEAD_ID} batch planner should converge: high_count={high_count}"
+        );
+    }
 }

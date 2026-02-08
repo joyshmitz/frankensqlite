@@ -886,7 +886,7 @@ impl<P: PageWriter> BtCursor<P> {
             // Leaf is the root — push root down first.
             balance::balance_deeper(cx, &mut self.pager, self.root_page, self.usable_size)?;
             // Root is now an interior page with 1 child at index 0.
-            balance::balance_nonroot(
+            let outcome = balance::balance_nonroot(
                 cx,
                 &mut self.pager,
                 self.root_page,
@@ -896,12 +896,17 @@ impl<P: PageWriter> BtCursor<P> {
                 self.usable_size,
                 true,
             )?;
+            if matches!(outcome, balance::BalanceResult::Split { .. }) {
+                return Err(FrankenError::internal(
+                    "root balance unexpectedly returned split requiring parent update",
+                ));
+            }
         } else {
             let parent_page_no = self.stack[depth - 2].page_no;
             let child_idx = self.stack[depth - 2].cell_idx as usize;
             let parent_is_root = parent_page_no == self.root_page;
 
-            balance::balance_nonroot(
+            let mut outcome = balance::balance_nonroot(
                 cx,
                 &mut self.pager,
                 parent_page_no,
@@ -911,6 +916,39 @@ impl<P: PageWriter> BtCursor<P> {
                 self.usable_size,
                 parent_is_root,
             )?;
+
+            // If balancing split the parent page, propagate the split up the
+            // cursor stack by updating each ancestor in turn.
+            let mut parent_level = depth - 2; // stack index of the split page
+            while let balance::BalanceResult::Split {
+                new_pgnos,
+                new_dividers,
+            } = outcome
+            {
+                if parent_level == 0 {
+                    return Err(FrankenError::internal(
+                        "balance split bubbled above root (unexpected)",
+                    ));
+                }
+
+                let ancestor_page_no = self.stack[parent_level - 1].page_no;
+                let ancestor_child_idx = self.stack[parent_level - 1].cell_idx as usize;
+                let ancestor_is_root = ancestor_page_no == self.root_page;
+
+                outcome = balance::apply_child_replacement(
+                    cx,
+                    &mut self.pager,
+                    ancestor_page_no,
+                    self.usable_size,
+                    ancestor_child_idx,
+                    1, // Replacing a single child page with its split siblings.
+                    &new_pgnos,
+                    &new_dividers,
+                    ancestor_is_root,
+                )?;
+
+                parent_level -= 1;
+            }
         }
 
         // Tree structure changed — invalidate the cursor stack.
@@ -931,7 +969,7 @@ impl<P: PageWriter> BtCursor<P> {
         let parent_page_no = self.stack[depth - 2].page_no;
         let child_idx = usize::from(self.stack[depth - 2].cell_idx);
 
-        balance::balance_nonroot(
+        let outcome = balance::balance_nonroot(
             cx,
             &mut self.pager,
             parent_page_no,
@@ -941,6 +979,11 @@ impl<P: PageWriter> BtCursor<P> {
             self.usable_size,
             parent_page_no == self.root_page,
         )?;
+        if matches!(outcome, balance::BalanceResult::Split { .. }) {
+            return Err(FrankenError::internal(
+                "delete balance unexpectedly returned split requiring parent update",
+            ));
+        }
 
         // Tree shape may change after balancing.
         self.stack.clear();

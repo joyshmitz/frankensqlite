@@ -32,6 +32,24 @@ const NB: usize = 3;
 /// plus NB-1 divider cells.
 const MAX_GATHERED_CELLS: usize = 4096;
 
+/// Result of a balancing operation that may require updating higher levels.
+#[derive(Debug)]
+pub enum BalanceResult {
+    /// Balancing completed; no further parent updates are required.
+    Done,
+    /// The updated interior page overflowed and was split into multiple pages.
+    ///
+    /// The caller must insert `new_dividers` into the parent-of-this-page to
+    /// reference the additional pages in `new_pgnos[1..]`. `new_pgnos[0]` is
+    /// always the original page number (rewritten in-place).
+    Split {
+        new_pgnos: Vec<PageNumber>,
+        new_dividers: Vec<(PageNumber, Vec<u8>)>,
+    },
+}
+
+type SplitPagesAndDividers = (Vec<PageNumber>, Vec<(PageNumber, Vec<u8>)>);
+
 // ---------------------------------------------------------------------------
 // Gathered cell descriptor
 // ---------------------------------------------------------------------------
@@ -268,8 +286,8 @@ pub fn balance_quick<W: PageWriter>(
 ///
 /// This gathers all cells from up to 3 sibling pages plus divider cells
 /// from the parent, computes a new distribution, and writes the result.
-#[allow(clippy::too_many_lines)]
-pub fn balance_nonroot<W: PageWriter>(
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn balance_nonroot<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     parent_page_no: PageNumber,
@@ -278,7 +296,7 @@ pub fn balance_nonroot<W: PageWriter>(
     overflow_insert_idx: usize,
     usable_size: u32,
     parent_is_root: bool,
-) -> Result<()> {
+) -> Result<BalanceResult> {
     let parent_data = writer.read_page(cx, parent_page_no)?;
     let parent_offset = header_offset_for_page(parent_page_no);
     let parent_header = BtreePageHeader::parse(&parent_data, parent_offset)?;
@@ -402,7 +420,7 @@ pub fn balance_nonroot<W: PageWriter>(
     }
 
     if all_cells.is_empty() {
-        return Ok(());
+        return Ok(BalanceResult::Done);
     }
 
     // Determine the page type for new pages.
@@ -521,8 +539,8 @@ pub fn balance_nonroot<W: PageWriter>(
         }
     }
 
-    // Update parent: remove old dividers, insert new ones, update right-child.
-    update_parent(
+    // Update parent: remove old dividers, insert new ones, update child pointers.
+    apply_child_replacement(
         cx,
         writer,
         parent_page_no,
@@ -532,9 +550,7 @@ pub fn balance_nonroot<W: PageWriter>(
         &new_pgnos,
         &new_dividers,
         parent_is_root,
-    )?;
-
-    Ok(())
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +637,7 @@ fn cell_on_page_size_from_ref(cell: &CellRef, cell_start: usize) -> usize {
 /// Compute how many cells go on each output page.
 ///
 /// Returns a vector of cell counts per page.
+#[allow(clippy::too_many_lines)]
 fn compute_distribution(
     cells: &[GatheredCell],
     usable_size: u32,
@@ -903,7 +920,7 @@ fn insert_cell_into_page<W: PageWriter>(
 ///
 /// Removes old divider cells and inserts new ones.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn update_parent<W: PageWriter>(
+pub(crate) fn apply_child_replacement<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     parent_page_no: PageNumber,
@@ -913,11 +930,13 @@ fn update_parent<W: PageWriter>(
     new_pgnos: &[PageNumber],
     new_dividers: &[(PageNumber, Vec<u8>)],
     parent_is_root: bool,
-) -> Result<()> {
+) -> Result<BalanceResult> {
     let page_data = writer.read_page(cx, parent_page_no)?;
     let offset = header_offset_for_page(parent_page_no);
     let header = BtreePageHeader::parse(&page_data, offset)?;
     let ptrs = read_cell_pointers(&page_data, &header, offset)?;
+    let total_children = header.cell_count as usize + 1;
+    let touches_rightmost = first_child + old_sibling_count == total_children;
 
     // Number of old divider cells to remove.
     let old_divider_count = old_sibling_count.saturating_sub(1);
@@ -973,23 +992,66 @@ fn update_parent<W: PageWriter>(
     }
 
     // Update right_child to point to the last new sibling.
-    let right_child = if let Some(&last_pgno) = new_pgnos.last() {
-        Some(last_pgno)
+    let right_child = if touches_rightmost {
+        new_pgnos.last().copied().or(header.right_child)
     } else {
         header.right_child
     };
+    if header.page_type.is_interior() && right_child.is_none() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("interior page {} missing right child", parent_page_no),
+        });
+    }
 
-    if !page_fits(&final_cells, header.page_type, offset, usable_size) {
-        if !parent_is_root {
+    // If we're not touching the rightmost child, the divider cell that follows
+    // the balanced range must have its left-child pointer updated to the
+    // last new sibling page.
+    if !touches_rightmost
+        && header.page_type.is_interior()
+        && !new_pgnos.is_empty()
+        && !new_dividers.is_empty()
+    {
+        let patch_idx = first_child + new_dividers.len();
+        if patch_idx >= final_cells.len() {
+            return Err(FrankenError::internal(format!(
+                "parent {} missing post-range divider cell at {} (final_cells={})",
+                parent_page_no,
+                patch_idx,
+                final_cells.len()
+            )));
+        }
+        let last_pgno = *new_pgnos.last().unwrap();
+        if final_cells[patch_idx].data.len() < 4 {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "parent page {} overflow while balancing non-root child",
-                    parent_page_no
+                    "parent {} divider cell at {} too small to patch child pointer",
+                    parent_page_no, patch_idx
                 ),
             });
         }
+        final_cells[patch_idx].data[0..4].copy_from_slice(&last_pgno.get().to_be_bytes());
+    }
 
-        return split_overflowing_root(
+    if !page_fits(&final_cells, header.page_type, offset, usable_size) {
+        if !parent_is_root {
+            let (new_pgnos, new_dividers) = split_overflowing_nonroot_interior_page(
+                cx,
+                writer,
+                parent_page_no,
+                usable_size,
+                offset,
+                header.page_type,
+                &page_data[..offset],
+                &final_cells,
+                right_child,
+            )?;
+            return Ok(BalanceResult::Split {
+                new_pgnos,
+                new_dividers,
+            });
+        }
+
+        split_overflowing_root(
             cx,
             writer,
             parent_page_no,
@@ -999,7 +1061,8 @@ fn update_parent<W: PageWriter>(
             &page_data[..offset],
             &final_cells,
             right_child,
-        );
+        )?;
+        return Ok(BalanceResult::Done);
     }
 
     // Rebuild the parent page.
@@ -1017,7 +1080,8 @@ fn update_parent<W: PageWriter>(
         final_page[..offset].copy_from_slice(&page_data[..offset]);
     }
 
-    writer.write_page(cx, parent_page_no, &final_page)
+    writer.write_page(cx, parent_page_no, &final_page)?;
+    Ok(BalanceResult::Done)
 }
 
 fn page_fits(
@@ -1047,7 +1111,7 @@ fn page_required_bytes(
         .checked_add(payload_bytes)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn split_overflowing_root<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
@@ -1162,7 +1226,10 @@ fn split_overflowing_root<W: PageWriter>(
         detail: format!("missing divider set for overflowing root {}", root_page_no),
     })?;
     let right_children = chosen_right_children.ok_or_else(|| FrankenError::DatabaseCorrupt {
-        detail: format!("missing right-child set for overflowing root {}", root_page_no),
+        detail: format!(
+            "missing right-child set for overflowing root {}",
+            root_page_no
+        ),
     })?;
 
     let child_count = ranges.len();
@@ -1217,11 +1284,15 @@ fn split_overflowing_root<W: PageWriter>(
         writer.write_page(cx, child_pgnos[i], &page)?;
     }
 
-    let root_right = child_pgnos.last().copied().ok_or_else(|| {
-        FrankenError::DatabaseCorrupt {
-            detail: format!("overflowing root {} split produced no children", root_page_no),
-        }
-    })?;
+    let root_right = child_pgnos
+        .last()
+        .copied()
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "overflowing root {} split produced no children",
+                root_page_no
+            ),
+        })?;
     let mut new_root = build_page(
         &root_cells,
         page_type,
@@ -1233,6 +1304,186 @@ fn split_overflowing_root<W: PageWriter>(
         new_root[..root_offset].copy_from_slice(root_prefix);
     }
     writer.write_page(cx, root_page_no, &new_root)
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn split_overflowing_nonroot_interior_page<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    page_no: PageNumber,
+    usable_size: u32,
+    page_offset: usize,
+    page_type: BtreePageType,
+    page_prefix: &[u8],
+    final_cells: &[GatheredCell],
+    right_child: Option<PageNumber>,
+) -> Result<SplitPagesAndDividers> {
+    if !page_type.is_interior() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("cannot split overflowing non-interior page {}", page_no),
+        });
+    }
+    let page_right_child = right_child.ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!("overflowing interior page {} missing right child", page_no),
+    })?;
+    if final_cells.len() < 3 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "overflowing interior page {} has too few cells ({}) to split",
+                page_no,
+                final_cells.len()
+            ),
+        });
+    }
+
+    let mut chosen_ranges: Option<Vec<(usize, usize)>> = None;
+    let mut chosen_dividers: Option<Vec<Vec<u8>>> = None;
+    let mut chosen_right_children: Option<Vec<PageNumber>> = None;
+
+    for child_count in 2usize..=8usize {
+        if final_cells.len() < child_count.saturating_mul(2).saturating_sub(1) {
+            break;
+        }
+
+        let divider_indices: Vec<usize> = (1..child_count)
+            .map(|k| k.saturating_mul(final_cells.len()) / child_count)
+            .collect();
+
+        // Validate indices are strictly increasing and within bounds.
+        if divider_indices
+            .windows(2)
+            .any(|w| w[0] == 0 || w[1] <= w[0] || w[1] >= final_cells.len())
+        {
+            continue;
+        }
+
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(child_count);
+        let mut dividers: Vec<Vec<u8>> = Vec::with_capacity(child_count.saturating_sub(1));
+        let mut right_children: Vec<PageNumber> = Vec::with_capacity(child_count);
+
+        let mut start = 0usize;
+        let mut valid = true;
+
+        for &divider_idx in &divider_indices {
+            if divider_idx <= start || divider_idx >= final_cells.len() {
+                valid = false;
+                break;
+            }
+            let segment = &final_cells[start..divider_idx];
+            if segment.is_empty() {
+                valid = false;
+                break;
+            }
+
+            let divider = &final_cells[divider_idx].data;
+            if divider.len() < 4 {
+                valid = false;
+                break;
+            }
+            let raw = u32::from_be_bytes([divider[0], divider[1], divider[2], divider[3]]);
+            let Some(rc) = PageNumber::new(raw) else {
+                valid = false;
+                break;
+            };
+
+            ranges.push((start, divider_idx));
+            dividers.push(divider.clone());
+            right_children.push(rc);
+            start = divider_idx + 1;
+        }
+
+        if !valid || start >= final_cells.len() {
+            continue;
+        }
+        ranges.push((start, final_cells.len()));
+        if ranges.last().is_some_and(|(s, e)| s == e) {
+            continue;
+        }
+        right_children.push(page_right_child);
+
+        if ranges.len() != child_count
+            || dividers.len() != child_count.saturating_sub(1)
+            || right_children.len() != child_count
+        {
+            continue;
+        }
+
+        // Ensure each child page fits (first child may be page 1 offset=100).
+        let mut fits = true;
+        for (i, (s, e)) in ranges.iter().copied().enumerate() {
+            let off = if i == 0 { page_offset } else { 0 };
+            if !page_fits(&final_cells[s..e], page_type, off, usable_size) {
+                fits = false;
+                break;
+            }
+        }
+        if !fits {
+            continue;
+        }
+
+        chosen_ranges = Some(ranges);
+        chosen_dividers = Some(dividers);
+        chosen_right_children = Some(right_children);
+        break;
+    }
+
+    let ranges = chosen_ranges.ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!(
+            "unable to choose split points for overflowing interior page {} with {} cells",
+            page_no,
+            final_cells.len()
+        ),
+    })?;
+    let mut dividers = chosen_dividers.ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!(
+            "missing divider set for overflowing interior page {}",
+            page_no
+        ),
+    })?;
+    let right_children = chosen_right_children.ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!(
+            "missing right-child set for overflowing interior page {}",
+            page_no
+        ),
+    })?;
+
+    // Allocate pages: reuse the current page as the leftmost child.
+    let child_count = ranges.len();
+    let mut child_pgnos: Vec<PageNumber> = Vec::with_capacity(child_count);
+    child_pgnos.push(page_no);
+    for _ in 1..child_count {
+        child_pgnos.push(writer.allocate_page(cx)?);
+    }
+
+    // Patch promoted divider cells to point to their left child pages.
+    for (i, divider) in dividers.iter_mut().enumerate() {
+        divider[0..4].copy_from_slice(&child_pgnos[i].get().to_be_bytes());
+    }
+    let promoted: Vec<(PageNumber, Vec<u8>)> = dividers
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| (child_pgnos[i], data))
+        .collect();
+
+    // Write child pages.
+    for (i, (start, end)) in ranges.iter().copied().enumerate() {
+        let child_pgno = child_pgnos[i];
+        let child_off = header_offset_for_page(child_pgno);
+        let page = build_page(
+            &final_cells[start..end],
+            page_type,
+            child_off,
+            usable_size,
+            Some(right_children[i]),
+        );
+        let mut final_page = page;
+        if i == 0 && child_off > 0 {
+            final_page[..child_off].copy_from_slice(page_prefix);
+        }
+        writer.write_page(cx, child_pgno, &final_page)?;
+    }
+
+    Ok((child_pgnos, promoted))
 }
 
 // ---------------------------------------------------------------------------
@@ -1627,7 +1878,8 @@ mod tests {
             .insert(4, build_leaf_table(&[(10, b"j"), (15, b"o"), (20, b"t")]));
 
         // Balance around child 0 (left child), no overflow.
-        balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true).unwrap();
+        let outcome = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true).unwrap();
+        assert!(matches!(outcome, BalanceResult::Done));
 
         // With tiny cells on 4096-byte pages, all 6 cells fit on one page.
         // The parent should have 0 dividers and just a right_child.
@@ -1687,7 +1939,9 @@ mod tests {
 
         let overflow_cells = vec![ov_cell[..pos].to_vec()];
 
-        balance_nonroot(&cx, &mut store, pn(2), 0, &overflow_cells, 2, USABLE, true).unwrap();
+        let outcome =
+            balance_nonroot(&cx, &mut store, pn(2), 0, &overflow_cells, 2, USABLE, true).unwrap();
+        assert!(matches!(outcome, BalanceResult::Done));
 
         // Count total cells across all children.
         let parent_data = store.pages.get(&2).unwrap();

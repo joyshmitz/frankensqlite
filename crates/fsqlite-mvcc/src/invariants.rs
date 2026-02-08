@@ -9,13 +9,13 @@
 //! - [`SerializedWriteMutex`]: Global write mutex for Serialized mode (INV-7).
 
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 
 use fsqlite_types::{
-    CommitSeq, PageNumber, PageSize, PageVersion, Snapshot, TxnId, VersionPointer,
+    CommitSeq, PageNumber, PageNumberBuildHasher, PageSize, PageVersion, Snapshot, TxnId,
+    VersionPointer,
 };
 
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
@@ -134,26 +134,6 @@ pub fn visible(version: &PageVersion, snapshot: &Snapshot) -> bool {
 // VersionStore — version chain management
 // ---------------------------------------------------------------------------
 
-/// Identity hasher for `PageNumber` keys (avoids re-hashing well-distributed u32).
-#[derive(Default)]
-struct PageHasher(u64);
-
-impl Hasher for PageHasher {
-    fn write(&mut self, _: &[u8]) {
-        debug_assert!(false, "PageHasher only supports write_u32");
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.0 = u64::from(n);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-type PageBuildHasher = BuildHasherDefault<PageHasher>;
-
 /// Version chain head table + arena, providing `resolve()` and `resolve_for_txn()`.
 ///
 /// The version store owns all committed page versions in the arena and
@@ -161,7 +141,7 @@ type PageBuildHasher = BuildHasherDefault<PageHasher>;
 pub struct VersionStore {
     arena: RwLock<VersionArena>,
     /// Maps each page to the head of its version chain (most recent committed version).
-    chain_heads: RwLock<HashMap<PageNumber, VersionIdx, PageBuildHasher>>,
+    chain_heads: RwLock<HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>>,
     page_size: PageSize,
 }
 
@@ -171,7 +151,7 @@ impl VersionStore {
     pub fn new(page_size: PageSize) -> Self {
         Self {
             arena: RwLock::new(VersionArena::new()),
-            chain_heads: RwLock::new(HashMap::with_hasher(PageBuildHasher::default())),
+            chain_heads: RwLock::new(HashMap::with_hasher(PageNumberBuildHasher::default())),
             page_size,
         }
     }

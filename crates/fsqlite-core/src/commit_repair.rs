@@ -916,6 +916,496 @@ fn record_event_into(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Group Commit Batching (§5.9.2.1, bd-l4gl)
+// ---------------------------------------------------------------------------
+
+const GROUP_COMMIT_BEAD_ID: &str = "bd-l4gl";
+
+/// Phase label recorded during coordinator batch processing for ordering
+/// verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchPhase {
+    /// Write-set conflict validation for each request.
+    Validate,
+    /// Sequential WAL append for all valid requests.
+    WalAppend,
+    /// Single `fsync` for the entire batch.
+    Fsync,
+    /// Version publication and response delivery.
+    Publish,
+}
+
+/// Response returned to each writer after batch processing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupCommitResponse {
+    /// Commit succeeded; pages are durable and published.
+    Committed { wal_offset: u64, commit_seq: u64 },
+    /// Commit rejected due to write-set conflict.
+    Conflict { reason: String },
+}
+
+/// Result of processing a single batch through the coordinator.
+#[derive(Debug)]
+pub struct BatchResult {
+    /// Successfully committed entries: `(txn_id, wal_offset, commit_seq)`.
+    pub committed: Vec<(u64, u64, u64)>,
+    /// Rejected entries: `(txn_id, reason)`.
+    pub conflicted: Vec<(u64, String)>,
+    /// Number of fsync calls issued for this batch (should always be 0 or 1).
+    pub fsync_count: u32,
+    /// Ordered record of phases executed during batch processing.
+    pub phase_order: Vec<BatchPhase>,
+}
+
+/// Batch WAL writer abstraction for the group commit coordinator.
+///
+/// A single `append_batch` call writes all frames from all valid requests
+/// in one sequential `write()`, and `sync` issues exactly one `fsync`.
+pub trait WalBatchWriter: Send + Sync {
+    /// Append commit frames for every request in the batch. Returns a WAL
+    /// offset per request.
+    fn append_batch(&self, requests: &[&CommitRequest]) -> Result<Vec<u64>>;
+
+    /// Issue a single `fsync` (or `fdatasync`) covering all appended frames.
+    fn sync(&self) -> Result<()>;
+}
+
+/// Write-set conflict validator using first-committer-wins (FCW) logic.
+///
+/// `committed_pages` is the set of pages that have been committed since
+/// the validating transaction's snapshot.
+pub trait WriteSetValidator: Send + Sync {
+    /// Returns `Ok(())` if the request passes validation, or `Err` with
+    /// a human-readable conflict description.
+    fn validate(
+        &self,
+        request: &CommitRequest,
+        committed_pages: &BTreeSet<u32>,
+    ) -> std::result::Result<(), String>;
+}
+
+/// First-committer-wins validator: any overlap between the request's
+/// write set and already-committed pages is a conflict.
+#[derive(Debug, Default)]
+pub struct FirstCommitterWinsValidator;
+
+impl WriteSetValidator for FirstCommitterWinsValidator {
+    fn validate(
+        &self,
+        request: &CommitRequest,
+        committed_pages: &BTreeSet<u32>,
+    ) -> std::result::Result<(), String> {
+        for &page in &request.write_set_pages {
+            if committed_pages.contains(&page) {
+                return Err(format!(
+                    "write-set conflict on page {page} for txn {}",
+                    request.txn_id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// In-memory WAL writer for deterministic testing and instrumentation.
+#[derive(Debug)]
+pub struct InMemoryWalWriter {
+    next_offset: AtomicU64,
+    sync_count: AtomicU64,
+    total_appended: AtomicU64,
+    /// Simulated fsync latency for throughput model tests.
+    fsync_delay: Duration,
+}
+
+impl InMemoryWalWriter {
+    /// Create an in-memory WAL writer with no simulated fsync delay.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            next_offset: AtomicU64::new(1),
+            sync_count: AtomicU64::new(0),
+            total_appended: AtomicU64::new(0),
+            fsync_delay: Duration::ZERO,
+        }
+    }
+
+    /// Create with simulated fsync delay for throughput model testing.
+    #[must_use]
+    pub fn with_fsync_delay(delay: Duration) -> Self {
+        Self {
+            next_offset: AtomicU64::new(1),
+            sync_count: AtomicU64::new(0),
+            total_appended: AtomicU64::new(0),
+            fsync_delay: delay,
+        }
+    }
+
+    /// Total number of `sync()` calls observed.
+    #[must_use]
+    pub fn sync_count(&self) -> u64 {
+        self.sync_count.load(Ordering::Acquire)
+    }
+
+    /// Total requests appended across all batches.
+    #[must_use]
+    pub fn total_appended(&self) -> u64 {
+        self.total_appended.load(Ordering::Acquire)
+    }
+}
+
+impl Default for InMemoryWalWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WalBatchWriter for InMemoryWalWriter {
+    fn append_batch(&self, requests: &[&CommitRequest]) -> Result<Vec<u64>> {
+        let mut offsets = Vec::with_capacity(requests.len());
+        for _req in requests {
+            let offset = self.next_offset.fetch_add(1, Ordering::Relaxed);
+            offsets.push(offset);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        self.total_appended
+            .fetch_add(requests.len() as u64, Ordering::Release);
+        Ok(offsets)
+    }
+
+    fn sync(&self) -> Result<()> {
+        if self.fsync_delay != Duration::ZERO {
+            thread::sleep(self.fsync_delay);
+        }
+        self.sync_count.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+}
+
+/// Group commit coordinator configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupCommitConfig {
+    /// Maximum requests coalesced into a single batch.
+    pub max_batch_size: usize,
+    /// Timeout for draining additional requests after the first.
+    pub drain_timeout: Duration,
+}
+
+impl Default for GroupCommitConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_size: DEFAULT_COMMIT_CHANNEL_CAPACITY,
+            drain_timeout: Duration::from_micros(100),
+        }
+    }
+}
+
+/// Published version notification for a committed transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedVersion {
+    pub txn_id: u64,
+    pub commit_seq: u64,
+    pub wal_offset: u64,
+}
+
+/// Group commit coordinator that batches write-coordinator requests to
+/// amortize `fsync` cost (§5.9.2.1, bd-l4gl).
+///
+/// The coordinator processes requests from the bounded two-phase MPSC
+/// channel in 4 strict phases per batch:
+///
+/// 1. **Validate** — first-committer-wins conflict check
+/// 2. **WAL append** — single sequential `write()` for all valid frames
+/// 3. **Fsync** — exactly ONE `fsync()` per batch
+/// 4. **Publish** — make versions visible and deliver responses
+pub struct GroupCommitCoordinator<W: WalBatchWriter, V: WriteSetValidator> {
+    wal: Arc<W>,
+    validator: Arc<V>,
+    config: GroupCommitConfig,
+    next_commit_seq: AtomicU64,
+    committed_pages: Mutex<BTreeSet<u32>>,
+    published: Mutex<Vec<PublishedVersion>>,
+    batch_history: Mutex<Vec<BatchResult>>,
+    total_batches: AtomicU64,
+}
+
+impl<W, V> GroupCommitCoordinator<W, V>
+where
+    W: WalBatchWriter + 'static,
+    V: WriteSetValidator + 'static,
+{
+    /// Create a new group commit coordinator.
+    #[must_use]
+    pub fn new(wal: W, validator: V, config: GroupCommitConfig) -> Self {
+        Self {
+            wal: Arc::new(wal),
+            validator: Arc::new(validator),
+            config,
+            next_commit_seq: AtomicU64::new(1),
+            committed_pages: Mutex::new(BTreeSet::new()),
+            published: Mutex::new(Vec::new()),
+            batch_history: Mutex::new(Vec::new()),
+            total_batches: AtomicU64::new(0),
+        }
+    }
+
+    /// Process a single batch of requests through the 4-phase pipeline.
+    ///
+    /// Returns individual responses and batch-level metrics. Phase ordering
+    /// is recorded in `BatchResult::phase_order` for verification.
+    #[allow(clippy::too_many_lines)]
+    pub fn process_batch(
+        &self,
+        requests: Vec<CommitRequest>,
+    ) -> Result<(Vec<(CommitRequest, GroupCommitResponse)>, BatchResult)> {
+        if requests.is_empty() {
+            return Ok((
+                Vec::new(),
+                BatchResult {
+                    committed: Vec::new(),
+                    conflicted: Vec::new(),
+                    fsync_count: 0,
+                    phase_order: Vec::new(),
+                },
+            ));
+        }
+
+        let batch_size = requests.len();
+        debug!(
+            bead_id = GROUP_COMMIT_BEAD_ID,
+            batch_size, "processing group commit batch"
+        );
+
+        let mut phase_order = Vec::with_capacity(4);
+        let mut responses: Vec<(CommitRequest, GroupCommitResponse)> =
+            Vec::with_capacity(batch_size);
+        let mut valid_requests: Vec<CommitRequest> = Vec::with_capacity(batch_size);
+        let mut conflicted: Vec<(u64, String)> = Vec::new();
+
+        // ---- Phase 1: Validate ----
+        phase_order.push(BatchPhase::Validate);
+        let committed_snapshot =
+            lock_with_recovery(&self.committed_pages, "committed_pages").clone();
+        // Within a batch, earlier requests (by position) win over later ones
+        // when their write sets overlap.
+        let mut batch_pages = BTreeSet::new();
+        for req in requests {
+            // Check against globally committed pages
+            let mut global_merged = committed_snapshot.clone();
+            for &p in &batch_pages {
+                global_merged.insert(p);
+            }
+            match self.validator.validate(&req, &global_merged) {
+                Ok(()) => {
+                    for &page in &req.write_set_pages {
+                        batch_pages.insert(page);
+                    }
+                    valid_requests.push(req);
+                }
+                Err(reason) => {
+                    info!(
+                        bead_id = GROUP_COMMIT_BEAD_ID,
+                        txn_id = req.txn_id,
+                        reason = %reason,
+                        "conflict detected in validate phase (fail-fast)"
+                    );
+                    conflicted.push((req.txn_id, reason.clone()));
+                    responses.push((req, GroupCommitResponse::Conflict { reason }));
+                }
+            }
+        }
+
+        if valid_requests.is_empty() {
+            let result = BatchResult {
+                committed: Vec::new(),
+                conflicted,
+                fsync_count: 0,
+                phase_order,
+            };
+            lock_with_recovery(&self.batch_history, "batch_history").push(BatchResult {
+                committed: Vec::new(),
+                conflicted: result.conflicted.clone(),
+                fsync_count: 0,
+                phase_order: result.phase_order.clone(),
+            });
+            self.total_batches.fetch_add(1, Ordering::Relaxed);
+            return Ok((responses, result));
+        }
+
+        // ---- Phase 2: WAL append ----
+        phase_order.push(BatchPhase::WalAppend);
+        let refs: Vec<&CommitRequest> = valid_requests.iter().collect();
+        let wal_offsets = self.wal.append_batch(&refs)?;
+
+        // ---- Phase 3: Fsync ----
+        phase_order.push(BatchPhase::Fsync);
+        self.wal.sync()?;
+        let fsync_count = 1;
+
+        // ---- Phase 4: Publish ----
+        phase_order.push(BatchPhase::Publish);
+        let mut committed_entries: Vec<(u64, u64, u64)> = Vec::with_capacity(valid_requests.len());
+        let mut committed_guard = lock_with_recovery(&self.committed_pages, "committed_pages");
+        let mut published_guard = lock_with_recovery(&self.published, "published_versions");
+        for (req, &wal_offset) in valid_requests.iter().zip(wal_offsets.iter()) {
+            let commit_seq = self.next_commit_seq.fetch_add(1, Ordering::Relaxed);
+            for &page in &req.write_set_pages {
+                committed_guard.insert(page);
+            }
+            published_guard.push(PublishedVersion {
+                txn_id: req.txn_id,
+                commit_seq,
+                wal_offset,
+            });
+            committed_entries.push((req.txn_id, wal_offset, commit_seq));
+            info!(
+                bead_id = GROUP_COMMIT_BEAD_ID,
+                txn_id = req.txn_id,
+                commit_seq,
+                wal_offset,
+                "version published after fsync"
+            );
+        }
+        drop(committed_guard);
+        drop(published_guard);
+
+        for (req, &wal_offset) in valid_requests.into_iter().zip(wal_offsets.iter()) {
+            let commit_seq = committed_entries
+                .iter()
+                .find(|(tid, _, _)| *tid == req.txn_id)
+                .map_or(0, |entry| entry.2);
+            responses.push((
+                req,
+                GroupCommitResponse::Committed {
+                    wal_offset,
+                    commit_seq,
+                },
+            ));
+        }
+
+        let result = BatchResult {
+            committed: committed_entries,
+            conflicted,
+            fsync_count,
+            phase_order,
+        };
+
+        lock_with_recovery(&self.batch_history, "batch_history").push(BatchResult {
+            committed: result.committed.clone(),
+            conflicted: result.conflicted.clone(),
+            fsync_count: result.fsync_count,
+            phase_order: result.phase_order.clone(),
+        });
+        self.total_batches.fetch_add(1, Ordering::Relaxed);
+
+        debug!(
+            bead_id = GROUP_COMMIT_BEAD_ID,
+            batch_size,
+            committed = result.committed.len(),
+            conflicted = result.conflicted.len(),
+            "batch processing complete"
+        );
+
+        Ok((responses, result))
+    }
+
+    /// Drain requests from the receiver and process them as a batch.
+    ///
+    /// Blocks waiting for the first request, then non-blocking drains up
+    /// to `max_batch_size`. Returns `None` if the receiver times out on
+    /// the first request (channel idle).
+    pub fn drain_and_process(
+        &self,
+        receiver: &TwoPhaseCommitReceiver,
+    ) -> Result<Option<BatchResult>> {
+        // Blocking wait for first request
+        let Some(first) = receiver.try_recv_for(Duration::from_secs(1)) else {
+            return Ok(None);
+        };
+
+        let mut batch = Vec::with_capacity(self.config.max_batch_size);
+        batch.push(first);
+
+        // Non-blocking drain for additional requests
+        while batch.len() < self.config.max_batch_size {
+            match receiver.try_recv_for(self.config.drain_timeout) {
+                Some(req) => batch.push(req),
+                None => break,
+            }
+        }
+
+        let (_responses, result) = self.process_batch(batch)?;
+        Ok(Some(result))
+    }
+
+    /// Run the coordinator loop, processing batches until `shutdown` is set.
+    ///
+    /// This is the production entry point. The loop blocks on the first
+    /// request of each batch, drains additional requests, and processes
+    /// the batch through all 4 phases.
+    pub fn run_loop(&self, receiver: &TwoPhaseCommitReceiver, shutdown: &AtomicBool) -> Result<()> {
+        info!(
+            bead_id = GROUP_COMMIT_BEAD_ID,
+            max_batch_size = self.config.max_batch_size,
+            "group commit coordinator loop started"
+        );
+        while !shutdown.load(Ordering::Acquire) {
+            if let Some(result) = self.drain_and_process(receiver)? {
+                debug!(
+                    bead_id = GROUP_COMMIT_BEAD_ID,
+                    committed = result.committed.len(),
+                    conflicted = result.conflicted.len(),
+                    "batch cycle completed"
+                );
+            }
+        }
+        info!(
+            bead_id = GROUP_COMMIT_BEAD_ID,
+            total_batches = self.total_batches.load(Ordering::Relaxed),
+            "group commit coordinator loop shut down"
+        );
+        Ok(())
+    }
+
+    /// Total batches processed so far.
+    #[must_use]
+    pub fn total_batches(&self) -> u64 {
+        self.total_batches.load(Ordering::Acquire)
+    }
+
+    /// All published versions for inspection/testing.
+    #[must_use]
+    pub fn published_versions(&self) -> Vec<PublishedVersion> {
+        lock_with_recovery(&self.published, "published_versions").clone()
+    }
+
+    /// Batch results for phase ordering verification.
+    #[must_use]
+    pub fn batch_history(&self) -> Vec<BatchResult> {
+        // Return summary without cloning internal Vecs fully
+        lock_with_recovery(&self.batch_history, "batch_history")
+            .iter()
+            .map(|b| BatchResult {
+                committed: b.committed.clone(),
+                conflicted: b.conflicted.clone(),
+                fsync_count: b.fsync_count,
+                phase_order: b.phase_order.clone(),
+            })
+            .collect()
+    }
+
+    /// Reference to the WAL writer for instrumentation.
+    #[must_use]
+    pub fn wal_handle(&self) -> Arc<W> {
+        Arc::clone(&self.wal)
+    }
+
+    /// Reset committed pages (useful for test isolation).
+    pub fn reset_committed_pages(&self) {
+        lock_with_recovery(&self.committed_pages, "committed_pages").clear();
+    }
+}
+
 #[cfg(test)]
 mod two_phase_pipeline_tests {
     use super::*;
@@ -1108,5 +1598,393 @@ mod two_phase_pipeline_tests {
         let burst_capacity = little_law_capacity(37_000.0, Duration::from_micros(40), 4.0, 2.5);
         assert_eq!(burst_capacity, 15);
         assert_eq!(DEFAULT_COMMIT_CHANNEL_CAPACITY, 16);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
+mod group_commit_tests {
+    use super::*;
+
+    fn req(txn_id: u64, pages: &[u32]) -> CommitRequest {
+        CommitRequest::new(txn_id, pages.to_vec(), vec![0xAB])
+    }
+
+    fn make_coordinator(
+        max_batch: usize,
+    ) -> GroupCommitCoordinator<InMemoryWalWriter, FirstCommitterWinsValidator> {
+        GroupCommitCoordinator::new(
+            InMemoryWalWriter::new(),
+            FirstCommitterWinsValidator,
+            GroupCommitConfig {
+                max_batch_size: max_batch,
+                ..GroupCommitConfig::default()
+            },
+        )
+    }
+
+    fn make_coordinator_with_delay(
+        max_batch: usize,
+        fsync_delay: Duration,
+    ) -> GroupCommitCoordinator<InMemoryWalWriter, FirstCommitterWinsValidator> {
+        GroupCommitCoordinator::new(
+            InMemoryWalWriter::with_fsync_delay(fsync_delay),
+            FirstCommitterWinsValidator,
+            GroupCommitConfig {
+                max_batch_size: max_batch,
+                ..GroupCommitConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn test_group_commit_single_request_no_batching() {
+        let coord = make_coordinator(16);
+        let batch = vec![req(1, &[10, 20])];
+        let (responses, result) = coord.process_batch(batch).expect("batch should succeed");
+
+        assert_eq!(result.committed.len(), 1);
+        assert_eq!(result.conflicted.len(), 0);
+        assert_eq!(
+            result.fsync_count, 1,
+            "exactly one fsync for single request"
+        );
+        assert_eq!(responses.len(), 1);
+        assert!(matches!(
+            &responses[0].1,
+            GroupCommitResponse::Committed { .. }
+        ));
+        assert_eq!(coord.wal_handle().sync_count(), 1);
+    }
+
+    #[test]
+    fn test_group_commit_batch_of_10_single_fsync() {
+        let coord = make_coordinator(16);
+        let batch: Vec<CommitRequest> = (1..=10)
+            .map(|txn_id| req(txn_id, &[txn_id as u32 * 100]))
+            .collect();
+
+        let (responses, result) = coord.process_batch(batch).expect("batch should succeed");
+
+        assert_eq!(result.committed.len(), 10, "all 10 should commit");
+        assert_eq!(result.conflicted.len(), 0);
+        assert_eq!(result.fsync_count, 1, "exactly ONE fsync for 10 requests");
+        assert_eq!(responses.len(), 10);
+
+        // All should have distinct wal_offsets
+        let offsets: BTreeSet<u64> = responses
+            .iter()
+            .filter_map(|(_, resp)| match resp {
+                GroupCommitResponse::Committed { wal_offset, .. } => Some(*wal_offset),
+                GroupCommitResponse::Conflict { .. } => None,
+            })
+            .collect();
+        assert_eq!(offsets.len(), 10, "all 10 should have distinct WAL offsets");
+
+        // Verify instrumented fsync count
+        assert_eq!(coord.wal_handle().sync_count(), 1);
+        assert_eq!(coord.wal_handle().total_appended(), 10);
+    }
+
+    #[test]
+    fn test_group_commit_conflict_in_batch_partial_success() {
+        let coord = make_coordinator(16);
+        // Request 1 writes pages [10, 20]
+        // Request 2 writes pages [30, 40] (no conflict)
+        // Request 3 writes pages [10, 50] (conflicts with request 1 on page 10)
+        // Request 4 writes pages [60] (no conflict)
+        // Request 5 writes pages [30] (conflicts with request 2 on page 30)
+        let batch = vec![
+            req(1, &[10, 20]),
+            req(2, &[30, 40]),
+            req(3, &[10, 50]),
+            req(4, &[60]),
+            req(5, &[30]),
+        ];
+
+        let (responses, result) = coord.process_batch(batch).expect("batch should succeed");
+
+        assert_eq!(result.committed.len(), 3, "requests 1, 2, 4 should commit");
+        assert_eq!(
+            result.conflicted.len(),
+            2,
+            "requests 3 and 5 should conflict"
+        );
+        assert_eq!(result.fsync_count, 1, "one fsync for valid subset");
+
+        // Verify specific responses
+        let committed_txns: BTreeSet<u64> =
+            result.committed.iter().map(|(tid, _, _)| *tid).collect();
+        assert!(committed_txns.contains(&1));
+        assert!(committed_txns.contains(&2));
+        assert!(committed_txns.contains(&4));
+
+        let conflicted_txns: BTreeSet<u64> =
+            result.conflicted.iter().map(|(tid, _)| *tid).collect();
+        assert!(conflicted_txns.contains(&3));
+        assert!(conflicted_txns.contains(&5));
+
+        assert_eq!(responses.len(), 5);
+    }
+
+    #[test]
+    fn test_group_commit_max_batch_size_respected() {
+        let coord = make_coordinator(4);
+        let (sender, receiver) = two_phase_commit_channel(16);
+
+        // Submit 10 requests
+        for txn_id in 1..=10_u64 {
+            let permit = sender.reserve();
+            permit.send(req(txn_id, &[txn_id as u32 * 100]));
+        }
+
+        // Process batches — each should have at most 4
+        let mut total_committed = 0_usize;
+        let mut total_batches = 0_u32;
+        while total_committed < 10 {
+            if let Some(result) = coord
+                .drain_and_process(&receiver)
+                .expect("drain should succeed")
+            {
+                assert!(
+                    result.committed.len() <= 4,
+                    "batch size must not exceed MAX_BATCH_SIZE=4, got {}",
+                    result.committed.len()
+                );
+                total_committed += result.committed.len();
+                total_batches += 1;
+            }
+        }
+        assert!(
+            total_batches >= 3,
+            "10 requests with max_batch=4 needs at least 3 batches, got {total_batches}"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_backpressure_channel_full() {
+        let coord = make_coordinator(16);
+        let (sender, receiver) = two_phase_commit_channel(2);
+
+        // Fill the channel
+        let permit1 = sender.reserve();
+        permit1.send(req(1, &[10]));
+        let permit2 = sender.reserve();
+        permit2.send(req(2, &[20]));
+
+        // Spawn threads to submit more (will block due to capacity=2)
+        let blocked_handle = thread::spawn(move || {
+            for txn_id in 3..=5_u64 {
+                let permit = sender.reserve();
+                permit.send(req(txn_id, &[txn_id as u32 * 100]));
+            }
+        });
+
+        // Process first batch to free capacity
+        let result = coord
+            .drain_and_process(&receiver)
+            .expect("drain should succeed")
+            .expect("should have received requests");
+        assert!(
+            !result.committed.is_empty(),
+            "first batch should have committed some"
+        );
+
+        // Allow blocked threads to proceed
+        thread::sleep(Duration::from_millis(50));
+
+        // Process remaining
+        let mut total = result.committed.len();
+        while total < 5 {
+            if let Some(r) = coord
+                .drain_and_process(&receiver)
+                .expect("drain should succeed")
+            {
+                total += r.committed.len();
+            }
+        }
+        assert_eq!(total, 5, "all 5 requests should eventually succeed");
+        blocked_handle.join().expect("blocked thread should finish");
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_group_commit_throughput_model_2_8x() {
+        // Simulate fsync cost of 50us
+        let fsync_delay = Duration::from_micros(50);
+
+        // Sequential: 10 requests, each with its own fsync
+        let sequential_start = Instant::now();
+        for txn_id in 1..=10_u64 {
+            let coord = make_coordinator_with_delay(1, fsync_delay);
+            let batch = vec![req(txn_id, &[txn_id as u32])];
+            let _ = coord.process_batch(batch).expect("should succeed");
+        }
+        let sequential_elapsed = sequential_start.elapsed();
+
+        // Batched: 10 requests in one batch, single fsync
+        let batched_start = Instant::now();
+        let coord_batched = make_coordinator_with_delay(16, fsync_delay);
+        let batch: Vec<CommitRequest> =
+            (1..=10).map(|tid| req(tid, &[tid as u32 + 1000])).collect();
+        let _ = coord_batched.process_batch(batch).expect("should succeed");
+        let batched_elapsed = batched_start.elapsed();
+
+        // Batched should be significantly faster
+        let speedup = sequential_elapsed.as_secs_f64() / batched_elapsed.as_secs_f64();
+        assert!(
+            speedup > 2.0,
+            "expected >2x speedup from batching, got {speedup:.2}x \
+             (seq={sequential_elapsed:?}, batch={batched_elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn test_group_commit_publish_after_fsync_ordering() {
+        let coord = make_coordinator(16);
+        let batch = vec![req(1, &[10]), req(2, &[20]), req(3, &[30])];
+        let (_, result) = coord.process_batch(batch).expect("batch should succeed");
+
+        // Verify strict phase ordering: Validate -> WalAppend -> Fsync -> Publish
+        assert_eq!(
+            result.phase_order,
+            vec![
+                BatchPhase::Validate,
+                BatchPhase::WalAppend,
+                BatchPhase::Fsync,
+                BatchPhase::Publish,
+            ],
+            "phases must execute in strict order"
+        );
+
+        // Published versions should exist only after the batch (which includes fsync)
+        let published = coord.published_versions();
+        assert_eq!(published.len(), 3, "all 3 versions should be published");
+    }
+
+    #[test]
+    fn test_group_commit_validate_phase_rejects_before_wal_append() {
+        let coord = make_coordinator(16);
+
+        // First batch: commit page 10
+        let _ = coord
+            .process_batch(vec![req(1, &[10])])
+            .expect("first batch should succeed");
+
+        // Second batch: request 2 conflicts on page 10, request 3 is clean
+        let batch2 = vec![req(2, &[10, 20]), req(3, &[30])];
+        let (_, result) = coord
+            .process_batch(batch2)
+            .expect("second batch should succeed");
+
+        // Request 2 should be rejected, request 3 committed
+        assert_eq!(result.committed.len(), 1);
+        assert_eq!(result.conflicted.len(), 1);
+        assert_eq!(result.conflicted[0].0, 2, "txn 2 should be conflicted");
+        assert_eq!(result.committed[0].0, 3, "txn 3 should be committed");
+
+        // Phase order shows Validate happened (rejects happen there, before WAL)
+        assert_eq!(result.phase_order[0], BatchPhase::Validate);
+        assert_eq!(result.phase_order[1], BatchPhase::WalAppend);
+
+        // WAL should only have appended request 3 (not the conflicted one)
+        // Total appended: 1 from first batch + 1 from second batch = 2
+        assert_eq!(coord.wal_handle().total_appended(), 2);
+    }
+
+    #[test]
+    fn test_group_commit_empty_batch() {
+        let coord = make_coordinator(16);
+        let (_, result) = coord
+            .process_batch(Vec::new())
+            .expect("empty batch should succeed");
+        assert!(result.committed.is_empty());
+        assert!(result.conflicted.is_empty());
+        assert_eq!(result.fsync_count, 0, "no fsync for empty batch");
+        assert!(result.phase_order.is_empty());
+    }
+
+    #[test]
+    fn test_group_commit_all_conflict_no_fsync() {
+        let coord = make_coordinator(16);
+
+        // First batch: commit pages 10, 20
+        let _ = coord
+            .process_batch(vec![req(1, &[10, 20])])
+            .expect("first batch should succeed");
+
+        // Second batch: all requests conflict
+        let batch = vec![req(2, &[10]), req(3, &[20])];
+        let (_, result) = coord.process_batch(batch).expect("should succeed");
+
+        assert_eq!(result.committed.len(), 0);
+        assert_eq!(result.conflicted.len(), 2);
+        assert_eq!(
+            result.fsync_count, 0,
+            "no fsync needed when all requests conflict"
+        );
+        // Only Validate phase should have executed
+        assert_eq!(result.phase_order, vec![BatchPhase::Validate]);
+    }
+
+    #[test]
+    fn test_group_commit_run_loop_shutdown() {
+        let coord = Arc::new(make_coordinator(16));
+        let (sender, receiver) = two_phase_commit_channel(16);
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Send some requests
+        for txn_id in 1..=3_u64 {
+            let permit = sender.reserve();
+            permit.send(req(txn_id, &[txn_id as u32 * 100]));
+        }
+
+        let shutdown_clone = Arc::clone(&shutdown);
+        let coord_clone = Arc::clone(&coord);
+        let handle = thread::spawn(move || coord_clone.run_loop(&receiver, &shutdown_clone));
+
+        // Let the loop process
+        thread::sleep(Duration::from_millis(200));
+        shutdown.store(true, Ordering::Release);
+
+        handle
+            .join()
+            .expect("loop thread should join")
+            .expect("loop should succeed");
+
+        assert!(
+            coord.total_batches() >= 1,
+            "should have processed at least one batch"
+        );
+        let published = coord.published_versions();
+        assert_eq!(published.len(), 3, "all 3 should be published");
+    }
+
+    #[test]
+    fn test_first_committer_wins_validator() {
+        let validator = FirstCommitterWinsValidator;
+        let committed: BTreeSet<u32> = [10, 20, 30].into_iter().collect();
+
+        // No overlap — passes
+        assert!(validator.validate(&req(1, &[40, 50]), &committed).is_ok());
+
+        // Overlap on page 10 — fails
+        let result = validator.validate(&req(2, &[10, 50]), &committed);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("page 10"));
+    }
+
+    #[test]
+    fn test_in_memory_wal_writer_basic() {
+        let wal = InMemoryWalWriter::new();
+        let r1 = req(1, &[10]);
+        let r2 = req(2, &[20]);
+        let offsets = wal.append_batch(&[&r1, &r2]).expect("append should work");
+        assert_eq!(offsets.len(), 2);
+        assert_ne!(offsets[0], offsets[1], "offsets must be distinct");
+        assert_eq!(wal.total_appended(), 2);
+        assert_eq!(wal.sync_count(), 0);
+        wal.sync().expect("sync should work");
+        assert_eq!(wal.sync_count(), 1);
     }
 }

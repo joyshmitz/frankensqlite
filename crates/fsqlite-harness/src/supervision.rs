@@ -83,20 +83,28 @@ impl FsqliteService {
     pub fn err_strategy(self) -> SupervisionStrategy {
         match self {
             Self::WriteCoordinator => SupervisionStrategy::Escalate,
-            Self::SymbolStore => SupervisionStrategy::Restart(RestartConfig::new(3, Duration::from_secs(60))
-                .with_backoff(BackoffStrategy::Exponential {
-                    initial: Duration::from_millis(100),
-                    max: Duration::from_secs(10),
-                    multiplier: 2.0,
-                })),
-            Self::Replicator => SupervisionStrategy::Restart(RestartConfig::new(5, Duration::from_secs(120))
-                .with_backoff(BackoffStrategy::Exponential {
-                    initial: Duration::from_millis(500),
-                    max: Duration::from_secs(30),
-                    multiplier: 2.0,
-                })),
-            Self::CheckpointerGc => SupervisionStrategy::Restart(RestartConfig::new(3, Duration::from_secs(60))
-                .with_backoff(BackoffStrategy::Fixed(Duration::from_secs(1)))),
+            Self::SymbolStore => SupervisionStrategy::Restart(
+                RestartConfig::new(3, Duration::from_secs(60)).with_backoff(
+                    BackoffStrategy::Exponential {
+                        initial: Duration::from_millis(100),
+                        max: Duration::from_secs(10),
+                        multiplier: 2.0,
+                    },
+                ),
+            ),
+            Self::Replicator => SupervisionStrategy::Restart(
+                RestartConfig::new(5, Duration::from_secs(120)).with_backoff(
+                    BackoffStrategy::Exponential {
+                        initial: Duration::from_millis(500),
+                        max: Duration::from_secs(30),
+                        multiplier: 2.0,
+                    },
+                ),
+            ),
+            Self::CheckpointerGc => SupervisionStrategy::Restart(
+                RestartConfig::new(3, Duration::from_secs(60))
+                    .with_backoff(BackoffStrategy::Fixed(Duration::from_secs(1))),
+            ),
             Self::IntegritySweeper => SupervisionStrategy::Stop,
         }
     }
@@ -509,6 +517,12 @@ impl<S: SupervisedService> Supervised<S> {
     }
 }
 
+impl<S: SupervisedService> Default for Supervised<S> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DbRootSupervisor (bd-27nu)
 // ---------------------------------------------------------------------------
@@ -567,18 +581,13 @@ impl DbRootSupervisor {
             FsqliteService::WriteCoordinator => {
                 Some(self.write_coordinator.on_outcome(outcome, now))
             }
-            FsqliteService::SymbolStore => {
-                Some(self.symbol_store.on_outcome(outcome, now))
-            }
-            FsqliteService::Replicator => {
-                Some(self.replicator.on_outcome(outcome, now))
-            }
-            FsqliteService::CheckpointerGc => {
-                Some(self.checkpointer_gc.on_outcome(outcome, now))
-            }
-            FsqliteService::IntegritySweeper => {
-                self.integrity_sweeper.as_mut().map(|s| s.on_outcome(outcome, now))
-            }
+            FsqliteService::SymbolStore => Some(self.symbol_store.on_outcome(outcome, now)),
+            FsqliteService::Replicator => Some(self.replicator.on_outcome(outcome, now)),
+            FsqliteService::CheckpointerGc => Some(self.checkpointer_gc.on_outcome(outcome, now)),
+            FsqliteService::IntegritySweeper => self
+                .integrity_sweeper
+                .as_mut()
+                .map(|s| s.on_outcome(outcome, now)),
         }
     }
 
@@ -597,6 +606,12 @@ impl DbRootSupervisor {
     }
 }
 
+impl Default for DbRootSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ===========================================================================
 // Tests (§4.14-4.15 unit test requirements)
 // ===========================================================================
@@ -610,12 +625,13 @@ mod tests {
     const TEST_BEAD_ID: &str = "bd-3go.10";
 
     fn make_restart_config(max_restarts: u32, window_secs: u64) -> RestartConfig {
-        RestartConfig::new(max_restarts, Duration::from_secs(window_secs))
-            .with_backoff(BackoffStrategy::Exponential {
+        RestartConfig::new(max_restarts, Duration::from_secs(window_secs)).with_backoff(
+            BackoffStrategy::Exponential {
                 initial: Duration::from_millis(100),
                 max: Duration::from_secs(10),
                 multiplier: 2.0,
-            })
+            },
+        )
     }
 
     // -- 1. test_supervision_panicked_never_restarted --
@@ -630,7 +646,10 @@ mod tests {
             let action = decide_action(service, &TaskOutcome::Panicked, &history, 0);
 
             assert!(
-                matches!(action, SupervisionAction::Stop | SupervisionAction::Escalate),
+                matches!(
+                    action,
+                    SupervisionAction::Stop | SupervisionAction::Escalate
+                ),
                 "bead_id={TEST_BEAD_ID} service={}: panicked outcome must be Stop or Escalate, \
                  got {action:?}",
                 service.name()
@@ -819,8 +838,8 @@ mod tests {
     fn test_bracket_cleanup_under_cancellation() {
         // Verify bracket pattern: resource cleanup still executes when cancelled.
         // We simulate this synchronously: acquire → use (simulate cancel) → verify release.
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let acquired = Arc::new(AtomicBool::new(false));
         let released = Arc::new(AtomicBool::new(false));
@@ -962,10 +981,7 @@ mod tests {
         let config = make_restart_config(10, 300);
         let history = RestartHistory::new(config);
 
-        for outcome in [
-            TaskOutcome::Err("any error".into()),
-            TaskOutcome::Panicked,
-        ] {
+        for outcome in [TaskOutcome::Err("any error".into()), TaskOutcome::Panicked] {
             let action = decide_action(FsqliteService::WriteCoordinator, &outcome, &history, 0);
             assert_eq!(
                 action,
@@ -1137,8 +1153,14 @@ mod tests {
 
     #[test]
     fn test_service_display() {
-        assert_eq!(FsqliteService::WriteCoordinator.to_string(), "WriteCoordinator");
-        assert_eq!(FsqliteService::IntegritySweeper.to_string(), "IntegritySweeper");
+        assert_eq!(
+            FsqliteService::WriteCoordinator.to_string(),
+            "WriteCoordinator"
+        );
+        assert_eq!(
+            FsqliteService::IntegritySweeper.to_string(),
+            "IntegritySweeper"
+        );
     }
 
     // -- Ok outcome produces no action --
@@ -1174,12 +1196,13 @@ mod tests {
     fn test_transient_err_restarts_within_budget_bd27nu() {
         // max_restarts=3, window=10s. 3 transient errors restart.
         // 4th within window → escalate (budget exhausted).
-        let config = RestartConfig::new(3, Duration::from_secs(10))
-            .with_backoff(BackoffStrategy::Exponential {
+        let config = RestartConfig::new(3, Duration::from_secs(10)).with_backoff(
+            BackoffStrategy::Exponential {
                 initial: Duration::from_millis(100),
                 max: Duration::from_secs(5),
                 multiplier: 2.0,
-            });
+            },
+        );
         let mut history = RestartHistory::new(config);
 
         // First 3 errors within window → restart.
@@ -1223,7 +1246,8 @@ mod tests {
             .with_backoff(BackoffStrategy::Fixed(Duration::from_millis(100)));
         let mut history = RestartHistory::new(config);
 
-        let window_nanos = window.as_nanos() as u64;
+        let window_nanos = u64::try_from(window.as_nanos())
+            .expect("window.as_nanos() must fit in u64 for this test");
 
         // 2 restarts at t=0 and t=1.
         history.record_restart(0);
@@ -1258,22 +1282,23 @@ mod tests {
     #[test]
     fn test_exponential_backoff_timing() {
         // base=100ms, max=5s, multiplier=2.0. Verify doubling up to cap.
-        let config = RestartConfig::new(10, Duration::from_secs(300))
-            .with_backoff(BackoffStrategy::Exponential {
+        let config = RestartConfig::new(10, Duration::from_secs(300)).with_backoff(
+            BackoffStrategy::Exponential {
                 initial: Duration::from_millis(100),
                 max: Duration::from_secs(5),
                 multiplier: 2.0,
-            });
+            },
+        );
         let mut history = RestartHistory::new(config);
 
-        let expected_ms = [100, 200, 400, 800, 1600, 3200, 5000, 5000];
+        let expected_ms: [u128; 8] = [100, 200, 400, 800, 1600, 3200, 5000, 5000];
 
         for (i, &expected) in expected_ms.iter().enumerate() {
             let delay = history.next_delay(i as u64);
             if let Some(d) = delay {
                 let actual_ms = d.as_millis();
                 assert_eq!(
-                    actual_ms, expected as u128,
+                    actual_ms, expected,
                     "bead_id={TEST_BEAD_ID} attempt {i}: expected {expected}ms, got {actual_ms}ms"
                 );
             }
@@ -1320,11 +1345,17 @@ mod tests {
     #[test]
     fn test_transient_or_permanent_classify() {
         let t = TransientOrPermanent::classify("io error: connection reset");
-        assert!(t.is_transient(), "bead_id={TEST_BEAD_ID} should be transient");
+        assert!(
+            t.is_transient(),
+            "bead_id={TEST_BEAD_ID} should be transient"
+        );
         assert_eq!(t.message(), "io error: connection reset");
 
         let p = TransientOrPermanent::classify("integrity check failed");
-        assert!(!p.is_transient(), "bead_id={TEST_BEAD_ID} should be permanent");
+        assert!(
+            !p.is_transient(),
+            "bead_id={TEST_BEAD_ID} should be permanent"
+        );
     }
 
     // -- Supervised<S> wrapper --
@@ -1431,12 +1462,13 @@ mod tests {
         // Run DbRootSupervisor with Replicator. Inject transient errors
         // repeatedly. Verify restart budget + backoff enforced, escalation
         // on budget exhaustion.
-        let repl_config = RestartConfig::new(3, Duration::from_secs(60))
-            .with_backoff(BackoffStrategy::Exponential {
+        let repl_config = RestartConfig::new(3, Duration::from_secs(60)).with_backoff(
+            BackoffStrategy::Exponential {
                 initial: Duration::from_millis(100),
                 max: Duration::from_secs(5),
                 multiplier: 2.0,
-            });
+            },
+        );
 
         let mut sup = DbRootSupervisor::new();
         // Override replicator with a test config for deterministic budget.
@@ -1446,11 +1478,13 @@ mod tests {
 
         // Inject 4 transient errors into Replicator.
         for t in 0..4_u64 {
-            let a = sup.on_outcome(
-                FsqliteService::Replicator,
-                &TaskOutcome::Err("transient timeout".into()),
-                t,
-            ).expect("replicator is enabled");
+            let a = sup
+                .on_outcome(
+                    FsqliteService::Replicator,
+                    &TaskOutcome::Err("transient timeout".into()),
+                    t,
+                )
+                .expect("replicator is enabled");
             actions.push(a);
         }
 
@@ -1482,11 +1516,7 @@ mod tests {
         }
 
         // Meanwhile, other services should be unaffected.
-        let wc = sup.on_outcome(
-            FsqliteService::WriteCoordinator,
-            &TaskOutcome::Ok,
-            10,
-        );
+        let wc = sup.on_outcome(FsqliteService::WriteCoordinator, &TaskOutcome::Ok, 10);
         assert_eq!(wc, Some(SupervisionAction::None));
     }
 
@@ -1504,11 +1534,7 @@ mod tests {
         assert!(matches!(a, Some(SupervisionAction::Restart { .. })));
 
         // 2. WriteCoordinator panics → escalate.
-        let a = sup.on_outcome(
-            FsqliteService::WriteCoordinator,
-            &TaskOutcome::Panicked,
-            1,
-        );
+        let a = sup.on_outcome(FsqliteService::WriteCoordinator, &TaskOutcome::Panicked, 1);
         assert_eq!(a, Some(SupervisionAction::Escalate));
 
         // 3. CheckpointerGc gets transient error → restart.
@@ -1520,19 +1546,11 @@ mod tests {
         assert!(matches!(a, Some(SupervisionAction::Restart { .. })));
 
         // 4. Replicator gets cancelled → stop (INV-SUPERVISION-MONOTONE).
-        let a = sup.on_outcome(
-            FsqliteService::Replicator,
-            &TaskOutcome::Cancelled,
-            3,
-        );
+        let a = sup.on_outcome(FsqliteService::Replicator, &TaskOutcome::Cancelled, 3);
         assert_eq!(a, Some(SupervisionAction::Stop));
 
         // 5. IntegritySweeper panics → stop (not escalate).
-        let a = sup.on_outcome(
-            FsqliteService::IntegritySweeper,
-            &TaskOutcome::Panicked,
-            4,
-        );
+        let a = sup.on_outcome(FsqliteService::IntegritySweeper, &TaskOutcome::Panicked, 4);
         assert_eq!(a, Some(SupervisionAction::Stop));
     }
 }

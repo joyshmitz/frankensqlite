@@ -1802,13 +1802,6 @@ impl Parser {
                 self.expect_kw(&TokenKind::KwFollowing)?;
                 Ok(FrameBound::UnboundedFollowing)
             }
-        } else if self.check_kw(&TokenKind::KwCurrentDate) {
-            // Hmm, this won't work for "CURRENT ROW". Let me check another approach.
-            // Actually CURRENT ROW is two separate tokens in some dialects.
-            // In our lexer, CURRENT_DATE is one token. But "CURRENT" alone isn't a keyword.
-            // Let me handle this via identifier.
-            self.advance();
-            Ok(FrameBound::CurrentRow)
         } else if matches!(self.peek(), TokenKind::Id(s) if s.eq_ignore_ascii_case("CURRENT")) {
             self.advance();
             self.expect_kw(&TokenKind::KwRow)?;
