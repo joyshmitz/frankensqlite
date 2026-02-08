@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use asupersync::channel::mpsc::{RecvError, SendError};
 use asupersync::channel::session;
 use asupersync::cx::Cx;
-use asupersync::types::{ArenaIndex, Budget, RegionId, TaskId};
+use asupersync::types::{Budget, RegionId, TaskId};
+use asupersync::util::ArenaIndex;
 
 use commit_pipeline::{
     CommitPipeline, CommitRequest, DEFAULT_COMMIT_CHANNEL_CAPACITY, GroupCommitCoordinator,

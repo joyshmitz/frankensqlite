@@ -723,7 +723,8 @@ mod tests {
             let permit = bulkhead.try_acquire(1);
             assert!(
                 permit.is_some(),
-                "bead_id={TEST_BEAD_ID} slot {i} should be acquirable"
+                "bead_id={TEST_BEAD_ID} slot {} should be acquirable",
+                i
             );
             permits.push(permit.unwrap());
         }
@@ -733,7 +734,8 @@ mod tests {
             let overflow = bulkhead.try_acquire(1);
             assert!(
                 overflow.is_none(),
-                "bead_id={TEST_BEAD_ID} slot {i} should be rejected (bulkhead full)"
+                "bead_id={TEST_BEAD_ID} slot {} should be rejected (bulkhead full)",
+                i
             );
         }
 
@@ -754,7 +756,7 @@ mod tests {
         let cb = remote_circuit_breaker("test_remote");
         let now = Time::from_millis(0);
 
-        for i in 0..5 {
+        for _ in 0..5 {
             let permit = cb.should_allow(now).expect("should be closed initially");
             cb.record_failure(permit, "timeout", now);
         }

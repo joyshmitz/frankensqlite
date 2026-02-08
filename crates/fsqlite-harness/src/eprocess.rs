@@ -359,6 +359,7 @@ impl RuntimeInvariantMonitor {
     /// Observe one SSI false-positive outcome (true = false-positive abort occurred).
     pub fn observe_ssi_false_positive(&mut self, false_positive_abort: bool) {
         self.ssi_fp.observe(false_positive_abort);
+        let threshold = self.ssi_fp.config.threshold();
         info!(
             bead_id = "bd-1cx0",
             monitor = "INV-SSI-FP",
@@ -368,17 +369,17 @@ impl RuntimeInvariantMonitor {
                 "monitoring"
             },
             e_value = self.ssi_fp.current,
-            threshold = self.ssi_fp.config.threshold(),
+            threshold,
             "invariant monitor state change"
         );
 
-        if self.ssi_fp.current >= 0.1 / self.ssi_fp.config.alpha {
+        if self.ssi_fp.current >= threshold {
             warn!(
                 bead_id = "bd-1cx0",
                 monitor = "INV-SSI-FP",
                 evidence_id = format!("inv-ssi-fp-{}", self.ssi_fp.observations),
                 e_value = self.ssi_fp.current,
-                threshold = self.ssi_fp.config.threshold(),
+                threshold,
                 "drift/regime shift detected"
             );
         }
@@ -1957,6 +1958,20 @@ mod tests {
     }
 
     #[test]
+    fn test_hard_invariants_zero_overhead_release() {
+        // Alias acceptance-name test: release builds compile out debug_assert checks.
+        let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = check_inv6_commit_atomicity(1);
+        }))
+        .is_err();
+        assert_eq!(
+            panicked,
+            cfg!(debug_assertions),
+            "bead_id={RUNTIME_BEAD_ID} hard-invariant checks should trap only in debug builds"
+        );
+    }
+
+    #[test]
     fn test_eprocess_not_used_for_hard_invariants() {
         let monitor = RuntimeInvariantMonitor::new();
         for &inv in MvccInvariant::ALL {
@@ -1970,6 +1985,62 @@ mod tests {
             monitor.uses_eprocess_for(MvccInvariant::SsiFalsePositiveRate),
             "bead_id={RUNTIME_BEAD_ID} INV-SSI-FP should use e-process runtime checks"
         );
+    }
+
+    #[test]
+    fn test_inv_ssi_fp_sequential_hypothesis() {
+        // H₀: false-positive rate <= 0.05 (monitor should not reject at random stop points).
+        let mut under_h0 = RuntimeInvariantMonitor::new();
+        let stop_points = [64, 256, 1024, 4096, 8192];
+        let mut stop_idx = 0;
+
+        for i in 1..=8192 {
+            under_h0.observe_ssi_false_positive(i % 20 == 0); // exactly 5%
+            if stop_idx < stop_points.len() && i == stop_points[stop_idx] {
+                assert!(
+                    !under_h0.ssi_fp_state().rejected,
+                    "bead_id={RUNTIME_BEAD_ID} H0 stream should not reject at stop point {i}"
+                );
+                assert!(
+                    under_h0.ssi_fp_state().current < under_h0.ssi_fp_state().config.threshold(),
+                    "bead_id={RUNTIME_BEAD_ID} H0 stream e-value should stay below threshold at \
+                     stop point {i}"
+                );
+                stop_idx += 1;
+            }
+        }
+
+        // H₁: elevated false-positive rate should reject.
+        let mut under_h1 = RuntimeInvariantMonitor::new();
+        for i in 0..5000 {
+            under_h1.observe_ssi_false_positive(i % 5 == 0); // 20%
+            if under_h1.ssi_fp_state().rejected {
+                break;
+            }
+        }
+        assert!(
+            under_h1.ssi_fp_state().rejected,
+            "bead_id={RUNTIME_BEAD_ID} elevated SSI-FP regime should reject under sequential test"
+        );
+    }
+
+    #[test]
+    fn test_eprocess_optional_stopping_valid() {
+        // Optional stopping checkpoints must preserve validity under baseline behavior.
+        let mut monitor = RuntimeInvariantMonitor::new();
+        let checkpoints = [17, 113, 997, 2003, 4999, 9991];
+        let mut cp_idx = 0;
+
+        for i in 1..=10_000 {
+            monitor.observe_ssi_false_positive(i % 25 == 0); // 4% < 5%
+            if cp_idx < checkpoints.len() && i == checkpoints[cp_idx] {
+                assert!(
+                    !monitor.ssi_fp_state().rejected,
+                    "bead_id={RUNTIME_BEAD_ID} optional stop {i} should not produce false reject"
+                );
+                cp_idx += 1;
+            }
+        }
     }
 
     #[test]

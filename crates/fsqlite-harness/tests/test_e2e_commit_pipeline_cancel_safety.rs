@@ -9,7 +9,8 @@ use std::thread;
 
 use asupersync::channel::mpsc::SendError;
 use asupersync::cx::Cx;
-use asupersync::types::{ArenaIndex, Budget, RegionId, TaskId};
+use asupersync::types::{Budget, RegionId, TaskId};
+use asupersync::util::ArenaIndex;
 
 use commit_pipeline::{CommitPipeline, CommitRequest};
 
