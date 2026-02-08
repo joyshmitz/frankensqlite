@@ -282,16 +282,19 @@ mod tests {
         // Simulate cancellation by cancelling Cx before a read.
         // read_page acquires a buffer first; on read failure the buffer must be
         // dropped and returned to the pool (no leak).
-        let mut cx = Cx::new();
-        cx.cancel();
+        let cx_open = Cx::new();
         let vfs = MemoryVfs::new();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("cancel.db")), flags).unwrap();
+        let (mut file, _) = vfs
+            .open(&cx_open, Some(Path::new("cancel.db")), flags)
+            .unwrap();
+        let cx_cancelled = Cx::new();
+        cx_cancelled.cancel();
 
         let pool = PageBufPool::new(PageSize::DEFAULT, 4);
         let mut cache = PageCache::with_pool(pool.clone(), PageSize::DEFAULT);
         assert_eq!(pool.available(), 0);
-        let result = cache.read_page(&cx, &mut file, PageNumber::ONE);
+        let result = cache.read_page(&cx_cancelled, &mut file, PageNumber::ONE);
         assert!(result.is_err(), "cancelled Cx should abort the read");
         assert_eq!(
             pool.available(),
