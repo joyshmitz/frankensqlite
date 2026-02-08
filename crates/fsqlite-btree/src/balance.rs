@@ -1078,94 +1078,156 @@ fn split_overflowing_root<W: PageWriter>(
     let root_right_child = right_child.ok_or_else(|| FrankenError::DatabaseCorrupt {
         detail: format!("overflowing root {} missing right child", root_page_no),
     })?;
+    let mut chosen_ranges: Option<Vec<(usize, usize)>> = None;
+    let mut chosen_dividers: Option<Vec<Vec<u8>>> = None;
+    let mut chosen_right_children: Option<Vec<PageNumber>> = None;
 
-    let split_idx = final_cells.len() / 2;
-    let left_cells = &final_cells[..split_idx];
-    let right_cells = &final_cells[split_idx + 1..];
-    if left_cells.is_empty() || right_cells.is_empty() {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "overflowing root {} split produced empty side (left={}, right={})",
-                root_page_no,
-                left_cells.len(),
-                right_cells.len()
-            ),
-        });
+    for child_count in 3usize..=8usize {
+        if final_cells.len() < child_count.saturating_mul(2).saturating_sub(1) {
+            break;
+        }
+
+        let divider_indices: Vec<usize> = (1..child_count)
+            .map(|k| k.saturating_mul(final_cells.len()) / child_count)
+            .collect();
+
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(child_count);
+        let mut dividers: Vec<Vec<u8>> = Vec::with_capacity(child_count.saturating_sub(1));
+        let mut right_children: Vec<PageNumber> = Vec::with_capacity(child_count);
+
+        let mut start = 0usize;
+        let mut valid = true;
+
+        for &divider_idx in &divider_indices {
+            if divider_idx <= start || divider_idx >= final_cells.len() {
+                valid = false;
+                break;
+            }
+
+            let segment = &final_cells[start..divider_idx];
+            if segment.is_empty() {
+                valid = false;
+                break;
+            }
+
+            let divider = &final_cells[divider_idx].data;
+            if divider.len() < 4 {
+                valid = false;
+                break;
+            }
+
+            let raw = u32::from_be_bytes([divider[0], divider[1], divider[2], divider[3]]);
+            let Some(rc) = PageNumber::new(raw) else {
+                valid = false;
+                break;
+            };
+
+            ranges.push((start, divider_idx));
+            dividers.push(divider.clone());
+            right_children.push(rc);
+
+            start = divider_idx + 1;
+        }
+
+        if !valid || start >= final_cells.len() {
+            continue;
+        }
+        ranges.push((start, final_cells.len()));
+        if ranges.last().is_some_and(|(s, e)| s == e) {
+            continue;
+        }
+        right_children.push(root_right_child);
+
+        if ranges.len() != child_count
+            || dividers.len() != child_count.saturating_sub(1)
+            || right_children.len() != child_count
+        {
+            continue;
+        }
+
+        chosen_ranges = Some(ranges);
+        chosen_dividers = Some(dividers);
+        chosen_right_children = Some(right_children);
+        break;
     }
 
-    let mut divider = final_cells[split_idx].data.clone();
-    if divider.len() < 4 {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "overflowing root {} divider cell too small ({} bytes)",
-                root_page_no,
-                divider.len()
-            ),
-        });
+    let ranges = chosen_ranges.ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!(
+            "unable to choose split points for overflowing root {} with {} cells",
+            root_page_no,
+            final_cells.len()
+        ),
+    })?;
+    let mut dividers = chosen_dividers.ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!("missing divider set for overflowing root {}", root_page_no),
+    })?;
+    let right_children = chosen_right_children.ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!("missing right-child set for overflowing root {}", root_page_no),
+    })?;
+
+    let child_count = ranges.len();
+    let mut child_pgnos: Vec<PageNumber> = Vec::with_capacity(child_count);
+    for _ in 0..child_count {
+        child_pgnos.push(writer.allocate_page(cx)?);
     }
 
-    let left_right_raw = u32::from_be_bytes([divider[0], divider[1], divider[2], divider[3]]);
-    let left_right_child =
-        PageNumber::new(left_right_raw).ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "overflowing root {} divider has invalid child pointer {}",
-                root_page_no, left_right_raw
-            ),
-        })?;
-
-    let left_pg = writer.allocate_page(cx)?;
-    let right_pg = writer.allocate_page(cx)?;
-    let left_offset = header_offset_for_page(left_pg);
-    let right_offset = header_offset_for_page(right_pg);
-
-    if !page_fits(left_cells, page_type, left_offset, usable_size)
-        || !page_fits(right_cells, page_type, right_offset, usable_size)
-    {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "overflowing root {} split pages still exceed capacity (left_cells={}, right_cells={})",
-                root_page_no,
-                left_cells.len(),
-                right_cells.len()
-            ),
-        });
+    for (i, (start, end)) in ranges.iter().copied().enumerate() {
+        let child_offset = header_offset_for_page(child_pgnos[i]);
+        let child_cells = &final_cells[start..end];
+        if !page_fits(child_cells, page_type, child_offset, usable_size) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "overflowing root {} split child {} does not fit",
+                    root_page_no, i
+                ),
+            });
+        }
     }
 
-    let left_page = build_page(
-        left_cells,
-        page_type,
-        left_offset,
-        usable_size,
-        Some(left_right_child),
-    );
-    let right_page = build_page(
-        right_cells,
-        page_type,
-        right_offset,
-        usable_size,
-        Some(root_right_child),
-    );
-    writer.write_page(cx, left_pg, &left_page)?;
-    writer.write_page(cx, right_pg, &right_page)?;
-
-    divider[0..4].copy_from_slice(&left_pg.get().to_be_bytes());
-    let root_cell = GatheredCell {
-        size: u16::try_from(divider.len()).unwrap_or(u16::MAX),
-        data: divider,
-    };
-    let root_cells = [root_cell];
+    for (i, divider) in dividers.iter_mut().enumerate() {
+        divider[0..4].copy_from_slice(&child_pgnos[i].get().to_be_bytes());
+    }
+    let root_cells: Vec<GatheredCell> = dividers
+        .into_iter()
+        .map(|data| GatheredCell {
+            size: u16::try_from(data.len()).unwrap_or(u16::MAX),
+            data,
+        })
+        .collect();
     if !page_fits(&root_cells, page_type, root_offset, usable_size) {
         return Err(FrankenError::DatabaseCorrupt {
-            detail: format!("new root cell does not fit for root {}", root_page_no),
+            detail: format!(
+                "overflowing root {} cannot fit {} promoted dividers",
+                root_page_no,
+                root_cells.len()
+            ),
         });
     }
 
+    for (i, (start, end)) in ranges.iter().copied().enumerate() {
+        let child_cells = &final_cells[start..end];
+        let child_offset = header_offset_for_page(child_pgnos[i]);
+        let page = build_page(
+            child_cells,
+            page_type,
+            child_offset,
+            usable_size,
+            Some(right_children[i]),
+        );
+        writer.write_page(cx, child_pgnos[i], &page)?;
+    }
+
+    let root_right = child_pgnos.last().copied().ok_or_else(|| {
+        FrankenError::DatabaseCorrupt {
+            detail: format!("overflowing root {} split produced no children", root_page_no),
+        }
+    })?;
     let mut new_root = build_page(
         &root_cells,
         page_type,
         root_offset,
         usable_size,
-        Some(right_pg),
+        Some(root_right),
     );
     if root_offset > 0 {
         new_root[..root_offset].copy_from_slice(root_prefix);
