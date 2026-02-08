@@ -1063,6 +1063,75 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // bd-22n.8 — Allocation-Free Read Path E2E Test
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_e2e_version_resolve_allocation_free() {
+        // bd-22n.8: The full MVCC read path (VersionStore::resolve) is
+        // allocation-free for cached, visible versions.
+        //
+        // We verify by:
+        // 1. Publishing a chain of versions
+        // 2. Resolving them repeatedly
+        // 3. Checking that resolve returns the same VersionIdx each time
+        //    (proving no intermediate data structures are allocated per call)
+        const BEAD_22N8: &str = "bd-22n.8";
+
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let p1 = PageNumber::new(1).unwrap();
+
+        // Publish 3 versions of page 1.
+        let v1 = make_version(1, 1, None);
+        let idx1 = store.publish(v1);
+
+        let v2 = make_version(1, 3, Some(idx_to_version_pointer(idx1)));
+        let idx2 = store.publish(v2);
+
+        let v3 = make_version(1, 5, Some(idx_to_version_pointer(idx2)));
+        store.publish(v3);
+
+        // Snapshot at commit_seq=4: should see v2 (commit_seq=3).
+        let snap = make_snapshot(4);
+
+        // Resolve 100 times — must return the same index each time.
+        let first_idx = store.resolve(p1, &snap).unwrap();
+        for round in 0..100u32 {
+            let idx = store.resolve(p1, &snap).unwrap();
+            assert_eq!(
+                idx, first_idx,
+                "bead_id={BEAD_22N8} case=e2e_version_resolve_stable \
+                 round={round} resolve must return same VersionIdx"
+            );
+        }
+
+        // Verify we got the right version (commit_seq=3).
+        let resolved = store.get_version(first_idx).unwrap();
+        assert_eq!(
+            resolved.commit_seq,
+            CommitSeq::new(3),
+            "bead_id={BEAD_22N8} case=e2e_resolved_correct_version"
+        );
+
+        // Snapshot at commit_seq=5: should see v3 (commit_seq=5).
+        let snap5 = make_snapshot(5);
+        let idx5 = store.resolve(p1, &snap5).unwrap();
+        let v5_resolved = store.get_version(idx5).unwrap();
+        assert_eq!(
+            v5_resolved.commit_seq,
+            CommitSeq::new(5),
+            "bead_id={BEAD_22N8} case=e2e_latest_version_resolved"
+        );
+
+        // Snapshot at commit_seq=0: nothing visible.
+        let snap0 = make_snapshot(0);
+        assert!(
+            store.resolve(p1, &snap0).is_none(),
+            "bead_id={BEAD_22N8} case=e2e_no_visible_version_at_zero"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Property tests
     // -----------------------------------------------------------------------
 

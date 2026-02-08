@@ -87,6 +87,73 @@ impl<T: std::fmt::Debug> std::fmt::Debug for CacheAligned<T> {
 }
 
 // ---------------------------------------------------------------------------
+// TxnSlot Sentinel Encoding (§5.6.2, bd-22n.13)
+// ---------------------------------------------------------------------------
+
+/// Bit position where the 2-bit tag begins in the `txn_id` word.
+pub const SLOT_TAG_SHIFT: u32 = 62;
+
+/// Mask isolating the top 2 tag bits of a `txn_id` word.
+pub const SLOT_TAG_MASK: u64 = 0b11_u64 << SLOT_TAG_SHIFT;
+
+/// Mask isolating the lower 62-bit payload (real `TxnId`) of a `txn_id` word.
+pub const SLOT_PAYLOAD_MASK: u64 = (1_u64 << SLOT_TAG_SHIFT) - 1;
+
+/// Sentinel tag: slot is being claimed (Phase 1 → Phase 3 of acquire).
+pub const TAG_CLAIMING: u64 = 0b01_u64 << SLOT_TAG_SHIFT;
+
+/// Sentinel tag: slot is being cleaned up after a crash.
+pub const TAG_CLEANING: u64 = 0b10_u64 << SLOT_TAG_SHIFT;
+
+/// Encode a claiming sentinel word: `TAG_CLAIMING | txn_id`.
+///
+/// The payload preserves the claimant's `TxnId` so Phase 3 CAS is unstealable.
+#[inline]
+#[must_use]
+pub const fn encode_claiming(txn_id_raw: u64) -> u64 {
+    TAG_CLAIMING | (txn_id_raw & SLOT_PAYLOAD_MASK)
+}
+
+/// Encode a cleaning sentinel word: `TAG_CLEANING | txn_id`.
+///
+/// The payload preserves the original `TxnId` so crash cleanup is retryable.
+#[inline]
+#[must_use]
+pub const fn encode_cleaning(txn_id_raw: u64) -> u64 {
+    TAG_CLEANING | (txn_id_raw & SLOT_PAYLOAD_MASK)
+}
+
+/// Extract the 2-bit tag from a `txn_id` word.
+#[inline]
+#[must_use]
+pub const fn decode_tag(word: u64) -> u64 {
+    word & SLOT_TAG_MASK
+}
+
+/// Extract the 62-bit payload (real `TxnId`) from a `txn_id` word.
+#[inline]
+#[must_use]
+pub const fn decode_payload(word: u64) -> u64 {
+    word & SLOT_PAYLOAD_MASK
+}
+
+/// Returns `true` if the word has any sentinel tag set (CLAIMING or CLEANING).
+#[inline]
+#[must_use]
+pub const fn is_sentinel(word: u64) -> bool {
+    (word & SLOT_TAG_MASK) != 0
+}
+
+/// Timeout for a slot stuck in CLAIMING state (seconds).
+///
+/// 5 seconds is orders of magnitude longer than any valid Phase 1 → Phase 3
+/// transition (~microseconds).
+pub const CLAIMING_TIMEOUT_SECS: u64 = 5;
+
+/// Conservative timeout when PID/pid_birth are not yet published (seconds).
+pub const CLAIMING_TIMEOUT_NO_PID_SECS: u64 = 30;
+
+// ---------------------------------------------------------------------------
 // SharedTxnSlot
 // ---------------------------------------------------------------------------
 
@@ -180,6 +247,39 @@ impl SharedTxnSlot {
     #[must_use]
     pub fn is_free(&self, ordering: Ordering) -> bool {
         self.txn_id.load(ordering) == 0
+    }
+
+    /// Whether this slot is in a sentinel state (CLAIMING or CLEANING).
+    #[inline]
+    #[must_use]
+    pub fn is_sentinel(&self, ordering: Ordering) -> bool {
+        is_sentinel(self.txn_id.load(ordering))
+    }
+
+    /// Whether this slot is in CLAIMING state.
+    #[inline]
+    #[must_use]
+    pub fn is_claiming(&self, ordering: Ordering) -> bool {
+        decode_tag(self.txn_id.load(ordering)) == TAG_CLAIMING
+    }
+
+    /// Whether this slot is in CLEANING state.
+    #[inline]
+    #[must_use]
+    pub fn is_cleaning(&self, ordering: Ordering) -> bool {
+        decode_tag(self.txn_id.load(ordering)) == TAG_CLEANING
+    }
+
+    /// Extract the payload `TxnId` from a sentinel word, if the slot is in a
+    /// sentinel state. Returns `None` for free or real-txn-id slots.
+    #[must_use]
+    pub fn sentinel_payload(&self, ordering: Ordering) -> Option<u64> {
+        let word = self.txn_id.load(ordering);
+        if is_sentinel(word) {
+            Some(decode_payload(word))
+        } else {
+            None
+        }
     }
 }
 
@@ -484,13 +584,26 @@ mod tests {
 
     // -- E2E false sharing regression --
 
-    #[test]
-    #[allow(clippy::cast_precision_loss)]
-    fn test_e2e_shared_memory_false_sharing_regression() {
-        const N_THREADS: usize = 4;
-        const N_ITERS: u64 = 200_000;
+    fn median(samples: &mut [u128]) -> u128 {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
 
-        // --- Padded (cache-line aligned) counters ---
+    fn ratio_permille(observed_us: u128, baseline_us: u128) -> u128 {
+        observed_us
+            .saturating_mul(1_000)
+            .checked_div(baseline_us)
+            .unwrap_or(1_000)
+    }
+
+    fn ops_per_sec(total_ops: u128, elapsed_us: u128) -> u128 {
+        total_ops
+            .saturating_mul(1_000_000)
+            .checked_div(elapsed_us)
+            .unwrap_or(total_ops.saturating_mul(1_000_000))
+    }
+
+    fn run_padded_round<const N_THREADS: usize>(iterations_per_thread: u64) -> u128 {
         let padded: Arc<[CacheAligned<AtomicU64>; N_THREADS]> =
             Arc::new(std::array::from_fn(|_| {
                 CacheAligned::new(AtomicU64::new(0))
@@ -498,61 +611,105 @@ mod tests {
 
         let start = Instant::now();
         let handles: Vec<_> = (0..N_THREADS)
-            .map(|t| {
+            .map(|thread_index| {
                 let counters = Arc::clone(&padded);
                 thread::spawn(move || {
-                    for _ in 0..N_ITERS {
-                        counters[t].fetch_add(1, Ordering::Relaxed);
+                    for _ in 0..iterations_per_thread {
+                        counters[thread_index].fetch_add(1, Ordering::Relaxed);
                     }
                 })
             })
             .collect();
-        for h in handles {
-            h.join().unwrap();
+        for handle in handles {
+            handle.join().expect("padded worker must not panic");
         }
-        let padded_us = start.elapsed().as_micros();
-
-        // Verify correctness.
         for counter in padded.iter() {
-            assert_eq!(counter.load(Ordering::Relaxed), N_ITERS);
+            assert_eq!(counter.load(Ordering::Relaxed), iterations_per_thread);
         }
+        start.elapsed().as_micros()
+    }
 
-        // --- Unpadded (potential false sharing) counters ---
+    fn run_unpadded_round<const N_THREADS: usize>(iterations_per_thread: u64) -> u128 {
         let unpadded: Arc<[AtomicU64; N_THREADS]> =
             Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
 
         let start = Instant::now();
         let handles: Vec<_> = (0..N_THREADS)
-            .map(|t| {
+            .map(|thread_index| {
                 let counters = Arc::clone(&unpadded);
                 thread::spawn(move || {
-                    for _ in 0..N_ITERS {
-                        counters[t].fetch_add(1, Ordering::Relaxed);
+                    for _ in 0..iterations_per_thread {
+                        counters[thread_index].fetch_add(1, Ordering::Relaxed);
                     }
                 })
             })
             .collect();
-        for h in handles {
-            h.join().unwrap();
+        for handle in handles {
+            handle.join().expect("unpadded worker must not panic");
         }
-        let unpadded_us = start.elapsed().as_micros();
-
-        // Verify correctness.
         for counter in unpadded.iter() {
-            assert_eq!(counter.load(Ordering::Relaxed), N_ITERS);
+            assert_eq!(counter.load(Ordering::Relaxed), iterations_per_thread);
+        }
+        start.elapsed().as_micros()
+    }
+
+    #[test]
+    fn test_e2e_shared_memory_false_sharing_regression() {
+        const N_THREADS: usize = 4;
+        const N_ITERS: u64 = 200_000;
+        const ROUNDS: usize = 5;
+        const WARN_RATIO_PERMILLE: u128 = 1_500; // 1.5x slower than unpadded baseline
+        const FAIL_RATIO_PERMILLE: u128 = 3_000; // 3.0x slower than unpadded baseline
+
+        let mut padded_samples = Vec::with_capacity(ROUNDS);
+        let mut unpadded_samples = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            padded_samples.push(run_padded_round::<N_THREADS>(N_ITERS));
+            unpadded_samples.push(run_unpadded_round::<N_THREADS>(N_ITERS));
         }
 
-        // Log for regression analysis. On typical hardware, the padded
-        // variant avoids false sharing and should be equal or faster.
-        // A large padded/unpadded ratio (>> 1) would indicate a regression.
-        let ratio = if unpadded_us > 0 {
-            padded_us as f64 / unpadded_us as f64
-        } else {
-            1.0
-        };
-        eprintln!(
-            "bead_id=bd-22n.3 case=false_sharing_regression \
-             padded_us={padded_us} unpadded_us={unpadded_us} ratio={ratio:.2}"
+        let mut padded_sorted = padded_samples.clone();
+        let mut unpadded_sorted = unpadded_samples.clone();
+        let observed_padded_median_us = median(&mut padded_sorted);
+        let baseline_unpadded_median_us = median(&mut unpadded_sorted);
+        let ratio_permille = ratio_permille(observed_padded_median_us, baseline_unpadded_median_us);
+
+        let total_ops =
+            u128::try_from(N_THREADS).expect("N_THREADS fits in u128") * u128::from(N_ITERS);
+        let observed_padded_ops_per_sec = ops_per_sec(total_ops, observed_padded_median_us);
+        let baseline_unpadded_ops_per_sec = ops_per_sec(total_ops, baseline_unpadded_median_us);
+
+        tracing::info!(
+            bead_id = "bd-22n.3",
+            case = "false_sharing_regression",
+            rounds = ROUNDS,
+            threads = N_THREADS,
+            iterations_per_thread = N_ITERS,
+            baseline_unpadded_median_us,
+            observed_padded_median_us,
+            baseline_unpadded_ops_per_sec,
+            observed_padded_ops_per_sec,
+            ratio_permille,
+            "false-sharing regression metrics"
+        );
+
+        if ratio_permille > WARN_RATIO_PERMILLE {
+            tracing::warn!(
+                bead_id = "bd-22n.3",
+                case = "false_sharing_regression_warn",
+                warn_ratio_permille = WARN_RATIO_PERMILLE,
+                ratio_permille,
+                baseline_unpadded_median_us,
+                observed_padded_median_us,
+                "padded counters are slower than expected relative to unpadded baseline"
+            );
+        }
+
+        assert!(
+            ratio_permille <= FAIL_RATIO_PERMILLE,
+            "bead_id=bd-22n.3 case=false_sharing_regression_detected \
+             ratio_permille={ratio_permille} baseline_unpadded_median_us={baseline_unpadded_median_us} \
+             observed_padded_median_us={observed_padded_median_us}"
         );
     }
 }
