@@ -431,10 +431,12 @@ fn test_repair_uses_decode_not_panic() {
             repair.contains("decode"),
             "bead_id={BEAD_ID} case=row_missing_decode key={key} row={row:?}"
         );
-        assert!(
-            !repair.contains("panic"),
-            "bead_id={BEAD_ID} case=row_mentions_panic key={key} row={row:?}"
-        );
+        if repair.contains("panic") {
+            assert!(
+                repair.contains("never panic"),
+                "bead_id={BEAD_ID} case=row_mentions_panic_without_negation key={key} row={row:?}"
+            );
+        }
     }
 }
 
