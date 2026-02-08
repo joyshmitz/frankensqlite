@@ -916,6 +916,34 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(())
     }
 
+    /// Balance the tree after deleting from a non-root leaf.
+    ///
+    /// For a root leaf page (single-level tree), no balancing is required.
+    fn balance_for_delete(&mut self, cx: &Cx) -> Result<()> {
+        let depth = self.stack.len();
+        if depth <= 1 {
+            return Ok(());
+        }
+
+        let parent_page_no = self.stack[depth - 2].page_no;
+        let child_idx = usize::from(self.stack[depth - 2].cell_idx);
+
+        balance::balance_nonroot(
+            cx,
+            &mut self.pager,
+            parent_page_no,
+            child_idx,
+            &[],
+            0,
+            self.usable_size,
+        )?;
+
+        // Tree shape may change after balancing.
+        self.stack.clear();
+        self.at_eof = true;
+        Ok(())
+    }
+
     /// Remove the cell at the current cursor position from its leaf page.
     ///
     /// Does NOT trigger rebalancing — the caller is responsible for that.
@@ -1092,13 +1120,15 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
         // Remove the cell from the leaf. This handles overflow chain
         // cleanup and refreshes the stack entry.
-        let (_leaf_page_no, _new_count) = self.remove_cell_from_leaf(cx)?;
+        let (_leaf_page_no, new_count) = self.remove_cell_from_leaf(cx)?;
 
-        // Rebalancing after delete is not yet implemented for multi-level
-        // trees. For single-leaf root trees, no rebalance is needed since
-        // the root is allowed to be underfull. For multi-level trees, we
-        // skip rebalancing for now — the tree remains valid, just
-        // potentially unbalanced. A future pass will add merge support.
+        // Trigger structural rebalance only when a non-root leaf drains.
+        // This avoids aggressive full-sibling rewrites on every delete while
+        // still fixing the "empty leftmost leaf breaks first()" failure mode.
+        if new_count == 0 {
+            self.balance_for_delete(cx)?;
+        }
+
         Ok(())
     }
 
@@ -1139,7 +1169,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 mod tests {
     use super::*;
     use fsqlite_types::serial_type::write_varint;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     /// Simple in-memory page store for testing.
     #[derive(Debug, Clone, Default)]
@@ -1313,6 +1343,40 @@ mod tests {
 
     fn pn(n: u32) -> PageNumber {
         PageNumber::new(n).unwrap()
+    }
+
+    fn lcg_next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        *state
+    }
+
+    fn deterministic_shuffle(values: &mut [i64], seed: u64) {
+        if values.len() <= 1 {
+            return;
+        }
+        let mut state = seed;
+        for i in (1..values.len()).rev() {
+            let j = (lcg_next(&mut state) as usize) % (i + 1);
+            values.swap(i, j);
+        }
+    }
+
+    fn payload_for_rowid(rowid: i64) -> Vec<u8> {
+        let rowid_usize = usize::try_from(rowid).expect("rowid must be positive in this test");
+        let payload_len = if rowid % 257 == 0 {
+            1_600 // force overflow-chain path for some keys
+        } else {
+            32 + (rowid_usize % 180)
+        };
+
+        let mut payload = Vec::with_capacity(payload_len);
+        for i in 0..payload_len {
+            let byte = (rowid_usize.wrapping_mul(31).wrapping_add(i * 17) & 0xFF) as u8;
+            payload.push(byte);
+        }
+        payload
     }
 
     // -- Single leaf page tests --
@@ -1610,6 +1674,79 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_delete_rebalances_empty_leftmost_leaf() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        let mut max_rowid = 1i64;
+        loop {
+            let payload = vec![b'R'; 220];
+            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
+            let root_page = cursor.pager.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            if root_header.page_type == cell::BtreePageType::InteriorTable {
+                break;
+            }
+            max_rowid += 1;
+            assert!(
+                max_rowid < 1000,
+                "table root did not split under sustained inserts"
+            );
+        }
+
+        let root_page = cursor.pager.pages.get(&2).unwrap();
+        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+        let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
+        let first_divider_cell = CellRef::parse(
+            root_page,
+            usize::from(root_ptrs[0]),
+            root_header.page_type,
+            USABLE,
+        )
+        .unwrap();
+        let leftmost_max_rowid = first_divider_cell.rowid.unwrap();
+        assert!(leftmost_max_rowid >= 1);
+        assert!(leftmost_max_rowid < max_rowid);
+
+        for rowid in 1..=leftmost_max_rowid {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+            cursor.delete(&cx).unwrap();
+        }
+
+        let root_page = cursor.pager.pages.get(&2).unwrap();
+        let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+        assert_eq!(root_header.page_type, cell::BtreePageType::InteriorTable);
+        assert_eq!(
+            root_header.cell_count, 0,
+            "root should collapse to a single right-child after leftmost leaf drains"
+        );
+
+        assert!(cursor.first(&cx).unwrap());
+        assert!(cursor.rowid(&cx).unwrap() > leftmost_max_rowid);
+
+        let mut seen = 0usize;
+        let mut prev = i64::MIN;
+        loop {
+            let rowid = cursor.rowid(&cx).unwrap();
+            assert!(rowid > prev);
+            assert!(rowid > leftmost_max_rowid);
+            prev = rowid;
+            seen += 1;
+            if !cursor.next(&cx).unwrap() {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            usize::try_from(max_rowid - leftmost_max_rowid).unwrap()
+        );
+    }
+
+    #[test]
     fn test_cursor_delete_all_after_root_split() {
         let mut store = MemPageStore::default();
         store.pages.insert(2, build_leaf_table(&[]));
@@ -1641,6 +1778,113 @@ mod tests {
 
         assert!(!cursor.first(&cx).unwrap());
         assert!(cursor.eof());
+    }
+
+    #[test]
+    fn test_e2e_bd_2kvo() {
+        const TOTAL_ROWS: i64 = 2_000;
+        const DELETE_ROWS: usize = 1_000;
+
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut expected = BTreeMap::<i64, Vec<u8>>::new();
+
+        for rowid in 1..=TOTAL_ROWS {
+            let payload = payload_for_rowid(rowid);
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            expected.insert(rowid, payload);
+        }
+
+        for (rowid, payload) in &expected {
+            let seek = cursor.table_move_to(&cx, *rowid).unwrap();
+            assert!(seek.is_found(), "missing rowid after insert: {rowid}");
+            assert_eq!(&cursor.payload(&cx).unwrap(), payload);
+        }
+
+        let mut deletion_order: Vec<i64> = expected.keys().copied().collect();
+        deterministic_shuffle(&mut deletion_order, 0x0BAD_5EED);
+
+        for rowid in deletion_order.into_iter().take(DELETE_ROWS) {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+            cursor.delete(&cx).unwrap();
+            expected.remove(&rowid);
+        }
+
+        if expected.is_empty() {
+            assert!(!cursor.first(&cx).unwrap());
+            assert!(cursor.eof());
+            return;
+        }
+
+        let mut expected_iter = expected.iter();
+        assert!(cursor.first(&cx).unwrap());
+        loop {
+            let rowid = cursor.rowid(&cx).unwrap();
+            let payload = cursor.payload(&cx).unwrap();
+
+            let (expected_rowid, expected_payload) =
+                expected_iter.next().expect("cursor yielded extra row");
+            assert_eq!(rowid, *expected_rowid);
+            assert_eq!(payload, *expected_payload);
+
+            if !cursor.next(&cx).unwrap() {
+                break;
+            }
+        }
+
+        assert!(
+            expected_iter.next().is_none(),
+            "cursor missed one or more rows during forward scan"
+        );
+    }
+
+    #[test]
+    fn test_btree_insert_delete_5k() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut remaining = BTreeSet::new();
+
+        for rowid in 1_i64..=10_000_i64 {
+            let payload = rowid.to_le_bytes();
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            remaining.insert(rowid);
+        }
+
+        let mut deletion_order: Vec<i64> = remaining.iter().copied().collect();
+        deterministic_shuffle(&mut deletion_order, 0x00D1_5EA5);
+
+        for rowid in deletion_order.into_iter().take(5_000) {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+            cursor.delete(&cx).unwrap();
+            remaining.remove(&rowid);
+        }
+
+        assert_eq!(remaining.len(), 5_000);
+        assert!(cursor.first(&cx).unwrap());
+
+        let mut expected_iter = remaining.iter();
+        loop {
+            let rowid = cursor.rowid(&cx).unwrap();
+            let expected = expected_iter.next().expect("cursor yielded extra row");
+            assert_eq!(&rowid, expected);
+
+            if !cursor.next(&cx).unwrap() {
+                break;
+            }
+        }
+
+        assert!(
+            expected_iter.next().is_none(),
+            "cursor missed one or more rows after delete workload"
+        );
     }
 
     #[test]
