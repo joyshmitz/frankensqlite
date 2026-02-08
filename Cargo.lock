@@ -527,6 +527,7 @@ dependencies = [
  "asupersync",
  "fsqlite",
  "fsqlite-btree",
+ "fsqlite-core",
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-pager",
