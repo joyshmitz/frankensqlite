@@ -736,6 +736,10 @@ pub struct Transaction {
     pub page_locks: HashSet<PageNumber>,
     pub state: TransactionState,
     pub mode: TransactionMode,
+    /// Whether SSI validation is enabled for this transaction (captured at BEGIN).
+    ///
+    /// Connection setting: `PRAGMA fsqlite.serializable`.
+    pub ssi_enabled_at_begin: bool,
     /// True iff this txn currently holds the global write mutex (Serialized mode).
     pub serialized_write_lock_held: bool,
     /// SSI witness-plane read evidence (§5.6.4).
@@ -772,6 +776,7 @@ impl Transaction {
             page_locks: HashSet::new(),
             state: TransactionState::Active,
             mode,
+            ssi_enabled_at_begin: true,
             serialized_write_lock_held: false,
             read_keys: HashSet::new(),
             write_keys: HashSet::new(),
