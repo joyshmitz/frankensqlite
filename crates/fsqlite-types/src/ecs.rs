@@ -159,6 +159,10 @@ pub enum SymbolRecordError {
     UnsupportedVersion(u8),
     /// `symbol_size != OTI.T` — key invariant violated.
     SymbolSizeMismatch { symbol_size: u32, oti_t: u32 },
+    /// `symbol_size` is not representable as a `usize` on this platform.
+    SymbolSizeTooLarge { symbol_size: u32 },
+    /// Size computation overflowed.
+    SizeOverflow,
     /// `frame_xxh3` integrity check failed.
     IntegrityFailure { expected: u64, computed: u64 },
     /// Auth tag verification failed.
@@ -182,6 +186,10 @@ impl fmt::Display for SymbolRecordError {
             Self::SymbolSizeMismatch { symbol_size, oti_t } => {
                 write!(f, "symbol_size ({symbol_size}) != OTI.T ({oti_t})")
             }
+            Self::SymbolSizeTooLarge { symbol_size } => {
+                write!(f, "symbol_size too large for platform: {symbol_size}")
+            }
+            Self::SizeOverflow => write!(f, "symbol record size overflow"),
             Self::IntegrityFailure { expected, computed } => {
                 write!(
                     f,
@@ -192,6 +200,8 @@ impl fmt::Display for SymbolRecordError {
         }
     }
 }
+
+impl std::error::Error for SymbolRecordError {}
 
 /// Fixed header size before `symbol_data`:
 /// magic(4) + version(1) + object_id(16) + OTI(22) + esi(4) + symbol_size(4) = 51.
@@ -251,9 +261,13 @@ impl SymbolRecord {
         buf.extend_from_slice(self.object_id.as_bytes());
         buf.extend_from_slice(&self.oti.to_bytes());
         buf.extend_from_slice(&self.esi.to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        let symbol_size = self.symbol_data.len() as u32;
-        buf.extend_from_slice(&symbol_size.to_le_bytes());
+        let expected_len = usize::try_from(self.oti.t).expect("OTI.t fits in usize");
+        debug_assert_eq!(
+            self.symbol_data.len(),
+            expected_len,
+            "symbol_data length must equal OTI.t"
+        );
+        buf.extend_from_slice(&self.oti.t.to_le_bytes());
         buf.extend_from_slice(&self.symbol_data);
         buf.push(self.flags.bits());
         buf
@@ -271,6 +285,15 @@ impl SymbolRecord {
         symbol_data: Vec<u8>,
         flags: SymbolRecordFlags,
     ) -> Self {
+        let expected_len = usize::try_from(oti.t).expect("OTI.t fits in usize");
+        assert_eq!(
+            symbol_data.len(),
+            expected_len,
+            "SymbolRecord::new: symbol_data.len ({}) must equal oti.t ({})",
+            symbol_data.len(),
+            oti.t
+        );
+
         let mut rec = Self {
             object_id,
             oti,
@@ -315,6 +338,13 @@ impl SymbolRecord {
     /// Serialize to canonical wire bytes.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
+        let expected_len = usize::try_from(self.oti.t).expect("OTI.t fits in usize");
+        debug_assert_eq!(
+            self.symbol_data.len(),
+            expected_len,
+            "symbol_data length must equal OTI.t"
+        );
+
         let total = HEADER_BEFORE_DATA + self.symbol_data.len() + TRAILER_AFTER_DATA;
         let mut buf = Vec::with_capacity(total);
 
@@ -324,9 +354,7 @@ impl SymbolRecord {
         buf.extend_from_slice(self.object_id.as_bytes());
         buf.extend_from_slice(&self.oti.to_bytes());
         buf.extend_from_slice(&self.esi.to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)]
-        let symbol_size = self.symbol_data.len() as u32;
-        buf.extend_from_slice(&symbol_size.to_le_bytes());
+        buf.extend_from_slice(&self.oti.t.to_le_bytes());
 
         // Payload
         buf.extend_from_slice(&self.symbol_data);
@@ -387,7 +415,12 @@ impl SymbolRecord {
             });
         }
 
-        let total_size = HEADER_BEFORE_DATA + symbol_size as usize + TRAILER_AFTER_DATA;
+        let symbol_size_usize = usize::try_from(symbol_size)
+            .map_err(|_| SymbolRecordError::SymbolSizeTooLarge { symbol_size })?;
+        let total_size = HEADER_BEFORE_DATA
+            .checked_add(symbol_size_usize)
+            .and_then(|v| v.checked_add(TRAILER_AFTER_DATA))
+            .ok_or(SymbolRecordError::SizeOverflow)?;
         if data.len() < total_size {
             return Err(SymbolRecordError::TooShort {
                 expected_min: total_size,
@@ -397,7 +430,9 @@ impl SymbolRecord {
 
         // Symbol data
         let data_start = HEADER_BEFORE_DATA;
-        let data_end = data_start + symbol_size as usize;
+        let data_end = data_start
+            .checked_add(symbol_size_usize)
+            .ok_or(SymbolRecordError::SizeOverflow)?;
         let symbol_data = data[data_start..data_end].to_vec();
 
         // Trailer
@@ -456,6 +491,349 @@ impl SymbolRecord {
     #[must_use]
     pub fn wire_size(&self) -> usize {
         HEADER_BEFORE_DATA + self.symbol_data.len() + TRAILER_AFTER_DATA
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §3.6.1-3.6.3 Native Index Types
+// ---------------------------------------------------------------------------
+
+/// How a page version is stored in an ECS patch object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum PatchKind {
+    /// Full page image — the patch object contains the entire page.
+    FullImage = 0,
+    /// Intent log — a sequence of semantic operations to replay.
+    IntentLog = 1,
+    /// Sparse XOR — byte-range XOR delta against a base image.
+    SparseXor = 2,
+}
+
+impl PatchKind {
+    /// Deserialize from wire byte.
+    #[must_use]
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::FullImage),
+            1 => Some(Self::IntentLog),
+            2 => Some(Self::SparseXor),
+            _ => None,
+        }
+    }
+}
+
+/// Stable, content-addressed pointer from a page index to a patch object (§3.6.2).
+///
+/// The atom of lookup in Native mode. References content-addressed ECS
+/// objects, not physical offsets, so the pointer is replicable across nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VersionPointer {
+    /// Commit sequence at which this version was created.
+    pub commit_seq: u64,
+    /// ECS object containing the patch/intent.
+    pub patch_object: ObjectId,
+    /// How the page bytes are represented.
+    pub patch_kind: PatchKind,
+    /// Optional base image hint for fast materialization of deltas.
+    pub base_hint: Option<ObjectId>,
+}
+
+/// Wire size of [`VersionPointer`]: commit_seq(8) + object_id(16) + patch_kind(1)
+/// + has_base(1) + optional base_hint(16) = 26 or 42 bytes.
+const VERSION_POINTER_MIN_WIRE: usize = 8 + 16 + 1 + 1;
+
+impl VersionPointer {
+    /// Serialize to canonical little-endian bytes.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let has_base: u8 = u8::from(self.base_hint.is_some());
+        let cap = VERSION_POINTER_MIN_WIRE + if has_base == 1 { 16 } else { 0 };
+        let mut buf = Vec::with_capacity(cap);
+        buf.extend_from_slice(&self.commit_seq.to_le_bytes());
+        buf.extend_from_slice(self.patch_object.as_bytes());
+        buf.push(self.patch_kind as u8);
+        buf.push(has_base);
+        if let Some(ref base) = self.base_hint {
+            buf.extend_from_slice(base.as_bytes());
+        }
+        buf
+    }
+
+    /// Deserialize from canonical little-endian bytes.
+    #[must_use]
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < VERSION_POINTER_MIN_WIRE {
+            return None;
+        }
+        let commit_seq = u64::from_le_bytes(data[0..8].try_into().ok()?);
+        let patch_object = ObjectId::from_bytes(data[8..24].try_into().ok()?);
+        let patch_kind = PatchKind::from_byte(data[24])?;
+        let has_base = data[25];
+        let base_hint = if has_base != 0 {
+            if data.len() < VERSION_POINTER_MIN_WIRE + 16 {
+                return None;
+            }
+            Some(ObjectId::from_bytes(data[26..42].try_into().ok()?))
+        } else {
+            None
+        };
+        Some(Self {
+            commit_seq,
+            patch_object,
+            patch_kind,
+            base_hint,
+        })
+    }
+}
+
+/// Offset into a symbol log file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SymbolLogOffset(pub u64);
+
+impl SymbolLogOffset {
+    #[must_use]
+    pub const fn new(offset: u64) -> Self {
+        Self(offset)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Minimal bloom filter for fast "not present" checks in index segments.
+///
+/// Uses double hashing (xxh3 + BLAKE3 truncated) to probe `k` bit positions
+/// in a bitvec of `m` bits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BloomFilter {
+    bits: Vec<u64>,
+    num_bits: u32,
+    num_hashes: u8,
+}
+
+impl BloomFilter {
+    /// Create a new bloom filter sized for `expected_items` with the given
+    /// false positive rate.
+    ///
+    /// Uses the classic formula: m = -n*ln(p) / (ln2)^2, k = (m/n)*ln2.
+    #[must_use]
+    pub fn new(expected_items: u32, false_positive_rate: f64) -> Self {
+        let n = f64::from(expected_items).max(1.0);
+        let p = false_positive_rate.clamp(1e-10, 0.5);
+
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let m = ((-n * p.ln()) / (core::f64::consts::LN_2.powi(2))).ceil() as u32;
+        let m = m.max(64); // minimum 64 bits
+
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let k = ((f64::from(m) / n) * core::f64::consts::LN_2).ceil() as u8;
+        let k = k.clamp(1, 16);
+
+        let words = usize::try_from(m.div_ceil(64)).expect("BloomFilter word count fits usize");
+        Self {
+            bits: vec![0u64; words],
+            num_bits: m,
+            num_hashes: k,
+        }
+    }
+
+    /// Insert a page number into the filter.
+    pub fn insert(&mut self, page: crate::PageNumber) {
+        let raw = page.get();
+        let (h1, h2) = Self::double_hash(raw);
+        for i in 0..u32::from(self.num_hashes) {
+            let pos = (h1.wrapping_add(i.wrapping_mul(h2))) % self.num_bits;
+            let word = (pos / 64) as usize;
+            let bit = pos % 64;
+            self.bits[word] |= 1u64 << bit;
+        }
+    }
+
+    /// Check if a page number might be present.
+    ///
+    /// Returns `false` if definitely not present (zero false negatives).
+    /// Returns `true` if possibly present (may be false positive).
+    #[must_use]
+    pub fn maybe_contains(&self, page: crate::PageNumber) -> bool {
+        let raw = page.get();
+        let (h1, h2) = Self::double_hash(raw);
+        for i in 0..u32::from(self.num_hashes) {
+            let pos = (h1.wrapping_add(i.wrapping_mul(h2))) % self.num_bits;
+            let word = (pos / 64) as usize;
+            let bit = pos % 64;
+            if self.bits[word] & (1u64 << bit) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn double_hash(page_raw: u32) -> (u32, u32) {
+        let bytes = page_raw.to_le_bytes();
+        let h1 = xxhash_rust::xxh3::xxh3_64(&bytes);
+        let h2 = {
+            let digest = blake3::hash(&bytes);
+            let b = digest.as_bytes();
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let h1_trunc = h1 as u32;
+        (h1_trunc, h2)
+    }
+}
+
+/// Maps `PageNumber -> VersionPointer` for a specific commit range (§3.6.3).
+///
+/// Includes a bloom filter for fast "not present" checks. All index segments
+/// are ECS objects (content-addressed, repairable via RaptorQ).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageVersionIndexSegment {
+    /// Inclusive start of the commit range covered.
+    pub start_seq: u64,
+    /// Inclusive end of the commit range covered.
+    pub end_seq: u64,
+    /// Sorted entries mapping page numbers to version pointers.
+    pub entries: Vec<(crate::PageNumber, VersionPointer)>,
+    /// Bloom filter for fast "not present" checks.
+    pub bloom: BloomFilter,
+}
+
+impl PageVersionIndexSegment {
+    /// Create a new segment from entries. Sorts entries by page number and
+    /// builds the bloom filter automatically.
+    #[must_use]
+    pub fn new(
+        start_seq: u64,
+        end_seq: u64,
+        mut entries: Vec<(crate::PageNumber, VersionPointer)>,
+    ) -> Self {
+        entries.sort_by_key(|(pgno, _)| pgno.get());
+
+        #[allow(clippy::cast_possible_truncation)]
+        let count = entries.len() as u32;
+        let mut bloom = BloomFilter::new(count.max(1), 0.01);
+        for &(pgno, _) in &entries {
+            bloom.insert(pgno);
+        }
+
+        Self {
+            start_seq,
+            end_seq,
+            entries,
+            bloom,
+        }
+    }
+
+    /// Look up the newest version pointer for `page` with
+    /// `commit_seq <= snapshot_high`.
+    ///
+    /// Returns `None` if the page has no entry in this segment or if
+    /// no version is visible under the given snapshot.
+    #[must_use]
+    pub fn lookup(&self, page: crate::PageNumber, snapshot_high: u64) -> Option<&VersionPointer> {
+        if !self.bloom.maybe_contains(page) {
+            return None;
+        }
+        // Binary search on sorted entries
+        self.entries
+            .binary_search_by_key(&page.get(), |(pgno, _)| pgno.get())
+            .ok()
+            .and_then(|idx| {
+                let (_, ref vp) = self.entries[idx];
+                if vp.commit_seq <= snapshot_high {
+                    Some(vp)
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+/// Maps `ObjectId -> Vec<SymbolLogOffset>` — accelerator for finding
+/// symbols on disk (§3.6.3).
+///
+/// Rebuildable by scanning symbol logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectLocatorSegment {
+    /// Sorted entries mapping object IDs to their symbol log offsets.
+    pub entries: Vec<(ObjectId, Vec<SymbolLogOffset>)>,
+}
+
+impl ObjectLocatorSegment {
+    /// Create from unsorted entries. Sorts by `ObjectId` bytes for
+    /// deterministic encoding.
+    #[must_use]
+    pub fn new(mut entries: Vec<(ObjectId, Vec<SymbolLogOffset>)>) -> Self {
+        entries.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
+        Self { entries }
+    }
+
+    /// Look up symbol log offsets for a given `ObjectId`.
+    #[must_use]
+    pub fn lookup(&self, id: &ObjectId) -> Option<&[SymbolLogOffset]> {
+        self.entries
+            .binary_search_by(|(oid, _)| oid.as_bytes().cmp(id.as_bytes()))
+            .ok()
+            .map(|idx| self.entries[idx].1.as_slice())
+    }
+
+    /// Rebuild from a set of `(ObjectId, SymbolLogOffset)` pairs, typically
+    /// obtained by scanning symbol log files.
+    #[must_use]
+    pub fn rebuild_from_scan(pairs: impl IntoIterator<Item = (ObjectId, SymbolLogOffset)>) -> Self {
+        let mut map: std::collections::BTreeMap<[u8; 16], Vec<SymbolLogOffset>> =
+            std::collections::BTreeMap::new();
+        for (oid, offset) in pairs {
+            map.entry(*oid.as_bytes()).or_default().push(offset);
+        }
+        let entries: Vec<_> = map
+            .into_iter()
+            .map(|(bytes, mut offsets)| {
+                offsets.sort();
+                (ObjectId::from_bytes(bytes), offsets)
+            })
+            .collect();
+        Self { entries }
+    }
+}
+
+/// Maps commit_seq ranges to `IndexSegment` object IDs (§3.6.3).
+///
+/// Used for bootstrapping: given a commit_seq, find which index segment
+/// covers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestSegment {
+    /// Sorted, non-overlapping entries: (start_seq, end_seq, segment ObjectId).
+    pub entries: Vec<(u64, u64, ObjectId)>,
+}
+
+impl ManifestSegment {
+    /// Create from entries. Sorts by `start_seq` for binary search.
+    #[must_use]
+    pub fn new(mut entries: Vec<(u64, u64, ObjectId)>) -> Self {
+        entries.sort_by_key(|&(start, _, _)| start);
+        Self { entries }
+    }
+
+    /// Find the index segment covering the given `commit_seq`.
+    #[must_use]
+    pub fn lookup(&self, commit_seq: u64) -> Option<&ObjectId> {
+        // Binary search for the last entry with start_seq <= commit_seq
+        let idx = self
+            .entries
+            .partition_point(|&(start, _, _)| start <= commit_seq);
+        if idx == 0 {
+            return None;
+        }
+        let (start, end, ref oid) = self.entries[idx - 1];
+        if commit_seq >= start && commit_seq <= end {
+            Some(oid)
+        } else {
+            None
+        }
     }
 }
 
@@ -815,20 +1193,6 @@ mod proptests {
             let bytes = rec.to_bytes();
             let rec2 = SymbolRecord::from_bytes(&bytes).unwrap();
             prop_assert_eq!(rec, rec2);
-        }
-
-        #[test]
-        fn prop_frame_xxh3_collision_resistance(
-            a in proptest::collection::vec(any::<u8>(), 64..=64),
-            b in proptest::collection::vec(any::<u8>(), 64..=64),
-        ) {
-            if a != b {
-                let oid = ObjectId::from_bytes([8u8; 16]);
-                let oti = Oti { f: 64, al: 4, t: 64, z: 1, n: 1 };
-                let rec_a = SymbolRecord::new(oid, oti, 0, a, SymbolRecordFlags::empty());
-                let rec_b = SymbolRecord::new(oid, oti, 0, b, SymbolRecordFlags::empty());
-                prop_assert_ne!(rec_a.frame_xxh3, rec_b.frame_xxh3);
-            }
         }
     }
 }
