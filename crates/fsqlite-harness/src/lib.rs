@@ -123,13 +123,12 @@ mod gf256_verification {
         let mut table = [0_u8; 512];
         let mut val: u16 = 1;
         for i in 0..255 {
-            #[allow(clippy::cast_possible_truncation)]
-            let v = val as u8;
+            let v = u8::try_from(val).expect("exp table value fits in u8");
             table[i] = v;
             table[i + 255] = v; // mirror for mod-free lookup
             val <<= 1;
             if val & 0x100 != 0 {
-                val ^= 0x100 | u16::from(POLY_REDUCTION);
+                val ^= POLY_FULL;
             }
         }
         table[255] = 1;
@@ -141,13 +140,11 @@ mod gf256_verification {
         let mut table = [0_u8; 256];
         let mut val: u16 = 1;
         for i in 0_u16..=254 {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                table[usize::from(val)] = i as u8;
-            }
+            let i_u8 = u8::try_from(i).expect("log table index fits in u8");
+            table[usize::from(val)] = i_u8;
             val <<= 1;
             if val & 0x100 != 0 {
-                val ^= 0x100 | u16::from(POLY_REDUCTION);
+                val ^= POLY_FULL;
             }
         }
         table
@@ -572,6 +569,13 @@ mod gf256_verification {
         // Add enough repair symbols to reach L total.
         for esi in k_u32..l_u32 {
             let (cols, coefs) = decoder.repair_equation(esi);
+            assert_eq!(
+                cols.len(),
+                coefs.len(),
+                "bead_id={BEAD_ID} case=e2e_repair_equation_shape_mismatch esi={esi} cols_len={} coefs_len={}",
+                cols.len(),
+                coefs.len(),
+            );
 
             // Build repair symbol bytes from the encoder's intermediate symbols using the oracle GF(256).
             let mut repair = vec![0_u8; symbol_size];

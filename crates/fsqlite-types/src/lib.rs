@@ -9,13 +9,17 @@ pub mod serial_type;
 pub mod value;
 
 pub use cx::Cx;
-pub use ecs::{ObjectId, PayloadHash};
+pub use ecs::{
+    ObjectId, PayloadHash, SYMBOL_RECORD_MAGIC, SYMBOL_RECORD_VERSION, SymbolRecord,
+    SymbolRecordError, SymbolRecordFlags,
+};
 pub use glossary::{
     ArcCache, Budget, CommitCapsule, CommitMarker, CommitProof, CommitSeq, DecodeProof,
-    DependencyEdge, EpochId, IdempotencyKey, IndexId, IntentLog, IntentOp, Oti, Outcome,
-    PageHistory, PageVersion, RangeKey, ReadWitness, Region, RemoteCap, RootManifest, RowId, Saga,
-    SchemaEpoch, Snapshot, SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId, TxnEpoch, TxnId,
-    TxnSlot, TxnToken, VersionPointer, WitnessIndexSegment, WitnessKey, WriteWitness,
+    DependencyEdge, EpochId, IdempotencyKey, IndexId, IntentLog, IntentOp, OTI_WIRE_SIZE, Oti,
+    Outcome, PageHistory, PageVersion, RangeKey, ReadWitness, Region, RemoteCap, RootManifest,
+    RowId, Saga, SchemaEpoch, Snapshot, SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId,
+    TxnEpoch, TxnId, TxnSlot, TxnToken, VersionPointer, WitnessIndexSegment, WitnessKey,
+    WriteWitness,
 };
 
 use std::fmt;

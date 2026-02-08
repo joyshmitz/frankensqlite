@@ -20,8 +20,9 @@
 //! ```compile_fail
 //! use fsqlite_types::cx::{cap, Cx};
 //!
-//! let cx = Cx::<cap::None>::new();
-//! let _nope = cx.restrict::<cap::All>();
+//! let cx = Cx::<cap::All>::new();
+//! let compute = cx.restrict::<cap::None>();
+//! let _nope = compute.restrict::<cap::All>();
 //! ```
 
 use std::marker::PhantomData;
@@ -268,14 +269,14 @@ impl CxInner {
 
 /// Capability context passed through all effectful operations.
 #[derive(Debug)]
-pub struct Cx<Caps = FullCaps> {
+pub struct Cx<Caps: cap::SubsetOf<cap::All> = FullCaps> {
     inner: Arc<CxInner>,
     budget: Budget,
     // fn() -> Caps ensures Send+Sync regardless of Caps marker type.
     _caps: PhantomData<fn() -> Caps>,
 }
 
-impl<Caps> Clone for Cx<Caps> {
+impl<Caps: cap::SubsetOf<cap::All>> Clone for Cx<Caps> {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
@@ -298,7 +299,7 @@ impl Cx<FullCaps> {
     }
 }
 
-impl<Caps> Cx<Caps> {
+impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[must_use]
     pub fn with_budget(budget: Budget) -> Self {
         Self {
@@ -329,11 +330,7 @@ impl<Caps> Cx<Caps> {
     /// Returns a cleanup scope that uses [`Budget::MINIMAL`].
     #[must_use]
     pub fn cleanup_scope(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-            budget: Budget::MINIMAL,
-            _caps: PhantomData,
-        }
+        self.scope_with_budget(Budget::MINIMAL)
     }
 
     /// Re-type this context to a narrower capability set.
@@ -342,14 +339,17 @@ impl<Caps> Cx<Caps> {
     #[must_use]
     pub fn restrict<NewCaps>(&self) -> Cx<NewCaps>
     where
-        NewCaps: cap::SubsetOf<Caps>,
+        NewCaps: cap::SubsetOf<cap::All> + cap::SubsetOf<Caps>,
     {
         self.retype()
     }
 
     /// Internal re-typing helper without subset enforcement.
     #[must_use]
-    pub fn retype<NewCaps>(&self) -> Cx<NewCaps> {
+    fn retype<NewCaps>(&self) -> Cx<NewCaps>
+    where
+        NewCaps: cap::SubsetOf<cap::All>,
+    {
         Cx {
             inner: Arc::clone(&self.inner),
             budget: self.budget,

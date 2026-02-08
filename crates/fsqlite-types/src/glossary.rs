@@ -232,18 +232,59 @@ pub struct CommitMarker {
 }
 
 /// Object Transmission Information (RaptorQ / RFC 6330).
+///
+/// This is an internal encoding, NOT the RFC 6330 Common FEC OTI wire format.
+/// Field widths are widened for implementation convenience:
+/// - `f` is `u64` (RFC: 40-bit)
+/// - `t` is `u32` (RFC: 16-bit) -- supports `page_size = 65_536`
+/// - `z` is `u32` (RFC: 12-bit)
+/// - `n` is `u32` (RFC: 8-bit)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Oti {
     /// Transfer length (bytes).
     pub f: u64,
     /// Alignment parameter.
-    pub al: u8,
-    /// Symbol size (bytes).
-    pub t: u16,
+    pub al: u16,
+    /// Symbol size (bytes). `u32` to represent all valid SQLite page sizes.
+    pub t: u32,
     /// Number of source blocks.
-    pub z: u16,
+    pub z: u32,
     /// Number of sub-blocks.
-    pub n: u16,
+    pub n: u32,
+}
+
+/// Serialized size of [`Oti`] on the wire: `8 + 2 + 4 + 4 + 4 = 22` bytes.
+pub const OTI_WIRE_SIZE: usize = 22;
+
+impl Oti {
+    /// Serialize to canonical little-endian bytes.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; OTI_WIRE_SIZE] {
+        let mut buf = [0u8; OTI_WIRE_SIZE];
+        buf[0..8].copy_from_slice(&self.f.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.al.to_le_bytes());
+        buf[10..14].copy_from_slice(&self.t.to_le_bytes());
+        buf[14..18].copy_from_slice(&self.z.to_le_bytes());
+        buf[18..22].copy_from_slice(&self.n.to_le_bytes());
+        buf
+    }
+
+    /// Deserialize from canonical little-endian bytes.
+    ///
+    /// Returns `None` if `data` is shorter than [`OTI_WIRE_SIZE`].
+    #[must_use]
+    pub fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < OTI_WIRE_SIZE {
+            return None;
+        }
+        Some(Self {
+            f: u64::from_le_bytes(data[0..8].try_into().ok()?),
+            al: u16::from_le_bytes(data[8..10].try_into().ok()?),
+            t: u32::from_le_bytes(data[10..14].try_into().ok()?),
+            z: u32::from_le_bytes(data[14..18].try_into().ok()?),
+            n: u32::from_le_bytes(data[18..22].try_into().ok()?),
+        })
+    }
 }
 
 /// Proof that a decode was correct (structure depends on codec mode).
@@ -569,6 +610,19 @@ mod tests {
     }
 
     #[test]
+    fn test_oti_field_widths_allow_large_symbol_size() {
+        // §3.5.2 requires T/Z/N to represent values >= 65536.
+        let oti = Oti {
+            f: 1,
+            al: 4,
+            t: 65_536,
+            z: 1,
+            n: 1,
+        };
+        assert_eq!(oti.t, 65_536);
+    }
+
+    #[test]
     fn test_budget_product_lattice_semantics() {
         let a = Budget {
             deadline: Some(Duration::from_millis(100)),
@@ -633,7 +687,7 @@ mod tests {
         assert_debug_clone::<CommitMarker>();
         assert_debug_clone::<Oti>();
         assert_debug_clone::<DecodeProof>();
-        assert_debug_clone::<Cx<()>>();
+        assert_debug_clone::<Cx<crate::cx::ComputeCaps>>();
         assert_debug_clone::<Budget>();
         assert_debug_clone::<Outcome>();
         assert_debug_clone::<EpochId>();

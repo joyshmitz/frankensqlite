@@ -12,6 +12,7 @@ bitflags = { workspace = true }
 blake3 = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

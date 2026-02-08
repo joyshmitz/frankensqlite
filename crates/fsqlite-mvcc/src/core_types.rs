@@ -31,8 +31,22 @@ pub struct VersionIdx {
 
 impl VersionIdx {
     #[inline]
-    const fn new(chunk: u32, offset: u32) -> Self {
+    pub(crate) const fn new(chunk: u32, offset: u32) -> Self {
         Self { chunk, offset }
+    }
+
+    /// Chunk index within the arena.
+    #[inline]
+    #[must_use]
+    pub fn chunk(&self) -> u32 {
+        self.chunk
+    }
+
+    /// Offset within the chunk.
+    #[inline]
+    #[must_use]
+    pub fn offset(&self) -> u32 {
+        self.offset
     }
 }
 
@@ -86,10 +100,10 @@ impl VersionArena {
     ///
     /// # Panics
     ///
-    /// Debug-asserts that the slot is currently occupied (catches double-free).
+    /// Asserts that the slot is currently occupied (catches double-free).
     pub fn free(&mut self, idx: VersionIdx) {
         let slot = &mut self.chunks[idx.chunk as usize][idx.offset as usize];
-        debug_assert!(slot.is_some(), "VersionArena::free: double-free of {idx:?}");
+        assert!(slot.is_some(), "VersionArena::free: double-free of {idx:?}");
         *slot = None;
         self.free_list.push(idx);
     }
@@ -140,8 +154,8 @@ impl Default for VersionArena {
 impl std::fmt::Debug for VersionArena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VersionArena")
-            .field("chunks", &self.chunks.len())
-            .field("free_list", &self.free_list.len())
+            .field("chunk_count", &self.chunks.len())
+            .field("free_count", &self.free_list.len())
             .field("high_water", &self.high_water)
             .finish_non_exhaustive()
     }
@@ -448,10 +462,10 @@ impl CommitLog {
 
     /// Look up a commit record by its `CommitSeq`.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
     pub fn get(&self, seq: CommitSeq) -> Option<&CommitRecord> {
         let idx = seq.get().checked_sub(self.base_seq)?;
-        self.records.get(idx as usize)
+        let idx = usize::try_from(idx).ok()?;
+        self.records.get(idx)
     }
 
     /// Number of records in the log.
@@ -551,21 +565,53 @@ impl std::fmt::Debug for CommitIndex {
 
 /// An owned, page-sized buffer.
 ///
-/// The data is always exactly `page_size` bytes. For the MVP, alignment
-/// is handled by the allocator (Vec guarantees sufficient alignment for
-/// the element type).
-#[derive(Clone, PartialEq, Eq)]
+/// The exposed page slice is always exactly `page_size` bytes and is
+/// guaranteed to be aligned to `page_size`.
+///
+/// Internally this uses a slightly larger `Vec<u8>` allocation and a
+/// subslice offset chosen to satisfy alignment without unsafe code.
 pub struct PageBuf {
-    data: Vec<u8>,
+    alloc: Vec<u8>,
+    offset: usize,
     page_size: PageSize,
 }
 
+impl Clone for PageBuf {
+    fn clone(&self) -> Self {
+        // Cannot derive Clone: the cloned Vec gets a new heap address,
+        // so the offset computed for the original allocation is invalid.
+        // Allocate a fresh aligned buffer and copy the page data in.
+        let mut buf = Self::zeroed(self.page_size);
+        buf.as_bytes_mut().copy_from_slice(self.as_bytes());
+        buf
+    }
+}
+
 impl PageBuf {
+    #[inline]
+    fn start(&self) -> usize {
+        self.offset
+    }
+
+    #[inline]
+    fn end(&self) -> usize {
+        self.offset + self.page_size.as_usize()
+    }
+
     /// Create a zeroed page buffer.
     #[must_use]
     pub fn zeroed(page_size: PageSize) -> Self {
+        let align = page_size.as_usize();
+        let len = page_size.as_usize() + align - 1;
+        let alloc = vec![0u8; len];
+
+        let base = alloc.as_ptr() as usize;
+        let rem = base % align;
+        let offset = if rem == 0 { 0 } else { align - rem };
+
         Self {
-            data: vec![0u8; page_size.as_usize()],
+            alloc,
+            offset,
             page_size,
         }
     }
@@ -574,17 +620,31 @@ impl PageBuf {
     #[must_use]
     pub fn from_vec(data: Vec<u8>, page_size: PageSize) -> Self {
         assert_eq!(data.len(), page_size.as_usize(), "PageBuf size mismatch");
-        Self { data, page_size }
+        // Fast path: already aligned; reuse the allocation without copying.
+        if (data.as_ptr() as usize) % page_size.as_usize() == 0 {
+            return Self {
+                alloc: data,
+                offset: 0,
+                page_size,
+            };
+        }
+
+        // Slow path: realign via a fresh allocation.
+        let mut buf = Self::zeroed(page_size);
+        buf.as_bytes_mut().copy_from_slice(&data);
+        buf
     }
 
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.data
+        &self.alloc[self.start()..self.end()]
     }
 
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.data
+        let start = self.start();
+        let end = self.end();
+        &mut self.alloc[start..end]
     }
 
     #[must_use]
@@ -595,9 +655,17 @@ impl PageBuf {
     /// Check if the data pointer is aligned to the page size.
     #[must_use]
     pub fn is_aligned(&self) -> bool {
-        (self.data.as_ptr() as usize) % self.page_size.as_usize() == 0
+        (self.as_bytes().as_ptr() as usize) % self.page_size.as_usize() == 0
     }
 }
+
+impl PartialEq for PageBuf {
+    fn eq(&self, other: &Self) -> bool {
+        self.page_size == other.page_size && self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for PageBuf {}
 
 #[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for PageBuf {
@@ -1069,12 +1137,40 @@ mod tests {
     #[test]
     fn test_page_buf_alignment() {
         let buf = PageBuf::zeroed(PageSize::DEFAULT);
-        // Vec<u8> alignment is at least 1, but on 64-bit systems the allocator
-        // often returns page-aligned memory for large allocations. Either way,
-        // verify the method itself returns a boolean correctly.
-        let _aligned = buf.is_aligned();
-        // Verify the data pointer is at least 8-byte aligned (allocator minimum).
-        assert_eq!(buf.as_bytes().as_ptr() as usize % 8, 0);
+        assert!(
+            buf.is_aligned(),
+            "PageBuf must be aligned to page_size (for direct I/O)"
+        );
+    }
+
+    #[test]
+    fn test_page_buf_from_vec_is_aligned_and_preserves_bytes() {
+        let mut data = vec![0u8; PageSize::DEFAULT.as_usize()];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = u8::try_from(i & 0xFF).unwrap_or(0);
+        }
+        let buf = PageBuf::from_vec(data.clone(), PageSize::DEFAULT);
+        assert!(
+            buf.is_aligned(),
+            "PageBuf::from_vec must yield aligned storage"
+        );
+        assert_eq!(buf.as_bytes(), data.as_slice());
+    }
+
+    #[test]
+    fn test_page_buf_clone_preserves_alignment_and_data() {
+        let mut buf = PageBuf::zeroed(PageSize::DEFAULT);
+        // Write a recognizable pattern.
+        for (i, b) in buf.as_bytes_mut().iter_mut().enumerate() {
+            *b = u8::try_from(i & 0xFF).unwrap_or(0);
+        }
+        let cloned = buf.clone();
+        assert!(
+            cloned.is_aligned(),
+            "cloned PageBuf must be aligned (new heap allocation)"
+        );
+        assert_eq!(cloned.as_bytes(), buf.as_bytes());
+        assert_eq!(cloned.page_size(), buf.page_size());
     }
 
     #[test]
@@ -1170,5 +1266,138 @@ mod tests {
             // No locks should remain.
             prop_assert_eq!(table.lock_count(), 0, "no phantom locks after release_all");
         }
+    }
+
+    // -- E2E: full transaction flow exercising all core types together --
+
+    #[test]
+    fn test_e2e_mvcc_core_types_roundtrip_in_real_txn_flow() {
+        // Setup shared infrastructure.
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut commit_log = CommitLog::new(CommitSeq::new(1));
+        let mut arena = VersionArena::new();
+
+        let snap = Snapshot::new(CommitSeq::new(0), SchemaEpoch::ZERO);
+
+        // --- Transaction 1: write pages 1 and 2, commit ---
+        let txn1_id = TxnId::new(1).unwrap();
+        let mut txn1 =
+            Transaction::new(txn1_id, TxnEpoch::new(0), snap, TransactionMode::Concurrent);
+        assert_eq!(txn1.state, TransactionState::Active);
+        assert_eq!(txn1.token(), TxnToken::new(txn1_id, TxnEpoch::new(0)));
+
+        let page1 = PageNumber::new(1).unwrap();
+        let page2 = PageNumber::new(2).unwrap();
+
+        // Acquire page locks.
+        lock_table.try_acquire(page1, txn1_id).unwrap();
+        lock_table.try_acquire(page2, txn1_id).unwrap();
+        txn1.page_locks.insert(page1);
+        txn1.page_locks.insert(page2);
+        txn1.write_set.push(page1);
+        txn1.write_set.push(page2);
+
+        // Allocate page versions in the arena.
+        let v1 = PageVersion {
+            pgno: page1,
+            commit_seq: CommitSeq::new(1),
+            created_by: txn1.token(),
+            data: PageData::zeroed(PageSize::DEFAULT),
+            prev: None,
+        };
+        let v2 = PageVersion {
+            pgno: page2,
+            commit_seq: CommitSeq::new(1),
+            created_by: txn1.token(),
+            data: PageData::zeroed(PageSize::DEFAULT),
+            prev: None,
+        };
+        let idx1 = arena.alloc(v1);
+        let idx2 = arena.alloc(v2);
+
+        // Commit txn1.
+        txn1.commit();
+        assert_eq!(txn1.state, TransactionState::Committed);
+
+        let rec1 = CommitRecord {
+            txn_id: txn1_id,
+            commit_seq: CommitSeq::new(1),
+            pages: SmallVec::from_slice(&[page1, page2]),
+            timestamp_unix_ns: 1000,
+        };
+        commit_log.append(rec1);
+        commit_index.update(page1, CommitSeq::new(1));
+        commit_index.update(page2, CommitSeq::new(1));
+
+        // Release locks.
+        lock_table.release_all(txn1_id);
+        assert_eq!(lock_table.lock_count(), 0);
+
+        // Verify commit log and index.
+        assert_eq!(commit_log.latest_seq(), Some(CommitSeq::new(1)));
+        assert_eq!(commit_index.latest(page1), Some(CommitSeq::new(1)));
+        assert_eq!(commit_index.latest(page2), Some(CommitSeq::new(1)));
+
+        // --- Transaction 2: reads page 1 at snapshot, writes page 2, detects SSI ---
+        let snap2 = Snapshot::new(CommitSeq::new(1), SchemaEpoch::ZERO);
+        let txn2_id = TxnId::new(2).unwrap();
+        let mut txn2 = Transaction::new(
+            txn2_id,
+            TxnEpoch::new(0),
+            snap2,
+            TransactionMode::Concurrent,
+        );
+
+        // Read page 1 — version is visible via snapshot.
+        let read_ver = arena.get(idx1).unwrap();
+        assert_eq!(read_ver.pgno, page1);
+        assert!(read_ver.commit_seq <= txn2.snapshot.high);
+        txn2.read_keys.insert(WitnessKey::Page(page1));
+
+        // Write page 2 — acquire lock, create new version chained to old.
+        lock_table.try_acquire(page2, txn2_id).unwrap();
+        txn2.page_locks.insert(page2);
+        txn2.write_set.push(page2);
+        txn2.write_keys.insert(WitnessKey::Page(page2));
+
+        let v2_new = PageVersion {
+            pgno: page2,
+            commit_seq: CommitSeq::new(2),
+            created_by: txn2.token(),
+            data: PageData::zeroed(PageSize::DEFAULT),
+            prev: Some(VersionPointer::new(
+                u64::from(idx2.chunk) << 32 | u64::from(idx2.offset),
+            )),
+        };
+        let idx2_new = arena.alloc(v2_new);
+
+        // SSI detection: simulate rw-antidependency edges.
+        txn2.has_in_rw = true;
+        assert!(!txn2.has_dangerous_structure());
+        txn2.has_out_rw = true;
+        assert!(txn2.has_dangerous_structure());
+
+        // Despite dangerous structure, abort txn2 (SSI would require it).
+        txn2.abort();
+        assert_eq!(txn2.state, TransactionState::Aborted);
+
+        // Release locks and free the aborted version.
+        lock_table.release_all(txn2_id);
+        arena.free(idx2_new);
+
+        // Verify arena: original versions still live, aborted one freed.
+        assert!(arena.get(idx1).is_some());
+        assert!(arena.get(idx2).is_some());
+        assert!(arena.get(idx2_new).is_none());
+
+        // Verify commit log unchanged (txn2 aborted, nothing committed).
+        assert_eq!(commit_log.len(), 1);
+        assert_eq!(commit_log.latest_seq(), Some(CommitSeq::new(1)));
+
+        // Final infrastructure sanity.
+        assert_eq!(lock_table.lock_count(), 0);
+        assert_eq!(arena.high_water(), 3); // 3 total allocations (idx1, idx2, idx2_new)
+        assert_eq!(arena.free_count(), 1); // idx2_new was freed
     }
 }

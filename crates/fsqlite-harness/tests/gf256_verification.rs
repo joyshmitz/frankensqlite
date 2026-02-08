@@ -22,9 +22,11 @@ const POLY_FULL: u16 = 0x11D;
 // Reduction mask (low 8 bits after subtracting x^8), used in xtime-style multiply.
 const POLY_REDUCTION: u8 = 0x1D;
 
+#[track_caller]
 fn fail_u8_case(case: &'static str, a: u8, b: u8, expected: u8, actual: u8, source: &'static str) {
-    panic!(
-        "bead_id={BEAD_ID} case={case} a=0x{a:02x} b=0x{b:02x} expected=0x{expected:02x} actual=0x{actual:02x} source={source}"
+    assert_eq!(
+        actual, expected,
+        "bead_id={BEAD_ID} case={case} a=0x{a:02X} b=0x{b:02X} source={source}",
     );
 }
 
@@ -160,7 +162,7 @@ fn test_gf256_log_exp_roundtrip_nonzero() {
 #[test]
 fn test_gf256_exp_table_extended_range() {
     let exp = build_exp_table();
-    for i in 0_usize..255 {
+    for i in 0_usize..=255 {
         assert_eq!(exp[i], exp[i + 255], "mirror mismatch at i={i}");
     }
 }
