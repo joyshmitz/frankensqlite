@@ -3,8 +3,8 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>FrankenSQLite Spec Evolution</title>
-    <meta name="description" content="Interactive visualization of 137 commits across 12 deep sessions building a 10,791-line comprehensive database specification." />
+    <title>FrankenSQLite | Spec Evolution</title>
+    <meta name="description" content="Interactive evolution of the FrankenSQLite comprehensive specification." />
     
     <!-- OpenGraph & Favicon -->
     <meta property="og:title" content="FrankenSQLite Spec Evolution" />
@@ -16,427 +16,690 @@
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Inter:wght@400;600;800&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" />
     <style>
-        /* === FrankenTUI Base === */
         :root {
-          --bg-color: #050505;
-          --fg-color: #33ff00;
-          --dim-color: #004400;
-          --accent-color: #bd00ff;
-          --error-color: #ff003c;
-          --panel-bg: #0a0a0a;
-          --border-color: #33ff00;
-          --grid-line: #112211;
-          --font-mono: 'JetBrains Mono', monospace;
-          --glow: 0 0 10px rgba(51, 255, 0, 0.2);
+            --bg: #0a0c10;
+            --panel: #0d1117;
+            --sidebar: #010409;
+            --fg: #e6edf3;
+            --fg-dim: #848d97;
+            --primary: #33ff00; /* Classic Terminal Green */
+            --primary-dim: rgba(51, 255, 0, 0.2);
+            --accent: #bd00ff; /* Purple for "Alien Math" */
+            --border: #30363d;
+            --border-bright: #484f58;
+            --font-mono: 'JetBrains Mono', monospace;
+            --font-sans: 'Inter', sans-serif;
+            --glow: 0 0 15px rgba(51, 255, 0, 0.15);
         }
+
         * { box-sizing: border-box; }
+        
         body {
-          background-color: var(--bg-color);
-          color: var(--fg-color);
-          font-family: var(--font-mono);
-          margin: 0;
-          overflow: hidden;
-          height: 100vh;
-          display: flex;
-          flex-direction: column;
+            background-color: var(--bg);
+            color: var(--fg);
+            font-family: var(--font-sans);
+            margin: 0;
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
         }
-        .tui-header {
-          border-bottom: 2px solid var(--border-color);
-          padding: 0.5rem 1rem;
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-          text-transform: uppercase;
-          letter-spacing: 0.1em;
-        }
-        .tui-panel {
-          border: 1px solid var(--border-color);
-          background: var(--panel-bg);
-          position: relative;
-          display: flex;
-          flex-direction: column;
-          box-shadow: var(--glow);
-        }
-        .tui-panel::before {
-          content: "";
-          position: absolute;
-          top: -1px; left: -1px; right: -1px; bottom: -1px;
-          border: 1px dashed var(--dim-color);
-          pointer-events: none;
-          z-index: 1;
-        }
-        button {
-          background: transparent;
-          border: 1px solid var(--fg-color);
-          color: var(--fg-color);
-          font-family: var(--font-mono);
-          padding: 0.5rem 1rem;
-          cursor: pointer;
-          text-transform: uppercase;
-          transition: all 0.1s;
-        }
-        button:hover {
-          background: var(--fg-color);
-          color: var(--bg-color);
-          box-shadow: var(--glow);
-        }
-        button:active { transform: translateY(1px); }
-        input, select {
-          background: #000;
-          border: 1px solid var(--dim-color);
-          color: var(--fg-color);
-          font-family: var(--font-mono);
-          padding: 0.5rem;
-          width: 100%;
-        }
-        input:focus, select:focus {
-          border-color: var(--fg-color);
-          outline: none;
-          box-shadow: var(--glow);
-        }
-        ::-webkit-scrollbar { width: 10px; height: 10px; }
-        ::-webkit-scrollbar-track { background: var(--bg-color); border-left: 1px solid var(--dim-color); }
-        ::-webkit-scrollbar-thumb { background: var(--dim-color); border: 1px solid var(--bg-color); }
-        ::-webkit-scrollbar-thumb:hover { background: var(--fg-color); }
-        .hidden { display: none !important; }
-        .flex { display: flex; }
-        .gap-2 { gap: 0.5rem; }
-        .gap-3 { gap: 0.75rem; }
-        .gap-4 { gap: 1rem; }
-        .items-center { align-items: center; }
-        .justify-between { justify-content: space-between; }
-        .w-full { width: 100%; }
-        .h-full { height: 100%; }
-        .mt-4 { margin-top: 1rem; }
-        .mb-1 { margin-bottom: 0.25rem; }
-        .mb-2 { margin-bottom: 0.5rem; }
-        .mb-4 { margin-bottom: 1rem; }
-        .text-xs { font-size: 0.75rem; }
-        .text-xl { font-size: 1.25rem; }
-        .text-2xl { font-size: 1.5rem; }
-        .font-bold { font-weight: bold; }
-        .font-mono { font-family: var(--font-mono); }
-        .text-dim { color: var(--dim-color); }
-        .text-center { text-align: center; }
-        .text-white { color: #fff; }
-        .uppercase { text-transform: uppercase; }
-        .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .select-none { user-select: none; }
-        .cursor-pointer { cursor: pointer; }
-        .relative { position: relative; }
-        .absolute { position: absolute; }
-        .inset-0 { inset: 0; }
-        .flex-1 { flex: 1; }
-        .flex-col { flex-direction: column; }
-        .flex-shrink-0 { flex-shrink: 0; }
-        .overflow-hidden { overflow: hidden; }
-        .overflow-y-auto { overflow-y: auto; }
-        .pointer-events-none { pointer-events: none; }
-        .z-50 { z-index: 50; }
 
-        /* === Specific overrides for this viz tool === */
-        .main-container { flex: 1; display: flex; overflow: hidden; position: relative; }
-        .sidebar { width: 320px; border-right: 1px solid var(--dim-color); display: flex; flex-direction: column; background: var(--bg-color); flex-shrink: 0; }
-        .content-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: #080808; }
-        
-        .pane-header { padding: 0.5rem 1rem; background: #0f0f0f; border-bottom: 1px solid var(--dim-color); font-size: 0.75rem; text-transform: uppercase; font-weight: bold; color: var(--fg-color); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; height: 40px; }
-        .pane-scroll { flex: 1; overflow-y: auto; padding: 1rem; position: relative; }
-        
-        /* Commit List */
-        .commit-item { border: 1px solid var(--dim-color); padding: 0.75rem; margin-bottom: 0.5rem; background: #0a0a0a; cursor: pointer; transition: all 0.1s; }
-        .commit-item:hover { border-color: var(--fg-color); background: #111; }
-        .commit-item.selected { border: 1px solid var(--fg-color); box-shadow: 0 0 10px rgba(51, 255, 0, 0.1); background: #0f150f; }
-        
-        /* Dock */
-        .dock { height: 80px; background: #000; border-top: 1px solid var(--border-color); padding: 0.5rem 1rem; display: flex; flex-direction: column; gap: 0.5rem; z-index: 100; flex-shrink: 0; }
-        .dock-controls { display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; }
-        .dock-canvas { width: 100%; height: 30px; display: block; }
-        input[type="range"] { width: 100%; accent-color: var(--fg-color); height: 4px; background: var(--dim-color); border: none; }
-        
-        /* Charts */
-        .chart-container { width: 100%; height: 100%; min-height: 200px; position: relative; }
-        
-        /* Markdown */
-        .doc-view { padding-right: 1rem; max-width: 900px; margin: 0 auto; color: #ccc; font-size: 0.9rem; line-height: 1.6; }
-        .doc-view h1, .doc-view h2, .doc-view h3 { color: var(--fg-color); border-bottom: 1px dashed var(--dim-color); padding-bottom: 0.5rem; margin-top: 2rem; }
-        .doc-view code { color: #bd00ff; background: #151515; padding: 2px 4px; border-radius: 3px; font-size: 0.85em; }
-        .doc-view pre { background: #111; border: 1px solid var(--dim-color); padding: 1rem; overflow-x: auto; margin: 1rem 0; }
-        
-        /* Search Palette */
-        #searchPaletteOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 200; display: flex; justify-content: center; align-items: flex-start; padding-top: 100px; }
-        .search-palette { width: 600px; background: #000; border: 1px solid var(--fg-color); padding: 0; box-shadow: 0 0 20px rgba(51, 255, 0, 0.2); }
-        .search-palette-input { width: 100%; background: transparent; border: none; border-bottom: 1px solid var(--dim-color); padding: 1rem; font-size: 1.2rem; color: var(--fg-color); font-family: 'JetBrains Mono'; outline: none; }
-        .search-palette-results { max-height: 400px; overflow-y: auto; padding: 0.5rem; }
-        .search-palette-item { padding: 0.5rem; cursor: pointer; display: flex; gap: 1rem; align-items: center; color: #888; }
-        .search-palette-item:hover, .search-palette-item.active { background: #111; border-left: 2px solid var(--fg-color); color: #fff; }
-        .search-palette-hint { color: #555; padding: 1rem; text-align: center; font-style: italic; }
-        .search-palette-footer { padding: 0.5rem; border-top: 1px solid var(--dim-color); display: flex; justify-content: flex-end; gap: 1rem; font-size: 0.7rem; color: #555; }
-
-        /* KPI */
-        .kpi-bar { display: flex; gap: 1.5rem; font-size: 0.8rem; }
-        .kpi-val { color: #fff; font-weight: bold; }
-
-        /* --- World-Class Overrides --- */
-        body {
-            background-color: #020202;
-            background-image:
-                radial-gradient(circle at 50% 0%, #001100 0%, transparent 60%),
-                linear-gradient(0deg, rgba(0,0,0,0.2) 50%, transparent 50%);
+        /* Background Effects */
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            background-image: 
+                radial-gradient(circle at 50% -20%, rgba(51, 255, 0, 0.05), transparent 70%),
+                linear-gradient(var(--bg) 50%, transparent 50%);
             background-size: 100% 100%, 100% 4px;
-            text-shadow: 0 0 2px rgba(51, 255, 0, 0.3);
-        }
-        body::after {
-            content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
-            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%),
-                        linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
-            background-size: 100% 3px, 3px 100%;
-            opacity: 0.4;
-            mix-blend-mode: overlay;
+            pointer-events: none;
+            z-index: -1;
         }
 
-        .dock {
-            position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-            width: 90%; max-width: 900px; height: auto;
-            background: rgba(10, 10, 10, 0.85);
-            border: 1px solid rgba(51, 255, 0, 0.3);
-            border-radius: 16px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.6), 0 0 20px rgba(51, 255, 0, 0.05);
-            backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-            padding: 12px 20px;
-            display: flex; flex-direction: column; gap: 8px;
-            z-index: 1000;
-            transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
-        }
-        .dock:hover {
-            border-color: var(--fg-color);
-            box-shadow: 0 15px 40px rgba(0,0,0,0.7), 0 0 30px rgba(51, 255, 0, 0.15);
-            transform: translateX(-50%) translateY(-2px);
+        /* --- Header --- */
+        .app-header {
+            height: 60px;
+            background: var(--sidebar);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 24px;
+            flex-shrink: 0;
+            z-index: 100;
         }
 
-        .sidebar, .pane-header, .tui-panel {
-            background: rgba(5, 5, 5, 0.85);
-            backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
-            border-color: rgba(51, 255, 0, 0.15);
-        }
-        .pane-header {
-            background: linear-gradient(90deg, rgba(0,20,0,0.6), rgba(0,0,0,0.6));
-            border-bottom: 1px solid rgba(51, 255, 0, 0.2);
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
         }
 
-        .commit-item {
-            border-left-width: 2px;
-            margin-bottom: 4px;
-            background: rgba(255,255,255,0.015);
-            transition: all 0.2s ease-out;
-            border-radius: 0 4px 4px 0;
-        }
-        .commit-item:hover {
-            background: rgba(51, 255, 0, 0.05);
-            border-left-color: var(--fg-color);
-            padding-left: 1rem;
-        }
-        .commit-item.selected {
-            background: linear-gradient(90deg, rgba(51, 255, 0, 0.1), transparent);
-            border-left: 3px solid var(--fg-color);
-            box-shadow: 0 0 15px rgba(51, 255, 0, 0.05);
+        .brand img {
+            height: 32px;
+            border-radius: 4px;
         }
 
-        button {
-            border-radius: 6px;
-            background: rgba(0,0,0,0.4);
-            border-color: rgba(51, 255, 0, 0.3);
+        .brand h1 {
+            font-size: 1.1rem;
+            font-weight: 800;
             letter-spacing: 0.05em;
+            margin: 0;
+            text-transform: uppercase;
+            color: var(--primary);
+            text-shadow: var(--glow);
+        }
+
+        .kpis {
+            display: flex;
+            gap: 24px;
+        }
+
+        .kpi {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+        }
+
+        .kpi-label {
+            font-size: 10px;
+            text-transform: uppercase;
+            color: var(--fg-dim);
+            font-family: var(--font-mono);
+            letter-spacing: 0.1em;
+        }
+
+        .kpi-value {
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--fg);
+            font-family: var(--font-mono);
+        }
+
+        /* --- Main Layout --- */
+        .app-body {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 340px;
+            background: var(--sidebar);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            flex-shrink: 0;
+            transition: all 0.3s ease;
+        }
+
+        .sidebar-header {
+            padding: 16px;
+            border-bottom: 1px solid var(--border);
+            background: rgba(255,255,255,0.02);
+        }
+
+        .search-box {
+            position: relative;
+            margin-bottom: 12px;
+        }
+
+        .search-box input {
+            width: 100%;
+            background: #000;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 12px;
+            color: var(--fg);
+            font-family: var(--font-mono);
+            font-size: 12px;
+            outline: none;
+        }
+
+        .search-box input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px var(--primary-dim);
+        }
+
+        .filter-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .commit-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px;
+        }
+
+        .commit-card {
+            padding: 12px;
+            border-radius: 6px;
+            margin-bottom: 4px;
+            cursor: pointer;
+            border: 1px solid transparent;
+            transition: all 0.2s;
+            position: relative;
+        }
+
+        .commit-card:hover {
+            background: rgba(255,255,255,0.05);
+            border-color: var(--border-bright);
+        }
+
+        .commit-card.selected {
+            background: rgba(51, 255, 0, 0.05);
+            border-color: var(--primary);
+            box-shadow: inset 4px 0 0 var(--primary);
+        }
+
+        .commit-card-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+            font-size: 10px;
+            font-family: var(--font-mono);
+            color: var(--fg-dim);
+        }
+
+        .commit-card-subject {
+            font-size: 12px;
+            font-weight: 500;
+            line-height: 1.4;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .commit-card-meta {
+            margin-top: 6px;
+            display: flex;
+            gap: 8px;
+            font-size: 10px;
+            font-family: var(--font-mono);
+        }
+
+        .tag {
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-size: 9px;
+            text-transform: uppercase;
+        }
+
+        /* Content Area */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: var(--bg);
+            overflow: hidden;
+        }
+
+        .content-header {
+            height: 48px;
+            background: var(--panel);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 16px;
+            flex-shrink: 0;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 4px;
+        }
+
+        .tab {
+            padding: 6px 16px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            cursor: pointer;
+            border-radius: 4px;
+            color: var(--fg-dim);
             transition: all 0.2s;
         }
-        button:hover {
-            background: rgba(51, 255, 0, 0.1);
-            border-color: var(--fg-color);
-            box-shadow: 0 0 10px rgba(51, 255, 0, 0.2);
-            text-shadow: 0 0 8px var(--fg-color);
-        }
-        button.active {
-            background: var(--fg-color);
-            color: #000;
-            box-shadow: 0 0 15px rgba(51, 255, 0, 0.4);
+
+        .tab:hover {
+            color: var(--fg);
+            background: rgba(255,255,255,0.05);
         }
 
-        @keyframes galaxy-pulse {
-            0% { box-shadow: 0 0 5px #ff00ff; }
-            50% { box-shadow: 0 0 25px #ff00ff, 0 0 10px #00ffff; }
-            100% { box-shadow: 0 0 5px #ff00ff; }
+        .tab.active {
+            color: var(--primary);
+            background: var(--primary-dim);
         }
-        .galaxy-mode {
-            --fg-color: #00ffff !important;
-            --dim-color: #330033 !important;
-            --border-color: #ff00ff !important;
-            --accent-color: #ff00ff !important;
+
+        .viewport {
+            flex: 1;
+            overflow: hidden;
+            position: relative;
         }
-        .galaxy-mode body {
-            background-image: radial-gradient(circle at 50% 50%, #1a001a 0%, #000 80%);
+
+        .scroll-pane {
+            height: 100%;
+            overflow-y: auto;
+            padding: 40px;
+            scroll-behavior: smooth;
         }
-        .galaxy-active-btn {
-            animation: galaxy-pulse 2s infinite;
-            background: transparent !important;
-            color: #ff00ff !important;
-            border-color: #ff00ff !important;
+
+        /* --- Spec View (Showpiece) --- */
+        .spec-container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 60px 80px;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+            color: #d1d5db; /* High contrast but soft */
+            font-size: 16px;
+            line-height: 1.7;
+        }
+
+        .spec-container h1, .spec-container h2, .spec-container h3 {
+            color: var(--primary);
+            font-family: var(--font-mono);
+            font-weight: 700;
+            margin-top: 2.5em;
+            margin-bottom: 1em;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0.5em;
+        }
+
+        .spec-container h1 { font-size: 2.2em; border-bottom-width: 2px; }
+        .spec-container h2 { font-size: 1.6em; }
+        
+        .spec-container p { margin-bottom: 1.5em; }
+
+        .spec-container code {
+            font-family: var(--font-mono);
+            background: rgba(0,0,0,0.3);
+            color: var(--accent);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+
+        .spec-container pre {
+            background: #010409;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 2em 0;
+            overflow-x: auto;
+        }
+
+        .spec-container blockquote {
+            border-left: 4px solid var(--primary);
+            margin-left: 0;
+            padding-left: 20px;
+            font-style: italic;
+            color: var(--fg-dim);
+        }
+
+        .spec-container table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 2em 0;
+            font-size: 14px;
+        }
+
+        .spec-container th, .spec-container td {
+            border: 1px solid var(--border);
+            padding: 12px;
+            text-align: left;
+        }
+
+        .spec-container th {
+            background: rgba(255,255,255,0.03);
+            color: var(--primary);
+        }
+
+        /* --- Timeline View --- */
+        .timeline-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            grid-template-rows: 1fr 1fr;
+            gap: 24px;
+            height: 100%;
+            padding: 24px;
+        }
+
+        .chart-card {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .chart-card-title {
+            font-size: 11px;
+            font-family: var(--font-mono);
+            color: var(--fg-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .chart-card-title::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            background: var(--primary);
+            border-radius: 2px;
+        }
+
+        .chart-view {
+            flex: 1;
+            min-height: 0;
+        }
+
+        /* --- Dock --- */
+        .dock {
+            height: 70px;
+            background: var(--sidebar);
+            border-top: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 24px;
+            gap: 20px;
+            flex-shrink: 0;
+            z-index: 100;
+        }
+
+        .playback-controls {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-icon {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--fg);
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-icon:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+            background: var(--primary-dim);
+        }
+
+        .btn-play {
+            width: 80px;
             font-weight: 800;
+            font-size: 12px;
+            text-transform: uppercase;
         }
 
-        #loadingOverlay {
-            transition: opacity 0.6s ease-out;
-            backdrop-filter: blur(20px);
-            background: rgba(0,0,0,0.9);
+        .timeline-slider {
+            flex: 1;
+            position: relative;
+            height: 32px;
+            display: flex;
+            align-items: center;
         }
-        .loader-spinner {
-            width: 50px; height: 50px;
-            border: 2px solid rgba(51, 255, 0, 0.1);
-            border-top-color: var(--fg-color);
+
+        .slider-canvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            opacity: 0.3;
+        }
+
+        input[type="range"] {
+            width: 100%;
+            background: transparent;
+            -webkit-appearance: none;
+            cursor: pointer;
+            z-index: 2;
+        }
+
+        input[type="range"]::-webkit-slider-runnable-track {
+            height: 4px;
+            background: var(--border-bright);
+            border-radius: 2px;
+        }
+
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            width: 12px;
+            height: 12px;
             border-radius: 50%;
-            animation: spin 0.8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
-            margin-bottom: 1rem;
-            box-shadow: 0 0 15px rgba(51, 255, 0, 0.2);
+            background: var(--primary);
+            margin-top: -4px;
+            box-shadow: 0 0 10px var(--primary);
         }
+
+        .dock-meta {
+            width: 250px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .dock-subject {
+            font-size: 12px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .dock-details {
+            font-size: 10px;
+            font-family: var(--font-mono);
+            color: var(--fg-dim);
+        }
+
+        /* --- Overlays --- */
+        #loadingOverlay {
+            position: fixed;
+            inset: 0;
+            background: var(--bg);
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            transition: opacity 0.5s ease;
+        }
+
+        .loader {
+            width: 40px;
+            height: 40px;
+            border: 3px solid var(--primary-dim);
+            border-top-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
         @keyframes spin { 100% { transform: rotate(360deg); } }
 
-        .main-container { padding-bottom: 120px; }
+        .hidden { display: none !important; }
+        .h-full { height: 100%; }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--border-bright); }
+
+        /* Markdown Highlighting Adjustments */
+        .hljs { background: transparent !important; padding: 0; }
+        .diff2html { background: transparent !important; border: none !important; }
+        .d2h-file-header { display: none !important; }
+        .d2h-wrapper { background: #010409 !important; border-radius: 8px !important; overflow: hidden !important; }
+
     </style>
 </head>
 <body>
 
-<header class="tui-header">
-    <div class="flex items-center gap-4">
-        <h1>FrankenSQLite</h1>
-        <div class="kpi-bar">
-            <span>Commits: <span id="kpiCommits" class="kpi-val">-</span></span>
-            <span>Groups: <span id="kpiGroups" class="kpi-val">-</span></span>
-            <span>Lines: <span id="kpiLines" class="kpi-val">-</span></span>
+<div id="loadingOverlay">
+    <div class="loader"></div>
+    <div style="margin-top: 20px; font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.2em; color: var(--primary);">INITIALIZING CORES...</div>
+</div>
+
+<header class="app-header">
+    <div class="brand">
+        <img src="frankensqlite_illustration.webp" alt="Logo">
+        <h1>FrankenSQLite <span style="font-weight: 300; color: var(--fg-dim); font-size: 0.8em;">Spec Evolution</span></h1>
+    </div>
+    
+    <div class="kpis">
+        <div class="kpi">
+            <span class="kpi-label">Commits</span>
+            <span id="kpiCommits" class="kpi-value">-</span>
+        </div>
+        <div class="kpi">
+            <span class="kpi-label">Total Impact</span>
+            <span id="kpiLines" class="kpi-value">-</span>
+        </div>
+        <div class="kpi">
+            <span class="kpi-label">Sessions</span>
+            <span id="kpiSessions" class="kpi-value">12</span>
         </div>
     </div>
-    <div class="flex gap-2">
-        <button id="btnGalaxy" title="Alien math visualization">Galaxy Brain</button>
-        <button onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">GitHub</button>
+
+    <div style="display: flex; gap: 12px;">
+        <button class="tab" onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">GitHub</button>
+        <button id="btnGalaxy" class="tab" style="border: 1px solid var(--accent); color: var(--accent);">Galaxy Mode</button>
     </div>
 </header>
 
-<div class="main-container">
+<div class="app-body">
     <aside class="sidebar">
-        <div class="pane-header">Filters</div>
-        <div class="pane-scroll">
-            <div class="mb-4">
-                <input id="q" type="text" placeholder="Search commits (regex)..." class="mb-2">
-                <div class="flex justify-between text-xs text-dim mb-1"><span>Min Impact</span><span id="impactLabel">0</span></div>
-                <input id="impact" type="range" min="0" max="200" value="0">
+        <div class="sidebar-header">
+            <div class="search-box">
+                <input id="searchInput" type="text" placeholder="Filter history...">
             </div>
-            <div class="mb-4">
-                <div class="text-xs font-bold mb-2 text-dim uppercase">Bucket Mode</div>
-                <div class="flex gap-2">
-                    <button id="modePrimary" class="active flex-1">Primary</button>
-                    <button id="modeMulti" class="flex-1">Multi</button>
+            <div class="filter-group">
+                <div style="display: flex; justify-content: space-between; font-size: 10px; color: var(--fg-dim);">
+                    <span>MIN IMPACT</span>
+                    <span id="impactVal">0</span>
                 </div>
+                <input id="impactFilter" type="range" min="0" max="500" value="0">
             </div>
-            <div id="bucketToggles" class="flex flex-col gap-1 mb-4"></div>
-            <div class="text-xs font-bold mb-2 text-dim uppercase">Commits</div>
-            <div id="commitList"></div>
+        </div>
+        <div id="commitList" class="commit-list">
+            <!-- Commits populated by JS -->
         </div>
     </aside>
 
-    <main class="content-area">
-        <div class="pane-header">
-            <div class="flex gap-2">
-                <button id="tabTimeline" class="active">Timeline</button>
-                <button id="tabSpec">Spec</button>
-                <button id="tabDiff">Diff</button>
-                <button id="tabStats">Stats</button>
+    <main class="main-content">
+        <div class="content-header">
+            <div class="tabs">
+                <div id="tabSpec" class="tab active">Specification</div>
+                <div id="tabTimeline" class="tab">Analytics</div>
+                <div id="tabDiff" class="tab">Patch Delta</div>
             </div>
-            <div id="docCommitTitle" class="text-xs truncate" style="max-width: 400px; color: #fff;"></div>
+            <div id="activeCommitLabel" style="font-size: 11px; font-family: var(--font-mono); color: var(--primary);"></div>
         </div>
-        
-        <div class="pane-scroll" id="mainPaneContent">
-            <div id="viewTimeline" class="h-full flex flex-col gap-4">
-                <div class="tui-panel" style="flex: 1; padding: 10px;">
-                    <div id="timelineChart" class="chart-container"></div>
-                </div>
-                <div class="tui-panel" style="flex: 1; padding: 10px;">
-                    <div id="stackChart" class="chart-container"></div>
+
+        <div class="viewport">
+            <!-- SPEC VIEW -->
+            <div id="viewSpec" class="scroll-pane">
+                <div id="specContent" class="spec-container">
+                    <!-- Markdown rendered here -->
                 </div>
             </div>
 
-            <div id="viewSpec" class="hidden h-full"><div id="docRendered" class="doc-view"></div></div>
-            <div id="viewDiff" class="hidden h-full"><div id="diffContent"></div></div>
-            
-            <div id="viewStats" class="hidden h-full">
-                <div class="flex gap-4 h-full">
-                    <div class="tui-panel" style="flex: 1; padding: 10px;">
-                        <h3 class="text-xs font-bold mb-2 text-dim uppercase text-center">Distribution</h3>
-                        <div id="donutChart" class="chart-container"></div>
+            <!-- ANALYTICS VIEW -->
+            <div id="viewTimeline" class="hidden h-full">
+                <div class="timeline-grid">
+                    <div class="chart-card">
+                        <div class="chart-card-title">Evolutionary Velocity</div>
+                        <div id="chartVelocity" class="chart-view"></div>
                     </div>
-                    <div class="tui-panel" style="flex: 1; padding: 10px;">
-                        <h3 class="text-xs font-bold mb-2 text-dim uppercase text-center">Telemetry</h3>
-                        <div id="bocpdChart" class="chart-container"></div>
+                    <div class="chart-card">
+                        <div class="chart-card-title">Impact Distribution</div>
+                        <div id="chartDistribution" class="chart-view"></div>
+                    </div>
+                    <div class="chart-card" style="grid-column: span 2;">
+                        <div class="chart-card-title">Conceptual Burndown (Lines of Code)</div>
+                        <div id="chartBurndown" class="chart-view"></div>
                     </div>
                 </div>
             </div>
-            
-            <div id="loadingOverlay" class="absolute inset-0 bg-black/90 flex flex-col items-center justify-center z-50">
-                <div class="loader-spinner"></div>
-                <div class="text-2xl mb-2 font-bold tracking-[0.2em] animate-pulse" style="color:var(--fg-color); text-shadow:0 0 15px var(--fg-color);">SYSTEM INITIALIZATION</div>
-                <div class="text-xs text-dim font-mono">Loading Neural Core...</div>
+
+            <!-- DIFF VIEW -->
+            <div id="viewDiff" class="hidden scroll-pane">
+                <div id="diffContent" style="max-width: 1000px; margin: 0 auto;"></div>
             </div>
         </div>
     </main>
 </div>
 
-<div class="dock">
-    <div class="dock-controls">
-        <div class="flex gap-3 items-center">
-            <button id="dockPrev" class="text-lg px-3 hover:scale-110" title="Previous">&#9664;</button>
-            <button id="dockPlay" class="w-24 font-bold tracking-widest border-2" title="Play/Pause">PLAY</button>
-            <button id="dockNext" class="text-lg px-3 hover:scale-110" title="Next">&#9654;</button>
-            <div style="width:1px; height:20px; background:var(--dim-color); margin:0 10px"></div>
-            <div id="dockTitle" class="text-xs font-bold truncate text-white" style="max-width: 300px; text-shadow:0 0 10px rgba(255,255,255,0.3);"></div>
-        </div>
-        <div class="text-[10px] font-mono text-dim"><span id="dockLabel"></span></div>
+<footer class="dock">
+    <div class="playback-controls">
+        <button id="btnPrev" class="btn-icon">◀</button>
+        <button id="btnPlay" class="btn-icon btn-play">Play</button>
+        <button id="btnNext" class="btn-icon">▶</button>
     </div>
-    <div class="relative group w-full">
-        <canvas id="dockCanvas" class="dock-canvas h-8 w-full rounded opacity-70 group-hover:opacity-100 transition-opacity cursor-crosshair"></canvas>
-        <div class="absolute inset-0 pointer-events-none" style="box-shadow: inset 0 0 20px rgba(0,0,0,0.8);"></div>
+    
+    <div class="timeline-slider">
+        <canvas id="sliderCanvas" class="slider-canvas"></canvas>
+        <input id="commitSlider" type="range" min="0" max="100" value="0">
     </div>
-    <input id="dockSlider" type="range" min="0" max="100" value="0" class="w-full">
-</div>
 
-<!-- Search Palette -->
-<div id="searchPalette" class="hidden fixed inset-0 bg-black/80 z-[200] flex items-start justify-center pt-20">
-    <div class="search-palette">
-        <input id="searchPaletteInput" type="text" class="search-palette-input" placeholder="> Type to search history (e.g. 'MVCC', 'RaptorQ')...">
-        <div id="searchPaletteResults" class="search-palette-results"></div>
-        <div class="search-palette-footer"><span>&uarr;&darr; to navigate</span><span>ENTER to jump</span><span>ESC to close</span></div>
+    <div class="dock-meta">
+        <div id="dockSubject" class="dock-subject">-</div>
+        <div id="dockDetails" class="dock-details">-</div>
     </div>
-</div>
+</footer>
 
 <!-- Deps -->
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/utc.js"></script>
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.0/dist/purify.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/diff@7.0.0/dist/diff.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
 
 <script type="module">
     const DB_URL = "spec_evolution_v1.sqlite3";
-    const COLORS = ["#39ff14", "#adff2f", "#00ff00", "#ff003c", "#94a3b8", "#d946ef", "#00f2ff", "#bf00ff", "#00ffcc", "#475569"];
+    
     const BUCKETS = [
-        { id: 1, name: "Logic/Math", color: COLORS[0] }, { id: 2, name: "SQLite Legacy", color: COLORS[1] },
-        { id: 3, name: "Asupersync", color: COLORS[2] }, { id: 4, name: "Arch Fixes", color: COLORS[3] },
-        { id: 5, name: "Scrivening", color: COLORS[4] }, { id: 6, name: "Context", color: COLORS[5] },
-        { id: 7, name: "Standard Eng", color: COLORS[6] }, { id: 8, name: "Alien Math", color: COLORS[7] },
-        { id: 9, name: "Clarification", color: COLORS[8] }, { id: 10, name: "Other", color: COLORS[9] }
+        { id: 1, name: "Logic/Math", color: "#39ff14" }, 
+        { id: 2, name: "SQLite Legacy", color: "#adff2f" },
+        { id: 3, name: "Asupersync", color: "#00ff00" }, 
+        { id: 4, name: "Arch Fixes", color: "#ff003c" },
+        { id: 5, name: "Scrivening", color: "#94a3b8" }, 
+        { id: 6, name: "Context", color: "#d946ef" },
+        { id: 7, name: "Standard Eng", color: "#00f2ff" }, 
+        { id: 8, name: "Alien Math", color: "#bf00ff" },
+        { id: 9, name: "Clarification", color: "#00ffcc" }, 
+        { id: 10, name: "Other", color: "#475569" }
     ];
 
     let DB = null;
@@ -446,139 +709,153 @@
     let DOC_CACHE = new Map();
     let BASE_DOC = "";
     
-    const STATE = { idx: 0, q: "", minImpact: 0, bucketMode: "primary", bucketEnabled: new Set(BUCKETS.map(b => b.id)), tab: "timeline" };
+    const STATE = { 
+        idx: 0, 
+        q: "", 
+        minImpact: 0, 
+        tab: "spec",
+        isPlaying: false,
+        playInterval: null
+    };
 
     async function init() {
         try {
-            const SQL = await window.initSqlJs({ locateFile: file => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}` });
+            const SQL = await window.initSqlJs({ 
+                locateFile: file => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}` 
+            });
             const res = await fetch(DB_URL);
             const buf = await res.arrayBuffer();
             DB = new SQL.Database(new Uint8Array(buf));
+            
             const baseRes = DB.exec("SELECT text FROM base_doc LIMIT 1");
             if (baseRes.length) BASE_DOC = baseRes[0].values[0][0];
+            
             loadCommits();
+            setupEventListeners();
+            
+            // Initial render
+            updateFiltered();
+            renderCommitList();
+            await selectCommit(COMMITS.length - 1);
+            
             hideLoader();
-            renderBucketToggles();
-            render();
-            window.addEventListener("resize", () => { chartTimeline?.resize(); chartStack?.resize(); chartDonut?.resize(); chartBocpd?.resize(); drawDockCanvas(); });
         } catch (e) {
             console.error(e);
-            document.getElementById("loadingOverlay").innerHTML = `<div class="text-red-500">ERROR<br>${e}</div>`;
+            document.getElementById("loadingOverlay").innerHTML = `<div style="color:red">INITIALIZATION FAILED<br>${e}</div>`;
         }
     }
 
     function loadCommits() {
         const res = DB.exec("SELECT idx, hash, short, date_iso, author, subject, add_lines, del_lines, impact, primary_bucket, labels_json FROM commits ORDER BY idx ASC");
         if (!res.length) return;
-        COMMITS = res[0].values.map(r => ({ idx: r[0], hash: r[1], short: r[2], date: r[3], author: r[4], subject: r[5], add: r[6], del: r[7], impact: r[8], primary: r[9], labels: JSON.parse(r[10] || "[]") }));
-        document.getElementById("dockSlider").max = COMMITS.length - 1;
+        COMMITS = res[0].values.map(r => ({ 
+            idx: r[0], hash: r[1], short: r[2], date: r[3], author: r[4], 
+            subject: r[5], add: r[6], del: r[7], impact: r[8], 
+            primary: r[9], labels: JSON.parse(r[10] || "[]") 
+        }));
+        
+        document.getElementById("commitSlider").max = COMMITS.length - 1;
         document.getElementById("kpiCommits").textContent = COMMITS.length;
         document.getElementById("kpiLines").textContent = COMMITS.reduce((s, c) => s + c.impact, 0).toLocaleString();
-        selectCommit(COMMITS.length - 1);
     }
 
-    function render() {
-        filterCommits();
-        renderCommitList();
-        renderCharts();
-        renderStats();
-        updateDock();
-        updateView();
-    }
-
-    function filterCommits() {
+    function updateFiltered() {
         const q = STATE.q.toLowerCase();
         FILTERED = COMMITS.filter(c => {
             if (c.impact < STATE.minImpact) return false;
-            if (q) { try { if (!new RegExp(q).test(c.subject.toLowerCase()) && !c.hash.includes(q)) return false; } catch { if (!c.subject.toLowerCase().includes(q)) return false; } }
-            if (STATE.bucketMode === "primary") return STATE.bucketEnabled.has(c.primary);
-            return c.labels.some(l => STATE.bucketEnabled.has(l));
+            if (q && !c.subject.toLowerCase().includes(q) && !c.hash.includes(q)) return false;
+            return true;
         });
-        document.getElementById("kpiGroups").textContent = FILTERED.length;
     }
 
     function renderCommitList() {
-        const el = document.getElementById("commitList");
-        const visible = FILTERED.slice(0, 150);
-        el.innerHTML = visible.map(c => {
-            const b = BUCKETS.find(x => x.id === c.primary) || BUCKETS[9];
-            const isSel = c.idx === STATE.idx ? "selected" : "";
-            return `<div class="commit-item ${isSel}" onclick="selectCommit(${c.idx})"><div class="flex justify-between mb-1"><span class="font-mono text-xs text-dim">#${c.idx} ${c.short}</span><span class="text-xs" style="color:${b.color}">${b.name}</span></div><div class="text-xs mb-1" style="color:#eee">${escapeHtml(c.subject)}</div><div class="text-xs text-dim">+${c.add} -${c.del}</div></div>`;
+        const container = document.getElementById("commitList");
+        container.innerHTML = FILTERED.slice().reverse().map(c => {
+            const bucket = BUCKETS.find(b => b.id === c.primary) || BUCKETS[9];
+            const isSelected = c.idx === STATE.idx ? "selected" : "";
+            return `
+                <div class="commit-card ${isSelected}" onclick="window.selectCommit(${c.idx})">
+                    <div class="commit-card-header">
+                        <span>#${c.idx} · ${c.short}</span>
+                        <span>${dayjs(c.date).format("MMM DD")}</span>
+                    </div>
+                    <div class="commit-card-subject">${escapeHtml(c.subject)}</div>
+                    <div class="commit-card-meta">
+                        <span style="color: ${bucket.color}">${bucket.name}</span>
+                        <span style="color: var(--primary)">+${c.add}</span>
+                        <span style="color: #ff003c">-${c.del}</span>
+                    </div>
+                </div>
+            `;
         }).join("");
     }
 
-    window.selectCommit = function(idx) {
-        STATE.idx = idx;
-        document.getElementById("dockSlider").value = idx;
+    window.selectCommit = async function(idx) {
+        STATE.idx = Math.max(0, Math.min(COMMITS.length - 1, idx));
+        document.getElementById("commitSlider").value = STATE.idx;
+        
+        const c = COMMITS[STATE.idx];
+        document.getElementById("dockSubject").textContent = c.subject;
+        document.getElementById("dockDetails").textContent = `${c.short} · ${c.author} · ${dayjs(c.date).format("YYYY-MM-DD HH:mm")}`;
+        document.getElementById("activeCommitLabel").textContent = `VIEWING COMMIT #${STATE.idx} [${c.short}]`;
+        
         renderCommitList();
-        updateDock();
-        updateView();
+        drawSliderCanvas();
+        await updateView();
+        
+        // Auto-scroll sidebar to selected
+        const selected = document.querySelector(".commit-card.selected");
+        if (selected) selected.scrollIntoView({ block: "nearest", behavior: "smooth" });
     };
 
-    function updateDock() {
-        const c = COMMITS[STATE.idx];
-        if (!c) return;
-        const dockTitle = document.getElementById("dockTitle");
-        if (dockTitle) dockTitle.textContent = c.subject;
-        document.getElementById("dockLabel").textContent = `${c.short} [${c.date.slice(0, 16)}]`;
-        drawDockCanvas();
-    }
-
-    function drawDockCanvas() {
-        const cvs = document.getElementById("dockCanvas");
-        const ctx = cvs.getContext("2d");
-        const w = cvs.width = cvs.clientWidth;
-        const h = cvs.height = cvs.clientHeight;
-        if (!w || !h) return;
-        ctx.clearRect(0, 0, w, h);
-        const barW = w / COMMITS.length;
-        COMMITS.forEach((c, i) => {
-            const b = BUCKETS.find(x => x.id === c.primary) || BUCKETS[9];
-            ctx.fillStyle = b.color;
-            ctx.globalAlpha = 0.8;
-            const hh = Math.max(2, Math.min(h, (c.impact / 200) * h));
-            ctx.fillRect(i * barW, h - hh, Math.max(1, barW), hh);
-        });
-        ctx.globalAlpha = 1.0;
-        ctx.fillStyle = "#fff";
-        ctx.fillRect(STATE.idx * barW, 0, Math.max(2, barW), h);
-        ctx.shadowColor = "#fff"; ctx.shadowBlur = 10;
-        ctx.fillRect(STATE.idx * barW, 0, Math.max(2, barW), h);
-        ctx.shadowBlur = 0;
-    }
-
     async function updateView() {
-        const c = COMMITS[STATE.idx];
-        if (!c) return;
-        document.getElementById("docCommitTitle").textContent = `#${c.idx} ${c.subject}`;
-        if (STATE.tab === "spec") {
-            const el = document.getElementById("docRendered");
-            el.innerHTML = '<div class="text-dim">Reconstructing...</div>';
-            await new Promise(r => setTimeout(r, 10));
-            const text = await reconstructSnapshot(STATE.idx);
-            if (window.markdownit) {
-                const md = window.markdownit({ html: true });
-                el.innerHTML = md.render(text);
-                if (window.hljs) el.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
-            } else el.innerText = text;
-        } else if (STATE.tab === "diff") {
-            const patch = await getPatch(STATE.idx);
-            const el = document.getElementById("diffContent");
-            if (window.Diff2Html) {
-                el.innerHTML = Diff2Html.html(patch, { drawFileList: false, matching: 'lines', outputFormat: 'side-by-side', colorScheme: 'dark' });
-            } else el.innerHTML = `<pre>${escapeHtml(patch)}</pre>`;
-        }
+        if (STATE.tab === "spec") await renderSpec();
+        else if (STATE.tab === "timeline") renderCharts();
+        else if (STATE.tab === "diff") await renderDiff();
+    }
+
+    async function renderSpec() {
+        const container = document.getElementById("specContent");
+        container.innerHTML = '<div style="color: var(--fg-dim); font-family: var(--font-mono); font-size: 12px;">RECONSTRUCTING DOCUMENT STATE...</div>';
+        
+        const text = await reconstructSnapshot(STATE.idx);
+        const md = window.markdownit({ 
+            html: true,
+            highlight: (str, lang) => {
+                if (lang && hljs.getLanguage(lang)) {
+                    try { return hljs.highlight(str, { language: lang }).value; } catch (__) {}
+                }
+                return ''; 
+            }
+        });
+        
+        container.innerHTML = DOMPurify.sanitize(md.render(text));
+    }
+
+    async function renderDiff() {
+        const container = document.getElementById("diffContent");
+        const patch = await getPatch(STATE.idx);
+        if (!patch) { container.innerHTML = "No changes in this commit."; return; }
+        
+        container.innerHTML = Diff2Html.html(patch, {
+            drawFileList: false,
+            matching: 'lines',
+            outputFormat: 'line-by-line',
+            colorScheme: 'dark'
+        });
     }
 
     async function reconstructSnapshot(targetIdx) {
         if (DOC_CACHE.has(targetIdx)) return DOC_CACHE.get(targetIdx);
-        let lines = BASE_DOC.split("\\n");
+        
+        let lines = BASE_DOC.split("\n");
         for (let i = 1; i <= targetIdx; i++) {
             const patch = await getPatch(i);
             if (!patch) continue;
             lines = applyPatch(lines, patch);
         }
-        const result = lines.join("\\n");
+        
+        const result = lines.join("\n");
         DOC_CACHE.set(targetIdx, result);
         return result;
     }
@@ -587,9 +864,13 @@
         const hunks = parseHunks(patch);
         const newLines = [...lines];
         let offset = 0;
+        
         hunks.forEach(hunk => {
             const start = hunk.oldStart - 1 + offset;
-            const newSegment = hunk.lines.filter(l => !l.startsWith("-")).map(l => l.startsWith("+") ? l.slice(1) : l.slice(1));
+            const newSegment = hunk.lines
+                .filter(l => !l.startsWith("-"))
+                .map(l => l.startsWith("+") ? l.slice(1) : l.slice(1));
+            
             newLines.splice(start, hunk.oldCount, ...newSegment);
             offset += (hunk.newCount - hunk.oldCount);
         });
@@ -598,13 +879,22 @@
 
     function parseHunks(patch) {
         const hunks = [];
-        const lines = patch.split("\\n");
+        const lines = patch.split("\n");
         let currentHunk = null;
+        
         lines.forEach(line => {
             if (line.startsWith("@@")) {
                 if (currentHunk) hunks.push(currentHunk);
-                const m = line.match(/@@ -(\\d+)(?:,(\\d+))? \\+(\\d+)(?:,(\\d+))? @@/);
-                if (m) currentHunk = { oldStart: parseInt(m[1]), oldCount: parseInt(m[2] || "1"), newStart: parseInt(m[3]), newCount: parseInt(m[4] || "1"), lines: [] };
+                const m = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+                if (m) {
+                    currentHunk = {
+                        oldStart: parseInt(m[1]),
+                        oldCount: parseInt(m[2] || "1"),
+                        newStart: parseInt(m[3]),
+                        newCount: parseInt(m[4] || "1"),
+                        lines: []
+                    };
+                }
             } else if (currentHunk && !line.startsWith("---") && !line.startsWith("+++") && !line.startsWith("index")) {
                 currentHunk.lines.push(line);
             }
@@ -621,147 +911,161 @@
         return p;
     }
 
-    function escapeHtml(text) { return text ? text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : ""; }
-
-    let chartTimeline, chartStack, chartDonut, chartBocpd;
+    /* --- Charts --- */
+    let charts = {};
     function renderCharts() {
-        if (STATE.tab !== "timeline") return;
-        const opts = {
+        const chartThemes = {
             backgroundColor: 'transparent',
-            textStyle: { fontFamily: 'JetBrains Mono', color: '#004400' },
-            grid: { top: 40, bottom: 30, left: 50, right: 20, borderColor: '#002200' },
-            tooltip: {
-                trigger: 'item',
-                backgroundColor: 'rgba(0,0,0,0.9)',
-                borderColor: '#33ff00',
-                textStyle: { color: '#eee' },
-                padding: [10, 15],
-                extraCssText: 'box-shadow: 0 0 10px rgba(51,255,0,0.3); border-radius: 4px;'
-            },
-            xAxis: { axisLine: { lineStyle: { color: '#004400' } }, axisLabel: { color: '#006600' }, splitLine: { show: false } },
-            yAxis: { axisLine: { lineStyle: { color: '#004400' } }, axisLabel: { color: '#006600' }, splitLine: { lineStyle: { color: '#002200', type: 'dashed' } } }
+            textStyle: { fontFamily: 'JetBrains Mono', color: '#848d97' },
+            grid: { top: 30, bottom: 30, left: 40, right: 20 },
+            xAxis: { axisLine: { lineStyle: { color: '#30363d' } }, splitLine: { show: false } },
+            yAxis: { axisLine: { lineStyle: { color: '#30363d' } }, splitLine: { lineStyle: { color: '#21262d', type: 'dashed' } } }
         };
-        if (!chartTimeline) chartTimeline = echarts.init(document.getElementById("timelineChart"));
-        const scatData = FILTERED.map(c => [c.date, c.impact, c.primary, c.subject]);
-        chartTimeline.setOption({ ...opts, title: { text: 'IMPACT OVER TIME', left: 'center', textStyle: { color: '#666', fontSize: 10 } }, xAxis: { type: 'time', splitLine: { show: false }, axisLabel: { color: '#666' } }, yAxis: { type: 'value', splitLine: { lineStyle: { color: '#111' } }, axisLabel: { color: '#666' } }, series: [{ type: 'scatter', data: scatData, symbolSize: d => Math.min(30, 4 + Math.sqrt(d[1])), itemStyle: { color: d => BUCKETS.find(b => b.id === d[2])?.color } }] });
-        if (!chartStack) chartStack = echarts.init(document.getElementById("stackChart"));
-        const days = {}; FILTERED.forEach(c => { const d = c.date.slice(0, 10); if (!days[d]) days[d] = {}; days[d][c.primary] = (days[d][c.primary] || 0) + c.impact; });
-        const xDays = Object.keys(days).sort();
-        const series = BUCKETS.map(b => ({ name: b.name, type: 'bar', stack: 'total', itemStyle: { color: b.color }, data: xDays.map(d => days[d][b.id] || 0) }));
-        chartStack.setOption({ ...opts, title: { text: 'IMPACT BY BUCKET (DAILY)', left: 'center', textStyle: { color: '#666', fontSize: 10 } }, tooltip: { trigger: 'axis', backgroundColor: '#111', borderColor: '#33ff00', textStyle: { color: '#eee' } }, xAxis: { type: 'category', data: xDays, axisLabel: { color: '#666' } }, yAxis: { type: 'value', splitLine: { lineStyle: { color: '#111' } }, axisLabel: { color: '#666' } }, series });
-    }
 
-    function renderStats() {
-        if (STATE.tab !== "stats") return;
-        const opts = { backgroundColor: 'transparent', textStyle: { fontFamily: 'JetBrains Mono' } };
-        if (!chartDonut) chartDonut = echarts.init(document.getElementById("donutChart"));
-        const counts = {}; FILTERED.forEach(c => counts[c.primary] = (counts[c.primary] || 0) + 1);
-        const pieData = BUCKETS.map(b => ({ value: counts[b.id] || 0, name: b.name, itemStyle: { color: b.color } })).filter(d => d.value > 0);
-        chartDonut.setOption({ ...opts, tooltip: { trigger: 'item' }, series: [{ type: 'pie', radius: ['40%', '70%'], data: pieData, label: { color: '#ccc' } }] });
-        if (!chartBocpd) chartBocpd = echarts.init(document.getElementById("bocpdChart"));
-        const lineData = COMMITS.map(c => [c.idx, Math.log1p(c.impact)]);
-        chartBocpd.setOption({ ...opts, tooltip: { trigger: 'axis' }, xAxis: { type: 'value', show: false }, yAxis: { type: 'value', show: false }, series: [{ type: 'line', data: lineData, showSymbol: false, lineStyle: { color: '#bd00ff', width: 1 } }] });
-    }
+        // Velocity Chart
+        if (!charts.velocity) charts.velocity = echarts.init(document.getElementById("chartVelocity"));
+        charts.velocity.setOption({
+            ...chartThemes,
+            tooltip: { trigger: 'axis' },
+            series: [{
+                data: COMMITS.map(c => [c.date, c.impact]),
+                type: 'line',
+                smooth: true,
+                symbol: 'none',
+                lineStyle: { color: '#33ff00', width: 2 },
+                areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(51, 255, 0, 0.2)' }, { offset: 1, color: 'transparent' }]) }
+            }]
+        });
 
-    function renderBucketToggles() {
-        const bucketContainer = document.getElementById("bucketToggles");
-        bucketContainer.innerHTML = "";
-        BUCKETS.forEach(b => {
-            const div = document.createElement("div");
-            div.className = "flex items-center gap-2 text-xs cursor-pointer select-none text-dim hover:text-white";
-            div.style.padding = "2px 0";
-            div.innerHTML = `<span id="bind-${b.id}" style="width:8px;height:8px;background:${b.color};display:inline-block;border-radius:2px;"></span> ${b.name}`;
-            div.onclick = () => {
-                if (STATE.bucketEnabled.has(b.id)) STATE.bucketEnabled.delete(b.id); else STATE.bucketEnabled.add(b.id);
-                const span = document.getElementById(`bind-${b.id}`);
-                span.style.opacity = STATE.bucketEnabled.has(b.id) ? 1 : 0.2;
-                div.style.opacity = STATE.bucketEnabled.has(b.id) ? 1 : 0.5;
-                render();
-            };
-            bucketContainer.appendChild(div);
+        // Distribution Chart
+        if (!charts.dist) charts.dist = echarts.init(document.getElementById("chartDistribution"));
+        const counts = {}; COMMITS.forEach(c => counts[c.primary] = (counts[c.primary] || 0) + 1);
+        charts.dist.setOption({
+            ...chartThemes,
+            tooltip: { trigger: 'item' },
+            series: [{
+                type: 'pie',
+                radius: ['50%', '80%'],
+                itemStyle: { borderRadius: 4 },
+                label: { show: false },
+                data: BUCKETS.map(b => ({ value: counts[b.id] || 0, name: b.name, itemStyle: { color: b.color } }))
+            }]
+        });
+
+        // Burndown Chart
+        if (!charts.burndown) charts.burndown = echarts.init(document.getElementById("chartBurndown"));
+        let total = 0;
+        const burndownData = COMMITS.map(c => { total += c.impact; return [c.date, total]; });
+        charts.burndown.setOption({
+            ...chartThemes,
+            xAxis: { type: 'time' },
+            tooltip: { trigger: 'axis' },
+            series: [{
+                data: burndownData,
+                type: 'line',
+                step: 'end',
+                symbol: 'none',
+                lineStyle: { color: '#bd00ff', width: 2 },
+                areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{ offset: 0, color: 'rgba(189, 0, 255, 0.1)' }, { offset: 1, color: 'transparent' }]) }
+            }]
         });
     }
 
-    document.getElementById("q").addEventListener("input", e => { STATE.q = e.target.value; render(); });
-    document.getElementById("impact").addEventListener("input", e => { STATE.minImpact = Number(e.target.value); document.getElementById("impactLabel").textContent = STATE.minImpact; render(); });
-    document.getElementById("modePrimary").addEventListener("click", () => { STATE.bucketMode = "primary"; render(); document.getElementById("modeMulti").classList.remove("active"); document.getElementById("modePrimary").classList.add("active"); });
-    document.getElementById("modeMulti").addEventListener("click", () => { STATE.bucketMode = "multi"; render(); document.getElementById("modePrimary").classList.remove("active"); document.getElementById("modeMulti").classList.add("active"); });
-    ["tabTimeline", "tabSpec", "tabDiff", "tabStats"].forEach(id => {
-        document.getElementById(id).addEventListener("click", e => {
-            document.querySelectorAll(".pane-header button").forEach(b => b.classList.remove("active"));
-            e.target.classList.add("active");
-            STATE.tab = id.replace("tab", "").toLowerCase();
-            ["viewTimeline", "viewSpec", "viewDiff", "viewStats"].forEach(v => document.getElementById(v).classList.add("hidden"));
-            document.getElementById("view" + id.replace("tab", "")).classList.remove("hidden");
-            render();
+    function drawSliderCanvas() {
+        const cvs = document.getElementById("sliderCanvas");
+        const ctx = cvs.getContext("2d");
+        const w = cvs.width = cvs.clientWidth;
+        const h = cvs.height = cvs.clientHeight;
+        
+        ctx.clearRect(0, 0, w, h);
+        const barW = w / COMMITS.length;
+        
+        COMMITS.forEach((c, i) => {
+            const bucket = BUCKETS.find(b => b.id === c.primary) || BUCKETS[9];
+            ctx.fillStyle = bucket.color;
+            ctx.globalAlpha = 0.5;
+            const hh = Math.max(2, (c.impact / 500) * h);
+            ctx.fillRect(i * barW, h - hh, Math.max(1, barW - 1), hh);
         });
-    });
-    
-    let playTimer = null;
-    document.getElementById("dockPlay").addEventListener("click", () => {
-        if (playTimer) { clearInterval(playTimer); playTimer = null; document.getElementById("dockPlay").textContent = "PLAY"; }
-        else { document.getElementById("dockPlay").textContent = "PAUSE"; playTimer = setInterval(() => { if (STATE.idx < COMMITS.length - 1) selectCommit(STATE.idx + 1); else { clearInterval(playTimer); playTimer = null; document.getElementById("dockPlay").textContent = "PLAY"; } }, 150); }
-    });
-    document.getElementById("dockPrev").addEventListener("click", () => { if (STATE.idx > 0) selectCommit(STATE.idx - 1); });
-    document.getElementById("dockNext").addEventListener("click", () => { if (STATE.idx < COMMITS.length - 1) selectCommit(STATE.idx + 1); });
-    let galaxyMode = false;
-    document.getElementById("btnGalaxy").addEventListener("click", () => {
-        galaxyMode = !galaxyMode;
-        const btn = document.getElementById("btnGalaxy");
-        if (galaxyMode) {
-            btn.classList.add("galaxy-active-btn");
-            btn.textContent = "GALAXY ACTIVE";
-            document.body.classList.add("galaxy-mode");
-            document.getElementById("tabStats").click();
-        } else {
-            btn.classList.remove("galaxy-active-btn");
-            btn.textContent = "Galaxy Brain";
-            document.body.classList.remove("galaxy-mode");
-        }
-        render();
-    });
+    }
 
-    // Search Palette
-    document.addEventListener("keydown", e => {
-        if (e.key === "k" && (e.metaKey || e.ctrlKey)) {
-            e.preventDefault();
-            document.getElementById("searchPalette").classList.remove("hidden");
-            document.getElementById("searchPaletteInput").focus();
-        }
-        if (e.key === "Escape") {
-            document.getElementById("searchPalette").classList.add("hidden");
-        }
-    });
-    
-    document.getElementById("searchPaletteInput").addEventListener("input", e => {
-        const q = e.target.value.toLowerCase();
-        const results = document.getElementById("searchPaletteResults");
-        if (!q) { results.innerHTML = ""; return; }
-        const hits = COMMITS.filter(c => c.subject.toLowerCase().includes(q) || c.hash.includes(q)).slice(0, 20);
-        results.innerHTML = hits.map(c => `<div class="search-palette-item" onclick="selectCommit(${c.idx}); document.getElementById('searchPalette').classList.add('hidden')">#${c.idx} ${c.subject}</div>`).join("");
-    });
+    function setupEventListeners() {
+        document.getElementById("searchInput").addEventListener("input", e => {
+            STATE.q = e.target.value;
+            updateFiltered();
+            renderCommitList();
+        });
+
+        document.getElementById("impactFilter").addEventListener("input", e => {
+            STATE.minImpact = parseInt(e.target.value);
+            document.getElementById("impactVal").textContent = STATE.minImpact;
+            updateFiltered();
+            renderCommitList();
+        });
+
+        document.getElementById("commitSlider").addEventListener("input", e => {
+            selectCommit(parseInt(e.target.value));
+        });
+
+        const tabs = ["Spec", "Timeline", "Diff"];
+        tabs.forEach(t => {
+            document.getElementById("tab" + t).addEventListener("click", () => {
+                tabs.forEach(tt => {
+                    document.getElementById("tab" + tt).classList.remove("active");
+                    document.getElementById("view" + tt).classList.add("hidden");
+                });
+                document.getElementById("tab" + t).classList.add("active");
+                document.getElementById("view" + t).classList.remove("hidden");
+                STATE.tab = t.toLowerCase();
+                updateView();
+            });
+        });
+
+        document.getElementById("btnPlay").addEventListener("click", () => {
+            STATE.isPlaying = !STATE.isPlaying;
+            document.getElementById("btnPlay").textContent = STATE.isPlaying ? "Pause" : "Play";
+            if (STATE.isPlaying) {
+                STATE.playInterval = setInterval(() => {
+                    if (STATE.idx < COMMITS.length - 1) selectCommit(STATE.idx + 1);
+                    else {
+                        clearInterval(STATE.playInterval);
+                        STATE.isPlaying = false;
+                        document.getElementById("btnPlay").textContent = "Play";
+                    }
+                }, 150);
+            } else {
+                clearInterval(STATE.playInterval);
+            }
+        });
+
+        document.getElementById("btnPrev").addEventListener("click", () => selectCommit(STATE.idx - 1));
+        document.getElementById("btnNext").addEventListener("click", () => selectCommit(STATE.idx + 1));
+        
+        window.addEventListener("resize", () => {
+            drawSliderCanvas();
+            Object.values(charts).forEach(c => c.resize());
+        });
+        
+        document.addEventListener("keydown", e => {
+            if (e.target.tagName === "INPUT") return;
+            if (e.key === "ArrowLeft") selectCommit(STATE.idx - 1);
+            if (e.key === "ArrowRight") selectCommit(STATE.idx + 1);
+            if (e.key === " ") { e.preventDefault(); document.getElementById("btnPlay").click(); }
+        });
+    }
 
     function hideLoader() {
         const el = document.getElementById("loadingOverlay");
-        if (el) {
-            el.style.opacity = '0';
-            setTimeout(() => el.classList.add("hidden"), 600);
-        }
+        el.style.opacity = '0';
+        setTimeout(() => el.classList.add("hidden"), 500);
     }
 
-    document.addEventListener("keydown", e => {
-        if (e.target.tagName === "INPUT") return;
-        switch(e.key) {
-            case " ": e.preventDefault(); document.getElementById("dockPlay").click(); break;
-            case "ArrowLeft": selectCommit(Math.max(0, STATE.idx - 1)); break;
-            case "ArrowRight": selectCommit(Math.min(COMMITS.length - 1, STATE.idx + 1)); break;
-            case "h": document.getElementById("tabTimeline").click(); break;
-            case "s": document.getElementById("tabSpec").click(); break;
-            case "d": document.getElementById("tabDiff").click(); break;
-        }
-    });
+    function escapeHtml(text) {
+        return text ? text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : "";
+    }
 
     init();
 </script>
+
 </body>
 </html>
