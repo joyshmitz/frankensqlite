@@ -1563,6 +1563,87 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_delete_after_root_split() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        let mut max_rowid = 1i64;
+        loop {
+            let payload = vec![b'D'; 220];
+            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
+            let root_page = cursor.pager.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            if root_header.page_type == cell::BtreePageType::InteriorTable {
+                break;
+            }
+            max_rowid += 1;
+            assert!(
+                max_rowid < 1000,
+                "table root did not split under sustained inserts"
+            );
+        }
+
+        let victim = max_rowid / 2;
+        assert!(cursor.table_move_to(&cx, victim).unwrap().is_found());
+        cursor.delete(&cx).unwrap();
+
+        assert!(!cursor.table_move_to(&cx, victim).unwrap().is_found());
+
+        let mut seen = 0usize;
+        let mut previous = i64::MIN;
+        if cursor.first(&cx).unwrap() {
+            loop {
+                let rowid = cursor.rowid(&cx).unwrap();
+                assert!(rowid > previous);
+                previous = rowid;
+                assert_ne!(rowid, victim);
+                seen += 1;
+                if !cursor.next(&cx).unwrap() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(seen, usize::try_from(max_rowid).unwrap() - 1);
+    }
+
+    #[test]
+    fn test_cursor_delete_all_after_root_split() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        let mut max_rowid = 1i64;
+        loop {
+            let payload = vec![b'Q'; 220];
+            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
+            let root_page = cursor.pager.pages.get(&2).unwrap();
+            let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
+            if root_header.page_type == cell::BtreePageType::InteriorTable {
+                break;
+            }
+            max_rowid += 1;
+            assert!(
+                max_rowid < 1000,
+                "table root did not split under sustained inserts"
+            );
+        }
+
+        for rowid in 1..=max_rowid {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+            cursor.delete(&cx).unwrap();
+        }
+
+        assert!(!cursor.first(&cx).unwrap());
+        assert!(cursor.eof());
+    }
+
+    #[test]
     fn test_point_read_uses_cell_witness() {
         let mut store = MemPageStore::default();
         store.pages.insert(

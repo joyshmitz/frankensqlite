@@ -600,7 +600,7 @@ mod tests {
         total_ops
             .saturating_mul(1_000_000)
             .checked_div(elapsed_us)
-            .unwrap_or(total_ops.saturating_mul(1_000_000))
+            .unwrap_or_else(|| total_ops.saturating_mul(1_000_000))
     }
 
     fn run_padded_round<const N_THREADS: usize>(iterations_per_thread: u64) -> u128 {
