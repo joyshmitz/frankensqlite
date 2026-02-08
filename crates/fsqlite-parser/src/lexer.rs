@@ -1,0 +1,909 @@
+// bd-2tu6: §10.1 SQL Lexer
+//
+// Converts SQL text into a stream of tokens. Uses memchr for accelerated
+// string scanning. Tracks line/column for error reporting.
+
+use fsqlite_ast::Span;
+use memchr::memchr;
+
+use crate::token::{Token, TokenKind};
+
+/// SQL lexer that produces a stream of tokens from source text.
+pub struct Lexer<'a> {
+    /// The source bytes (UTF-8).
+    src: &'a [u8],
+    /// Current byte offset into src.
+    pos: usize,
+    /// Current line number (1-based).
+    line: u32,
+    /// Current column number (1-based).
+    col: u32,
+}
+
+impl<'a> Lexer<'a> {
+    /// Create a new lexer for the given SQL source text.
+    #[must_use]
+    pub fn new(source: &'a str) -> Self {
+        Self {
+            src: source.as_bytes(),
+            pos: 0,
+            line: 1,
+            col: 1,
+        }
+    }
+
+    /// Tokenize the entire input into a Vec of tokens.
+    #[must_use]
+    pub fn tokenize(source: &str) -> Vec<Token> {
+        let mut lexer = Self::new(source);
+        let mut tokens = Vec::new();
+        loop {
+            let tok = lexer.next_token();
+            let is_eof = tok.kind == TokenKind::Eof;
+            tokens.push(tok);
+            if is_eof {
+                break;
+            }
+        }
+        tokens
+    }
+
+    /// Produce the next token.
+    pub fn next_token(&mut self) -> Token {
+        self.skip_whitespace_and_comments();
+
+        if self.pos >= self.src.len() {
+            return self.make_token(TokenKind::Eof, self.pos, self.pos);
+        }
+
+        let start = self.pos;
+        let start_line = self.line;
+        let start_col = self.col;
+        let ch = self.src[self.pos];
+
+        let kind = match ch {
+            // String literal (single-quoted)
+            b'\'' => self.lex_string(),
+
+            // Double-quoted identifier
+            b'"' => self.lex_double_quoted_id(),
+
+            // Backtick-quoted identifier
+            b'`' => self.lex_backtick_id(),
+
+            // Bracket-quoted identifier
+            b'[' => self.lex_bracket_id(),
+
+            // Blob literal or hex
+            b'X' | b'x' if self.peek_at(1) == Some(b'\'') => self.lex_blob(),
+
+            // Numbers
+            b'0'..=b'9' => self.lex_number(),
+            b'.' if self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) => self.lex_number(),
+
+            // Identifiers and keywords
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_identifier(),
+
+            // Bind parameters
+            b'?' => self.lex_question(),
+            b':' => self.lex_colon_param(),
+            b'@' => self.lex_at_param(),
+            b'$' => self.lex_dollar_param(),
+
+            // Operators and punctuation
+            b'+' => {
+                self.advance();
+                TokenKind::Plus
+            }
+            b'*' => {
+                self.advance();
+                TokenKind::Star
+            }
+            b'/' => {
+                self.advance();
+                TokenKind::Slash
+            }
+            b'%' => {
+                self.advance();
+                TokenKind::Percent
+            }
+            b'&' => {
+                self.advance();
+                TokenKind::Ampersand
+            }
+            b'~' => {
+                self.advance();
+                TokenKind::Tilde
+            }
+            b',' => {
+                self.advance();
+                TokenKind::Comma
+            }
+            b';' => {
+                self.advance();
+                TokenKind::Semicolon
+            }
+            b'(' => {
+                self.advance();
+                TokenKind::LeftParen
+            }
+            b')' => {
+                self.advance();
+                TokenKind::RightParen
+            }
+            b'.' => {
+                self.advance();
+                TokenKind::Dot
+            }
+
+            // Multi-character operators
+            b'-' => self.lex_minus_or_arrow(),
+            b'<' => self.lex_lt(),
+            b'>' => self.lex_gt(),
+            b'=' => self.lex_eq(),
+            b'!' => self.lex_bang(),
+            b'|' => self.lex_pipe(),
+
+            _ => {
+                self.advance();
+                let s = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
+                TokenKind::Error(format!("unexpected character: {s}"))
+            }
+        };
+
+        Token {
+            kind,
+            span: Span::new(start as u32, self.pos as u32),
+            line: start_line,
+            col: start_col,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    fn advance(&mut self) -> u8 {
+        let ch = self.src[self.pos];
+        self.pos += 1;
+        if ch == b'\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        ch
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.src.get(self.pos).copied()
+    }
+
+    fn peek_at(&self, offset: usize) -> Option<u8> {
+        self.src.get(self.pos + offset).copied()
+    }
+
+    fn make_token(&self, kind: TokenKind, start: usize, end: usize) -> Token {
+        Token {
+            kind,
+            span: Span::new(start as u32, end as u32),
+            line: self.line,
+            col: self.col,
+        }
+    }
+
+    /// Skip whitespace, line comments (`--`), and block comments (`/* */`).
+    fn skip_whitespace_and_comments(&mut self) {
+        loop {
+            // Skip whitespace
+            while self.pos < self.src.len() && self.src[self.pos].is_ascii_whitespace() {
+                self.advance();
+            }
+
+            if self.pos >= self.src.len() {
+                break;
+            }
+
+            // Line comment: `-- ...`
+            if self.src[self.pos] == b'-'
+                && self.peek_at(1) == Some(b'-')
+            {
+                self.advance(); // skip -
+                self.advance(); // skip -
+                while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
+                    self.advance();
+                }
+                continue;
+            }
+
+            // Block comment: `/* ... */`
+            if self.src[self.pos] == b'/'
+                && self.peek_at(1) == Some(b'*')
+            {
+                self.advance(); // skip /
+                self.advance(); // skip *
+                let mut depth = 1u32;
+                while self.pos < self.src.len() && depth > 0 {
+                    if self.src[self.pos] == b'/'
+                        && self.peek_at(1) == Some(b'*')
+                    {
+                        self.advance();
+                        self.advance();
+                        depth += 1;
+                    } else if self.src[self.pos] == b'*'
+                        && self.peek_at(1) == Some(b'/')
+                    {
+                        self.advance();
+                        self.advance();
+                        depth -= 1;
+                    } else {
+                        self.advance();
+                    }
+                }
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Literal tokenizers
+    // -----------------------------------------------------------------------
+
+    /// Lex a single-quoted string literal. Uses memchr for fast quote search.
+    fn lex_string(&mut self) -> TokenKind {
+        let start = self.pos;
+        self.advance(); // skip opening quote
+
+        let mut value = String::new();
+        loop {
+            // Use memchr to find the next single quote quickly
+            let remaining = &self.src[self.pos..];
+            match memchr(b'\'', remaining) {
+                Some(offset) => {
+                    // Append bytes up to the quote
+                    value.push_str(&String::from_utf8_lossy(&self.src[self.pos..self.pos + offset]));
+                    // Advance past the accumulated bytes and the quote
+                    for _ in 0..offset {
+                        self.advance();
+                    }
+                    self.advance(); // the quote itself
+
+                    // Check for escaped quote ('')
+                    if self.peek() == Some(b'\'') {
+                        value.push('\'');
+                        self.advance();
+                    } else {
+                        return TokenKind::String(value);
+                    }
+                }
+                None => {
+                    // Unterminated string
+                    let rest = String::from_utf8_lossy(&self.src[self.pos..]).into_owned();
+                    value.push_str(&rest);
+                    while self.pos < self.src.len() {
+                        self.advance();
+                    }
+                    return TokenKind::Error(format!(
+                        "unterminated string literal starting at byte {}",
+                        start
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Lex a double-quoted identifier. Sets the EP_DblQuoted flag.
+    fn lex_double_quoted_id(&mut self) -> TokenKind {
+        let start = self.pos;
+        self.advance(); // skip opening "
+
+        let mut value = String::new();
+        loop {
+            let remaining = &self.src[self.pos..];
+            match memchr(b'"', remaining) {
+                Some(offset) => {
+                    value.push_str(&String::from_utf8_lossy(&self.src[self.pos..self.pos + offset]));
+                    for _ in 0..offset {
+                        self.advance();
+                    }
+                    self.advance(); // the quote
+
+                    // Doubled-quote escape: "" -> "
+                    if self.peek() == Some(b'"') {
+                        value.push('"');
+                        self.advance();
+                    } else {
+                        return TokenKind::QuotedId(value, true);
+                    }
+                }
+                None => {
+                    while self.pos < self.src.len() {
+                        self.advance();
+                    }
+                    return TokenKind::Error(format!(
+                        "unterminated double-quoted identifier at byte {}",
+                        start
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Lex a backtick-quoted identifier.
+    fn lex_backtick_id(&mut self) -> TokenKind {
+        let start = self.pos;
+        self.advance(); // skip `
+
+        let mut value = String::new();
+        loop {
+            let remaining = &self.src[self.pos..];
+            match memchr(b'`', remaining) {
+                Some(offset) => {
+                    value.push_str(&String::from_utf8_lossy(&self.src[self.pos..self.pos + offset]));
+                    for _ in 0..offset {
+                        self.advance();
+                    }
+                    self.advance(); // the backtick
+
+                    if self.peek() == Some(b'`') {
+                        value.push('`');
+                        self.advance();
+                    } else {
+                        return TokenKind::QuotedId(value, false);
+                    }
+                }
+                None => {
+                    while self.pos < self.src.len() {
+                        self.advance();
+                    }
+                    return TokenKind::Error(format!(
+                        "unterminated backtick identifier at byte {}",
+                        start
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Lex a bracket-quoted identifier `[name]`.
+    fn lex_bracket_id(&mut self) -> TokenKind {
+        let start = self.pos;
+        self.advance(); // skip [
+
+        let mut value = String::new();
+        let remaining = &self.src[self.pos..];
+        match memchr(b']', remaining) {
+            Some(offset) => {
+                value.push_str(&String::from_utf8_lossy(&self.src[self.pos..self.pos + offset]));
+                for _ in 0..offset {
+                    self.advance();
+                }
+                self.advance(); // skip ]
+                TokenKind::QuotedId(value, false)
+            }
+            None => {
+                while self.pos < self.src.len() {
+                    self.advance();
+                }
+                TokenKind::Error(format!(
+                    "unterminated bracket identifier at byte {}",
+                    start
+                ))
+            }
+        }
+    }
+
+    /// Lex a blob literal `X'...'` / `x'...'`.
+    fn lex_blob(&mut self) -> TokenKind {
+        let start = self.pos;
+        self.advance(); // skip X/x
+        self.advance(); // skip '
+
+        let hex_start = self.pos;
+        let remaining = &self.src[self.pos..];
+        match memchr(b'\'', remaining) {
+            Some(offset) => {
+                let hex_bytes = &self.src[hex_start..hex_start + offset];
+                for _ in 0..offset {
+                    self.advance();
+                }
+                self.advance(); // skip closing '
+
+                // Validate hex content
+                if hex_bytes.len() % 2 != 0 {
+                    return TokenKind::Error(format!(
+                        "blob literal has odd number of hex digits at byte {}",
+                        start
+                    ));
+                }
+
+                let hex_str = String::from_utf8_lossy(hex_bytes);
+                let mut bytes = Vec::with_capacity(hex_bytes.len() / 2);
+                let mut i = 0;
+                while i < hex_str.len() {
+                    match u8::from_str_radix(&hex_str[i..i + 2], 16) {
+                        Ok(b) => bytes.push(b),
+                        Err(_) => {
+                            return TokenKind::Error(format!(
+                                "invalid hex in blob literal at byte {}",
+                                start
+                            ));
+                        }
+                    }
+                    i += 2;
+                }
+                TokenKind::Blob(bytes)
+            }
+            None => {
+                while self.pos < self.src.len() {
+                    self.advance();
+                }
+                TokenKind::Error(format!("unterminated blob literal at byte {}", start))
+            }
+        }
+    }
+
+    /// Lex a number: integer, hex integer, or float.
+    fn lex_number(&mut self) -> TokenKind {
+        let start = self.pos;
+
+        // Check for hex prefix
+        if self.src[self.pos] == b'0' && self.peek_at(1).is_some_and(|c| c == b'x' || c == b'X') {
+            self.advance(); // 0
+            self.advance(); // x
+            let hex_start = self.pos;
+            while self.pos < self.src.len() && self.src[self.pos].is_ascii_hexdigit() {
+                self.advance();
+            }
+            if self.pos == hex_start {
+                return TokenKind::Error("empty hex literal".to_owned());
+            }
+            let hex_str = String::from_utf8_lossy(&self.src[hex_start..self.pos]);
+            return match i64::from_str_radix(&hex_str, 16) {
+                Ok(v) => TokenKind::Integer(v),
+                Err(_) => TokenKind::Error(format!(
+                    "hex literal out of range at byte {}",
+                    start
+                )),
+            };
+        }
+
+        // Decimal integer or float
+        let mut is_float = false;
+
+        // Integer part (may be empty for `.5` style)
+        while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
+            self.advance();
+        }
+
+        // Fractional part
+        if self.pos < self.src.len()
+            && self.src[self.pos] == b'.'
+            && self.peek_at(1).is_some_and(|c| c.is_ascii_digit() || c == b'e' || c == b'E')
+        {
+            is_float = true;
+            self.advance(); // skip dot
+            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
+                self.advance();
+            }
+        } else if self.pos < self.src.len()
+            && self.src[self.pos] == b'.'
+            && start < self.pos // we had digits before the dot
+            && !self.peek_at(1).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            // e.g. `123.` with nothing meaningful after -- still a float
+            is_float = true;
+            self.advance(); // skip dot
+        }
+
+        // Handle case where input starts with '.'
+        if self.src[start] == b'.' {
+            is_float = true;
+        }
+
+        // Exponent
+        if self.pos < self.src.len() && (self.src[self.pos] == b'e' || self.src[self.pos] == b'E')
+        {
+            is_float = true;
+            self.advance(); // skip e/E
+            if self.pos < self.src.len() && (self.src[self.pos] == b'+' || self.src[self.pos] == b'-')
+            {
+                self.advance();
+            }
+            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
+                self.advance();
+            }
+        }
+
+        let text = String::from_utf8_lossy(&self.src[start..self.pos]);
+        if is_float {
+            match text.parse::<f64>() {
+                Ok(v) => TokenKind::Float(v),
+                Err(_) => TokenKind::Error(format!("invalid float: {text}")),
+            }
+        } else {
+            match text.parse::<i64>() {
+                Ok(v) => TokenKind::Integer(v),
+                Err(_) => TokenKind::Error(format!("integer out of range: {text}")),
+            }
+        }
+    }
+
+    /// Lex an identifier or keyword.
+    fn lex_identifier(&mut self) -> TokenKind {
+        let start = self.pos;
+        self.advance(); // first character already validated
+
+        while self.pos < self.src.len() {
+            let ch = self.src[self.pos];
+            if ch.is_ascii_alphanumeric() || ch == b'_' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        let text = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
+
+        // Check for keyword
+        if let Some(kw) = TokenKind::lookup_keyword(&text) {
+            kw
+        } else {
+            TokenKind::Id(text)
+        }
+    }
+
+    /// Lex `?` or `?NNN`.
+    fn lex_question(&mut self) -> TokenKind {
+        self.advance(); // skip ?
+        if self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
+            let num_start = self.pos;
+            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
+                self.advance();
+            }
+            let text = String::from_utf8_lossy(&self.src[num_start..self.pos]);
+            match text.parse::<u32>() {
+                Ok(n) => TokenKind::QuestionNum(n),
+                Err(_) => TokenKind::Error("invalid parameter number".to_owned()),
+            }
+        } else {
+            TokenKind::Question
+        }
+    }
+
+    /// Lex `:name`.
+    fn lex_colon_param(&mut self) -> TokenKind {
+        self.advance(); // skip :
+        let name_start = self.pos;
+        while self.pos < self.src.len() {
+            let ch = self.src[self.pos];
+            if ch.is_ascii_alphanumeric() || ch == b'_' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if self.pos == name_start {
+            return TokenKind::Error("empty parameter name after ':'".to_owned());
+        }
+        let name = String::from_utf8_lossy(&self.src[name_start..self.pos]).into_owned();
+        TokenKind::ColonParam(name)
+    }
+
+    /// Lex `@name`.
+    fn lex_at_param(&mut self) -> TokenKind {
+        self.advance(); // skip @
+        let name_start = self.pos;
+        while self.pos < self.src.len() {
+            let ch = self.src[self.pos];
+            if ch.is_ascii_alphanumeric() || ch == b'_' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if self.pos == name_start {
+            return TokenKind::Error("empty parameter name after '@'".to_owned());
+        }
+        let name = String::from_utf8_lossy(&self.src[name_start..self.pos]).into_owned();
+        TokenKind::AtParam(name)
+    }
+
+    /// Lex `$name`.
+    fn lex_dollar_param(&mut self) -> TokenKind {
+        self.advance(); // skip $
+        let name_start = self.pos;
+        while self.pos < self.src.len() {
+            let ch = self.src[self.pos];
+            if ch.is_ascii_alphanumeric() || ch == b'_' {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if self.pos == name_start {
+            return TokenKind::Error("empty parameter name after '$'".to_owned());
+        }
+        let name = String::from_utf8_lossy(&self.src[name_start..self.pos]).into_owned();
+        TokenKind::DollarParam(name)
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-character operator tokenizers
+    // -----------------------------------------------------------------------
+
+    /// Lex `-`, `->`, or `->>`.
+    fn lex_minus_or_arrow(&mut self) -> TokenKind {
+        self.advance(); // skip -
+        if self.peek() == Some(b'>') {
+            self.advance(); // skip >
+            if self.peek() == Some(b'>') {
+                self.advance(); // skip >
+                TokenKind::DoubleArrow
+            } else {
+                TokenKind::Arrow
+            }
+        } else {
+            TokenKind::Minus
+        }
+    }
+
+    /// Lex `<`, `<=`, `<>`, or `<<`.
+    fn lex_lt(&mut self) -> TokenKind {
+        self.advance(); // skip <
+        match self.peek() {
+            Some(b'=') => {
+                self.advance();
+                TokenKind::Le
+            }
+            Some(b'>') => {
+                self.advance();
+                TokenKind::LtGt
+            }
+            Some(b'<') => {
+                self.advance();
+                TokenKind::ShiftLeft
+            }
+            _ => TokenKind::Lt,
+        }
+    }
+
+    /// Lex `>`, `>=`, or `>>`.
+    fn lex_gt(&mut self) -> TokenKind {
+        self.advance(); // skip >
+        match self.peek() {
+            Some(b'=') => {
+                self.advance();
+                TokenKind::Ge
+            }
+            Some(b'>') => {
+                self.advance();
+                TokenKind::ShiftRight
+            }
+            _ => TokenKind::Gt,
+        }
+    }
+
+    /// Lex `=` or `==`.
+    fn lex_eq(&mut self) -> TokenKind {
+        self.advance(); // skip =
+        if self.peek() == Some(b'=') {
+            self.advance();
+            TokenKind::EqEq
+        } else {
+            TokenKind::Eq
+        }
+    }
+
+    /// Lex `!=`.
+    fn lex_bang(&mut self) -> TokenKind {
+        self.advance(); // skip !
+        if self.peek() == Some(b'=') {
+            self.advance();
+            TokenKind::Ne
+        } else {
+            TokenKind::Error("unexpected '!', did you mean '!='?".to_owned())
+        }
+    }
+
+    /// Lex `|` or `||`.
+    fn lex_pipe(&mut self) -> TokenKind {
+        self.advance(); // skip |
+        if self.peek() == Some(b'|') {
+            self.advance();
+            TokenKind::Concat
+        } else {
+            TokenKind::Pipe
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lex(src: &str) -> Vec<Token> {
+        Lexer::tokenize(src)
+    }
+
+    fn kinds(src: &str) -> Vec<TokenKind> {
+        lex(src).into_iter().map(|t| t.kind).collect()
+    }
+
+    #[test]
+    fn test_lex_integer_literals() {
+        let tokens = kinds("42 0 0xFF");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Integer(42),
+                TokenKind::Integer(0),
+                TokenKind::Integer(255),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lex_float_literals() {
+        let tokens = kinds("3.14 1e10 .5 1.0e-3 0.0");
+        assert!(matches!(tokens[0], TokenKind::Float(v) if (v - 3.14).abs() < 1e-10));
+        assert!(matches!(tokens[1], TokenKind::Float(v) if (v - 1e10).abs() < 1.0));
+        assert!(matches!(tokens[2], TokenKind::Float(v) if (v - 0.5).abs() < 1e-10));
+        assert!(matches!(tokens[3], TokenKind::Float(v) if (v - 0.001).abs() < 1e-10));
+        assert!(matches!(tokens[4], TokenKind::Float(v) if v.abs() < 1e-10));
+        assert_eq!(tokens[5], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_string_literals() {
+        let tokens = kinds("'hello' 'it''s' ''");
+        assert_eq!(tokens[0], TokenKind::String("hello".to_owned()));
+        assert_eq!(tokens[1], TokenKind::String("it's".to_owned()));
+        assert_eq!(tokens[2], TokenKind::String(String::new()));
+        assert_eq!(tokens[3], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_blob_literals() {
+        let tokens = kinds("X'CAFE' x'00ff' X''");
+        assert_eq!(tokens[0], TokenKind::Blob(vec![0xCA, 0xFE]));
+        assert_eq!(tokens[1], TokenKind::Blob(vec![0x00, 0xFF]));
+        assert_eq!(tokens[2], TokenKind::Blob(vec![]));
+        assert_eq!(tokens[3], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_blob_odd_hex_error() {
+        let tokens = kinds("X'CAF'");
+        assert!(matches!(tokens[0], TokenKind::Error(_)));
+    }
+
+    #[test]
+    fn test_lex_variables() {
+        let tokens = kinds("?1 :name @param $var ?");
+        assert_eq!(tokens[0], TokenKind::QuestionNum(1));
+        assert_eq!(tokens[1], TokenKind::ColonParam("name".to_owned()));
+        assert_eq!(tokens[2], TokenKind::AtParam("param".to_owned()));
+        assert_eq!(tokens[3], TokenKind::DollarParam("var".to_owned()));
+        assert_eq!(tokens[4], TokenKind::Question);
+        assert_eq!(tokens[5], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_quoted_identifiers() {
+        let tokens = kinds("\"table_name\" [column] `backtick`");
+        assert_eq!(
+            tokens[0],
+            TokenKind::QuotedId("table_name".to_owned(), true)
+        );
+        assert_eq!(tokens[1], TokenKind::QuotedId("column".to_owned(), false));
+        assert_eq!(
+            tokens[2],
+            TokenKind::QuotedId("backtick".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn test_lex_dqs_flag() {
+        let tokens = kinds("\"hello\"");
+        // Double-quoted strings produce QuotedId with EP_DblQuoted=true
+        assert_eq!(tokens[0], TokenKind::QuotedId("hello".to_owned(), true));
+    }
+
+    #[test]
+    fn test_lex_keywords() {
+        let tokens = kinds("SELECT FROM WHERE INSERT CREATE TABLE CONCURRENT");
+        assert_eq!(tokens[0], TokenKind::KwSelect);
+        assert_eq!(tokens[1], TokenKind::KwFrom);
+        assert_eq!(tokens[2], TokenKind::KwWhere);
+        assert_eq!(tokens[3], TokenKind::KwInsert);
+        assert_eq!(tokens[4], TokenKind::KwCreate);
+        assert_eq!(tokens[5], TokenKind::KwTable);
+        assert_eq!(tokens[6], TokenKind::KwConcurrent);
+
+        // Case insensitivity
+        let tokens2 = kinds("select from where");
+        assert_eq!(tokens2[0], TokenKind::KwSelect);
+        assert_eq!(tokens2[1], TokenKind::KwFrom);
+        assert_eq!(tokens2[2], TokenKind::KwWhere);
+    }
+
+    #[test]
+    fn test_lex_operators() {
+        let tokens = kinds("+ - * / % & | ~ << >> = < <= > >= == != <> || -> ->>");
+        let expected = vec![
+            TokenKind::Plus,
+            TokenKind::Minus,
+            TokenKind::Star,
+            TokenKind::Slash,
+            TokenKind::Percent,
+            TokenKind::Ampersand,
+            TokenKind::Pipe,
+            TokenKind::Tilde,
+            TokenKind::ShiftLeft,
+            TokenKind::ShiftRight,
+            TokenKind::Eq,
+            TokenKind::Lt,
+            TokenKind::Le,
+            TokenKind::Gt,
+            TokenKind::Ge,
+            TokenKind::EqEq,
+            TokenKind::Ne,
+            TokenKind::LtGt,
+            TokenKind::Concat,
+            TokenKind::Arrow,
+            TokenKind::DoubleArrow,
+            TokenKind::Eof,
+        ];
+        assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn test_lex_eq_vs_eqeq() {
+        let tokens = kinds("= ==");
+        assert_eq!(tokens[0], TokenKind::Eq);
+        assert_eq!(tokens[1], TokenKind::EqEq);
+    }
+
+    #[test]
+    fn test_lex_ne_vs_ltgt() {
+        let tokens = kinds("!= <>");
+        assert_eq!(tokens[0], TokenKind::Ne);
+        assert_eq!(tokens[1], TokenKind::LtGt);
+    }
+
+    #[test]
+    fn test_lex_error_unterminated_string() {
+        let tokens = kinds("'hello");
+        assert!(matches!(tokens[0], TokenKind::Error(_)));
+    }
+
+    #[test]
+    fn test_lex_line_column_tracking() {
+        let tokens = lex("SELECT\n  a,\n  b");
+        assert_eq!(tokens[0].line, 1);
+        assert_eq!(tokens[0].col, 1);
+        // 'a' is on line 2, col 3
+        assert_eq!(tokens[1].line, 2);
+        assert_eq!(tokens[1].col, 3);
+        // ',' is on line 2, col 4
+        assert_eq!(tokens[2].line, 2);
+        assert_eq!(tokens[2].col, 4);
+        // 'b' is on line 3, col 3
+        assert_eq!(tokens[3].line, 3);
+        assert_eq!(tokens[3].col, 3);
+    }
+
+    #[test]
+    fn test_lex_whitespace_and_comments_skipped() {
+        let tokens = kinds("SELECT -- this is a comment\n  a /* block */ FROM b");
+        assert_eq!(tokens[0], TokenKind::KwSelect);
+        assert_eq!(tokens[1], TokenKind::Id("a".to_owned()));
+        assert_eq!(tokens[2], TokenKind::KwFrom);
+        assert_eq!(tokens[3], TokenKind::Id("b".to_owned()));
+        assert_eq!(tokens[4], TokenKind::Eof);
+    }
+}
