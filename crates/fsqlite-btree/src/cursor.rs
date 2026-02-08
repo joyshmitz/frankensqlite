@@ -1888,6 +1888,31 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_insert_10k_random_keys() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut expected = BTreeMap::<i64, Vec<u8>>::new();
+
+        let mut insertion_order: Vec<i64> = (1_i64..=10_000_i64).collect();
+        deterministic_shuffle(&mut insertion_order, 0x000D_EADB);
+
+        for rowid in insertion_order {
+            let payload = payload_for_rowid(rowid);
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            expected.insert(rowid, payload);
+        }
+
+        for (rowid, payload) in &expected {
+            let seek = cursor.table_move_to(&cx, *rowid).unwrap();
+            assert!(seek.is_found(), "missing rowid after insert: {rowid}");
+            assert_eq!(&cursor.payload(&cx).unwrap(), payload);
+        }
+    }
+
+    #[test]
     fn test_point_read_uses_cell_witness() {
         let mut store = MemPageStore::default();
         store.pages.insert(
