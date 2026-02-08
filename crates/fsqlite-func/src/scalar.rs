@@ -18,6 +18,7 @@
 //! are pure computations (§9 cross-cutting rule: "Pure computation
 //! exceptions: deterministic ScalarFunction::invoke without I/O need not
 //! take Cx").
+#![allow(clippy::unnecessary_literal_bound)]
 
 use fsqlite_error::Result;
 use fsqlite_types::SqliteValue;
@@ -143,9 +144,7 @@ mod tests {
             match &args[0] {
                 SqliteValue::Integer(i) => {
                     if *i == i64::MIN {
-                        return Err(FrankenError::function_error(
-                            "abs(i64::MIN) would overflow",
-                        ));
+                        return Err(FrankenError::function_error("abs(i64::MIN) would overflow"));
                     }
                     Ok(SqliteValue::Integer(i.abs()))
                 }
@@ -219,10 +218,7 @@ mod tests {
         assert_eq!(f.num_args(), -1);
 
         // 0 args
-        assert_eq!(
-            f.invoke(&[]).unwrap(),
-            SqliteValue::Text(String::new())
-        );
+        assert_eq!(f.invoke(&[]).unwrap(), SqliteValue::Text(String::new()));
 
         // 1 arg
         assert_eq!(

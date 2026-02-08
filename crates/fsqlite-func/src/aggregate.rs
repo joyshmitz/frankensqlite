@@ -8,6 +8,7 @@
 //! The [`FunctionRegistry`](crate::FunctionRegistry) stores aggregates as
 //! `Arc<dyn AggregateFunction<State = Box<dyn Any + Send>>>`. Concrete
 //! implementations use [`AggregateAdapter`] to wrap their typed state.
+#![allow(clippy::unnecessary_literal_bound)]
 
 use std::any::Any;
 

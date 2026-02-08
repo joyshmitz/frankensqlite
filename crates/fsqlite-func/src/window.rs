@@ -4,6 +4,7 @@
 //! efficiently process sliding window frames via the `inverse` method.
 //! This enables O(1) per-row computation for frames like
 //! `ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING`.
+#![allow(clippy::unnecessary_literal_bound)]
 
 use std::any::Any;
 
