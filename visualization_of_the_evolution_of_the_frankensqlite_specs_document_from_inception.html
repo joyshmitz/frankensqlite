@@ -6932,17 +6932,17 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
               <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Hunks ${fmtInt(hn ?? 0)}</span>
               <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Tokens ${fmtInt(tok ?? 0)}</span>
               <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Bytes ${fmtInt(byt ?? 0)}</span>
-              <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Lev ${lv == null ? "?" : fmtInt(lv)}</span>
+              <span class="chip mono rounded-full px-2.5 py-1 text-[11px] text-slate-700">Lev ${(lv === null || lv === undefined) ? "?" : fmtInt(lv)}</span>
             </div>
             <div class="mt-2 text-xs text-slate-600">Bucket: <span class="font-semibold">${escapeHtml(bucketById(c.primary).name)}</span></div>
           `;
         }
 
         // Metrics cards
-        document.getElementById("mTokens").textContent = tok == null ? "-" : fmtInt(tok);
-        document.getElementById("mBytes").textContent = byt == null ? "-" : fmtInt(byt);
-        document.getElementById("mHunks").textContent = hn == null ? "-" : fmtInt(hn);
-        document.getElementById("mLev").textContent = lv == null ? "-" : fmtInt(lv);
+        document.getElementById("mTokens").textContent = (tok === null || tok === undefined) ? "-" : fmtInt(tok);
+        document.getElementById("mBytes").textContent = (byt === null || byt === undefined) ? "-" : fmtInt(byt);
+        document.getElementById("mHunks").textContent = (hn === null || hn === undefined) ? "-" : fmtInt(hn);
+        document.getElementById("mLev").textContent = (lv === null || lv === undefined) ? "-" : fmtInt(lv);
 
         const patch = patchForIdx(DOC.idx);
 
@@ -7245,7 +7245,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         for (const c of commits) {
           const k = binKey(c);
           let j = binIdx.get(k);
-          if (j == null) {
+          if (j === undefined) {
             j = binLabels.length;
             binIdx.set(k, j);
             binLabels.push(k);
