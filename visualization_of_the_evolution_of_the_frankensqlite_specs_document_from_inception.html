@@ -2,7 +2,6 @@
 <html lang="en">
 <head>
     <meta charset="utf-8" />
-    <!-- Deploy Hash: 2026-02-08-PREMIUM-DARK-V2 -->
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0, viewport-fit=cover" />
     <title>FrankenSQLite | Spec Reanimation</title>
     
@@ -15,64 +14,79 @@
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&family=Inter:wght@300;400;600;700;800&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" />
     <style>
         :root {
-            /* Premium Dark Palette */
-            --bg: #050505;
-            --surface-1: #0A0A0A;
-            --surface-2: #121212;
-            --surface-3: #1E1E1E;
-            --border: #2A2A2A;
-            --border-highlight: #3A3A3A;
+            /* --- Core Palette (Stripe-grade Dark Mode) --- */
+            --bg-depth: #020202;
+            --bg-surface: #080808;
+            --bg-surface-2: #101010;
+            --bg-surface-3: #181818;
             
-            --primary: #39ff14; /* Keeping brand green */
-            --primary-dim: rgba(57, 255, 20, 0.1);
-            --primary-glow: rgba(57, 255, 20, 0.3);
-
-            /* Legacy accent tokens still referenced in HUD/error overlays */
-            --accent: #ff003c;
-            --electric: #00f2ff;
+            /* --- Accents (Neon Lab Green) --- */
+            --primary: #39ff14;
+            --primary-dim: rgba(57, 255, 20, 0.08);
+            --primary-glow: rgba(57, 255, 20, 0.25);
+            --accent-error: #ff2a6d;
+            --accent-info: #05d9e8;
             
-            --text-primary: #EDEDED;
-            --text-secondary: #A0A0A0;
-            --text-tertiary: #606060;
+            /* --- Text --- */
+            --text-1: #ffffff;
+            --text-2: #a1a1aa;
+            --text-3: #52525b;
+            --text-4: #27272a;
             
-            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+            /* --- Borders & Glass --- */
+            --border: rgba(255, 255, 255, 0.06);
+            --border-hover: rgba(255, 255, 255, 0.12);
+            --glass-bg: rgba(8, 8, 8, 0.65);
+            --glass-border: rgba(255, 255, 255, 0.04);
+            --backdrop-blur: blur(20px);
             
-            --glass-bg: rgba(10, 10, 10, 0.7);
-            --glass-border: rgba(255, 255, 255, 0.08);
-            --backdrop-blur: blur(12px);
+            /* --- Typography --- */
+            --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
             
-            --shadow-sm: 0 2px 8px rgba(0,0,0,0.4);
-            --shadow-md: 0 8px 24px rgba(0,0,0,0.5);
-            --shadow-lg: 0 24px 48px rgba(0,0,0,0.6);
-            
+            /* --- Metrics --- */
             --radius-sm: 6px;
             --radius-md: 12px;
-            --radius-lg: 16px;
+            --radius-lg: 20px;
+            --header-height: 64px;
+            --sidebar-width: 380px;
             
-            --transition-fast: 0.15s cubic-bezier(0.2, 0, 0, 1);
-            --transition-smooth: 0.3s cubic-bezier(0.2, 0, 0, 1);
+            /* --- Animation --- */
+            --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+            --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+            --duration-fast: 0.2s;
+            --duration-med: 0.4s;
         }
 
-        * { box-sizing: border-box; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+        /* --- Global Reset & Base --- */
+        *, *::before, *::after { box-sizing: border-box; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
         
         body {
-            background-color: var(--bg);
-            color: var(--text-primary);
+            background-color: var(--bg-depth);
+            color: var(--text-1);
             font-family: var(--font-sans);
             margin: 0;
             overflow: hidden;
             height: 100dvh;
             display: flex;
             flex-direction: column;
+            background-image: 
+                radial-gradient(circle at 50% 0%, rgba(57, 255, 20, 0.03) 0%, transparent 60%),
+                linear-gradient(to bottom, var(--bg-depth), var(--bg-surface));
         }
 
-        /* --- Layout Structure --- */
+        /* --- Scrollbar --- */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--text-4); border-radius: 99px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+        
+        /* --- Layout --- */
         .main-container {
             width: 100%;
             height: 100%;
@@ -80,135 +94,158 @@
             flex-direction: column;
             position: relative;
             z-index: 1;
-            background: radial-gradient(circle at top center, #111 0%, var(--bg) 60%);
         }
 
+        /* --- Header --- */
         .app-header {
-            height: 60px;
+            height: var(--header-height);
             background: var(--glass-bg);
             backdrop-filter: var(--backdrop-blur);
             border-bottom: 1px solid var(--glass-border);
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0 24px;
+            padding: 0 32px;
             flex-shrink: 0;
             z-index: 100;
-            position: relative;
         }
 
-        .brand { display: flex; align-items: center; gap: 12px; }
-        .brand img { height: 32px; border-radius: 6px; box-shadow: 0 0 10px rgba(57,255,20,0.1); }
-        .brand h1 { font-size: 14px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.01em; margin: 0; }
-        .brand h1 span { color: var(--text-secondary); font-weight: 400; margin-left: 8px; }
+        .brand { display: flex; align-items: center; gap: 16px; }
+        .brand img { height: 36px; border-radius: 8px; box-shadow: 0 0 20px rgba(57,255,20,0.15); transition: transform 0.3s var(--ease-out-expo); }
+        .brand:hover img { transform: scale(1.05) rotate(-2deg); }
+        
+        .brand h1 { 
+            font-size: 15px; 
+            font-weight: 600; 
+            color: var(--text-1); 
+            margin: 0; 
+            letter-spacing: -0.01em; 
+        }
+        .brand h1 span { 
+            color: var(--text-3); 
+            font-weight: 400; 
+            margin-left: 12px; 
+            font-size: 13px;
+        }
 
+        /* --- App Body --- */
         .app-body { flex: 1; display: flex; overflow: hidden; position: relative; }
 
-        /* --- Optional "Lab Effects" (must never crash core rendering) --- */
-        .data-packet {
-            position: fixed;
-            width: 6px;
-            height: 6px;
-            border-radius: 999px;
-            background: rgba(57, 255, 20, 0.95);
-            box-shadow: 0 0 12px rgba(57, 255, 20, 0.35);
-            pointer-events: none;
-            z-index: 9997;
-        }
-
-        /* --- Sidebar (Commit List) --- */
+        /* --- Sidebar --- */
         .sidebar {
-            width: 360px;
-            background: var(--surface-1);
+            width: var(--sidebar-width);
+            background: rgba(5, 5, 5, 0.4);
             border-right: 1px solid var(--border);
             display: flex;
             flex-direction: column;
             flex-shrink: 0;
             z-index: 50;
-            transition: transform var(--transition-smooth);
+            backdrop-filter: blur(10px);
         }
 
         .sidebar-header {
-            padding: 16px 20px;
+            padding: 24px;
             border-bottom: 1px solid var(--border);
-            background: var(--surface-1);
+            background: rgba(10, 10, 10, 0.3);
         }
         
-        .sidebar-header input {
+        .search-wrapper { position: relative; }
+        .search-wrapper input {
             width: 100%;
-            background: var(--surface-2);
+            background: var(--bg-surface-2);
             border: 1px solid var(--border);
-            padding: 10px 12px;
-            color: var(--text-primary);
+            padding: 12px 16px;
+            color: var(--text-1);
             font-family: var(--font-sans);
             font-size: 13px;
-            border-radius: var(--radius-sm);
+            border-radius: var(--radius-md);
             outline: none;
-            transition: all var(--transition-fast);
+            transition: all var(--duration-fast);
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
         }
         
-        .sidebar-header input:focus {
-            border-color: var(--primary);
-            box-shadow: 0 0 0 2px var(--primary-dim);
+        .search-wrapper input:focus {
+            border-color: var(--text-3);
+            background: var(--bg-surface-3);
+            box-shadow: 0 0 0 4px rgba(255,255,255,0.02);
         }
-        
-        .sidebar-header input::placeholder { color: var(--text-tertiary); }
 
         .commit-list {
             flex: 1;
             overflow-y: auto;
-            padding: 12px;
+            padding: 16px;
         }
 
         .commit-card {
             background: transparent;
             border: 1px solid transparent;
-            border-radius: var(--radius-sm);
-            padding: 10px 12px;
-            margin-bottom: 4px;
+            border-radius: var(--radius-md);
+            padding: 14px;
+            margin-bottom: 8px;
             cursor: pointer;
-            transition: all var(--transition-fast);
+            transition: all var(--duration-fast);
+            position: relative;
+            overflow: hidden;
         }
 
         .commit-card:hover {
-            background: var(--surface-2);
-            border-color: var(--border);
+            background: rgba(255, 255, 255, 0.02);
+            border-color: var(--border-hover);
+            transform: translateY(-1px);
         }
 
         .commit-card.selected {
-            background: var(--surface-2);
-            border-color: var(--primary);
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            background: var(--bg-surface-2);
+            border-color: var(--primary-dim);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+        }
+        .commit-card.selected::before {
+            content: '';
+            position: absolute;
+            left: 0; top: 0; bottom: 0;
+            width: 3px;
+            background: var(--primary);
+            box-shadow: 0 0 12px var(--primary);
         }
 
         .commit-card-header {
             display: flex;
             justify-content: space-between;
-            font-size: 11px;
-            color: var(--text-tertiary);
+            font-size: 10px;
+            color: var(--text-3);
             font-family: var(--font-mono);
-            margin-bottom: 4px;
+            margin-bottom: 8px;
+            letter-spacing: 0.05em;
         }
 
         .commit-card-subject {
-            font-size: 13px;
+            font-size: 14px;
             font-weight: 500;
-            color: var(--text-secondary);
-            margin-bottom: 6px;
-            line-height: 1.4;
+            color: var(--text-2);
+            margin-bottom: 10px;
+            line-height: 1.5;
             display: -webkit-box;
             -webkit-line-clamp: 2;
             -webkit-box-orient: vertical;
             overflow: hidden;
+            transition: color 0.2s;
         }
 
-        .commit-card.selected .commit-card-subject { color: var(--text-primary); }
+        .commit-card.selected .commit-card-subject { color: var(--text-1); }
 
         .commit-card-meta {
             display: flex;
+            align-items: center;
             justify-content: space-between;
-            font-size: 10px;
+            font-size: 11px;
             font-weight: 600;
+        }
+        
+        .tag-pill {
+            padding: 2px 8px;
+            border-radius: 4px;
+            background: rgba(255,255,255,0.05);
+            font-size: 10px;
             text-transform: uppercase;
             letter-spacing: 0.05em;
         }
@@ -218,86 +255,111 @@
             flex: 1;
             display: flex;
             flex-direction: column;
-            background: var(--bg);
+            background: transparent;
             overflow: hidden;
             position: relative;
         }
 
         .content-header {
-            height: 48px;
+            height: 56px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0 24px;
+            padding: 0 40px;
             border-bottom: 1px solid var(--border);
-            background: var(--surface-1);
+            background: rgba(5,5,5,0.2);
+            backdrop-filter: blur(5px);
         }
 
-        .tabs { display: flex; gap: 4px; background: var(--surface-2); padding: 3px; border-radius: var(--radius-sm); border: 1px solid var(--border); }
+        .tabs { 
+            display: flex; 
+            gap: 24px; 
+            position: relative;
+        }
+        
         .tab {
-            padding: 6px 14px;
-            font-size: 12px;
+            font-size: 13px;
             font-weight: 500;
             cursor: pointer;
-            color: var(--text-secondary);
-            border-radius: 4px;
-            transition: all var(--transition-fast);
+            color: var(--text-3);
+            padding: 18px 0;
+            transition: color var(--duration-fast);
+            position: relative;
         }
-        .tab:hover { color: var(--text-primary); }
-        .tab.active { background: var(--surface-3); color: var(--text-primary); box-shadow: var(--shadow-sm); }
+        
+        .tab:hover { color: var(--text-2); }
+        .tab.active { color: var(--text-1); }
+        
+        .tab.active::after {
+            content: '';
+            position: absolute;
+            bottom: -1px;
+            left: 0; right: 0;
+            height: 2px;
+            background: var(--primary);
+            box-shadow: 0 -2px 10px var(--primary-glow);
+        }
 
         .viewport { flex: 1; position: relative; overflow: hidden; }
         
         .scroll-pane { 
             height: 100%; 
             overflow-y: auto; 
-            padding: 40px; 
-            -webkit-overflow-scrolling: touch; 
+            padding: 60px 80px;
+            scroll-behavior: smooth;
         }
 
         .spec-container {
-            max-width: 800px;
+            max-width: 900px;
             margin: 0 auto;
-            color: var(--text-secondary);
-            padding-bottom: 100px;
+            color: var(--text-2);
+            padding-bottom: 120px;
         }
 
         .spec-content {
             font-family: var(--font-sans);
             font-size: 16px;
-            line-height: 1.7;
-            color: var(--text-secondary);
-            overflow-x: hidden;
-            word-wrap: break-word;
-            overflow-wrap: anywhere; 
+            line-height: 1.8;
+            color: var(--text-2);
         }
 
         .spec-content h1, .spec-content h2, .spec-content h3 {
-            color: var(--text-primary);
-            font-weight: 600;
+            color: var(--text-1);
+            font-weight: 700;
             letter-spacing: -0.02em;
-            margin-top: 2em;
+            margin-top: 2.5em;
+            margin-bottom: 1em;
         }
         
-        .spec-content h1 { border-bottom: 1px solid var(--border); padding-bottom: 0.5em; font-size: 24px; }
-        .spec-content h2 { font-size: 20px; }
+        .spec-content h1 { 
+            font-size: 32px; 
+            border-bottom: 1px solid var(--border); 
+            padding-bottom: 0.8em; 
+            background: linear-gradient(to bottom, #fff, #aaa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .spec-content h2 { font-size: 22px; }
         
         .spec-content code {
             font-family: var(--font-mono);
-            background: var(--surface-2);
-            padding: 2px 5px;
+            background: rgba(255,255,255,0.06);
+            padding: 2px 6px;
             border-radius: 4px;
-            font-size: 0.9em;
-            color: #E6E6E6;
+            font-size: 0.85em;
+            color: #d1d5db;
+            border: 1px solid rgba(255,255,255,0.04);
         }
         
         .spec-content pre {
-            background: var(--surface-2);
+            background: #0d0d0d;
             border: 1px solid var(--border);
-            border-radius: var(--radius-sm);
-            padding: 16px;
+            border-radius: var(--radius-md);
+            padding: 24px;
             overflow-x: auto;
-            margin: 1.5em 0;
+            margin: 2em 0;
+            box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);
         }
 
         /* --- Dock --- */
@@ -305,49 +367,58 @@
             background: var(--glass-bg);
             backdrop-filter: var(--backdrop-blur);
             border-top: 1px solid var(--glass-border);
-            padding: 16px 24px calc(16px + env(safe-area-inset-bottom));
+            padding: 16px 32px calc(16px + env(safe-area-inset-bottom));
             z-index: 100;
         }
 
         .evolution-map { 
-            height: 48px; 
-            background: var(--surface-2); 
-            border-radius: var(--radius-sm); 
+            height: 56px; 
+            background: var(--bg-surface); 
+            border-radius: var(--radius-md); 
             position: relative; 
-            margin-bottom: 16px; 
+            margin-bottom: 20px; 
             border: 1px solid var(--border); 
             overflow: hidden;
+            box-shadow: inset 0 2px 8px rgba(0,0,0,0.3);
         }
         
-        .map-canvas { width: 100%; height: 100%; display: block; opacity: 0.8; }
-        .map-slider { position: absolute; inset: 0; width: 100%; height: 100%; -webkit-appearance: none; background: transparent; margin: 0; z-index: 10; cursor: crosshair; }
+        .map-canvas { width: 100%; height: 100%; display: block; opacity: 1; }
+        .map-slider { 
+            position: absolute; inset: 0; width: 100%; height: 100%; 
+            -webkit-appearance: none; background: transparent; margin: 0; z-index: 10; 
+            cursor: pointer;
+        }
         .map-slider:focus { outline: none; }
         .map-slider::-webkit-slider-thumb { 
             -webkit-appearance: none; 
             width: 4px; 
-            height: 48px; 
+            height: 56px; 
             background: #fff; 
-            box-shadow: 0 0 15px rgba(255,255,255,0.5); 
+            box-shadow: 0 0 20px rgba(255,255,255,0.8); 
             border-radius: 2px;
-            cursor: ew-resize;
         }
 
-        .dock-bottom { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+        .dock-bottom { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
         
         .btn-lab {
-            background: var(--surface-2); 
+            background: var(--bg-surface-3); 
             border: 1px solid var(--border); 
-            color: var(--text-secondary); 
-            font-family: var(--font-mono);
-            font-weight: 600; 
+            color: var(--text-2); 
+            font-family: var(--font-sans);
+            font-weight: 500; 
             padding: 8px 16px; 
             border-radius: var(--radius-sm); 
-            font-size: 11px; 
+            font-size: 12px; 
             cursor: pointer;
-            transition: all var(--transition-fast);
+            transition: all 0.2s var(--ease-out-expo);
         }
-        .btn-lab:hover { background: var(--surface-3); color: var(--text-primary); border-color: var(--border-highlight); }
-        .btn-lab:active { transform: translateY(1px); }
+        .btn-lab:hover { 
+            background: var(--text-4); 
+            color: var(--text-1); 
+            border-color: var(--text-3); 
+            transform: translateY(-1px);
+        }
+        .btn-lab:active { transform: translateY(0); }
 
         .btn-play { display: none !important; }
 
@@ -358,120 +429,130 @@
             .mobile-only { display: block !important; }
             .mobile-hide { display: none !important; }
             
-            /* Sidebar becomes a drawer */
             .sidebar {
                 position: absolute;
                 top: 0; bottom: 0; left: 0;
-                width: 85%;
-                max-width: 320px;
+                width: 90%;
+                max-width: 340px;
                 transform: translateX(-100%);
-                box-shadow: var(--shadow-lg);
-                border-right: 1px solid var(--glass-border);
+                box-shadow: 50px 0 100px rgba(0,0,0,0.5);
+                transition: transform 0.4s var(--ease-out-expo);
             }
             .sidebar.active { transform: translateX(0); }
             
-            /* Add backdrop for sidebar */
-            .sidebar.active::before {
-                content: "";
-                position: fixed;
-                inset: 0;
-                left: 320px; /* Offset by sidebar width */
-                width: 100vw;
-                background: rgba(0,0,0,0.5);
-                backdrop-filter: blur(4px);
-                z-index: -1;
-            }
-
-            .app-header { padding: 0 16px; height: 56px; }
-            .content-header { padding: 0 16px; overflow-x: auto; }
-            .scroll-pane { padding: 20px 16px; }
+            .app-header { padding: 0 20px; height: 60px; }
+            .content-header { padding: 0 20px; overflow-x: auto; gap: 16px; }
+            .scroll-pane { padding: 24px 20px; }
             
-            .dock { padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); }
-            .evolution-map { height: 60px; /* Taller touch target */ }
-            .map-slider::-webkit-slider-thumb { width: 20px; height: 60px; background: rgba(255,255,255,0.2); box-shadow: none; border-left: 2px solid #fff; border-right: 2px solid #fff; }
+            .dock { padding: 16px 20px calc(16px + env(safe-area-inset-bottom)); }
+            .evolution-map { height: 60px; }
             
-            .brand h1 span { display: none; }
+            .tabs { gap: 16px; }
         }
 
         /* --- Utilities --- */
         .hidden { display: none !important; }
-        #loadingOverlay { position: fixed; inset: 0; background: var(--bg); z-index: 10000; display: flex; flex-direction: column; align-items: center; justify-content: center; }
-        .vital-pulse { width: 40px; height: 40px; border: 3px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; }
-        @keyframes spin { to { transform: rotate(360deg); } }
         
-        /* Cleanup unwanted elements */
+        /* --- Responsive Tables (Card View) --- */
+        @media (max-width: 768px) {
+            .spec-content table, .spec-content thead, .spec-content tbody, .spec-content th, .spec-content td, .spec-content tr { 
+                display: block; 
+            }
+            .spec-content thead tr { position: absolute; top: -9999px; left: -9999px; }
+            .spec-content tr { 
+                border: 1px solid var(--border); 
+                margin-bottom: 16px; 
+                border-radius: var(--radius-sm); 
+                background: var(--bg-surface-2);
+                overflow: hidden;
+            }
+            .spec-content td { 
+                border: none; 
+                border-bottom: 1px solid var(--border); 
+                position: relative; 
+                padding: 12px 16px 12px 40%; 
+                text-align: right;
+                font-size: 13px;
+                min-height: 40px;
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
+            }
+            .spec-content td:last-child { border-bottom: none; }
+            .spec-content td::before { 
+                position: absolute; 
+                top: 0; left: 0; bottom: 0;
+                width: 35%; 
+                padding: 12px 16px; 
+                background: rgba(255,255,255,0.03);
+                white-space: nowrap; 
+                text-align: left; 
+                font-weight: 600; 
+                color: var(--text-3);
+                content: attr(data-label); 
+                font-size: 11px;
+                text-transform: uppercase;
+                display: flex;
+                align-items: center;
+                border-right: 1px solid var(--border);
+            }
+        }
+        
+        /* --- Mobile Legend --- */
+        .legend-overlay {
+            position: fixed; inset: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(8px);
+            z-index: 2000; display: flex; align-items: center; justify-content: center;
+            opacity: 0; pointer-events: none; transition: opacity 0.3s;
+        }
+        .legend-overlay.active { opacity: 1; pointer-events: auto; }
+        .legend-card {
+            background: var(--bg-surface); border: 1px solid var(--border); 
+            border-radius: var(--radius-md); padding: 24px; width: 90%; max-width: 320px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+        }
+        .legend-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
+        .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+        /* --- Focus Mode --- */
+        body.focus-mode .sidebar, body.focus-mode .dock, body.focus-mode .app-header { transform: translateY(150%) opacity(0); pointer-events: none; }
+        body.focus-mode .app-header { transform: translateY(-100%); }
+        body.focus-mode .sidebar { transform: translateX(-100%); }
+        body.focus-mode .main-content { margin: 0; height: 100vh; }
+        body.focus-mode .scroll-pane { padding: 40px; }
+        
+        .btn-focus-exit {
+            position: fixed; bottom: 32px; right: 32px; 
+            background: var(--primary); color: #000; font-weight: 700;
+            padding: 12px 24px; border-radius: 99px; box-shadow: 0 4px 20px var(--primary-glow);
+            z-index: 5000; opacity: 0; transform: translateY(20px); transition: all 0.3s;
+            cursor: pointer; border: none; font-family: var(--font-sans);
+        }
+        body.focus-mode .btn-focus-exit { opacity: 1; transform: translateY(0); }
+
+        /* --- Diff Highlight --- */
+        .diff-highlight {
+            background: rgba(57, 255, 20, 0.1);
+            border-left: 2px solid var(--primary);
+            margin: 0 -16px; padding: 0 14px;
+            display: block;
+        }
+
+        #loadingOverlay { 
+            position: fixed; inset: 0; background: var(--bg-depth); 
+            z-index: 10000; display: flex; flex-direction: column; 
+            align-items: center; justify-content: center; 
+            transition: opacity 0.8s ease;
+        }
+        
         .system-hud, .dna-hud, .metrics-hud, #flashlight, .aberration, .arc-container { display: none !important; }
     </style>
 </head>
-<body data-flashlight="true">
-
-<!-- SVG Filter Pipeline -->
-<svg style="position: absolute; width: 0; height: 0;" aria-hidden="true" focusable="false">
-  <defs>
-    <filter id="crt-filter">
-      <!-- Barrel Distortion -->
-      <feDisplacementMap in="SourceGraphic" in2="noise" scale="5" xChannelSelector="R" yChannelSelector="G" />
-      
-      <!-- Chromatic Aberration -->
-      <feOffset in="SourceGraphic" dx="1.5" dy="0" result="red-chan" />
-      <feOffset in="SourceGraphic" dx="-1.5" dy="0" result="blue-chan" />
-      <feColorMatrix in="red-chan" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="r" />
-      <feColorMatrix in="blue-chan" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="b" />
-      <feColorMatrix in="SourceGraphic" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="g" />
-      <feBlend in="r" in2="g" mode="screen" result="rg" />
-      <feBlend in="rg" in2="b" mode="screen" />
-    </filter>
-    
-    <filter id="glow-filter">
-      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
-      <feMerge>
-        <feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-  </defs>
-</svg>
-
-<div class="lab-grid"></div>
-<div id="flashlight"></div>
-
-<svg class="arc-container" id="arcContainer" viewBox="0 0 1000 1000" preserveAspectRatio="none">
-    <path id="arcPath" class="electric-arc" d="" />
-</svg>
-
-<div class="system-hud" id="systemHud">
-    <div style="display: flex; justify-content: center; margin-bottom: 12px; border-bottom: 1px dashed var(--border); padding-bottom: 8px;">
-        <svg class="hud-brain" viewBox="0 0 24 24" id="hudBrain">
-            <path d="M12,2C7.58,2,4,5.58,4,10c0,2.42,1.08,4.59,2.78,6.06C6.29,16.5,6,17.21,6,18c0,1.66,1.34,3,3,3h6c1.66,0,3-1.34,3-3 c0-0.79-0.29-1.5-0.78-1.94C18.92,14.59,20,12.42,20,10C20,5.58,16.42,2,12,2z M9,19c-0.55,0-1-0.45-1-1s0.45-1,1-1s1,0.45,1,1 S9.55,19,9,19z M15,19c-0.55,0-1-0.45-1-1s0.45-1,1-1s1,0.45,1,1S15.55,19,15,19z"/>
-            <circle id="brainLogic" class="brain-glow" cx="12" cy="8" r="3" />
-            <circle id="brainEng" class="brain-glow" cx="8" cy="12" r="2" />
-            <circle id="brainArch" class="brain-glow" cx="16" cy="12" r="2" />
-        </svg>
-    </div>
-    <div class="hud-row">
-        <span>NEURAL_LOAD</span>
-        <div class="hud-bar"><div id="hudLoad" class="hud-fill"></div></div>
-    </div>
-    <div class="hud-row">
-        <span>SYNC_STATE</span>
-        <span id="hudSync" style="color: var(--electric);">STABLE</span>
-    </div>
-    <div class="hud-row">
-        <span>TISSUE_INTEGRITY</span>
-        <div class="hud-bar"><div id="hudIntegrity" class="hud-fill"></div></div>
-    </div>
-    <div class="hud-row" style="margin-top: 8px; border-top: 1px dashed var(--border); padding-top: 8px;">
-        <span>CORE_TEMP</span>
-        <span id="hudTemp">36.5°C</span>
-    </div>
-    <div class="hud-row">
-        <span>VOLTAGE</span>
-        <span id="hudVoltage">240V</span>
-    </div>
-</div>
+<body data-flashlight="false">
 
 <div id="loadingOverlay">
     <div class="vital-pulse"></div>
-    <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); margin-top: 24px; letter-spacing: 0.1em; font-weight: 500;">INITIALIZING</div>
+    <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-2); margin-top: 24px; letter-spacing: 0.1em; font-weight: 500;">INITIALIZING</div>
 </div>
 
 <div class="main-container" id="mainContainer">
@@ -482,8 +563,9 @@
         <h1>FrankenSQLite<span>Evolutionary DNA</span></h1>
     </div>
     <div class="kpis" style="display: flex; gap: 30px;">
-        <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-tertiary); letter-spacing: 0.05em;">ENTRIES</span><span id="kpiCommits" style="font-size: 13px; font-weight: 600; color: var(--text-primary);">-</span></div>
-        <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-tertiary); letter-spacing: 0.05em;">MASS</span><span id="kpiLines" style="font-size: 13px; font-weight: 600; color: var(--text-primary);">-</span></div>
+        <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.05em;">ENTRIES</span><span id="kpiCommits" style="font-size: 13px; font-weight: 600; color: var(--text-1);">-</span></div>
+        <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.05em;">MASS</span><span id="kpiLines" style="font-size: 13px; font-weight: 600; color: var(--text-1);">-</span></div>
+        <button class="btn-lab mobile-only" id="btnShowLegend" style="margin-left: 12px;">LEGEND</button>
     </div>
     <button class="btn-lab mobile-hide" onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">SOURCE</button>
 </header>
@@ -491,11 +573,13 @@
 <div class="app-body">
     <aside class="sidebar" id="sidebar">
         <div class="sidebar-header">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-                <span style="font-size: 10px; font-weight: 800; color: var(--fg-dim); letter-spacing: 0.2em;">LABORATORY_LOGS</span>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <span style="font-size: 10px; font-weight: 700; color: var(--text-3); letter-spacing: 0.1em; text-transform: uppercase;">Laboratory Logs</span>
                 <button class="btn-lab mobile-only" id="btnCloseLogs">CLOSE</button>
             </div>
-            <input id="searchInput" type="text" placeholder="FILTER_EVOLUTION..." style="width:100%; background:#050505; border:1px solid var(--border); padding:10px; color:var(--primary); font-family:var(--font-mono); border-radius:4px; outline:none;">
+            <div class="search-wrapper">
+                <input id="searchInput" type="text" placeholder="Filter evolution...">
+            </div>
         </div>
         <div id="commitList" class="commit-list"></div>
     </aside>
@@ -507,7 +591,7 @@
                 <div id="tabTimeline" class="tab">DIAGNOSTICS</div>
                 <div id="tabDiff" class="tab">DELTA</div>
             </div>
-            <div id="activeLabel" style="font-size: 9px; font-family: var(--font-mono); color: var(--fg-dim);"></div>
+            <div id="activeLabel" style="font-size: 10px; font-family: var(--font-mono); color: var(--text-3);"></div>
         </div>
 
         <div class="viewport">
@@ -536,29 +620,29 @@
             <button id="btnPrev" class="btn-lab">PREV</button>
             <button id="btnPlay" class="btn-lab btn-play">REANIMATE</button>
             <button id="btnNext" class="btn-lab">NEXT</button>
-        </div>
-
-        <div class="dna-hud">
-            <div class="dna-label">Categorical_Mutation_DNA</div>
-            <div id="dnaBar" class="dna-bar"></div>
-        </div>
-
-        <div class="metrics-hud">
-            <div class="metric-item"><span class="metric-label">Tissue_Lines</span><span id="metricLines" class="metric-value">0</span></div>
-            <div class="metric-item"><span class="metric-label">Synaptic_Tokens</span><span id="metricTokens" class="metric-value">0</span></div>
-            <div class="metric-item"><span class="metric-label">Delta_Volatility</span><span id="metricLev" class="metric-value">0</span></div>
-            <div class="metric-item"><span class="metric-label">Logical_Density</span><span id="metricDensity" class="metric-value">0.0</span></div>
+            <button id="btnFocus" class="btn-lab" style="color: var(--primary); border-color: var(--primary-dim);">FOCUS</button>
         </div>
 
         <div style="text-align: right; font-family: var(--font-mono); flex: 1; overflow: hidden;" class="mobile-hide">
-            <div id="dockSubject" style="font-size: 12px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">-</div>
-            <div id="dockDetails" style="font-size: 9px; color: var(--fg-dim); text-transform: uppercase;">-</div>
+            <div id="dockSubject" style="font-size: 12px; font-weight: 600; color: var(--text-1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">-</div>
+            <div id="dockDetails" style="font-size: 9px; color: var(--text-3); text-transform: uppercase;">-</div>
         </div>
     </div>
 </footer>
 </div>
 
-<!-- Deps --><script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<button class="btn-focus-exit" id="btnFocusExit">EXIT FOCUS</button>
+
+<div class="legend-overlay" id="legendOverlay">
+    <div class="legend-card">
+        <h3 style="margin: 0 0 16px 0; font-size: 14px; color: var(--text-1); border-bottom: 1px solid var(--border); padding-bottom: 12px;">Evolutionary Categories</h3>
+        <div class="legend-grid" id="legendGrid"></div>
+        <button class="btn-lab" style="width: 100%; margin-top: 20px; text-align: center;" id="btnCloseLegend">CLOSE</button>
+    </div>
+</div>
+
+<!-- Deps -->
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
@@ -567,13 +651,15 @@
 <script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
 
 <script type="module">
+    import { animate, stagger, spring } from "https://cdn.jsdelivr.net/npm/motion@10.18.0/+esm";
+
     const DB_URL = "spec_evolution_v1.sqlite3";
     const BUCKETS = [
         { id: 1, name: "Logic", color: "#39ff14" }, { id: 2, name: "SQLite", color: "#adff2f" },
         { id: 3, name: "Async", color: "#00ff00" }, { id: 4, name: "Arch", color: "#ff003c" },
-        { id: 5, name: "Meta", color: "#666" }, { id: 6, name: "Context", color: "#d946ef" },
-        { id: 7, name: "Eng", color: "#00f2ff" }, { id: 8, name: "Math", color: "#bf00ff" },
-        { id: 9, name: "Clarify", color: "#00ffcc" }, { id: 10, name: "Other", color: "#475569" }
+        { id: 5, name: "Meta", color: "#71717a" }, { id: 6, name: "Context", color: "#d946ef" },
+        { id: 7, name: "Eng", color: "#06b6d4" }, { id: 8, name: "Math", color: "#8b5cf6" },
+        { id: 9, name: "Clarify", color: "#14b8a6" }, { id: 10, name: "Other", color: "#52525b" }
     ];
 
     let DB = null;
@@ -585,13 +671,15 @@
     let METRICS = [];
     let BASE_DOC = "";
     
-    const STATE = { idx: 0, q: "", tab: "spec", isPlaying: false, playInterval: null, timeBucket: "day" };
+    const STATE = { idx: 0, q: "", tab: "spec", timeBucket: "day" };
+
+    // --- Initialization ---
 
     async function init() {
         try {
             const SQL = await window.initSqlJs({ locateFile: file => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}` });
             const res = await fetch(DB_URL);
-            if (!res.ok) throw new Error("Neural Core Data Fetch Failed");
+            if (!res.ok) throw new Error("Database fetch failed");
             const buf = await res.arrayBuffer();
             DB = new SQL.Database(new Uint8Array(buf));
             
@@ -603,16 +691,19 @@
             setupEventListeners();
             syncNeuralFilters();
             await computeSynapticMetrics();
-            renderCommitList();
+            
+            // Initial Render
+            renderCommitList(true); // true = animate entry
             drawSynapticMap();
             
             if (COMMITS.length > 0) {
-                await selectCommit(COMMITS.length - 1);
+                await selectCommit(COMMITS.length - 1, false);
             }
+            
             hideLoader();
         } catch (e) {
             console.error(e);
-            document.getElementById("loadingOverlay").innerHTML = `<div style="color:var(--accent); font-family:var(--font-mono); font-size:12px; text-align:center; padding:20px;">REANIMATION_FAILURE:<br>${e.message}</div>`;
+            document.getElementById("loadingOverlay").innerHTML = `<div style="color:var(--accent-error); font-family:var(--font-mono); font-size:12px;">INIT_FAILURE: ${e.message}</div>`;
         }
     }
 
@@ -632,120 +723,150 @@
         const res = DB.exec("SELECT commit_hash, labels_json FROM change_groups");
         if (!res.length) return;
         res[0].values.forEach(r => {
-            const hash = r[0];
-            const labels = JSON.parse(r[1]);
-            if (!GROUPS.has(hash)) GROUPS.set(hash, []);
-            GROUPS.get(hash).push(...labels);
+            if (!GROUPS.has(r[0])) GROUPS.set(r[0], []);
+            GROUPS.get(r[0]).push(...JSON.parse(r[1]));
         });
     }
 
     async function computeSynapticMetrics() {
         let lines = BASE_DOC.split("\n");
-        let prevText = BASE_DOC;
-        METRICS = [];
         for (let i = 0; i < COMMITS.length; i++) {
             const p = await getPatch(i);
             if (p) lines = applySynapticPatch(lines, p);
             const text = lines.join("\n");
             const tokens = text.split(/\s+/).length;
-            // Use commit impact as a proxy for volatility to avoid expensive Levenshtein calc
-            const lev = (COMMITS[i] && COMMITS[i].impact) ? COMMITS[i].impact : 0; 
-            METRICS.push({ lines: lines.length, tokens, lev });
-            prevText = text;
+            METRICS.push({ lines: lines.length, tokens, lev: COMMITS[i].impact || 0 });
             if (i % 10 === 0) DOC_CACHE.set(i, text);
         }
     }
 
-    function synapticDistance(a, b) {
-        const wa = a.split(/\s+/), wb = b.split(/\s+/);
-        const m = wa.length, n = wb.length;
-        if (m === 0) return n; if (n === 0) return m;
-        let prev = Array.from({length: n + 1}, (_, i) => i);
-        for (let i = 1; i <= m; i++) {
-            let curr = [i];
-            for (let j = 1; j <= n; j++) {
-                curr[j] = wa[i-1] === wb[j-1] ? prev[j-1] : Math.min(prev[j-1], prev[j], curr[j-1]) + 1;
-            }
-            prev = curr;
-        }
-        return prev[n];
-    }
+    // --- Interactions ---
 
-    window.selectCommit = async function(idx) {
+    window.selectCommit = async function(idx, animateScroll = true) {
+        const prevIdx = STATE.idx;
         STATE.idx = Math.max(0, Math.min(COMMITS.length - 1, idx));
         document.getElementById("commitSlider").value = STATE.idx;
+        
         const c = COMMITS[STATE.idx];
-        const m = METRICS[STATE.idx];
         
-        const dockSubject = document.getElementById("dockSubject");
-        dockSubject.textContent = c.subject;
-        if(!STATE.isPlaying) decodeText(dockSubject, c.subject, 0.8);
-        
-        document.getElementById("dockDetails").style.color = "var(--text-tertiary)";
-        document.getElementById("dockDetails").textContent = `HASH: ${c.short} // BY: ${c.author} // TIME: ${dayjs(c.date).format("MMM DD HH:mm")}`;
-        document.getElementById("activeLabel").textContent = `LOG_ENTRY_${STATE.idx} // ${c.short}`;
-        
-        const ml = document.getElementById("metricLines");
-        const mt = document.getElementById("metricTokens");
-        const mev = document.getElementById("metricLev");
-        const md = document.getElementById("metricDensity");
-        if(ml) ml.textContent = m.lines.toLocaleString();
-        if(mt) mt.textContent = m.tokens.toLocaleString();
-        if(mev) mev.textContent = m.lev.toLocaleString();
-        if(md) md.textContent = (m.tokens / m.lines).toFixed(2);
+        // Update selection UI
+        document.querySelectorAll(".commit-card").forEach(el => el.classList.remove("selected"));
+        const newSel = document.querySelector(`.commit-card[data-idx="${STATE.idx}"]`);
+        if (newSel) {
+            newSel.classList.add("selected");
+            if (animateScroll) newSel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        }
 
-        renderDNA(c);
+        // Update Dock/Header info
+        const subjectEl = document.getElementById("dockSubject");
+        if (subjectEl) subjectEl.textContent = c.subject;
+        const detailsEl = document.getElementById("dockDetails");
+        if (detailsEl) detailsEl.textContent = `HASH: ${c.short} // BY: ${c.author} // TIME: ${dayjs(c.date).format("MMM DD HH:mm")}`;
+        
+        const activeLabel = document.getElementById("activeLabel");
+        if (activeLabel) activeLabel.textContent = `LOG_ENTRY_${STATE.idx} // ${c.short}`;
+
         renderCommitList();
         await updateView();
-        
-        const sel = document.querySelector(".commit-card.selected");
-        if (sel) sel.scrollIntoView({ block: "nearest", behavior: "smooth" });
     };
 
-    function renderDNA(c) {
-        const dna = document.getElementById("dnaBar");
-        dna.innerHTML = "";
-        
-        // Brain Glow logic
-        document.querySelectorAll('.brain-glow').forEach(el => el.style.opacity = '0');
-        const primary = c.primary;
-        if([1, 8, 9].includes(primary)) document.getElementById('brainLogic').style.opacity = '1';
-        if([7, 3, 2].includes(primary)) document.getElementById('brainEng').style.opacity = '1';
-        if([4, 6, 5].includes(primary)) document.getElementById('brainArch').style.opacity = '1';
-
-        const labels = GROUPS.get(c.hash) || c.labels;
-        if (!labels.length) {
-            const s = document.createElement("div"); s.className="dna-seg"; s.style.width="100%"; s.style.background=BUCKETS[9].color;
-            dna.appendChild(s); return;
-        }
-        const counts = {}; labels.forEach(l => counts[l] = (counts[l] || 0) + 1);
-        const total = labels.length;
-        Object.keys(counts).forEach(l => {
-            const bucket = BUCKETS.find(b => b.id == l) || BUCKETS[9];
-            const s = document.createElement("div"); s.className="dna-seg";
-            s.style.width = (counts[l] / total * 100) + "%";
-            s.style.background = bucket.color;
-            dna.appendChild(s);
-        });
-    }
-
     async function updateView() {
+        const container = document.getElementById("view" + STATE.tab.charAt(0).toUpperCase() + STATE.tab.slice(1));
+        
+        // Out animation
+        await animate(container, { opacity: 0.5, y: 5 }, { duration: 0.1 }).finished;
+
         if (STATE.tab === "spec") await renderSpec();
         else if (STATE.tab === "timeline") renderCharts();
         else if (STATE.tab === "diff") await renderDiff();
+        
+        // In animation
+        animate(container, { opacity: 1, y: 0 }, { duration: 0.3, easing: spring() });
     }
 
     async function renderSpec() {
         const el = document.getElementById("specContent");
-        el.innerHTML = '<div style="color: var(--primary); font-family: var(--font-mono); font-size: 11px;">RECONSTRUCTING_TISSUE...</div>';
         const text = await reconstructSnapshot(STATE.idx);
-        const md = window.markdownit({ html: true, highlight: (str, lang) => (lang && hljs.getLanguage(lang)) ? hljs.highlight(str, { language: lang }).value : '' });
+        const md = window.markdownit({ 
+            html: true, 
+            highlight: (str, lang) => (lang && hljs.getLanguage(lang)) ? hljs.highlight(str, { language: lang }).value : '' 
+        });
         el.innerHTML = DOMPurify.sanitize(md.render(text));
-        document.getElementById("kpiLines").textContent = text.split("\n").length.toLocaleString();
+        
+        // --- Feature: Responsive Tables & Diff Highlight ---
+        enhanceTables(el);
+        await highlightDiffContext(el, STATE.idx);
+        
+        const kpiLines = document.getElementById("kpiLines");
+        if(kpiLines) kpiLines.textContent = text.split("\n").length.toLocaleString();
+    }
+
+    function enhanceTables(root) {
+        root.querySelectorAll("table").forEach(table => {
+            const headers = Array.from(table.querySelectorAll("th")).map(th => th.textContent.trim());
+            table.querySelectorAll("tr").forEach(tr => {
+                tr.querySelectorAll("td").forEach((td, i) => {
+                    if (headers[i]) td.setAttribute("data-label", headers[i]);
+                });
+            });
+        });
+    }
+
+    async function highlightDiffContext(root, idx) {
+        const p = await getPatch(idx);
+        if (!p) return;
+        // Simple heuristic: find text blocks that were added and wrap them in a highlight class.
+        // Since we reconstructed the text, we can't easily map line numbers 1:1 without a sourcemap,
+        // but we can try to find exact matches for added lines.
+        // For a visual prototype, highlighting the headers or sections modified is often enough.
+        
+        // Advanced: Parse the patch to find added lines content
+        const addedLines = [];
+        p.split("\n").forEach(line => {
+            if (line.startsWith("+") && !line.startsWith("+++")) addedLines.push(line.slice(1).trim());
+        });
+
+        // Walk the DOM and highlight text nodes that match added lines
+        // Limit to reasonable length to avoid perf issues
+        if (addedLines.length > 0 && addedLines.length < 500) {
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+            let node;
+            const matches = new Set(addedLines);
+            while(node = walker.nextNode()) {
+                const txt = node.textContent.trim();
+                if (txt.length > 5 && matches.has(txt)) {
+                    const span = document.createElement("span");
+                    span.className = "diff-highlight";
+                    span.textContent = node.textContent;
+                    node.parentNode.replaceChild(span, node);
+                }
+            }
+        }
+    }
+
+    function toggleFocusMode() {
+        document.body.classList.toggle("focus-mode");
+    }
+
+    function initLegend() {
+        const grid = document.getElementById("legendGrid");
+        grid.innerHTML = BUCKETS.map(b => `
+            <div class="legend-item">
+                <div class="legend-dot" style="background: ${b.color}"></div>
+                <span>${b.name}</span>
+            </div>
+        `).join("");
+        
+        document.getElementById("btnShowLegend").addEventListener("click", () => document.getElementById("legendOverlay").classList.add("active"));
+        document.getElementById("btnCloseLegend").addEventListener("click", () => document.getElementById("legendOverlay").classList.remove("active"));
+        document.getElementById("legendOverlay").addEventListener("click", (e) => {
+            if (e.target.id === "legendOverlay") e.target.classList.remove("active");
+        });
     }
 
     async function reconstructSnapshot(idx) {
         if (DOC_CACHE.has(idx)) return DOC_CACHE.get(idx);
+        // Find nearest checkpoint
         let startIdx = 0;
         let lines = BASE_DOC.split("\n");
         for (let i = Math.floor(idx / 10) * 10; i >= 0; i -= 10) {
@@ -818,9 +939,38 @@
     async function renderDiff() {
         const el = document.getElementById("diffContent");
         const p = await getPatch(STATE.idx);
-        if (!p) { el.innerHTML = "SYSTEM_STABLE: NO_DELTA"; return; }
+        if (!p) { el.innerHTML = "<div style='padding:20px; color:var(--text-3)'>NO DELTA</div>"; return; }
         const diffHtml = Diff2Html.html(p, { drawFileList: false, matching: 'lines', outputFormat: 'line-by-line', colorScheme: 'dark' });
         el.innerHTML = DOMPurify.sanitize(diffHtml);
+    }
+
+    // --- Visuals & Animation ---
+
+    function renderCommitList(animateEntry = false) {
+        const container = document.getElementById("commitList");
+        container.innerHTML = FILTERED.slice().reverse().map(c => {
+            const b = BUCKETS.find(x => x.id === c.primary) || BUCKETS[9];
+            const sel = c.idx === STATE.idx ? "selected" : "";
+            return `
+                <div class="commit-card ${sel}" data-idx="${c.idx}" onclick="window.selectCommit(${c.idx}); document.getElementById('sidebar').classList.remove('active');">
+                    <div class="commit-card-header">
+                        <span>#${c.idx}</span>
+                        <span>${dayjs(c.date).format("MMM DD")}</span>
+                    </div>
+                    <div class="commit-card-subject">${escapeHtml(c.subject)}</div>
+                    <div class="commit-card-meta">
+                        <span class="tag-pill" style="color:${b.color}; border:1px solid ${b.color}20">${b.name}</span>
+                        <span style="color:var(--text-3); font-size:10px;">+${c.add} / -${c.del}</span>
+                    </div>
+                </div>`;
+        }).join("");
+
+        if (animateEntry) {
+            animate(".commit-card", 
+                { opacity: [0, 1], x: [-10, 0] }, 
+                { delay: stagger(0.02), duration: 0.3, easing: "ease-out" }
+            );
+        }
     }
 
     function drawSynapticMap() {
@@ -840,82 +990,37 @@
             Object.keys(counts).forEach(l => {
                 const b = BUCKETS.find(x => x.id == l) || BUCKETS[9];
                 const sh = (counts[l] / total) * h;
-                ctx.fillStyle = b.color; ctx.globalAlpha = 0.6;
-                ctx.fillRect(i * barW, cy, barW - 1, sh);
+                ctx.fillStyle = b.color; 
+                ctx.fillRect(i * barW, cy, Math.max(1, barW), sh);
                 cy += sh;
             });
-            if (c.impact > 250) { ctx.fillStyle = "#fff"; ctx.globalAlpha = 0.2; ctx.fillRect(i * barW, 0, barW - 1, h); }
         });
-    }
-
-    let charts = {};
-    function renderCharts() {
-        const t = { backgroundColor: 'transparent', textStyle: { fontFamily: 'JetBrains Mono', color: '#4a7a4a' }, grid: { top: 30, bottom: 30, left: 40, right: 20 }, xAxis: { axisLine: { lineStyle: { color: '#1a221a' } }, splitLine: { show: false } }, yAxis: { axisLine: { lineStyle: { color: '#1a221a' } }, splitLine: { lineStyle: { color: '#111', type: 'dashed' } } } };
-        if (!charts.velocity) charts.velocity = echarts.init(document.getElementById("chartVelocity"));
-        charts.velocity.setOption({ ...t, series: [{ data: COMMITS.map(c => [c.date, c.impact]), type: 'line', smooth: true, lineStyle: { color: '#39ff14' }, areaStyle: { color: 'rgba(57, 255, 20, 0.1)' } }] });
-        if (!charts.dist) charts.dist = echarts.init(document.getElementById("chartDistribution"));
-        const counts = {}; COMMITS.forEach(c => counts[c.primary] = (counts[c.primary] || 0) + 1);
-        charts.dist.setOption({ ...t, series: [{ type: 'pie', radius: ['40%', '70%'], data: BUCKETS.map(b => ({ value: counts[b.id] || 0, name: b.name, itemStyle: { color: b.color } })) }] });
-        renderMassGrowth();
-    }
-
-    function renderMassGrowth() {
-        if (!charts.mass) charts.mass = echarts.init(document.getElementById("chartMass"));
-        const buckets = groupCommits(STATE.timeBucket);
-        const labels = Object.keys(buckets).sort();
-        const series = BUCKETS.map(b => ({ name: b.name, type: 'bar', stack: 'total', itemStyle: { color: b.color }, data: labels.map(l => buckets[l][b.id] || 0) }));
-        const t = { backgroundColor: 'transparent', textStyle: { fontFamily: 'JetBrains Mono', color: '#4a7a4a' }, grid: { top: 30, bottom: 30, left: 40, right: 20 }, xAxis: { axisLine: { lineStyle: { color: '#1a221a' } } }, yAxis: { axisLine: { lineStyle: { color: '#1a221a' } }, splitLine: { lineStyle: { color: '#111' } } } };
-        charts.mass.setOption({ ...t, tooltip: { trigger: 'axis' }, xAxis: { type: 'category', data: labels }, series }, true);
-    }
-
-    function groupCommits(unit) {
-        const res = {};
-        COMMITS.forEach(c => {
-            let k; const d = dayjs(c.date);
-            if (unit === "day") k = d.format("YYYY-MM-DD");
-            else if (unit === "hour") k = d.format("MM-DD HH:00");
-            else if (unit === "15m") k = d.format("MM-DD HH:") + (Math.floor(d.minute()/15)*15).toString().padStart(2,'0');
-            else k = d.format("MM-DD HH:") + (Math.floor(d.minute()/5)*5).toString().padStart(2,'0');
-            if (!res[k]) res[k] = {};
-            res[k][c.primary] = (res[k][c.primary] || 0) + c.impact;
-        });
-        return res;
     }
 
     function setupEventListeners() {
         document.getElementById("searchInput").addEventListener("input", e => { STATE.q = e.target.value; syncNeuralFilters(); renderCommitList(); });
-        document.getElementById("commitSlider").addEventListener("input", e => selectCommit(parseInt(e.target.value)));
+        document.getElementById("commitSlider").addEventListener("input", e => selectCommit(parseInt(e.target.value), false));
         
         ["Spec", "Timeline", "Diff"].forEach(t => {
             const btn = document.getElementById("tab" + t);
             btn.addEventListener("click", e => {
-                ["Spec", "Timeline", "Diff"].forEach(tt => { document.getElementById("tab" + tt).classList.remove("active"); document.getElementById("view" + tt).classList.add("hidden"); });
-                e.target.classList.add("active"); document.getElementById("view" + t).classList.remove("hidden");
-                
-                // Kinetic title reveal
-                const titleMap = { "Spec": "THE_LEDGER", "Timeline": "DIAGNOSTICS", "Diff": "DELTA" };
-                decodeText(btn, titleMap[t], 0.5);
-                
-                STATE.tab = t.toLowerCase(); updateView();
+                ["Spec", "Timeline", "Diff"].forEach(tt => { 
+                    document.getElementById("tab" + tt).classList.remove("active"); 
+                    document.getElementById("view" + tt).classList.add("hidden"); 
+                });
+                e.target.classList.add("active"); 
+                document.getElementById("view" + t).classList.remove("hidden");
+                STATE.tab = t.toLowerCase(); 
+                updateView();
             });
         });
 
-        ["btnDay", "btnHour", "btn15m", "btn5m"].forEach(id => {
-            const el = document.getElementById(id);
-            if(el) el.addEventListener("click", () => {
-                STATE.timeBucket = id.replace("btn", "").toLowerCase();
-                renderMassGrowth();
-            });
-        });
-
+        // Mobile Sidebar
         document.getElementById("btnOpenLogs").addEventListener("click", (e) => {
             e.stopPropagation();
             document.getElementById("sidebar").classList.add("active");
         });
-        
         document.getElementById("btnCloseLogs").addEventListener("click", () => document.getElementById("sidebar").classList.remove("active"));
-        
-        // Click outside to close sidebar on mobile
         document.addEventListener("click", (e) => {
             const sidebar = document.getElementById("sidebar");
             const btn = document.getElementById("btnOpenLogs");
@@ -924,211 +1029,97 @@
             }
         });
 
-        // Reanimate button disabled
-        /*
-        document.getElementById("btnPlay").addEventListener("click", () => {
-             // ...
-        });
-        */
-
-        document.getElementById("btnPrev").addEventListener("click", () => selectCommit(STATE.idx - 1));
-        document.getElementById("btnNext").addEventListener("click", () => selectCommit(STATE.idx + 1));
         window.addEventListener("resize", () => { drawSynapticMap(); Object.values(charts).forEach(c => c.resize()); });
+        
+        // Focus Mode
+        document.getElementById("btnFocus").addEventListener("click", toggleFocusMode);
+        document.getElementById("btnFocusExit").addEventListener("click", toggleFocusMode);
+        
+        initLegend();
     }
 
     function syncNeuralFilters() { const q = STATE.q.toLowerCase(); FILTERED = COMMITS.filter(c => !q || c.subject.toLowerCase().includes(q) || c.hash.includes(q)); }
     
-    function renderCommitList() {
-        const container = document.getElementById("commitList");
-        container.innerHTML = FILTERED.slice().reverse().map(c => {
-            const b = BUCKETS.find(x => x.id === c.primary) || BUCKETS[9];
-            const sel = c.idx === STATE.idx ? "selected" : "";
-            // Use --text-tertiary instead of old --fg-dim
-            return `<div class="commit-card ${sel}" onclick="window.selectCommit(${c.idx}); document.getElementById('sidebar').classList.remove('active');"><div class="commit-card-header"><span>ENT_${c.idx}</span><span style="color: var(--text-tertiary)">${dayjs(c.date).format("MMM DD")}</span></div><div class="commit-card-subject">${escapeHtml(c.subject)}</div><div class="commit-card-meta"><span style="color:${b.color}">${b.name}</span><span style="color:var(--primary)">+${c.add}</span></div></div>`;
-        }).join("");
-    }
-
     function hideLoader() {
-        document.getElementById("loadingOverlay").style.opacity = '0';
-        setTimeout(() => {
-            document.getElementById("loadingOverlay").classList.add("hidden");
-            // Start kinetic reveals
-            decodeText(document.querySelector('.brand h1'), "FrankenSQLite // Evolutionary_DNA", 1.5);
-            decodeText(document.querySelector('.sidebar-header span'), "LABORATORY_LOGS", 1.2, 0.5);
-            startLabEffects();
-        }, 500);
+        const loader = document.getElementById("loadingOverlay");
+        animate(loader, { opacity: 0 }, { duration: 0.5 }).finished.then(() => {
+            loader.classList.add("hidden");
+        });
     }
-
-    // --- Kinetic & Lab Effects ---
-
-    const CHARS = "01$!@#%^&*()_+{}:<>?[]|";
-
-	    function decodeText(element, targetText, duration = 1, delay = 0) {
-	        if (!element || !targetText) return;
-	        const dur = Math.max(0.01, duration);
-	        setTimeout(() => {
-	            let iteration = 0;
-            const maxIterations = targetText.length;
-            const startTime = Date.now();
-            element.innerText = "";
-            const interval = setInterval(() => {
-                const elapsed = (Date.now() - startTime) / 1000;
-                iteration = (elapsed / dur) * maxIterations;
-                element.innerText = targetText.split("").map((char, index) => {
-                    if (index < iteration) return targetText[index];
-                    if (char === " ") return " ";
-                    return CHARS[Math.floor(Math.random() * CHARS.length)];
-                }).join("");
-                if (iteration >= maxIterations) { clearInterval(interval); element.innerText = targetText; }
-            }, 30);
-	        }, delay * 1000);
-	    }
-
-	    // Optional lab effect: animated "data packets" across the UI.
-	    // Must never crash the app (the viz page should render even if effects fail).
-	    let LAST_PACKET_AT_MS = 0;
-	    let LAB_EFFECTS_DISABLED = false;
-	    let LAB_EFFECTS_DISABLE_REASON = "";
-
-	    function logLabEffectOnce(level, event, extra) {
-	        if (LAB_EFFECTS_DISABLED && event === "spec_viz_effect_disabled" && LAB_EFFECTS_DISABLE_REASON) return;
-	        try {
-	            const payload = Object.assign({ event, level, ts_ms: Date.now() }, extra || {});
-	            // One-line JSON so Playwright/CI logs are readable.
-	            console.log(JSON.stringify(payload));
-	        } catch (_) {
-	            // Logging must never crash the page.
-	        }
-	    }
-
-	    function disableLabEffects(reason, err) {
-	        LAB_EFFECTS_DISABLED = true;
-	        LAB_EFFECTS_DISABLE_REASON = reason || "unknown";
-	        logLabEffectOnce("info", "spec_viz_effect_disabled", {
-	            effect: "lab_effects",
-	            reason: LAB_EFFECTS_DISABLE_REASON,
-	            error: err && err.message ? String(err.message) : undefined,
-	        });
-	    }
-
-	    function isSelfTestMode() {
-	        try {
-	            const u = new URL(window.location.href);
-	            return u.searchParams.get("selftest") === "1" || u.hash === "#selftest";
-	        } catch (_) {
-	            return false;
-	        }
-	    }
-
-	    function prefersReducedMotion() {
-	        try {
-	            return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-	        } catch (_) {
-	            return false;
-	        }
-	    }
-
-	    function setSelfTestSentinel(ok, err) {
-	        const id = "specVizSelftestSentinel";
-	        let el = document.getElementById(id);
-	        if (!el) {
-	            el = document.createElement("div");
-	            el.id = id;
-	            el.style.cssText = "position:fixed;left:-9999px;top:-9999px;font-family:monospace;font-size:12px;";
-	            document.body.appendChild(el);
-	        }
-	        el.textContent = ok ? "SPEC_VIZ_SELFTEST_PASS" : "SPEC_VIZ_SELFTEST_FAIL";
-	        logLabEffectOnce("info", "spec_viz_selftest", {
-	            result: ok ? "pass" : "fail",
-	            error: err && err.message ? String(err.message) : undefined,
-	        });
-	    }
-
-	    function createDataPacket() {
-	        if (LAB_EFFECTS_DISABLED) return;
-	        try {
-	            const now = performance.now();
-	            // Throttle to avoid DOM churn on high-FPS displays.
-	            if (now - LAST_PACKET_AT_MS < 120) return;
-	            LAST_PACKET_AT_MS = now;
-
-	            const packet = document.createElement("div");
-	            packet.className = "data-packet";
-	            const w = window.innerWidth || 0;
-	            const h = window.innerHeight || 0;
-	            const margin = 20;
-	            const startFromLeft = Math.random() < 0.5;
-	            const startX = startFromLeft ? -margin : (w + margin);
-	            const startY = margin + Math.random() * Math.max(0, h - (margin * 2));
-	            const endX = startFromLeft ? (w + margin) : -margin;
-	            const endY = margin + Math.random() * Math.max(0, h - (margin * 2));
-
-	            packet.style.left = startX + "px";
-	            packet.style.top = startY + "px";
-	            document.body.appendChild(packet);
-
-	            const dx = endX - startX;
-	            const dy = endY - startY;
-	            const dur = 600 + Math.random() * 900;
-	            const t0 = performance.now();
-	            const anim = packet.animate(
-	                [
-	                    { transform: "translate(0,0)", opacity: 0.0 },
-	                    { transform: "translate(0,0)", opacity: 1.0, offset: 0.12 },
-	                    { transform: `translate(${dx}px, ${dy}px)`, opacity: 0.0 }
-	                ],
-	                { duration: dur, easing: "cubic-bezier(0.2,0.8,0.2,1)", fill: "forwards" }
-	            );
-	            anim.onfinish = () => {
-	                try { packet.remove(); } catch (_) {}
-	                const dt = performance.now() - t0;
-	                logLabEffectOnce("debug", "spec_viz_create_data_packet", { duration_ms: Math.round(dt) });
-	            };
-	            anim.oncancel = () => { try { packet.remove(); } catch (_) {} };
-	        } catch (e) {
-	            disableLabEffects("exception", e);
-	        }
-	    }
-
-	    function startLabEffects() {
-	        try {
-	            const selftest = isSelfTestMode();
-	            if (!selftest && prefersReducedMotion()) return;
-	            if (LAB_EFFECTS_DISABLED) return;
-
-	            if (selftest) {
-	                try {
-	                    createDataPacket();
-	                    setSelfTestSentinel(true);
-	                } catch (e) {
-	                    setSelfTestSentinel(false, e);
-	                }
-	                return;
-	            }
-
-	            function packetLoop() {
-	                if (LAB_EFFECTS_DISABLED) return;
-	                try {
-	                    if (document.visibilityState === "visible" && Math.random() > 0.98) createDataPacket();
-	                } catch (e) {
-	                    disableLabEffects("exception", e);
-	                    return;
-	                }
-	                requestAnimationFrame(packetLoop);
-	            }
-	            packetLoop();
-	        } catch (e) {
-	            disableLabEffects("exception", e);
-	        }
-	    }
-
-    function updateSystemHud() { return; }
-
-    function maybeSpark() { return; }
-
-    function createElectricArc() { return; }
 
     function escapeHtml(text) { return text ? text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : ""; }
+
+    let charts = {};
+    function renderCharts() {
+        const t = { 
+            backgroundColor: 'transparent', 
+            textStyle: { fontFamily: 'JetBrains Mono', color: '#71717a' }, 
+            grid: { top: 30, bottom: 30, left: 40, right: 20 }, 
+            xAxis: { axisLine: { lineStyle: { color: '#27272a' } }, splitLine: { show: false } }, 
+            yAxis: { axisLine: { lineStyle: { color: '#27272a' } }, splitLine: { lineStyle: { color: '#27272a', type: 'dashed' } } } 
+        };
+        
+        if (!charts.velocity) charts.velocity = echarts.init(document.getElementById("chartVelocity"));
+        charts.velocity.setOption({ 
+            ...t, 
+            series: [{ 
+                data: COMMITS.map(c => [c.date, c.impact]), 
+                type: 'line', 
+                smooth: true, 
+                lineStyle: { color: '#39ff14', width: 2 }, 
+                areaStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{offset: 0, color: 'rgba(57, 255, 20, 0.2)'}, {offset: 1, color: 'rgba(57, 255, 20, 0)'}]) } 
+            }] 
+        });
+        
+        if (!charts.dist) charts.dist = echarts.init(document.getElementById("chartDistribution"));
+        const counts = {}; COMMITS.forEach(c => counts[c.primary] = (counts[c.primary] || 0) + 1);
+        charts.dist.setOption({ 
+            ...t, 
+            series: [{ 
+                type: 'pie', 
+                radius: ['50%', '80%'], 
+                itemStyle: { borderRadius: 5, borderColor: '#020202', borderWidth: 2 },
+                label: { show: false },
+                data: BUCKETS.map(b => ({ value: counts[b.id] || 0, name: b.name, itemStyle: { color: b.color } })) 
+            }] 
+        });
+        renderMassGrowth();
+    }
+
+    function renderMassGrowth() {
+        if (!charts.mass) charts.mass = echarts.init(document.getElementById("chartMass"));
+        const buckets = groupCommits(STATE.timeBucket);
+        const labels = Object.keys(buckets).sort();
+        const series = BUCKETS.map(b => ({ 
+            name: b.name, 
+            type: 'bar', 
+            stack: 'total', 
+            itemStyle: { color: b.color }, 
+            data: labels.map(l => buckets[l][b.id] || 0) 
+        }));
+        
+        const t = { 
+            backgroundColor: 'transparent', 
+            textStyle: { fontFamily: 'JetBrains Mono', color: '#71717a' }, 
+            grid: { top: 30, bottom: 30, left: 40, right: 20 }, 
+            xAxis: { axisLine: { lineStyle: { color: '#27272a' } } }, 
+            yAxis: { axisLine: { lineStyle: { color: '#27272a' } }, splitLine: { lineStyle: { color: '#27272a' } } } 
+        };
+        
+        charts.mass.setOption({ ...t, tooltip: { trigger: 'axis' }, xAxis: { type: 'category', data: labels }, series }, true);
+    }
+
+    function groupCommits(unit) {
+        const res = {};
+        COMMITS.forEach(c => {
+            let k; const d = dayjs(c.date);
+            if (unit === "day") k = d.format("YYYY-MM-DD");
+            else k = d.format("MM-DD HH:00");
+            if (!res[k]) res[k] = {};
+            res[k][c.primary] = (res[k][c.primary] || 0) + c.impact;
+        });
+        return res;
+    }
 
     init();
 </script>
