@@ -910,24 +910,17 @@
         setInterval(maybeSpark, 3000);
         const flashlight = document.getElementById('flashlight');
         document.addEventListener('mousemove', (e) => {
-            flashlight.style.left = e.clientX + 'px';
-            flashlight.style.top = e.clientY + 'px';
+            let x = e.clientX, y = e.clientY;
+            const targets = document.querySelectorAll('button, .commit-card, .tab');
+            let nearestDist = 150;
+            targets.forEach(t => {
+                const r = t.getBoundingClientRect();
+                const tx = r.left + r.width/2, ty = r.top + r.height/2;
+                const d = Math.hypot(x - tx, y - ty);
+                if (d < nearestDist) { x = x * 0.85 + tx * 0.15; y = y * 0.85 + ty * 0.15; }
+            });
+            if(flashlight) flashlight.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
         });
-    }
-
-    function createDataPacket() {
-        const packet = document.createElement('div');
-        packet.className = 'data-packet';
-        document.body.appendChild(packet);
-        const startX = Math.random() * window.innerWidth, startY = Math.random() * window.innerHeight;
-        const endX = Math.random() * window.innerWidth, endY = Math.random() * window.innerHeight;
-        packet.style.left = startX + 'px'; packet.style.top = startY + 'px';
-        const anim = packet.animate([
-            { transform: `translate(0, 0)`, opacity: 0 },
-            { opacity: 1, offset: 0.2 }, { opacity: 1, offset: 0.8 },
-            { transform: `translate(${endX - startX}px, ${endY - startY}px)`, opacity: 0 }
-        ], { duration: 2000 + Math.random() * 3000, easing: 'ease-in-out' });
-        anim.onfinish = () => packet.remove();
     }
 
     function updateSystemHud() {
@@ -937,14 +930,22 @@
         const temp = (isReanimating ? (42 + Math.random() * 5) : (36 + Math.random() * 0.5)).toFixed(1);
         const voltage = isReanimating ? (400 + Math.floor(Math.random() * 100)) : (230 + Math.floor(Math.random() * 10));
 
+        const shift = (load / 100) * 2.5;
+        const offR = document.querySelector('#crt-filter feOffset[result="red-chan"]');
+        const offB = document.querySelector('#crt-filter feOffset[result="blue-chan"]');
+        if(offR) offR.setAttribute('dx', shift);
+        if(offB) offB.setAttribute('dx', -shift);
+
         const hl = document.getElementById('hudLoad'), hi = document.getElementById('hudIntegrity');
         if(hl) hl.style.width = load + '%'; if(hi) hi.style.width = integrity + '%';
-        document.getElementById('hudTemp').innerText = temp + '°C';
-        document.getElementById('hudVoltage').innerText = voltage + 'V';
+        const ht = document.getElementById('hudTemp'), hv = document.getElementById('hudVoltage');
+        if(ht) ht.innerText = temp + '°C'; if(hv) hv.innerText = voltage + 'V';
         const syncs = isReanimating ? ["STRESS", "CRITICAL", "REANIMATING", "OVERLOAD"] : ["STABLE", "SYNCING", "IDLE", "CALIBRATED"];
         const hs = document.getElementById('hudSync');
-        hs.innerText = syncs[Math.floor(Math.random() * syncs.length)];
-        hs.style.color = isReanimating ? 'var(--accent)' : 'var(--electric)';
+        if(hs) {
+            hs.innerText = syncs[Math.floor(Math.random() * syncs.length)];
+            hs.style.color = isReanimating ? 'var(--accent)' : 'var(--electric)';
+        }
     }
 
     function maybeSpark() { const threshold = STATE.isPlaying ? 0.3 : 0.8; if (Math.random() > threshold) createElectricArc(); }
