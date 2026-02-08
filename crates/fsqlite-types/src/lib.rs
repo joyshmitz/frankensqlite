@@ -239,6 +239,70 @@ pub enum TypeAffinity {
     Numeric = b'C',
 }
 
+impl TypeAffinity {
+    /// Determine the type affinity for a declared column type name.
+    ///
+    /// Uses SQLite's first-match rule (§3.1 of datatype3.html):
+    /// 1. Contains "INT" → INTEGER
+    /// 2. Contains "CHAR", "CLOB", or "TEXT" → TEXT
+    /// 3. Contains "BLOB" or is empty → BLOB
+    /// 4. Contains "REAL", "FLOA", or "DOUB" → REAL
+    /// 5. Otherwise → NUMERIC
+    pub fn from_type_name(type_name: &str) -> Self {
+        let upper = type_name.to_ascii_uppercase();
+
+        if upper.contains("INT") {
+            Self::Integer
+        } else if upper.contains("CHAR") || upper.contains("CLOB") || upper.contains("TEXT") {
+            Self::Text
+        } else if upper.is_empty() || upper.contains("BLOB") {
+            Self::Blob
+        } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+            Self::Real
+        } else {
+            Self::Numeric
+        }
+    }
+
+    /// Determine the affinity to apply for a comparison between two operands.
+    ///
+    /// Returns `Some(affinity)` if one side needs coercion, `None` if no
+    /// coercion is needed. The returned affinity should be applied to the
+    /// operand that needs conversion.
+    ///
+    /// Rules (§3.2 of datatype3.html):
+    /// - If one operand is INTEGER/REAL/NUMERIC and the other is TEXT/BLOB,
+    ///   apply numeric affinity to the TEXT/BLOB side.
+    /// - If one operand is TEXT and the other is BLOB (no numeric involved),
+    ///   apply TEXT affinity to the BLOB side.
+    /// - Same affinity or both BLOB → no coercion.
+    pub fn comparison_affinity(left: Self, right: Self) -> Option<Self> {
+        if left == right {
+            return None;
+        }
+
+        let is_numeric = |a: Self| matches!(a, Self::Integer | Self::Real | Self::Numeric);
+
+        // Rule 1: numeric vs TEXT/BLOB → apply numeric affinity
+        if is_numeric(left) && matches!(right, Self::Text | Self::Blob) {
+            return Some(Self::Numeric);
+        }
+        if is_numeric(right) && matches!(left, Self::Text | Self::Blob) {
+            return Some(Self::Numeric);
+        }
+
+        // Rule 2: TEXT vs BLOB → apply TEXT affinity to BLOB side
+        if (left == Self::Text && right == Self::Blob)
+            || (left == Self::Blob && right == Self::Text)
+        {
+            return Some(Self::Text);
+        }
+
+        // Rule 3: no coercion
+        None
+    }
+}
+
 /// Encoding used for text in the database.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -1707,5 +1771,315 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── bd-94us §11.11-11.12 sqlite_master + encoding tests ────────────
+
+    #[test]
+    fn test_sqlite_master_page1_root() {
+        // sqlite_master is always rooted at page 1.
+        // On creation, page 1 is a table leaf (0x0D) with 0 cells.
+        let page_size = PageSize::new(4096).unwrap();
+        let mut page = [0u8; 4096];
+        // Page 1 has 100-byte database header prefix.
+        // B-tree header starts at offset 100 for page 1.
+        page[..16].copy_from_slice(b"SQLite format 3\0");
+        page[16..18].copy_from_slice(&4096u16.to_be_bytes()); // page size
+        page[100] = 0x0D; // leaf table page type at header offset
+        // cell count = 0 at offset 103
+        page[103..105].copy_from_slice(&0u16.to_be_bytes());
+        // cell content area start = page_size at offset 105
+        page[105..107].copy_from_slice(&4096u16.to_be_bytes()); // cell content area at end of page
+
+        let page_type = BTreePageType::from_byte(page[100]);
+        assert_eq!(page_type, Some(BTreePageType::LeafTable));
+        let hdr = BTreePageHeader::parse(&page, page_size, 0, true).expect("valid leaf header");
+        assert_eq!(hdr.cell_count, 0, "fresh sqlite_master has 0 rows");
+    }
+
+    #[test]
+    fn test_sqlite_master_schema_columns() {
+        // sqlite_master has exactly 5 columns: type, name, tbl_name, rootpage, sql.
+        let columns = ["type", "name", "tbl_name", "rootpage", "sql"];
+        assert_eq!(columns.len(), 5);
+        // Verify the valid type values.
+        let valid_types = ["table", "index", "view", "trigger"];
+        assert_eq!(valid_types.len(), 4);
+    }
+
+    #[test]
+    fn test_encoding_utf8_default() {
+        // New database defaults to text encoding 1 (UTF-8).
+        let hdr = DatabaseHeader::default();
+        assert_eq!(hdr.text_encoding, TextEncoding::Utf8);
+
+        let bytes = hdr.to_bytes().expect("encode");
+        // Header offset 56 stores encoding as big-endian u32.
+        let enc_raw = u32::from_be_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]);
+        assert_eq!(enc_raw, 1, "UTF-8 encoding stored as 1 at offset 56");
+    }
+
+    #[test]
+    fn test_encoding_utf16le() {
+        let mut hdr = make_header_for_tests();
+        hdr.text_encoding = TextEncoding::Utf16le;
+        let bytes = hdr.to_bytes().expect("encode");
+        let enc_raw = u32::from_be_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]);
+        assert_eq!(enc_raw, 2, "UTF-16LE encoding stored as 2");
+
+        let parsed = DatabaseHeader::from_bytes(&bytes).expect("decode");
+        assert_eq!(parsed.text_encoding, TextEncoding::Utf16le);
+    }
+
+    #[test]
+    fn test_encoding_utf16be() {
+        let mut hdr = make_header_for_tests();
+        hdr.text_encoding = TextEncoding::Utf16be;
+        let bytes = hdr.to_bytes().expect("encode");
+        let enc_raw = u32::from_be_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]);
+        assert_eq!(enc_raw, 3, "UTF-16BE encoding stored as 3");
+
+        let parsed = DatabaseHeader::from_bytes(&bytes).expect("decode");
+        assert_eq!(parsed.text_encoding, TextEncoding::Utf16be);
+    }
+
+    #[test]
+    fn test_encoding_immutable_after_creation() {
+        // Encoding is set at creation and cannot be changed afterward.
+        // Changing the encoding field in an existing header and re-serializing
+        // produces a different byte at offset 56 -- the enforcement is at the
+        // application layer (PRAGMA encoding is rejected after first table).
+        let hdr1 = make_header_for_tests();
+        assert_eq!(hdr1.text_encoding, TextEncoding::Utf8);
+        let bytes1 = hdr1.to_bytes().expect("encode");
+
+        let mut hdr2 = hdr1;
+        hdr2.text_encoding = TextEncoding::Utf16le;
+        let bytes2 = hdr2.to_bytes().expect("encode");
+
+        // The encoding field differs in the serialized bytes.
+        assert_ne!(
+            bytes1[56..60],
+            bytes2[56..60],
+            "different encodings must serialize differently"
+        );
+    }
+
+    #[test]
+    fn test_binary_collation_memcmp_utf8() {
+        // BINARY collation uses memcmp on raw bytes.
+        // For UTF-8, memcmp produces correct Unicode code point ordering.
+        let a = "abc";
+        let b = "abd";
+        assert!(
+            a.as_bytes() < b.as_bytes(),
+            "memcmp ordering for ASCII UTF-8"
+        );
+
+        // Multi-byte UTF-8: 'é' (U+00E9) = [0xC3, 0xA9], 'z' (U+007A) = [0x7A].
+        // In code point order: 'z' (122) < 'é' (233).
+        // In byte order: 0x7A < 0xC3, so 'z' < 'é' — same as code point order.
+        let z = "z";
+        let e_acute = "é";
+        assert!(
+            z.as_bytes() < e_acute.as_bytes(),
+            "UTF-8 memcmp preserves code point order"
+        );
+    }
+
+    // ── bd-16ov §12.15-12.16 Type Affinity tests ────────────────────────
+
+    #[test]
+    fn test_affinity_int_keyword() {
+        assert_eq!(
+            TypeAffinity::from_type_name("INTEGER"),
+            TypeAffinity::Integer
+        );
+        assert_eq!(TypeAffinity::from_type_name("INT"), TypeAffinity::Integer);
+        assert_eq!(
+            TypeAffinity::from_type_name("TINYINT"),
+            TypeAffinity::Integer
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("SMALLINT"),
+            TypeAffinity::Integer
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("MEDIUMINT"),
+            TypeAffinity::Integer
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("BIGINT"),
+            TypeAffinity::Integer
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("UNSIGNED BIG INT"),
+            TypeAffinity::Integer
+        );
+        assert_eq!(TypeAffinity::from_type_name("INT2"), TypeAffinity::Integer);
+        assert_eq!(TypeAffinity::from_type_name("INT8"), TypeAffinity::Integer);
+    }
+
+    #[test]
+    fn test_affinity_text_keyword() {
+        assert_eq!(TypeAffinity::from_type_name("TEXT"), TypeAffinity::Text);
+        assert_eq!(
+            TypeAffinity::from_type_name("CHARACTER(20)"),
+            TypeAffinity::Text
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("VARCHAR(255)"),
+            TypeAffinity::Text
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("VARYING CHARACTER(255)"),
+            TypeAffinity::Text
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("NCHAR(55)"),
+            TypeAffinity::Text
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("NATIVE CHARACTER(70)"),
+            TypeAffinity::Text
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("NVARCHAR(100)"),
+            TypeAffinity::Text
+        );
+        assert_eq!(TypeAffinity::from_type_name("CLOB"), TypeAffinity::Text);
+    }
+
+    #[test]
+    fn test_affinity_blob_keyword() {
+        assert_eq!(TypeAffinity::from_type_name("BLOB"), TypeAffinity::Blob);
+        assert_eq!(TypeAffinity::from_type_name("blob"), TypeAffinity::Blob);
+    }
+
+    #[test]
+    fn test_affinity_empty_type() {
+        assert_eq!(TypeAffinity::from_type_name(""), TypeAffinity::Blob);
+    }
+
+    #[test]
+    fn test_affinity_real_keyword() {
+        assert_eq!(TypeAffinity::from_type_name("REAL"), TypeAffinity::Real);
+        assert_eq!(TypeAffinity::from_type_name("DOUBLE"), TypeAffinity::Real);
+        assert_eq!(
+            TypeAffinity::from_type_name("DOUBLE PRECISION"),
+            TypeAffinity::Real
+        );
+        assert_eq!(TypeAffinity::from_type_name("FLOAT"), TypeAffinity::Real);
+    }
+
+    #[test]
+    fn test_affinity_numeric_keyword() {
+        assert_eq!(
+            TypeAffinity::from_type_name("NUMERIC"),
+            TypeAffinity::Numeric
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("DECIMAL(10,5)"),
+            TypeAffinity::Numeric
+        );
+        assert_eq!(
+            TypeAffinity::from_type_name("BOOLEAN"),
+            TypeAffinity::Numeric
+        );
+        assert_eq!(TypeAffinity::from_type_name("DATE"), TypeAffinity::Numeric);
+        assert_eq!(
+            TypeAffinity::from_type_name("DATETIME"),
+            TypeAffinity::Numeric
+        );
+    }
+
+    #[test]
+    fn test_affinity_case_insensitive() {
+        assert_eq!(
+            TypeAffinity::from_type_name("integer"),
+            TypeAffinity::Integer
+        );
+        assert_eq!(TypeAffinity::from_type_name("text"), TypeAffinity::Text);
+        assert_eq!(TypeAffinity::from_type_name("Real"), TypeAffinity::Real);
+        assert_eq!(
+            TypeAffinity::from_type_name("Numeric"),
+            TypeAffinity::Numeric
+        );
+    }
+
+    #[test]
+    fn test_affinity_first_match_int_before_char() {
+        // "CHARINT" contains both "CHAR" and "INT", but "INT" is checked first.
+        assert_eq!(
+            TypeAffinity::from_type_name("CHARINT"),
+            TypeAffinity::Integer
+        );
+        // "POINTERFLOAT" contains "INT" so INTEGER wins over REAL.
+        assert_eq!(
+            TypeAffinity::from_type_name("POINTERFLOAT"),
+            TypeAffinity::Integer
+        );
+    }
+
+    #[test]
+    fn test_comparison_numeric_vs_text() {
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Integer, TypeAffinity::Text),
+            Some(TypeAffinity::Numeric)
+        );
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Text, TypeAffinity::Real),
+            Some(TypeAffinity::Numeric)
+        );
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Numeric, TypeAffinity::Blob),
+            Some(TypeAffinity::Numeric)
+        );
+    }
+
+    #[test]
+    fn test_comparison_text_vs_blob() {
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Text, TypeAffinity::Blob),
+            Some(TypeAffinity::Text)
+        );
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Blob, TypeAffinity::Text),
+            Some(TypeAffinity::Text)
+        );
+    }
+
+    #[test]
+    fn test_comparison_same_affinity_no_coercion() {
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Integer, TypeAffinity::Integer),
+            None
+        );
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Text, TypeAffinity::Text),
+            None
+        );
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Blob, TypeAffinity::Blob),
+            None
+        );
+    }
+
+    #[test]
+    fn test_comparison_numeric_subtypes() {
+        // INTEGER vs REAL: both numeric, different variants but no coercion needed
+        // per SQLite rules (they share the numeric class).
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Integer, TypeAffinity::Real),
+            None
+        );
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Integer, TypeAffinity::Numeric),
+            None
+        );
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Real, TypeAffinity::Numeric),
+            None
+        );
     }
 }

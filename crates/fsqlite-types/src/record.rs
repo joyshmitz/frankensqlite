@@ -440,4 +440,92 @@ mod tests {
         let values = parse_record(&[]).unwrap();
         assert!(values.is_empty());
     }
+
+    #[test]
+    fn test_record_format_null_vector() {
+        let data = serialize_record(&[SqliteValue::Null]);
+        assert_eq!(data, vec![0x02, 0x00]);
+    }
+
+    #[test]
+    fn test_record_format_int8_vector() {
+        let data = serialize_record(&[SqliteValue::Integer(42)]);
+        assert_eq!(data, vec![0x02, 0x01, 0x2A]);
+    }
+
+    #[test]
+    fn test_record_format_int16_vector() {
+        let data = serialize_record(&[SqliteValue::Integer(256)]);
+        assert_eq!(data, vec![0x02, 0x02, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn test_record_format_int64_vector() {
+        let value = 0x0102_0304_0506_0708_i64;
+        let data = serialize_record(&[SqliteValue::Integer(value)]);
+        assert_eq!(
+            data,
+            vec![0x02, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
+    }
+
+    #[test]
+    fn test_record_format_float_vector() {
+        let data = serialize_record(&[SqliteValue::Float(3.14)]);
+        assert_eq!(
+            data,
+            vec![0x02, 0x07, 0x40, 0x09, 0x1E, 0xB8, 0x51, 0xEB, 0x85, 0x1F]
+        );
+    }
+
+    #[test]
+    fn test_record_format_zero_one_constants_vectors() {
+        let zero = serialize_record(&[SqliteValue::Integer(0)]);
+        assert_eq!(zero, vec![0x02, 0x08]);
+
+        let one = serialize_record(&[SqliteValue::Integer(1)]);
+        assert_eq!(one, vec![0x02, 0x09]);
+    }
+
+    #[test]
+    fn test_record_format_text_blob_vectors() {
+        let text = serialize_record(&[SqliteValue::Text("hello".to_owned())]);
+        assert_eq!(text, vec![0x02, 0x17, 0x68, 0x65, 0x6C, 0x6C, 0x6F]);
+
+        let blob = serialize_record(&[SqliteValue::Blob(vec![0xCA, 0xFE])]);
+        assert_eq!(blob, vec![0x02, 0x10, 0xCA, 0xFE]);
+    }
+
+    #[test]
+    fn test_record_format_worked_example_exact_bytes() {
+        let values = vec![
+            SqliteValue::Integer(42),
+            SqliteValue::Text("hello".to_owned()),
+            SqliteValue::Float(3.14),
+            SqliteValue::Null,
+            SqliteValue::Blob(vec![0xCA, 0xFE]),
+        ];
+        let data = serialize_record(&values);
+        let expected = vec![
+            0x06, 0x01, 0x17, 0x07, 0x00, 0x10, 0x2A, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x40, 0x09,
+            0x1E, 0xB8, 0x51, 0xEB, 0x85, 0x1F, 0xCA, 0xFE,
+        ];
+        assert_eq!(data, expected);
+        assert_eq!(data.len(), 22);
+    }
+
+    #[test]
+    fn test_record_header_size_includes_self_for_one_and_ten_columns() {
+        let one_col = serialize_record(&[SqliteValue::Integer(42)]);
+        let (one_header_size, one_consumed) = read_varint(&one_col).expect("valid one-col header");
+        assert_eq!(one_consumed, 1);
+        assert_eq!(one_header_size, 2);
+
+        let ten_values: Vec<SqliteValue> = (2_i64..=11).map(SqliteValue::Integer).collect();
+        let ten_col = serialize_record(&ten_values);
+        let (ten_header_size, ten_consumed) = read_varint(&ten_col).expect("valid ten-col header");
+        assert_eq!(ten_consumed, 1);
+        assert_eq!(ten_header_size, 11);
+        assert!(ten_col[1..11].iter().all(|&serial| serial == 0x01));
+    }
 }
