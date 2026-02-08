@@ -690,7 +690,13 @@ impl VfsFile for UnixFile {
         }
     }
 
-    fn shm_map(&mut self, _cx: &Cx, _region: u32, _size: u32, _extend: bool) -> Result<*mut u8> {
+    fn shm_map(
+        &mut self,
+        _cx: &Cx,
+        _region: u32,
+        _size: u32,
+        _extend: bool,
+    ) -> Result<crate::shm::ShmRegion> {
         // SHM support will be added in a later phase (WAL mode).
         Err(FrankenError::Unsupported)
     }

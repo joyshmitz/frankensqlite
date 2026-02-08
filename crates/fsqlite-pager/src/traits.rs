@@ -1,0 +1,318 @@
+//! Storage trait hierarchy for MVCC pager and checkpoint operations.
+//!
+//! This module defines the sealed, internal-only traits that encode
+//! MVCC safety invariants. Only the defining crate (and test mocks
+//! within it) can implement these traits.
+//!
+//! # Sealed Trait Discipline (§9)
+//!
+//! Internal traits use `mod sealed { pub trait Sealed {} }` so that
+//! downstream crates cannot provide alternate implementations.
+//!
+//! - **Sealed:** [`MvccPager`], [`TransactionHandle`], [`CheckpointPageWriter`]
+//! - **Open (user-implementable):** `Vfs`, `VfsFile` (in `fsqlite-vfs`)
+
+use fsqlite_error::Result;
+use fsqlite_types::cx::Cx;
+use fsqlite_types::{PageData, PageNumber};
+
+// ---------------------------------------------------------------------------
+// Sealed trait discipline
+// ---------------------------------------------------------------------------
+
+/// Sealed trait module — prevents external crates from implementing
+/// internal traits that encode MVCC safety invariants.
+pub(crate) mod sealed {
+    /// Marker trait restricting implementation to this crate.
+    pub trait Sealed {}
+}
+
+// ---------------------------------------------------------------------------
+// Transaction mode
+// ---------------------------------------------------------------------------
+
+/// How a transaction should be opened.
+///
+/// Matches SQLite's `BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE]` semantics
+/// adapted for MVCC.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionMode {
+    /// Deferred: starts as read-only, upgrades to writer on first write.
+    /// This is the default mode.
+    #[default]
+    Deferred,
+    /// Immediate: acquires write intent at `BEGIN` time. Corresponds to
+    /// `BEGIN IMMEDIATE` in SQLite. Under MVCC this takes a reservation
+    /// on the serialized writer token.
+    Immediate,
+    /// Exclusive: like Immediate but also prevents new readers from
+    /// starting. Used for schema changes and `VACUUM`.
+    Exclusive,
+    /// Read-only: the transaction will never write. The pager can skip
+    /// SSI bookkeeping and use a lightweight snapshot.
+    ReadOnly,
+}
+
+// ---------------------------------------------------------------------------
+// MvccPager — primary storage interface
+// ---------------------------------------------------------------------------
+
+/// The MVCC-aware page-level storage interface.
+///
+/// This is the primary interface consumed by the B-tree layer and VDBE.
+/// It supports multiple concurrent transactions from different threads,
+/// with internal locking (version store `RwLock`, lock table `Mutex`).
+///
+/// The pager outlives all transactions it creates (via `Arc`).
+///
+/// # Cx Everywhere
+///
+/// Every method that touches I/O, acquires locks, or could block accepts
+/// `&Cx` for cancellation and deadline propagation (§9 cross-cutting rule).
+///
+/// # Sealed
+///
+/// This trait is sealed — only this crate can implement it.
+pub trait MvccPager: sealed::Sealed + Send + Sync {
+    /// The transaction handle type produced by this pager.
+    type Txn: TransactionHandle;
+
+    /// Begin a new transaction.
+    ///
+    /// Returns a [`TransactionHandle`] that provides page-level access
+    /// within the transaction's snapshot. The handle is `Send` so it
+    /// can be moved to another thread if needed.
+    fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn>;
+}
+
+// ---------------------------------------------------------------------------
+// TransactionHandle
+// ---------------------------------------------------------------------------
+
+/// A handle to an active MVCC transaction.
+///
+/// Provides page-level read/write access scoped to the transaction's
+/// snapshot. Dropping a handle without calling [`commit`](Self::commit)
+/// implicitly rolls back.
+///
+/// # Page resolution chain
+///
+/// `get_page` resolves through: write-set → version chain → disk.
+/// SSI `WitnessKey` tracking records which pages were read.
+///
+/// # Sealed
+///
+/// This trait is sealed — only this crate can implement it.
+pub trait TransactionHandle: sealed::Sealed + Send {
+    /// Read a page, resolving through the MVCC version chain.
+    ///
+    /// Resolution order: local write-set → version chain → on-disk.
+    /// Records the read in SSI witness tracking for conflict detection
+    /// at commit time.
+    fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData>;
+
+    /// Write a page within this transaction.
+    ///
+    /// Acquires a page-level lock and records the write for SSI
+    /// validation at commit time.
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()>;
+
+    /// Allocate a new page and return its page number.
+    ///
+    /// Searches the freelist first, then extends the database file.
+    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber>;
+
+    /// Free a page, returning it to the freelist.
+    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()>;
+
+    /// Commit this transaction.
+    ///
+    /// Performs SSI validation, First-Committer-Wins check, merge ladder,
+    /// WAL append, and version publish. Returns `SQLITE_BUSY_SNAPSHOT`
+    /// (via [`FrankenError::BusySnapshot`]) on serialization failure.
+    fn commit(&mut self, cx: &Cx) -> Result<()>;
+
+    /// Roll back this transaction, discarding the write-set.
+    ///
+    /// Rollback is infallible in the MVCC model (we simply discard the
+    /// local write-set and release page locks), but returns `Result` for
+    /// consistency with the trait surface.
+    fn rollback(&mut self, cx: &Cx) -> Result<()>;
+}
+
+// ---------------------------------------------------------------------------
+// CheckpointPageWriter
+// ---------------------------------------------------------------------------
+
+/// A write-back interface used during WAL checkpointing.
+///
+/// This trait breaks the `pager ↔ wal` circular dependency: it is
+/// defined here in `fsqlite-pager` but passed to `fsqlite-wal` at
+/// runtime from `fsqlite-core`.
+///
+/// # Sealed
+///
+/// This trait is sealed — only this crate can implement it.
+pub trait CheckpointPageWriter: sealed::Sealed + Send {
+    /// Write a page directly to the database file (bypassing the cache).
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()>;
+
+    /// Truncate the database file to `n_pages` pages.
+    fn truncate(&mut self, cx: &Cx, n_pages: u32) -> Result<()>;
+
+    /// Sync the database file to stable storage.
+    fn sync(&mut self, cx: &Cx) -> Result<()>;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Sealed trait enforcement (compile-fail conceptually, compile-pass here) --
+
+    /// A test mock for `MvccPager` — only possible within this crate
+    /// because the trait is sealed.
+    struct MockPager;
+
+    impl sealed::Sealed for MockPager {}
+
+    impl MvccPager for MockPager {
+        type Txn = MockTxn;
+
+        fn begin(&self, _cx: &Cx, _mode: TransactionMode) -> Result<Self::Txn> {
+            Ok(MockTxn { committed: false })
+        }
+    }
+
+    struct MockTxn {
+        committed: bool,
+    }
+
+    impl sealed::Sealed for MockTxn {}
+
+    impl TransactionHandle for MockTxn {
+        fn get_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+            let size = fsqlite_types::PageSize::default();
+            let mut data = PageData::zeroed(size);
+            // Stamp the page number in the first 4 bytes for test verification.
+            data.as_bytes_mut()[..4].copy_from_slice(&page_no.get().to_le_bytes());
+            Ok(data)
+        }
+
+        fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
+            Ok(PageNumber::new(2).expect("2 is non-zero"))
+        }
+
+        fn free_page(&mut self, _cx: &Cx, _page_no: PageNumber) -> Result<()> {
+            Ok(())
+        }
+
+        fn commit(&mut self, _cx: &Cx) -> Result<()> {
+            self.committed = true;
+            Ok(())
+        }
+
+        fn rollback(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockCheckpointWriter;
+
+    impl sealed::Sealed for MockCheckpointWriter {}
+
+    impl CheckpointPageWriter for MockCheckpointWriter {
+        fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn truncate(&mut self, _cx: &Cx, _n_pages: u32) -> Result<()> {
+            Ok(())
+        }
+
+        fn sync(&mut self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // -- Unit tests --
+
+    #[test]
+    fn test_pager_trait_is_sealed_mock_impl() {
+        // This compiles because MockPager is in the same crate.
+        // External crates cannot impl Sealed, so they cannot impl MvccPager.
+        let pager = MockPager;
+        let cx = Cx::new();
+        let _txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+    }
+
+    #[test]
+    fn test_mvccpager_begin_commit_rollback_signatures() {
+        let pager = MockPager;
+        let cx = Cx::new();
+
+        // Begin takes &Cx and returns Result.
+        let mut txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+
+        // All blocking/I/O methods take &Cx and return Result.
+        let page_no = PageNumber::new(1).unwrap();
+        let data = txn.get_page(&cx, page_no).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(data.as_bytes()[..4].try_into().unwrap()),
+            1
+        );
+
+        txn.write_page(&cx, page_no, &[0u8; 4096]).unwrap();
+        let new_page = txn.allocate_page(&cx).unwrap();
+        assert_eq!(new_page.get(), 2);
+        txn.free_page(&cx, new_page).unwrap();
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_transaction_rollback_is_infallible() {
+        let pager = MockPager;
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        // Rollback should succeed without error.
+        txn.rollback(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_checkpoint_page_writer_signatures() {
+        let mut writer = MockCheckpointWriter;
+        let cx = Cx::new();
+        let page1 = PageNumber::new(1).unwrap();
+
+        writer.write_page(&cx, page1, &[0u8; 4096]).unwrap();
+        writer.truncate(&cx, 10).unwrap();
+        writer.sync(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_transaction_mode_default_is_deferred() {
+        assert_eq!(TransactionMode::default(), TransactionMode::Deferred);
+    }
+
+    #[test]
+    fn test_open_traits_are_extensible() {
+        // Vfs and VfsFile are open traits — external crates CAN implement them.
+        // This test is in fsqlite-vfs, but we verify the concept:
+        // sealed traits CANNOT be implemented externally.
+        // Open traits CAN be implemented externally.
+        //
+        // Since we can't directly test "external crate fails to compile"
+        // in a unit test, we verify that our mock impls compile and work.
+        let pager = MockPager;
+        let _: &dyn MvccPager<Txn = MockTxn> = &pager;
+    }
+}

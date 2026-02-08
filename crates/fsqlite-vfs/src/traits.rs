@@ -6,6 +6,8 @@ use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
+use crate::shm::ShmRegion;
+
 static DEFAULT_RANDOMNESS_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A virtual filesystem implementation.
@@ -146,9 +148,9 @@ pub trait VfsFile: Send + Sync {
 
     /// Map a region of shared memory. `region` is a 0-based index of 32KB
     /// regions. If `extend` is true and the region does not exist, create it.
-    /// Returns a mutable pointer to the mapped region.
+    /// Returns a safe [`ShmRegion`] handle with bounds-checked accessors.
     /// (Equivalent to sqlite3_io_methods.xShmMap)
-    fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<*mut u8>;
+    fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion>;
 
     /// Acquire or release a shared-memory lock.
     /// `offset` and `n` define a range of lock slots.
@@ -215,7 +217,7 @@ mod tests {
                 _region: u32,
                 _size: u32,
                 _extend: bool,
-            ) -> Result<*mut u8> {
+            ) -> Result<ShmRegion> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {

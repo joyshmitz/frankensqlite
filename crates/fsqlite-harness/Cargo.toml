@@ -17,6 +17,8 @@ parking_lot = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+fsqlite-vfs = { workspace = true }
+fsqlite-types = { workspace = true }
 
 [lints]
 workspace = true

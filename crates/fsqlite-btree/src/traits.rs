@@ -1,0 +1,381 @@
+//! B-tree cursor operations trait (sealed).
+//!
+//! This module defines `BtreeCursorOps`, the internal interface used by
+//! the VDBE to navigate and mutate B-tree structures. The trait is sealed
+//! to enforce MVCC safety invariants — only this crate provides implementations.
+//!
+//! # Cursor semantics
+//!
+//! A cursor is bound to a single transaction and a single B-tree (either
+//! a table intkey tree or an index blobkey tree). Cursors are NOT `Send`
+//! or `Sync` — they are pinned to the creating thread.
+//!
+//! # Two B-tree types
+//!
+//! - **Table B-trees (intkey):** Keyed by `i64` rowid, leaves store record payloads.
+//! - **Index B-trees (blobkey):** Keyed by arbitrary byte sequences, leaves are key-only.
+
+use fsqlite_error::Result;
+use fsqlite_types::cx::Cx;
+
+// ---------------------------------------------------------------------------
+// Sealed trait discipline
+// ---------------------------------------------------------------------------
+
+pub(crate) mod sealed {
+    /// Marker trait restricting implementation to this crate.
+    pub trait Sealed {}
+}
+
+// ---------------------------------------------------------------------------
+// Cursor seek result
+// ---------------------------------------------------------------------------
+
+/// Result of a seek operation on a B-tree cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekResult {
+    /// The exact key was found; the cursor points to it.
+    Found,
+    /// The key was not found; the cursor points to the entry that would
+    /// follow it in sort order (or is at EOF if no such entry exists).
+    NotFound,
+}
+
+impl SeekResult {
+    /// Whether the seek found an exact match.
+    #[must_use]
+    pub fn is_found(self) -> bool {
+        self == Self::Found
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BtreeCursorOps
+// ---------------------------------------------------------------------------
+
+/// Low-level B-tree cursor operations.
+///
+/// This trait is consumed by the VDBE to implement `OP_SeekRowid`,
+/// `OP_Next`, `OP_Insert`, `OP_Delete`, etc. Each cursor is bound to
+/// a single transaction and a single B-tree root page.
+///
+/// # NOT Send/Sync
+///
+/// Cursors hold mutable references into the page cache and are bound
+/// to a single transaction/thread. They must not cross thread boundaries.
+///
+/// # Cx Everywhere
+///
+/// Every method that touches I/O or could block accepts `&Cx` for
+/// cancellation and deadline propagation.
+///
+/// # Sealed
+///
+/// This trait is sealed — only this crate can implement it.
+pub trait BtreeCursorOps: sealed::Sealed {
+    // -- Seek operations --
+
+    /// Position the cursor at the given key in an index B-tree.
+    ///
+    /// Returns [`SeekResult::Found`] if the exact key exists, or
+    /// [`SeekResult::NotFound`] if the cursor is positioned at the
+    /// entry that would follow the key in sort order.
+    fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<SeekResult>;
+
+    /// Position the cursor at the given rowid in a table B-tree.
+    fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult>;
+
+    // -- Navigation --
+
+    /// Move the cursor to the first entry. Returns `false` if the tree
+    /// is empty.
+    fn first(&mut self, cx: &Cx) -> Result<bool>;
+
+    /// Move the cursor to the last entry. Returns `false` if the tree
+    /// is empty.
+    fn last(&mut self, cx: &Cx) -> Result<bool>;
+
+    /// Advance the cursor to the next entry. Returns `false` if there
+    /// is no next entry (cursor is now at EOF).
+    fn next(&mut self, cx: &Cx) -> Result<bool>;
+
+    /// Move the cursor to the previous entry. Returns `false` if there
+    /// is no previous entry.
+    fn prev(&mut self, cx: &Cx) -> Result<bool>;
+
+    // -- Mutation --
+
+    /// Insert a key into an index B-tree.
+    ///
+    /// If the key already exists, it is replaced.
+    fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()>;
+
+    /// Insert a row into a table B-tree.
+    ///
+    /// `rowid` is the integer key. `data` is the serialized record payload.
+    fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()>;
+
+    /// Delete the entry at the current cursor position.
+    ///
+    /// The cursor is positioned at the next entry after deletion (or EOF
+    /// if the deleted entry was the last one).
+    fn delete(&mut self, cx: &Cx) -> Result<()>;
+
+    // -- Access --
+
+    /// Read the payload at the current cursor position.
+    ///
+    /// For table B-trees, this is the serialized record. For index
+    /// B-trees, this is the key bytes.
+    fn payload(&self, cx: &Cx) -> Result<Vec<u8>>;
+
+    /// Read the rowid at the current cursor position (table B-trees only).
+    fn rowid(&self, cx: &Cx) -> Result<i64>;
+
+    /// Whether the cursor is at EOF (past the last entry).
+    fn eof(&self) -> bool;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-crate mock proving the sealed trait can be implemented here.
+    struct MockCursor {
+        at_eof: bool,
+        current_rowid: i64,
+        entries: Vec<(i64, Vec<u8>)>,
+        pos: usize,
+    }
+
+    impl MockCursor {
+        fn new(entries: Vec<(i64, Vec<u8>)>) -> Self {
+            Self {
+                at_eof: entries.is_empty(),
+                current_rowid: entries.first().map_or(0, |e| e.0),
+                entries,
+                pos: 0,
+            }
+        }
+    }
+
+    impl sealed::Sealed for MockCursor {}
+
+    impl BtreeCursorOps for MockCursor {
+        fn index_move_to(&mut self, _cx: &Cx, key: &[u8]) -> Result<SeekResult> {
+            // Simple linear scan for testing.
+            for (i, (_, data)) in self.entries.iter().enumerate() {
+                if data.as_slice() == key {
+                    self.pos = i;
+                    self.at_eof = false;
+                    self.current_rowid = self.entries[i].0;
+                    return Ok(SeekResult::Found);
+                }
+            }
+            self.at_eof = true;
+            Ok(SeekResult::NotFound)
+        }
+
+        fn table_move_to(&mut self, _cx: &Cx, rowid: i64) -> Result<SeekResult> {
+            for (i, (rid, _)) in self.entries.iter().enumerate() {
+                if *rid == rowid {
+                    self.pos = i;
+                    self.at_eof = false;
+                    self.current_rowid = rowid;
+                    return Ok(SeekResult::Found);
+                }
+            }
+            self.at_eof = true;
+            Ok(SeekResult::NotFound)
+        }
+
+        fn first(&mut self, _cx: &Cx) -> Result<bool> {
+            if self.entries.is_empty() {
+                self.at_eof = true;
+                return Ok(false);
+            }
+            self.pos = 0;
+            self.at_eof = false;
+            self.current_rowid = self.entries[0].0;
+            Ok(true)
+        }
+
+        fn last(&mut self, _cx: &Cx) -> Result<bool> {
+            if self.entries.is_empty() {
+                self.at_eof = true;
+                return Ok(false);
+            }
+            self.pos = self.entries.len() - 1;
+            self.at_eof = false;
+            self.current_rowid = self.entries[self.pos].0;
+            Ok(true)
+        }
+
+        fn next(&mut self, _cx: &Cx) -> Result<bool> {
+            if self.pos + 1 >= self.entries.len() {
+                self.at_eof = true;
+                return Ok(false);
+            }
+            self.pos += 1;
+            self.current_rowid = self.entries[self.pos].0;
+            Ok(true)
+        }
+
+        fn prev(&mut self, _cx: &Cx) -> Result<bool> {
+            if self.pos == 0 {
+                return Ok(false);
+            }
+            self.pos -= 1;
+            self.current_rowid = self.entries[self.pos].0;
+            Ok(true)
+        }
+
+        fn index_insert(&mut self, _cx: &Cx, key: &[u8]) -> Result<()> {
+            let next_rowid = self.entries.last().map_or(1, |e| e.0 + 1);
+            self.entries.push((next_rowid, key.to_vec()));
+            Ok(())
+        }
+
+        fn table_insert(&mut self, _cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
+            self.entries.push((rowid, data.to_vec()));
+            self.current_rowid = rowid;
+            self.at_eof = false;
+            Ok(())
+        }
+
+        fn delete(&mut self, _cx: &Cx) -> Result<()> {
+            if !self.at_eof && self.pos < self.entries.len() {
+                self.entries.remove(self.pos);
+                if self.pos >= self.entries.len() {
+                    self.at_eof = true;
+                } else {
+                    self.current_rowid = self.entries[self.pos].0;
+                }
+            }
+            Ok(())
+        }
+
+        fn payload(&self, _cx: &Cx) -> Result<Vec<u8>> {
+            if self.at_eof {
+                return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
+            }
+            Ok(self.entries[self.pos].1.clone())
+        }
+
+        fn rowid(&self, _cx: &Cx) -> Result<i64> {
+            if self.at_eof {
+                return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
+            }
+            Ok(self.current_rowid)
+        }
+
+        fn eof(&self) -> bool {
+            self.at_eof
+        }
+    }
+
+    #[test]
+    fn test_btree_cursor_ops_sealed_mock() {
+        let entries = vec![
+            (1, b"alice".to_vec()),
+            (2, b"bob".to_vec()),
+            (3, b"charlie".to_vec()),
+        ];
+        let mut cursor = MockCursor::new(entries);
+        let cx = Cx::new();
+
+        // Navigate forward.
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+        assert_eq!(cursor.payload(&cx).unwrap(), b"alice");
+
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+
+        assert!(!cursor.next(&cx).unwrap());
+        assert!(cursor.eof());
+    }
+
+    #[test]
+    fn test_btree_cursor_seek() {
+        let entries = vec![
+            (10, b"ten".to_vec()),
+            (20, b"twenty".to_vec()),
+            (30, b"thirty".to_vec()),
+        ];
+        let mut cursor = MockCursor::new(entries);
+        let cx = Cx::new();
+
+        assert!(cursor.table_move_to(&cx, 20).unwrap().is_found());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 20);
+        assert_eq!(cursor.payload(&cx).unwrap(), b"twenty");
+
+        assert!(!cursor.table_move_to(&cx, 99).unwrap().is_found());
+    }
+
+    #[test]
+    fn test_btree_cursor_insert_delete() {
+        let mut cursor = MockCursor::new(vec![]);
+        let cx = Cx::new();
+
+        assert!(!cursor.first(&cx).unwrap());
+        assert!(cursor.eof());
+
+        cursor.table_insert(&cx, 1, b"hello").unwrap();
+        cursor.table_insert(&cx, 2, b"world").unwrap();
+
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.payload(&cx).unwrap(), b"hello");
+
+        cursor.delete(&cx).unwrap();
+        assert!(!cursor.eof());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_btree_cursor_navigate_backward() {
+        let entries = vec![(1, b"a".to_vec()), (2, b"b".to_vec()), (3, b"c".to_vec())];
+        let mut cursor = MockCursor::new(entries);
+        let cx = Cx::new();
+
+        assert!(cursor.last(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+
+        assert!(cursor.prev(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+
+        assert!(cursor.prev(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+
+        assert!(!cursor.prev(&cx).unwrap());
+    }
+
+    #[test]
+    fn test_btree_cursor_index_seek() {
+        let entries = vec![
+            (1, b"alpha".to_vec()),
+            (2, b"beta".to_vec()),
+            (3, b"gamma".to_vec()),
+        ];
+        let mut cursor = MockCursor::new(entries);
+        let cx = Cx::new();
+
+        assert!(cursor.index_move_to(&cx, b"beta").unwrap().is_found());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+
+        assert!(!cursor.index_move_to(&cx, b"delta").unwrap().is_found());
+    }
+
+    #[test]
+    fn test_seek_result_is_found() {
+        assert!(SeekResult::Found.is_found());
+        assert!(!SeekResult::NotFound.is_found());
+    }
+}

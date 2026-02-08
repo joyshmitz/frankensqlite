@@ -230,7 +230,13 @@ impl VfsFile for MemoryFile {
         Ok(false)
     }
 
-    fn shm_map(&mut self, _cx: &Cx, _region: u32, _size: u32, _extend: bool) -> Result<*mut u8> {
+    fn shm_map(
+        &mut self,
+        _cx: &Cx,
+        _region: u32,
+        _size: u32,
+        _extend: bool,
+    ) -> Result<crate::shm::ShmRegion> {
         Err(FrankenError::Unsupported)
     }
 
