@@ -180,15 +180,39 @@
         transform: translateY(12px);
         opacity: 0;
         transition: transform 200ms ease, opacity 200ms ease;
+        will-change: transform, opacity;
       }
       .sheet.open {
         transform: translateY(0);
         opacity: 1;
       }
 
+      @media (max-width: 639px) {
+        .glass,
+        .glass-2 {
+          backdrop-filter: blur(8px);
+          -webkit-backdrop-filter: blur(8px);
+        }
+        .chart {
+          min-height: 320px;
+        }
+        #docMain {
+          display: flex;
+          flex-direction: column;
+        }
+        #docMain > aside {
+          order: -1;
+        }
+      }
+
       /* ECharts container should not shrink weirdly */
       .chart {
         min-height: 280px;
+        contain: content;
+      }
+
+      #commitList {
+        contain: content;
       }
 
       /* Markdown rendering (hand-rolled; avoids tailwind/typography plugin dependency) */
@@ -305,7 +329,7 @@
   </head>
 
   <body>
-    <div class="mx-auto max-w-[1200px] px-4 pb-40 pt-10 sm:px-6 lg:px-8">
+    <div class="mx-auto max-w-[1200px] px-4 pb-28 pt-10 sm:px-6 lg:px-8">
       <!-- Top -->
       <header class="enter">
         <div
@@ -365,7 +389,7 @@
             </div>
           </div>
 
-          <div class="mt-7 grid grid-cols-2 gap-3 sm:grid-cols-4 lg:grid-cols-5">
+          <div class="mt-7 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-5">
             <div class="glass-2 rounded-2xl p-4 shadow-sm">
               <div class="text-xs font-semibold text-slate-500">Commits</div>
               <div id="kpiCommits" class="mt-2 text-2xl font-bold text-slate-900">-</div>
@@ -382,7 +406,7 @@
               <div class="text-xs font-semibold text-slate-500">Primary Mode</div>
               <div id="kpiMode" class="mt-2 text-2xl font-bold text-slate-900">-</div>
             </div>
-            <div class="glass-2 hidden rounded-2xl p-4 shadow-sm lg:block">
+            <div class="glass-2 rounded-2xl p-4 shadow-sm">
               <div class="text-xs font-semibold text-slate-500">Data Integrity</div>
               <div id="kpiIntegrity" class="mt-2 text-2xl font-bold text-slate-900">-</div>
             </div>
@@ -599,7 +623,7 @@
               Loading spec evolution dataset... (local gzip JSON; no GitHub API)
             </div>
 
-            <div id="docMain" class="mt-4 hidden grid-cols-1 gap-4 lg:grid lg:grid-cols-[1fr_420px]">
+            <div id="docMain" class="mt-4 hidden grid-cols-1 gap-4 lg:grid lg:grid-cols-[1fr_360px]">
               <section class="glass-2 rounded-3xl p-4 lg:p-5">
                 <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                   <div class="min-w-0">
@@ -857,21 +881,29 @@
     <div id="dock" class="dock fixed inset-x-0 bottom-0 z-30 px-4 py-3">
       <div class="mx-auto max-w-[1200px]">
         <div class="flex items-center justify-between gap-3">
-          <div class="min-w-0">
-            <div class="text-[11px] font-semibold text-slate-500">Timeline scrubber</div>
-            <div id="dockTitle" class="mt-0.5 truncate text-xs font-semibold text-slate-900">-</div>
+          <div class="min-w-0 flex items-center gap-2">
+            <button
+              id="dockCollapseToggle"
+              class="sm:hidden focus-ring inline-flex h-6 w-6 items-center justify-center rounded-lg border border-slate-900/10 bg-white/70 text-[10px] font-bold text-slate-600 hover:bg-white"
+              type="button"
+              aria-label="Toggle dock"
+            >&#9650;</button>
+            <div>
+              <div class="text-[11px] font-semibold text-slate-500">Timeline scrubber</div>
+              <div id="dockTitle" class="mt-0.5 truncate text-xs font-semibold text-slate-900">-</div>
+            </div>
           </div>
           <div class="shrink-0 flex items-center gap-2">
             <button
               id="dockPrev"
-              class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
+              class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-2.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
               type="button"
             >
               Prev
             </button>
             <button
               id="dockNext"
-              class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
+              class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-2.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
               type="button"
             >
               Next
@@ -879,14 +911,16 @@
           </div>
         </div>
 
-        <canvas
-          id="dockCanvas"
-          class="dock-canvas mt-2 rounded-2xl border border-slate-900/10 bg-white/70"
-        ></canvas>
-        <input id="dockSlider" class="dock-slider mt-2" type="range" min="0" max="1" value="0" />
-        <div class="mt-1 flex items-center justify-between text-[11px] text-slate-500">
-          <div id="dockLeftLabel" class="mono">-</div>
-          <div id="dockRightLabel" class="mono">-</div>
+        <div id="dockBody">
+          <canvas
+            id="dockCanvas"
+            class="dock-canvas mt-2 rounded-2xl border border-slate-900/10 bg-white/70"
+          ></canvas>
+          <input id="dockSlider" class="dock-slider mt-2" type="range" min="0" max="1" value="0" />
+          <div class="mt-1 flex items-center justify-between text-[11px] text-slate-500">
+            <div id="dockLeftLabel" class="mono">-</div>
+            <div id="dockRightLabel" class="mono">-</div>
+          </div>
         </div>
       </div>
     </div>
@@ -901,6 +935,22 @@
     <script src="https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html.min.js"></script>
 
     <script>
+      // requestIdleCallback polyfill (Safari < 16.4)
+      if (typeof requestIdleCallback === "undefined") {
+        window.requestIdleCallback = function (cb) {
+          const start = Date.now();
+          return setTimeout(() => {
+            cb({
+              didTimeout: false,
+              timeRemaining: () => Math.max(0, 50 - (Date.now() - start)),
+            });
+          }, 1);
+        };
+        window.cancelIdleCallback = function (id) {
+          clearTimeout(id);
+        };
+      }
+
       // -----------------------------
       // Data: commit metadata + stats
       // -----------------------------
@@ -6200,8 +6250,12 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       // Helpers
       // -----------------------------
 
+      const CSS_CACHE = new Map();
       function getCss(varName) {
-        return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+        if (CSS_CACHE.has(varName)) return CSS_CACHE.get(varName);
+        const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+        CSS_CACHE.set(varName, v);
+        return v;
       }
 
       function clamp(n, lo, hi) {
@@ -6219,6 +6273,14 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
       function fmtInt(n) {
         return Intl.NumberFormat(undefined).format(n);
+      }
+
+      function debounce(fn, ms) {
+        let t;
+        return function (...args) {
+          clearTimeout(t);
+          t = setTimeout(() => fn.apply(this, args), ms);
+        };
       }
 
       function parseCommitLog() {
@@ -6435,8 +6497,12 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         return hunks;
       }
 
+      const BUCKET_MAP = new Map();
       function bucketById(id) {
-        return BUCKETS.find((b) => b.id === id) || BUCKETS[BUCKETS.length - 1];
+        if (BUCKET_MAP.size === 0) {
+          for (const b of BUCKETS) BUCKET_MAP.set(b.id, b);
+        }
+        return BUCKET_MAP.get(id) || BUCKETS[BUCKETS.length - 1];
       }
 
       function pickPrimary(labels) {
@@ -6555,12 +6621,18 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       let FILTERED_COMMITS = [];
       let DOCK_READY = false;
 
-      function render() {
+      // --- Phase 1: Lazy enrichment cache (parse + enrich once) ---
+      let ENRICHED_READY = false;
+      let ENRICHED_MISSING = [];
+
+      function ensureEnriched() {
+        if (ENRICHED_READY) return;
         const commits = parseCommitLog();
         const stats = parseCommitStats();
         const { byHash: clsByHash, missing } = normalizeClassification(commits);
+        ENRICHED_MISSING = missing;
 
-        const enriched = commits.map((c) => {
+        ALL_COMMITS = commits.map((c) => {
           const st = stats.get(c.hash) || { add: 0, del: 0, impact: 0 };
           const raw = clsByHash.get(c.hash) || null;
           const changeGroupsRaw = raw?.change_groups || [];
@@ -6593,7 +6665,13 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           };
         });
 
-        ALL_COMMITS = enriched;
+        ENRICHED_READY = true;
+      }
+
+      function render() {
+        ensureEnriched();
+        const enriched = ALL_COMMITS;
+        const missing = ENRICHED_MISSING;
 
         // KPI
         document.getElementById("kpiCommits").textContent = fmtInt(enriched.length);
@@ -6643,7 +6721,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
         // Make sure code highlighting is applied to newly inserted excerpts
         requestAnimationFrame(() => {
-          document.querySelectorAll("pre code").forEach((el) => {
+          document.querySelectorAll("pre code:not(.hljs)").forEach((el) => {
             try {
               hljs.highlightElement(el);
             } catch {
@@ -6981,22 +7059,24 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           if (raw) raw.textContent = text;
 
           if (rendered) {
-            const md = markdownit({
-              html: false,
-              linkify: true,
-              typographer: true,
-              highlight: (str, lang) => {
-                try {
-                  if (lang && hljs.getLanguage(lang)) {
-                    return `<pre class=\"hljs\"><code>${hljs.highlight(str, { language: lang }).value}</code></pre>`;
+            if (!window._mdSingleton) {
+              window._mdSingleton = markdownit({
+                html: false,
+                linkify: true,
+                typographer: true,
+                highlight: (str, lang) => {
+                  try {
+                    if (lang && hljs.getLanguage(lang)) {
+                      return `<pre class="hljs"><code>${hljs.highlight(str, { language: lang }).value}</code></pre>`;
+                    }
+                    return `<pre class="hljs"><code>${hljs.highlightAuto(str).value}</code></pre>`;
+                  } catch {
+                    return `<pre class="hljs"><code>${escapeHtml(str)}</code></pre>`;
                   }
-                  return `<pre class=\"hljs\"><code>${hljs.highlightAuto(str).value}</code></pre>`;
-                } catch {
-                  return `<pre class=\"hljs\"><code>${escapeHtml(str)}</code></pre>`;
-                }
-              },
-            });
-            const html = md.render(text || "");
+                },
+              });
+            }
+            const html = window._mdSingleton.render(text || "");
             rendered.innerHTML = DOMPurify.sanitize(html);
           }
 
@@ -7082,23 +7162,44 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         void updateDocUI();
       }
 
+      // --- Phase 4: Bucket toggle DOM caching ---
+      let BUCKET_TOGGLES_BUILT = false;
+      const BUCKET_TOGGLE_INDICATORS = new Map(); // bucketId -> [desktopSpan, mobileSpan]
+
       function renderBucketToggles() {
         const wrap = document.getElementById("bucketToggles");
         const wrapM = document.getElementById("bucketTogglesMobile");
-        wrap.innerHTML = "";
-        wrapM.innerHTML = "";
 
+        if (!BUCKET_TOGGLES_BUILT) {
+          wrap.innerHTML = "";
+          wrapM.innerHTML = "";
+          for (const b of BUCKETS) {
+            const item = bucketToggleItem(b);
+            const itemM = bucketToggleItem(b, true);
+            wrap.appendChild(item);
+            wrapM.appendChild(itemM);
+            const ind = item.querySelector("[data-toggle-ind]");
+            const indM = itemM.querySelector("[data-toggle-ind]");
+            BUCKET_TOGGLE_INDICATORS.set(b.id, [ind, indM]);
+          }
+          BUCKET_TOGGLES_BUILT = true;
+        }
+
+        // Update only the toggle indicator styles
         for (const b of BUCKETS) {
-          const item = bucketToggleItem(b);
-          const itemM = bucketToggleItem(b, true);
-          wrap.appendChild(item);
-          wrapM.appendChild(itemM);
+          const on = STATE.bucketEnabled.has(b.id);
+          const indicators = BUCKET_TOGGLE_INDICATORS.get(b.id);
+          if (!indicators) continue;
+          for (const ind of indicators) {
+            if (!ind) continue;
+            ind.style.background = on ? b.color : "#cbd5e1";
+            ind.style.transform = on ? "translateX(16px)" : "translateX(0)";
+          }
         }
       }
 
       function bucketToggleItem(bucket, isMobile = false) {
         const id = (isMobile ? "m-" : "") + `b-${bucket.id}`;
-        const on = STATE.bucketEnabled.has(bucket.id);
 
         const btn = document.createElement("button");
         btn.type = "button";
@@ -7112,7 +7213,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             <span class="mt-0.5 block text-[11px] leading-snug text-slate-500">${escapeHtml(bucket.desc)}</span>
           </span>
           <span class="ml-auto mt-0.5 inline-flex h-6 w-10 items-center rounded-full border border-slate-900/10 bg-white/60 p-0.5">
-            <span class="h-5 w-5 rounded-full transition" style="background:${on ? bucket.color : "#cbd5e1"}; transform: translateX(${on ? "16px" : "0"});"></span>
+            <span data-toggle-ind class="h-5 w-5 rounded-full transition"></span>
           </span>
         `;
         btn.addEventListener("click", () => {
@@ -7559,59 +7660,120 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
       }
 
-      function renderCommitList(commits) {
-        const wrap = document.getElementById("commitList");
-        wrap.innerHTML = "";
+      // --- Phase 5: Commit list DOM caching + progressive rendering ---
+      const COMMIT_LIST_NODES = new Map(); // hash -> details element
+      let COMMIT_LIST_MODE = null; // tracks bucketMode used for build
 
-        for (const c of commits) {
-          const b = bucketById(c.primary);
-          const details = document.createElement("details");
-          details.id = `commit-${c.hash}`;
-          details.className = "glass-2 rounded-3xl px-4 py-3 shadow-sm";
+      function buildCommitNode(c) {
+        const details = document.createElement("details");
+        details.id = `commit-${c.hash}`;
+        details.className = "glass-2 rounded-3xl px-4 py-3 shadow-sm";
+        details.dataset.hash = c.hash;
 
-          const tags = (STATE.bucketMode === "primary" ? [c.primary] : c.labels).map(bucketById);
+        const tags = (STATE.bucketMode === "primary" ? [c.primary] : c.labels).map(bucketById);
 
-          details.innerHTML = `
-            <summary class="cursor-pointer list-none">
-              <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                <div class="min-w-0">
-                  <div class="flex flex-wrap items-center gap-2">
-                    <span class="mono text-xs font-semibold text-slate-600">${escapeHtml(c.short)}</span>
-                    <span class="mono text-xs text-slate-500">${dayjs(c.dateIso).format("HH:mm:ss")}</span>
-                    <span class="mono text-xs text-slate-500">+${fmtInt(c.add)} -${fmtInt(c.del)}</span>
-                  </div>
-                  <div class="mt-1 truncate text-sm font-semibold text-slate-900">${escapeHtml(c.subject)}</div>
-                  <div class="mt-1 flex flex-wrap gap-1.5">
-                    ${tags
-                      .map(
-                        (t) => `
-                          <span class="chip inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-[11px] font-semibold text-slate-700">
-                            <span class="inline-block h-2 w-2 rounded-full" style="background:${t.color}"></span>
-                            ${escapeHtml(`${t.id}. ${t.name}`)}
-                          </span>`,
-                      )
-                      .join("")}
-                  </div>
+        details.innerHTML = `
+          <summary class="cursor-pointer list-none">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div class="min-w-0">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="mono text-xs font-semibold text-slate-600">${escapeHtml(c.short)}</span>
+                  <span class="mono text-xs text-slate-500">${dayjs(c.dateIso).format("HH:mm:ss")}</span>
+                  <span class="mono text-xs text-slate-500">+${fmtInt(c.add)} -${fmtInt(c.del)}</span>
                 </div>
-                <div class="shrink-0">
-                  <a class="focus-ring chip inline-flex items-center gap-2 rounded-2xl px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-white"
-                     href="${escapeHtml(c.url)}" target="_blank" rel="noreferrer">View commit</a>
+                <div class="mt-1 truncate text-sm font-semibold text-slate-900">${escapeHtml(c.subject)}</div>
+                <div class="mt-1 flex flex-wrap gap-1.5">
+                  ${tags
+                    .map(
+                      (t) => `
+                        <span class="chip inline-flex items-center gap-2 rounded-full px-2.5 py-1 text-[11px] font-semibold text-slate-700">
+                          <span class="inline-block h-2 w-2 rounded-full" style="background:${t.color}"></span>
+                          ${escapeHtml(`${t.id}. ${t.name}`)}
+                        </span>`,
+                    )
+                    .join("")}
                 </div>
               </div>
-            </summary>
-            <div class="mt-3 border-t border-slate-900/10 pt-3">
-              ${c.hasClassification ? "" : `<div class="text-xs text-red-700">Missing classification entry for this commit.</div>`}
-              ${c.changeGroups
-                .map((g, i) => renderGroup(g, i))
-                .join("")}
+              <div class="shrink-0">
+                <a class="focus-ring chip inline-flex items-center gap-2 rounded-2xl px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-white"
+                   href="${escapeHtml(c.url)}" target="_blank" rel="noreferrer">View commit</a>
+              </div>
             </div>
-          `;
+          </summary>
+          <div class="mt-3 border-t border-slate-900/10 pt-3">
+            ${c.hasClassification ? "" : `<div class="text-xs text-red-700">Missing classification entry for this commit.</div>`}
+            ${c.changeGroups
+              .map((g, i) => renderGroup(g, i))
+              .join("")}
+          </div>
+        `;
 
-          details.addEventListener("toggle", () => {
-            if (details.open) selectCommitIdx(c.idx);
-          });
+        details.addEventListener("toggle", () => {
+          if (details.open) selectCommitIdx(c.idx);
+        });
 
-          wrap.appendChild(details);
+        return details;
+      }
+
+      function ensureCommitNodes() {
+        if (COMMIT_LIST_MODE === STATE.bucketMode && COMMIT_LIST_NODES.size === ALL_COMMITS.length) return;
+        COMMIT_LIST_NODES.clear();
+        COMMIT_LIST_MODE = STATE.bucketMode;
+        for (const c of ALL_COMMITS) {
+          COMMIT_LIST_NODES.set(c.hash, buildCommitNode(c));
+        }
+      }
+
+      function renderCommitList(filteredCommits) {
+        ensureCommitNodes();
+        const wrap = document.getElementById("commitList");
+        const filteredSet = new Set(filteredCommits.map((c) => c.hash));
+
+        // If the DOM already has the right children, just toggle visibility
+        if (wrap.children.length === ALL_COMMITS.length && wrap.dataset.mode === STATE.bucketMode) {
+          for (const node of wrap.children) {
+            node.classList.toggle("hidden", !filteredSet.has(node.dataset.hash));
+          }
+          return;
+        }
+
+        // Full rebuild: insert all nodes, hide non-matching
+        wrap.innerHTML = "";
+        wrap.dataset.mode = STATE.bucketMode;
+        const frag = document.createDocumentFragment();
+        const BATCH_SIZE = 25;
+        let count = 0;
+
+        for (const c of ALL_COMMITS) {
+          const node = COMMIT_LIST_NODES.get(c.hash);
+          if (!node) continue;
+          node.classList.toggle("hidden", !filteredSet.has(c.hash));
+          if (count < BATCH_SIZE) {
+            frag.appendChild(node);
+          }
+          count++;
+        }
+        wrap.appendChild(frag);
+
+        // Progressive: append remaining via requestIdleCallback
+        if (count > BATCH_SIZE) {
+          let idx = BATCH_SIZE;
+          const allArr = Array.from(ALL_COMMITS);
+          const appendBatch = (deadline) => {
+            while (idx < allArr.length && (deadline.timeRemaining() > 0 || idx - BATCH_SIZE < 10)) {
+              const c = allArr[idx];
+              const node = COMMIT_LIST_NODES.get(c.hash);
+              if (node) {
+                node.classList.toggle("hidden", !filteredSet.has(c.hash));
+                wrap.appendChild(node);
+              }
+              idx++;
+            }
+            if (idx < allArr.length) {
+              requestIdleCallback(appendBatch);
+            }
+          };
+          requestIdleCallback(appendBatch);
         }
       }
 
@@ -7707,27 +7869,44 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         const impactMobile = document.getElementById("impactMobile");
         const impactLabelMobile = document.getElementById("impactLabelMobile");
 
-        const setImpact = (v) => {
+        const setImpact = (v, skipRender) => {
           STATE.minImpact = Number(v);
           impact.value = String(v);
           impactMobile.value = String(v);
           impactLabel.textContent = `${fmtInt(v)} lines`;
           impactLabelMobile.textContent = `${fmtInt(v)} lines`;
+          if (!skipRender) render();
         };
-        setImpact(STATE.minImpact);
+        setImpact(STATE.minImpact, true);
+
+        const debouncedRenderSearch = debounce(() => render(), 150);
+        const debouncedRenderSlider = debounce(() => render(), 50);
 
         q.addEventListener("input", () => {
           STATE.q = q.value;
           qMobile.value = q.value;
-          render();
+          debouncedRenderSearch();
         });
         qMobile.addEventListener("input", () => {
           STATE.q = qMobile.value;
           q.value = qMobile.value;
+          debouncedRenderSearch();
         });
 
-        impact.addEventListener("input", () => setImpact(impact.value));
-        impactMobile.addEventListener("input", () => setImpact(impactMobile.value));
+        impact.addEventListener("input", () => {
+          STATE.minImpact = Number(impact.value);
+          impactMobile.value = impact.value;
+          impactLabel.textContent = `${fmtInt(impact.value)} lines`;
+          impactLabelMobile.textContent = `${fmtInt(impact.value)} lines`;
+          debouncedRenderSlider();
+        });
+        impactMobile.addEventListener("input", () => {
+          STATE.minImpact = Number(impactMobile.value);
+          impact.value = impactMobile.value;
+          impactLabel.textContent = `${fmtInt(impactMobile.value)} lines`;
+          impactLabelMobile.textContent = `${fmtInt(impactMobile.value)} lines`;
+          debouncedRenderSlider();
+        });
 
         const setMode = (m) => {
           STATE.bucketMode = m;
@@ -7761,7 +7940,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         document.getElementById("viewAlien").addEventListener("click", () => scrollToSection("sectionAlien"));
 
         // BOCPD hazard slider
-        document.getElementById("hazard").addEventListener("input", () => render());
+        document.getElementById("hazard").addEventListener("input", debounce(() => render(), 50));
 
         // Stack chart controls
         document.getElementById("stackResolution")?.addEventListener("change", () => render());
@@ -7792,6 +7971,16 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
         // Galaxy brain button: jump to alien section
         document.getElementById("btnGalaxy").addEventListener("click", () => scrollToSection("sectionAlien"));
+
+        // Dock collapse toggle (mobile)
+        const dockBody = document.getElementById("dockBody");
+        const dockToggle = document.getElementById("dockCollapseToggle");
+        if (dockToggle && dockBody) {
+          dockToggle.addEventListener("click", () => {
+            const hidden = dockBody.classList.toggle("hidden");
+            dockToggle.textContent = hidden ? "\u25BC" : "\u25B2";
+          });
+        }
 
         // Dock controls
         document.getElementById("dockPrev")?.addEventListener("click", () => selectCommitIdx(DOC.idx - 1));
