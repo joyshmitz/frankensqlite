@@ -581,7 +581,7 @@
   </head>
 
   <body>
-    <div class="mx-auto max-w-[1200px] px-4 pb-28 pt-10 sm:px-6 lg:px-8">
+    <div class="mx-auto max-w-[1200px] px-4 pb-28 pt-10 sm:px-6 lg:px-8" style="position:relative;z-index:31">
       <!-- Top -->
       <header class="enter">
         <div
@@ -15546,9 +15546,16 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
       }
 
-      // --- Phase 5: Commit list DOM caching + progressive rendering ---
+      // --- Phase 5: Virtualized commit list + lazy detail loading ---
+      // Only render a window of COMMIT_PAGE_SIZE commits at a time.
+      // Change group details are injected on first <details> open (lazy).
+      const COMMIT_PAGE_SIZE = 20;
       const COMMIT_LIST_NODES = new Map(); // hash -> details element
-      let COMMIT_LIST_MODE = null; // tracks bucketMode used for build
+      let COMMIT_LIST_MODE = null;
+      let _clFilteredCommits = []; // current filtered list for progressive load
+      let _clRenderedCount = 0;    // how many we've appended so far
+      let _clObserver = null;      // IntersectionObserver for sentinel
+      const COMMIT_DETAIL_LOADED = new Set(); // hashes with detail content populated
 
       function buildCommitNode(c) {
         const details = document.createElement("details");
@@ -15558,6 +15565,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
         const tags = (STATE.bucketMode === "primary" ? [c.primary] : c.labels).map(bucketById);
 
+        // Render only the summary; detail content is lazy-loaded on first open
         details.innerHTML = `
           <summary class="cursor-pointer list-none">
             <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -15586,16 +15594,24 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
               </div>
             </div>
           </summary>
-          <div class="mt-3 border-t border-slate-900/10 pt-3">
-            ${c.hasClassification ? "" : `<div class="text-xs text-red-700">Missing classification entry for this commit.</div>`}
-            ${c.changeGroups
-              .map((g, i) => renderGroup(g, i))
-              .join("")}
-          </div>
+          <div class="commit-detail-placeholder"></div>
         `;
 
         details.addEventListener("toggle", () => {
-          if (details.open) selectCommitIdx(c.idx);
+          if (details.open) {
+            selectCommitIdx(c.idx);
+            // Lazy-load change group detail on first open
+            if (!COMMIT_DETAIL_LOADED.has(c.hash)) {
+              COMMIT_DETAIL_LOADED.add(c.hash);
+              const ph = details.querySelector(".commit-detail-placeholder");
+              if (ph) {
+                ph.className = "mt-3 border-t border-slate-900/10 pt-3";
+                ph.innerHTML =
+                  (c.hasClassification ? "" : `<div class="text-xs text-red-700">Missing classification entry for this commit.</div>`) +
+                  c.changeGroups.map((g, i) => renderGroup(g, i)).join("");
+              }
+            }
+          }
         });
 
         return details;
@@ -15605,37 +15621,67 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         if (COMMIT_LIST_MODE === STATE.bucketMode && COMMIT_LIST_NODES.size === ALL_COMMITS.length) return;
         COMMIT_LIST_NODES.clear();
         COMMIT_LIST_MODE = STATE.bucketMode;
+        COMMIT_DETAIL_LOADED.clear();
         for (const c of ALL_COMMITS) {
           COMMIT_LIST_NODES.set(c.hash, buildCommitNode(c));
         }
       }
 
+      // Append the next page of commits to the DOM
+      function _clAppendPage() {
+        const wrap = document.getElementById("commitList");
+        const end = Math.min(_clRenderedCount + COMMIT_PAGE_SIZE, _clFilteredCommits.length);
+        if (_clRenderedCount >= end) return;
+        const frag = document.createDocumentFragment();
+        for (let i = _clRenderedCount; i < end; i++) {
+          const c = _clFilteredCommits[i];
+          const node = COMMIT_LIST_NODES.get(c.hash);
+          if (node) frag.appendChild(node);
+        }
+        const sentinel = document.getElementById("commitListSentinel");
+        if (sentinel) wrap.insertBefore(frag, sentinel);
+        else wrap.appendChild(frag);
+        _clRenderedCount = end;
+        if (sentinel && _clRenderedCount >= _clFilteredCommits.length) {
+          sentinel.style.display = "none";
+        }
+      }
+
+      function _clSetupObserver() {
+        if (_clObserver) _clObserver.disconnect();
+        const sentinel = document.getElementById("commitListSentinel");
+        if (!sentinel) return;
+        _clObserver = new IntersectionObserver(
+          (entries) => {
+            if (entries[0].isIntersecting && _clRenderedCount < _clFilteredCommits.length) {
+              _clAppendPage();
+            }
+          },
+          { rootMargin: "400px" }
+        );
+        _clObserver.observe(sentinel);
+      }
+
       function renderCommitList(filteredCommits) {
         ensureCommitNodes();
         const wrap = document.getElementById("commitList");
-        const filteredSet = new Set(filteredCommits.map((c) => c.hash));
 
-        // If the DOM already has the right children, just toggle visibility
-        if (wrap.children.length === ALL_COMMITS.length && wrap.dataset.mode === STATE.bucketMode) {
-          for (const node of wrap.children) {
-            node.classList.toggle("hidden", !filteredSet.has(node.dataset.hash));
-          }
-          return;
-        }
+        _clFilteredCommits = filteredCommits;
+        _clRenderedCount = 0;
 
-        // Full rebuild: insert all nodes via DocumentFragment (single reflow),
-        // toggle hidden based on filter match.
+        // Clear and rebuild with sentinel
         wrap.innerHTML = "";
         wrap.dataset.mode = STATE.bucketMode;
-        const frag = document.createDocumentFragment();
 
-        for (const c of ALL_COMMITS) {
-          const node = COMMIT_LIST_NODES.get(c.hash);
-          if (!node) continue;
-          node.classList.toggle("hidden", !filteredSet.has(c.hash));
-          frag.appendChild(node);
-        }
-        wrap.appendChild(frag);
+        let sentinel = document.createElement("div");
+        sentinel.id = "commitListSentinel";
+        sentinel.style.height = "1px";
+        wrap.appendChild(sentinel);
+
+        // Render first page
+        _clAppendPage();
+        // Set up observer for subsequent pages
+        _clSetupObserver();
       }
 
       function renderGroup(g, i) {
