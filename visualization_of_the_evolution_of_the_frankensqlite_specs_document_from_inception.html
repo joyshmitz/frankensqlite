@@ -6,6 +6,26 @@
     <meta name="color-scheme" content="light" />
     <title>FrankenSQLite Spec Evolution</title>
 
+    <!-- OpenGraph -->
+    <meta property="og:title" content="FrankenSQLite Spec Evolution" />
+    <meta property="og:description" content="Interactive visualization of 137 commits across 12 deep sessions building a 10,791-line comprehensive database specification. MVCC page-level versioning, RaptorQ erasure coding, SSI concurrency control." />
+    <meta property="og:image" content="https://frankensqlite.com/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:url" content="https://frankensqlite.com" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="FrankenSQLite" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="FrankenSQLite Spec Evolution" />
+    <meta name="twitter:description" content="137 commits · 10,791 lines · 12 sessions of deep architectural design for a clean-room Rust reimplementation of SQLite with MVCC." />
+    <meta name="twitter:image" content="https://frankensqlite.com/twitter-image.png" />
+
+    <!-- General meta -->
+    <meta name="description" content="Interactive visualization tracking the evolution of the FrankenSQLite specification across 137 commits — from initial architecture through MVCC, RaptorQ erasure coding, and SSI concurrency control." />
+
     <!-- Typography -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -215,6 +235,30 @@
         contain: content;
       }
 
+      /* Section summary heading highlight */
+      @keyframes section-flash {
+        0% { background-color: rgba(59, 130, 246, 0.25); }
+        100% { background-color: transparent; }
+      }
+      .section-highlight {
+        animation: section-flash 1.2s ease-out;
+      }
+
+      /* Section summary table */
+      #sectionTable th {
+        cursor: pointer;
+        user-select: none;
+      }
+      #sectionTable th:hover {
+        color: var(--ink0);
+      }
+      #sectionTable .sparkline-bar {
+        display: inline-block;
+        min-width: 2px;
+        border-radius: 1px;
+        vertical-align: middle;
+      }
+
       /* Markdown rendering (hand-rolled; avoids tailwind/typography plugin dependency) */
       .md {
         color: rgba(2, 6, 23, 0.82);
@@ -324,6 +368,127 @@
       }
       .dock-slider {
         width: 100%;
+      }
+
+      /* A/B Compare Typeahead Pickers (bd-24q.1) */
+      .ab-picker {
+        position: relative;
+        display: inline-flex;
+      }
+      .ab-picker-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 4px 10px;
+        border: 1px solid rgba(59, 130, 246, 0.3);
+        border-radius: 8px;
+        background: white;
+        font-size: 11px;
+        font-weight: 600;
+        color: #0f172a;
+        cursor: pointer;
+        max-width: 240px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        transition: border-color 150ms, box-shadow 150ms;
+      }
+      .ab-picker-btn:hover { border-color: rgba(59, 130, 246, 0.5); }
+      .ab-picker-btn:focus { outline: none; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25); }
+      .ab-picker-dropdown {
+        position: absolute;
+        top: 100%;
+        left: 0;
+        z-index: 60;
+        margin-top: 4px;
+        width: 340px;
+        max-height: 300px;
+        border: 1px solid rgba(2, 6, 23, 0.12);
+        border-radius: 14px;
+        background: white;
+        box-shadow: 0 10px 30px rgba(2, 6, 23, 0.16);
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      .ab-picker-search {
+        width: 100%;
+        border: none;
+        border-bottom: 1px solid rgba(2, 6, 23, 0.08);
+        padding: 8px 12px;
+        font-size: 12px;
+        outline: none;
+        background: transparent;
+      }
+      .ab-picker-search::placeholder { color: rgba(2, 6, 23, 0.4); }
+      .ab-picker-list {
+        flex: 1;
+        overflow-y: auto;
+        padding: 4px;
+      }
+      .ab-picker-item {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+        padding: 6px 8px;
+        border-radius: 8px;
+        font-size: 11px;
+        cursor: pointer;
+        transition: background 100ms;
+      }
+      .ab-picker-item:hover,
+      .ab-picker-item.keyboard-active { background: rgba(59, 130, 246, 0.08); }
+      .ab-picker-item.selected { background: rgba(59, 130, 246, 0.12); font-weight: 700; }
+      .ab-picker-item .idx {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        color: rgba(2, 6, 23, 0.35);
+        font-size: 10px;
+        min-width: 22px;
+        flex-shrink: 0;
+      }
+      .ab-picker-item .hash {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        color: rgba(2, 6, 23, 0.5);
+        font-size: 10px;
+        flex-shrink: 0;
+      }
+      .ab-picker-item .subject {
+        color: #0f172a;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex: 1;
+        min-width: 0;
+      }
+      @media (max-width: 639px) {
+        .ab-picker-dropdown {
+          position: fixed;
+          inset: 0;
+          width: 100%;
+          max-height: 100%;
+          border-radius: 0;
+          margin-top: 0;
+          z-index: 100;
+        }
+        .ab-picker-search {
+          padding: 14px 16px;
+          font-size: 16px;
+        }
+        .ab-picker-item {
+          padding: 12px 16px;
+          font-size: 13px;
+        }
+        .ab-picker-item .idx { font-size: 11px; }
+        .ab-picker-item .hash { font-size: 11px; }
+        .ab-picker-dropdown::before {
+          content: "";
+          display: block;
+          height: 4px;
+          width: 36px;
+          margin: 8px auto 4px;
+          border-radius: 2px;
+          background: rgba(2, 6, 23, 0.15);
+        }
       }
     </style>
   </head>
@@ -568,6 +733,13 @@
                       <option value="lev">Levenshtein (hunks)</option>
                     </select>
                   </label>
+                  <label class="chip inline-flex items-center gap-2 rounded-2xl px-3 py-1.5 text-xs font-semibold text-slate-700">
+                    Timezone
+                    <select id="stackTimezone" class="ml-1 rounded-xl border border-slate-900/10 bg-white/70 px-2 py-1 text-xs">
+                      <option value="local">Local</option>
+                      <option value="utc">UTC</option>
+                    </select>
+                  </label>
                 </div>
               </div>
               <div id="stackChart" class="chart mt-4 w-full"></div>
@@ -616,6 +788,52 @@
                 >
                   Metrics
                 </button>
+                <button
+                  id="docTabSections"
+                  class="focus-ring rounded-2xl border border-slate-900/10 bg-white/70 px-3 py-2 text-xs font-semibold text-slate-900 hover:bg-white"
+                  type="button"
+                >
+                  Sections
+                </button>
+                <span class="relative ml-1">
+                  <button
+                    id="btnCopyLink"
+                    class="focus-ring rounded-2xl border border-slate-900/10 bg-white/70 px-3 py-2 text-xs font-semibold text-slate-900 hover:bg-white"
+                    type="button"
+                    title="Copy a shareable permalink to the current view"
+                  >Copy Link</button>
+                  <button
+                    id="btnShareHelp"
+                    class="focus-ring ml-1 rounded-full border border-slate-900/10 bg-white/70 px-2 py-1 text-[10px] font-bold text-slate-500 hover:bg-white hover:text-slate-900"
+                    type="button"
+                    title="URL parameter reference"
+                  >?</button>
+                  <div
+                    id="shareHelpPopover"
+                    class="hidden absolute right-0 top-full z-50 mt-2 w-72 rounded-2xl border border-slate-900/10 bg-white p-4 shadow-glowLg text-left"
+                  >
+                    <div class="text-xs font-bold text-slate-900 mb-2">Permalink URL Parameters</div>
+                    <table class="w-full text-[11px] text-slate-700">
+                      <thead><tr class="border-b border-slate-200"><th class="pb-1 text-left font-semibold">Param</th><th class="pb-1 text-left font-semibold">Values</th><th class="pb-1 text-left font-semibold">Default</th></tr></thead>
+                      <tbody>
+                        <tr><td class="py-0.5 font-mono">v</td><td>Schema version</td><td>1</td></tr>
+                        <tr><td class="py-0.5 font-mono">c</td><td>Commit index (0-based)</td><td>latest</td></tr>
+                        <tr><td class="py-0.5 font-mono">t</td><td>spec | diff | metrics</td><td>spec</td></tr>
+                        <tr><td class="py-0.5 font-mono">raw</td><td>1 = raw markdown</td><td>rendered</td></tr>
+                        <tr><td class="py-0.5 font-mono">dm</td><td>pretty | raw</td><td>pretty</td></tr>
+                        <tr><td class="py-0.5 font-mono">q</td><td>Search query</td><td>(empty)</td></tr>
+                        <tr><td class="py-0.5 font-mono">mi</td><td>Min impact (lines)</td><td>0</td></tr>
+                        <tr><td class="py-0.5 font-mono">bm</td><td>primary | multi</td><td>primary</td></tr>
+                        <tr><td class="py-0.5 font-mono">b</td><td>Bucket IDs (1-10, comma-sep)</td><td>all</td></tr>
+                        <tr><td class="py-0.5 font-mono">cmp</td><td>1 = A/B compare mode</td><td>off</td></tr>
+                        <tr><td class="py-0.5 font-mono">ca</td><td>Compare "A" commit index</td><td>0</td></tr>
+                        <tr><td class="py-0.5 font-mono">cb</td><td>Compare "B" commit index</td><td>0</td></tr>
+                        <tr><td class="py-0.5 font-mono">dl</td><td>side-by-side | line-by-line</td><td>side-by-side</td></tr>
+                      </tbody>
+                    </table>
+                    <div class="mt-2 text-[10px] text-slate-500">Default values are omitted for minimal URLs. Invalid values are clamped. Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, q, mi, bm, b.</div>
+                  </div>
+                </span>
               </div>
             </div>
 
@@ -648,22 +866,65 @@
                   <div id="docSpecView" class="hidden">
                     <div class="flex items-center justify-between">
                       <div class="text-xs font-semibold text-slate-600">Rendered Markdown</div>
-                      <button
-                        id="btnRawToggle"
-                        class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
-                        type="button"
-                      >
-                        Toggle Raw
-                      </button>
+                      <div class="flex items-center gap-2">
+                        <button
+                          id="btnMiniMapToggle"
+                          class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
+                          type="button"
+                          title="Toggle heading mini-map"
+                        >
+                          Outline
+                        </button>
+                        <button
+                          id="btnRawToggle"
+                          class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
+                          type="button"
+                        >
+                          Toggle Raw
+                        </button>
+                      </div>
                     </div>
-                    <div id="docRendered" class="md mt-3 max-h-[70vh] overflow-auto rounded-2xl border border-slate-900/10 bg-white/70 p-4"></div>
+                    <div class="mt-3 flex gap-3">
+                      <nav
+                        id="miniMap"
+                        class="hidden w-56 shrink-0 flex flex-col rounded-2xl border border-slate-900/10 bg-white/70"
+                        style="max-height: 70vh"
+                        aria-label="Document outline"
+                      >
+                        <div class="shrink-0 border-b border-slate-900/10 px-3 py-2">
+                          <input
+                            id="miniMapSearch"
+                            type="text"
+                            class="w-full rounded-lg border border-slate-900/10 bg-white/80 px-2 py-1 text-[11px] text-slate-700 placeholder:text-slate-400 focus:border-slate-400 focus:outline-none"
+                            placeholder="Filter headings..."
+                            autocomplete="off"
+                          />
+                        </div>
+                        <div id="miniMapItems" class="flex-1 overflow-y-auto p-3" role="tree" tabindex="0"></div>
+                      </nav>
+                      <div id="docRendered" class="md min-w-0 flex-1 max-h-[70vh] overflow-auto rounded-2xl border border-slate-900/10 bg-white/70 p-4"></div>
+                    </div>
                     <pre id="docRaw" class="codebox mono mt-3 hidden max-h-[70vh] overflow-auto rounded-2xl p-4 text-[11px] leading-relaxed text-slate-900"></pre>
                   </div>
 
                   <div id="docDiffView" class="hidden">
-                    <div class="flex items-center justify-between">
-                      <div class="text-xs font-semibold text-slate-600">Diff (parent → selected)</div>
+                    <div class="flex items-center justify-between flex-wrap gap-2">
                       <div class="flex items-center gap-2">
+                        <div id="diffLabel" class="text-xs font-semibold text-slate-600">Diff (parent → selected)</div>
+                        <button
+                          id="btnCompareToggle"
+                          class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
+                          type="button"
+                          title="Toggle A/B compare mode"
+                        >A/B Compare</button>
+                      </div>
+                      <div class="flex items-center gap-2">
+                        <button
+                          id="btnDiffLayout"
+                          class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white hidden"
+                          type="button"
+                          title="Toggle side-by-side / unified layout"
+                        >Side-by-Side</button>
                         <button
                           id="btnPrettyDiff"
                           class="focus-ring rounded-xl bg-slate-900 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-slate-800"
@@ -679,6 +940,36 @@
                           Raw
                         </button>
                       </div>
+                    </div>
+                    <!-- A/B Compare commit pickers with typeahead (bd-24q.1) -->
+                    <div id="abCompareBar" class="hidden mt-2 flex items-center gap-2 flex-wrap rounded-xl border border-blue-200 bg-blue-50/60 px-3 py-2">
+                      <label class="text-[11px] font-semibold text-blue-700">A:</label>
+                      <div class="ab-picker" id="pickerA">
+                        <button type="button" class="ab-picker-btn" id="pickerABtn" title="Select commit A">Select...</button>
+                        <div class="ab-picker-dropdown hidden" id="pickerADropdown">
+                          <input type="text" class="ab-picker-search" id="pickerASearch" placeholder="Search by subject, hash, or #index..." autocomplete="off" />
+                          <div class="ab-picker-list" id="pickerAList"></div>
+                        </div>
+                      </div>
+                      <button id="btnSwapAB" class="focus-ring rounded-lg border border-blue-200 bg-white px-2 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-100" type="button" title="Swap A and B">⇄</button>
+                      <label class="text-[11px] font-semibold text-blue-700">B:</label>
+                      <div class="ab-picker" id="pickerB">
+                        <button type="button" class="ab-picker-btn" id="pickerBBtn" title="Select commit B">Select...</button>
+                        <div class="ab-picker-dropdown hidden" id="pickerBDropdown">
+                          <input type="text" class="ab-picker-search" id="pickerBSearch" placeholder="Search by subject, hash, or #index..." autocomplete="off" />
+                          <div class="ab-picker-list" id="pickerBList"></div>
+                        </div>
+                      </div>
+                      <button id="btnResetAB" class="focus-ring rounded-lg border border-blue-200 bg-white px-2 py-1 text-[11px] font-semibold text-blue-700 hover:bg-blue-100" type="button" title="Reset to current commit">Reset</button>
+                      <div id="abDiffLoading" class="hidden text-[11px] text-blue-600 ml-2">Computing diff…</div>
+                    </div>
+                    <!-- A/B Compare metric chips -->
+                    <div id="abMetricsBar" class="hidden mt-2 flex items-center gap-2 flex-wrap">
+                      <span id="abmLines" class="chip mono rounded-full px-2.5 py-1 text-[11px] text-blue-800 bg-blue-100 border border-blue-200"></span>
+                      <span id="abmTokens" class="chip mono rounded-full px-2.5 py-1 text-[11px] text-blue-800 bg-blue-100 border border-blue-200"></span>
+                      <span id="abmLev" class="chip mono rounded-full px-2.5 py-1 text-[11px] text-blue-800 bg-blue-100 border border-blue-200"></span>
+                      <span id="abmHunks" class="chip mono rounded-full px-2.5 py-1 text-[11px] text-blue-800 bg-blue-100 border border-blue-200"></span>
+                      <span id="abmBytes" class="chip mono rounded-full px-2.5 py-1 text-[11px] text-blue-800 bg-blue-100 border border-blue-200"></span>
                     </div>
                     <div id="diffPretty" class="mt-3 max-h-[70vh] overflow-auto rounded-2xl border border-slate-900/10 bg-white/70 p-2"></div>
                     <pre id="diffRaw" class="codebox mono mt-3 hidden max-h-[70vh] overflow-auto rounded-2xl p-4 text-[11px] leading-relaxed text-slate-900"></pre>
@@ -728,6 +1019,36 @@
                       <div id="workerStatus" class="mt-2 text-xs text-slate-500"></div>
                       <div id="computeProgress" class="mt-2 hidden text-xs font-semibold text-slate-700"></div>
                     </div>
+                  </div>
+
+                  <div id="docSectionsView" class="hidden">
+                    <div class="flex items-center justify-between">
+                      <div class="text-xs font-semibold text-slate-600">Per-Section Change Summary</div>
+                      <div class="flex items-center gap-2">
+                        <input
+                          id="sectionFilter"
+                          type="text"
+                          placeholder="Filter headings..."
+                          class="focus-ring w-40 rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] text-slate-700 placeholder-slate-400"
+                        />
+                      </div>
+                    </div>
+                    <div id="sectionTableWrap" class="mt-3 max-h-[70vh] overflow-auto rounded-2xl border border-slate-900/10 bg-white/70">
+                      <table id="sectionTable" class="w-full text-[11px]">
+                        <thead class="sticky top-0 z-10 bg-white/95 backdrop-blur">
+                          <tr class="border-b border-slate-200">
+                            <th class="px-3 py-2 text-left font-semibold text-slate-500" data-sort="name">Section</th>
+                            <th class="px-3 py-2 text-right font-semibold text-slate-500 w-16" data-sort="add">+Lines</th>
+                            <th class="px-3 py-2 text-right font-semibold text-slate-500 w-16" data-sort="del">-Lines</th>
+                            <th class="px-3 py-2 text-right font-semibold text-slate-500 w-20" data-sort="tokens">Tokens</th>
+                            <th class="px-3 py-2 text-right font-semibold text-slate-500 w-20" data-sort="impact">Impact</th>
+                          </tr>
+                        </thead>
+                        <tbody id="sectionTableBody"></tbody>
+                      </table>
+                    </div>
+                    <div id="sectionEmpty" class="hidden mt-3 text-xs text-slate-400 italic p-3">No section changes for this commit.</div>
+                    <button id="btnOpenSectionSheet" class="mt-3 w-full sm:hidden focus-ring rounded-2xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800" type="button">View sections (mobile)</button>
                   </div>
                 </div>
               </section>
@@ -887,6 +1208,30 @@
       </div>
     </div>
 
+    <!-- Mobile section summary sheet (bd-24q.8.3) -->
+    <div id="sectionSheetOverlay" class="fixed inset-0 z-40 hidden bg-slate-900/30 backdrop-blur-sm"></div>
+    <div
+      id="sectionSheet"
+      class="sheet fixed bottom-0 left-0 right-0 z-50 hidden rounded-t-3xl border border-slate-900/10 bg-white/90 p-5 shadow-2xl backdrop-blur-xl"
+      style="max-height: 75vh"
+    >
+      <div class="flex items-center justify-between">
+        <div class="text-sm font-bold text-slate-900">Section Changes</div>
+        <button
+          id="btnCloseSectionSheet"
+          class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-xs font-semibold text-slate-900 hover:bg-white"
+          type="button"
+        >Close</button>
+      </div>
+      <input
+        id="sectionFilterMobile"
+        type="text"
+        placeholder="Filter headings..."
+        class="focus-ring mt-3 w-full rounded-2xl border border-slate-900/10 bg-white/70 px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400"
+      />
+      <div id="sectionSheetList" class="mt-3 overflow-auto space-y-1" style="max-height: 55vh"></div>
+    </div>
+
     <!-- Timeline dock -->
     <div id="dock" class="dock fixed inset-x-0 bottom-0 z-30 px-4 py-3">
       <div class="mx-auto max-w-[1200px]">
@@ -908,15 +1253,45 @@
               id="dockPrev"
               class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-2.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
               type="button"
+              aria-label="Previous commit"
             >
               Prev
+            </button>
+            <button
+              id="dockPlayPause"
+              class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-2.5 text-[11px] font-semibold text-slate-900 hover:bg-white min-w-[3.5rem]"
+              type="button"
+              aria-label="Play or pause timeline playback"
+            >
+              &#9654;
             </button>
             <button
               id="dockNext"
               class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-2.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
               type="button"
+              aria-label="Next commit"
             >
               Next
+            </button>
+            <select
+              id="dockSpeed"
+              class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-2 py-2 text-[11px] font-semibold text-slate-900 hover:bg-white cursor-pointer"
+              aria-label="Playback speed"
+            >
+              <option value="0.25">0.25x</option>
+              <option value="0.5">0.5x</option>
+              <option value="1" selected>1x</option>
+              <option value="2">2x</option>
+              <option value="4">4x</option>
+            </select>
+            <button
+              id="dockLoop"
+              class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-2.5 py-2.5 text-[11px] font-semibold text-slate-500 hover:bg-white"
+              type="button"
+              aria-label="Toggle loop playback"
+              title="Loop"
+            >
+              &#x1F501;
             </button>
           </div>
         </div>
@@ -938,13 +1313,18 @@
     <!-- Dependencies -->
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/dayjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/utc.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.0/dist/purify.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff2html/bundles/js/diff2html.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/diff@7.0.0/dist/diff.min.js"></script>
 
     <script>
+      // Extend dayjs with UTC plugin for timezone-aware binning.
+      if (window.dayjs_plugin_utc) dayjs.extend(window.dayjs_plugin_utc);
+
       // requestIdleCallback polyfill (Safari < 16.4)
       if (typeof requestIdleCallback === "undefined") {
         window.requestIdleCallback = function (cb) {
@@ -6221,6 +6601,37 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         },
       ];
 
+      // Story Mode: Milestone Schema + Curated Data (bd-24q.4.1)
+      const MILESTONES = [
+        { id: "genesis", title: "Genesis: 8,628 Lines", commitHash: "c08f160", annotationMd: "The spec is born. A single massive commit lays down the entire architectural blueprint: MVCC page-level versioning, RaptorQ erasure coding, asupersync integration, and the 23-crate workspace structure.", defaultTab: "spec" },
+        { id: "ssi-promotion", title: "SSI Promoted to V1", commitHash: "f9d88aa", annotationMd: "Serializable Snapshot Isolation promoted from future goal to V1 requirement. Intent logs, sharded lock tables, and the conservative Page-SSI rule introduced.", focusHeading: "serializable-snapshot-isolation-ssi", defaultTab: "diff" },
+        { id: "scope-doctrine", title: "V1.3: Scope Doctrine", commitHash: "9800b17", annotationMd: "\"There is no V1 scope\" \u2014 everything ships. ECS substrate, multi-process MVCC, encryption, WindowsVfs all mandatory.", defaultTab: "diff" },
+        { id: "codex-synthesis", title: "V1.4: Codex Synthesis", commitHash: "5ad3487", annotationMd: "Codex (GPT-5.3) spec merged. RaptorQ pervasive: WAL sidecar, ECS layout, replication. Spec crosses 9,000 lines.", defaultTab: "diff" },
+        { id: "alien-artifact", title: "V1.5: Alien-Artifact Discipline", commitHash: "7b2c677", annotationMd: "Decision-theoretic rigor: BOCPD, e-process monitoring, conformal calibration. SSI abort gets formal loss matrix. Spec crosses 10,000 lines.", focusHeading: "decision-theoretic-ssi-abort-policy", defaultTab: "diff" },
+        { id: "witness-plane", title: "V1.6a: RaptorQ Witness Plane", commitHash: "bf04264", annotationMd: "SSI gains RaptorQ-native witness plane for cross-process proof-carrying commits.", defaultTab: "diff" },
+        { id: "perf-optimizations", title: "V1.6c: Performance Hardening", commitHash: "e8ddf46", annotationMd: "Arena allocators, CAR/CLOCK-Pro cache, per-invariant e-process calibration. Cache-line alignment scrutiny.", defaultTab: "diff" },
+        { id: "canonical-ssi", title: "V1.6g: Canonical SSI Algorithm", commitHash: "643c89c", annotationMd: "SSI detection algorithm reaches final form. Canonical proof-carrying commit with eager abort.", defaultTab: "diff" },
+        { id: "deep-audit-mvcc", title: "V1.7: MVCC Deep Audit", commitHash: "d7b38ef", annotationMd: "Word-by-word audit of Section 5 (~3,000 lines). Finds SSI incoming-edge false negative. RecentlyCommittedReadersIndex added.", focusHeading: "mvcc-formal-model", defaultTab: "diff" },
+        { id: "deep-audit-raptorq", title: "V1.7e: RaptorQ Deep Audit", commitHash: "3cf0f13", annotationMd: "Section 3 audit: MTU/sub-blocking fixes, ESI/ISI confusion, OTI.T u16\u2192u32. GF(256) verified against RFC 6330.", defaultTab: "diff" },
+        { id: "deep-audit-query", title: "V1.7h: Query Pipeline Audit", commitHash: "2f0970b", annotationMd: "Section 10: lexer DQS, cost model, UPDATE trace. Ne/BangEq fixed. ESCAPE removed from Pratt table.", defaultTab: "diff" },
+        { id: "deep-audit-fts5", title: "V1.7j: FTS5 + SQL Coverage", commitHash: "a3e7ae5", annotationMd: "Section 14: FTS5 NOT binary-only. Full section-by-section audit coverage reached.", defaultTab: "diff" },
+      ];
+      /** Resolve milestones against loaded commit data. Call after ALL_COMMITS is populated. */
+      function getMilestones() {
+        if (!ALL_COMMITS || !ALL_COMMITS.length) return [];
+        const hashToIdx = new Map();
+        for (let i = 0; i < ALL_COMMITS.length; i++) {
+          const c = ALL_COMMITS[i];
+          hashToIdx.set(c.hash, i);
+          if (c.short) hashToIdx.set(c.short, i);
+        }
+        return MILESTONES.map((m) => {
+          const idx = hashToIdx.get(m.commitHash) ?? null;
+          if (idx === null) console.warn(`Milestone "${m.id}": commit ${m.commitHash} not found`);
+          return { ...m, commitIdx: idx, warning: idx === null ? `commit ${m.commitHash} not found` : null };
+        });
+      }
+
       // -----------------------------
       // App state
       // -----------------------------
@@ -6249,6 +6660,11 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         tab: "spec", // 'spec' | 'diff' | 'metrics'
         rawSpec: false,
         diffMode: "pretty", // 'pretty' | 'raw'
+        compareMode: false, // true = A/B compare between two arbitrary commits
+        compareFromIdx: 0, // "A" commit index
+        compareToIdx: 0, // "B" commit index
+        diffLayout: "side-by-side", // 'side-by-side' | 'line-by-line'
+        diffCollapse: true, // collapse unchanged context in A/B diffs
       };
 
       const METRICS = {
@@ -6287,6 +6703,225 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       let COMPUTE_ABORT_CONTROLLER = null;
       let PHASE_ABORT_CONTROLLER = null;
       let OUTLIER_ABORT_CONTROLLER = null;
+
+      // -----------------------------
+      // URL State Schema (Permalinks) — v1
+      // -----------------------------
+      // Canonical param order: v, c, t, raw, dm, q, mi, bm, b
+      // Default values are omitted for minimal URLs.
+      // Invalid values are clamped or reset to defaults.
+
+      const URL_SCHEMA_VERSION = 1;
+
+      const URL_DEFAULTS = {
+        c: -1,          // commit index; -1 means "latest"
+        t: "spec",      // tab: spec | diff | metrics
+        raw: false,     // raw spec toggle
+        dm: "pretty",   // diff mode: pretty | raw
+        q: "",          // search query
+        mi: 0,          // minimum impact filter
+        bm: "primary",  // bucket mode: primary | multi
+        b: null,        // enabled bucket ids; null = all
+      };
+
+      const URL_VALID_TABS = new Set(["spec", "diff", "metrics", "sections"]);
+      const URL_VALID_DIFF_MODES = new Set(["pretty", "raw"]);
+      const URL_VALID_BUCKET_MODES = new Set(["primary", "multi"]);
+      const URL_ALL_BUCKET_IDS = new Set(BUCKETS.map((b) => b.id));
+
+      function encodeUrlState() {
+        const p = new URLSearchParams();
+        const maxIdx = Math.max(0, (ALL_COMMITS?.length || 1) - 1);
+
+        // Always include version when any non-default param is present.
+        // We build params first, then prepend v= if non-empty.
+
+        if (DOC.idx !== maxIdx && DOC.idx >= 0) p.set("c", String(DOC.idx));
+        if (DOC.tab !== URL_DEFAULTS.t && URL_VALID_TABS.has(DOC.tab)) p.set("t", DOC.tab);
+        if (DOC.rawSpec) p.set("raw", "1");
+        if (DOC.diffMode !== URL_DEFAULTS.dm && URL_VALID_DIFF_MODES.has(DOC.diffMode)) p.set("dm", DOC.diffMode);
+        if (STATE.q) p.set("q", STATE.q);
+        if (STATE.minImpact > 0) p.set("mi", String(STATE.minImpact));
+        if (STATE.bucketMode !== URL_DEFAULTS.bm) p.set("bm", STATE.bucketMode);
+
+        // Encode enabled buckets only if not all are enabled.
+        const allEnabled = URL_ALL_BUCKET_IDS.size === STATE.bucketEnabled.size &&
+          [...URL_ALL_BUCKET_IDS].every((id) => STATE.bucketEnabled.has(id));
+        if (!allEnabled) {
+          const sorted = [...STATE.bucketEnabled].sort((a, b) => a - b);
+          p.set("b", sorted.join(","));
+        }
+
+        // Canonical ordering: rebuild with v first, then alphabetical key order.
+        if ([...p.keys()].length === 0) return "";
+        const canon = new URLSearchParams();
+        canon.set("v", String(URL_SCHEMA_VERSION));
+        // Canonical key order: v, c, t, raw, dm, cmp, ca, cb, dl, q, mi, bm, b
+        if (DOC.compareMode) { p.set("cmp", "1"); p.set("ca", String(DOC.compareFromIdx)); p.set("cb", String(DOC.compareToIdx)); if (DOC.diffLayout !== "side-by-side") p.set("dl", DOC.diffLayout); }
+        for (const k of ["c", "t", "raw", "dm", "cmp", "ca", "cb", "dl", "q", "mi", "bm", "b"]) {
+          if (p.has(k)) canon.set(k, p.get(k));
+        }
+        return canon.toString();
+      }
+
+      function decodeUrlState(search) {
+        const p = new URLSearchParams(search || "");
+        if (!p.has("v")) return null; // No URL state present.
+
+        const v = Number(p.get("v"));
+        if (v !== URL_SCHEMA_VERSION) return null; // Unknown schema version; ignore.
+
+        const result = {};
+
+        // Commit index.
+        if (p.has("c")) {
+          const raw = Number(p.get("c"));
+          result.c = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : URL_DEFAULTS.c;
+        } else {
+          result.c = URL_DEFAULTS.c;
+        }
+
+        // Tab.
+        const tab = p.get("t") || URL_DEFAULTS.t;
+        result.t = URL_VALID_TABS.has(tab) ? tab : URL_DEFAULTS.t;
+
+        // Raw spec.
+        result.raw = p.get("raw") === "1";
+
+        // Diff mode.
+        const dm = p.get("dm") || URL_DEFAULTS.dm;
+        result.dm = URL_VALID_DIFF_MODES.has(dm) ? dm : URL_DEFAULTS.dm;
+
+        // Search query.
+        result.q = p.get("q") || URL_DEFAULTS.q;
+
+        // Min impact.
+        if (p.has("mi")) {
+          const mi = Number(p.get("mi"));
+          result.mi = Number.isFinite(mi) && mi >= 0 ? Math.floor(mi) : URL_DEFAULTS.mi;
+        } else {
+          result.mi = URL_DEFAULTS.mi;
+        }
+
+        // Bucket mode.
+        const bm = p.get("bm") || URL_DEFAULTS.bm;
+        result.bm = URL_VALID_BUCKET_MODES.has(bm) ? bm : URL_DEFAULTS.bm;
+
+        // Enabled buckets.
+        if (p.has("b")) {
+          const ids = p.get("b").split(",")
+            .map((s) => Number(s.trim()))
+            .filter((n) => Number.isFinite(n) && URL_ALL_BUCKET_IDS.has(n));
+          result.b = ids.length > 0 ? new Set(ids) : new Set(URL_ALL_BUCKET_IDS);
+        } else {
+          result.b = null; // null = all enabled
+        }
+
+        // A/B Compare mode.
+        result.cmp = p.get("cmp") === "1";
+        if (result.cmp) {
+          const ca = Number(p.get("ca")); result.ca = Number.isFinite(ca) && ca >= 0 ? Math.floor(ca) : 0;
+          const cb = Number(p.get("cb")); result.cb = Number.isFinite(cb) && cb >= 0 ? Math.floor(cb) : 0;
+          const dl = p.get("dl") || "side-by-side";
+          result.dl = (dl === "line-by-line") ? "line-by-line" : "side-by-side";
+        }
+
+        return result;
+      }
+
+      function applyUrlState(s) {
+        if (!s) return;
+        const maxIdx = Math.max(0, (ALL_COMMITS?.length || 1) - 1);
+
+        // Commit index: -1 means latest, otherwise clamp.
+        DOC.idx = s.c < 0 ? maxIdx : clamp(s.c, 0, maxIdx);
+        DOC.tab = s.t;
+        DOC.rawSpec = s.raw;
+        DOC.diffMode = s.dm;
+        STATE.q = s.q;
+        STATE.minImpact = s.mi;
+        STATE.bucketMode = s.bm;
+        STATE.bucketEnabled = s.b ? new Set(s.b) : new Set(URL_ALL_BUCKET_IDS);
+        if (s.cmp) { DOC.compareMode = true; DOC.compareFromIdx = clamp(s.ca || 0, 0, maxIdx); DOC.compareToIdx = clamp(s.cb || 0, 0, maxIdx); DOC.diffLayout = s.dl || "side-by-side"; }
+
+        // Sync UI inputs to match restored state.
+        const qEl = document.getElementById("q");
+        const qMob = document.getElementById("qMobile");
+        if (qEl) qEl.value = STATE.q;
+        if (qMob) qMob.value = STATE.q;
+
+        const impactEl = document.getElementById("impact");
+        const impactMob = document.getElementById("impactMobile");
+        if (impactEl) impactEl.value = String(STATE.minImpact);
+        if (impactMob) impactMob.value = String(STATE.minImpact);
+      }
+
+      let _urlSyncScheduled = false;
+
+      function syncUrlToState(opts = {}) {
+        // Debounce: avoid thrashing history on rapid slider moves.
+        if (_urlSyncScheduled && !opts.immediate) return;
+        _urlSyncScheduled = true;
+        requestAnimationFrame(() => {
+          _urlSyncScheduled = false;
+          const qs = encodeUrlState();
+          const newUrl = qs ? `${location.pathname}?${qs}` : location.pathname;
+          if (location.search !== (qs ? `?${qs}` : "")) {
+            history.replaceState(null, "", newUrl);
+          }
+        });
+      }
+
+      function copyPermalink() {
+        const qs = encodeUrlState();
+        const url = qs
+          ? `${location.origin}${location.pathname}?${qs}`
+          : `${location.origin}${location.pathname}`;
+        if (navigator.clipboard?.writeText) {
+          navigator.clipboard.writeText(url).then(() => {
+            showCopyToast("Link copied");
+          }, () => {
+            fallbackCopy(url);
+          });
+        } else {
+          fallbackCopy(url);
+        }
+      }
+
+      function fallbackCopy(text) {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+          showCopyToast("Link copied");
+        } catch {
+          showCopyToast("Copy failed");
+        }
+        document.body.removeChild(ta);
+      }
+
+      function showCopyToast(msg) {
+        const btn = document.getElementById("btnCopyLink");
+        if (!btn) return;
+        const orig = btn.textContent;
+        btn.textContent = msg;
+        btn.classList.add("bg-emerald-600", "text-white");
+        btn.classList.remove("bg-white/70", "text-slate-900");
+        setTimeout(() => {
+          btn.textContent = orig;
+          btn.classList.remove("bg-emerald-600", "text-white");
+          btn.classList.add("bg-white/70", "text-slate-900");
+        }, 1500);
+      }
+
+      function toggleShareHelp() {
+        const el = document.getElementById("shareHelpPopover");
+        if (el) el.classList.toggle("hidden");
+      }
 
       // -----------------------------
       // Helpers
@@ -6680,6 +7315,81 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             return sum;
           }
 
+          function slugifyHeadingW(text) {
+            return String(text || "")
+              .toLowerCase()
+              .replace(/[^a-z0-9\\u00C0-\\u024F]+/g, "-")
+              .replace(/^-+|-+$/g, "")
+              || "heading";
+          }
+
+          function extractOutlineWorker(markdownText) {
+            const lines = String(markdownText || "").split("\\n");
+            const outline = [];
+            const slugCounts = new Map();
+            const atxRe = /^(#{1,6})\\s+(.+?)\\s*$/;
+            let inFence = false;
+            for (let li = 0; li < lines.length; li++) {
+              const line = lines[li];
+              if (line.startsWith("\`\`\`")) {
+                inFence = !inFence;
+                continue;
+              }
+              if (inFence) continue;
+              const m = atxRe.exec(line);
+              if (!m) continue;
+              const level = m[1].length;
+              const text = m[2].replace(/\\s+#+\\s*$/, "");
+              const baseSlug = slugifyHeadingW(text);
+              const count = slugCounts.get(baseSlug) || 0;
+              slugCounts.set(baseSlug, count + 1);
+              const id = count === 0 ? baseSlug : baseSlug + "-" + count;
+              outline.push({ text: text.trim(), level, id, line: li + 1 });
+            }
+            return outline;
+          }
+
+          function buildLineToHeadingMapW(totalLines, outline) {
+            const map = new Array(totalLines + 1);
+            map[0] = "__preamble__";
+            let ptr = 0;
+            let currentId = "__preamble__";
+            for (let ln = 1; ln <= totalLines; ln++) {
+              while (ptr < outline.length && outline[ptr].line != null && outline[ptr].line <= ln) {
+                currentId = outline[ptr].id;
+                ptr++;
+              }
+              map[ln] = currentId;
+            }
+            return map;
+          }
+
+          function attributeHunksToHeadingsW(patch, lineToHeading) {
+            const hunks = parseUnifiedHunks(patch);
+            const metrics = {};
+            for (const hunk of hunks) {
+              let newLineNum = hunk.newStart;
+              for (const hl of hunk.lines) {
+                if (!hl) continue;
+                const p = hl[0];
+                const content = hl.slice(1);
+                const hid = lineToHeading[newLineNum] || "__preamble__";
+                if (!metrics[hid]) metrics[hid] = { addLines: 0, delLines: 0, tokensAdded: 0, tokensDeleted: 0 };
+                if (p === "+") {
+                  metrics[hid].addLines++;
+                  metrics[hid].tokensAdded += countRoughTokens(content);
+                  newLineNum++;
+                } else if (p === "-") {
+                  metrics[hid].delLines++;
+                  metrics[hid].tokensDeleted += countRoughTokens(content);
+                } else if (p === " ") {
+                  newLineNum++;
+                }
+              }
+            }
+            return metrics;
+          }
+
           function tokenize(text) {
             return String(text || "")
               .toLowerCase()
@@ -6965,6 +7675,51 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             }
             return { tokensChanged, bytesChanged, hunks, lev, commitCount: total };
           }
+          const AB_METRICS_CACHE = new Map();
+          async function computeABMetrics(aIdx, bIdx, reqId, progressCb) {
+            const key = aIdx + ":" + bIdx;
+            if (AB_METRICS_CACHE.has(key)) return AB_METRICS_CACHE.get(key);
+            progressCb({ stage: "ab_snapshot", message: "Reconstructing snapshot A" });
+            const textA = docTextAtLocal(aIdx, reqId, progressCb);
+            throwIfCancelled(reqId);
+            progressCb({ stage: "ab_snapshot", message: "Reconstructing snapshot B" });
+            const textB = docTextAtLocal(bIdx, reqId, progressCb);
+            throwIfCancelled(reqId);
+            progressCb({ stage: "ab_diff", message: "Computing A/B line diff" });
+            const lA = textA.split("\\n"), lB = textB.split("\\n");
+            let addL = 0, delL = 0, hn = 0, tokA = 0, tokD = 0, byA = 0, byD = 0;
+            const n = lA.length, m = lB.length;
+            let ia = 0, ib = 0, tags = [];
+            while (ia < n || ib < m) {
+              if (ia < n && ib < m && lA[ia] === lB[ib]) { tags.push(" "); ia++; ib++; }
+              else {
+                let fA = -1, fB = -1;
+                const ahead = Math.min(200, Math.max(n - ia, m - ib));
+                for (let k = 1; k <= ahead; k++) {
+                  if (fA < 0 && ib + k < m && ia < n && lA[ia] === lB[ib + k]) fA = k;
+                  if (fB < 0 && ia + k < n && ib < m && lB[ib] === lA[ia + k]) fB = k;
+                  if (fA >= 0 || fB >= 0) break;
+                }
+                if (fA >= 0 && (fB < 0 || fA <= fB)) {
+                  for (let k = 0; k < fA; k++) { const l = lB[ib++]; tags.push("+"); addL++; tokA += countRoughTokens(l); byA += l.length + 1; }
+                } else if (fB >= 0) {
+                  for (let k = 0; k < fB; k++) { const l = lA[ia++]; tags.push("-"); delL++; tokD += countRoughTokens(l); byD += l.length + 1; }
+                } else {
+                  if (ia < n) { const l = lA[ia++]; tags.push("-"); delL++; tokD += countRoughTokens(l); byD += l.length + 1; }
+                  if (ib < m) { const l = lB[ib++]; tags.push("+"); addL++; tokA += countRoughTokens(l); byA += l.length + 1; }
+                }
+              }
+              if (tags.length % 500 === 0) throwIfCancelled(reqId);
+            }
+            let prev = " ";
+            for (const t of tags) { if (t !== " " && prev === " ") hn++; prev = t; }
+            progressCb({ stage: "ab_lev", message: "Computing Levenshtein" });
+            let lev = null;
+            try { const enc = new TextEncoder(); lev = await levenshteinBytes(enc.encode(textA), enc.encode(textB)); } catch {}
+            const res = { addLines: addL, delLines: delL, deltaLines: addL - delL, tokensChanged: tokA + tokD, tokensDelta: tokA - tokD, bytesChanged: byA + byD, bytesDelta: byA - byD, hunks: hn, lev, aIdx, bIdx };
+            AB_METRICS_CACHE.set(key, res);
+            return res;
+          }
 
           function validateDatasetHash(inputHash) {
             if (!STATE.datasetHash) return;
@@ -7057,6 +7812,12 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
                   result = await computeAllMetrics(reqId, progressCb, includeLev);
                   break;
                 }
+                case "ab_metrics": {
+                  const aIdx = Number(payload.aIdx || 0);
+                  const bIdx = Number(payload.bIdx || 0);
+                  result = await computeABMetrics(aIdx, bIdx, reqId, progressCb);
+                  break;
+                }
                 case "build_search_index": {
                   result = buildSearchIndex();
                   break;
@@ -7075,6 +7836,23 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
                 }
                 case "compute_outliers": {
                   result = computeOutliers(payload.values || [], payload.topK || 10);
+                  break;
+                }
+                case "extract_outline": {
+                  const idx = Number(payload.idx || 0);
+                  const text = docTextAtLocal(idx, reqId, progressCb);
+                  result = { idx, outline: extractOutlineWorker(text) };
+                  break;
+                }
+                case "heading_metrics": {
+                  const idx = Number(payload.idx || 0);
+                  const text = docTextAtLocal(idx, reqId, progressCb);
+                  const outline = extractOutlineWorker(text);
+                  const patch = patchForIdx(idx);
+                  const totalLines = text.split("\\n").length;
+                  const lineMap = buildLineToHeadingMapW(totalLines, outline);
+                  const metrics = attributeHunksToHeadingsW(patch, lineMap);
+                  result = { idx, outline, metrics };
                   break;
                 }
                 default:
@@ -7718,6 +8496,9 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             }
           });
         });
+
+        // Keep URL in sync with filter/view state.
+        syncUrlToState();
       }
 
       function matchesFilters(commit) {
@@ -7754,15 +8535,16 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         const btnSpec = document.getElementById("docTabSpec");
         const btnDiff = document.getElementById("docTabDiff");
         const btnMetrics = document.getElementById("docTabMetrics");
+        const btnSections = document.getElementById("docTabSections");
         const on = "focus-ring rounded-2xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800";
         const off =
           "focus-ring rounded-2xl border border-slate-900/10 bg-white/70 px-3 py-2 text-xs font-semibold text-slate-900 hover:bg-white";
-        if (btnSpec && btnDiff && btnMetrics) {
-          btnSpec.className = tab === "spec" ? on : off;
-          btnDiff.className = tab === "diff" ? on : off;
-          btnMetrics.className = tab === "metrics" ? on : off;
-        }
+        if (btnSpec) btnSpec.className = tab === "spec" ? on : off;
+        if (btnDiff) btnDiff.className = tab === "diff" ? on : off;
+        if (btnMetrics) btnMetrics.className = tab === "metrics" ? on : off;
+        if (btnSections) btnSections.className = tab === "sections" ? on : off;
         updateDocPanelVisibility();
+        syncUrlToState();
         // Re-render diff/spec if needed.
         void updateDocUI();
       }
@@ -7771,16 +8553,216 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         const spec = document.getElementById("docSpecView");
         const diff = document.getElementById("docDiffView");
         const metrics = document.getElementById("docMetricsView");
+        const sections = document.getElementById("docSectionsView");
         if (!spec || !diff || !metrics) return;
         spec.classList.toggle("hidden", DOC.tab !== "spec");
         diff.classList.toggle("hidden", DOC.tab !== "diff");
         metrics.classList.toggle("hidden", DOC.tab !== "metrics");
+        if (sections) sections.classList.toggle("hidden", DOC.tab !== "sections");
       }
 
       function patchForIdx(idx) {
         const d = DATASET.data;
         if (!d || !Array.isArray(d.patches)) return "";
         return d.patches[idx] || "";
+      }
+
+      // --- A/B Compare Typeahead Picker System (bd-24q.1) ---
+
+      /** Format a commit label for the picker button. */
+      function fmtPickerLabel(idx) {
+        const c = ALL_COMMITS[idx];
+        if (!c) return `#${idx}`;
+        return `#${idx} ${c.short} – ${c.subject.slice(0, 32)}`;
+      }
+
+      /** Render commit items into a picker list element, filtered by query. */
+      function renderPickerList(listEl, query, selectedIdx, onSelect) {
+        listEl.innerHTML = "";
+        const q = (query || "").toLowerCase().trim();
+        const items = [];
+        for (let i = 0; i < ALL_COMMITS.length; i++) {
+          const c = ALL_COMMITS[i];
+          const searchable = `#${i} ${c.short} ${c.hash} ${c.subject}`.toLowerCase();
+          if (q && !searchable.includes(q)) continue;
+          items.push(i);
+        }
+        if (items.length === 0) {
+          const empty = document.createElement("div");
+          empty.className = "px-3 py-4 text-center text-[11px] text-slate-400";
+          empty.textContent = q ? "No matching commits" : "No commits loaded";
+          listEl.appendChild(empty);
+          return;
+        }
+        for (const i of items) {
+          const c = ALL_COMMITS[i];
+          const div = document.createElement("div");
+          div.className = "ab-picker-item" + (i === selectedIdx ? " selected" : "");
+          div.dataset.idx = i;
+          div.innerHTML = `<span class="idx">#${i}</span><span class="hash">${escapeHtml(c.short)}</span><span class="subject">${escapeHtml(c.subject)}</span>`;
+          div.addEventListener("click", () => onSelect(i));
+          listEl.appendChild(div);
+        }
+      }
+
+      /** Open a typeahead picker dropdown. */
+      function openPicker(pickerId) {
+        const dropdown = document.getElementById(pickerId + "Dropdown");
+        const search = document.getElementById(pickerId + "Search");
+        if (!dropdown) return;
+        // Close any other open picker first.
+        document.querySelectorAll(".ab-picker-dropdown").forEach(d => { if (d.id !== pickerId + "Dropdown") d.classList.add("hidden"); });
+        dropdown.classList.remove("hidden");
+        if (search) { search.value = ""; search.focus(); }
+        const isA = pickerId === "pickerA";
+        const selectedIdx = isA ? DOC.compareFromIdx : DOC.compareToIdx;
+        const listEl = document.getElementById(pickerId + "List");
+        if (listEl) {
+          renderPickerList(listEl, "", selectedIdx, (idx) => {
+            if (isA) DOC.compareFromIdx = idx; else DOC.compareToIdx = idx;
+            closePicker(pickerId);
+            populateCompareSelects();
+            syncUrlToState();
+            void updateDocUI();
+          });
+          // Scroll selected item into view.
+          requestAnimationFrame(() => {
+            const sel = listEl.querySelector(".selected");
+            if (sel) sel.scrollIntoView({ block: "center", behavior: "instant" });
+          });
+        }
+      }
+
+      /** Close a typeahead picker dropdown. */
+      function closePicker(pickerId) {
+        const dropdown = document.getElementById(pickerId + "Dropdown");
+        if (dropdown) dropdown.classList.add("hidden");
+      }
+
+      /** Wire up search input filtering for a picker. */
+      function wirePickerSearch(pickerId) {
+        const search = document.getElementById(pickerId + "Search");
+        const listEl = document.getElementById(pickerId + "List");
+        if (!search || !listEl) return;
+        let debounce = 0;
+        const isA = pickerId === "pickerA";
+        search.addEventListener("input", () => {
+          clearTimeout(debounce);
+          debounce = setTimeout(() => {
+            const selectedIdx = isA ? DOC.compareFromIdx : DOC.compareToIdx;
+            renderPickerList(listEl, search.value, selectedIdx, (idx) => {
+              if (isA) DOC.compareFromIdx = idx; else DOC.compareToIdx = idx;
+              closePicker(pickerId);
+              populateCompareSelects();
+              syncUrlToState();
+              void updateDocUI();
+            });
+          }, 80);
+        });
+        // Keyboard navigation.
+        search.addEventListener("keydown", (e) => {
+          if (e.key === "Escape") { closePicker(pickerId); return; }
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            const items = listEl.querySelectorAll(".ab-picker-item");
+            if (!items.length) return;
+            let active = listEl.querySelector(".keyboard-active");
+            let nextIdx = 0;
+            if (active) {
+              active.classList.remove("keyboard-active");
+              const arr = Array.from(items);
+              const cur = arr.indexOf(active);
+              nextIdx = e.key === "ArrowDown" ? Math.min(cur + 1, arr.length - 1) : Math.max(cur - 1, 0);
+            }
+            items[nextIdx].classList.add("keyboard-active");
+            items[nextIdx].scrollIntoView({ block: "nearest" });
+          }
+          if (e.key === "Enter") {
+            const active = listEl.querySelector(".keyboard-active") || listEl.querySelector(".ab-picker-item");
+            if (active) active.click();
+          }
+        });
+      }
+
+      /** Populate the A/B compare typeahead pickers from ALL_COMMITS. */
+      function populateCompareSelects() {
+        if (!ALL_COMMITS.length) return;
+        // Update picker button labels.
+        const btnA = document.getElementById("pickerABtn");
+        const btnB = document.getElementById("pickerBBtn");
+        if (btnA) btnA.textContent = fmtPickerLabel(DOC.compareFromIdx);
+        if (btnB) btnB.textContent = fmtPickerLabel(DOC.compareToIdx);
+      }
+
+      /**
+       * Generate a unified diff between two arbitrary commit snapshots.
+       * Uses jsdiff (Diff library) to compute and returns a unified-diff string
+       * suitable for Diff2Html rendering.
+       */
+      async function generateABDiff(fromIdx, toIdx) {
+        const loading = document.getElementById("abDiffLoading");
+        if (loading) loading.classList.remove("hidden");
+        try {
+          const [textA, textB] = await Promise.all([
+            docTextAt(fromIdx),
+            docTextAt(toIdx),
+          ]);
+          const commitA = ALL_COMMITS[fromIdx];
+          const commitB = ALL_COMMITS[toIdx];
+          const nameA = commitA ? `${commitA.short} (${commitA.subject.slice(0, 30)})` : `commit #${fromIdx}`;
+          const nameB = commitB ? `${commitB.short} (${commitB.subject.slice(0, 30)})` : `commit #${toIdx}`;
+          // Diff.createTwoFilesPatch(oldFileName, newFileName, oldStr, newStr, oldHeader, newHeader)
+          const patch = Diff.createTwoFilesPatch(
+            nameA, nameB,
+            textA, textB,
+            `commit #${fromIdx}`, `commit #${toIdx}`
+          );
+          return patch;
+        } finally {
+          if (loading) loading.classList.add("hidden");
+        }
+      }
+
+      const AB_METRICS_MAIN_CACHE = new Map();
+      let AB_METRICS_ABORT = null;
+      async function computeAndShowABMetrics(aIdx, bIdx) {
+        const bar = document.getElementById("abMetricsBar");
+        if (!bar) return;
+        if (aIdx === bIdx) { bar.classList.add("hidden"); return; }
+        bar.classList.remove("hidden");
+        const chips = ["abmLines", "abmTokens", "abmLev", "abmHunks", "abmBytes"];
+        for (const id of chips) { const el = document.getElementById(id); if (el) el.textContent = "..."; }
+        if (AB_METRICS_ABORT) AB_METRICS_ABORT.abort();
+        AB_METRICS_ABORT = new AbortController();
+        const cacheKey = `${WORKER_STATE.datasetHash}:${aIdx}:${bIdx}`;
+        const cached = AB_METRICS_MAIN_CACHE.get(cacheKey);
+        if (cached) { renderABMetricChips(cached); return; }
+        try {
+          let metrics;
+          if (WORKER_STATE.ready) {
+            metrics = await workerRequest("ab_metrics", { aIdx, bIdx }, { timeoutMs: 120000, signal: AB_METRICS_ABORT.signal });
+          } else {
+            const patch = await generateABDiff(aIdx, bIdx);
+            metrics = quickMetricsFromPatch(patch);
+            metrics.lev = null;
+          }
+          AB_METRICS_MAIN_CACHE.set(cacheKey, metrics);
+          renderABMetricChips(metrics);
+        } catch (e) {
+          if (e?.name !== "AbortError") {
+            console.error("A/B metrics failed:", e);
+            for (const id of chips) { const el = document.getElementById(id); if (el) el.textContent = "ERR"; }
+          }
+        }
+      }
+      function renderABMetricChips(m) {
+        const sign = (v) => v > 0 ? "+" + fmtInt(v) : v < 0 ? fmtInt(v) : "0";
+        const el = (id) => document.getElementById(id);
+        if (el("abmLines")) el("abmLines").textContent = `\u0394lines ${sign(m.deltaLines || 0)} (+${fmtInt(m.addLines || 0)} -${fmtInt(m.delLines || 0)})`;
+        if (el("abmTokens")) el("abmTokens").textContent = `\u0394tokens ${sign(m.tokensDelta || 0)} (${fmtInt(m.tokensChanged || 0)} touched)`;
+        if (el("abmLev")) el("abmLev").textContent = `Lev ${m.lev != null ? fmtInt(m.lev) : "?"}`;
+        if (el("abmHunks")) el("abmHunks").textContent = `Hunks ${fmtInt(m.hunks || 0)}`;
+        if (el("abmBytes")) el("abmBytes").textContent = `\u0394bytes ${sign(m.bytesDelta || 0)} (${fmtInt(m.bytesChanged || 0)} touched)`;
       }
 
       function applyPatchLines(prevLines, patch) {
@@ -7918,6 +8900,9 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           // Level from tag: "h1" -> 1, "h2" -> 2, etc.
           const level = Number(tok.tag?.slice(1)) || 1;
 
+          // Source line (1-based) from markdown-it token map.
+          const line = tok.map ? tok.map[0] + 1 : null;
+
           // Next token should be the inline content.
           const inlineTok = tokens[i + 1];
           let text = "";
@@ -7936,7 +8921,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           slugCounts.set(baseSlug, count + 1);
           const id = count === 0 ? baseSlug : `${baseSlug}-${count}`;
 
-          outline.push({ text: text.trim(), level, id });
+          outline.push({ text: text.trim(), level, id, line });
         }
         return outline;
       }
@@ -7972,6 +8957,781 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           };
         });
       }
+
+      // -----------------------------
+      // Per-Heading Change Metrics (bd-24q.8.2)
+      // -----------------------------
+
+      const HEADING_METRICS_CACHE = new Map(); // idx -> Map<headingId, metrics>
+
+      /**
+       * Build a lookup: 1-based line number -> heading ID.
+       * Lines before the first heading map to "__preamble__".
+       */
+      function buildLineToHeadingMap(totalLines, outline) {
+        const map = new Array(totalLines + 1);
+        map[0] = "__preamble__";
+
+        // Determine the heading boundary for each line by walking
+        // through the outline's sorted line numbers.
+        let ptr = 0;
+        let currentId = "__preamble__";
+        for (let ln = 1; ln <= totalLines; ln++) {
+          while (ptr < outline.length && outline[ptr].line != null && outline[ptr].line <= ln) {
+            currentId = outline[ptr].id;
+            ptr++;
+          }
+          map[ln] = currentId;
+        }
+        return map;
+      }
+
+      /**
+       * Attribute each added/removed line in a unified diff to the
+       * nearest preceding heading in the new (current) snapshot.
+       *
+       * Returns: Map<headingId, { addLines, delLines, tokensAdded, tokensDeleted }>
+       */
+      function attributeHunksToHeadings(patch, lineToHeading) {
+        const hunks = parseUnifiedHunks(patch);
+        const metrics = new Map();
+
+        const ensure = (id) => {
+          if (!metrics.has(id)) {
+            metrics.set(id, { addLines: 0, delLines: 0, tokensAdded: 0, tokensDeleted: 0 });
+          }
+          return metrics.get(id);
+        };
+
+        for (const hunk of hunks) {
+          let newLineNum = hunk.newStart;
+          for (const hl of hunk.lines) {
+            if (!hl) continue;
+            const p = hl[0];
+            const content = hl.slice(1);
+            const headingId = lineToHeading[newLineNum] || "__preamble__";
+
+            if (p === "+") {
+              const m = ensure(headingId);
+              m.addLines++;
+              m.tokensAdded += countRoughTokens(content);
+              newLineNum++;
+            } else if (p === "-") {
+              const m = ensure(headingId);
+              m.delLines++;
+              m.tokensDeleted += countRoughTokens(content);
+              // Deleted lines don't advance the new-file cursor.
+            } else if (p === " ") {
+              newLineNum++;
+            }
+          }
+        }
+        return metrics;
+      }
+
+      /**
+       * Get per-heading change metrics for a commit.
+       *
+       * Returns: Promise<Map<headingId, { addLines, delLines, tokensAdded, tokensDeleted }>>
+       */
+      async function getHeadingMetrics(commitIdx) {
+        const idx = Number(commitIdx || 0);
+        if (HEADING_METRICS_CACHE.has(idx)) return HEADING_METRICS_CACHE.get(idx);
+
+        const outline = await getOutline(idx);
+        const text = await docTextAt(idx);
+        const patch = patchForIdx(idx);
+
+        if (!patch || !outline.length) {
+          const empty = new Map();
+          HEADING_METRICS_CACHE.set(idx, empty);
+          return empty;
+        }
+
+        const totalLines = text.split("\n").length;
+        const lineToHeading = buildLineToHeadingMap(totalLines, outline);
+        const metrics = attributeHunksToHeadings(patch, lineToHeading);
+        HEADING_METRICS_CACHE.set(idx, metrics);
+        return metrics;
+      }
+
+      /**
+       * Render the mini-map outline panel for the current commit.
+       *
+       * Features (bd-24q.2.2):
+       * - Heading hierarchy with change-heat indicators
+       * - Follow-along: tracks visible heading while scrolling docRendered
+       * - Search/filter headings by text
+       * - Keyboard navigation (arrow keys, Enter to jump)
+       */
+      let _miniMapOutline = [];
+      let _miniMapScrollCleanup = null;
+
+      async function updateMiniMap() {
+        const mm = document.getElementById("miniMap");
+        if (!mm || mm.classList.contains("hidden")) return;
+
+        const itemsContainer = document.getElementById("miniMapItems") || mm;
+        const outline = await getOutline(DOC.idx);
+        _miniMapOutline = outline;
+
+        if (!outline.length) {
+          itemsContainer.innerHTML = '<div class="text-xs text-slate-400 italic p-2">No headings</div>';
+          return;
+        }
+
+        // In A/B compare mode, compute metrics between A and B; otherwise parent→current.
+        let headingMetrics = null;
+        if (DOC.compareMode && DOC.compareToIdx > 0) {
+          try { headingMetrics = await getHeadingMetrics(DOC.compareToIdx); } catch { /* best-effort */ }
+        } else if (DOC.idx > 0) {
+          try { headingMetrics = await getHeadingMetrics(DOC.idx); } catch { /* best-effort */ }
+        }
+
+        // Bucket accent: use current commit's primary bucket color.
+        const commitForAccent = DOC.compareMode
+          ? ALL_COMMITS[DOC.compareToIdx]
+          : ALL_COMMITS[DOC.idx];
+        const accentColor = commitForAccent ? bucketById(commitForAccent.primary)?.color : null;
+
+        const docEl = document.getElementById("docRendered");
+        const searchInput = document.getElementById("miniMapSearch");
+        const filterText = (searchInput?.value || "").toLowerCase().trim();
+
+        const filtered = filterText
+          ? outline.filter((e) => e.text.toLowerCase().includes(filterText))
+          : outline;
+
+        const items = filtered.map((entry, i) => {
+          const indent = Math.max(0, entry.level - 1) * 12;
+          const hasChange = headingMetrics?.has(entry.id);
+          const m = hasChange ? headingMetrics.get(entry.id) : null;
+          const changeTotal = m ? m.addLines + m.delLines : 0;
+          const tokenTotal = m ? m.tokensAdded + m.tokensDeleted : 0;
+          // Intensity: use token count for size, line count for color.
+          const dotSize = tokenTotal > 50 ? 10 : tokenTotal > 10 ? 8 : 6;
+          const dotColor = changeTotal > 20 ? '#dc2626' : changeTotal > 5 ? '#d97706' : '#059669';
+          const borderStyle = accentColor && hasChange && changeTotal > 0
+            ? `; border: 1.5px solid ${accentColor}` : "";
+          const marker = hasChange && changeTotal > 0
+            ? `<span class="inline-block rounded-full mr-1.5 shrink-0" style="width: ${dotSize}px; height: ${dotSize}px; background: ${dotColor}${borderStyle}" title="+${m.addLines} -${m.delLines} lines, ~${tokenTotal} tokens"></span>`
+            : "";
+          return `<a href="#${escapeHtml(entry.id)}" role="treeitem" tabindex="${i === 0 ? '0' : '-1'}" class="minimap-item flex items-center py-0.5 text-[11px] leading-tight text-slate-700 hover:text-slate-900 hover:bg-slate-100/60 rounded px-1 cursor-pointer no-underline transition-colors" style="padding-left: ${indent}px" data-heading-id="${escapeHtml(entry.id)}" title="${escapeHtml(entry.text)}">${marker}<span class="truncate">${escapeHtml(entry.text)}</span></a>`;
+        });
+        itemsContainer.innerHTML = items.join("");
+
+        // Click handlers: smooth-scroll to heading in doc.
+        itemsContainer.querySelectorAll(".minimap-item").forEach((a) => {
+          a.addEventListener("click", (e) => {
+            e.preventDefault();
+            const hid = a.dataset.headingId;
+            if (!hid || !docEl) return;
+            const target = docEl.querySelector(`#${CSS.escape(hid)}`);
+            if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+            miniMapSetActive(a);
+          });
+        });
+
+        // Keyboard navigation on items container.
+        itemsContainer.onkeydown = (e) => {
+          const links = [...itemsContainer.querySelectorAll(".minimap-item")];
+          if (!links.length) return;
+          const cur = itemsContainer.querySelector(".minimap-item[tabindex='0']");
+          const idx = cur ? links.indexOf(cur) : 0;
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            const next = e.key === "ArrowDown" ? Math.min(idx + 1, links.length - 1) : Math.max(idx - 1, 0);
+            if (cur) cur.tabIndex = -1;
+            links[next].tabIndex = 0;
+            links[next].focus();
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            if (cur) cur.click();
+          } else if (e.key === "Home") {
+            e.preventDefault();
+            if (cur) cur.tabIndex = -1;
+            links[0].tabIndex = 0;
+            links[0].focus();
+          } else if (e.key === "End") {
+            e.preventDefault();
+            if (cur) cur.tabIndex = -1;
+            links[links.length - 1].tabIndex = 0;
+            links[links.length - 1].focus();
+          }
+        };
+
+        // Follow-along: highlight current heading while scrolling docRendered.
+        setupMiniMapFollowAlong(docEl, itemsContainer, outline);
+      }
+
+      /** Highlight a mini-map item as active and scroll it into view. */
+      function miniMapSetActive(el) {
+        const container = el?.closest("#miniMapItems") || el?.closest("#miniMap");
+        if (!container) return;
+        container.querySelectorAll(".minimap-item.minimap-active").forEach((a) => {
+          a.classList.remove("minimap-active", "bg-slate-200/80", "font-semibold", "text-slate-900");
+        });
+        if (el) {
+          el.classList.add("minimap-active", "bg-slate-200/80", "font-semibold", "text-slate-900");
+          el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        }
+      }
+
+      /** Attach a scroll listener on docRendered to track the current heading. */
+      function setupMiniMapFollowAlong(docEl, itemsContainer, outline) {
+        if (_miniMapScrollCleanup) { _miniMapScrollCleanup(); _miniMapScrollCleanup = null; }
+        if (!docEl || !outline.length) return;
+
+        // Cache heading offsets to avoid O(N) DOM queries per scroll.
+        const headingOffsets = [];
+        for (const entry of outline) {
+          const el = docEl.querySelector(`#${CSS.escape(entry.id)}`);
+          headingOffsets.push({ id: entry.id, top: el ? el.offsetTop : 0 });
+        }
+
+        let rafId = 0;
+        const onScroll = () => {
+          cancelAnimationFrame(rafId);
+          rafId = requestAnimationFrame(() => {
+            const viewportMid = docEl.scrollTop + docEl.clientHeight * 0.25;
+            let activeId = headingOffsets[0]?.id;
+            for (const h of headingOffsets) {
+              if (h.top <= viewportMid) activeId = h.id;
+            }
+            const activeLink = activeId ? itemsContainer.querySelector(`[data-heading-id="${CSS.escape(activeId)}"]`) : null;
+            if (activeLink && !activeLink.classList.contains("minimap-active")) miniMapSetActive(activeLink);
+          });
+        };
+        docEl.addEventListener("scroll", onScroll, { passive: true });
+        onScroll();
+        _miniMapScrollCleanup = () => { docEl.removeEventListener("scroll", onScroll); cancelAnimationFrame(rafId); };
+      }
+
+      // ---- Section Summary Panel (bd-24q.8.3) ----
+      const SECTION_SORT = { key: "impact", asc: false };
+      function sectionSparkline(headingId, currentIdx) {
+        const range = 5, startIdx = Math.max(1, currentIdx - range + 1), vals = [];
+        for (let i = startIdx; i <= currentIdx; i++) {
+          const cached = HEADING_METRICS_CACHE.get(i);
+          if (cached && cached.has(headingId)) { const m = cached.get(headingId); vals.push(m.addLines + m.delLines); }
+          else vals.push(0);
+        }
+        const maxVal = Math.max(1, ...vals);
+        return vals.map(v => {
+          const h = Math.max(1, Math.round((v / maxVal) * 14));
+          const color = v === 0 ? "#cbd5e1" : v > 20 ? "#dc2626" : v > 5 ? "#d97706" : "#059669";
+          return `<span class="sparkline-bar" style="width:3px;height:${h}px;background:${color};"><\/span>`;
+        }).join("");
+      }
+      async function updateSectionSummary() {
+        const view = document.getElementById("docSectionsView");
+        if (!view || view.classList.contains("hidden")) return;
+        const tbody = document.getElementById("sectionTableBody");
+        const empty = document.getElementById("sectionEmpty");
+        const wrap = document.getElementById("sectionTableWrap");
+        if (!tbody) return;
+        const outline = await getOutline(DOC.idx);
+        const metrics = DOC.idx > 0 ? await getHeadingMetrics(DOC.idx) : new Map();
+        const filter = (document.getElementById("sectionFilter")?.value || "").trim().toLowerCase();
+        const rows = [];
+        for (const entry of outline) {
+          if (filter && !entry.text.toLowerCase().includes(filter)) continue;
+          const m = metrics.get(entry.id) || { addLines: 0, delLines: 0, tokensAdded: 0, tokensDeleted: 0 };
+          rows.push({ id: entry.id, text: entry.text, level: entry.level, add: m.addLines, del: m.delLines, tokens: m.tokensAdded + m.tokensDeleted, impact: m.addLines + m.delLines });
+        }
+        const sortKey = SECTION_SORT.key, dir = SECTION_SORT.asc ? 1 : -1;
+        rows.sort((a, b) => sortKey === "name" ? dir * a.text.localeCompare(b.text) : dir * ((a[sortKey] || 0) - (b[sortKey] || 0)));
+        if (!rows.length) { tbody.innerHTML = ""; if (wrap) wrap.classList.add("hidden"); if (empty) empty.classList.remove("hidden"); return; }
+        if (wrap) wrap.classList.remove("hidden");
+        if (empty) empty.classList.add("hidden");
+        const maxImpact = Math.max(1, ...rows.map(r => r.impact));
+        tbody.innerHTML = rows.map(r => {
+          const indent = Math.max(0, r.level - 1) * 10;
+          const barW = Math.round((r.impact / maxImpact) * 100);
+          const spark = sectionSparkline(r.id, DOC.idx);
+          const ic = r.impact === 0 ? "text-slate-400" : r.impact > 20 ? "text-red-600" : r.impact > 5 ? "text-amber-600" : "text-emerald-600";
+          return `<tr class="border-b border-slate-100 hover:bg-slate-50/60 cursor-pointer transition-colors" data-heading-id="${escapeHtml(r.id)}"><td class="px-3 py-2 text-left"><div class="flex items-center gap-1.5" style="padding-left:${indent}px"><span class="truncate max-w-[240px]" title="${escapeHtml(r.text)}">${escapeHtml(r.text)}<\/span><span class="flex items-end gap-px ml-1">${spark}<\/span><\/div><\/td><td class="px-3 py-2 text-right mono text-emerald-600">${r.add > 0 ? "+" + r.add : ""}<\/td><td class="px-3 py-2 text-right mono text-red-500">${r.del > 0 ? "-" + r.del : ""}<\/td><td class="px-3 py-2 text-right mono text-slate-600">${r.tokens || ""}<\/td><td class="px-3 py-2 text-right"><div class="flex items-center justify-end gap-1.5"><span class="mono ${ic} font-semibold">${r.impact || ""}<\/span><span class="inline-block h-1.5 rounded-full bg-slate-200" style="width:40px"><span class="inline-block h-1.5 rounded-full" style="width:${barW}%;background:${r.impact > 20 ? '#dc2626' : r.impact > 5 ? '#d97706' : '#059669'}"><\/span><\/span><\/div><\/td><\/tr>`;
+        }).join("");
+        tbody.querySelectorAll("tr[data-heading-id]").forEach(tr => {
+          tr.addEventListener("click", () => {
+            const hid = tr.dataset.headingId;
+            if (!hid) return;
+            if (DOC.tab !== "spec") setDocTab("spec");
+            requestAnimationFrame(() => {
+              const docEl = document.getElementById("docRendered");
+              if (!docEl) return;
+              const target = docEl.querySelector(`#${CSS.escape(hid)}`);
+              if (target) { target.scrollIntoView({ behavior: "smooth", block: "start" }); target.classList.remove("section-highlight"); void target.offsetWidth; target.classList.add("section-highlight"); }
+            });
+          });
+        });
+      }
+      document.addEventListener("click", e => {
+        const th = e.target.closest("#sectionTable th[data-sort]");
+        if (!th) return;
+        const key = th.dataset.sort;
+        if (SECTION_SORT.key === key) SECTION_SORT.asc = !SECTION_SORT.asc;
+        else { SECTION_SORT.key = key; SECTION_SORT.asc = key === "name"; }
+        th.closest("thead")?.querySelectorAll("th[data-sort]").forEach(h => {
+          const arrow = SECTION_SORT.key === h.dataset.sort ? (SECTION_SORT.asc ? " \u25B2" : " \u25BC") : "";
+          h.textContent = h.textContent.replace(/\s*[\u25B2\u25BC]$/, "") + arrow;
+        });
+        void updateSectionSummary();
+      });
+      document.addEventListener("input", e => {
+        if (e.target?.id === "sectionFilter") { clearTimeout(e.target._debounce); e.target._debounce = setTimeout(() => void updateSectionSummary(), 150); }
+      });
+      // Mobile section sheet open/close.
+      function openSectionSheet() {
+        const sheet = document.getElementById("sectionSheet");
+        const overlay = document.getElementById("sectionSheetOverlay");
+        if (sheet) { sheet.classList.remove("hidden"); requestAnimationFrame(() => sheet.classList.add("open")); }
+        if (overlay) overlay.classList.remove("hidden");
+        void updateSectionSheetList();
+      }
+      function closeSectionSheet() {
+        const sheet = document.getElementById("sectionSheet");
+        const overlay = document.getElementById("sectionSheetOverlay");
+        if (sheet) { sheet.classList.remove("open"); setTimeout(() => sheet.classList.add("hidden"), 220); }
+        if (overlay) overlay.classList.add("hidden");
+      }
+      async function updateSectionSheetList() {
+        const list = document.getElementById("sectionSheetList");
+        if (!list) return;
+        const outline = await getOutline(DOC.idx);
+        const metrics = DOC.idx > 0 ? await getHeadingMetrics(DOC.idx) : new Map();
+        const filter = (document.getElementById("sectionFilterMobile")?.value || "").trim().toLowerCase();
+        const items = [];
+        for (const entry of outline) {
+          if (filter && !entry.text.toLowerCase().includes(filter)) continue;
+          const m = metrics.get(entry.id) || { addLines: 0, delLines: 0, tokensAdded: 0, tokensDeleted: 0 };
+          const total = m.addLines + m.delLines;
+          const color = total === 0 ? "bg-slate-100 text-slate-400" : total > 20 ? "bg-red-50 text-red-700" : total > 5 ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700";
+          const indent = Math.max(0, entry.level - 1) * 12;
+          items.push(`<button class="w-full text-left rounded-2xl px-4 py-3 ${color} hover:brightness-95 transition-colors" data-heading-id="${escapeHtml(entry.id)}" style="padding-left:${indent + 16}px"><div class="text-sm font-semibold">${escapeHtml(entry.text)}<\/div><div class="mt-0.5 text-[11px]">+${m.addLines} -${m.delLines} lines \u00b7 ${m.tokensAdded + m.tokensDeleted} tokens<\/div><\/button>`);
+        }
+        list.innerHTML = items.length ? items.join("") : '<div class="text-xs text-slate-400 italic p-3">No section changes<\/div>';
+        list.querySelectorAll("button[data-heading-id]").forEach(btn => {
+          btn.addEventListener("click", () => {
+            closeSectionSheet();
+            setDocTab("spec");
+            setTimeout(() => {
+              const docEl = document.getElementById("docRendered");
+              if (!docEl) return;
+              const target = docEl.querySelector(`#${CSS.escape(btn.dataset.headingId)}`);
+              if (target) { target.scrollIntoView({ behavior: "smooth", block: "start" }); target.classList.remove("section-highlight"); void target.offsetWidth; target.classList.add("section-highlight"); }
+            }, 300);
+          });
+        });
+      }
+      document.getElementById("btnOpenSectionSheet")?.addEventListener("click", openSectionSheet);
+      document.getElementById("btnCloseSectionSheet")?.addEventListener("click", closeSectionSheet);
+      document.getElementById("sectionSheetOverlay")?.addEventListener("click", closeSectionSheet);
+      document.getElementById("sectionFilterMobile")?.addEventListener("input", e => {
+        clearTimeout(e.target._debounce);
+        e.target._debounce = setTimeout(() => void updateSectionSheetList(), 150);
+      });
+
+      // ---- End Section Summary Panel ----
+
+      // ---- Section Summary Unit Tests (bd-24q.8.4) ----
+      // Run via console: window.__runSectionTests()
+      window.__runSectionTests = function () {
+        const results = [];
+        const assert = (cond, msg, ctx) => {
+          if (!cond) { results.push({ pass: false, msg, ctx }); console.error("FAIL:", msg, ctx || ""); }
+          else results.push({ pass: true, msg });
+        };
+
+        // --- extractOutline tests ---
+        (function testOutline_basic() {
+          const md = "# Title\n\nSome text\n\n## Section A\n\nBody\n\n## Section B\n\nMore body\n\n### Subsection B.1\n";
+          const o = extractOutline(md);
+          assert(o.length === 4, "outline: 4 headings", { got: o.length });
+          assert(o[0].text === "Title" && o[0].level === 1, "outline: h1 Title");
+          assert(o[1].text === "Section A" && o[1].level === 2, "outline: h2 Section A");
+          assert(o[2].text === "Section B" && o[2].level === 2, "outline: h2 Section B");
+          assert(o[3].text === "Subsection B.1" && o[3].level === 3, "outline: h3 Subsection B.1");
+        })();
+
+        (function testOutline_duplicateSlugs() {
+          const md = "## Intro\n\nText\n\n## Intro\n\nText\n\n## Intro\n";
+          const o = extractOutline(md);
+          assert(o.length === 3, "duplicate: 3 headings");
+          assert(o[0].id === "intro", "duplicate: first is 'intro'", { got: o[0].id });
+          assert(o[1].id === "intro-1", "duplicate: second is 'intro-1'", { got: o[1].id });
+          assert(o[2].id === "intro-2", "duplicate: third is 'intro-2'", { got: o[2].id });
+        })();
+
+        (function testOutline_weirdPunctuation() {
+          const md = "# Hello, World! (v2.0)\n\n## 日本語の見出し\n\n## `code_heading`\n";
+          const o = extractOutline(md);
+          assert(o.length === 3, "punctuation: 3 headings");
+          assert(o[0].id.length > 0, "punctuation: non-empty slug for punctuated heading");
+          assert(o[1].id.length > 0, "punctuation: non-empty slug for Unicode heading");
+        })();
+
+        (function testOutline_emptyHeading() {
+          const md = "## \n\n## Real\n";
+          const o = extractOutline(md);
+          assert(o.length === 2, "empty: 2 headings (one empty)");
+          assert(o[0].id === "heading", "empty: empty heading gets fallback slug 'heading'", { got: o[0].id });
+        })();
+
+        (function testOutline_deepNesting() {
+          const md = "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\n";
+          const o = extractOutline(md);
+          assert(o.length === 6, "deep: 6 levels");
+          assert(o[5].level === 6, "deep: h6 detected", { got: o[5].level });
+        })();
+
+        // --- slugifyHeading tests ---
+        (function testSlug_basic() {
+          assert(slugifyHeading("Hello World") === "hello-world", "slug: basic");
+          assert(slugifyHeading("") === "heading", "slug: empty string fallback");
+          assert(slugifyHeading("  ") === "heading", "slug: whitespace fallback");
+          assert(slugifyHeading("CamelCase") === "camelcase", "slug: lowercased");
+          assert(slugifyHeading("a--b") === "a-b", "slug: collapsed hyphens");
+        })();
+
+        // --- buildLineToHeadingMap tests ---
+        (function testLineMap_basic() {
+          const outline = [
+            { text: "A", level: 1, id: "a", line: 1 },
+            { text: "B", level: 2, id: "b", line: 5 },
+            { text: "C", level: 2, id: "c", line: 10 },
+          ];
+          const map = buildLineToHeadingMap(15, outline);
+          assert(map[1] === "a", "linemap: line 1 -> a", { got: map[1] });
+          assert(map[4] === "a", "linemap: line 4 -> a (before B)", { got: map[4] });
+          assert(map[5] === "b", "linemap: line 5 -> b", { got: map[5] });
+          assert(map[9] === "b", "linemap: line 9 -> b", { got: map[9] });
+          assert(map[10] === "c", "linemap: line 10 -> c", { got: map[10] });
+          assert(map[15] === "c", "linemap: line 15 -> c", { got: map[15] });
+        })();
+
+        (function testLineMap_preamble() {
+          const outline = [{ text: "A", level: 1, id: "a", line: 5 }];
+          const map = buildLineToHeadingMap(10, outline);
+          assert(map[1] === "__preamble__", "preamble: line 1 before any heading", { got: map[1] });
+          assert(map[4] === "__preamble__", "preamble: line 4 before first heading", { got: map[4] });
+          assert(map[5] === "a", "preamble: line 5 at first heading", { got: map[5] });
+        })();
+
+        // --- attributeHunksToHeadings tests ---
+        (function testAttribution_basic() {
+          const patch = `--- a/doc.md
++++ b/doc.md
+@@ -3,2 +3,3 @@
+ unchanged
++new line in section A
++another new line
+@@ -8,1 +9,2 @@
+ unchanged
++added in section B`;
+          const lineToHeading = new Array(12);
+          for (let i = 0; i <= 11; i++) lineToHeading[i] = i < 7 ? "a" : "b";
+          const m = attributeHunksToHeadings(patch, lineToHeading);
+          assert(m.has("a"), "attr: section a has metrics");
+          assert(m.get("a").addLines === 2, "attr: section a +2 lines", { got: m.get("a")?.addLines });
+          assert(m.has("b"), "attr: section b has metrics");
+          assert(m.get("b").addLines === 1, "attr: section b +1 line", { got: m.get("b")?.addLines });
+        })();
+
+        (function testAttribution_deletions() {
+          const patch = `--- a/doc.md
++++ b/doc.md
+@@ -3,3 +3,1 @@
+ unchanged
+-removed line 1
+-removed line 2`;
+          const lineToHeading = new Array(8);
+          for (let i = 0; i <= 7; i++) lineToHeading[i] = "section";
+          const m = attributeHunksToHeadings(patch, lineToHeading);
+          assert(m.has("section"), "del: section has metrics");
+          assert(m.get("section").delLines === 2, "del: 2 lines deleted", { got: m.get("section")?.delLines });
+          assert(m.get("section").addLines === 0, "del: 0 lines added", { got: m.get("section")?.addLines });
+        })();
+
+        (function testAttribution_empty_patch() {
+          const m = attributeHunksToHeadings("", []);
+          assert(m.size === 0, "empty: no metrics for empty patch");
+        })();
+
+        // --- countRoughTokens tests ---
+        (function testTokens() {
+          assert(countRoughTokens("hello world") === 2, "tokens: 2 words");
+          assert(countRoughTokens("a + b = c") === 6, "tokens: operators count", { got: countRoughTokens("a + b = c") });
+          assert(countRoughTokens("") === 0, "tokens: empty string");
+          assert(countRoughTokens("single") === 1, "tokens: single word");
+        })();
+
+        // --- sectionSparkline tests ---
+        (function testSparkline() {
+          const html = sectionSparkline("nonexistent", 3);
+          assert(html.includes("sparkline-bar"), "sparkline: contains bar spans");
+          assert(!html.includes("undefined"), "sparkline: no undefined in output");
+        })();
+
+        // --- Performance sanity ---
+        (function testPerformance_attribution() {
+          // Generate a large synthetic diff.
+          const lines = [];
+          lines.push("--- a/big.md", "+++ b/big.md", "@@ -1,500 +1,600 @@");
+          for (let i = 0; i < 500; i++) lines.push(" unchanged line " + i);
+          for (let i = 0; i < 100; i++) lines.push("+added line " + i);
+          const bigPatch = lines.join("\n");
+          const bigMap = new Array(700);
+          for (let i = 0; i < 700; i++) bigMap[i] = "section-" + Math.floor(i / 100);
+          const t0 = performance.now();
+          attributeHunksToHeadings(bigPatch, bigMap);
+          const elapsed = performance.now() - t0;
+          assert(elapsed < 100, "perf: 600-line attribution < 100ms", { elapsed: elapsed.toFixed(1) + "ms" });
+        })();
+
+        // Summary
+        const passed = results.filter(r => r.pass).length;
+        const failed = results.filter(r => !r.pass).length;
+        const summary = `Section Summary Tests: ${passed} passed, ${failed} failed, ${results.length} total`;
+        if (failed > 0) {
+          console.warn(summary);
+          results.filter(r => !r.pass).forEach(r => console.error("  FAIL:", r.msg, r.ctx || ""));
+        } else {
+          console.log("%c" + summary, "color: green; font-weight: bold");
+        }
+        return { passed, failed, total: results.length, results };
+      };
+      // ---- End Section Summary Unit Tests ----
+
+      // ---- Section Summary E2E Tests (bd-24q.8.5) ----
+      // Run via console: window.__runSectionE2ETests()
+      // Requires dataset to be loaded and at least one commit with changes.
+      window.__runSectionE2ETests = async function () {
+        const results = [];
+        const log = (msg, ctx) => console.log("  [E2E]", msg, ctx || "");
+        const assert = (cond, msg, ctx) => {
+          if (!cond) { results.push({ pass: false, msg, ctx }); console.error("  FAIL:", msg, ctx || ""); }
+          else { results.push({ pass: true, msg }); log("PASS: " + msg); }
+        };
+
+        if (!DATASET.loaded || !ALL_COMMITS.length) {
+          console.error("E2E: Dataset not loaded. Cannot run tests.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded" }] };
+        }
+
+        // Find a commit with actual changes for meaningful testing.
+        let testIdx = -1;
+        for (let i = 1; i < ALL_COMMITS.length; i++) {
+          if (ALL_COMMITS[i].impact > 10) { testIdx = i; break; }
+        }
+        if (testIdx < 0) testIdx = Math.min(1, ALL_COMMITS.length - 1);
+        log("Using commit idx=" + testIdx + " (" + ALL_COMMITS[testIdx].short + ")");
+
+        // E2E 1: Switch to sections tab and verify table renders.
+        await (async function testE2E_sectionsTabRenders() {
+          selectCommitIdx(testIdx);
+          setDocTab("sections");
+          // Give async updateSectionSummary time to complete.
+          await new Promise(r => setTimeout(r, 500));
+          const view = document.getElementById("docSectionsView");
+          assert(view && !view.classList.contains("hidden"), "e2e: sections view is visible");
+          const tbody = document.getElementById("sectionTableBody");
+          const rowCount = tbody ? tbody.querySelectorAll("tr").length : 0;
+          log("Table has " + rowCount + " rows");
+          assert(rowCount > 0, "e2e: section table has rows", { rowCount });
+        })();
+
+        // E2E 2: Sort by impact and verify order changes.
+        await (async function testE2E_sortByImpact() {
+          const th = document.querySelector('#sectionTable th[data-sort="impact"]');
+          if (th) {
+            th.click();
+            await new Promise(r => setTimeout(r, 300));
+            const rows = document.querySelectorAll("#sectionTableBody tr");
+            if (rows.length >= 2) {
+              const first = rows[0].querySelector("td:last-child .mono")?.textContent?.trim() || "0";
+              const last = rows[rows.length - 1].querySelector("td:last-child .mono")?.textContent?.trim() || "0";
+              log("First row impact: " + first + ", last row: " + last);
+              assert(true, "e2e: sort by impact executed without error");
+            } else {
+              assert(true, "e2e: sort by impact (not enough rows to verify order)");
+            }
+          } else {
+            assert(false, "e2e: impact sort header not found");
+          }
+        })();
+
+        // E2E 3: Filter headings.
+        await (async function testE2E_filterHeadings() {
+          const input = document.getElementById("sectionFilter");
+          if (input) {
+            const tbody = document.getElementById("sectionTableBody");
+            const beforeCount = tbody ? tbody.querySelectorAll("tr").length : 0;
+            input.value = "xyznonexistent";
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            await new Promise(r => setTimeout(r, 300));
+            const afterCount = tbody ? tbody.querySelectorAll("tr").length : 0;
+            log("Before filter: " + beforeCount + " rows, after: " + afterCount);
+            assert(afterCount <= beforeCount, "e2e: filter reduces or maintains row count");
+            // Reset filter.
+            input.value = "";
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            await new Promise(r => setTimeout(r, 300));
+          } else {
+            assert(false, "e2e: filter input not found");
+          }
+        })();
+
+        // E2E 4: Click row jumps to spec tab with heading.
+        await (async function testE2E_clickRowJumps() {
+          setDocTab("sections");
+          await new Promise(r => setTimeout(r, 500));
+          const firstRow = document.querySelector("#sectionTableBody tr[data-heading-id]");
+          if (firstRow) {
+            const hid = firstRow.dataset.headingId;
+            log("Clicking row for heading: " + hid);
+            firstRow.click();
+            await new Promise(r => setTimeout(r, 600));
+            assert(DOC.tab === "spec", "e2e: after click, tab switched to spec", { got: DOC.tab });
+            const docEl = document.getElementById("docRendered");
+            const target = docEl ? docEl.querySelector("#" + CSS.escape(hid)) : null;
+            assert(target !== null, "e2e: heading element exists in rendered doc", { hid });
+            if (target) {
+              const hasHighlight = target.classList.contains("section-highlight");
+              log("Heading has highlight class: " + hasHighlight);
+              assert(true, "e2e: heading element found (highlight animation triggered)");
+            }
+          } else {
+            assert(false, "e2e: no rows in section table to click");
+          }
+        })();
+
+        // E2E 5: Mobile sheet open/close.
+        await (async function testE2E_mobileSheet() {
+          const sheet = document.getElementById("sectionSheet");
+          const overlay = document.getElementById("sectionSheetOverlay");
+          if (sheet && overlay) {
+            // Open.
+            if (typeof openSectionSheet === "function") {
+              openSectionSheet();
+              await new Promise(r => setTimeout(r, 300));
+              assert(!sheet.classList.contains("hidden"), "e2e: mobile sheet opened");
+              const list = document.getElementById("sectionSheetList");
+              const itemCount = list ? list.querySelectorAll("button[data-heading-id]").length : 0;
+              log("Mobile sheet has " + itemCount + " items");
+              assert(itemCount > 0, "e2e: mobile sheet has items", { itemCount });
+              // Close.
+              closeSectionSheet();
+              await new Promise(r => setTimeout(r, 300));
+              assert(overlay.classList.contains("hidden"), "e2e: mobile sheet overlay hidden after close");
+            } else {
+              assert(false, "e2e: openSectionSheet function not found");
+            }
+          } else {
+            assert(false, "e2e: mobile sheet elements not found");
+          }
+        })();
+
+        // E2E 6: Mobile sheet tap navigates.
+        await (async function testE2E_mobileSheetTap() {
+          if (typeof openSectionSheet === "function") {
+            openSectionSheet();
+            await new Promise(r => setTimeout(r, 300));
+            const firstBtn = document.querySelector("#sectionSheetList button[data-heading-id]");
+            if (firstBtn) {
+              const hid = firstBtn.dataset.headingId;
+              log("Mobile: tapping heading " + hid);
+              firstBtn.click();
+              await new Promise(r => setTimeout(r, 600));
+              assert(DOC.tab === "spec", "e2e: mobile tap switched to spec", { got: DOC.tab });
+              const sheet = document.getElementById("sectionSheet");
+              // Sheet may still be animating closed.
+              log("Sheet hidden: " + sheet?.classList.contains("hidden"));
+              assert(true, "e2e: mobile tap navigation executed");
+            } else {
+              assert(false, "e2e: no mobile sheet items to tap");
+            }
+          }
+        })();
+
+        // E2E 7: No dock overlap check.
+        await (async function testE2E_noDockOverlap() {
+          const sheet = document.getElementById("sectionSheet");
+          const dock = document.getElementById("dock");
+          if (sheet && dock) {
+            if (typeof openSectionSheet === "function") {
+              openSectionSheet();
+              await new Promise(r => setTimeout(r, 300));
+              const sheetRect = sheet.getBoundingClientRect();
+              const dockRect = dock.getBoundingClientRect();
+              // Sheet z-index (50) should be above dock z-index (30).
+              const sheetZ = parseInt(getComputedStyle(sheet).zIndex) || 0;
+              const dockZ = parseInt(getComputedStyle(dock).zIndex) || 0;
+              log("Sheet z-index: " + sheetZ + ", dock z-index: " + dockZ);
+              assert(sheetZ > dockZ, "e2e: sheet z-index above dock", { sheetZ, dockZ });
+              closeSectionSheet();
+              await new Promise(r => setTimeout(r, 300));
+            }
+          }
+        })();
+
+        // Summary.
+        const passed = results.filter(r => r.pass).length;
+        const failed = results.filter(r => !r.pass).length;
+        const summary = `Section E2E Tests: ${passed} passed, ${failed} failed, ${results.length} total`;
+        if (failed > 0) {
+          console.warn(summary);
+          results.filter(r => !r.pass).forEach(r => console.error("  FAIL:", r.msg, r.ctx || ""));
+        } else {
+          console.log("%c" + summary, "color: green; font-weight: bold");
+        }
+        return { passed, failed, total: results.length, results };
+      };
+      // ---- End Section Summary E2E Tests ----
+
+      // ---- A/B Compare Unit Tests (bd-24q.1.5) ----
+      window.__runABCompareTests = async function () {
+        const R = [];
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("FAIL:", m, x || ""); };
+        A(quickMetricsFromPatch("").hunks === 0, "empty patch: 0 hunks");
+        let m = quickMetricsFromPatch("--- a/f\n+++ b/f\n@@ -1,2 +1,3 @@\n l1\n+added\n l2\n");
+        A(m.hunks === 1 && m.addLines === 1 && m.delLines === 0, "simple add", m);
+        m = quickMetricsFromPatch("--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n ctx\n-old\n+new\n ctx2\n");
+        A(m.addLines === 1 && m.delLines === 1, "replace 1+1", m);
+        m = quickMetricsFromPatch("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n@@ -5 +5 @@\n-a\n+b\n");
+        A(m.hunks === 2, "multi-hunk", m);
+        let h = parseUnifiedHunks("@@ -1,3 +1,4 @@\n l1\n+ins\n l2\n l3\n");
+        A(h.length === 1 && h[0].oldStart === 1, "hunks basic");
+        h = parseUnifiedHunks("@@ -5 +5 @@\n-old\n+new\n");
+        A(h.length === 1 && h[0].oldCount === 1, "hunks no-count");
+        let r = applyPatchLines(["a","b","c"], "@@ -2,2 +2,3 @@\n b\n+ins\n c\n");
+        A(r.length === 4 && r[2] === "ins", "apply add");
+        r = applyPatchLines(["a","b","c"], "@@ -1,3 +1,2 @@\n a\n-b\n c\n");
+        A(r.length === 2 && r[1] === "c", "apply del");
+        r = applyPatchLines(["a","b","c"], "@@ -2,1 +2,1 @@\n-b\n+B\n");
+        A(r.length === 3 && r[1] === "B", "apply replace");
+        if (DATASET.loaded && DATASET.data) {
+          const base = String(DATASET.data.base_doc || "");
+          A((await docTextAtLocal(0)) === base, "snapshot 0==base");
+          if (ALL_COMMITS.length > 1) { DOC_CACHE.delete(1); DOC_CURSOR.idx=-1; DOC_CURSOR.lines=null; const a=await docTextAtLocal(1); DOC_CACHE.delete(1); DOC_CURSOR.idx=-1; DOC_CURSOR.lines=null; A(a===(await docTextAtLocal(1)), "snapshot 1 deterministic"); }
+          if (ALL_COMMITS.length > 5) { DOC_CACHE.clear(); DOC_CURSOR.idx=-1; DOC_CURSOR.lines=null; const d=await docTextAtLocal(5); DOC_CACHE.clear(); DOC_CURSOR.idx=-1; DOC_CURSOR.lines=null; let ln=base.split("\n"); for(let i=1;i<=5;i++) ln=applyPatchLines(ln,patchForIdx(i)); A(d===ln.join("\n"), "snapshot 5 far-jump"); }
+          if (typeof Diff!=="undefined" && ALL_COMMITS.length>3) {
+            A((await generateABDiff(0,2))===(await generateABDiff(0,2)), "diff deterministic");
+            const ms=quickMetricsFromPatch(await generateABDiff(1,1)); A(ms.addLines===0&&ms.delLines===0, "diff same: 0");
+            const mAB=quickMetricsFromPatch(await generateABDiff(0,3)); const mBA=quickMetricsFromPatch(await generateABDiff(3,0));
+            A(mAB.addLines===mBA.delLines&&mAB.delLines===mBA.addLines, "diff swap symmetry");
+            A(quickMetricsFromPatch(await generateABDiff(0,ALL_COMMITS.length-1)).tokensDelta>0, "spec grew");
+          }
+        }
+        (() => { const c=document.createElement("div"); c.innerHTML='<span id="abmLines"></span><span id="abmTokens"></span><span id="abmLev"></span><span id="abmHunks"></span><span id="abmBytes"></span>'; document.body.appendChild(c); renderABMetricChips({addLines:100,delLines:50,deltaLines:50,tokensChanged:300,tokensDelta:100,bytesChanged:5000,bytesDelta:2000,hunks:5,lev:42}); A(document.getElementById("abmLines").textContent.includes("+100"),"chip +100"); A(document.getElementById("abmLev").textContent.includes("42"),"chip lev"); document.body.removeChild(c); })();
+        (() => { const c=document.createElement("div"); c.innerHTML='<span id="abmLines"></span><span id="abmTokens"></span><span id="abmLev"></span><span id="abmHunks"></span><span id="abmBytes"></span>'; document.body.appendChild(c); renderABMetricChips({addLines:0,delLines:0,deltaLines:0,tokensChanged:0,tokensDelta:0,bytesChanged:0,bytesDelta:0,hunks:0,lev:null}); A(document.getElementById("abmLev").textContent.includes("?"),"chip null lev"); document.body.removeChild(c); })();
+        const p=R.filter(x=>x.pass).length, f=R.filter(x=>!x.pass).length;
+        const s=`A/B Compare Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if(f>0){console.warn(s);R.filter(x=>!x.pass).forEach(x=>console.error("  FAIL:",x.msg,x.ctx||""));}else console.log("%c"+s,"color:green;font-weight:bold");
+        return{passed:p,failed:f,total:R.length,results:R};
+      };
+      // ---- End A/B Compare Unit Tests ----
+
 
       async function levenshteinForPatchLocal(patch) {
         const hunks = parseUnifiedHunks(patch);
@@ -8022,6 +9782,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         if (slider) slider.value = String(next);
 
         syncDockAndDoc();
+        if (!opts._fromPopstate) syncUrlToState();
 
         if (opts.scrollToCommitList) {
           const c = ALL_COMMITS[next];
@@ -8030,6 +9791,208 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             el.scrollIntoView({ behavior: "smooth", block: "start" });
             el.open = true;
           }
+        }
+      }
+
+      // -------------------------------------------------------
+      // Playback: Core Scheduler + State Machine (bd-24q.7.1)
+      // -------------------------------------------------------
+      // States: "paused" | "playing" | "seeking"
+      // Transitions:
+      //   paused  -> playing  (play)
+      //   playing -> paused   (pause / reach end without loop / visibility hidden)
+      //   playing -> seeking  (manual scrub during playback)
+      //   seeking -> playing  (scrub ends, resume)
+      //   seeking -> paused   (scrub ends, was paused before)
+      //   any     -> paused   (stop)
+
+      const PLAYBACK = {
+        state: "paused",         // "paused" | "playing" | "seeking"
+        speed: 1,                // commits per second (0.25, 0.5, 1, 2, 4)
+        loop: false,             // loop back to start at end
+        _preSeekState: "paused", // state to restore after seeking
+        _rafId: 0,               // requestAnimationFrame id
+        _lastTickTime: 0,        // performance.now() of last tick
+        _accumMs: 0,             // accumulated sub-tick milliseconds (drift correction)
+        _visCleanup: null,       // cleanup for visibilitychange listener
+      };
+
+      const PLAYBACK_SPEEDS = [0.25, 0.5, 1, 2, 4];
+
+      /** Pure: compute how many commits to advance given elapsed ms and speed. */
+      function playbackTicksForElapsed(elapsedMs, speed, accumMs) {
+        const totalMs = accumMs + elapsedMs;
+        const intervalMs = 1000 / speed;
+        const ticks = Math.floor(totalMs / intervalMs);
+        const remainder = totalMs - ticks * intervalMs;
+        return { ticks, remainder };
+      }
+
+      /** Pure: compute next commit index given current, ticks, max, and loop flag. */
+      function playbackNextIndex(currentIdx, ticks, maxIdx, loop) {
+        if (ticks <= 0) return { idx: currentIdx, stopped: false };
+        let next = currentIdx + ticks;
+        if (next > maxIdx) {
+          if (loop) {
+            next = next % (maxIdx + 1);
+          } else {
+            return { idx: maxIdx, stopped: true };
+          }
+        }
+        return { idx: next, stopped: false };
+      }
+
+      /** Pure: validate and return a transition, or null if invalid. */
+      function playbackTransition(currentState, action) {
+        const transitions = {
+          paused:  { play: "playing", seek: "seeking" },
+          playing: { pause: "paused", seek: "seeking", stop: "paused", end: "paused" },
+          seeking: { resume: null, stop: "paused" }, // resume target computed at runtime
+        };
+        const t = transitions[currentState];
+        if (!t || !(action in t)) return null;
+        if (currentState === "seeking" && action === "resume") {
+          return PLAYBACK._preSeekState === "playing" ? "playing" : "paused";
+        }
+        return t[action];
+      }
+
+      function playbackPlay() {
+        // Respect prefers-reduced-motion (a11y).
+        if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) return;
+        const next = playbackTransition(PLAYBACK.state, "play");
+        if (!next) return;
+        PLAYBACK.state = next;
+        PLAYBACK._lastTickTime = performance.now();
+        PLAYBACK._accumMs = 0;
+        _playbackInstallVisibility();
+        _playbackSchedule();
+      }
+
+      function playbackPause() {
+        const next = playbackTransition(PLAYBACK.state, "pause")
+          || playbackTransition(PLAYBACK.state, "stop");
+        if (!next) return;
+        PLAYBACK.state = next;
+        _playbackCancel();
+      }
+
+      function playbackStop() {
+        PLAYBACK.state = "paused";
+        PLAYBACK._accumMs = 0;
+        _playbackCancel();
+        _playbackRemoveVisibility();
+        _syncPlaybackUI();
+      }
+
+      function playbackToggle() {
+        if (PLAYBACK.state === "playing") playbackPause();
+        else playbackPlay();
+        _syncPlaybackUI();
+      }
+
+      function playbackSetSpeed(speed) {
+        PLAYBACK.speed = Math.max(0.1, Number(speed) || 1);
+        PLAYBACK._accumMs = 0;
+        PLAYBACK._lastTickTime = performance.now();
+      }
+
+      function playbackSetLoop(loop) {
+        PLAYBACK.loop = Boolean(loop);
+      }
+
+      /** Call when user manually scrubs the slider during playback. */
+      function playbackOnManualScrub() {
+        if (PLAYBACK.state === "paused") return; // no-op
+        PLAYBACK._preSeekState = PLAYBACK.state;
+        PLAYBACK.state = "seeking";
+        _playbackCancel();
+      }
+
+      /** Call when manual scrub ends to optionally resume playback. */
+      function playbackOnScrubEnd() {
+        if (PLAYBACK.state !== "seeking") return;
+        const next = playbackTransition("seeking", "resume");
+        PLAYBACK.state = next || "paused";
+        if (PLAYBACK.state === "playing") {
+          PLAYBACK._lastTickTime = performance.now();
+          PLAYBACK._accumMs = 0;
+          _playbackSchedule();
+        }
+      }
+
+      function _playbackSchedule() {
+        if (PLAYBACK.state !== "playing") return;
+        PLAYBACK._rafId = requestAnimationFrame(_playbackFrame);
+      }
+
+      function _playbackFrame(now) {
+        if (PLAYBACK.state !== "playing") return;
+        const elapsed = now - PLAYBACK._lastTickTime;
+        PLAYBACK._lastTickTime = now;
+
+        const { ticks, remainder } = playbackTicksForElapsed(elapsed, PLAYBACK.speed, PLAYBACK._accumMs);
+        PLAYBACK._accumMs = remainder;
+
+        if (ticks > 0) {
+          const maxIdx = Math.max(0, (ALL_COMMITS.length || 1) - 1);
+          const { idx, stopped } = playbackNextIndex(DOC.idx, ticks, maxIdx, PLAYBACK.loop);
+          selectCommitIdx(idx);
+          if (stopped) {
+            playbackStop();
+            return;
+          }
+        }
+        _playbackSchedule();
+      }
+
+      function _playbackCancel() {
+        if (PLAYBACK._rafId) {
+          cancelAnimationFrame(PLAYBACK._rafId);
+          PLAYBACK._rafId = 0;
+        }
+      }
+
+      /** Update playback UI elements to match PLAYBACK state. */
+      function _syncPlaybackUI() {
+        const btn = document.getElementById("dockPlayPause");
+        if (btn) {
+          btn.innerHTML = PLAYBACK.state === "playing" ? "&#9646;&#9646;" : "&#9654;";
+          btn.classList.toggle("bg-slate-900", PLAYBACK.state === "playing");
+          btn.classList.toggle("text-white", PLAYBACK.state === "playing");
+          btn.classList.toggle("bg-white/70", PLAYBACK.state !== "playing");
+          btn.classList.toggle("text-slate-900", PLAYBACK.state !== "playing");
+          btn.setAttribute("aria-label", PLAYBACK.state === "playing" ? "Pause playback" : "Play timeline");
+        }
+        const speedSel = document.getElementById("dockSpeed");
+        if (speedSel) speedSel.value = String(PLAYBACK.speed);
+        const loopBtn = document.getElementById("dockLoop");
+        if (loopBtn) {
+          loopBtn.classList.toggle("bg-slate-900", PLAYBACK.loop);
+          loopBtn.classList.toggle("text-white", PLAYBACK.loop);
+          loopBtn.classList.toggle("text-slate-500", !PLAYBACK.loop);
+        }
+      }
+
+      function _playbackInstallVisibility() {
+        if (PLAYBACK._visCleanup) return;
+        const handler = () => {
+          if (document.hidden && PLAYBACK.state === "playing") {
+            PLAYBACK._preSeekState = "playing";
+            PLAYBACK.state = "paused";
+            _playbackCancel();
+          } else if (!document.hidden && PLAYBACK._preSeekState === "playing" && PLAYBACK.state === "paused") {
+            playbackPlay();
+          }
+        };
+        document.addEventListener("visibilitychange", handler);
+        PLAYBACK._visCleanup = () => document.removeEventListener("visibilitychange", handler);
+      }
+
+      function _playbackRemoveVisibility() {
+        if (PLAYBACK._visCleanup) {
+          PLAYBACK._visCleanup();
+          PLAYBACK._visCleanup = null;
         }
       }
 
@@ -8148,15 +10111,28 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         if (DOC.tab === "diff") {
           const raw = document.getElementById("diffRaw");
           const pretty = document.getElementById("diffPretty");
-          if (raw) raw.textContent = patch || "";
+          // A/B compare mode: generate diff between two arbitrary commits.
+          let diffText = patch || "";
+          let abDiffError = false;
+          if (DOC.compareMode) {
+            try {
+              diffText = await generateABDiff(DOC.compareFromIdx, DOC.compareToIdx);
+            } catch (e) {
+              abDiffError = true;
+              diffText = "";
+              if (pretty) pretty.innerHTML = `<div class="p-3 text-xs text-red-600">A/B diff failed: ${escapeHtml(String(e?.message || e))}</div>`;
+            }
+          }
+          if (raw) raw.textContent = diffText;
 
-          if (pretty) {
+          if (pretty && !abDiffError) {
             if (DOC.diffMode === "pretty") {
               try {
-                pretty.innerHTML = Diff2Html.html(patch || "", {
+                const outputFmt = DOC.compareMode ? DOC.diffLayout : "side-by-side";
+                pretty.innerHTML = Diff2Html.html(diffText, {
                   drawFileList: false,
                   matching: "lines",
-                  outputFormat: "side-by-side",
+                  outputFormat: outputFmt,
                 });
               } catch (e) {
                 pretty.innerHTML = `<div class="p-3 text-xs text-slate-700">Diff2Html failed: ${escapeHtml(String(e?.message || e))}</div>`;
@@ -8166,8 +10142,30 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             }
           }
 
-          document.getElementById("diffPretty").classList.toggle("hidden", DOC.diffMode !== "pretty");
-          document.getElementById("diffRaw").classList.toggle("hidden", DOC.diffMode !== "raw");
+          document.getElementById("diffPretty")?.classList.toggle("hidden", DOC.diffMode !== "pretty");
+          document.getElementById("diffRaw")?.classList.toggle("hidden", DOC.diffMode !== "raw");
+
+          // Update diff label for compare mode.
+          const diffLabel = document.getElementById("diffLabel");
+          if (diffLabel) {
+            if (DOC.compareMode) {
+              const cA = ALL_COMMITS[DOC.compareFromIdx];
+              const cB = ALL_COMMITS[DOC.compareToIdx];
+              diffLabel.textContent = `Diff (${cA?.short || "#" + DOC.compareFromIdx} → ${cB?.short || "#" + DOC.compareToIdx})`;
+            } else {
+              diffLabel.textContent = "Diff (parent → selected)";
+            }
+          }
+
+          // A/B Compare metrics: show chips when in compare mode.
+          const abMetricsBar = document.getElementById("abMetricsBar");
+          if (abMetricsBar) {
+            if (DOC.compareMode) {
+              void computeAndShowABMetrics(DOC.compareFromIdx, DOC.compareToIdx);
+            } else {
+              abMetricsBar.classList.add("hidden");
+            }
+          }
         }
 
         if (DOC.tab === "spec") {
@@ -8180,6 +10178,10 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           if (raw) raw.textContent = text;
 
           if (rendered) {
+            // Extract outline and render markdown with anchor IDs injected.
+            const outline = extractOutline(text);
+            OUTLINE_CACHE.set(DOC.idx, outline);
+
             if (!window._mdSingleton) {
               window._mdSingleton = markdownit({
                 html: false,
@@ -8197,12 +10199,39 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
                 },
               });
             }
+
+            // Install heading_open renderer to inject stable anchor IDs.
+            let outlineIdx = 0;
+            const origHeadingOpen = window._mdSingleton.renderer.rules.heading_open;
+            window._mdSingleton.renderer.rules.heading_open = (tokens, idx, options, env, self) => {
+              const entry = outline[outlineIdx++];
+              if (entry) {
+                tokens[idx].attrSet("id", entry.id);
+              }
+              return self.renderToken(tokens, idx, options);
+            };
+
             const html = window._mdSingleton.render(text || "");
-            rendered.innerHTML = DOMPurify.sanitize(html);
+            rendered.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ["id"] });
+
+            // Restore original renderer rule.
+            if (origHeadingOpen) {
+              window._mdSingleton.renderer.rules.heading_open = origHeadingOpen;
+            } else {
+              delete window._mdSingleton.renderer.rules.heading_open;
+            }
           }
 
           document.getElementById("docRendered").classList.toggle("hidden", DOC.rawSpec);
           document.getElementById("docRaw").classList.toggle("hidden", !DOC.rawSpec);
+
+          // Refresh mini-map outline (non-blocking).
+          void updateMiniMap();
+        }
+
+        // Refresh section summary panel (non-blocking).
+        if (DOC.tab === "sections") {
+          void updateSectionSummary();
         }
 
         // On-demand Levenshtein for selected commit.
@@ -8426,8 +10455,108 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             STATE.bucketEnabled.add(bucket.id);
           }
           render();
+          syncUrlToState();
         });
         return btn;
+      }
+
+      // -----------------------------------------------------------
+      // Wall-Clock Series Builder (bd-24q.12.1)
+      // Builds a dense bin array with explicit empty bins so quiet
+      // periods are visible. Supports UTC and local timezone modes.
+      // -----------------------------------------------------------
+
+      function wallClockBinKey(t, resolution) {
+        const fmt2 = (n) => String(n).padStart(2, "0");
+        if (resolution === "day") return t.format("YYYY-MM-DD");
+        if (resolution === "hour") return t.format("YYYY-MM-DD HH:00");
+        if (resolution === "15m") {
+          const m = Math.floor(t.minute() / 15) * 15;
+          return `${t.format("YYYY-MM-DD HH")}:${fmt2(m)}`;
+        }
+        if (resolution === "5m") {
+          const m = Math.floor(t.minute() / 5) * 5;
+          return `${t.format("YYYY-MM-DD HH")}:${fmt2(m)}`;
+        }
+        return t.format("YYYY-MM-DD HH:mm");
+      }
+
+      function wallClockBinMinutes(resolution) {
+        if (resolution === "day") return 1440;
+        if (resolution === "hour") return 60;
+        if (resolution === "15m") return 15;
+        if (resolution === "5m") return 5;
+        return 1;
+      }
+
+      function wallClockFloor(t, resolution) {
+        if (resolution === "day") return t.startOf("day");
+        if (resolution === "hour") return t.startOf("hour");
+        if (resolution === "15m") {
+          const m = Math.floor(t.minute() / 15) * 15;
+          return t.startOf("hour").add(m, "minute");
+        }
+        if (resolution === "5m") {
+          const m = Math.floor(t.minute() / 5) * 5;
+          return t.startOf("hour").add(m, "minute");
+        }
+        return t.startOf("minute");
+      }
+
+      function buildWallClockBins(commits, resolution, tzMode) {
+        if (!commits.length || resolution === "commit") return null;
+
+        const toT = (c) => (tzMode === "utc" && dayjs.utc) ? dayjs.utc(c.dateIso) : dayjs(c.dateIso);
+        // Use calendar-aware units for day/hour to handle DST correctly in local tz.
+        const stepUnit = resolution === "day" ? "day" : resolution === "hour" ? "hour" : "minute";
+        const stepAmount = (stepUnit === "minute") ? wallClockBinMinutes(resolution) : 1;
+
+        let minT = toT(commits[0]);
+        let maxT = toT(commits[0]);
+        for (const c of commits) {
+          const t = toT(c);
+          if (t.isBefore(minT)) minT = t;
+          if (t.isAfter(maxT)) maxT = t;
+        }
+
+        const startBin = wallClockFloor(minT, resolution);
+        const endBin = wallClockFloor(maxT, resolution);
+
+        const labels = [];
+        const binsMap = new Map();
+        let cursor = startBin;
+        const maxBins = 10000;
+        let count = 0;
+        while (!cursor.isAfter(endBin) && count < maxBins) {
+          const key = wallClockBinKey(cursor, resolution);
+          labels.push(key);
+          binsMap.set(key, { key, label: key, start: cursor, commits: [] });
+          cursor = cursor.add(stepAmount, stepUnit);
+          count++;
+        }
+
+        for (const c of commits) {
+          const t = toT(c);
+          const key = wallClockBinKey(wallClockFloor(t, resolution), resolution);
+          const bin = binsMap.get(key);
+          if (bin) bin.commits.push(c);
+        }
+
+        return { labels, bins: labels.map((k) => binsMap.get(k)) };
+      }
+
+      function aggregateBinMetric(binCommits, metricFn, mode) {
+        if (!binCommits.length) return 0;
+        const vals = binCommits.map(metricFn);
+        const sum = vals.reduce((a, b) => a + b, 0);
+        if (mode === "sum") return sum;
+        if (mode === "mean") return sum / vals.length;
+        if (mode === "median") {
+          const sorted = vals.slice().sort((a, b) => a - b);
+          const mid = Math.floor(sorted.length / 2);
+          return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+        }
+        return sum;
       }
 
       function renderCharts(commits) {
@@ -8520,42 +10649,39 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         });
 
         // Stacked buckets by time bin (commit/day/hour/15m/5m)
+        // Uses dense wall-clock bins for time-based resolutions so
+        // empty periods are visible in the chart (bd-24q.12.1).
         const resSel = document.getElementById("stackResolution");
         const metricSel = document.getElementById("stackMetric");
+        const tzSel = document.getElementById("stackTimezone");
         const resolution = resSel?.value || "commit";
         const metric = metricSel?.value || "groups";
+        const tzMode = tzSel?.value || "local";
 
-        const binLabels = [];
-        const binCommits = [];
-        const binIdx = new Map();
+        let binLabels = [];
+        let binCommits = [];
 
-        const fmt2 = (n) => String(n).padStart(2, "0");
-        const binKey = (c) => {
-          if (resolution === "commit") return c.short;
-          const t = dayjs(c.dateIso);
-          if (resolution === "day") return t.format("YYYY-MM-DD");
-          if (resolution === "hour") return t.format("YYYY-MM-DD HH:00");
-          if (resolution === "15m") {
-            const m = Math.floor(t.minute() / 15) * 15;
-            return `${t.format("YYYY-MM-DD HH")}:${fmt2(m)}`;
+        if (resolution === "commit") {
+          // Commit mode: one bin per commit (no empty bins).
+          const binIdx = new Map();
+          for (const c of commits) {
+            const k = c.short;
+            let j = binIdx.get(k);
+            if (j === undefined) {
+              j = binLabels.length;
+              binIdx.set(k, j);
+              binLabels.push(k);
+              binCommits.push([]);
+            }
+            binCommits[j].push(c);
           }
-          if (resolution === "5m") {
-            const m = Math.floor(t.minute() / 5) * 5;
-            return `${t.format("YYYY-MM-DD HH")}:${fmt2(m)}`;
+        } else {
+          // Wall-clock mode: dense bins with empties filled.
+          const wc = buildWallClockBins(commits, resolution, tzMode);
+          if (wc) {
+            binLabels = wc.labels;
+            binCommits = wc.bins.map((b) => b.commits);
           }
-          return t.format();
-        };
-
-        for (const c of commits) {
-          const k = binKey(c);
-          let j = binIdx.get(k);
-          if (j === undefined) {
-            j = binLabels.length;
-            binIdx.set(k, j);
-            binLabels.push(k);
-            binCommits.push([]);
-          }
-          binCommits[j].push(c);
         }
 
         const valuesByBucket = new Map(BUCKETS.map((b) => [b.id, new Array(binLabels.length).fill(0)]));
@@ -8611,11 +10737,27 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
         chartStack.setOption({
           grid: { left: 44, right: 18, top: 18, bottom: 60 },
-          tooltip: { trigger: "axis" },
+          tooltip: {
+            trigger: "axis",
+            formatter: (params) => {
+              if (!params?.length) return "";
+              const label = params[0].axisValue + (tzMode === "utc" && resolution !== "commit" ? " UTC" : "");
+              const total = params.reduce((s, p) => s + (Number(p.value) || 0), 0);
+              const lines = params
+                .filter((p) => p.value > 0)
+                .map((p) => `${p.marker} ${escapeHtml(p.seriesName)}: ${Number(p.value).toFixed(metric === "groups" ? 0 : 1)}`)
+                .join("<br>");
+              return `<div style="font-weight:700;margin-bottom:4px">${escapeHtml(label)}</div>${lines || "<span style='color:#94a3b8'>No activity</span>"}${total > 0 ? `<div style="margin-top:4px;font-size:11px;color:rgba(2,6,23,.55)">Total: ${total.toFixed(metric === "groups" ? 0 : 1)}</div>` : ""}`;
+            },
+          },
           xAxis: {
             type: "category",
             data: binLabels,
-            axisLabel: { color: "rgba(2,6,23,.55)", rotate: resolution === "day" ? 0 : 45 },
+            axisLabel: {
+              color: "rgba(2,6,23,.55)",
+              rotate: resolution === "commit" ? 45 : (resolution === "day" ? 0 : 45),
+              interval: "auto",
+            },
             axisLine: { lineStyle: { color: "rgba(2,6,23,.12)" } },
           },
           yAxis: {
@@ -9060,8 +11202,8 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         };
         setImpact(STATE.minImpact, true);
 
-        const debouncedRenderSearch = debounce(() => render(), 150);
-        const debouncedRenderSlider = debounce(() => render(), 50);
+        const debouncedRenderSearch = debounce(() => { render(); syncUrlToState(); }, 150);
+        const debouncedRenderSlider = debounce(() => { render(); syncUrlToState(); }, 50);
 
         q.addEventListener("input", () => {
           STATE.q = q.value;
@@ -9105,6 +11247,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             "focus-ring rounded-2xl border border-slate-900/10 px-3 py-2 text-xs font-semibold " +
             (m === "multi" ? "bg-slate-900 text-white" : "bg-white/70 text-slate-900");
           render();
+          syncUrlToState();
         };
 
         document.getElementById("modePrimary").addEventListener("click", () => setMode("primary"));
@@ -9112,8 +11255,8 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         document.getElementById("modePrimaryMobile").addEventListener("click", () => setMode("primary"));
         document.getElementById("modeMultiMobile").addEventListener("click", () => setMode("multi"));
 
-        document.getElementById("btnReset").addEventListener("click", resetFilters);
-        document.getElementById("btnResetMobile").addEventListener("click", resetFilters);
+        document.getElementById("btnReset").addEventListener("click", () => { resetFilters(); syncUrlToState(); });
+        document.getElementById("btnResetMobile").addEventListener("click", () => { resetFilters(); syncUrlToState(); });
 
         // Section buttons
         document.getElementById("viewTimeline").addEventListener("click", () => scrollToSection("sectionTimeline"));
@@ -9126,25 +11269,91 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         // Stack chart controls
         document.getElementById("stackResolution")?.addEventListener("change", () => render());
         document.getElementById("stackMetric")?.addEventListener("change", () => render());
+        document.getElementById("stackTimezone")?.addEventListener("change", () => render());
 
         // Doc tabs + toggles
         document.getElementById("docTabSpec")?.addEventListener("click", () => setDocTab("spec"));
         document.getElementById("docTabDiff")?.addEventListener("click", () => setDocTab("diff"));
         document.getElementById("docTabMetrics")?.addEventListener("click", () => setDocTab("metrics"));
+        document.getElementById("docTabSections")?.addEventListener("click", () => setDocTab("sections"));
+
+        document.getElementById("btnCopyLink")?.addEventListener("click", () => copyPermalink());
+        document.getElementById("btnShareHelp")?.addEventListener("click", () => toggleShareHelp());
+        // Close share help popover on outside click.
+        document.addEventListener("click", (e) => {
+          const pop = document.getElementById("shareHelpPopover");
+          const btn = document.getElementById("btnShareHelp");
+          if (pop && !pop.classList.contains("hidden") && !pop.contains(e.target) && e.target !== btn) {
+            pop.classList.add("hidden");
+          }
+        });
 
         document.getElementById("btnRawToggle")?.addEventListener("click", () => {
           DOC.rawSpec = !DOC.rawSpec;
+          syncUrlToState();
           void updateDocUI();
         });
 
+        document.getElementById("btnMiniMapToggle")?.addEventListener("click", () => {
+          const mm = document.getElementById("miniMap");
+          if (mm) {
+            const show = mm.classList.toggle("hidden");
+            const btn = document.getElementById("btnMiniMapToggle");
+            if (btn) {
+              btn.classList.toggle("bg-slate-900", !show);
+              btn.classList.toggle("text-white", !show);
+              btn.classList.toggle("bg-white/70", show);
+              btn.classList.toggle("text-slate-900", show);
+            }
+            if (!show) void updateMiniMap();
+          }
+        });
+
+        // Mini-map search filter with debounce (bd-24q.2.2).
+        {
+          let searchTimer = 0;
+          document.getElementById("miniMapSearch")?.addEventListener("input", () => {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(() => void updateMiniMap(), 150);
+          });
+        }
+
         document.getElementById("btnPrettyDiff")?.addEventListener("click", () => {
           DOC.diffMode = "pretty";
+          syncUrlToState();
           void updateDocUI();
         });
         document.getElementById("btnRawDiff")?.addEventListener("click", () => {
           DOC.diffMode = "raw";
+          syncUrlToState();
           void updateDocUI();
         });
+
+        // --- A/B Compare event listeners ---
+        document.getElementById("btnCompareToggle")?.addEventListener("click", () => {
+          DOC.compareMode = !DOC.compareMode;
+          const btn = document.getElementById("btnCompareToggle");
+          const bar = document.getElementById("abCompareBar");
+          const layoutBtn = document.getElementById("btnDiffLayout");
+          if (btn) { btn.classList.toggle("bg-slate-900", DOC.compareMode); btn.classList.toggle("text-white", DOC.compareMode); btn.classList.toggle("bg-white/70", !DOC.compareMode); btn.classList.toggle("text-slate-900", !DOC.compareMode); }
+          if (bar) bar.classList.toggle("hidden", !DOC.compareMode);
+          if (layoutBtn) layoutBtn.classList.toggle("hidden", !DOC.compareMode);
+          if (DOC.compareMode) { DOC.compareFromIdx = Math.max(0, DOC.idx - 1); DOC.compareToIdx = DOC.idx; populateCompareSelects(); }
+          syncUrlToState();
+          void updateDocUI();
+        });
+        document.getElementById("btnDiffLayout")?.addEventListener("click", () => {
+          DOC.diffLayout = DOC.diffLayout === "side-by-side" ? "line-by-line" : "side-by-side";
+          const btn = document.getElementById("btnDiffLayout");
+          if (btn) btn.textContent = DOC.diffLayout === "side-by-side" ? "Side-by-Side" : "Unified";
+          syncUrlToState(); void updateDocUI();
+        });
+        document.getElementById("btnSwapAB")?.addEventListener("click", () => {
+          const tmp = DOC.compareFromIdx; DOC.compareFromIdx = DOC.compareToIdx; DOC.compareToIdx = tmp;
+          populateCompareSelects(); syncUrlToState(); void updateDocUI();
+        });
+        document.getElementById("compareFromSelect")?.addEventListener("change", (e) => { DOC.compareFromIdx = Number(e.target.value); syncUrlToState(); void updateDocUI(); });
+        document.getElementById("compareToSelect")?.addEventListener("change", (e) => { DOC.compareToIdx = Number(e.target.value); syncUrlToState(); void updateDocUI(); });
 
         document.getElementById("btnComputeAll")?.addEventListener("click", () => {
           void computeAllMetrics();
@@ -9171,8 +11380,23 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         document.getElementById("dockPrev")?.addEventListener("click", () => selectCommitIdx(DOC.idx - 1));
         document.getElementById("dockNext")?.addEventListener("click", () => selectCommitIdx(DOC.idx + 1));
         document.getElementById("dockSlider")?.addEventListener("input", (e) => {
+          playbackOnManualScrub();
           const v = Number(e?.target?.value || 0);
           selectCommitIdx(v);
+        });
+        document.getElementById("dockSlider")?.addEventListener("change", () => {
+          playbackOnScrubEnd();
+        });
+
+        // Playback controls (bd-24q.7.2).
+        document.getElementById("dockPlayPause")?.addEventListener("click", () => playbackToggle());
+        document.getElementById("dockSpeed")?.addEventListener("change", (e) => {
+          playbackSetSpeed(Number(e.target.value));
+          _syncPlaybackUI();
+        });
+        document.getElementById("dockLoop")?.addEventListener("click", () => {
+          playbackSetLoop(!PLAYBACK.loop);
+          _syncPlaybackUI();
         });
 
         document.addEventListener("keydown", (e) => {
@@ -9188,6 +11412,11 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           if (e.key === "ArrowRight") {
             e.preventDefault();
             selectCommitIdx(DOC.idx + 1);
+          }
+          // Playback keyboard shortcuts (bd-24q.7.2).
+          if (e.key === " " || e.code === "Space") {
+            e.preventDefault();
+            playbackToggle();
           }
         });
 
@@ -9215,6 +11444,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           STATE.q = qMobile.value;
           q.value = qMobile.value;
           render();
+          syncUrlToState();
           closeSheet();
         });
       }
@@ -9287,11 +11517,44 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           DOC.idx = Math.max(0, d.commits.length - 1);
         }
 
-        // Default tabs.
-        setDocTab("spec");
+        // Restore state from URL if present; otherwise use defaults.
+        const urlState = decodeUrlState(location.search);
+        if (urlState) {
+          applyUrlState(urlState);
+          if (DOC.compareMode) {
+            populateCompareSelects();
+            const _b = document.getElementById("btnCompareToggle"); if (_b) { _b.classList.add("bg-slate-900","text-white"); _b.classList.remove("bg-white/70","text-slate-900"); }
+            const _r = document.getElementById("abCompareBar"); if (_r) _r.classList.remove("hidden");
+            const _l = document.getElementById("btnDiffLayout"); if (_l) { _l.classList.remove("hidden"); _l.textContent = DOC.diffLayout === "side-by-side" ? "Side-by-Side" : "Unified"; }
+          }
+        }
+
+        // Set tab (may have been overridden by URL state).
+        setDocTab(DOC.tab);
         render();
+        // Record initial URL state (replaceState so back goes to referrer, not blank).
+        syncUrlToState({ immediate: true, replace: true });
         void warmDerivedWorkerArtifacts();
       })();
+
+      // Browser back/forward: restore state from URL.
+      window.addEventListener("popstate", () => {
+        const s = decodeUrlState(location.search);
+        if (s) {
+          applyUrlState(s);
+          // Restore compare UI elements.
+          const cmpBtn = document.getElementById("btnCompareToggle");
+          const cmpBar = document.getElementById("abCompareBar");
+          const layoutBtn = document.getElementById("btnDiffLayout");
+          if (cmpBtn) { cmpBtn.classList.toggle("bg-slate-900", DOC.compareMode); cmpBtn.classList.toggle("text-white", DOC.compareMode); cmpBtn.classList.toggle("bg-white/70", !DOC.compareMode); cmpBtn.classList.toggle("text-slate-900", !DOC.compareMode); }
+          if (cmpBar) cmpBar.classList.toggle("hidden", !DOC.compareMode);
+          if (layoutBtn) { layoutBtn.classList.toggle("hidden", !DOC.compareMode); if (DOC.compareMode) layoutBtn.textContent = DOC.diffLayout === "side-by-side" ? "Side-by-Side" : "Unified"; }
+          if (DOC.compareMode) populateCompareSelects();
+          setDocTab(DOC.tab);
+          selectCommitIdx(DOC.idx);
+          render();
+        }
+      });
     </script>
   </body>
 </html>

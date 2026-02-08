@@ -47,6 +47,8 @@ fuzz/artifacts/
 
 # Source PNGs (webp versions are committed)
 *.png
+!og-image.png
+!twitter-image.png
 
 # Claude Code / AI agent ephemeral files
 .claude/
