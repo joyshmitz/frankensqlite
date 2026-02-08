@@ -21,6 +21,7 @@ pub use glossary::{
     TxnEpoch, TxnId, TxnSlot, TxnToken, VersionPointer, WitnessIndexSegment, WitnessKey,
     WriteWitness,
 };
+pub use value::SqliteValue;
 
 use std::fmt;
 use std::num::NonZeroU32;

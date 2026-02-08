@@ -220,6 +220,14 @@ pub enum FrankenError {
     /// Out of memory.
     #[error("out of memory")]
     OutOfMemory,
+
+    /// SQL function domain/runtime error (analogous to `sqlite3_result_error`).
+    #[error("{0}")]
+    FunctionError(String),
+
+    /// Attempt to write a read-only database or virtual table.
+    #[error("attempt to write a readonly database")]
+    ReadOnly,
 }
 
 /// SQLite result/error codes for wire protocol compatibility.
@@ -324,7 +332,8 @@ impl FrankenError {
             | Self::ExpressionTooDeep { .. }
             | Self::TooManyAttached { .. }
             | Self::TooManyArguments { .. }
-            | Self::NotImplemented(_) => ErrorCode::Error,
+            | Self::NotImplemented(_)
+            | Self::FunctionError(_) => ErrorCode::Error,
             Self::UniqueViolation { .. }
             | Self::NotNullViolation { .. }
             | Self::CheckViolation { .. }
@@ -344,6 +353,7 @@ impl FrankenError {
             Self::AuthDenied => ErrorCode::Auth,
             Self::OutOfMemory => ErrorCode::NoMem,
             Self::Unsupported => ErrorCode::NoLfs,
+            Self::ReadOnly => ErrorCode::ReadOnly,
         }
     }
 
@@ -426,6 +436,11 @@ impl FrankenError {
     /// Create a not-implemented error.
     pub fn not_implemented(feature: impl Into<String>) -> Self {
         Self::NotImplemented(feature.into())
+    }
+
+    /// Create a function domain error.
+    pub fn function_error(msg: impl Into<String>) -> Self {
+        Self::FunctionError(msg.into())
     }
 }
 
