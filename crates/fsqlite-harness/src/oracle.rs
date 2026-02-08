@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_vfs::host_fs;
 
 /// Bead identifier for log correlation.
 const BEAD_ID: &str = "bd-1daa";
@@ -782,7 +783,7 @@ pub struct FixtureReport {
 
 /// Load a fixture from a JSON file.
 pub fn load_fixture(path: &Path) -> Result<TestFixture> {
-    let bytes = std::fs::read(path).map_err(|err| {
+    let bytes = host_fs::read(path).map_err(|err| {
         FrankenError::Internal(format!("failed to read fixture {}: {err}", path.display()))
     })?;
     let fixture: TestFixture = serde_json::from_slice(&bytes).map_err(|err| {
@@ -800,14 +801,14 @@ pub fn load_fixtures_from_dir(dir: &Path) -> Result<Vec<TestFixture>> {
             dir.display()
         )));
     }
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
+    let mut entries: Vec<_> = host_fs::read_dir_paths(dir)
         .map_err(|err| FrankenError::Internal(format!("failed to read fixture directory: {err}")))?
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect();
-    entries.sort_by_key(std::fs::DirEntry::path);
+    entries.sort();
     for entry in entries {
-        fixtures.push(load_fixture(&entry.path())?);
+        fixtures.push(load_fixture(&entry)?);
     }
     info!(
         bead_id = BEAD_ID,
@@ -1532,10 +1533,10 @@ SELECT a FROM t1 ORDER BY a
     }
 
     #[test]
-    fn test_oracle_execution_simple() {
+    fn test_oracle_execution_simple() -> Result<()> {
         let Ok(sqlite3_path) = find_sqlite3_binary() else {
             eprintln!("skipping: sqlite3 binary not found");
-            return;
+            return Ok(());
         };
 
         let results = run_sqlite3_oracle(
@@ -1560,7 +1561,7 @@ SELECT a FROM t1 ORDER BY a
             "bead_id={TEST_BEAD_ID} CREATE TABLE"
         );
         assert_eq!(results[1], OpResult::Ok, "bead_id={TEST_BEAD_ID} INSERT");
-        if let OpResult::Rows { ref rows, .. } = results[2] {
+        if let OpResult::Rows { rows, .. } = &results[2] {
             assert_eq!(
                 rows.len(),
                 1,
@@ -1572,18 +1573,19 @@ SELECT a FROM t1 ORDER BY a
                 "bead_id={TEST_BEAD_ID} SELECT should return 2 columns"
             );
         } else {
-            panic!(
+            return Err(FrankenError::Internal(format!(
                 "bead_id={TEST_BEAD_ID} SELECT should return rows, got {:?}",
                 results[2]
-            );
+            )));
         }
+        Ok(())
     }
 
     #[test]
-    fn test_oracle_error_detection() {
+    fn test_oracle_error_detection() -> Result<()> {
         let Ok(sqlite3_path) = find_sqlite3_binary() else {
             eprintln!("skipping: sqlite3 binary not found");
-            return;
+            return Ok(());
         };
 
         let results = run_sqlite3_oracle(
@@ -1606,11 +1608,12 @@ SELECT a FROM t1 ORDER BY a
                 "bead_id={TEST_BEAD_ID} UNIQUE violation should be Constraint category"
             );
         } else {
-            panic!(
+            return Err(FrankenError::Internal(format!(
                 "bead_id={TEST_BEAD_ID} expected error for duplicate insert, got {:?}",
                 results[2]
-            );
+            )));
         }
+        Ok(())
     }
 
     #[test]

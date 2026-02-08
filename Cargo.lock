@@ -550,6 +550,7 @@ dependencies = [
  "fsqlite-pager",
  "fsqlite-types",
  "fsqlite-wal",
+ "nix",
  "parking_lot",
  "proptest",
  "serde",

@@ -7,11 +7,10 @@
 //! - optional engine artifacts (DB/WAL/SHM, oracle diffs, etc.)
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_vfs::host_fs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{error, info, warn};
@@ -72,7 +71,7 @@ pub struct ConformanceDiff {
 #[derive(Debug)]
 pub struct ReproBundle {
     root: PathBuf,
-    events_file: File,
+    events_path: PathBuf,
     next_step: u64,
 }
 
@@ -99,11 +98,11 @@ impl ReproBundle {
     }
 
     pub fn append_stdout(&self, text: &str) -> Result<()> {
-        append_line(self.root.join("stdout.log"), text)
+        append_line(&self.root.join("stdout.log"), text)
     }
 
     pub fn append_stderr(&self, text: &str) -> Result<()> {
-        append_line(self.root.join("stderr.log"), text)
+        append_line(&self.root.join("stderr.log"), text)
     }
 
     pub fn write_artifact_json<T: Serialize>(
@@ -113,11 +112,11 @@ impl ReproBundle {
     ) -> Result<PathBuf> {
         let artifact_path = self.root.join(relative_path);
         if let Some(parent) = artifact_path.parent() {
-            fs::create_dir_all(parent)?;
+            host_fs::create_dir_all(parent)?;
         }
         let bytes = serde_json::to_vec_pretty(value)
             .map_err(|err| internal_error(format!("failed to serialize artifact JSON: {err}")))?;
-        fs::write(&artifact_path, bytes)?;
+        host_fs::write(&artifact_path, bytes)?;
         Ok(artifact_path)
     }
 
@@ -142,7 +141,7 @@ impl ReproBundle {
         Ok(artifact_path)
     }
 
-    pub fn finish(mut self, status: RunStatus) -> Result<PathBuf> {
+    pub fn finish(self, status: RunStatus) -> Result<PathBuf> {
         let event = HarnessEvent {
             kind: LifecycleEventKind::RunEnd,
             status: Some(status),
@@ -151,7 +150,6 @@ impl ReproBundle {
             payload: BTreeMap::new(),
         };
         self.write_event_line(&event)?;
-        self.events_file.flush()?;
         info!(
             suite = %self.root.display(),
             status = ?status,
@@ -160,11 +158,10 @@ impl ReproBundle {
         Ok(self.root)
     }
 
-    fn write_event_line(&mut self, event: &HarnessEvent) -> Result<()> {
+    fn write_event_line(&self, event: &HarnessEvent) -> Result<()> {
         let encoded = serde_json::to_string(event)
             .map_err(|err| internal_error(format!("failed to serialize harness event: {err}")))?;
-        writeln!(self.events_file, "{encoded}")?;
-        self.events_file.flush()?;
+        host_fs::append_line(&self.events_path, &encoded)?;
         Ok(())
     }
 }
@@ -184,7 +181,7 @@ pub fn init_repro_bundle(
 
     let bundle_name = bundle_dir_name(suite, case_id, seed);
     let root = base_dir.join(bundle_name);
-    fs::create_dir_all(&root)?;
+    host_fs::create_dir_all(&root)?;
 
     let meta = BundleMeta {
         schema_version: LOG_SCHEMA_VERSION,
@@ -193,19 +190,17 @@ pub fn init_repro_bundle(
         seed,
         harness_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    write_json_file(root.join("meta.json"), &meta)?;
+    write_json_file(&root.join("meta.json"), &meta)?;
 
-    File::create(root.join("stdout.log"))?;
-    File::create(root.join("stderr.log"))?;
+    host_fs::create_empty_file(&root.join("stdout.log"))?;
+    host_fs::create_empty_file(&root.join("stderr.log"))?;
 
-    let events_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(root.join("events.jsonl"))?;
+    let events_path = root.join("events.jsonl");
+    host_fs::create_empty_file(&events_path)?;
 
     let mut bundle = ReproBundle {
         root,
-        events_file,
+        events_path,
         next_step: 0,
     };
     bundle.emit_event(LifecycleEventKind::RunStart, "run_start", BTreeMap::new())?;
@@ -245,7 +240,7 @@ pub fn validate_required_files(bundle_root: &Path) -> Result<()> {
 
 pub fn validate_bundle_meta(bundle_root: &Path) -> Result<BundleMeta> {
     let meta_path = bundle_root.join("meta.json");
-    let bytes = fs::read(meta_path)?;
+    let bytes = host_fs::read(&meta_path)?;
     let meta: BundleMeta = serde_json::from_slice(&bytes)
         .map_err(|err| internal_error(format!("meta.json parse failure: {err}")))?;
 
@@ -272,19 +267,17 @@ pub fn validate_bundle_meta(bundle_root: &Path) -> Result<BundleMeta> {
 
 pub fn validate_events_jsonl(bundle_root: &Path) -> Result<Vec<HarnessEvent>> {
     let events_path = bundle_root.join("events.jsonl");
-    let file = File::open(events_path)?;
-    let reader = BufReader::new(file);
+    let contents = host_fs::read_to_string(&events_path)?;
     let mut events = Vec::new();
 
-    for (line_no, line_result) in reader.lines().enumerate() {
-        let line = line_result?;
+    for (line_no, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             return Err(internal_error(format!(
                 "events.jsonl has empty line at {}",
                 line_no + 1
             )));
         }
-        let event: HarnessEvent = serde_json::from_str(&line).map_err(|err| {
+        let event: HarnessEvent = serde_json::from_str(line).map_err(|err| {
             internal_error(format!(
                 "events.jsonl parse failure at line {}: {err}",
                 line_no + 1
@@ -325,16 +318,15 @@ pub fn validate_bundle(bundle_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn append_line(path: PathBuf, text: &str) -> Result<()> {
-    let mut file = OpenOptions::new().append(true).create(true).open(path)?;
-    writeln!(file, "{text}")?;
+fn append_line(path: &Path, text: &str) -> Result<()> {
+    host_fs::append_line(path, text)?;
     Ok(())
 }
 
-fn write_json_file<T: Serialize>(path: PathBuf, value: &T) -> Result<()> {
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|err| internal_error(format!("failed to serialize JSON: {err}")))?;
-    fs::write(path, bytes)?;
+    host_fs::write(path, bytes)?;
     Ok(())
 }
 

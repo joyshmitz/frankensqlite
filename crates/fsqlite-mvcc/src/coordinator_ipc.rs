@@ -1118,14 +1118,22 @@ impl std::error::Error for PeerAuthError {}
 
 /// Authenticate a Unix domain socket peer by UID.
 ///
-/// Note: `UnixStream::peer_cred()` is currently an unstable stdlib API. Until we
-/// wire a stable, safe peer-credential path (likely via an external dependency),
-/// this function is a no-op that accepts the peer.
+/// Uses the nightly `UnixStream::peer_cred()` API (gated by the crate-level
+/// `peer_credentials_unix_socket` feature) to retrieve the peer UID and compare
+/// it to the expected UID.
 #[cfg(target_family = "unix")]
 pub fn authenticate_peer(
-    _stream: &std::os::unix::net::UnixStream,
-    _expected_uid: u32,
+    stream: &std::os::unix::net::UnixStream,
+    expected_uid: u32,
 ) -> Result<(), PeerAuthError> {
+    let cred = stream.peer_cred().map_err(|_| PeerAuthError::NoCreds)?;
+    let actual_uid = cred.uid;
+    if actual_uid != expected_uid {
+        return Err(PeerAuthError::UidMismatch {
+            expected: expected_uid,
+            actual: actual_uid,
+        });
+    }
     Ok(())
 }
 
@@ -1133,34 +1141,100 @@ pub fn authenticate_peer(
 // File descriptor passing helpers (§5.9.0 bulk payload transfer)
 // ---------------------------------------------------------------------------
 
-/// Send raw bytes plus a file descriptor over a Unix stream.
+/// A received file descriptor that is closed on drop.
 ///
-/// Note: fd passing via `SCM_RIGHTS` is currently an unstable stdlib API.
-/// For now, this sends only the bytes and ignores the fd.
+/// We intentionally keep this as a raw fd and close it via `nix` in `Drop` to
+/// avoid `unsafe` `FromRawFd` conversions.
+#[cfg(target_family = "unix")]
+#[derive(Debug)]
+pub struct ReceivedFd(std::os::unix::io::RawFd);
+
+#[cfg(target_family = "unix")]
+impl ReceivedFd {
+    #[must_use]
+    pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.0
+    }
+}
+
+#[cfg(target_family = "unix")]
+impl Drop for ReceivedFd {
+    fn drop(&mut self) {
+        // Best-effort close; ignore errors since we can't recover meaningfully here.
+        let _ = nix::unistd::close(self.0);
+    }
+}
+
+/// Send raw bytes plus a file descriptor over a Unix stream.
 #[cfg(target_family = "unix")]
 pub fn send_with_fd(
     stream: &std::os::unix::net::UnixStream,
     data: &[u8],
-    _fd: std::os::unix::io::RawFd,
+    fd: std::os::unix::io::RawFd,
 ) -> std::io::Result<usize> {
-    use std::io::Write;
-    let mut s = stream;
-    s.write_all(data)?;
-    Ok(data.len())
+    use std::io::IoSlice;
+    use std::os::unix::net::SocketAncillary;
+
+    let mut ancillary_buf = [0u8; 128];
+    let mut ancillary = SocketAncillary::new(&mut ancillary_buf);
+    if !ancillary.add_fds(&[fd]) {
+        return Err(std::io::Error::other("ancillary buffer too small for fd"));
+    }
+
+    stream.send_vectored_with_ancillary(&[IoSlice::new(data)], &mut ancillary)
 }
 
 /// Receive raw bytes plus a file descriptor from a Unix stream.
 ///
-/// Returns `(bytes_read, Option<RawFd>)`.
+/// Returns `(bytes_read, Option<ReceivedFd>)`.
 #[cfg(target_family = "unix")]
 pub fn recv_with_fd(
     stream: &std::os::unix::net::UnixStream,
     buf: &mut [u8],
-) -> std::io::Result<(usize, Option<std::os::unix::io::RawFd>)> {
-    use std::io::Read;
-    let mut s = stream;
-    let n = s.read(buf)?;
-    Ok((n, None))
+) -> std::io::Result<(usize, Option<ReceivedFd>)> {
+    use std::io::IoSliceMut;
+    use std::os::unix::net::{AncillaryData, SocketAncillary};
+
+    let mut ancillary_buf = [0u8; 128];
+    let mut ancillary = SocketAncillary::new(&mut ancillary_buf);
+
+    let mut iov = [IoSliceMut::new(buf)];
+    let n = stream.recv_vectored_with_ancillary(&mut iov, &mut ancillary)?;
+
+    if ancillary.truncated() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ancillary data truncated",
+        ));
+    }
+
+    let mut fds = Vec::<std::os::unix::io::RawFd>::new();
+    for msg in ancillary.messages() {
+        let msg = msg.map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("ancillary message decode error: {e:?}"),
+            )
+        })?;
+        if let AncillaryData::ScmRights(scm_rights) = msg {
+            fds.extend(scm_rights);
+        }
+    }
+
+    match fds.len() {
+        0 => Ok((n, None)),
+        1 => Ok((n, Some(ReceivedFd(fds[0])))),
+        _ => {
+            // Close all received fds to avoid leaking them.
+            for fd in fds {
+                let _ = nix::unistd::close(fd);
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "received more than one fd",
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,37 +1424,59 @@ mod tests {
         assert_eq!(cache.get(99, 2).expect("second hit"), resp2);
     }
 
-    // -- bd-1m07 test 6: Peer auth (stub) is callable --
+    // -- bd-1m07 test 6: Peer auth rejects wrong UID --
     #[cfg(target_family = "unix")]
     #[test]
-    fn test_peer_auth_is_callable() {
+    fn test_peer_auth_rejects_wrong_uid() {
         use std::os::unix::net::UnixStream;
 
         let (a, _b) = UnixStream::pair().expect("socketpair");
 
-        // Current implementation is a no-op (see authenticate_peer docs).
-        authenticate_peer(&a, 0).expect("peer auth");
-        authenticate_peer(&a, 1).expect("peer auth");
+        let actual_uid = a.peer_cred().expect("peer_cred").uid;
+        authenticate_peer(&a, actual_uid).expect("peer auth ok");
+
+        let wrong_uid = actual_uid ^ 1;
+        assert_eq!(
+            authenticate_peer(&a, wrong_uid),
+            Err(PeerAuthError::UidMismatch {
+                expected: wrong_uid,
+                actual: actual_uid,
+            })
+        );
     }
 
     // -- bd-1m07 test 7: SCM_RIGHTS fd passing --
     #[cfg(target_family = "unix")]
     #[test]
-    fn test_send_recv_with_fd_marker_no_fd_attached() {
+    fn test_scm_rights_fd_passing() {
+        use std::io::Write;
+        use std::io::pipe;
+        use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
 
         let (sender, receiver) = UnixStream::pair().expect("socketpair");
 
-        // Send bytes; fd is currently ignored.
-        let data = b"fd-marker";
-        let sent = send_with_fd(&sender, data, -1).expect("send_with_fd");
-        assert_eq!(sent, data.len());
+        let (pipe_r, mut pipe_w) = pipe().expect("pipe");
 
-        // Receive.
+        // Send bytes with a real fd attached.
+        let data = b"fd-marker";
+        let sent = send_with_fd(&sender, data, pipe_r.as_raw_fd()).expect("send_with_fd");
+        assert_eq!(sent, data.len());
+        drop(pipe_r);
+
+        // Receive bytes + fd.
         let mut buf = [0u8; 64];
         let (n, maybe_fd) = recv_with_fd(&receiver, &mut buf).expect("recv_with_fd");
         assert_eq!(&buf[..n], data);
-        assert!(maybe_fd.is_none(), "no fd should be attached in stub mode");
+        let recv_fd = maybe_fd.expect("fd must be attached");
+
+        // Prove the received fd is usable by reading from it after writing into the original pipe.
+        let payload = b"pipe-data";
+        pipe_w.write_all(payload).expect("write into pipe");
+
+        let mut out = [0u8; 64];
+        let nr = nix::unistd::read(recv_fd.raw_fd(), &mut out).expect("read from received fd");
+        assert_eq!(&out[..nr], payload);
     }
 
     // -- bd-1m07 test 8: Canonical ordering validation --
@@ -1458,6 +1554,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn test_e2e_bd_1m07() {
         use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
         use std::sync::{Arc, Barrier};
 
@@ -1467,8 +1564,8 @@ mod tests {
 
         let (client_sock, server_sock) = UnixStream::pair().expect("socketpair");
 
-        // Peer auth is currently a no-op (see authenticate_peer docs).
-        authenticate_peer(&server_sock, 0).expect("E2E peer auth");
+        let expected_uid = server_sock.peer_cred().expect("peer_cred").uid;
+        authenticate_peer(&server_sock, expected_uid).expect("E2E peer auth");
 
         let pm_server = Arc::clone(&pm);
         let cache_server = Arc::clone(&cache);
@@ -1480,7 +1577,8 @@ mod tests {
             barrier_server.wait();
 
             // --- Round 1: RESERVE ---
-            let n = (&server_sock).read(&mut buf).expect("server read reserve");
+            let (n, maybe_fd) = recv_with_fd(&server_sock, &mut buf).expect("server recv reserve");
+            assert!(maybe_fd.is_none(), "reserve must not carry an fd");
             let frame = Frame::decode(&buf[..n]).expect("decode reserve frame");
             assert_eq!(frame.kind, MessageKind::Reserve);
 
@@ -1500,7 +1598,8 @@ mod tests {
                 .expect("server write reserve response");
 
             // --- Round 2: SUBMIT_WAL_COMMIT ---
-            let n = (&server_sock).read(&mut buf).expect("server read submit");
+            let (n, maybe_fd) = recv_with_fd(&server_sock, &mut buf).expect("server recv submit");
+            let _spill_fd = maybe_fd.expect("submit must carry spill fd");
             let frame = Frame::decode(&buf[..n]).expect("decode submit frame");
             assert_eq!(frame.kind, MessageKind::SubmitWalCommit);
 
@@ -1536,7 +1635,8 @@ mod tests {
             }
 
             // --- Round 3: Duplicate SUBMIT (idempotency) ---
-            let n = (&server_sock).read(&mut buf).expect("server read dup");
+            let (n, maybe_fd) = recv_with_fd(&server_sock, &mut buf).expect("server recv dup");
+            let _spill_fd = maybe_fd.expect("dup submit must carry spill fd");
             let frame = Frame::decode(&buf[..n]).expect("decode dup frame");
             let wal_payload =
                 SubmitWalPayload::from_bytes(&frame.payload).expect("parse dup payload");
@@ -1554,7 +1654,8 @@ mod tests {
                 .expect("server write dup response");
 
             // --- Round 4: PING ---
-            let n = (&server_sock).read(&mut buf).expect("server read ping");
+            let (n, maybe_fd) = recv_with_fd(&server_sock, &mut buf).expect("server recv ping");
+            assert!(maybe_fd.is_none(), "ping must not carry an fd");
             let frame = Frame::decode(&buf[..n]).expect("decode ping");
             assert_eq!(frame.kind, MessageKind::Ping);
             let pong = Frame {
@@ -1619,15 +1720,16 @@ mod tests {
             merge_refs: vec![],
         };
 
-        // Round 2: SUBMIT_WAL_COMMIT.
+        let (_spill_r, spill_w) = std::io::pipe().expect("spill pipe");
+
+        // Round 2: SUBMIT_WAL_COMMIT (with spill fd attached).
         let submit = Frame {
             kind: MessageKind::SubmitWalCommit,
             request_id: 2,
             payload: wal.to_bytes(),
         };
-        (&client_sock)
-            .write_all(&submit.encode())
-            .expect("client write submit");
+        send_with_fd(&client_sock, &submit.encode(), spill_w.as_raw_fd())
+            .expect("client send submit");
 
         let n = (&client_sock)
             .read(&mut buf)
@@ -1643,9 +1745,8 @@ mod tests {
             request_id: 3,
             payload: wal.to_bytes(),
         };
-        (&client_sock)
-            .write_all(&dup_submit.encode())
-            .expect("client write dup submit");
+        send_with_fd(&client_sock, &dup_submit.encode(), spill_w.as_raw_fd())
+            .expect("client send dup submit");
 
         let n = (&client_sock).read(&mut buf).expect("client read dup resp");
         let resp = Frame::decode(&buf[..n]).expect("decode dup resp");
@@ -1674,6 +1775,4 @@ mod tests {
 
         server.join().expect("server thread");
     }
-
-    // No peer-cred / SCM_RIGHTS helpers yet (kept stub-only to avoid unsafe + unstable APIs).
 }
