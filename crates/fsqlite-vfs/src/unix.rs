@@ -86,6 +86,31 @@ fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
     Ok(())
 }
 
+/// Query whether a lock would succeed without acquiring it.
+///
+/// Uses `fcntl(F_GETLK)` and returns the kernel-filled `flock`.
+#[allow(clippy::cast_possible_wrap)]
+#[allow(dead_code)]
+fn posix_getlk(file: &impl AsFd, lock_type: i32, start: u64, len: u64) -> Result<libc::flock> {
+    let lock_type = i16::try_from(lock_type).expect("fcntl lock type must fit in i16");
+    let whence = i16::try_from(libc::SEEK_SET).expect("SEEK_SET must fit in i16");
+    let mut flock = libc::flock {
+        l_type: lock_type,
+        l_whence: whence,
+        l_start: start as libc::off_t,
+        l_len: len as libc::off_t,
+        l_pid: 0,
+    };
+
+    nix::fcntl::fcntl(
+        file.as_fd().as_raw_fd(),
+        nix::fcntl::FcntlArg::F_GETLK(&mut flock),
+    )
+    .map_err(|e| FrankenError::Io(e.into()))?;
+
+    Ok(flock)
+}
+
 // ---------------------------------------------------------------------------
 // Inode table — per-process lock coalescing
 // ---------------------------------------------------------------------------
@@ -108,8 +133,12 @@ struct InodeInfo {
     file: Arc<File>,
     /// Number of handles that hold at least SHARED.
     n_shared: u32,
-    /// Highest lock level held by any handle in this process.
-    lock_level: LockLevel,
+    /// Number of handles that hold at least RESERVED.
+    n_reserved: u32,
+    /// Number of handles that hold at least PENDING.
+    n_pending: u32,
+    /// Number of handles that hold EXCLUSIVE.
+    n_exclusive: u32,
     /// Total number of open file handles referencing this inode.
     n_ref: u32,
 }
@@ -119,7 +148,9 @@ impl InodeInfo {
         Self {
             file,
             n_shared: 0,
-            lock_level: LockLevel::None,
+            n_reserved: 0,
+            n_pending: 0,
+            n_exclusive: 0,
             n_ref: 0,
         }
     }
@@ -409,6 +440,68 @@ pub struct UnixFile {
     inode_info: Arc<Mutex<InodeInfo>>,
 }
 
+impl UnixFile {
+    fn unlock_with_level(
+        lock_level: &mut LockLevel,
+        info: &mut InodeInfo,
+        file: &File,
+        level: LockLevel,
+    ) -> Result<()> {
+        if *lock_level <= level {
+            *lock_level = level;
+            return Ok(());
+        }
+
+        // Drop EXCLUSIVE first (downgrade SHARED range from write -> read).
+        if *lock_level == LockLevel::Exclusive && level < LockLevel::Exclusive {
+            debug_assert!(info.n_exclusive > 0, "exclusive count underflow");
+            info.n_exclusive = info.n_exclusive.saturating_sub(1);
+
+            if info.n_exclusive == 0 {
+                debug_assert!(info.n_shared > 0, "exclusive implies shared");
+                let ok = posix_lock(file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
+                debug_assert!(
+                    ok,
+                    "downgrading an exclusive lock back to shared should not block"
+                );
+                if !ok {
+                    return Err(FrankenError::Busy);
+                }
+            }
+        }
+
+        // Drop PENDING (unlock the pending byte).
+        if *lock_level >= LockLevel::Pending && level < LockLevel::Pending {
+            debug_assert!(info.n_pending > 0, "pending count underflow");
+            info.n_pending = info.n_pending.saturating_sub(1);
+            if info.n_pending == 0 {
+                posix_unlock(file, PENDING_BYTE, 1)?;
+            }
+        }
+
+        // Drop RESERVED (unlock the reserved byte).
+        if *lock_level >= LockLevel::Reserved && level < LockLevel::Reserved {
+            debug_assert!(info.n_reserved > 0, "reserved count underflow");
+            info.n_reserved = info.n_reserved.saturating_sub(1);
+            if info.n_reserved == 0 {
+                posix_unlock(file, RESERVED_BYTE, 1)?;
+            }
+        }
+
+        // Drop SHARED (unlock the shared range).
+        if *lock_level >= LockLevel::Shared && level < LockLevel::Shared {
+            debug_assert!(info.n_shared > 0, "shared count underflow");
+            info.n_shared = info.n_shared.saturating_sub(1);
+            if info.n_shared == 0 {
+                posix_unlock(file, SHARED_FIRST, SHARED_SIZE)?;
+            }
+        }
+
+        *lock_level = level;
+        Ok(())
+    }
+}
+
 impl VfsFile for UnixFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
         // Downgrade to no lock before closing.
@@ -499,126 +592,66 @@ impl VfsFile for UnixFile {
             return Ok(());
         }
 
-        // Clone the Arc so we have an independent handle for fcntl calls.
-        // This avoids borrow-checker conflicts between `&mut self` and
-        // the file descriptor reference.
         let file = Arc::clone(&self.file);
         let mut info = self.inode_info.lock().expect("inode info lock poisoned");
 
         let original = self.lock_level;
-        let original_info_level = info.lock_level;
-        let mut acquired_shared = false;
-        let mut acquired_reserved = false;
-        let mut acquired_pending = false;
-
-        // Upgrade step-by-step, rolling back any locks acquired in this call on failure.
-        let rollback = |info: &mut InodeInfo,
-                        f: &File,
-                        acquired_shared: bool,
-                        acquired_reserved: bool,
-                        acquired_pending: bool,
-                        original_info_level: LockLevel|
-         -> Result<()> {
-            if acquired_pending {
-                posix_unlock(f, PENDING_BYTE, 1)?;
-            }
-            if acquired_reserved {
-                posix_unlock(f, RESERVED_BYTE, 1)?;
-            }
-            if acquired_shared {
-                info.n_shared = info.n_shared.saturating_sub(1);
-                if info.n_shared == 0 {
-                    posix_unlock(f, SHARED_FIRST, SHARED_SIZE)?;
-                }
-            }
-            info.lock_level = original_info_level;
-            Ok(())
-        };
 
         if level >= LockLevel::Shared && self.lock_level < LockLevel::Shared {
-            // Step 1: Check PENDING byte is not write-locked (blocks new readers).
-            if !posix_lock(&*file, libc::F_RDLCK, PENDING_BYTE, 1)? {
-                return Err(FrankenError::Busy);
-            }
-
-            // Step 2: Acquire read lock on SHARED range.
             if info.n_shared == 0 {
-                // First shared lock in this process — issue OS lock.
+                debug_assert_eq!(info.n_reserved, 0);
+                debug_assert_eq!(info.n_pending, 0);
+                debug_assert_eq!(info.n_exclusive, 0);
+
+                // Step 1: Check PENDING byte is not write-locked (blocks new readers).
+                if !posix_lock(&*file, libc::F_RDLCK, PENDING_BYTE, 1)? {
+                    return Err(FrankenError::Busy);
+                }
+
+                // Step 2: Acquire read lock on SHARED range.
                 if !posix_lock(&*file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)? {
                     posix_unlock(&*file, PENDING_BYTE, 1)?;
                     return Err(FrankenError::Busy);
                 }
+
+                // Step 3: Release PENDING byte.
+                posix_unlock(&*file, PENDING_BYTE, 1)?;
             }
+
             info.n_shared += 1;
-
-            // Step 3: Release PENDING byte.
-            posix_unlock(&*file, PENDING_BYTE, 1)?;
-
             self.lock_level = LockLevel::Shared;
-            acquired_shared = true;
-            if info.lock_level < LockLevel::Shared {
-                info.lock_level = LockLevel::Shared;
-            }
         }
 
         if level >= LockLevel::Reserved && self.lock_level < LockLevel::Reserved {
-            if !posix_lock(&*file, libc::F_WRLCK, RESERVED_BYTE, 1)? {
-                rollback(
-                    &mut info,
-                    &file,
-                    acquired_shared,
-                    acquired_reserved,
-                    acquired_pending,
-                    original_info_level,
-                )?;
-                self.lock_level = original;
+            if info.n_reserved == 0 && !posix_lock(&*file, libc::F_WRLCK, RESERVED_BYTE, 1)? {
+                Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
             }
 
+            info.n_reserved += 1;
             self.lock_level = LockLevel::Reserved;
-            acquired_reserved = true;
-            if info.lock_level < LockLevel::Reserved {
-                info.lock_level = LockLevel::Reserved;
-            }
         }
 
         if level >= LockLevel::Pending && self.lock_level < LockLevel::Pending {
-            if !posix_lock(&*file, libc::F_WRLCK, PENDING_BYTE, 1)? {
-                rollback(
-                    &mut info,
-                    &file,
-                    acquired_shared,
-                    acquired_reserved,
-                    acquired_pending,
-                    original_info_level,
-                )?;
-                self.lock_level = original;
+            if info.n_pending == 0 && !posix_lock(&*file, libc::F_WRLCK, PENDING_BYTE, 1)? {
+                Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
             }
 
+            info.n_pending += 1;
             self.lock_level = LockLevel::Pending;
-            acquired_pending = true;
-            if info.lock_level < LockLevel::Pending {
-                info.lock_level = LockLevel::Pending;
-            }
         }
 
         if level >= LockLevel::Exclusive && self.lock_level < LockLevel::Exclusive {
-            if !posix_lock(&*file, libc::F_WRLCK, SHARED_FIRST, SHARED_SIZE)? {
-                rollback(
-                    &mut info,
-                    &file,
-                    acquired_shared,
-                    acquired_reserved,
-                    acquired_pending,
-                    original_info_level,
-                )?;
-                self.lock_level = original;
+            if info.n_exclusive == 0
+                && !posix_lock(&*file, libc::F_WRLCK, SHARED_FIRST, SHARED_SIZE)?
+            {
+                Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
             }
 
+            info.n_exclusive += 1;
             self.lock_level = LockLevel::Exclusive;
-            info.lock_level = LockLevel::Exclusive;
         }
 
         drop(info);
@@ -626,63 +659,26 @@ impl VfsFile for UnixFile {
     }
 
     fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        // No-op if already at or below the requested level.
-        if self.lock_level <= level {
-            return Ok(());
-        }
-
         let file = Arc::clone(&self.file);
         let mut info = self.inode_info.lock().expect("inode info lock poisoned");
-
-        if self.lock_level >= LockLevel::Reserved && level < LockLevel::Reserved {
-            // Release PENDING and RESERVED bytes.
-            posix_unlock(&*file, PENDING_BYTE, 2)?;
-
-            if self.lock_level == LockLevel::Exclusive {
-                // Downgrade SHARED range from F_WRLCK back to F_RDLCK.
-                if info.n_shared > 0 {
-                    let ok = posix_lock(&*file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
-                    debug_assert!(
-                        ok,
-                        "downgrading an exclusive lock back to shared should not block"
-                    );
-                    if !ok {
-                        return Err(FrankenError::Busy);
-                    }
-                }
-            }
-        }
-
-        if level == LockLevel::None && self.lock_level >= LockLevel::Shared {
-            info.n_shared = info.n_shared.saturating_sub(1);
-
-            if info.n_shared == 0 {
-                // Last shared handle in this process — release OS lock.
-                posix_unlock(&*file, SHARED_FIRST, SHARED_SIZE)?;
-                info.lock_level = LockLevel::None;
-            } else {
-                info.lock_level = LockLevel::Shared;
-            }
-        } else if level >= LockLevel::Shared {
-            info.lock_level = level;
-        }
-
-        drop(info);
-        self.lock_level = level;
-        Ok(())
+        Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), level)
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        // If *we* hold reserved or higher, report false (it's us, not another).
-        if self.lock_level >= LockLevel::Reserved {
+        let file = Arc::clone(&self.file);
+        let info = self.inode_info.lock().expect("inode info lock poisoned");
+
+        // If *this process* holds reserved or higher, report false (it's us).
+        if info.n_reserved > 0 {
             return Ok(false);
         }
+        drop(info);
 
         // Probe the RESERVED byte with a non-blocking F_WRLCK.
-        let can_lock = posix_lock(&*self.file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
+        let can_lock = posix_lock(&*file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
         if can_lock {
             // We got it, meaning nobody else has it. Release immediately.
-            posix_unlock(&*self.file, RESERVED_BYTE, 1)?;
+            posix_unlock(&*file, RESERVED_BYTE, 1)?;
             Ok(false)
         } else {
             // Another process holds reserved.
