@@ -49,6 +49,185 @@ pub struct WalSalts {
     pub salt2: u32,
 }
 
+/// WAL magic number for little-endian checksum mode.
+pub const WAL_MAGIC_LE: u32 = 0x377F_0682;
+
+/// WAL magic number for big-endian checksum mode.
+pub const WAL_MAGIC_BE: u32 = 0x377F_0683;
+
+/// WAL format version constant (SQLite 3.7.0+).
+pub const WAL_FORMAT_VERSION: u32 = 3_007_000;
+
+/// Parsed 32-byte WAL header.
+///
+/// Layout:
+/// ```text
+/// Offset  Size  Description
+///   0       4   Magic: 0x377F0682 (LE checksum) or 0x377F0683 (BE checksum)
+///   4       4   Format version: 3007000
+///   8       4   Page size in bytes
+///  12       4   Checkpoint sequence number
+///  16       4   Salt-1
+///  20       4   Salt-2
+///  24       4   Checksum-1 (of bytes 0..24)
+///  28       4   Checksum-2 (of bytes 0..24)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalHeader {
+    /// Magic number: `WAL_MAGIC_LE` or `WAL_MAGIC_BE`.
+    pub magic: u32,
+    /// Format version (must be `WAL_FORMAT_VERSION`).
+    pub format_version: u32,
+    /// Database page size in bytes.
+    pub page_size: u32,
+    /// Checkpoint sequence number.
+    pub checkpoint_seq: u32,
+    /// Salt pair for frame validation.
+    pub salts: WalSalts,
+    /// Header checksum (covers bytes 0..24).
+    pub checksum: SqliteWalChecksum,
+}
+
+impl WalHeader {
+    /// Whether the magic indicates big-endian checksum words.
+    #[must_use]
+    pub const fn big_endian_checksum(&self) -> bool {
+        self.magic == WAL_MAGIC_BE
+    }
+
+    /// Parse a 32-byte WAL header from raw bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self> {
+        if buf.len() < WAL_HEADER_SIZE {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL header too small: expected >= {WAL_HEADER_SIZE}, got {}",
+                    buf.len()
+                ),
+            });
+        }
+        let magic = read_be_u32_at(buf, 0);
+        if magic != WAL_MAGIC_LE && magic != WAL_MAGIC_BE {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!("invalid WAL magic: {magic:#010x}"),
+            });
+        }
+        let format_version = read_be_u32_at(buf, 4);
+        if format_version != WAL_FORMAT_VERSION {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "unsupported WAL format version: {format_version} (expected {WAL_FORMAT_VERSION})"
+                ),
+            });
+        }
+        Ok(Self {
+            magic,
+            format_version,
+            page_size: read_be_u32_at(buf, 8),
+            checkpoint_seq: read_be_u32_at(buf, 12),
+            salts: WalSalts {
+                salt1: read_be_u32_at(buf, WAL_HEADER_SALT1_OFFSET),
+                salt2: read_be_u32_at(buf, WAL_HEADER_SALT2_OFFSET),
+            },
+            checksum: SqliteWalChecksum {
+                s1: read_be_u32_at(buf, WAL_HEADER_CKSUM1_OFFSET),
+                s2: read_be_u32_at(buf, WAL_HEADER_CKSUM2_OFFSET),
+            },
+        })
+    }
+
+    /// Serialize this header into a 32-byte buffer and compute the checksum.
+    pub fn to_bytes(&self) -> Result<[u8; WAL_HEADER_SIZE]> {
+        let mut buf = [0u8; WAL_HEADER_SIZE];
+        write_be_u32_at(&mut buf, 0, self.magic);
+        write_be_u32_at(&mut buf, 4, self.format_version);
+        write_be_u32_at(&mut buf, 8, self.page_size);
+        write_be_u32_at(&mut buf, 12, self.checkpoint_seq);
+        write_be_u32_at(&mut buf, WAL_HEADER_SALT1_OFFSET, self.salts.salt1);
+        write_be_u32_at(&mut buf, WAL_HEADER_SALT2_OFFSET, self.salts.salt2);
+        // Compute and write checksum over bytes 0..24.
+        let checksum = sqlite_wal_checksum(
+            &buf[..WAL_HEADER_CKSUM1_OFFSET],
+            0,
+            0,
+            self.big_endian_checksum(),
+        )?;
+        write_be_u32_at(&mut buf, WAL_HEADER_CKSUM1_OFFSET, checksum.s1);
+        write_be_u32_at(&mut buf, WAL_HEADER_CKSUM2_OFFSET, checksum.s2);
+        Ok(buf)
+    }
+}
+
+/// Parsed 24-byte WAL frame header.
+///
+/// Layout:
+/// ```text
+/// Offset  Size  Description
+///   0       4   Page number
+///   4       4   For commit frames: db size in pages. Otherwise 0.
+///   8       4   Salt-1 (must match WAL header)
+///  12       4   Salt-2 (must match WAL header)
+///  16       4   Cumulative checksum-1
+///  20       4   Cumulative checksum-2
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalFrameHeader {
+    /// Page number this frame writes to.
+    pub page_number: u32,
+    /// For commit frames: database size in pages after this commit. Otherwise 0.
+    pub db_size: u32,
+    /// Salt pair (must match WAL header salts).
+    pub salts: WalSalts,
+    /// Cumulative checksum (covers this frame and all prior frames).
+    pub checksum: SqliteWalChecksum,
+}
+
+impl WalFrameHeader {
+    /// Whether this frame is a commit frame (non-zero `db_size`).
+    #[must_use]
+    pub const fn is_commit(&self) -> bool {
+        self.db_size > 0
+    }
+
+    /// Parse a 24-byte WAL frame header from raw bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self> {
+        if buf.len() < WAL_FRAME_HEADER_SIZE {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL frame header too small: expected >= {WAL_FRAME_HEADER_SIZE}, got {}",
+                    buf.len()
+                ),
+            });
+        }
+        Ok(Self {
+            page_number: read_be_u32_at(buf, 0),
+            db_size: read_be_u32_at(buf, WAL_FRAME_DB_SIZE_OFFSET),
+            salts: WalSalts {
+                salt1: read_be_u32_at(buf, WAL_FRAME_SALT1_OFFSET),
+                salt2: read_be_u32_at(buf, WAL_FRAME_SALT2_OFFSET),
+            },
+            checksum: SqliteWalChecksum {
+                s1: read_be_u32_at(buf, WAL_FRAME_CKSUM1_OFFSET),
+                s2: read_be_u32_at(buf, WAL_FRAME_CKSUM2_OFFSET),
+            },
+        })
+    }
+
+    /// Serialize this frame header into a 24-byte buffer.
+    ///
+    /// Note: The checksum field is written as-is. To compute the correct
+    /// checksum, use `compute_wal_frame_checksum` on the complete frame.
+    pub fn to_bytes(&self) -> [u8; WAL_FRAME_HEADER_SIZE] {
+        let mut buf = [0u8; WAL_FRAME_HEADER_SIZE];
+        write_be_u32_at(&mut buf, 0, self.page_number);
+        write_be_u32_at(&mut buf, WAL_FRAME_DB_SIZE_OFFSET, self.db_size);
+        write_be_u32_at(&mut buf, WAL_FRAME_SALT1_OFFSET, self.salts.salt1);
+        write_be_u32_at(&mut buf, WAL_FRAME_SALT2_OFFSET, self.salts.salt2);
+        write_be_u32_at(&mut buf, WAL_FRAME_CKSUM1_OFFSET, self.checksum.s1);
+        write_be_u32_at(&mut buf, WAL_FRAME_CKSUM2_OFFSET, self.checksum.s2);
+        buf
+    }
+}
+
 /// First failure reason encountered while validating a WAL chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalChainInvalidReason {
@@ -1300,6 +1479,237 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_header_magic_le_roundtrip() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: u32::try_from(PAGE_SIZE).expect("page size fits in u32"),
+            checkpoint_seq: 7,
+            salts: WalSalts {
+                salt1: 0x1111_2222,
+                salt2: 0x3333_4444,
+            },
+            checksum: SqliteWalChecksum::default(),
+        };
+        let bytes = header.to_bytes().expect("header should serialize");
+        assert_eq!(read_be_u32_at(&bytes, 0), WAL_MAGIC_LE);
+        assert!(
+            validate_wal_header_checksum(&bytes, false).expect("header checksum should validate")
+        );
+
+        let parsed = WalHeader::from_bytes(&bytes).expect("header should parse");
+        assert_eq!(parsed.magic, WAL_MAGIC_LE);
+        assert!(!parsed.big_endian_checksum());
+    }
+
+    #[test]
+    fn test_wal_header_magic_be_roundtrip() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_BE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: u32::try_from(PAGE_SIZE).expect("page size fits in u32"),
+            checkpoint_seq: 11,
+            salts: WalSalts {
+                salt1: 0xAAAA_BBBB,
+                salt2: 0xCCCC_DDDD,
+            },
+            checksum: SqliteWalChecksum::default(),
+        };
+        let bytes = header.to_bytes().expect("header should serialize");
+        assert_eq!(read_be_u32_at(&bytes, 0), WAL_MAGIC_BE);
+        assert!(
+            validate_wal_header_checksum(&bytes, true).expect("header checksum should validate")
+        );
+
+        let parsed = WalHeader::from_bytes(&bytes).expect("header should parse");
+        assert_eq!(parsed.magic, WAL_MAGIC_BE);
+        assert!(parsed.big_endian_checksum());
+    }
+
+    #[test]
+    fn test_wal_header_format_version_constant_and_rejection() {
+        assert_eq!(WAL_FORMAT_VERSION, 3_007_000);
+
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: u32::try_from(PAGE_SIZE).expect("page size fits in u32"),
+            checkpoint_seq: 0,
+            salts: WalSalts { salt1: 1, salt2: 2 },
+            checksum: SqliteWalChecksum::default(),
+        };
+        let mut bytes = header.to_bytes().expect("header should serialize");
+        write_be_u32_at(&mut bytes, 4, WAL_FORMAT_VERSION + 1);
+        let err = WalHeader::from_bytes(&bytes).expect_err("invalid version must be rejected");
+        assert!(matches!(err, FrankenError::WalCorrupt { .. }));
+    }
+
+    #[test]
+    fn test_wal_frame_header_commit_and_non_commit() {
+        let salts = WalSalts {
+            salt1: 0x0102_0304,
+            salt2: 0x0506_0708,
+        };
+        let checksum = SqliteWalChecksum {
+            s1: 0x1111_1111,
+            s2: 0x2222_2222,
+        };
+
+        let non_commit = WalFrameHeader {
+            page_number: 4,
+            db_size: 0,
+            salts,
+            checksum,
+        };
+        assert!(!non_commit.is_commit());
+        let parsed_non_commit =
+            WalFrameHeader::from_bytes(&non_commit.to_bytes()).expect("frame should parse");
+        assert_eq!(parsed_non_commit, non_commit);
+
+        let commit = WalFrameHeader {
+            page_number: 5,
+            db_size: 99,
+            salts,
+            checksum,
+        };
+        assert!(commit.is_commit());
+        let parsed_commit =
+            WalFrameHeader::from_bytes(&commit.to_bytes()).expect("frame should parse");
+        assert_eq!(parsed_commit, commit);
+    }
+
+    #[test]
+    fn test_wal_frame_salt_match_validation() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: u32::try_from(PAGE_SIZE).expect("page size fits in u32"),
+            checkpoint_seq: 1,
+            salts: WalSalts {
+                salt1: 0xABCD_1234,
+                salt2: 0x9876_5432,
+            },
+            checksum: SqliteWalChecksum::default(),
+        };
+        let header_bytes = header.to_bytes().expect("header should serialize");
+        let seed = read_wal_header_checksum(&header_bytes).expect("header checksum should read");
+
+        let mut frame = vec![0_u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
+        frame[..4].copy_from_slice(&1_u32.to_be_bytes());
+        frame[4..8].copy_from_slice(&1_u32.to_be_bytes());
+        write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], header.salts)
+            .expect("frame salts should write");
+        frame[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&sample_page(0x3A));
+        write_wal_frame_checksum(&mut frame, PAGE_SIZE, seed, false)
+            .expect("frame checksum should write");
+
+        let mut wal_bytes = Vec::with_capacity(WAL_HEADER_SIZE + frame.len());
+        wal_bytes.extend_from_slice(&header_bytes);
+        wal_bytes.extend_from_slice(&frame);
+        let valid = validate_wal_chain(&wal_bytes, PAGE_SIZE, false).expect("valid chain");
+        assert!(valid.valid);
+        assert_eq!(valid.valid_frames, 1);
+
+        write_wal_frame_salts(
+            &mut wal_bytes[WAL_HEADER_SIZE..WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE],
+            WalSalts {
+                salt1: 0xDEAD_BEEF,
+                salt2: 0xFACE_FEED,
+            },
+        )
+        .expect("salt rewrite should succeed");
+        let invalid =
+            validate_wal_chain(&wal_bytes, PAGE_SIZE, false).expect("invalid chain should parse");
+        assert_eq!(invalid.reason, Some(WalChainInvalidReason::SaltMismatch));
+        assert_eq!(invalid.first_invalid_frame, Some(0));
+    }
+
+    #[test]
+    fn test_wal_checksum_chain_integrity_two_frames() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: u32::try_from(PAGE_SIZE).expect("page size fits in u32"),
+            checkpoint_seq: 3,
+            salts: WalSalts {
+                salt1: 0xA1A2_A3A4,
+                salt2: 0xB1B2_B3B4,
+            },
+            checksum: SqliteWalChecksum::default(),
+        };
+        let header_bytes = header.to_bytes().expect("header should serialize");
+        let mut running_checksum =
+            read_wal_header_checksum(&header_bytes).expect("header checksum should read");
+
+        let mut frame1 = vec![0_u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
+        frame1[..4].copy_from_slice(&1_u32.to_be_bytes());
+        frame1[4..8].copy_from_slice(&0_u32.to_be_bytes());
+        write_wal_frame_salts(&mut frame1[..WAL_FRAME_HEADER_SIZE], header.salts)
+            .expect("frame salts should write");
+        frame1[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&sample_page(0x10));
+        running_checksum =
+            write_wal_frame_checksum(&mut frame1, PAGE_SIZE, running_checksum, false)
+                .expect("frame checksum should write");
+
+        let mut frame2 = vec![0_u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
+        frame2[..4].copy_from_slice(&2_u32.to_be_bytes());
+        frame2[4..8].copy_from_slice(&7_u32.to_be_bytes());
+        write_wal_frame_salts(&mut frame2[..WAL_FRAME_HEADER_SIZE], header.salts)
+            .expect("frame salts should write");
+        frame2[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&sample_page(0x20));
+        let frame2_checksum =
+            write_wal_frame_checksum(&mut frame2, PAGE_SIZE, running_checksum, false)
+                .expect("frame checksum should write");
+
+        let mut wal_bytes = Vec::with_capacity(WAL_HEADER_SIZE + frame1.len() + frame2.len());
+        wal_bytes.extend_from_slice(&header_bytes);
+        wal_bytes.extend_from_slice(&frame1);
+        wal_bytes.extend_from_slice(&frame2);
+        let validation = validate_wal_chain(&wal_bytes, PAGE_SIZE, false).expect("valid chain");
+
+        assert!(validation.valid);
+        assert_eq!(validation.valid_frames, 2);
+        assert_eq!(validation.replayable_frames, 2);
+        assert_eq!(validation.last_commit_frame, Some(1));
+        let parsed_frame2 =
+            WalFrameHeader::from_bytes(&frame2[..WAL_FRAME_HEADER_SIZE]).expect("frame parses");
+        assert_eq!(parsed_frame2.checksum, frame2_checksum);
+    }
+
+    #[test]
+    fn test_wal_frame_checksum_ignores_salt_words() {
+        let seed = SqliteWalChecksum {
+            s1: 0x1234_5678,
+            s2: 0x9ABC_DEF0,
+        };
+        let mut frame_a = vec![0_u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
+        frame_a[..4].copy_from_slice(&2_u32.to_be_bytes());
+        frame_a[4..8].copy_from_slice(&0_u32.to_be_bytes());
+        write_wal_frame_salts(
+            &mut frame_a[..WAL_FRAME_HEADER_SIZE],
+            WalSalts { salt1: 1, salt2: 2 },
+        )
+        .expect("frame salts should write");
+        frame_a[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&sample_page(0x55));
+
+        let mut frame_b = frame_a.clone();
+        write_wal_frame_salts(
+            &mut frame_b[..WAL_FRAME_HEADER_SIZE],
+            WalSalts {
+                salt1: 0xAAAA_BBBB,
+                salt2: 0xCCCC_DDDD,
+            },
+        )
+        .expect("frame salts should write");
+
+        let checksum_a =
+            compute_wal_frame_checksum(&frame_a, PAGE_SIZE, seed, false).expect("checksum");
+        let checksum_b =
+            compute_wal_frame_checksum(&frame_b, PAGE_SIZE, seed, false).expect("checksum");
+        assert_eq!(checksum_a, checksum_b);
+    }
+
+    #[test]
     fn test_sqlite_checksum_alignment_guard() {
         let err = sqlite_wal_checksum(&[1_u8, 2, 3], 0, 0, false).expect_err("must reject");
         assert!(matches!(err, FrankenError::WalCorrupt { .. }));
@@ -1635,5 +2045,227 @@ mod tests {
             assert_eq!(validation.valid_frames, crash_frame);
             assert_eq!(validation.replayable_frames, crash_frame);
         }
+    }
+
+    // ── bd-lldk §11.8-11.9 WAL header / frame / checksum tests ─────────
+
+    #[test]
+    fn test_wal_header_magic_le() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: 4096,
+            checkpoint_seq: 0,
+            salts: WalSalts {
+                salt1: 0xAAAA_BBBB,
+                salt2: 0xCCCC_DDDD,
+            },
+            checksum: SqliteWalChecksum::default(),
+        };
+        assert!(!header.big_endian_checksum());
+        let bytes = header.to_bytes().expect("LE header should serialize");
+        assert_eq!(&bytes[..4], &WAL_MAGIC_LE.to_be_bytes());
+    }
+
+    #[test]
+    fn test_wal_header_magic_be() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_BE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: 4096,
+            checkpoint_seq: 0,
+            salts: WalSalts {
+                salt1: 0x1111_2222,
+                salt2: 0x3333_4444,
+            },
+            checksum: SqliteWalChecksum::default(),
+        };
+        assert!(header.big_endian_checksum());
+        let bytes = header.to_bytes().expect("BE header should serialize");
+        assert_eq!(&bytes[..4], &WAL_MAGIC_BE.to_be_bytes());
+    }
+
+    #[test]
+    fn test_wal_header_format_version() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: 4096,
+            checkpoint_seq: 1,
+            salts: WalSalts::default(),
+            checksum: SqliteWalChecksum::default(),
+        };
+        let bytes = header.to_bytes().expect("header should serialize");
+        let parsed = WalHeader::from_bytes(&bytes).expect("header should parse");
+        assert_eq!(parsed.format_version, 3_007_000);
+
+        // Wrong format version must be rejected.
+        let mut bad_bytes = bytes;
+        bad_bytes[4..8].copy_from_slice(&999_u32.to_be_bytes());
+        assert!(WalHeader::from_bytes(&bad_bytes).is_err());
+    }
+
+    #[test]
+    fn test_wal_header_round_trip() {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size: 4096,
+            checkpoint_seq: 42,
+            salts: WalSalts {
+                salt1: 0xDEAD_BEEF,
+                salt2: 0xCAFE_BABE,
+            },
+            checksum: SqliteWalChecksum::default(),
+        };
+        let bytes = header.to_bytes().expect("header should serialize");
+        assert_eq!(bytes.len(), WAL_HEADER_SIZE);
+
+        let parsed = WalHeader::from_bytes(&bytes).expect("header should parse");
+        assert_eq!(parsed.magic, WAL_MAGIC_LE);
+        assert_eq!(parsed.format_version, WAL_FORMAT_VERSION);
+        assert_eq!(parsed.page_size, 4096);
+        assert_eq!(parsed.checkpoint_seq, 42);
+        assert_eq!(parsed.salts.salt1, 0xDEAD_BEEF);
+        assert_eq!(parsed.salts.salt2, 0xCAFE_BABE);
+        // Checksum is computed by to_bytes; parsed checksum should be non-zero.
+        assert!(
+            parsed.checksum.s1 != 0 || parsed.checksum.s2 != 0,
+            "computed checksum should be non-trivial"
+        );
+    }
+
+    #[test]
+    fn test_wal_frame_header_commit() {
+        // Commit frame: db_size > 0.
+        let commit_frame = WalFrameHeader {
+            page_number: 1,
+            db_size: 10,
+            salts: WalSalts {
+                salt1: 0x1111,
+                salt2: 0x2222,
+            },
+            checksum: SqliteWalChecksum { s1: 100, s2: 200 },
+        };
+        assert!(commit_frame.is_commit());
+
+        let bytes = commit_frame.to_bytes();
+        assert_eq!(bytes.len(), WAL_FRAME_HEADER_SIZE);
+        let parsed = WalFrameHeader::from_bytes(&bytes).expect("frame should parse");
+        assert!(parsed.is_commit());
+        assert_eq!(parsed.db_size, 10);
+
+        // Non-commit frame: db_size == 0.
+        let non_commit = WalFrameHeader {
+            page_number: 2,
+            db_size: 0,
+            salts: WalSalts {
+                salt1: 0x1111,
+                salt2: 0x2222,
+            },
+            checksum: SqliteWalChecksum { s1: 300, s2: 400 },
+        };
+        assert!(!non_commit.is_commit());
+
+        let bytes2 = non_commit.to_bytes();
+        let parsed2 = WalFrameHeader::from_bytes(&bytes2).expect("frame should parse");
+        assert!(!parsed2.is_commit());
+        assert_eq!(parsed2.db_size, 0);
+    }
+
+    #[test]
+    fn test_wal_frame_header_salt_match() {
+        let wal_salts = WalSalts {
+            salt1: 0xAAAA_BBBB,
+            salt2: 0xCCCC_DDDD,
+        };
+
+        // Frame with matching salt: accepted.
+        let good_frame = WalFrameHeader {
+            page_number: 1,
+            db_size: 5,
+            salts: wal_salts,
+            checksum: SqliteWalChecksum::default(),
+        };
+        assert_eq!(good_frame.salts, wal_salts);
+
+        // Frame with mismatched salt: rejected.
+        let bad_salts = WalSalts {
+            salt1: 0x0000_0000,
+            salt2: 0x0000_0000,
+        };
+        let bad_frame = WalFrameHeader {
+            page_number: 1,
+            db_size: 5,
+            salts: bad_salts,
+            checksum: SqliteWalChecksum::default(),
+        };
+        assert_ne!(
+            bad_frame.salts, wal_salts,
+            "mismatched salt must be detected"
+        );
+    }
+
+    #[test]
+    fn test_wal_checksum_chain_integrity() {
+        // Build a multi-frame WAL and verify the cumulative checksum chain.
+        let salts = WalSalts {
+            salt1: 0x1234_5678,
+            salt2: 0x9ABC_DEF0,
+        };
+        let mut wal_header_buf = [0_u8; WAL_HEADER_SIZE];
+        wal_header_buf[..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+        wal_header_buf[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
+        wal_header_buf[8..12].copy_from_slice(
+            &u32::try_from(PAGE_SIZE)
+                .expect("page size fits")
+                .to_be_bytes(),
+        );
+        write_wal_header_salts(&mut wal_header_buf, salts).expect("write salts");
+        write_wal_header_checksum(&mut wal_header_buf, false).expect("write header checksum");
+
+        let mut running = read_wal_header_checksum(&wal_header_buf).expect("read header checksum");
+
+        let mut wal_bytes = Vec::new();
+        wal_bytes.extend_from_slice(&wal_header_buf);
+
+        // Write 5 frames, each a commit frame.
+        for frame_idx in 0..5_u32 {
+            let mut frame = vec![0_u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
+            frame[..4].copy_from_slice(&(frame_idx + 1).to_be_bytes());
+            frame[4..8].copy_from_slice(&(frame_idx + 1).to_be_bytes());
+            write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts)
+                .expect("write frame salts");
+
+            for (offset, byte) in frame[WAL_FRAME_HEADER_SIZE..].iter_mut().enumerate() {
+                let reduced = u8::try_from(offset % 251).expect("fits");
+                *byte = reduced ^ u8::try_from(frame_idx % 251).expect("fits");
+            }
+
+            running = write_wal_frame_checksum(&mut frame, PAGE_SIZE, running, false)
+                .expect("write frame checksum");
+            wal_bytes.extend_from_slice(&frame);
+        }
+
+        // Validate the entire chain.
+        let validation =
+            validate_wal_chain(&wal_bytes, PAGE_SIZE, false).expect("chain should validate");
+        assert!(validation.valid, "chain must be fully valid");
+        assert_eq!(validation.valid_frames, 5);
+        assert_eq!(validation.replayable_frames, 5);
+        assert!(validation.reason.is_none());
+
+        // Corrupt one byte in frame 3's page data; chain must break at frame 3.
+        let frame3_page_offset =
+            WAL_HEADER_SIZE + 2 * (WAL_FRAME_HEADER_SIZE + PAGE_SIZE) + WAL_FRAME_HEADER_SIZE + 10;
+        wal_bytes[frame3_page_offset] ^= 0xFF;
+        let bad_validation =
+            validate_wal_chain(&wal_bytes, PAGE_SIZE, false).expect("corrupt chain should parse");
+        assert!(!bad_validation.valid);
+        assert_eq!(bad_validation.valid_frames, 2, "frames 1-2 should be valid");
+        assert_eq!(
+            bad_validation.reason,
+            Some(WalChainInvalidReason::FrameChecksumMismatch)
+        );
     }
 }
