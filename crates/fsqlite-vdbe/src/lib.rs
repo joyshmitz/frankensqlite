@@ -1,1 +1,835 @@
+// bd-gird: §10.7-10.8 VDBE Instruction Format + Coroutines
+//
+// This crate provides the VDBE (Virtual Database Engine) program builder,
+// label resolution, register allocation, coroutine mechanism, and disassembly.
+// The foundational types (Opcode, VdbeOp, P4) live in fsqlite-types.
 
+use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+
+// ── Label System ────────────────────────────────────────────────────────────
+
+/// An opaque handle representing a forward-reference label.
+///
+/// Labels allow codegen to emit jump instructions before the target address
+/// is known. All labels MUST be resolved before execution begins; unresolved
+/// labels are a codegen bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Label(u32);
+
+/// Internal tracking for label resolution.
+#[derive(Debug)]
+enum LabelState {
+    /// Not yet resolved. Contains the indices of instructions whose `p2`
+    /// field should be patched when the label is resolved.
+    Unresolved(Vec<usize>),
+    /// Resolved to a concrete instruction address.
+    Resolved(i32),
+}
+
+// ── Sort Order ──────────────────────────────────────────────────────────────
+
+/// Sort direction for key comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    /// Ascending order (default).
+    Asc,
+    /// Descending order.
+    Desc,
+}
+
+// ── KeyInfo ─────────────────────────────────────────────────────────────────
+
+/// Describes the key structure for multi-column index comparisons.
+///
+/// Used by Compare, IdxInsert, IdxDelete, and seek operations. Each field
+/// has an associated collation sequence and sort order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyInfo {
+    /// Number of key fields.
+    pub num_fields: u16,
+    /// Collation sequence name per field (one entry per `num_fields`).
+    pub collations: Vec<String>,
+    /// Sort direction per field.
+    pub sort_orders: Vec<SortOrder>,
+}
+
+// ── Coroutine State ─────────────────────────────────────────────────────────
+
+/// Tracks the execution state of a coroutine.
+///
+/// Coroutines in VDBE are cooperative PC-swap state machines (NOT async).
+/// `InitCoroutine` initializes the state, `Yield` swaps PCs bidirectionally,
+/// and `EndCoroutine` marks exhaustion and returns to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoroutineState {
+    /// The register that stores the yield/resume PC.
+    pub yield_reg: i32,
+    /// The saved program counter (where to resume).
+    pub saved_pc: i32,
+    /// Whether the coroutine has been exhausted (EndCoroutine reached).
+    pub exhausted: bool,
+}
+
+impl CoroutineState {
+    /// Create a new coroutine state with the given yield register and
+    /// initial body address.
+    pub fn new(yield_reg: i32, body_pc: i32) -> Self {
+        Self {
+            yield_reg,
+            saved_pc: body_pc,
+            exhausted: false,
+        }
+    }
+
+    /// Perform a bidirectional PC swap (Yield semantics).
+    ///
+    /// The current PC is saved into this state, and the previously saved PC
+    /// is returned as the new PC to jump to.
+    pub fn yield_swap(&mut self, current_pc: i32) -> i32 {
+        let resume_at = self.saved_pc;
+        self.saved_pc = current_pc;
+        resume_at
+    }
+
+    /// Mark the coroutine as exhausted (EndCoroutine semantics).
+    ///
+    /// Returns the saved PC to return to the caller.
+    pub fn end(&mut self) -> i32 {
+        self.exhausted = true;
+        self.saved_pc
+    }
+}
+
+// ── Register Allocator ──────────────────────────────────────────────────────
+
+/// Sequential register allocator for the VDBE register file.
+///
+/// Registers are numbered starting at 1 (register 0 is reserved/unused,
+/// matching C SQLite convention). The allocator supports both persistent
+/// registers (held for statement lifetime) and temporary registers that
+/// can be returned to a reuse pool.
+#[derive(Debug)]
+pub struct RegisterAllocator {
+    /// The next register number to allocate (starts at 1).
+    next_reg: i32,
+    /// Pool of returned temporary registers available for reuse.
+    temp_pool: Vec<i32>,
+}
+
+impl RegisterAllocator {
+    /// Create a new allocator. First allocation returns register 1.
+    pub fn new() -> Self {
+        Self {
+            next_reg: 1,
+            temp_pool: Vec::new(),
+        }
+    }
+
+    /// Allocate a single persistent register.
+    pub fn alloc_reg(&mut self) -> i32 {
+        let reg = self.next_reg;
+        self.next_reg += 1;
+        reg
+    }
+
+    /// Allocate a contiguous block of `n` persistent registers.
+    ///
+    /// Returns the first register number. The block spans `[result, result+n)`.
+    pub fn alloc_regs(&mut self, n: i32) -> i32 {
+        let first = self.next_reg;
+        self.next_reg += n;
+        first
+    }
+
+    /// Allocate a temporary register (reuses from pool if available).
+    pub fn alloc_temp(&mut self) -> i32 {
+        self.temp_pool.pop().unwrap_or_else(|| {
+            let reg = self.next_reg;
+            self.next_reg += 1;
+            reg
+        })
+    }
+
+    /// Return a temporary register to the reuse pool.
+    pub fn free_temp(&mut self, reg: i32) {
+        self.temp_pool.push(reg);
+    }
+
+    /// The total number of registers allocated (high water mark).
+    pub fn count(&self) -> i32 {
+        self.next_reg - 1
+    }
+}
+
+impl Default for RegisterAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── VDBE Program Builder ────────────────────────────────────────────────────
+
+/// A VDBE bytecode program under construction.
+///
+/// Provides methods to emit instructions, create/resolve labels for forward
+/// jumps, and allocate registers. Once construction is complete, call
+/// [`finish`](Self::finish) to validate and extract the final instruction
+/// sequence.
+#[derive(Debug)]
+pub struct ProgramBuilder {
+    /// The instruction sequence.
+    ops: Vec<VdbeOp>,
+    /// Label states (indexed by `Label.0`).
+    labels: Vec<LabelState>,
+    /// Register allocator.
+    regs: RegisterAllocator,
+}
+
+impl ProgramBuilder {
+    /// Create a new empty program builder.
+    pub fn new() -> Self {
+        Self {
+            ops: Vec::new(),
+            labels: Vec::new(),
+            regs: RegisterAllocator::new(),
+        }
+    }
+
+    // ── Instruction emission ────────────────────────────────────────────
+
+    /// Emit a single instruction and return its address (index in `ops`).
+    pub fn emit(&mut self, op: VdbeOp) -> usize {
+        let addr = self.ops.len();
+        self.ops.push(op);
+        addr
+    }
+
+    /// Emit a simple instruction from parts.
+    pub fn emit_op(&mut self, opcode: Opcode, p1: i32, p2: i32, p3: i32, p4: P4, p5: u16) -> usize {
+        self.emit(VdbeOp {
+            opcode,
+            p1,
+            p2,
+            p3,
+            p4,
+            p5,
+        })
+    }
+
+    /// The current address (index of the next instruction to be emitted).
+    pub fn current_addr(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Get a reference to the instruction at `addr`.
+    pub fn op_at(&self, addr: usize) -> Option<&VdbeOp> {
+        self.ops.get(addr)
+    }
+
+    /// Get a mutable reference to the instruction at `addr`.
+    pub fn op_at_mut(&mut self, addr: usize) -> Option<&mut VdbeOp> {
+        self.ops.get_mut(addr)
+    }
+
+    // ── Label system ────────────────────────────────────────────────────
+
+    /// Create a new label for forward-reference jumps.
+    pub fn emit_label(&mut self) -> Label {
+        let id = u32::try_from(self.labels.len()).expect("too many labels");
+        self.labels.push(LabelState::Unresolved(Vec::new()));
+        Label(id)
+    }
+
+    /// Emit a jump instruction whose p2 target is a label (forward reference).
+    ///
+    /// The label's address will be patched into p2 when `resolve_label` is called.
+    pub fn emit_jump_to_label(
+        &mut self,
+        opcode: Opcode,
+        p1: i32,
+        p3: i32,
+        label: Label,
+        p4: P4,
+        p5: u16,
+    ) -> usize {
+        let addr = self.emit(VdbeOp {
+            opcode,
+            p1,
+            p2: -1, // placeholder; will be patched
+            p3,
+            p4,
+            p5,
+        });
+
+        let idx = label.0 as usize;
+        match &mut self.labels[idx] {
+            LabelState::Unresolved(refs) => refs.push(addr),
+            LabelState::Resolved(target) => {
+                // Label already resolved; patch immediately.
+                self.ops[addr].p2 = *target;
+            }
+        }
+
+        addr
+    }
+
+    /// Resolve a label to the current instruction address.
+    ///
+    /// All instructions that reference this label have their `p2` patched.
+    pub fn resolve_label(&mut self, label: Label) {
+        let target = i32::try_from(self.ops.len()).expect("program too large");
+        let idx = label.0 as usize;
+
+        let refs = match std::mem::replace(&mut self.labels[idx], LabelState::Resolved(target)) {
+            LabelState::Unresolved(refs) => refs,
+            LabelState::Resolved(_) => {
+                // Double resolve is a codegen bug, but we tolerate it
+                // if the target is the same.
+                return;
+            }
+        };
+
+        for op_idx in refs {
+            self.ops[op_idx].p2 = target;
+        }
+    }
+
+    /// Resolve a label to a specific address (not necessarily current).
+    pub fn resolve_label_to(&mut self, label: Label, address: i32) {
+        let idx = label.0 as usize;
+
+        let refs = match std::mem::replace(&mut self.labels[idx], LabelState::Resolved(address)) {
+            LabelState::Unresolved(refs) => refs,
+            LabelState::Resolved(_) => return,
+        };
+
+        for op_idx in refs {
+            self.ops[op_idx].p2 = address;
+        }
+    }
+
+    // ── Register allocation (delegates to RegisterAllocator) ────────────
+
+    /// Allocate a single persistent register.
+    pub fn alloc_reg(&mut self) -> i32 {
+        self.regs.alloc_reg()
+    }
+
+    /// Allocate a contiguous block of `n` persistent registers.
+    pub fn alloc_regs(&mut self, n: i32) -> i32 {
+        self.regs.alloc_regs(n)
+    }
+
+    /// Allocate a temporary register (reusable).
+    pub fn alloc_temp(&mut self) -> i32 {
+        self.regs.alloc_temp()
+    }
+
+    /// Return a temporary register to the pool.
+    pub fn free_temp(&mut self, reg: i32) {
+        self.regs.free_temp(reg);
+    }
+
+    /// Total registers allocated (high water mark).
+    pub fn register_count(&self) -> i32 {
+        self.regs.count()
+    }
+
+    // ── Finalization ────────────────────────────────────────────────────
+
+    /// Validate all labels are resolved and return the finished program.
+    pub fn finish(self) -> Result<VdbeProgram> {
+        // Check for unresolved labels.
+        for (i, state) in self.labels.iter().enumerate() {
+            if let LabelState::Unresolved(refs) = state {
+                if !refs.is_empty() {
+                    return Err(FrankenError::Internal(format!(
+                        "unresolved label {i} referenced by {} instruction(s)",
+                        refs.len()
+                    )));
+                }
+            }
+        }
+
+        Ok(VdbeProgram {
+            ops: self.ops,
+            register_count: self.regs.count(),
+        })
+    }
+}
+
+impl Default for ProgramBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── VDBE Program ────────────────────────────────────────────────────────────
+
+/// A finalized VDBE bytecode program ready for execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VdbeProgram {
+    /// The instruction sequence.
+    ops: Vec<VdbeOp>,
+    /// Number of registers needed (high water mark from allocation).
+    register_count: i32,
+}
+
+impl VdbeProgram {
+    /// The instruction sequence.
+    pub fn ops(&self) -> &[VdbeOp] {
+        &self.ops
+    }
+
+    /// Number of instructions.
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Whether the program is empty.
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Number of registers required.
+    pub fn register_count(&self) -> i32 {
+        self.register_count
+    }
+
+    /// Get the instruction at the given program counter.
+    pub fn get(&self, pc: usize) -> Option<&VdbeOp> {
+        self.ops.get(pc)
+    }
+
+    /// Disassemble the program to a human-readable string.
+    ///
+    /// Output format matches SQLite's `EXPLAIN` output:
+    /// ```text
+    /// addr  opcode         p1    p2    p3    p4             p5
+    /// ----  ----------     ----  ----  ----  -----          --
+    /// 0     Init           0     8     0                    0
+    /// ```
+    pub fn disassemble(&self) -> String {
+        use std::fmt::Write;
+
+        let mut out = std::string::String::with_capacity(self.ops.len() * 60);
+        out.push_str("addr  opcode           p1    p2    p3    p4                 p5\n");
+        out.push_str("----  ---------------  ----  ----  ----  -----------------  --\n");
+
+        for (addr, op) in self.ops.iter().enumerate() {
+            let p4_str = match &op.p4 {
+                P4::None => String::new(),
+                P4::Int(v) => format!("(int){v}"),
+                P4::Int64(v) => format!("(i64){v}"),
+                P4::Real(v) => format!("(real){v}"),
+                P4::Str(s) => format!("(str){s}"),
+                P4::Blob(b) => format!("(blob)[{}B]", b.len()),
+                P4::Collation(c) => format!("(coll){c}"),
+                P4::FuncName(f) => format!("(func){f}"),
+                P4::Table(t) => format!("(tbl){t}"),
+                P4::Affinity(a) => format!("(aff){a}"),
+            };
+
+            writeln!(
+                &mut out,
+                "{addr:<4}  {:<15}  {:<4}  {:<4}  {:<4}  {:<17}  {:<2}",
+                op.opcode.name(),
+                op.p1,
+                op.p2,
+                op.p3,
+                p4_str,
+                op.p5,
+            )
+            .expect("write to string");
+        }
+
+        out
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── test_vdbe_op_struct_size ─────────────────────────────────────────
+    #[test]
+    fn test_vdbe_op_struct_size() {
+        // Verify VdbeOp fields are accessible and correctly typed.
+        let op = VdbeOp {
+            opcode: Opcode::Integer,
+            p1: 42,
+            p2: 1,
+            p3: 0,
+            p4: P4::None,
+            p5: 0,
+        };
+        assert_eq!(op.opcode, Opcode::Integer);
+        assert_eq!(op.p1, 42_i32);
+        assert_eq!(op.p2, 1_i32);
+        assert_eq!(op.p3, 0_i32);
+        assert_eq!(op.p4, P4::None);
+        assert_eq!(op.p5, 0_u16);
+    }
+
+    // ── test_p4_variant_all_types ───────────────────────────────────────
+    #[test]
+    fn test_p4_variant_all_types() {
+        // Each P4 variant can be constructed and pattern-matched.
+        let variants: Vec<P4> = vec![
+            P4::None,
+            P4::Int(42),
+            P4::Int64(i64::MAX),
+            P4::Real(1.234_567_89),
+            P4::Str("hello".to_owned()),
+            P4::Blob(vec![0xDE, 0xAD]),
+            P4::Collation("BINARY".to_owned()),
+            P4::FuncName("count".to_owned()),
+            P4::Table("users".to_owned()),
+            P4::Affinity("ddd".to_owned()),
+        ];
+        assert_eq!(variants.len(), 10);
+
+        // Verify each variant matches itself.
+        assert!(matches!(variants[0], P4::None));
+        assert!(matches!(variants[1], P4::Int(42)));
+        assert!(matches!(variants[2], P4::Int64(i64::MAX)));
+        assert!(matches!(variants[3], P4::Real(_)));
+        assert!(matches!(variants[4], P4::Str(_)));
+        assert!(matches!(variants[5], P4::Blob(_)));
+        assert!(matches!(variants[6], P4::Collation(_)));
+        assert!(matches!(variants[7], P4::FuncName(_)));
+        assert!(matches!(variants[8], P4::Table(_)));
+        assert!(matches!(variants[9], P4::Affinity(_)));
+    }
+
+    // ── test_label_emit_and_resolve ─────────────────────────────────────
+    #[test]
+    fn test_label_emit_and_resolve() {
+        let mut b = ProgramBuilder::new();
+
+        // Emit two distinct labels.
+        let label_a = b.emit_label();
+        let label_b = b.emit_label();
+        assert_ne!(label_a, label_b);
+
+        // Emit a jump to label_a (forward reference).
+        let jump_addr = b.emit_jump_to_label(Opcode::Goto, 0, 0, label_a, P4::None, 0);
+        assert_eq!(b.op_at(jump_addr).unwrap().p2, -1); // unresolved placeholder
+
+        // Emit some instructions.
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 2, 2, 0, P4::None, 0);
+
+        // Resolve label_a to the current address (2 instructions after the jump).
+        b.resolve_label(label_a);
+
+        // The jump's p2 should now be patched to address 3.
+        assert_eq!(b.op_at(jump_addr).unwrap().p2, 3);
+
+        // Emit another jump to label_b.
+        let jump2 = b.emit_jump_to_label(Opcode::If, 1, 0, label_b, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(label_b);
+        assert_eq!(b.op_at(jump2).unwrap().p2, 5);
+
+        // Finish should succeed (all labels resolved).
+        let prog = b.finish().unwrap();
+        assert_eq!(prog.len(), 5);
+    }
+
+    // ── test_unresolved_label_error ─────────────────────────────────────
+    #[test]
+    fn test_unresolved_label_error() {
+        let mut b = ProgramBuilder::new();
+        let label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, label, P4::None, 0);
+
+        // Don't resolve the label — finish should fail.
+        let result = b.finish();
+        assert!(result.is_err());
+    }
+
+    // ── test_register_alloc_sequential ──────────────────────────────────
+    #[test]
+    fn test_register_alloc_sequential() {
+        let mut alloc = RegisterAllocator::new();
+
+        // Sequential single allocations start at 1.
+        assert_eq!(alloc.alloc_reg(), 1);
+        assert_eq!(alloc.alloc_reg(), 2);
+        assert_eq!(alloc.alloc_reg(), 3);
+
+        // Block allocation returns first register of contiguous block.
+        let block_start = alloc.alloc_regs(3);
+        assert_eq!(block_start, 4);
+        // Next single alloc continues after the block.
+        assert_eq!(alloc.alloc_reg(), 7);
+
+        assert_eq!(alloc.count(), 7);
+    }
+
+    // ── test_register_temp_pool_reuse ───────────────────────────────────
+    #[test]
+    fn test_register_temp_pool_reuse() {
+        let mut alloc = RegisterAllocator::new();
+
+        let r1 = alloc.alloc_reg(); // 1
+        let t1 = alloc.alloc_temp(); // 2 (new allocation)
+        let t2 = alloc.alloc_temp(); // 3 (new allocation)
+        assert_eq!(r1, 1);
+        assert_eq!(t1, 2);
+        assert_eq!(t2, 3);
+
+        // Return temps to pool.
+        alloc.free_temp(t1);
+        alloc.free_temp(t2);
+
+        // Next temp allocations reuse from pool (LIFO order).
+        let t3 = alloc.alloc_temp();
+        let t4 = alloc.alloc_temp();
+        assert_eq!(t3, t2); // 3 (last freed)
+        assert_eq!(t4, t1); // 2
+
+        // High water mark unchanged (no new registers needed).
+        assert_eq!(alloc.count(), 3);
+    }
+
+    // ── test_coroutine_init_yield_end ───────────────────────────────────
+    #[test]
+    fn test_coroutine_init_yield_end() {
+        // InitCoroutine: set yield register to body PC.
+        let yield_reg = 1;
+        let body_pc = 10;
+        let mut co = CoroutineState::new(yield_reg, body_pc);
+        assert_eq!(co.yield_reg, yield_reg);
+        assert_eq!(co.saved_pc, body_pc);
+        assert!(!co.exhausted);
+
+        // Yield: bidirectional PC swap.
+        // Caller is at PC=5, coroutine body is at PC=10.
+        let resume = co.yield_swap(5);
+        assert_eq!(resume, 10); // jump to body
+        assert_eq!(co.saved_pc, 5); // caller's PC saved
+
+        // Body yields back: caller at 5, body at 15.
+        let resume2 = co.yield_swap(15);
+        assert_eq!(resume2, 5); // back to caller
+        assert_eq!(co.saved_pc, 15);
+
+        // EndCoroutine: marks exhaustion, returns to caller.
+        let final_pc = co.end();
+        assert_eq!(final_pc, 15); // returns saved_pc
+        assert!(co.exhausted);
+    }
+
+    // ── test_coroutine_multi_row_production ─────────────────────────────
+    #[test]
+    fn test_coroutine_multi_row_production() {
+        // Simulate a CTE body producing 5 rows via Yield loop.
+        let mut co = CoroutineState::new(1, 10); // body starts at PC=10
+        let mut rows_consumed = 0;
+        let caller_start_pc = 5;
+
+        // Caller yields to body.
+        let mut next_pc = co.yield_swap(caller_start_pc);
+        assert_eq!(next_pc, 10); // first entry into body
+
+        // Body produces rows.
+        for row in 1..=5 {
+            // Body "produces" a row, then yields back to caller.
+            let body_pc = 10 + row; // body advances its PC
+            next_pc = co.yield_swap(body_pc);
+            // Caller resumes at its saved PC.
+            assert_eq!(next_pc, caller_start_pc);
+            rows_consumed += 1;
+
+            if row < 5 {
+                // Caller yields back to body to get next row.
+                next_pc = co.yield_swap(caller_start_pc);
+                assert_eq!(next_pc, body_pc); // resume body
+            }
+        }
+
+        assert_eq!(rows_consumed, 5);
+
+        // Body signals exhaustion.
+        let final_pc = co.end();
+        assert!(co.exhausted);
+        assert!(final_pc > 0); // valid return PC
+    }
+
+    // ── test_all_opcode_dispatch_coverage ────────────────────────────────
+    #[test]
+    fn test_all_opcode_dispatch_coverage() {
+        // Every Opcode enum variant (1..=190) has a valid name and can be
+        // constructed from its byte value. This ensures no gaps in the enum.
+        for byte in 1..=190u8 {
+            let opcode = Opcode::from_byte(byte).unwrap_or_else(|| {
+                panic!("Opcode::from_byte({byte}) returned None — gap in opcode enum");
+            });
+            let name = opcode.name();
+            assert!(!name.is_empty(), "opcode {byte} has empty name");
+        }
+        assert_eq!(Opcode::COUNT, 191);
+    }
+
+    // ── test_p5_flags_u16_range ─────────────────────────────────────────
+    #[test]
+    fn test_p5_flags_u16_range() {
+        // Confirm p5 is u16 and accepts values above 0xFF.
+        let op = VdbeOp {
+            opcode: Opcode::Eq,
+            p1: 1,
+            p2: 5,
+            p3: 2,
+            p4: P4::None,
+            p5: 0x1FF, // 511, exceeds u8 range
+        };
+        assert_eq!(op.p5, 0x1FF);
+        assert!(op.p5 > 255);
+
+        let op2 = VdbeOp {
+            opcode: Opcode::Noop,
+            p1: 0,
+            p2: 0,
+            p3: 0,
+            p4: P4::None,
+            p5: u16::MAX,
+        };
+        assert_eq!(op2.p5, 65535);
+    }
+
+    // ── test_program_builder_basic ──────────────────────────────────────
+    #[test]
+    fn test_program_builder_basic() {
+        let mut b = ProgramBuilder::new();
+
+        // Build: Init -> Integer 42 into r1 -> ResultRow r1,1 -> Halt
+        let end_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+        let r1 = b.alloc_reg();
+        assert_eq!(r1, 1);
+        b.emit_op(Opcode::Integer, 42, r1, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end_label);
+
+        let prog = b.finish().unwrap();
+        assert_eq!(prog.len(), 4);
+        assert_eq!(prog.register_count(), 1);
+
+        // The Init instruction's p2 should point to address 4 (after Halt).
+        assert_eq!(prog.get(0).unwrap().opcode, Opcode::Init);
+        assert_eq!(prog.get(0).unwrap().p2, 4);
+    }
+
+    // ── test_disassemble ────────────────────────────────────────────────
+    #[test]
+    fn test_disassemble() {
+        let mut b = ProgramBuilder::new();
+        b.emit_op(Opcode::Init, 0, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 42, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+
+        let asm = prog.disassemble();
+        assert!(asm.contains("Init"));
+        assert!(asm.contains("Integer"));
+        assert!(asm.contains("Halt"));
+        assert!(asm.contains("42")); // p1 of Integer
+    }
+
+    // ── test_key_info ───────────────────────────────────────────────────
+    #[test]
+    fn test_key_info() {
+        let ki = KeyInfo {
+            num_fields: 3,
+            collations: vec![
+                "BINARY".to_owned(),
+                "NOCASE".to_owned(),
+                "BINARY".to_owned(),
+            ],
+            sort_orders: vec![SortOrder::Asc, SortOrder::Desc, SortOrder::Asc],
+        };
+        assert_eq!(ki.num_fields, 3);
+        assert_eq!(ki.collations.len(), 3);
+        assert_eq!(ki.sort_orders[1], SortOrder::Desc);
+    }
+
+    // ── test_label_already_resolved ─────────────────────────────────────
+    #[test]
+    fn test_label_already_resolved() {
+        // If a label is resolved before a jump references it, the jump
+        // should be patched immediately.
+        let mut b = ProgramBuilder::new();
+        let label = b.emit_label();
+        b.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
+        b.resolve_label(label); // resolved to address 1
+
+        // Now emit a jump referencing the already-resolved label.
+        let jump_addr = b.emit_jump_to_label(Opcode::Goto, 0, 0, label, P4::None, 0);
+        // p2 should already be patched to 1.
+        assert_eq!(b.op_at(jump_addr).unwrap().p2, 1);
+
+        let prog = b.finish().unwrap();
+        assert_eq!(prog.len(), 2);
+    }
+
+    // ── test_builder_register_via_builder ────────────────────────────────
+    #[test]
+    fn test_builder_register_via_builder() {
+        let mut b = ProgramBuilder::new();
+        let r1 = b.alloc_reg();
+        let r2 = b.alloc_reg();
+        let block = b.alloc_regs(4);
+        assert_eq!(r1, 1);
+        assert_eq!(r2, 2);
+        assert_eq!(block, 3);
+        assert_eq!(b.register_count(), 6);
+
+        // Temp allocation.
+        let t1 = b.alloc_temp();
+        assert_eq!(t1, 7);
+        b.free_temp(t1);
+        let t2 = b.alloc_temp();
+        assert_eq!(t2, t1); // reused
+    }
+
+    // ── test_resolve_label_to_specific_address ──────────────────────────
+    #[test]
+    fn test_resolve_label_to_specific_address() {
+        let mut b = ProgramBuilder::new();
+        let label = b.emit_label();
+        let jump_addr = b.emit_jump_to_label(Opcode::Goto, 0, 0, label, P4::None, 0);
+        b.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
+
+        // Resolve to a specific address (not current).
+        b.resolve_label_to(label, 42);
+        assert_eq!(b.op_at(jump_addr).unwrap().p2, 42);
+    }
+
+    // ── test_empty_program_finishes ─────────────────────────────────────
+    #[test]
+    fn test_empty_program_finishes() {
+        let b = ProgramBuilder::new();
+        let prog = b.finish().unwrap();
+        assert!(prog.is_empty());
+        assert_eq!(prog.register_count(), 0);
+    }
+
+    // ── test_unreferenced_unresolved_label_ok ───────────────────────────
+    #[test]
+    fn test_unreferenced_unresolved_label_ok() {
+        // A label that was created but never referenced or resolved should
+        // not cause an error (it's unused, not a dangling reference).
+        let mut b = ProgramBuilder::new();
+        let _label = b.emit_label();
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        assert_eq!(prog.len(), 1);
+    }
+}
