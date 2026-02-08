@@ -458,14 +458,18 @@ impl UnixFile {
             info.n_exclusive = info.n_exclusive.saturating_sub(1);
 
             if info.n_exclusive == 0 {
-                debug_assert!(info.n_shared > 0, "exclusive implies shared");
-                let ok = posix_lock(file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
-                debug_assert!(
-                    ok,
-                    "downgrading an exclusive lock back to shared should not block"
-                );
-                if !ok {
-                    return Err(FrankenError::Busy);
+                if info.n_shared > 0 {
+                    let ok = posix_lock(file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
+                    debug_assert!(
+                        ok,
+                        "downgrading an exclusive lock back to shared should not block"
+                    );
+                    if !ok {
+                        return Err(FrankenError::Busy);
+                    }
+                } else {
+                    // No readers remain in-process: release the shared-range lock entirely.
+                    posix_unlock(file, SHARED_FIRST, SHARED_SIZE)?;
                 }
             }
         }
@@ -598,31 +602,41 @@ impl VfsFile for UnixFile {
         let original = self.lock_level;
 
         if level >= LockLevel::Shared && self.lock_level < LockLevel::Shared {
+            // In-process pending/exclusive blocks new readers. (fcntl locks are per-process.)
+            if info.n_pending > 0 || info.n_exclusive > 0 {
+                return Err(FrankenError::Busy);
+            }
+
+            // Check PENDING byte is not write-locked (blocks new readers).
+            if !posix_lock(&*file, libc::F_RDLCK, PENDING_BYTE, 1)? {
+                return Err(FrankenError::Busy);
+            }
+
             if info.n_shared == 0 {
                 debug_assert_eq!(info.n_reserved, 0);
                 debug_assert_eq!(info.n_pending, 0);
                 debug_assert_eq!(info.n_exclusive, 0);
-
-                // Step 1: Check PENDING byte is not write-locked (blocks new readers).
-                if !posix_lock(&*file, libc::F_RDLCK, PENDING_BYTE, 1)? {
-                    return Err(FrankenError::Busy);
-                }
 
                 // Step 2: Acquire read lock on SHARED range.
                 if !posix_lock(&*file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)? {
                     posix_unlock(&*file, PENDING_BYTE, 1)?;
                     return Err(FrankenError::Busy);
                 }
-
-                // Step 3: Release PENDING byte.
-                posix_unlock(&*file, PENDING_BYTE, 1)?;
             }
+
+            // Release PENDING byte.
+            posix_unlock(&*file, PENDING_BYTE, 1)?;
 
             info.n_shared += 1;
             self.lock_level = LockLevel::Shared;
         }
 
         if level >= LockLevel::Reserved && self.lock_level < LockLevel::Reserved {
+            // RESERVED is exclusive per connection; enforce that within a process.
+            if info.n_reserved > 0 {
+                Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
+                return Err(FrankenError::Busy);
+            }
             if info.n_reserved == 0 && !posix_lock(&*file, libc::F_WRLCK, RESERVED_BYTE, 1)? {
                 Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
@@ -633,6 +647,11 @@ impl VfsFile for UnixFile {
         }
 
         if level >= LockLevel::Pending && self.lock_level < LockLevel::Pending {
+            // Only one pending/exclusive lock-holder per process.
+            if info.n_pending > 0 {
+                Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
+                return Err(FrankenError::Busy);
+            }
             if info.n_pending == 0 && !posix_lock(&*file, libc::F_WRLCK, PENDING_BYTE, 1)? {
                 Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
                 return Err(FrankenError::Busy);
@@ -643,6 +662,11 @@ impl VfsFile for UnixFile {
         }
 
         if level >= LockLevel::Exclusive && self.lock_level < LockLevel::Exclusive {
+            // Exclusive requires that this handle is the sole shared lock holder in-process.
+            if info.n_exclusive > 0 || info.n_shared > 1 {
+                Self::unlock_with_level(&mut self.lock_level, &mut info, file.as_ref(), original)?;
+                return Err(FrankenError::Busy);
+            }
             if info.n_exclusive == 0
                 && !posix_lock(&*file, libc::F_WRLCK, SHARED_FIRST, SHARED_SIZE)?
             {
@@ -668,9 +692,14 @@ impl VfsFile for UnixFile {
         let file = Arc::clone(&self.file);
         let info = self.inode_info.lock().expect("inode info lock poisoned");
 
-        // If *this process* holds reserved or higher, report false (it's us).
-        if info.n_reserved > 0 {
+        // If *this handle* holds reserved or higher, report false (it's us).
+        if self.lock_level >= LockLevel::Reserved {
             return Ok(false);
+        }
+
+        // If another handle in this process holds reserved, that's "another connection".
+        if info.n_reserved > 0 {
+            return Ok(true);
         }
         drop(info);
 
