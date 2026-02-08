@@ -321,7 +321,8 @@ cross-cutting checklist:
 - **GC horizon must account for TxnSlot sentinel states.**
   `raise_gc_horizon()` MUST treat TxnSlots in CLAIMING/CLEANING sentinel states
   as horizon blockers (§5.6.5). Crash cleanup MUST preserve enough identity
-  (`cleanup_txn_id`) to make cleanup retryable without lock leaks (§5.6.2).
+  (the TxnId payload encoded in TAG_CLEANING; optionally mirrored in
+  `cleanup_txn_id`) to make cleanup retryable without lock leaks (§5.6.2).
 
 - **Direct I/O is incompatible with SQLite WAL framing.**
   Compatibility mode MUST NOT require `O_DIRECT` for `.wal` I/O because the
@@ -6928,6 +6929,8 @@ TxnSlot := {
     cleanup_txn_id   : AtomicU64,    -- crash-cleanup: TxnId being cleaned when slot is in CLEANING state.
                                    -- Only meaningful when txn_id is CLEANING; otherwise ignored.
                                    -- SHOULD be 0 in all other states; MUST be zeroed when slot is freed.
+                                   -- Redundant with `decode_payload(txn_id)` in TAG_CLEANING; if non-zero,
+                                   -- it MUST equal the tagged payload.
     _padding        : [u8; 40],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
                                    -- Layout: 88 bytes of fields with repr(C) alignment + 40B padding = 128B total.
                                    -- Gaps: 2B after mode (witness_epoch align), 1B after marked_for_abort (write_set_pages align).
@@ -7106,8 +7109,8 @@ cleanup_orphaned_slots():
                 continue
             if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
                 // If the cleaner crashed mid-release, we must not leak locks.
-                // cleanup_txn_id preserves the original TxnId so cleanup is retryable.
-                orphan_txn_id = slot.cleanup_txn_id.load()
+                // TAG_CLEANING payload preserves the original TxnId so cleanup is retryable.
+                orphan_txn_id = decode_payload(tid)
                 if orphan_txn_id != 0:
                     release_page_locks_for(orphan_txn_id)
                 // Best-effort reclaim: clear fields again and free the slot.
@@ -8265,6 +8268,11 @@ maintain the standard `foo.db-shm` WAL-index:
          2. Write/update `aReadMark[i] = m` while holding EXCLUSIVE.
          3. Downgrade to **SHARED** `WAL_READ_LOCK(i)` for the full snapshot
             lifetime, releasing it only when the snapshot ends.
+
+       **Downgrade rule (normative):** Downgrading EXCLUSIVE → SHARED MUST NOT
+       introduce an "unlock window" where no lock is held. Implementations MUST
+       perform the downgrade as a lock-type transition on the same byte-range
+       (e.g., replace a write lock with a read lock).
 
      This matches SQLite's invariants: the lock (not just the mark value) is what
      legacy checkpointers consult to decide which marks are live, and EXCLUSIVE
