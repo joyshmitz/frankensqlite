@@ -277,6 +277,7 @@ pub fn balance_nonroot<W: PageWriter>(
     overflow_cells: &[Vec<u8>],
     overflow_insert_idx: usize,
     usable_size: u32,
+    parent_is_root: bool,
 ) -> Result<()> {
     let parent_data = writer.read_page(cx, parent_page_no)?;
     let parent_offset = header_offset_for_page(parent_page_no);
@@ -530,6 +531,7 @@ pub fn balance_nonroot<W: PageWriter>(
         sibling_count,
         &new_pgnos,
         &new_dividers,
+        parent_is_root,
     )?;
 
     Ok(())
@@ -649,6 +651,16 @@ fn compute_distribution(
     let mut current_page = 0;
     for (i, cell) in cells.iter().enumerate() {
         let cell_cost = cell.size as usize + CELL_POINTER_SIZE as usize;
+        if hdr_size + cell_cost > usable_space {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "balance: cell {} requires {} bytes but page usable space is {}",
+                    i,
+                    hdr_size + cell_cost,
+                    usable_space
+                ),
+            });
+        }
 
         // Check if cell fits on current page.
         if page_sizes[current_page] + cell_cost > usable_space && distribution[current_page] > 0 {
@@ -659,6 +671,14 @@ fn compute_distribution(
                 distribution.push(0);
                 page_sizes.push(hdr_size);
             }
+        }
+        if page_sizes[current_page] + cell_cost > usable_space {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "balance: cell {} cannot fit on page {} (usage {} + cost {} > {})",
+                    i, current_page, page_sizes[current_page], cell_cost, usable_space
+                ),
+            });
         }
 
         distribution[current_page] += 1;
@@ -680,10 +700,10 @@ fn compute_distribution(
             // Few iterations suffice.
             let mut changed = false;
             for i in 0..page_count - 1 {
-                let left_start: usize = distribution[..i].iter().sum();
-                let left_count = distribution[i];
-                let right_start = left_start + left_count;
-                let right_count = distribution[i + 1];
+                let mut left_start: usize = distribution[..i].iter().sum();
+                let mut left_count = distribution[i];
+                let mut right_start = left_start + left_count;
+                let mut right_count = distribution[i + 1];
 
                 // Try moving the last cell from left to right.
                 if left_count > 1 {
@@ -703,6 +723,10 @@ fn compute_distribution(
                         page_sizes[i] = left_usage;
                         page_sizes[i + 1] = right_usage;
                         changed = true;
+                        left_count = distribution[i];
+                        right_count = distribution[i + 1];
+                        left_start = distribution[..i].iter().sum();
+                        right_start = left_start + left_count;
                     }
                 }
 
@@ -730,6 +754,25 @@ fn compute_distribution(
                 break;
             }
         }
+    }
+
+    let mut cursor = 0usize;
+    for (i, &count) in distribution.iter().enumerate() {
+        let slice_end = cursor + count;
+        let payload_bytes = cells[cursor..slice_end]
+            .iter()
+            .map(|c| c.data.len())
+            .sum::<usize>();
+        let required = hdr_size + count * CELL_POINTER_SIZE as usize + payload_bytes;
+        if required > usable_space {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "balance: distribution page {} requires {} bytes (usable {})",
+                    i, required, usable_space
+                ),
+            });
+        }
+        cursor = slice_end;
     }
 
     // Verify no page is empty (except in degenerate cases).
@@ -768,7 +811,15 @@ fn build_page(
 
     for cell in cells {
         let cell_len = cell.data.len();
-        content_offset -= cell_len;
+        let Some(next_offset) = content_offset.checked_sub(cell_len) else {
+            panic!(
+                "build_page overflow: page_type={page_type:?} header_offset={header_offset} \
+                 page_size={page_size} content_offset={content_offset} cell_len={cell_len} \
+                 cells={}",
+                cells.len()
+            );
+        };
+        content_offset = next_offset;
         page[content_offset..content_offset + cell_len].copy_from_slice(&cell.data);
         #[allow(clippy::cast_possible_truncation)]
         cell_pointers.push(content_offset as u16);
@@ -861,6 +912,7 @@ fn update_parent<W: PageWriter>(
     old_sibling_count: usize,
     new_pgnos: &[PageNumber],
     new_dividers: &[(PageNumber, Vec<u8>)],
+    parent_is_root: bool,
 ) -> Result<()> {
     let page_data = writer.read_page(cx, parent_page_no)?;
     let offset = header_offset_for_page(parent_page_no);
@@ -927,6 +979,29 @@ fn update_parent<W: PageWriter>(
         header.right_child
     };
 
+    if !page_fits(&final_cells, header.page_type, offset, usable_size) {
+        if !parent_is_root {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "parent page {} overflow while balancing non-root child",
+                    parent_page_no
+                ),
+            });
+        }
+
+        return split_overflowing_root(
+            cx,
+            writer,
+            parent_page_no,
+            usable_size,
+            offset,
+            header.page_type,
+            &page_data[..offset],
+            &final_cells,
+            right_child,
+        );
+    }
+
     // Rebuild the parent page.
     let new_page = build_page(
         &final_cells,
@@ -943,6 +1018,159 @@ fn update_parent<W: PageWriter>(
     }
 
     writer.write_page(cx, parent_page_no, &final_page)
+}
+
+fn page_fits(
+    cells: &[GatheredCell],
+    page_type: BtreePageType,
+    header_offset: usize,
+    usable: u32,
+) -> bool {
+    let Some(total) = page_required_bytes(cells, page_type, header_offset) else {
+        return false;
+    };
+    total <= usable as usize
+}
+
+fn page_required_bytes(
+    cells: &[GatheredCell],
+    page_type: BtreePageType,
+    header_offset: usize,
+) -> Option<usize> {
+    let ptr_bytes = cells.len().checked_mul(CELL_POINTER_SIZE as usize)?;
+    let payload_bytes = cells
+        .iter()
+        .try_fold(0usize, |acc, c| acc.checked_add(c.data.len()))?;
+    header_offset
+        .checked_add(page_type.header_size() as usize)?
+        .checked_add(ptr_bytes)?
+        .checked_add(payload_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_overflowing_root<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    root_page_no: PageNumber,
+    usable_size: u32,
+    root_offset: usize,
+    page_type: BtreePageType,
+    root_prefix: &[u8],
+    final_cells: &[GatheredCell],
+    right_child: Option<PageNumber>,
+) -> Result<()> {
+    if !page_type.is_interior() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "cannot split overflowing non-interior root page {}",
+                root_page_no
+            ),
+        });
+    }
+    if final_cells.len() < 2 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "overflowing root {} has too few cells to split",
+                root_page_no
+            ),
+        });
+    }
+    let root_right_child = right_child.ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!("overflowing root {} missing right child", root_page_no),
+    })?;
+
+    let split_idx = final_cells.len() / 2;
+    let left_cells = &final_cells[..split_idx];
+    let right_cells = &final_cells[split_idx + 1..];
+    if left_cells.is_empty() || right_cells.is_empty() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "overflowing root {} split produced empty side (left={}, right={})",
+                root_page_no,
+                left_cells.len(),
+                right_cells.len()
+            ),
+        });
+    }
+
+    let mut divider = final_cells[split_idx].data.clone();
+    if divider.len() < 4 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "overflowing root {} divider cell too small ({} bytes)",
+                root_page_no,
+                divider.len()
+            ),
+        });
+    }
+
+    let left_right_raw = u32::from_be_bytes([divider[0], divider[1], divider[2], divider[3]]);
+    let left_right_child =
+        PageNumber::new(left_right_raw).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "overflowing root {} divider has invalid child pointer {}",
+                root_page_no, left_right_raw
+            ),
+        })?;
+
+    let left_pg = writer.allocate_page(cx)?;
+    let right_pg = writer.allocate_page(cx)?;
+    let left_offset = header_offset_for_page(left_pg);
+    let right_offset = header_offset_for_page(right_pg);
+
+    if !page_fits(left_cells, page_type, left_offset, usable_size)
+        || !page_fits(right_cells, page_type, right_offset, usable_size)
+    {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "overflowing root {} split pages still exceed capacity (left_cells={}, right_cells={})",
+                root_page_no,
+                left_cells.len(),
+                right_cells.len()
+            ),
+        });
+    }
+
+    let left_page = build_page(
+        left_cells,
+        page_type,
+        left_offset,
+        usable_size,
+        Some(left_right_child),
+    );
+    let right_page = build_page(
+        right_cells,
+        page_type,
+        right_offset,
+        usable_size,
+        Some(root_right_child),
+    );
+    writer.write_page(cx, left_pg, &left_page)?;
+    writer.write_page(cx, right_pg, &right_page)?;
+
+    divider[0..4].copy_from_slice(&left_pg.get().to_be_bytes());
+    let root_cell = GatheredCell {
+        size: u16::try_from(divider.len()).unwrap_or(u16::MAX),
+        data: divider,
+    };
+    let root_cells = [root_cell];
+    if !page_fits(&root_cells, page_type, root_offset, usable_size) {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("new root cell does not fit for root {}", root_page_no),
+        });
+    }
+
+    let mut new_root = build_page(
+        &root_cells,
+        page_type,
+        root_offset,
+        usable_size,
+        Some(right_pg),
+    );
+    if root_offset > 0 {
+        new_root[..root_offset].copy_from_slice(root_prefix);
+    }
+    writer.write_page(cx, root_page_no, &new_root)
 }
 
 // ---------------------------------------------------------------------------
@@ -1337,7 +1565,7 @@ mod tests {
             .insert(4, build_leaf_table(&[(10, b"j"), (15, b"o"), (20, b"t")]));
 
         // Balance around child 0 (left child), no overflow.
-        balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE).unwrap();
+        balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true).unwrap();
 
         // With tiny cells on 4096-byte pages, all 6 cells fit on one page.
         // The parent should have 0 dividers and just a right_child.
@@ -1397,7 +1625,7 @@ mod tests {
 
         let overflow_cells = vec![ov_cell[..pos].to_vec()];
 
-        balance_nonroot(&cx, &mut store, pn(2), 0, &overflow_cells, 2, USABLE).unwrap();
+        balance_nonroot(&cx, &mut store, pn(2), 0, &overflow_cells, 2, USABLE, true).unwrap();
 
         // Count total cells across all children.
         let parent_data = store.pages.get(&2).unwrap();

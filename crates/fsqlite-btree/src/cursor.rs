@@ -894,10 +894,12 @@ impl<P: PageWriter> BtCursor<P> {
                 &[cell_data.to_vec()],
                 insert_idx as usize,
                 self.usable_size,
+                true,
             )?;
         } else {
             let parent_page_no = self.stack[depth - 2].page_no;
             let child_idx = self.stack[depth - 2].cell_idx as usize;
+            let parent_is_root = parent_page_no == self.root_page;
 
             balance::balance_nonroot(
                 cx,
@@ -907,6 +909,7 @@ impl<P: PageWriter> BtCursor<P> {
                 &[cell_data.to_vec()],
                 insert_idx as usize,
                 self.usable_size,
+                parent_is_root,
             )?;
         }
 
@@ -936,6 +939,7 @@ impl<P: PageWriter> BtCursor<P> {
             &[],
             0,
             self.usable_size,
+            parent_page_no == self.root_page,
         )?;
 
         // Tree shape may change after balancing.
