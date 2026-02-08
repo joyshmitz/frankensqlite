@@ -147,22 +147,33 @@
         /* ... (skipping unchanged parts) ... */
 
         /* --- Focus Mode --- */
-        body.focus-mode .app-header { margin-top: calc(var(--header-height) * -1); }
-        body.focus-mode .sidebar { margin-left: calc(var(--sidebar-width) * -1); }
-        body.focus-mode .dock { margin-bottom: -100px; } /* Approx height */
-        
-        body.focus-mode .app-header, 
-        body.focus-mode .sidebar, 
-        body.focus-mode .dock { 
-            pointer-events: none; 
-            opacity: 0;
+        .app-header, .dock {
+            transition: max-height 0.4s var(--ease-in-out), padding 0.4s var(--ease-in-out), opacity 0.3s var(--ease-in-out);
+            max-height: 120px; /* Arbitrary safe max */
+            opacity: 1;
+            overflow: hidden;
         }
+
+        .sidebar {
+            transition: margin-left 0.4s var(--ease-in-out), opacity 0.3s;
+        }
+
+        body.focus-mode .app-header, 
+        body.focus-mode .dock {
+            max-height: 0;
+            padding-top: 0;
+            padding-bottom: 0;
+            opacity: 0;
+            border-bottom: none;
+            border-top: none;
+            pointer-events: none;
+        }
+
+        body.focus-mode .sidebar { margin-left: calc(var(--sidebar-width) * -1); opacity: 0; }
         
         body.focus-mode .main-content { margin: 0; height: 100vh; }
         body.focus-mode .scroll-pane { padding: 40px; }
         
-        .app-header, .dock { transition: margin 0.4s var(--ease-in-out), opacity 0.4s var(--ease-in-out); }
-
         .btn-focus-exit {
             position: fixed; bottom: 32px; right: 32px; 
             background: var(--primary); color: #000; font-weight: 700;
@@ -174,8 +185,29 @@
 
         /* --- Responsive Tables (Card View) --- */
         @media (max-width: 768px) {
-            /* ... (skipping unchanged parts) ... */
-            .spec-content td::before { 
+            .spec-content table, .spec-content thead, .spec-content tbody, .spec-content th, .spec-content td, .spec-content tr { 
+                display: block; 
+            }
+            .spec-content thead tr { position: absolute; top: -9999px; left: -9999px; }
+            .spec-content tr { 
+                border: 1px solid var(--border); 
+                margin-bottom: 16px; 
+                border-radius: var(--radius-sm); 
+                background: var(--bg-surface-2);
+                overflow: hidden;
+            }
+            .spec-content td { 
+                border: none; 
+                border-bottom: 1px solid var(--border); 
+                position: relative; 
+                padding: 12px 16px 12px 40%; 
+                text-align: right !important; /* Force override markdown inline styles */
+                font-size: 13px;
+                min-height: 40px;
+                display: flex;
+                align-items: center;
+                justify-content: flex-end;
+            } 
                 position: absolute; 
                 top: 0; left: 0; bottom: 0;
                 width: 35%; 
@@ -479,34 +511,38 @@
     }
 
     async function highlightDiffContext(root, idx) {
-        const p = await getPatch(idx);
-        if (!p) return;
-        // Simple heuristic: find text blocks that were added and wrap them in a highlight class.
-        // Since we reconstructed the text, we can't easily map line numbers 1:1 without a sourcemap,
-        // but we can try to find exact matches for added lines.
-        // For a visual prototype, highlighting the headers or sections modified is often enough.
-        
-        // Advanced: Parse the patch to find added lines content
-        const addedLines = [];
-        p.split("\n").forEach(line => {
-            if (line.startsWith("+") && !line.startsWith("+++")) addedLines.push(line.slice(1).trim());
-        });
+        try {
+            const p = await getPatch(idx);
+            if (!p) return;
+            // Simple heuristic: find text blocks that were added and wrap them in a highlight class.
+            // Since we reconstructed the text, we can't easily map line numbers 1:1 without a sourcemap,
+            // but we can try to find exact matches for added lines.
+            // For a visual prototype, highlighting the headers or sections modified is often enough.
+            
+            // Advanced: Parse the patch to find added lines content
+            const addedLines = [];
+            p.split("\n").forEach(line => {
+                if (line.startsWith("+") && !line.startsWith("+++")) addedLines.push(line.slice(1).trim());
+            });
 
-        // Walk the DOM and highlight text nodes that match added lines
-        // Limit to reasonable length to avoid perf issues
-        if (addedLines.length > 0 && addedLines.length < 500) {
-            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
-            let node;
-            const matches = new Set(addedLines);
-            while(node = walker.nextNode()) {
-                const txt = node.textContent.trim();
-                if (txt.length > 5 && matches.has(txt)) {
-                    const span = document.createElement("span");
-                    span.className = "diff-highlight";
-                    span.textContent = node.textContent;
-                    node.parentNode.replaceChild(span, node);
+            // Walk the DOM and highlight text nodes that match added lines
+            // Limit to reasonable length to avoid perf issues
+            if (addedLines.length > 0 && addedLines.length < 500) {
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+                let node;
+                const matches = new Set(addedLines);
+                while(node = walker.nextNode()) {
+                    const txt = node.textContent.trim();
+                    if (txt.length > 5 && matches.has(txt)) {
+                        const span = document.createElement("span");
+                        span.className = "diff-highlight";
+                        span.textContent = node.textContent;
+                        node.parentNode.replaceChild(span, node);
+                    }
                 }
             }
+        } catch (e) {
+            console.warn("Diff highlight failed", e);
         }
     }
 
