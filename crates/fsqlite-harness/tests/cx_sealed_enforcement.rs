@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use fsqlite_btree::{BtreeCursorOps, MockBtreeCursor, SeekResult};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
-    AggregateFunction, AuthAction, AuthResult, Authorizer, CollationFunction,
-    ColumnContext, ConstraintOp, IndexConstraint, IndexInfo, ScalarFunction, VirtualTable,
-    VirtualTableCursor, WindowFunction,
+    AggregateFunction, AuthAction, AuthResult, Authorizer, CollationFunction, ColumnContext,
+    ConstraintOp, IndexConstraint, IndexInfo, ScalarFunction, VirtualTable, VirtualTableCursor,
+    WindowFunction,
 };
 use fsqlite_pager::{
     CheckpointPageWriter, MockCheckpointPageWriter, MockMvccPager, MockTransaction, MvccPager,

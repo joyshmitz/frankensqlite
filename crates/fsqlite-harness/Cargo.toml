@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+asupersync = { path = "/dp/asupersync" }
 fsqlite = { workspace = true }
 fsqlite-error = { workspace = true }
 serde = { workspace = true }
@@ -15,13 +16,13 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-asupersync = { path = "/dp/asupersync" }
 parking_lot = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 trybuild = "1.0"
 fsqlite-btree = { workspace = true }
+fsqlite-core = { workspace = true }
 fsqlite-func = { workspace = true }
 fsqlite-pager = { workspace = true }
 fsqlite-vfs = { workspace = true }

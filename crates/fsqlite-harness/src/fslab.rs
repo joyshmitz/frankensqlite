@@ -20,7 +20,6 @@ use asupersync::lab::runtime::LabRunReport;
 use asupersync::lab::{LabConfig, LabRuntime};
 use asupersync::types::{Budget, RegionId, TaskId};
 use std::future::Future;
-use std::sync::Arc;
 use tracing::info;
 
 /// Bead identifier for tracing and log correlation.
@@ -226,8 +225,7 @@ impl FsLab {
         );
 
         assert_eq!(
-            report1.trace_certificate.schedule_hash,
-            report2.trace_certificate.schedule_hash,
+            report1.trace_certificate.schedule_hash, report2.trace_certificate.schedule_hash,
             "bead_id={BEAD_ID} determinism violation: schedule hashes differ (seed={})",
             self.config.seed,
         );
@@ -276,7 +274,7 @@ mod tests {
 
         assert!(
             report.oracle_report.all_passed(),
-            "bead_id={TEST_BEAD_ID} oracle failures: {}",
+            "bead_id={TEST_BEAD_ID} oracle failures: {:?}",
             report.oracle_report
         );
         assert!(
@@ -296,19 +294,17 @@ mod tests {
         let lab = FsLab::new(42).worker_count(2).max_steps(50_000);
 
         let report = lab.run_with_setup(|runtime, root| {
-            let (t1, _h1) =
-                FsLab::spawn_named(runtime, root, "reader", async { "read_done" });
-            let (t2, _h2) =
-                FsLab::spawn_named(runtime, root, "writer", async { "write_done" });
+            let (t1, _h1) = FsLab::spawn_named(runtime, root, "reader", async { "read_done" });
+            let (t2, _h2) = FsLab::spawn_named(runtime, root, "writer", async { "write_done" });
 
-            let sched = runtime.scheduler.lock().expect("scheduler lock");
+            let mut sched = runtime.scheduler.lock().expect("scheduler lock");
             sched.schedule(t1, 0);
             sched.schedule(t2, 1);
         });
 
         assert!(
             report.oracle_report.all_passed(),
-            "bead_id={TEST_BEAD_ID} oracle failures for named tasks: {}",
+            "bead_id={TEST_BEAD_ID} oracle failures for named tasks: {:?}",
             report.oracle_report
         );
         assert!(
@@ -324,7 +320,10 @@ mod tests {
     #[test]
     fn test_cancellation_injection_all_points_no_leaks() {
         // With light chaos (cancel injection), verify no leaked obligations/tasks.
-        let lab = FsLab::new(42).worker_count(2).max_steps(50_000).with_light_chaos();
+        let lab = FsLab::new(42)
+            .worker_count(2)
+            .max_steps(50_000)
+            .with_light_chaos();
 
         let report = lab.run_with_setup(|runtime, root| {
             let (tid, _handle) = runtime
@@ -369,7 +368,7 @@ mod tests {
                 .create_task(root, Budget::INFINITE, async { 2_u32 })
                 .expect("task 2");
 
-            let sched = runtime.scheduler.lock().expect("lock");
+            let mut sched = runtime.scheduler.lock().expect("lock");
             sched.schedule(t1, 0);
             sched.schedule(t2, 1);
         });

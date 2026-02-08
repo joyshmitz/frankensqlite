@@ -4,6 +4,7 @@
 //! crate's tests without pulling in a full TLA+ toolchain at build time.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// A rendered TLA+ module.
@@ -141,6 +142,640 @@ impl MvccStateSnapshot {
 #[derive(Debug, Clone)]
 pub struct MvccTlaExporter {
     snapshots: Vec<MvccStateSnapshot>,
+}
+
+/// Action kinds used for Mazurkiewicz-trace exploration of MVCC schedules.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MvccActionKind {
+    /// `BEGIN` starts a transaction snapshot.
+    Begin,
+    /// A page read.
+    Read { page_id: u32 },
+    /// A page write.
+    Write { page_id: u32 },
+    /// Commit attempt with declared write-set footprint.
+    Commit { write_set: BTreeSet<u32> },
+    /// GC horizon advance request.
+    Gc { horizon_seq: u64 },
+}
+
+/// An action in the MVCC alphabet used by trace-monoid reasoning.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MvccAction {
+    /// Transaction identifier.
+    pub txn_id: u64,
+    /// Stable per-transaction ordinal to preserve program order.
+    pub ordinal: u32,
+    /// Action kind.
+    pub kind: MvccActionKind,
+}
+
+impl MvccAction {
+    /// Construct a `BEGIN` action.
+    #[must_use]
+    pub fn begin(txn_id: u64, ordinal: u32) -> Self {
+        Self {
+            txn_id,
+            ordinal,
+            kind: MvccActionKind::Begin,
+        }
+    }
+
+    /// Construct a `READ` action.
+    #[must_use]
+    pub fn read(txn_id: u64, ordinal: u32, page_id: u32) -> Self {
+        Self {
+            txn_id,
+            ordinal,
+            kind: MvccActionKind::Read { page_id },
+        }
+    }
+
+    /// Construct a `WRITE` action.
+    #[must_use]
+    pub fn write(txn_id: u64, ordinal: u32, page_id: u32) -> Self {
+        Self {
+            txn_id,
+            ordinal,
+            kind: MvccActionKind::Write { page_id },
+        }
+    }
+
+    /// Construct a `COMMIT` action.
+    #[must_use]
+    pub fn commit(txn_id: u64, ordinal: u32, write_set: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            txn_id,
+            ordinal,
+            kind: MvccActionKind::Commit {
+                write_set: write_set.into_iter().collect(),
+            },
+        }
+    }
+
+    /// Construct a `GC` action.
+    #[must_use]
+    pub fn gc(txn_id: u64, ordinal: u32, horizon_seq: u64) -> Self {
+        Self {
+            txn_id,
+            ordinal,
+            kind: MvccActionKind::Gc { horizon_seq },
+        }
+    }
+}
+
+/// Independence relation `I` used for the MVCC trace monoid.
+///
+/// This follows §4.4:
+/// - `read/read` independent
+/// - `read/write` dependent on same page
+/// - `write/write` independent iff pages differ
+/// - `commit/commit` dependent
+/// - `begin/begin` dependent
+/// - `read/commit` dependent iff read page is in commit write-set
+/// - same-transaction actions are always dependent (program-order edge)
+#[must_use]
+pub fn are_independent(lhs: &MvccAction, rhs: &MvccAction) -> bool {
+    if lhs == rhs || lhs.txn_id == rhs.txn_id {
+        return false;
+    }
+    match (&lhs.kind, &rhs.kind) {
+        (MvccActionKind::Read { .. }, MvccActionKind::Read { .. }) => true,
+        (
+            MvccActionKind::Read { page_id },
+            MvccActionKind::Write {
+                page_id: write_page,
+            },
+        )
+        | (
+            MvccActionKind::Write {
+                page_id: write_page,
+            },
+            MvccActionKind::Read { page_id },
+        ) => page_id != write_page,
+        (
+            MvccActionKind::Write { page_id: lhs_page },
+            MvccActionKind::Write { page_id: rhs_page },
+        ) => lhs_page != rhs_page,
+        (MvccActionKind::Commit { write_set }, MvccActionKind::Read { page_id })
+        | (MvccActionKind::Read { page_id }, MvccActionKind::Commit { write_set }) => {
+            !write_set.contains(page_id)
+        }
+        (MvccActionKind::Commit { .. }, MvccActionKind::Commit { .. }) => false,
+        (MvccActionKind::Begin, MvccActionKind::Begin) => false,
+        (MvccActionKind::Gc { .. }, _) | (_, MvccActionKind::Gc { .. }) => false,
+        _ => false,
+    }
+}
+
+/// Foata normal form: layers of mutually independent actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoataNormalForm {
+    /// Canonical layers, each sorted deterministically.
+    pub layers: Vec<Vec<MvccAction>>,
+}
+
+impl FoataNormalForm {
+    /// Deterministic textual signature used for class deduplication.
+    #[must_use]
+    pub fn canonical_signature(&self) -> String {
+        let mut out = String::new();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if layer_idx != 0 {
+                out.push('|');
+            }
+            out.push('[');
+            for (item_idx, action) in layer.iter().enumerate() {
+                if item_idx != 0 {
+                    out.push(',');
+                }
+                push_action_signature(&mut out, action);
+            }
+            out.push(']');
+        }
+        out
+    }
+}
+
+fn push_action_signature(out: &mut String, action: &MvccAction) {
+    out.push_str(&action.txn_id.to_string());
+    out.push(':');
+    out.push_str(&action.ordinal.to_string());
+    out.push(':');
+    match &action.kind {
+        MvccActionKind::Begin => out.push('B'),
+        MvccActionKind::Read { page_id } => {
+            out.push('R');
+            out.push_str(&page_id.to_string());
+        }
+        MvccActionKind::Write { page_id } => {
+            out.push('W');
+            out.push_str(&page_id.to_string());
+        }
+        MvccActionKind::Commit { write_set } => {
+            out.push('C');
+            out.push('{');
+            for (idx, page_id) in write_set.iter().enumerate() {
+                if idx != 0 {
+                    out.push(';');
+                }
+                out.push_str(&page_id.to_string());
+            }
+            out.push('}');
+        }
+        MvccActionKind::Gc { horizon_seq } => {
+            out.push('G');
+            out.push_str(&horizon_seq.to_string());
+        }
+    }
+}
+
+/// Compute Foata normal form for a concrete schedule.
+#[must_use]
+pub fn foata_normal_form(word: &[MvccAction]) -> FoataNormalForm {
+    let mut level_by_action = Vec::with_capacity(word.len());
+    for (idx, action) in word.iter().enumerate() {
+        let mut level = 0_usize;
+        for (prev_idx, prev) in word.iter().take(idx).enumerate() {
+            if !are_independent(prev, action) {
+                level = level.max(level_by_action[prev_idx] + 1);
+            }
+        }
+        level_by_action.push(level);
+    }
+
+    let max_level = level_by_action.iter().copied().max().unwrap_or(0);
+    let mut layers = vec![Vec::new(); max_level.saturating_add(1)];
+    for (action, level) in word.iter().cloned().zip(level_by_action) {
+        layers[level].push(action);
+    }
+    for layer in &mut layers {
+        layer.sort_unstable();
+    }
+    FoataNormalForm { layers }
+}
+
+/// A trace-equivalence class with one representative schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceClass {
+    /// Canonical Foata representative for this class.
+    pub canonical: FoataNormalForm,
+    /// One concrete schedule in the class.
+    pub representative: Vec<MvccAction>,
+    /// Number of linearizations collapsed into this class.
+    pub member_count: usize,
+}
+
+/// Reduction metrics comparing naive interleavings vs trace classes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TraceReductionStats {
+    /// Number of naive interleavings preserving intra-transaction order.
+    pub naive_interleavings: usize,
+    /// Number of distinct Mazurkiewicz classes.
+    pub trace_classes: usize,
+    /// Reduction factor (`naive_interleavings / trace_classes`).
+    pub reduction_factor: f64,
+}
+
+/// Enumerate all order-preserving interleavings of transaction action chains.
+#[must_use]
+pub fn enumerate_interleavings(chains: &[Vec<MvccAction>]) -> Vec<Vec<MvccAction>> {
+    let total_actions: usize = chains.iter().map(Vec::len).sum();
+    let mut positions = vec![0_usize; chains.len()];
+    let mut prefix = Vec::with_capacity(total_actions);
+    let mut out = Vec::new();
+    enumerate_interleavings_rec(chains, &mut positions, &mut prefix, &mut out);
+    out
+}
+
+fn enumerate_interleavings_rec(
+    chains: &[Vec<MvccAction>],
+    positions: &mut [usize],
+    prefix: &mut Vec<MvccAction>,
+    out: &mut Vec<Vec<MvccAction>>,
+) {
+    let done = positions
+        .iter()
+        .zip(chains)
+        .all(|(idx, chain)| *idx >= chain.len());
+    if done {
+        out.push(prefix.clone());
+        return;
+    }
+
+    for chain_idx in 0..chains.len() {
+        if positions[chain_idx] >= chains[chain_idx].len() {
+            continue;
+        }
+        let action = chains[chain_idx][positions[chain_idx]].clone();
+        positions[chain_idx] += 1;
+        prefix.push(action);
+        enumerate_interleavings_rec(chains, positions, prefix, out);
+        let _ = prefix.pop();
+        positions[chain_idx] -= 1;
+    }
+}
+
+/// Enumerate all distinct trace-equivalence classes.
+#[must_use]
+pub fn enumerate_trace_classes(chains: &[Vec<MvccAction>]) -> Vec<TraceClass> {
+    let mut classes = BTreeMap::<String, TraceClass>::new();
+    for schedule in enumerate_interleavings(chains) {
+        let canonical = foata_normal_form(&schedule);
+        let signature = canonical.canonical_signature();
+        if let Some(existing) = classes.get_mut(&signature) {
+            existing.member_count = existing.member_count.saturating_add(1);
+            continue;
+        }
+        classes.insert(
+            signature,
+            TraceClass {
+                canonical,
+                representative: schedule,
+                member_count: 1,
+            },
+        );
+    }
+    classes.into_values().collect()
+}
+
+/// Compute trace-reduction stats for a scenario.
+#[must_use]
+pub fn trace_reduction_stats(chains: &[Vec<MvccAction>]) -> TraceReductionStats {
+    let naive = enumerate_interleavings(chains).len();
+    let classes = enumerate_trace_classes(chains).len();
+    let reduction_factor = if classes == 0 {
+        1.0
+    } else {
+        naive as f64 / classes as f64
+    };
+    TraceReductionStats {
+        naive_interleavings: naive,
+        trace_classes: classes,
+        reduction_factor,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TxnState {
+    snapshot_seq: Option<u64>,
+    reads: BTreeSet<u32>,
+    writes: BTreeSet<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct CommittedTxn {
+    commit_seq: u64,
+    reads: BTreeSet<u32>,
+    writes: BTreeSet<u32>,
+}
+
+/// Invariant summary over one trace representative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceInvariantReport {
+    /// Snapshot-isolation/SSI safety checks held.
+    pub snapshot_isolation_holds: bool,
+    /// No write-write FCW conflict was silently accepted.
+    pub fcw_conflicts_detected: bool,
+    /// GC did not advance past any active snapshot.
+    pub gc_safe: bool,
+}
+
+impl TraceInvariantReport {
+    /// Returns true when all tracked invariants hold.
+    #[must_use]
+    pub fn all_hold(self) -> bool {
+        self.snapshot_isolation_holds && self.fcw_conflicts_detected && self.gc_safe
+    }
+}
+
+/// Validate SI/FCW/GC invariants for a concrete schedule.
+#[must_use]
+pub fn verify_trace_invariants(schedule: &[MvccAction]) -> TraceInvariantReport {
+    let mut snapshot_isolation_holds = true;
+    let mut fcw_conflicts_detected = true;
+    let mut gc_safe = true;
+
+    let mut txn_state = BTreeMap::<u64, TxnState>::new();
+    let mut committed = Vec::<CommittedTxn>::new();
+    let mut latest_writer_by_page = BTreeMap::<u32, u64>::new();
+    let mut commit_seq_hi = 0_u64;
+
+    for action in schedule {
+        match &action.kind {
+            MvccActionKind::Begin => {
+                let entry = txn_state.entry(action.txn_id).or_default();
+                if entry.snapshot_seq.is_some() {
+                    snapshot_isolation_holds = false;
+                    continue;
+                }
+                entry.snapshot_seq = Some(commit_seq_hi);
+            }
+            MvccActionKind::Read { page_id } => {
+                let entry = txn_state.entry(action.txn_id).or_default();
+                if entry.snapshot_seq.is_none() {
+                    snapshot_isolation_holds = false;
+                    continue;
+                }
+                entry.reads.insert(*page_id);
+            }
+            MvccActionKind::Write { page_id } => {
+                let entry = txn_state.entry(action.txn_id).or_default();
+                if entry.snapshot_seq.is_none() {
+                    snapshot_isolation_holds = false;
+                    continue;
+                }
+                entry.writes.insert(*page_id);
+            }
+            MvccActionKind::Commit { write_set } => {
+                let Some(entry) = txn_state.get(&action.txn_id).cloned() else {
+                    snapshot_isolation_holds = false;
+                    continue;
+                };
+                let Some(snapshot_seq) = entry.snapshot_seq else {
+                    snapshot_isolation_holds = false;
+                    continue;
+                };
+
+                let commit_pages = if write_set.is_empty() {
+                    entry.writes.clone()
+                } else {
+                    write_set.clone()
+                };
+
+                let ww_conflict = commit_pages.iter().any(|page_id| {
+                    latest_writer_by_page
+                        .get(page_id)
+                        .is_some_and(|last_seq| *last_seq > snapshot_seq)
+                });
+                if ww_conflict {
+                    fcw_conflicts_detected = false;
+                    snapshot_isolation_holds = false;
+                    continue;
+                }
+
+                let dangerous_structure = committed.iter().any(|other| {
+                    other.commit_seq > snapshot_seq
+                        && pages_overlap(&entry.reads, &other.writes)
+                        && pages_overlap(&commit_pages, &other.reads)
+                });
+                if dangerous_structure {
+                    snapshot_isolation_holds = false;
+                    continue;
+                }
+
+                commit_seq_hi = commit_seq_hi.saturating_add(1);
+                for page_id in &commit_pages {
+                    latest_writer_by_page.insert(*page_id, commit_seq_hi);
+                }
+                committed.push(CommittedTxn {
+                    commit_seq: commit_seq_hi,
+                    reads: entry.reads.clone(),
+                    writes: commit_pages,
+                });
+            }
+            MvccActionKind::Gc { horizon_seq } => {
+                let min_active_snapshot = txn_state
+                    .values()
+                    .filter_map(|txn| txn.snapshot_seq)
+                    .min()
+                    .unwrap_or(commit_seq_hi);
+                if *horizon_seq > min_active_snapshot {
+                    gc_safe = false;
+                }
+            }
+        }
+    }
+
+    TraceInvariantReport {
+        snapshot_isolation_holds,
+        fcw_conflicts_detected,
+        gc_safe,
+    }
+}
+
+/// Commit/abort decisions produced by SSI-style validation over a schedule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SsiExecutionOutcome {
+    /// Transactions that committed.
+    pub committed: BTreeSet<u64>,
+    /// Transactions rejected by FCW/SSI checks.
+    pub aborted: BTreeSet<u64>,
+}
+
+/// Simulate FCW + SSI guardrails for commit attempts in a schedule.
+#[must_use]
+pub fn simulate_ssi_execution(schedule: &[MvccAction]) -> SsiExecutionOutcome {
+    let mut txn_state = BTreeMap::<u64, TxnState>::new();
+    let mut committed = Vec::<CommittedTxn>::new();
+    let mut latest_writer_by_page = BTreeMap::<u32, u64>::new();
+    let mut commit_seq_hi = 0_u64;
+    let mut outcome = SsiExecutionOutcome::default();
+
+    for action in schedule {
+        match &action.kind {
+            MvccActionKind::Begin => {
+                let entry = txn_state.entry(action.txn_id).or_default();
+                if entry.snapshot_seq.is_none() {
+                    entry.snapshot_seq = Some(commit_seq_hi);
+                }
+            }
+            MvccActionKind::Read { page_id } => {
+                if let Some(entry) = txn_state.get_mut(&action.txn_id) {
+                    entry.reads.insert(*page_id);
+                }
+            }
+            MvccActionKind::Write { page_id } => {
+                if let Some(entry) = txn_state.get_mut(&action.txn_id) {
+                    entry.writes.insert(*page_id);
+                }
+            }
+            MvccActionKind::Commit { write_set } => {
+                let Some(entry) = txn_state.get(&action.txn_id).cloned() else {
+                    outcome.aborted.insert(action.txn_id);
+                    continue;
+                };
+                let Some(snapshot_seq) = entry.snapshot_seq else {
+                    outcome.aborted.insert(action.txn_id);
+                    continue;
+                };
+                let commit_pages = if write_set.is_empty() {
+                    entry.writes.clone()
+                } else {
+                    write_set.clone()
+                };
+
+                let ww_conflict = commit_pages.iter().any(|page_id| {
+                    latest_writer_by_page
+                        .get(page_id)
+                        .is_some_and(|last_seq| *last_seq > snapshot_seq)
+                });
+                if ww_conflict {
+                    outcome.aborted.insert(action.txn_id);
+                    continue;
+                }
+
+                let dangerous_structure = committed.iter().any(|other| {
+                    other.commit_seq > snapshot_seq
+                        && pages_overlap(&entry.reads, &other.writes)
+                        && pages_overlap(&commit_pages, &other.reads)
+                });
+                if dangerous_structure {
+                    outcome.aborted.insert(action.txn_id);
+                    continue;
+                }
+
+                commit_seq_hi = commit_seq_hi.saturating_add(1);
+                for page_id in &commit_pages {
+                    latest_writer_by_page.insert(*page_id, commit_seq_hi);
+                }
+                committed.push(CommittedTxn {
+                    commit_seq: commit_seq_hi,
+                    reads: entry.reads.clone(),
+                    writes: commit_pages,
+                });
+                outcome.committed.insert(action.txn_id);
+            }
+            MvccActionKind::Gc { .. } => {}
+        }
+    }
+
+    outcome
+}
+
+fn pages_overlap(lhs: &BTreeSet<u32>, rhs: &BTreeSet<u32>) -> bool {
+    lhs.iter().any(|page_id| rhs.contains(page_id))
+}
+
+/// DPOR-style class exploration report.
+#[derive(Debug, Clone)]
+pub struct DporExploration {
+    /// Distinct explored trace classes.
+    pub classes: Vec<TraceClass>,
+    /// Number of explored representative paths.
+    pub explored_paths: usize,
+    /// Number of all naive interleavings for the same scenario.
+    pub naive_interleavings: usize,
+}
+
+/// Explore representative schedules with a DPOR-style pruning strategy.
+///
+/// This explores the canonical first enabled action plus additional enabled
+/// actions that are dependent with that canonical action, which is enough to
+/// cover all relevant classes in the small MVCC harness scenarios.
+#[must_use]
+pub fn dpor_enumerate_trace_classes(chains: &[Vec<MvccAction>]) -> DporExploration {
+    let mut positions = vec![0_usize; chains.len()];
+    let mut prefix = Vec::with_capacity(chains.iter().map(Vec::len).sum());
+    let mut classes = BTreeMap::<String, TraceClass>::new();
+    let mut explored_paths = 0_usize;
+    dpor_rec(
+        chains,
+        &mut positions,
+        &mut prefix,
+        &mut classes,
+        &mut explored_paths,
+    );
+    DporExploration {
+        classes: classes.into_values().collect(),
+        explored_paths,
+        naive_interleavings: enumerate_interleavings(chains).len(),
+    }
+}
+
+fn dpor_rec(
+    chains: &[Vec<MvccAction>],
+    positions: &mut [usize],
+    prefix: &mut Vec<MvccAction>,
+    classes: &mut BTreeMap<String, TraceClass>,
+    explored_paths: &mut usize,
+) {
+    let mut enabled = Vec::<(usize, MvccAction)>::new();
+    for chain_idx in 0..chains.len() {
+        if positions[chain_idx] < chains[chain_idx].len() {
+            enabled.push((chain_idx, chains[chain_idx][positions[chain_idx]].clone()));
+        }
+    }
+    if enabled.is_empty() {
+        *explored_paths = explored_paths.saturating_add(1);
+        let canonical = foata_normal_form(prefix);
+        let signature = canonical.canonical_signature();
+        if let Some(existing) = classes.get_mut(&signature) {
+            existing.member_count = existing.member_count.saturating_add(1);
+            return;
+        }
+        classes.insert(
+            signature,
+            TraceClass {
+                canonical,
+                representative: prefix.clone(),
+                member_count: 1,
+            },
+        );
+        return;
+    }
+
+    enabled.sort_unstable_by(|lhs, rhs| lhs.1.cmp(&rhs.1));
+    let Some((primary_chain_idx, primary_action)) = enabled.first().cloned() else {
+        return;
+    };
+
+    let mut branches = BTreeSet::<usize>::new();
+    branches.insert(primary_chain_idx);
+    for (chain_idx, action) in enabled.iter().skip(1) {
+        if !are_independent(&primary_action, action) {
+            branches.insert(*chain_idx);
+        }
+    }
+
+    for chain_idx in branches {
+        let next_action = chains[chain_idx][positions[chain_idx]].clone();
+        positions[chain_idx] += 1;
+        prefix.push(next_action);
+        dpor_rec(chains, positions, prefix, classes, explored_paths);
+        let _ = prefix.pop();
+        positions[chain_idx] -= 1;
+    }
 }
 
 impl MvccTlaExporter {

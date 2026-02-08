@@ -4,6 +4,8 @@
 //! verification tooling (trace exporters, schedule exploration harnesses, etc.)
 //! that other crates can call into from their own tests.
 
+pub mod eprocess;
+pub mod fslab;
 pub mod log;
 pub mod tla;
 
