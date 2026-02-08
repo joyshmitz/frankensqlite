@@ -916,7 +916,8 @@
         playing: false, 
         playInterval: null,
         activeBuckets: new Set(),
-        diffMode: 'line-by-line' 
+        diffMode: 'line-by-line',
+        renderNonce: 0 
     };
 
     // --- Initialization ---
@@ -937,11 +938,12 @@
             setupEventListeners();
             initBucketFilters();
             syncNeuralFilters();
-            await computeSynapticMetrics();
             
             // Initial Render
             renderCommitList(true);
             drawSynapticMap();
+
+            await computeSynapticMetrics();
             
             // Deep Linking
             const hash = window.location.hash;
@@ -989,21 +991,11 @@
         });
     }
 
-    async function computeSynapticMetrics() {
-        let lines = BASE_DOC.split("\n");
-        for (let i = 0; i < COMMITS.length; i++) {
-            const p = await getPatch(i);
-            if (p) lines = applySynapticPatch(lines, p);
-            const text = lines.join("\n");
-            const tokens = text.split(/\s+/).length;
-            METRICS.push({ lines: lines.length, tokens, lev: COMMITS[i].impact || 0 });
-            if (i % 10 === 0) DOC_CACHE.set(i, text);
-        }
-    }
-
     // --- Interactions ---
 
-    window.selectCommit = async function(idx, animateScroll = true) {
+    window.selectCommit = async function(idx, animateScroll = true, isAuto = false) {
+        if (!isAuto && STATE.playing) togglePlay();
+
         const targetIdx = Math.max(0, Math.min(COMMITS.length - 1, idx));
         if (targetIdx === STATE.idx && document.querySelector(".commit-card.selected")) {
              await updateView();
@@ -1026,6 +1018,9 @@
         renderCommitList();
         const newSel = document.querySelector(`.commit-card[data-idx="${STATE.idx}"]`);
         if (newSel && animateScroll) newSel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+
+        // Reset scroll for manual navigation
+        if (!isAuto) document.querySelectorAll(".scroll-pane").forEach(el => el.scrollTop = 0);
 
         await updateView();
     };
@@ -1067,37 +1062,53 @@
             btn.style.color = "var(--text-2)";
             renderCommitList();
         } else {
+            if (FILTERED.length === 0) return;
             STATE.playing = true;
             btn.textContent = "SUSPEND";
             btn.style.color = "var(--primary)";
             renderCommitList();
             STATE.playInterval = setInterval(() => {
-                if (STATE.idx < COMMITS.length - 1) {
-                    selectCommit(STATE.idx + 1);
+                if (FILTERED.length === 0) { togglePlay(); return; }
+                // Find next index in FILTERED
+                const nextIdx = FILTERED.findIndex(c => c.idx > STATE.idx);
+                if (nextIdx !== -1) {
+                    selectCommit(FILTERED[nextIdx].idx, true, true);
+                } else if (FILTERED.length > 0 && STATE.idx < FILTERED[0].idx) {
+                    selectCommit(FILTERED[0].idx, true, true);
                 } else {
-                    togglePlay();
+                    togglePlay(); // End of filtered list
                 }
             }, 1500);
         }
     }
 
     async function updateView() {
+        const nonce = ++STATE.renderNonce;
         const container = document.getElementById("view" + STATE.tab.charAt(0).toUpperCase() + STATE.tab.slice(1));
         
         // Out animation
         await animate(container, { opacity: 0.5, y: 5 }, { duration: 0.1 }).finished;
+        
+        // Check if we were superseded during animation
+        if (nonce !== STATE.renderNonce) return;
 
-        if (STATE.tab === "spec") await renderSpec();
-        else if (STATE.tab === "timeline") renderCharts();
-        else if (STATE.tab === "diff") await renderDiff();
+        if (STATE.tab === "spec") await renderSpec(nonce);
+        else if (STATE.tab === "timeline") renderCharts(nonce);
+        else if (STATE.tab === "diff") await renderDiff(nonce);
         
         // In animation
-        animate(container, { opacity: 1, y: 0 }, { duration: 0.3, easing: spring() });
+        if (nonce === STATE.renderNonce) {
+            animate(container, { opacity: 1, y: 0 }, { duration: 0.3, easing: spring() });
+        }
     }
 
-    async function renderSpec() {
+    async function renderSpec(nonce) {
         const el = document.getElementById("specContent");
-        const text = await reconstructSnapshot(STATE.idx);
+        const targetIdx = STATE.idx;
+        const text = await reconstructSnapshot(targetIdx);
+        
+        if (nonce !== STATE.renderNonce) return;
+
         const md = window.markdownit({ 
             html: true, 
             highlight: (str, lang) => (lang && hljs.getLanguage(lang)) ? hljs.highlight(str, { language: lang }).value : '' 
@@ -1106,7 +1117,7 @@
         
         // --- Feature: Responsive Tables & Diff Highlight ---
         enhanceTables(el);
-        await highlightDiffContext(el, STATE.idx);
+        await highlightDiffContext(el, targetIdx);
         
         const kpiLines = document.getElementById("kpiLines");
         if(kpiLines) kpiLines.textContent = text.split("\n").length.toLocaleString();
@@ -1127,33 +1138,35 @@
         try {
             const p = await getPatch(idx);
             if (!p) return;
-            // Simple heuristic: find text blocks that were added and wrap them in a highlight class.
-            // Since we reconstructed the text, we can't easily map line numbers 1:1 without a sourcemap,
-            // but we can try to find exact matches for added lines.
-            // For a visual prototype, highlighting the headers or sections modified is often enough.
             
-            // Advanced: Parse the patch to find added lines content
-            const addedLines = [];
+            const addedLines = new Set();
             p.split("\n").forEach(line => {
-                if (line.startsWith("+") && !line.startsWith("+++")) addedLines.push(line.slice(1).trim());
+                if (line.startsWith("+") && !line.startsWith("+++")) {
+                    const content = line.slice(1).trim();
+                    if (content.length > 8) addedLines.add(content);
+                }
             });
 
-            // Walk the DOM and highlight text nodes that match added lines
-            // Limit to reasonable length to avoid perf issues
-            if (addedLines.length > 0 && addedLines.length < 500) {
-                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
-                let node;
-                const matches = new Set(addedLines);
-                while(node = walker.nextNode()) {
-                    const txt = node.textContent.trim();
-                    if (txt.length > 5 && matches.has(txt)) {
-                        const span = document.createElement("span");
-                        span.className = "diff-highlight";
-                        span.textContent = node.textContent;
-                        node.parentNode.replaceChild(span, node);
-                    }
+            if (addedLines.size === 0) return;
+
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+            const nodesToReplace = [];
+            
+            let node;
+            while(node = walker.nextNode()) {
+                const txt = node.textContent.trim();
+                if (txt.length > 8 && addedLines.has(txt)) {
+                    nodesToReplace.push(node);
                 }
             }
+
+            // Batch DOM updates
+            nodesToReplace.forEach(node => {
+                const span = document.createElement("span");
+                span.className = "diff-highlight";
+                span.textContent = node.textContent;
+                node.parentNode.replaceChild(span, node);
+            });
         } catch (e) {
             console.warn("Diff highlight failed", e);
         }
@@ -1254,9 +1267,24 @@
         PATCH_CACHE.set(idx, p); return p;
     }
 
-    async function renderDiff() {
+    async function computeSynapticMetrics() {
+        let lines = BASE_DOC.split("\n");
+        for (let i = 0; i < COMMITS.length; i++) {
+            const p = await getPatch(i);
+            if (p) lines = applySynapticPatch(lines, p);
+            const text = lines.join("\n");
+            const tokens = text.split(/\s+/).length;
+            METRICS.push({ lines: lines.length, tokens, lev: COMMITS[i].impact || 0 });
+            if (i % 10 === 0) DOC_CACHE.set(i, text);
+        }
+    }
+
+    async function renderDiff(nonce) {
         const el = document.getElementById("diffContent");
         const p = await getPatch(STATE.idx);
+        
+        if (nonce !== STATE.renderNonce) return;
+
         if (!p) { el.innerHTML = "<div style='padding:20px; color:var(--text-3)'>NO DELTA</div>"; return; }
         const diffHtml = Diff2Html.html(p, { 
             drawFileList: false, 
@@ -1351,20 +1379,43 @@
         document.getElementById("btnDiffMode").addEventListener("click", (e) => {
             STATE.diffMode = STATE.diffMode === 'line-by-line' ? 'side-by-side' : 'line-by-line';
             e.target.textContent = STATE.diffMode === 'line-by-line' ? 'MODE: LINE' : 'MODE: SIDE';
-            renderDiff();
+            renderDiff(STATE.renderNonce);
+        });
+
+        // Navigation Buttons
+        document.getElementById("btnPrev").addEventListener("click", () => {
+            const currentIdx = FILTERED.findIndex(c => c.idx >= STATE.idx);
+            if (currentIdx > 0) {
+                selectCommit(FILTERED[currentIdx - 1].idx);
+            } else if (currentIdx === -1 && FILTERED.length > 0) {
+                // If current is after all filtered, pick the last filtered
+                selectCommit(FILTERED[FILTERED.length - 1].idx);
+            }
+        });
+
+        document.getElementById("btnNext").addEventListener("click", () => {
+            const currentIdx = FILTERED.findIndex(c => c.idx > STATE.idx);
+            if (currentIdx !== -1) {
+                selectCommit(FILTERED[currentIdx].idx);
+            }
         });
 
         // Mobile Sidebar
         document.getElementById("btnOpenLogs").addEventListener("click", (e) => {
             e.stopPropagation();
             document.getElementById("sidebar").classList.add("active");
+            document.body.style.overflow = "hidden";
         });
-        document.getElementById("btnCloseLogs").addEventListener("click", () => document.getElementById("sidebar").classList.remove("active"));
+        document.getElementById("btnCloseLogs").addEventListener("click", () => {
+            document.getElementById("sidebar").classList.remove("active");
+            document.body.style.overflow = "";
+        });
         document.addEventListener("click", (e) => {
             const sidebar = document.getElementById("sidebar");
             const btn = document.getElementById("btnOpenLogs");
             if (sidebar.classList.contains("active") && !sidebar.contains(e.target) && e.target !== btn) {
                 sidebar.classList.remove("active");
+                document.body.style.overflow = "";
             }
         });
 
@@ -1389,6 +1440,13 @@
             const matchesBucket = STATE.activeBuckets.size === 0 || STATE.activeBuckets.has(c.primary);
             return matchesText && matchesBucket;
         }); 
+
+        if (FILTERED.length === 0 && STATE.playing) togglePlay();
+
+        // If current selection is now hidden, select the first visible one
+        if (FILTERED.length > 0 && !FILTERED.some(c => c.idx === STATE.idx)) {
+            selectCommit(FILTERED[0].idx, true, true);
+        }
     }
     
     function hideLoader() {
@@ -1401,7 +1459,8 @@
     function escapeHtml(text) { return text ? text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : ""; }
 
     let charts = {};
-    function renderCharts() {
+    function renderCharts(nonce) {
+        if (nonce !== STATE.renderNonce) return;
         const t = { 
             backgroundColor: 'transparent', 
             textStyle: { fontFamily: 'JetBrains Mono', color: '#71717a' }, 
@@ -1434,10 +1493,11 @@
                 data: BUCKETS.map(b => ({ value: counts[b.id] || 0, name: b.name, itemStyle: { color: b.color } })) 
             }] 
         });
-        renderMassGrowth();
+        renderMassGrowth(nonce);
     }
 
-    function renderMassGrowth() {
+    function renderMassGrowth(nonce) {
+        if (nonce && nonce !== STATE.renderNonce) return;
         if (!charts.mass) charts.mass = echarts.init(document.getElementById("chartMass"));
         const buckets = groupCommits(STATE.timeBucket);
         const labels = Object.keys(buckets).sort();
