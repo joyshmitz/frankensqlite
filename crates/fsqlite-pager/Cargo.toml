@@ -10,7 +10,12 @@ rust-version.workspace = true
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-vfs = { workspace = true }
+# fsqlite-vfs: commented out while unix.rs WIP has compile errors (re-enable for bd-22n.2)
+# fsqlite-vfs = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true

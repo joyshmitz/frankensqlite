@@ -1,0 +1,997 @@
+//! Unix VFS implementation with POSIX fcntl-based five-level locking.
+//!
+//! This module implements the `Vfs` and `VfsFile` traits using standard POSIX
+//! file I/O and advisory locking. The locking protocol matches C SQLite's
+//! `os_unix.c` implementation:
+//!
+//! **Lock hierarchy:** `None < Shared < Reserved < Pending < Exclusive`
+//!
+//! **Lock byte ranges (at the 1 GB boundary):**
+//! - `PENDING_BYTE`  = `0x4000_0000` (1 byte)
+//! - `RESERVED_BYTE` = `0x4000_0001` (1 byte)
+//! - `SHARED_FIRST`  = `0x4000_0002` (510 bytes)
+//!
+//! **Key design:** POSIX fcntl locks are per-process, not per-fd. If one fd in
+//! a process holds a lock, closing *any* fd to the same file releases it. We
+//! handle this with a global inode table ([`InodeTable`]) that coalesces locks
+//! across all file handles in the same process.
+
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::LockLevel;
+use fsqlite_types::cx::Cx;
+use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+
+use crate::traits::{Vfs, VfsFile};
+
+// ---------------------------------------------------------------------------
+// Lock byte constants (must match C SQLite for file-level compatibility)
+// ---------------------------------------------------------------------------
+
+/// Byte offset of the pending lock byte.
+const PENDING_BYTE: u64 = 0x4000_0000;
+/// Byte offset of the reserved lock byte.
+const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
+/// Byte offset of the first shared lock byte.
+const SHARED_FIRST: u64 = PENDING_BYTE + 2;
+/// Number of bytes in the shared lock range.
+const SHARED_SIZE: u64 = 510;
+
+// ---------------------------------------------------------------------------
+// POSIX fcntl helpers
+// ---------------------------------------------------------------------------
+
+/// Attempt a non-blocking POSIX advisory lock via `fcntl(F_SETLK)`.
+///
+/// Uses the `nix` crate for safe syscall wrapping (no `unsafe` needed).
+///
+/// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if it would
+/// block (another process holds a conflicting lock), and `Err` for real
+/// I/O errors.
+#[allow(clippy::cast_possible_wrap)]
+fn posix_lock(file: &impl AsFd, lock_type: i32, start: u64, len: u64) -> Result<bool> {
+    let lock_type = i16::try_from(lock_type).expect("fcntl lock type must fit in i16");
+    let whence = i16::try_from(libc::SEEK_SET).expect("SEEK_SET must fit in i16");
+    let flock = libc::flock {
+        l_type: lock_type,
+        l_whence: whence,
+        l_start: start as libc::off_t,
+        l_len: len as libc::off_t,
+        l_pid: 0,
+    };
+
+    match nix::fcntl::fcntl(
+        file.as_fd().as_raw_fd(),
+        nix::fcntl::FcntlArg::F_SETLK(&flock),
+    ) {
+        Ok(_) => Ok(true),
+        Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => Ok(false),
+        Err(e) => Err(FrankenError::Io(e.into())),
+    }
+}
+
+/// Release a POSIX advisory lock.
+fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
+    let ok = posix_lock(file, libc::F_UNLCK, start, len)?;
+    debug_assert!(ok, "F_UNLCK should never fail with EAGAIN");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Inode table — per-process lock coalescing
+// ---------------------------------------------------------------------------
+
+/// Unique identity for an open file (device + inode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct InodeKey {
+    dev: u64,
+    ino: u64,
+}
+
+/// Per-inode lock state shared across all file handles in this process.
+#[derive(Debug)]
+struct InodeInfo {
+    /// Canonical file descriptor for this inode.
+    ///
+    /// POSIX fcntl locks are per-process, and closing *any* fd for the file can
+    /// release the process' locks. To avoid that, we keep exactly one fd per
+    /// inode in-process and share it across handles via `Arc`.
+    file: Arc<File>,
+    /// Number of handles that hold at least SHARED.
+    n_shared: u32,
+    /// Highest lock level held by any handle in this process.
+    lock_level: LockLevel,
+    /// Total number of open file handles referencing this inode.
+    n_ref: u32,
+}
+
+impl InodeInfo {
+    fn new(file: Arc<File>) -> Self {
+        Self {
+            file,
+            n_shared: 0,
+            lock_level: LockLevel::None,
+            n_ref: 0,
+        }
+    }
+}
+
+/// Global per-process table mapping (dev, ino) to shared lock state.
+///
+/// This prevents the "POSIX close drops all locks" problem: we only issue
+/// OS-level lock/unlock calls through one canonical fd per inode, and track
+/// how many handles want each lock level.
+struct InodeTable {
+    map: Mutex<HashMap<InodeKey, Arc<Mutex<InodeInfo>>>>,
+}
+
+impl InodeTable {
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Get the inode info for the given key if present.
+    fn get(&self, key: InodeKey) -> Option<Arc<Mutex<InodeInfo>>> {
+        let map = self.map.lock().expect("inode table lock poisoned");
+        map.get(&key).cloned()
+    }
+
+    /// Get or create the inode info for the given key.
+    fn get_or_create(&self, key: InodeKey, file: Arc<File>) -> Arc<Mutex<InodeInfo>> {
+        let mut map = self.map.lock().expect("inode table lock poisoned");
+        Arc::clone(
+            map.entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(InodeInfo::new(file)))),
+        )
+    }
+
+    /// Remove the inode entry if its refcount reaches zero.
+    fn maybe_remove(&self, key: InodeKey) {
+        let mut map = self.map.lock().expect("inode table lock poisoned");
+        if let Some(info) = map.get(&key) {
+            let guard = info.lock().expect("inode info lock poisoned");
+            if guard.n_ref == 0 {
+                drop(guard);
+                map.remove(&key);
+            }
+        }
+    }
+}
+
+/// The singleton global inode table for the process.
+fn global_inode_table() -> &'static InodeTable {
+    static TABLE: OnceLock<InodeTable> = OnceLock::new();
+    TABLE.get_or_init(InodeTable::new)
+}
+
+// ---------------------------------------------------------------------------
+// UnixVfs
+// ---------------------------------------------------------------------------
+
+/// A VFS backed by the real Unix filesystem with POSIX advisory locking.
+#[derive(Debug)]
+pub struct UnixVfs;
+
+impl UnixVfs {
+    /// Create a new Unix VFS instance.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for UnixVfs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vfs for UnixVfs {
+    type File = UnixFile;
+
+    fn name(&self) -> &'static str {
+        "unix"
+    }
+
+    fn open(
+        &self,
+        cx: &Cx,
+        path: Option<&Path>,
+        flags: VfsOpenFlags,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        let is_temp = path.is_none();
+        let resolved = if let Some(p) = path {
+            p.to_path_buf()
+        } else {
+            let mut rng_buf = [0u8; 16];
+            self.randomness(cx, &mut rng_buf);
+            let mut hex = String::with_capacity(32);
+            for b in rng_buf {
+                write!(hex, "{b:02x}").expect("writing to a String should not fail");
+            }
+            std::env::temp_dir().join(format!("fsqlite_{hex}.db"))
+        };
+
+        let create_new = is_temp
+            || (flags.contains(VfsOpenFlags::CREATE) && flags.contains(VfsOpenFlags::EXCLUSIVE));
+
+        // Try to reuse the in-process canonical fd if the file already exists
+        // and we're not creating a new exclusive file.
+        if !create_new {
+            if let Some(inode_key) = inode_key_from_path(&resolved)? {
+                if let Some(inode_info) = global_inode_table().get(inode_key) {
+                    let file = {
+                        let mut info = inode_info.lock().expect("inode info lock poisoned");
+                        info.n_ref += 1;
+                        Arc::clone(&info.file)
+                    };
+
+                    let unix_file = UnixFile {
+                        file,
+                        path: resolved,
+                        lock_level: LockLevel::None,
+                        delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
+                        inode_key,
+                        inode_info,
+                    };
+
+                    let mut out_flags = flags;
+                    if flags.contains(VfsOpenFlags::CREATE) {
+                        out_flags |= VfsOpenFlags::READWRITE;
+                    }
+                    return Ok((unix_file, out_flags));
+                }
+            }
+        }
+
+        let is_create = is_temp || flags.contains(VfsOpenFlags::CREATE);
+        let is_rw = is_temp || flags.contains(VfsOpenFlags::READWRITE) || is_create;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(is_rw)
+            .create(is_create)
+            .create_new(create_new)
+            .open(&resolved)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    FrankenError::CannotOpen {
+                        path: resolved.clone(),
+                    }
+                } else {
+                    FrankenError::Io(e)
+                }
+            })?;
+
+        // Install / reuse inode identity for per-process lock coalescing.
+        let opened = Arc::new(file);
+        let inode_key = inode_key_from_file(opened.as_ref())?;
+        let inode_info = global_inode_table().get_or_create(inode_key, Arc::clone(&opened));
+        let file = {
+            let mut info = inode_info.lock().expect("inode info lock poisoned");
+            info.n_ref += 1;
+            Arc::clone(&info.file)
+        };
+
+        let mut out_flags = flags;
+        if is_create {
+            out_flags |= VfsOpenFlags::READWRITE;
+        }
+        if is_temp {
+            // Temp files are always created read-write.
+            out_flags |= VfsOpenFlags::READWRITE;
+        }
+
+        let unix_file = UnixFile {
+            file,
+            path: resolved,
+            lock_level: LockLevel::None,
+            delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
+            inode_key,
+            inode_info,
+        };
+
+        Ok((unix_file, out_flags))
+    }
+
+    fn delete(&self, _cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
+        fs::remove_file(path).map_err(FrankenError::Io)?;
+
+        if sync_dir {
+            if let Some(parent) = path.parent() {
+                // Open the directory and fsync it.
+                if let Ok(dir) = File::open(parent) {
+                    drop(dir.sync_all());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn access(&self, _cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
+        match flags {
+            AccessFlags::READWRITE => {
+                // Avoid opening the file (opening/closing extra fds can interact
+                // poorly with fcntl locks). Use metadata-based heuristics.
+                match fs::metadata(path) {
+                    Ok(meta) => Ok(!meta.permissions().readonly()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(e) => Err(FrankenError::Io(e)),
+                }
+            }
+            _ => Ok(path.exists()),
+        }
+    }
+
+    fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            let cwd = std::env::current_dir().map_err(FrankenError::Io)?;
+            Ok(cwd.join(path))
+        }
+    }
+
+    fn randomness(&self, _cx: &Cx, buf: &mut [u8]) {
+        static FALLBACK_SEQ: AtomicU64 = AtomicU64::new(0);
+
+        // Use /dev/urandom for real randomness; fall back to deterministic
+        // xorshift if unavailable (for hermetic test environments).
+        if let Ok(mut f) = File::open("/dev/urandom") {
+            if f.read_exact(buf).is_ok() {
+                return;
+            }
+        }
+
+        let seq = FALLBACK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut state: u64 = 0x5DEE_CE66_D1A4_F681 ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        for chunk in buf.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let bytes = state.to_le_bytes();
+            for (dst, &src) in chunk.iter_mut().zip(bytes.iter()) {
+                *dst = src;
+            }
+        }
+    }
+}
+
+/// Extract the (device, inode) pair from an open file for lock coalescing.
+fn inode_key_from_file(file: &File) -> Result<InodeKey> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata().map_err(FrankenError::Io)?;
+    Ok(InodeKey {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+/// Extract the (device, inode) pair from a path without opening the file.
+///
+/// Returns `Ok(None)` if the file does not exist.
+fn inode_key_from_path(path: &Path) -> Result<Option<InodeKey>> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::metadata(path) {
+        Ok(meta) => Ok(Some(InodeKey {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(FrankenError::Io(e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UnixFile
+// ---------------------------------------------------------------------------
+
+/// A file handle opened by [`UnixVfs`].
+#[derive(Debug)]
+pub struct UnixFile {
+    file: Arc<File>,
+    path: PathBuf,
+    lock_level: LockLevel,
+    delete_on_close: bool,
+    inode_key: InodeKey,
+    inode_info: Arc<Mutex<InodeInfo>>,
+}
+
+impl VfsFile for UnixFile {
+    fn close(&mut self, cx: &Cx) -> Result<()> {
+        // Downgrade to no lock before closing.
+        if self.lock_level != LockLevel::None {
+            self.unlock(cx, LockLevel::None)?;
+        }
+
+        // Decrement refcount.
+        {
+            let mut info = self.inode_info.lock().expect("inode info lock poisoned");
+            info.n_ref = info.n_ref.saturating_sub(1);
+        }
+        global_inode_table().maybe_remove(self.inode_key);
+
+        if self.delete_on_close {
+            drop(fs::remove_file(&self.path));
+        }
+
+        Ok(())
+    }
+
+    fn read(&mut self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        let mut total = 0_usize;
+        while total < buf.len() {
+            #[allow(clippy::cast_possible_truncation)]
+            let off = offset + total as u64;
+            let n = self
+                .file
+                .read_at(&mut buf[total..], off)
+                .map_err(FrankenError::Io)?;
+            if n == 0 {
+                break; // EOF
+            }
+            total += n;
+        }
+
+        // Zero-fill short reads (SQLite requirement).
+        if total < buf.len() {
+            buf[total..].fill(0);
+        }
+
+        Ok(total)
+    }
+
+    fn write(&mut self, _cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        let mut total = 0_usize;
+        while total < buf.len() {
+            #[allow(clippy::cast_possible_truncation)]
+            let off = offset + total as u64;
+            let n = self
+                .file
+                .write_at(&buf[total..], off)
+                .map_err(FrankenError::Io)?;
+            if n == 0 {
+                return Err(FrankenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "unix vfs write_at returned 0",
+                )));
+            }
+            total += n;
+        }
+        Ok(())
+    }
+
+    fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
+        self.file.set_len(size).map_err(FrankenError::Io)?;
+        Ok(())
+    }
+
+    fn sync(&mut self, _cx: &Cx, flags: SyncFlags) -> Result<()> {
+        if flags.contains(SyncFlags::DATAONLY) {
+            self.file.sync_data().map_err(FrankenError::Io)?;
+        } else {
+            self.file.sync_all().map_err(FrankenError::Io)?;
+        }
+        Ok(())
+    }
+
+    fn file_size(&self, _cx: &Cx) -> Result<u64> {
+        let meta = self.file.metadata().map_err(FrankenError::Io)?;
+        Ok(meta.len())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
+        // No-op if already at or above the requested level.
+        if self.lock_level >= level {
+            return Ok(());
+        }
+
+        // Clone the Arc so we have an independent handle for fcntl calls.
+        // This avoids borrow-checker conflicts between `&mut self` and
+        // the file descriptor reference.
+        let file = Arc::clone(&self.file);
+        let mut info = self.inode_info.lock().expect("inode info lock poisoned");
+
+        let original = self.lock_level;
+        let original_info_level = info.lock_level;
+        let mut acquired_shared = false;
+        let mut acquired_reserved = false;
+        let mut acquired_pending = false;
+
+        // Upgrade step-by-step, rolling back any locks acquired in this call on failure.
+        let rollback = |info: &mut InodeInfo,
+                        f: &File,
+                        acquired_shared: bool,
+                        acquired_reserved: bool,
+                        acquired_pending: bool,
+                        original_info_level: LockLevel|
+         -> Result<()> {
+            if acquired_pending {
+                posix_unlock(f, PENDING_BYTE, 1)?;
+            }
+            if acquired_reserved {
+                posix_unlock(f, RESERVED_BYTE, 1)?;
+            }
+            if acquired_shared {
+                info.n_shared = info.n_shared.saturating_sub(1);
+                if info.n_shared == 0 {
+                    posix_unlock(f, SHARED_FIRST, SHARED_SIZE)?;
+                }
+            }
+            info.lock_level = original_info_level;
+            Ok(())
+        };
+
+        if level >= LockLevel::Shared && self.lock_level < LockLevel::Shared {
+            // Step 1: Check PENDING byte is not write-locked (blocks new readers).
+            if !posix_lock(&*file, libc::F_RDLCK, PENDING_BYTE, 1)? {
+                return Err(FrankenError::Busy);
+            }
+
+            // Step 2: Acquire read lock on SHARED range.
+            if info.n_shared == 0 {
+                // First shared lock in this process — issue OS lock.
+                if !posix_lock(&*file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)? {
+                    posix_unlock(&*file, PENDING_BYTE, 1)?;
+                    return Err(FrankenError::Busy);
+                }
+            }
+            info.n_shared += 1;
+
+            // Step 3: Release PENDING byte.
+            posix_unlock(&*file, PENDING_BYTE, 1)?;
+
+            self.lock_level = LockLevel::Shared;
+            acquired_shared = true;
+            if info.lock_level < LockLevel::Shared {
+                info.lock_level = LockLevel::Shared;
+            }
+        }
+
+        if level >= LockLevel::Reserved && self.lock_level < LockLevel::Reserved {
+            if !posix_lock(&*file, libc::F_WRLCK, RESERVED_BYTE, 1)? {
+                rollback(
+                    &mut info,
+                    &file,
+                    acquired_shared,
+                    acquired_reserved,
+                    acquired_pending,
+                    original_info_level,
+                )?;
+                self.lock_level = original;
+                return Err(FrankenError::Busy);
+            }
+
+            self.lock_level = LockLevel::Reserved;
+            acquired_reserved = true;
+            if info.lock_level < LockLevel::Reserved {
+                info.lock_level = LockLevel::Reserved;
+            }
+        }
+
+        if level >= LockLevel::Pending && self.lock_level < LockLevel::Pending {
+            if !posix_lock(&*file, libc::F_WRLCK, PENDING_BYTE, 1)? {
+                rollback(
+                    &mut info,
+                    &file,
+                    acquired_shared,
+                    acquired_reserved,
+                    acquired_pending,
+                    original_info_level,
+                )?;
+                self.lock_level = original;
+                return Err(FrankenError::Busy);
+            }
+
+            self.lock_level = LockLevel::Pending;
+            acquired_pending = true;
+            if info.lock_level < LockLevel::Pending {
+                info.lock_level = LockLevel::Pending;
+            }
+        }
+
+        if level >= LockLevel::Exclusive && self.lock_level < LockLevel::Exclusive {
+            if !posix_lock(&*file, libc::F_WRLCK, SHARED_FIRST, SHARED_SIZE)? {
+                rollback(
+                    &mut info,
+                    &file,
+                    acquired_shared,
+                    acquired_reserved,
+                    acquired_pending,
+                    original_info_level,
+                )?;
+                self.lock_level = original;
+                return Err(FrankenError::Busy);
+            }
+
+            self.lock_level = LockLevel::Exclusive;
+            info.lock_level = LockLevel::Exclusive;
+        }
+
+        drop(info);
+        Ok(())
+    }
+
+    fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
+        // No-op if already at or below the requested level.
+        if self.lock_level <= level {
+            return Ok(());
+        }
+
+        let file = Arc::clone(&self.file);
+        let mut info = self.inode_info.lock().expect("inode info lock poisoned");
+
+        if self.lock_level >= LockLevel::Reserved && level < LockLevel::Reserved {
+            // Release PENDING and RESERVED bytes.
+            posix_unlock(&*file, PENDING_BYTE, 2)?;
+
+            if self.lock_level == LockLevel::Exclusive {
+                // Downgrade SHARED range from F_WRLCK back to F_RDLCK.
+                if info.n_shared > 0 {
+                    let ok = posix_lock(&*file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
+                    debug_assert!(
+                        ok,
+                        "downgrading an exclusive lock back to shared should not block"
+                    );
+                    if !ok {
+                        return Err(FrankenError::Busy);
+                    }
+                }
+            }
+        }
+
+        if level == LockLevel::None && self.lock_level >= LockLevel::Shared {
+            info.n_shared = info.n_shared.saturating_sub(1);
+
+            if info.n_shared == 0 {
+                // Last shared handle in this process — release OS lock.
+                posix_unlock(&*file, SHARED_FIRST, SHARED_SIZE)?;
+                info.lock_level = LockLevel::None;
+            } else {
+                info.lock_level = LockLevel::Shared;
+            }
+        } else if level >= LockLevel::Shared {
+            info.lock_level = level;
+        }
+
+        drop(info);
+        self.lock_level = level;
+        Ok(())
+    }
+
+    fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
+        // If *we* hold reserved or higher, report false (it's us, not another).
+        if self.lock_level >= LockLevel::Reserved {
+            return Ok(false);
+        }
+
+        // Probe the RESERVED byte with a non-blocking F_WRLCK.
+        let can_lock = posix_lock(&*self.file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
+        if can_lock {
+            // We got it, meaning nobody else has it. Release immediately.
+            posix_unlock(&*self.file, RESERVED_BYTE, 1)?;
+            Ok(false)
+        } else {
+            // Another process holds reserved.
+            Ok(true)
+        }
+    }
+
+    fn shm_map(&mut self, _cx: &Cx, _region: u32, _size: u32, _extend: bool) -> Result<*mut u8> {
+        // SHM support will be added in a later phase (WAL mode).
+        Err(FrankenError::Unsupported)
+    }
+
+    fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
+    fn shm_barrier(&self) {}
+
+    fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_temp_path(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(name);
+        (dir, path)
+    }
+
+    fn open_flags_create() -> VfsOpenFlags {
+        VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
+    }
+
+    // -- Basic I/O --
+
+    #[test]
+    fn test_unix_vfs_create_write_close_reopen_read() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("rw_test.db");
+
+        // Create and write.
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"hello unix vfs", 0).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 14);
+        file.close(&cx).unwrap();
+
+        // Reopen and read.
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let mut buf = [0u8; 14];
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 14);
+        assert_eq!(&buf, b"hello unix vfs");
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_read_past_end_zeroes() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("short_read.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"hi", 0).unwrap();
+
+        let mut buf = [0xFF_u8; 10];
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"hi");
+        assert!(
+            buf[2..].iter().all(|&b| b == 0),
+            "short read must zero-fill"
+        );
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_truncate() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("truncate.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"hello world!!", 0).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 13);
+
+        file.truncate(&cx, 5).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 5);
+
+        let mut buf = [0u8; 5];
+        file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"hello");
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_delete_nonexistent() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("nonexistent_delete_test.db");
+        let result = vfs.delete(&cx, &path, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unix_vfs_delete_file() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("delete_me.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"data", 0).unwrap();
+        file.close(&cx).unwrap();
+
+        assert!(vfs.access(&cx, &path, AccessFlags::EXISTS).unwrap());
+        vfs.delete(&cx, &path, false).unwrap();
+        assert!(!vfs.access(&cx, &path, AccessFlags::EXISTS).unwrap());
+    }
+
+    #[test]
+    fn test_unix_vfs_open_nonexistent_without_create_fails() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("definitely_not_here.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let result = vfs.open(&cx, Some(&path), flags);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unix_vfs_full_pathname() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+
+        let abs = vfs.full_pathname(&cx, Path::new("/tmp/test.db")).unwrap();
+        assert_eq!(abs, Path::new("/tmp/test.db"));
+
+        let rel = vfs.full_pathname(&cx, Path::new("test.db")).unwrap();
+        assert!(rel.is_absolute());
+    }
+
+    #[test]
+    fn test_unix_vfs_name() {
+        let vfs = UnixVfs::new();
+        assert_eq!(vfs.name(), "unix");
+    }
+
+    // -- Locking --
+
+    #[test]
+    fn test_unix_vfs_lock_escalation() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("lock_test.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"lock test data", 0).unwrap();
+
+        // Escalate: None -> Shared -> Reserved -> Exclusive.
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Shared);
+
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Reserved);
+
+        file.lock(&cx, LockLevel::Exclusive).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Exclusive);
+
+        // Downgrade: Exclusive -> Shared -> None.
+        file.unlock(&cx, LockLevel::Shared).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Shared);
+
+        file.unlock(&cx, LockLevel::None).unwrap();
+        assert_eq!(file.lock_level, LockLevel::None);
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_lock_idempotent() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("idem_lock.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        // Requesting the same lock level is a no-op.
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        assert_eq!(file.lock_level, LockLevel::Shared);
+
+        file.unlock(&cx, LockLevel::None).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_check_reserved_lock() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("check_reserved.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"data", 0).unwrap();
+
+        // No reserved lock held by others.
+        assert!(!file.check_reserved_lock(&cx).unwrap());
+
+        // If we hold reserved, check_reserved_lock returns false (it's us).
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        assert!(!file.check_reserved_lock(&cx).unwrap());
+
+        file.unlock(&cx, LockLevel::None).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_sync() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("sync_test.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"sync me", 0).unwrap();
+
+        file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        file.sync(&cx, SyncFlags::FULL).unwrap();
+        file.sync(&cx, SyncFlags::DATAONLY).unwrap();
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_delete_on_close() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("auto_delete.db");
+
+        let flags = VfsOpenFlags::MAIN_DB
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::DELETEONCLOSE;
+        let (mut file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        file.write(&cx, b"temp", 0).unwrap();
+        assert!(path.exists());
+
+        file.close(&cx).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_unix_vfs_write_at_offset() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("offset_write.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"AAAA", 0).unwrap();
+        file.write(&cx, b"BB", 1).unwrap();
+
+        let mut buf = [0u8; 4];
+        file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(&buf, b"ABBA");
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_page_write_read() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("pages.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+
+        let page1 = vec![0xAA_u8; 4096];
+        let page2 = vec![0xBB_u8; 4096];
+        file.write(&cx, &page1, 0).unwrap();
+        file.write(&cx, &page2, 4096).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 8192);
+
+        let mut buf = vec![0u8; 4096];
+        file.read(&cx, &mut buf, 0).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xAA));
+
+        file.read(&cx, &mut buf, 4096).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xBB));
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_unix_vfs_randomness() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let mut buf1 = [0u8; 16];
+        let mut buf2 = [0u8; 16];
+        vfs.randomness(&cx, &mut buf1);
+        vfs.randomness(&cx, &mut buf2);
+        assert_ne!(buf1, buf2, "randomness should produce different outputs");
+    }
+}

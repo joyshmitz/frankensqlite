@@ -381,4 +381,445 @@ mod tests {
     fn read_varint_empty() {
         assert!(read_varint(&[]).is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // bd-1y7b: §11.2 Varint Edge Cases
+    // -----------------------------------------------------------------------
+
+    const BEAD_ID: &str = "bd-1y7b";
+
+    /// Byte-length boundary values: (min_value, max_value, expected_bytes).
+    const BYTE_BOUNDARIES: [(u64, u64, usize); 9] = [
+        (0, 0x7F, 1),                                  // 1 byte: [0, 127]
+        (0x80, 0x3FFF, 2),                             // 2 bytes: [128, 16383]
+        (0x4000, 0x001F_FFFF, 3),                      // 3 bytes: [16384, 2097151]
+        (0x0020_0000, 0x0FFF_FFFF, 4),                 // 4 bytes: [2097152, 268435455]
+        (0x1000_0000, 0x07_FFFF_FFFF, 5),              // 5 bytes: [268435456, 34359738367]
+        (0x08_0000_0000, 0x03FF_FFFF_FFFF, 6),         // 6 bytes
+        (0x0400_0000_0000, 0x01_FFFF_FFFF_FFFF, 7),    // 7 bytes
+        (0x02_0000_0000_0000, 0xFF_FFFF_FFFF_FFFF, 8), // 8 bytes
+        (0x0100_0000_0000_0000, u64::MAX, 9),          // 9 bytes
+    ];
+
+    #[test]
+    fn test_varint_1byte_boundary() {
+        let mut buf = [0u8; 9];
+        for value in [0u64, 1, 42, 126, 127] {
+            let written = write_varint(&mut buf, value);
+            assert_eq!(
+                written, 1,
+                "bead_id={BEAD_ID} case=1byte_boundary value={value}"
+            );
+            let (decoded, consumed) = read_varint(&buf[..written]).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(consumed, 1);
+        }
+    }
+
+    #[test]
+    fn test_varint_2byte_boundary() {
+        let mut buf = [0u8; 9];
+        // min 2-byte: 128
+        let written = write_varint(&mut buf, 128);
+        assert_eq!(written, 2, "bead_id={BEAD_ID} case=2byte_min");
+        assert_eq!(
+            &buf[..2],
+            [0x81, 0x00],
+            "bead_id={BEAD_ID} case=2byte_min_bytes"
+        );
+        let (decoded, _) = read_varint(&buf[..2]).unwrap();
+        assert_eq!(decoded, 128);
+
+        // max 2-byte: 16383
+        let written = write_varint(&mut buf, 16383);
+        assert_eq!(written, 2, "bead_id={BEAD_ID} case=2byte_max");
+        assert_eq!(
+            &buf[..2],
+            [0xFF, 0x7F],
+            "bead_id={BEAD_ID} case=2byte_max_bytes"
+        );
+        let (decoded, _) = read_varint(&buf[..2]).unwrap();
+        assert_eq!(decoded, 16383);
+    }
+
+    #[test]
+    fn test_varint_3byte_boundary() {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, 16384);
+        assert_eq!(written, 3, "bead_id={BEAD_ID} case=3byte_min");
+        let (decoded, consumed) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 16384);
+        assert_eq!(consumed, 3);
+
+        let written = write_varint(&mut buf, 2_097_151);
+        assert_eq!(written, 3, "bead_id={BEAD_ID} case=3byte_max");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 2_097_151);
+    }
+
+    #[test]
+    fn test_varint_4byte_boundary() {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, 2_097_152);
+        assert_eq!(written, 4, "bead_id={BEAD_ID} case=4byte_min");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 2_097_152);
+
+        let written = write_varint(&mut buf, 268_435_455);
+        assert_eq!(written, 4, "bead_id={BEAD_ID} case=4byte_max");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 268_435_455);
+    }
+
+    #[test]
+    fn test_varint_5byte_boundary() {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, 268_435_456);
+        assert_eq!(written, 5, "bead_id={BEAD_ID} case=5byte_min");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 268_435_456);
+
+        let written = write_varint(&mut buf, 34_359_738_367);
+        assert_eq!(written, 5, "bead_id={BEAD_ID} case=5byte_max");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 34_359_738_367);
+    }
+
+    #[test]
+    fn test_varint_6byte_boundary() {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, 34_359_738_368);
+        assert_eq!(written, 6, "bead_id={BEAD_ID} case=6byte_min");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 34_359_738_368);
+
+        let written = write_varint(&mut buf, 4_398_046_511_103);
+        assert_eq!(written, 6, "bead_id={BEAD_ID} case=6byte_max");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 4_398_046_511_103);
+    }
+
+    #[test]
+    fn test_varint_7byte_boundary() {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, 4_398_046_511_104);
+        assert_eq!(written, 7, "bead_id={BEAD_ID} case=7byte_min");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 4_398_046_511_104);
+
+        let written = write_varint(&mut buf, 562_949_953_421_311);
+        assert_eq!(written, 7, "bead_id={BEAD_ID} case=7byte_max");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 562_949_953_421_311);
+    }
+
+    #[test]
+    fn test_varint_8byte_boundary() {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, 562_949_953_421_312);
+        assert_eq!(written, 8, "bead_id={BEAD_ID} case=8byte_min");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 562_949_953_421_312);
+
+        let written = write_varint(&mut buf, 72_057_594_037_927_935);
+        assert_eq!(written, 8, "bead_id={BEAD_ID} case=8byte_max");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, 72_057_594_037_927_935);
+    }
+
+    #[test]
+    fn test_varint_9byte_full_u64() {
+        let mut buf = [0u8; 9];
+
+        // min 9-byte value
+        let min9 = 72_057_594_037_927_936u64; // 2^56
+        let written = write_varint(&mut buf, min9);
+        assert_eq!(written, 9, "bead_id={BEAD_ID} case=9byte_min");
+        let (decoded, consumed) = read_varint(&buf).unwrap();
+        assert_eq!(decoded, min9);
+        assert_eq!(consumed, 9);
+
+        // u64::MAX
+        let written = write_varint(&mut buf, u64::MAX);
+        assert_eq!(written, 9, "bead_id={BEAD_ID} case=9byte_max");
+        assert_eq!(
+            buf,
+            [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            "bead_id={BEAD_ID} case=9byte_max_bytes u64::MAX must be all-0xFF"
+        );
+        let (decoded, consumed) = read_varint(&buf).unwrap();
+        assert_eq!(decoded, u64::MAX);
+        assert_eq!(consumed, 9);
+    }
+
+    #[test]
+    fn test_varint_9th_byte_all_bits() {
+        // Verify the 9th byte contributes ALL 8 bits, not just 7.
+        // Value chosen so the 9th byte has its high bit set (0x80+).
+        let mut buf = [0u8; 9];
+
+        for low_byte in [0x80u8, 0xFF, 0xAB, 0xFE] {
+            let value = (1u64 << 56) | u64::from(low_byte);
+            let written = write_varint(&mut buf, value);
+            assert_eq!(written, 9);
+            assert_eq!(
+                buf[8], low_byte,
+                "bead_id={BEAD_ID} case=9th_byte_all_bits low={low_byte:#04x}"
+            );
+            // First 8 bytes must all have continuation bit set.
+            for (i, &b) in buf[..8].iter().enumerate() {
+                assert_ne!(
+                    b & 0x80,
+                    0,
+                    "bead_id={BEAD_ID} case=continuation_bit byte={i}"
+                );
+            }
+            let (decoded, consumed) = read_varint(&buf).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(consumed, 9);
+        }
+    }
+
+    #[test]
+    fn test_varint_signed_negative_rowid() {
+        let mut buf = [0u8; 9];
+
+        // i64::MIN as u64 via two's complement = 0x8000_0000_0000_0000
+        #[allow(clippy::cast_sign_loss)]
+        let min_u64 = i64::MIN as u64;
+        assert_eq!(min_u64, 0x8000_0000_0000_0000);
+
+        let written = write_varint(&mut buf, min_u64);
+        assert_eq!(written, 9, "bead_id={BEAD_ID} case=i64_min_length");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, min_u64);
+
+        // Cast back to i64
+        #[allow(clippy::cast_possible_wrap)]
+        let signed = decoded as i64;
+        assert_eq!(signed, i64::MIN, "bead_id={BEAD_ID} case=i64_min_roundtrip");
+    }
+
+    #[test]
+    fn test_varint_signed_minus_one() {
+        let mut buf = [0u8; 9];
+
+        // -1i64 as u64 = u64::MAX
+        #[allow(clippy::cast_sign_loss)]
+        let minus_one_u64 = (-1i64) as u64;
+        assert_eq!(minus_one_u64, u64::MAX);
+
+        let written = write_varint(&mut buf, minus_one_u64);
+        assert_eq!(written, 9, "bead_id={BEAD_ID} case=minus_one_length");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+
+        #[allow(clippy::cast_possible_wrap)]
+        let signed = decoded as i64;
+        assert_eq!(signed, -1, "bead_id={BEAD_ID} case=minus_one_roundtrip");
+    }
+
+    #[test]
+    fn test_varint_not_protobuf() {
+        // SQLite varint for u64::MAX: exactly 9 bytes.
+        // Protobuf LEB128 for u64::MAX: 10 bytes (7 bits per byte).
+        let mut buf = [0u8; 9];
+        let sqlite_len = write_varint(&mut buf, u64::MAX);
+        assert_eq!(
+            sqlite_len, 9,
+            "bead_id={BEAD_ID} case=not_protobuf SQLite u64::MAX must be 9 bytes"
+        );
+
+        // Compute protobuf LEB128 length for u64::MAX.
+        let protobuf_len = leb128_len(u64::MAX);
+        assert_eq!(
+            protobuf_len, 10,
+            "bead_id={BEAD_ID} case=not_protobuf protobuf u64::MAX must be 10 bytes"
+        );
+
+        // Also verify a mid-range 9-byte value.
+        let value = 1u64 << 56;
+        let sqlite_len = write_varint(&mut buf, value);
+        assert_eq!(sqlite_len, 9);
+        let protobuf_len = leb128_len(value);
+        assert_eq!(protobuf_len, 9); // protobuf is also 9 for 2^56 (57 bits / 7 = 9 bytes)
+
+        // But the BYTE SEQUENCES differ. Encode both and compare.
+        let mut leb_buf = [0u8; 10];
+        let leb_n = leb128_encode(&mut leb_buf, value);
+        assert_ne!(
+            &buf[..sqlite_len],
+            &leb_buf[..leb_n],
+            "bead_id={BEAD_ID} case=not_protobuf byte sequences must differ for 2^56"
+        );
+    }
+
+    /// Protobuf LEB128 encoding length (for comparison — NOT used by SQLite).
+    fn leb128_len(mut v: u64) -> usize {
+        let mut len = 1;
+        while v >= 0x80 {
+            v >>= 7;
+            len += 1;
+        }
+        len
+    }
+
+    /// Protobuf LEB128 encode (for comparison — NOT used by SQLite).
+    fn leb128_encode(buf: &mut [u8], mut v: u64) -> usize {
+        let mut i = 0;
+        while v >= 0x80 {
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                buf[i] = (v as u8 & 0x7F) | 0x80;
+            }
+            v >>= 7;
+            i += 1;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            buf[i] = v as u8;
+        }
+        i + 1
+    }
+
+    #[test]
+    fn test_varint_all_boundaries_roundtrip() {
+        let mut buf = [0u8; 9];
+        for &(min_val, max_val, expected_len) in &BYTE_BOUNDARIES {
+            // Test min value
+            let written = write_varint(&mut buf, min_val);
+            assert_eq!(
+                written, expected_len,
+                "bead_id={BEAD_ID} case=boundary_min value={min_val} expected_len={expected_len}"
+            );
+            let (decoded, consumed) = read_varint(&buf[..written]).unwrap();
+            assert_eq!(decoded, min_val);
+            assert_eq!(consumed, expected_len);
+
+            // Test max value
+            let written = write_varint(&mut buf, max_val);
+            assert_eq!(
+                written, expected_len,
+                "bead_id={BEAD_ID} case=boundary_max value={max_val} expected_len={expected_len}"
+            );
+            let (decoded, consumed) = read_varint(&buf[..written]).unwrap();
+            assert_eq!(decoded, max_val);
+            assert_eq!(consumed, expected_len);
+
+            // Test varint_len matches
+            assert_eq!(varint_len(min_val), expected_len);
+            assert_eq!(varint_len(max_val), expected_len);
+        }
+    }
+
+    #[test]
+    fn test_varint_canonical_encoding() {
+        // Verify encoder always produces minimal-length encoding.
+        // For each boundary, the value just below the min should encode shorter.
+        for &(min_val, _, expected_len) in &BYTE_BOUNDARIES {
+            if min_val == 0 {
+                continue;
+            }
+            let below = min_val - 1;
+            let mut buf = [0u8; 9];
+            let written = write_varint(&mut buf, below);
+            assert!(
+                written < expected_len,
+                "bead_id={BEAD_ID} case=canonical value={below} written={written} \
+                 must be < {expected_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_varint_decode_from_longer_buffer() {
+        // Decoder must read exactly N bytes and leave trailing bytes untouched.
+        let mut buf = [0xCC_u8; 16]; // fill with sentinel
+        let written = write_varint(&mut buf, 128); // 2 bytes
+        assert_eq!(written, 2);
+
+        // Read from the full 16-byte buffer.
+        let (decoded, consumed) = read_varint(&buf).unwrap();
+        assert_eq!(decoded, 128);
+        assert_eq!(
+            consumed, 2,
+            "bead_id={BEAD_ID} case=longer_buffer decoder must stop at 2 bytes"
+        );
+        // Trailing bytes must be untouched.
+        assert!(
+            buf[2..].iter().all(|&b| b == 0xCC),
+            "bead_id={BEAD_ID} case=longer_buffer trailing bytes must be untouched"
+        );
+    }
+
+    #[test]
+    fn test_varint_decode_truncated_returns_none() {
+        // A multi-byte varint with insufficient bytes should return None.
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, 128); // 2 bytes: [0x81, 0x00]
+        assert_eq!(written, 2);
+
+        // Only provide 1 byte of the 2-byte encoding.
+        assert!(
+            read_varint(&buf[..1]).is_none(),
+            "bead_id={BEAD_ID} case=truncated_2byte"
+        );
+
+        // 9-byte value with only 8 bytes available.
+        let written = write_varint(&mut buf, u64::MAX);
+        assert_eq!(written, 9);
+        assert!(
+            read_varint(&buf[..8]).is_none(),
+            "bead_id={BEAD_ID} case=truncated_9byte"
+        );
+    }
+
+    #[test]
+    fn test_varint_golden_vectors() {
+        // Golden byte sequences derived from C SQLite's sqlite3PutVarint.
+        let cases: &[(u64, &[u8])] = &[
+            (0, &[0x00]),
+            (1, &[0x01]),
+            (127, &[0x7F]),
+            (128, &[0x81, 0x00]),
+            (129, &[0x81, 0x01]),
+            (16383, &[0xFF, 0x7F]),
+            (16384, &[0x81, 0x80, 0x00]),
+            (
+                u64::MAX,
+                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            ),
+        ];
+
+        let mut buf = [0u8; 9];
+        for &(value, expected_bytes) in cases {
+            let written = write_varint(&mut buf, value);
+            assert_eq!(
+                &buf[..written],
+                expected_bytes,
+                "bead_id={BEAD_ID} case=golden_vector value={value}"
+            );
+            let (decoded, consumed) = read_varint(expected_bytes).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(consumed, expected_bytes.len());
+        }
+    }
+
+    #[test]
+    fn test_varint_i64_max_and_nearby() {
+        let mut buf = [0u8; 9];
+
+        // i64::MAX = 2^63 - 1 = 0x7FFF_FFFF_FFFF_FFFF
+        #[allow(clippy::cast_sign_loss)]
+        let i64_max_u = i64::MAX as u64;
+        let written = write_varint(&mut buf, i64_max_u);
+        assert_eq!(written, 9, "bead_id={BEAD_ID} case=i64_max");
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, i64_max_u);
+
+        // i64::MAX + 1 (first "negative" rowid as u64) = 0x8000_0000_0000_0000
+        let written = write_varint(&mut buf, i64_max_u + 1);
+        assert_eq!(written, 9);
+        let (decoded, _) = read_varint(&buf[..written]).unwrap();
+        assert_eq!(decoded, i64_max_u + 1);
+    }
 }

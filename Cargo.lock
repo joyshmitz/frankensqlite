@@ -378,7 +378,8 @@ version = "0.1.0"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
- "fsqlite-vfs",
+ "parking_lot",
+ "proptest",
 ]
 
 [[package]]
@@ -428,6 +429,9 @@ version = "0.1.0"
 dependencies = [
  "fsqlite-error",
  "fsqlite-types",
+ "libc",
+ "nix",
+ "tempfile",
 ]
 
 [[package]]

@@ -177,9 +177,9 @@ fn internal_dep_graph(metadata: &serde_json::Value) -> BTreeMap<String, BTreeSet
             continue;
         }
 
-        let deps: BTreeSet<String> = node["deps"]
-            .as_array()
-            .unwrap_or(&Vec::new())
+        let deps_array: &[serde_json::Value] = node["deps"].as_array().map_or(&[], Vec::as_slice);
+
+        let deps: BTreeSet<String> = deps_array
             .iter()
             .filter_map(|dep| {
                 let dep_name = dep["name"].as_str()?;

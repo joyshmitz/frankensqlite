@@ -1228,12 +1228,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn test_page_version_index_segment_lookup() {
         let entries: Vec<_> = (1..=50u32)
             .map(|i| {
                 let pgno = make_page(i);
-                let vp = make_vp(u64::from(i) + 10, i as u8, PatchKind::FullImage);
+                let seed = u8::try_from(i).expect("i <= 50");
+                let vp = make_vp(u64::from(i) + 10, seed, PatchKind::FullImage);
                 (pgno, vp)
             })
             .collect();
@@ -1266,13 +1266,13 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn test_page_version_index_segment_bloom_filter() {
         let entries: Vec<_> = (1..=100u32)
             .map(|i| {
+                let seed = u8::try_from(i).expect("i <= 100");
                 (
                     make_page(i),
-                    make_vp(u64::from(i), i as u8, PatchKind::FullImage),
+                    make_vp(u64::from(i), seed, PatchKind::FullImage),
                 )
             })
             .collect();
