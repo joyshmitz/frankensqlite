@@ -6119,7 +6119,20 @@ acquire_and_publish_txn_slot(manager, txn_id, mode) -> Result<(u32, TxnEpoch, Sn
         slot.claiming_timestamp.CAS(0, unix_timestamp())
 
         // Phase 2: initialize required fields (see §5.6.2 for full list).
+        //
+        // IMPORTANT (normative): publish liveness identity FIRST, before any
+        // potentially-blocking work (including snapshot capture). This allows
+        // cleanup_orphaned_slots() to avoid reclaiming an alive claimer in the
+        // TAG_CLAIMING state, which would otherwise permit shared-memory scribbles
+        // by a resumed but "timed out" process.
+        slot.pid.store(current_pid(), Relaxed)
+        slot.pid_birth.store(process_birth_id(), Relaxed)
+        slot.lease_expiry.store(unix_timestamp() + LEASE_DURATION, Relaxed)
+
         slot.txn_epoch.fetch_add(1, AcqRel)  // wrap permitted
+
+        // Snapshot capture can spin briefly on the snapshot seqlock (§5.6.1),
+        // so it MUST happen after pid/pid_birth are published.
         snap = load_consistent_snapshot(manager)
         slot.begin_seq.store(snap.high, Release)
         slot.snapshot_high.store(snap.high, Release)
@@ -6131,9 +6144,6 @@ acquire_and_publish_txn_slot(manager, txn_id, mode) -> Result<(u32, TxnEpoch, Sn
         slot.marked_for_abort.store(false, Relaxed)
         slot.write_set_pages.store(0, Relaxed)
         slot.cleanup_txn_id.store(0, Relaxed)
-        slot.pid.store(current_pid(), Relaxed)
-        slot.pid_birth.store(process_birth_id(), Relaxed)
-        slot.lease_expiry.store(unix_timestamp() + LEASE_DURATION, Relaxed)
         if mode == Concurrent:
             slot.witness_epoch.store(HotWitnessIndex.epoch.load(Acquire), Release)
         else:
@@ -6982,14 +6992,23 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    In particular, `begin_seq`/`snapshot_high` MUST be set before the slot can
    influence GC and witness-epoch advancement decisions (§5.6.4.8, §5.6.5).
 
+   **PID publication ordering (normative):** The claimer MUST write
+   `pid`/`pid_birth`/`lease_expiry` immediately after Phase 1 claim and BEFORE
+   any potentially-blocking operation (including snapshot capture via
+   `load_consistent_snapshot`). This is correctness-critical: cleanup MUST NOT
+   reclaim a TAG_CLAIMING slot owned by an alive process (§5.6.2
+   `cleanup_orphaned_slots`), because the process could later resume and scribble
+   shared-memory fields after the slot has been freed and re-claimed.
+
    Minimum required initialization:
    - increment `txn_epoch` (wrap permitted),
+   - set `pid`, `pid_birth`, `lease_expiry` (EARLY; before snapshot capture),
    - `snap = load_consistent_snapshot(...)` (seqlock; §5.4),
    - set `begin_seq = snap.high` and `snapshot_high = snap.high` (from the SAME snapshot),
    - set `mode` (Serialized or Concurrent) for this transaction,
    - clear `commit_seq = 0`, clear SSI flags/counters (`has_in_rw/has_out_rw/marked_for_abort/write_set_pages = 0`),
    - clear `cleanup_txn_id = 0` (must never leak across slot reuse),
-   - set `pid`, `pid_birth`, `lease_expiry`, and `state = Active`.
+   - set `state = Active`.
    If `mode == Concurrent`, set `witness_epoch = HotWitnessIndex.epoch.load(Acquire)` so all
    witness-plane registrations for the transaction are pinned to a single epoch
    generation (prevents reader-induced epoch livelock; §5.6.4.8).
@@ -7049,10 +7068,11 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    **Freeing discipline (normative):** Before setting `txn_id = 0`, the owner
    MUST clear snapshot/epoch fields so a future claimer cannot transiently expose
    stale values under CLAIMING:
-   - `begin_seq = 0`, `snapshot_high = 0`, `witness_epoch = 0`,
+   - `begin_seq = 0`, `snapshot_high = 0`, `witness_epoch = 0`, `commit_seq = 0`,
    - `cleanup_txn_id = 0` and `claiming_timestamp = 0`,
+   - `pid = 0`, `pid_birth = 0`, `lease_expiry = 0`,
    - clear SSI flags/counters (`has_in_rw/has_out_rw/marked_for_abort/write_set_pages = 0`),
-   - set `state = Free` and clear/zero other metadata as desired (pid/lease, etc.).
+   - set `state = Free` and clear/zero other metadata as desired.
    The `txn_id.store(0, Release)` MUST be the final write that publishes the slot
    as free.
    (The next acquirer increments `txn_epoch`, so stale slot references are rejected.)
@@ -7062,7 +7082,8 @@ orphaned (lease expires, and the owning process is no longer alive). Any process
 this and clean up:
 
 ```
-const CLAIMING_TIMEOUT_SECS: u64 = 5;  // no valid Phase 1->Phase 2 takes 5s
+const CLAIMING_TIMEOUT_SECS: u64 = 5;        // expected Phase 1->Phase 3 fast path
+const CLAIMING_TIMEOUT_NO_PID_SECS: u64 = 30; // fallback if pid/pid_birth not yet published
 
 cleanup_orphaned_slots():
     now = unix_timestamp()
@@ -7115,7 +7136,15 @@ cleanup_orphaned_slots():
             // CLAIMING(tag)) and Phase 2 (write pid/lease_expiry), the
             // slot's pid/pid_birth/lease_expiry fields are STALE (they
             // belong to the previous occupant, or are zero for a fresh slot).
-            // We MUST NOT rely on those fields for CLAIMING-state cleanup.
+            //
+            // However, after the claimer publishes pid/pid_birth (required early
+            // in Phase 2; §5.4 wrapper), reclaiming an *alive* claimer would be
+            // unsafe: the process could later resume and scribble over a slot
+            // that has been freed and re-claimed by another process.
+            //
+            // Therefore:
+            // - if pid/pid_birth are still 0, we can only use a conservative timeout,
+            // - if pid/pid_birth are non-zero, we MUST NOT reclaim while the process is alive.
             //
             // Instead, use a dedicated timeout: if the slot has been in
             // CLAIMING state for longer than CLAIMING_TIMEOUT_SECS, the
@@ -7127,7 +7156,19 @@ cleanup_orphaned_slots():
                 // still be 0. Seed the timeout clock without touching other fields.
                 slot.claiming_timestamp.CAS(0, now)
                 continue
-            if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
+
+            pid = slot.pid.load(Acquire)
+            birth = slot.pid_birth.load(Acquire)
+
+            // If the claimer has published pid/pid_birth and is alive, never reclaim.
+            // This is correctness-critical (prevents resumed-claimer shared-memory scribbles).
+            if pid != 0 && birth != 0 && process_alive(pid, birth):
+                continue
+
+            // pid/birth unknown (still 0) or process is dead. Use a timeout to
+            // avoid pinning the slot forever if the claimer crashed.
+            timeout = if pid == 0 || birth == 0 { CLAIMING_TIMEOUT_NO_PID_SECS } else { CLAIMING_TIMEOUT_SECS }
+            if now - slot.claiming_timestamp > timeout:
                 // Transition to CLEANING before clearing fields so we do not race
                 // with a new claimer that could otherwise observe/clobber state.
                 tok = decode_payload(tid)
@@ -9067,23 +9108,29 @@ Concurrent-mode write paths MUST check this indicator before acquiring page lock
 
 ```
 check_serialized_writer_exclusion(shm) -> Result<()>:
-  tok = shm.serialized_writer_token.load(Acquire)
-  if tok == 0:
-    return Ok(())
+  loop:
+    tok = shm.serialized_writer_token.load(Acquire)
+    if tok == 0:
+      return Ok(())
 
-  expiry = shm.serialized_writer_lease_expiry.load(Relaxed)
-  pid = shm.serialized_writer_pid.load(Relaxed)
-  birth = shm.serialized_writer_pid_birth.load(Relaxed)
+    expiry = shm.serialized_writer_lease_expiry.load(Relaxed)
+    pid = shm.serialized_writer_pid.load(Relaxed)
+    birth = shm.serialized_writer_pid_birth.load(Relaxed)
 
-  if expiry >= unix_timestamp() && process_alive(pid, birth):
-    return Err(SQLITE_BUSY)   // a serialized writer is active
+    if expiry >= unix_timestamp() && process_alive(pid, birth):
+      return Err(SQLITE_BUSY)   // a serialized writer is active
 
-  // Stale indicator: lease expired or owner is dead. Best-effort clear.
-  if shm.serialized_writer_token.CAS(tok, 0):
-    shm.serialized_writer_pid.store(0, Relaxed)
-    shm.serialized_writer_pid_birth.store(0, Relaxed)
-    shm.serialized_writer_lease_expiry.store(0, Relaxed)
-  return Ok(())
+    // Stale indicator: lease expired or owner is dead. Best-effort clear.
+    //
+    // IMPORTANT: If the CAS fails, the token changed (either another checker
+    // cleared it, or a new serialized writer installed a fresh token). Retry
+    // so we never return Ok while a new serialized writer is active.
+    if shm.serialized_writer_token.CAS(tok, 0, AcqRel, Acquire):
+      shm.serialized_writer_pid.store(0, Relaxed)
+      shm.serialized_writer_pid_birth.store(0, Relaxed)
+      shm.serialized_writer_lease_expiry.store(0, Relaxed)
+      return Ok(())
+    continue
 ```
 
 **Serialized writer acquisition ordering (normative):**
@@ -9191,6 +9238,15 @@ Frame := {
 - Payload encoding is **canonical** and deterministic: integers are little-endian
   unless otherwise specified by the payload schema. Variable-length arrays are
   length-prefixed with `u32` counts and elements are encoded in a fixed order.
+  **Canonical ordering (normative):** Any payload field that semantically
+  represents a **set** MUST be encoded in sorted order with no duplicates.
+  For this protocol:
+  - All `ObjectId` arrays (witness refs, edge refs, merge refs) MUST be sorted
+    lexicographically by their 16 raw bytes and MUST contain no duplicates.
+  - Any `pages: [u32]` arrays in conflict responses MUST be sorted ascending and
+    MUST contain no duplicates.
+  - `spill_pages` MUST be sorted ascending by `pgno` and MUST contain no
+    duplicate `pgno` entries.
 
 **Reserve/submit discipline (normative):**
 Cross-process IPC MUST preserve the same safety posture as the in-process
@@ -18105,6 +18161,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.32 (Round 15 audit: coordinator IPC wire framing tightened (len bounds, kind mapping, permit binding); response payloads made fully canonical with explicit variant tags; BEGIN TxnId allocation corrected to read `SharedMemoryLayout.next_txn_id` in pseudocode. Round 14 audit: define cross-process coordinator IPC transport via asupersync Unix domain sockets + SCM_RIGHTS fd passing; specify cancel-safe reserve/submit framing + wire payload schemas; define coordinator-owned per-table RowId allocator + `ROWID_RESERVE`; formal model `PageData` switched to page-aligned `PageBuf` (no Vec-alignment contradiction); `SpillLoc` integrity hash clarified as `xxh3_64`; lock-table rebuild liveness rule strengthened to forbid blocking commit sequencing. Round 13 audit: snapshot seqlock made normative and wired through `load_consistent_snapshot`; TxnSlot sentinel timestamp cleanup rule clarified; Serialized writer exclusion indicator wiring clarified; `SharedMemoryLayout.layout_checksum` fixed to cover immutable layout metadata only; Expression precedence duplication removed (`ESCAPE` is not an operator); Round 12 audit: Compatibility/WAL mode corrected: ARC eviction MUST NOT append to `.wal`; WAL append is coordinator-only; write-set spill to per-txn temp file specified (`CommitWriteSet::Spilled`) + `PRAGMA fsqlite.txn_write_set_mem_bytes`; Round 11 audit: ARC p-update online-learning framing added (research note; canonical ARC update remains normative); Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
-*Last updated: 2026-02-07*
+*Document version: 1.33 (Round 16 audit: fix `check_serialized_writer_exclusion()` to retry on CAS failure so stale-token cleanup cannot return Ok while a new serialized writer installs a fresh token (prevents Concurrent writers from slipping past the indicator); make coordinator IPC payload set-ordering canonical (ObjectId arrays sorted/deduped; conflict page arrays sorted; spill_pages sorted by pgno). Round 15 audit: coordinator IPC wire framing tightened (len bounds, kind mapping, permit binding); response payloads made fully canonical with explicit variant tags; BEGIN TxnId allocation corrected to read `SharedMemoryLayout.next_txn_id` in pseudocode. Round 14 audit: define cross-process coordinator IPC transport via asupersync Unix domain sockets + SCM_RIGHTS fd passing; specify cancel-safe reserve/submit framing + wire payload schemas; define coordinator-owned per-table RowId allocator + `ROWID_RESERVE`; formal model `PageData` switched to page-aligned `PageBuf` (no Vec-alignment contradiction); `SpillLoc` integrity hash clarified as `xxh3_64`; lock-table rebuild liveness rule strengthened to forbid blocking commit sequencing. Round 13 audit: snapshot seqlock made normative and wired through `load_consistent_snapshot`; TxnSlot sentinel timestamp cleanup rule clarified; Serialized writer exclusion indicator wiring clarified; `SharedMemoryLayout.layout_checksum` fixed to cover immutable layout metadata only; Expression precedence duplication removed (`ESCAPE` is not an operator); Round 12 audit: Compatibility/WAL mode corrected: ARC eviction MUST NOT append to `.wal`; WAL append is coordinator-only; write-set spill to per-txn temp file specified (`CommitWriteSet::Spilled`) + `PRAGMA fsqlite.txn_write_set_mem_bytes`; Round 11 audit: ARC p-update online-learning framing added (research note; canonical ARC update remains normative); Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
+*Last updated: 2026-02-08*
 *Status: Authoritative Specification*

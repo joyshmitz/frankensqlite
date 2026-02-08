@@ -830,4 +830,5 @@ without abort storms, and formalizing the TxnSlot acquire/publish protocol.
 - Continue deep-review for the remaining commits in Subset A not covered above:
   - `6b0c12f`, `b181b6d`, `0177456`, `5dae90d`, `ca60e00`, `30203fb`, `ec9adc1`, `e80fdde`, `1d8bbfb`
   - `3d56854`, `df0313b`, `97df1f0`, `bbc4a31`, `4363f50`, `d9021cf`, `120eee2`, `975f65c`, `24b6f60`
-- After Subset A, pick Subset B by impact (top commits across full history) and repeat the same deep-review structure.
+- Subset B (18:11–18:41 ET hardening thread: SHM seqlock + coordinator IPC + rolling rebuild) is now covered above.
+- Next: pick Subset C by impact (top commits outside Subset A/B across the full history) and repeat the same deep-review structure.
