@@ -2610,8 +2610,7 @@ mod tests {
                 );
             }
             DrainResult::TimedOut { remaining, .. } => {
-                assert!(
-                    false,
+                unreachable!(
                     "bead_id={BEAD_22N12} case=bounded_time \
                      rebuild should not time out, remaining={remaining}"
                 );
@@ -3262,5 +3261,578 @@ mod tests {
         slot.txn_id.store(7, Ordering::Release);
         assert!(!slot.is_sentinel(Ordering::Acquire));
         assert!(slot.sentinel_payload(Ordering::Acquire).is_none());
+    }
+
+    // ===================================================================
+    // bd-2xns: TxnSlot Crash Recovery — cleanup_orphaned_slots (§5.6.2.2)
+    // ===================================================================
+
+    const BEAD_2XNS: &str = "bd-2xns";
+
+    /// Helper: create a slot with a real TxnId, lease, and process identity.
+    fn make_orphaned_real_slot(
+        txn_id_raw: u64,
+        lease_expiry: u64,
+        pid: u32,
+        pid_birth: u64,
+    ) -> SharedTxnSlot {
+        let slot = SharedTxnSlot::new();
+        slot.txn_id.store(txn_id_raw, Ordering::Release);
+        slot.lease_expiry.store(lease_expiry, Ordering::Release);
+        slot.pid.store(pid, Ordering::Release);
+        slot.pid_birth.store(pid_birth, Ordering::Release);
+        slot.begin_seq.store(50, Ordering::Release);
+        slot
+    }
+
+    #[test]
+    fn test_cleanup_skips_free_slots() {
+        let slots = [SharedTxnSlot::new(), SharedTxnSlot::new()];
+        let released = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let released_clone = std::sync::Arc::clone(&released);
+
+        let stats = cleanup_orphaned_slots(
+            &slots,
+            9999,
+            |_, _| false,
+            |txn_id| {
+                released_clone.lock().unwrap().push(txn_id);
+            },
+        );
+
+        assert_eq!(
+            stats.scanned, 2,
+            "bead_id={BEAD_2XNS} case=skips_free_scanned"
+        );
+        assert_eq!(
+            stats.orphans_found, 0,
+            "bead_id={BEAD_2XNS} case=skips_free_no_orphans"
+        );
+        assert!(
+            released.lock().unwrap().is_empty(),
+            "bead_id={BEAD_2XNS} case=skips_free_no_releases"
+        );
+        for slot in &slots {
+            assert!(
+                slot.is_free(Ordering::Acquire),
+                "bead_id={BEAD_2XNS} case=skips_free_unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cleanup_reclaims_expired_dead_process() {
+        let txn_id_raw = 42_u64;
+        let now = 1000_u64;
+        let expired_lease = now - 10;
+
+        let slot = make_orphaned_real_slot(txn_id_raw, expired_lease, 12345, 9999);
+        let released = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let released_clone = std::sync::Arc::clone(&released);
+
+        let result = try_cleanup_orphaned_slot(
+            &slot,
+            now,
+            |_, _| false,
+            |txn_id| {
+                released_clone.lock().unwrap().push(txn_id);
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                SlotCleanupResult::Reclaimed { orphan_txn_id, .. }
+                    if orphan_txn_id == txn_id_raw
+            ),
+            "bead_id={BEAD_2XNS} case=reclaims_expired_dead"
+        );
+        assert!(
+            slot.is_free(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=slot_freed"
+        );
+        assert_eq!(
+            released.lock().unwrap().as_slice(),
+            &[txn_id_raw],
+            "bead_id={BEAD_2XNS} case=locks_released"
+        );
+        assert_eq!(slot.begin_seq.load(Ordering::Acquire), 0);
+        assert_eq!(slot.pid.load(Ordering::Acquire), 0);
+        assert_eq!(slot.pid_birth.load(Ordering::Acquire), 0);
+        assert_eq!(slot.lease_expiry.load(Ordering::Acquire), 0);
+        assert_eq!(slot.cleanup_txn_id.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_cleanup_skips_alive_process_even_expired_lease() {
+        let txn_id_raw = 42_u64;
+        let now = 1000_u64;
+        let expired_lease = now - 10;
+        let slot = make_orphaned_real_slot(txn_id_raw, expired_lease, 12345, 9999);
+
+        let result = try_cleanup_orphaned_slot(&slot, now, |_, _| true, |_| {});
+
+        assert_eq!(
+            result,
+            SlotCleanupResult::ProcessAlive,
+            "bead_id={BEAD_2XNS} case=alive_skipped"
+        );
+        assert_eq!(
+            slot.txn_id.load(Ordering::Acquire),
+            txn_id_raw,
+            "bead_id={BEAD_2XNS} case=alive_txn_unchanged"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_claiming_no_pid_uses_30s_timeout() {
+        let txn_id_raw = 99_u64;
+        let claim_time = 1000_u64;
+        let slot = make_claiming_slot(txn_id_raw, claim_time);
+        assert_eq!(slot.pid.load(Ordering::Relaxed), 0);
+
+        let recent_now = claim_time + 10;
+        let result = try_cleanup_orphaned_slot(&slot, recent_now, |_, _| false, |_| {});
+        assert_eq!(
+            result,
+            SlotCleanupResult::StillRecent,
+            "bead_id={BEAD_2XNS} case=claiming_no_pid_too_recent"
+        );
+
+        let stale_now = claim_time + CLAIMING_TIMEOUT_NO_PID_SECS + 1;
+        let result = try_cleanup_orphaned_slot(&slot, stale_now, |_, _| false, |_| {});
+        assert!(
+            matches!(
+                result,
+                SlotCleanupResult::Reclaimed {
+                    orphan_txn_id,
+                    was_claiming: true
+                } if orphan_txn_id == txn_id_raw
+            ),
+            "bead_id={BEAD_2XNS} case=claiming_no_pid_reclaimed"
+        );
+        assert!(slot.is_free(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_cleanup_claiming_with_pid_uses_5s_timeout() {
+        let txn_id_raw = 55_u64;
+        let claim_time = 1000_u64;
+        let slot = make_claiming_slot(txn_id_raw, claim_time);
+        slot.pid.store(12345, Ordering::Release);
+        slot.pid_birth.store(9999, Ordering::Release);
+
+        let recent_now = claim_time + 3;
+        let result = try_cleanup_orphaned_slot(&slot, recent_now, |_, _| false, |_| {});
+        assert_eq!(
+            result,
+            SlotCleanupResult::StillRecent,
+            "bead_id={BEAD_2XNS} case=claiming_pid_too_recent"
+        );
+
+        let stale_now = claim_time + CLAIMING_TIMEOUT_SECS + 1;
+        let result = try_cleanup_orphaned_slot(&slot, stale_now, |_, _| false, |_| {});
+        assert!(
+            matches!(
+                result,
+                SlotCleanupResult::Reclaimed {
+                    orphan_txn_id,
+                    was_claiming: true
+                } if orphan_txn_id == txn_id_raw
+            ),
+            "bead_id={BEAD_2XNS} case=claiming_pid_reclaimed"
+        );
+        assert!(slot.is_free(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_cleanup_claiming_alive_process_never_reclaimed() {
+        let txn_id_raw = 77_u64;
+        let claim_time = 1_u64;
+        let slot = make_claiming_slot(txn_id_raw, claim_time);
+        slot.pid.store(12345, Ordering::Release);
+        slot.pid_birth.store(9999, Ordering::Release);
+
+        let very_late = claim_time + 10_000;
+        let result = try_cleanup_orphaned_slot(&slot, very_late, |_, _| true, |_| {});
+        assert_eq!(
+            result,
+            SlotCleanupResult::ProcessAlive,
+            "bead_id={BEAD_2XNS} case=alive_never_reclaimed"
+        );
+        assert!(
+            !slot.is_free(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=alive_slot_not_freed"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_cleaning_stuck_slot_reclaimed() {
+        let original_txn_id = 42_u64;
+        let long_ago = 1000_u64;
+        let now = long_ago + CLAIMING_TIMEOUT_SECS + 10;
+        let slot = make_cleaning_slot(original_txn_id, long_ago);
+
+        let released = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let released_clone = std::sync::Arc::clone(&released);
+
+        let result = try_cleanup_orphaned_slot(
+            &slot,
+            now,
+            |_, _| false,
+            |txn_id| {
+                released_clone.lock().unwrap().push(txn_id);
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                SlotCleanupResult::Reclaimed {
+                    orphan_txn_id,
+                    was_claiming: false
+                } if orphan_txn_id == original_txn_id
+            ),
+            "bead_id={BEAD_2XNS} case=cleaning_stuck_reclaimed"
+        );
+        assert!(slot.is_free(Ordering::Acquire));
+        assert_eq!(
+            released.lock().unwrap().as_slice(),
+            &[original_txn_id],
+            "bead_id={BEAD_2XNS} case=cleaning_locks_released"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_concurrent_cas_contention() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let txn_id_raw = 42_u64;
+        let claim_time = 1_u64;
+        let now = claim_time + CLAIMING_TIMEOUT_NO_PID_SECS + 10;
+
+        let slot = Arc::new(make_claiming_slot(txn_id_raw, claim_time));
+        let barrier = Arc::new(Barrier::new(2));
+        let release_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let slot_ref = Arc::clone(&slot);
+            let barrier_ref = Arc::clone(&barrier);
+            let count_ref = Arc::clone(&release_count);
+            handles.push(thread::spawn(move || {
+                barrier_ref.wait();
+                try_cleanup_orphaned_slot(
+                    &slot_ref,
+                    now,
+                    |_, _| false,
+                    |_| {
+                        count_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    },
+                )
+            }));
+        }
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("cleaner thread panicked"))
+            .collect();
+
+        let reclaimed_count = results
+            .iter()
+            .filter(|r| matches!(r, SlotCleanupResult::Reclaimed { .. }))
+            .count();
+
+        assert!(
+            reclaimed_count >= 1,
+            "bead_id={BEAD_2XNS} case=concurrent_at_least_one_reclaimed"
+        );
+        assert!(
+            slot.is_free(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=concurrent_slot_freed"
+        );
+        assert!(
+            release_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "bead_id={BEAD_2XNS} case=concurrent_lock_release"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_cleanup_field_clearing_order() {
+        let original_txn_id = 42_u64;
+        let long_ago = 1000_u64;
+        let now = long_ago + CLAIMING_TIMEOUT_SECS + 10;
+
+        let slot = make_cleaning_slot(original_txn_id, long_ago);
+        slot.state.store(1, Ordering::Release);
+        slot.mode.store(1, Ordering::Release);
+        slot.commit_seq.store(99, Ordering::Release);
+        slot.begin_seq.store(50, Ordering::Release);
+        slot.snapshot_high.store(100, Ordering::Release);
+        slot.witness_epoch.store(3, Ordering::Release);
+        slot.has_in_rw.store(true, Ordering::Release);
+        slot.has_out_rw.store(true, Ordering::Release);
+        slot.marked_for_abort.store(true, Ordering::Release);
+        slot.write_set_pages.store(10, Ordering::Release);
+        slot.pid.store(12345, Ordering::Release);
+        slot.pid_birth.store(9999, Ordering::Release);
+        slot.lease_expiry.store(5000, Ordering::Release);
+
+        let result = try_cleanup_orphaned_slot(&slot, now, |_, _| false, |_| {});
+        assert!(matches!(result, SlotCleanupResult::Reclaimed { .. }));
+
+        assert_eq!(
+            slot.txn_id.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_txn_id"
+        );
+        assert_eq!(
+            slot.state.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_state"
+        );
+        assert_eq!(
+            slot.mode.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_mode"
+        );
+        assert_eq!(
+            slot.commit_seq.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_commit_seq"
+        );
+        assert_eq!(
+            slot.begin_seq.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_begin_seq"
+        );
+        assert_eq!(
+            slot.snapshot_high.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_snapshot_high"
+        );
+        assert_eq!(
+            slot.witness_epoch.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_witness_epoch"
+        );
+        assert!(
+            !slot.has_in_rw.load(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=field_order_has_in_rw"
+        );
+        assert!(
+            !slot.has_out_rw.load(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=field_order_has_out_rw"
+        );
+        assert!(
+            !slot.marked_for_abort.load(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=field_order_marked_for_abort"
+        );
+        assert_eq!(
+            slot.write_set_pages.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_write_set_pages"
+        );
+        assert_eq!(
+            slot.pid.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_pid"
+        );
+        assert_eq!(
+            slot.pid_birth.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_pid_birth"
+        );
+        assert_eq!(
+            slot.lease_expiry.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_lease_expiry"
+        );
+        assert_eq!(
+            slot.cleanup_txn_id.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_cleanup_txn_id"
+        );
+        assert_eq!(
+            slot.claiming_timestamp.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=field_order_claiming_ts"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_cleaning_preserves_payload_for_lock_release() {
+        let original_txn_id = 42_u64;
+        let cleaning_word = encode_cleaning(original_txn_id);
+        assert_eq!(
+            decode_payload(cleaning_word),
+            original_txn_id,
+            "bead_id={BEAD_2XNS} case=cleaning_payload_preserved"
+        );
+
+        let long_ago = 1000_u64;
+        let now = long_ago + CLAIMING_TIMEOUT_SECS + 10;
+        let slot = make_cleaning_slot(original_txn_id, long_ago);
+
+        let released = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let released_clone = std::sync::Arc::clone(&released);
+
+        let result = try_cleanup_orphaned_slot(
+            &slot,
+            now,
+            |_, _| false,
+            |txn_id| {
+                released_clone.lock().unwrap().push(txn_id);
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                SlotCleanupResult::Reclaimed { orphan_txn_id, .. }
+                    if orphan_txn_id == original_txn_id
+            ),
+            "bead_id={BEAD_2XNS} case=cleaning_correct_orphan_txn_id"
+        );
+        assert_eq!(
+            released.lock().unwrap().as_slice(),
+            &[original_txn_id],
+            "bead_id={BEAD_2XNS} case=cleaning_release_correct_txn_id"
+        );
+    }
+
+    #[test]
+    fn test_claiming_timestamp_cleared_after_publish() {
+        let txn_id_raw = 42_u64;
+        let claim_time = 1000_u64;
+        let slot = make_claiming_slot(txn_id_raw, claim_time);
+        assert!(slot.is_claiming(Ordering::Acquire));
+        assert_eq!(slot.claiming_timestamp.load(Ordering::Acquire), claim_time);
+
+        let claiming_word = encode_claiming(txn_id_raw);
+        let publish_ok = slot
+            .txn_id
+            .compare_exchange(
+                claiming_word,
+                txn_id_raw,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        assert!(publish_ok, "bead_id={BEAD_2XNS} case=publish_cas_ok");
+
+        slot.claiming_timestamp.store(0, Ordering::Release);
+        assert_eq!(
+            slot.claiming_timestamp.load(Ordering::Acquire),
+            0,
+            "bead_id={BEAD_2XNS} case=claiming_ts_cleared_after_publish"
+        );
+
+        let cleaning_word = encode_cleaning(txn_id_raw);
+        slot.txn_id.store(cleaning_word, Ordering::Release);
+
+        let now = 5000_u64;
+        let result = try_cleanup_orphaned_slot(&slot, now, |_, _| false, |_| {});
+        assert_eq!(
+            result,
+            SlotCleanupResult::StillRecent,
+            "bead_id={BEAD_2XNS} case=cleaning_zero_ts_seeds_and_waits"
+        );
+        assert_eq!(
+            slot.claiming_timestamp.load(Ordering::Acquire),
+            now,
+            "bead_id={BEAD_2XNS} case=cleaning_ts_seeded"
+        );
+    }
+
+    #[test]
+    fn test_e2e_orphaned_txnslot_cleanup_after_crash() {
+        use std::sync::{Arc, Mutex};
+
+        let now = 10_000_u64;
+        let dead_pid = 99_999_u32;
+        let dead_pid_birth = 12_345_u64;
+
+        let slots = [
+            SharedTxnSlot::new(),
+            {
+                let s = SharedTxnSlot::new();
+                s.txn_id.store(42, Ordering::Release);
+                s.begin_seq.store(100, Ordering::Release);
+                s.pid.store(dead_pid, Ordering::Release);
+                s.pid_birth.store(dead_pid_birth, Ordering::Release);
+                s.lease_expiry.store(now - 60, Ordering::Release);
+                s.state.store(1, Ordering::Release);
+                s.mode.store(1, Ordering::Release);
+                s.write_set_pages.store(5, Ordering::Release);
+                s
+            },
+            {
+                let s = SharedTxnSlot::new();
+                s.txn_id.store(43, Ordering::Release);
+                s.begin_seq.store(150, Ordering::Release);
+                s.pid.store(dead_pid + 1, Ordering::Release);
+                s.pid_birth.store(dead_pid_birth + 1, Ordering::Release);
+                s.lease_expiry.store(now + 60, Ordering::Release);
+                s
+            },
+            make_cleaning_slot(44, now - CLAIMING_TIMEOUT_SECS - 10),
+        ];
+
+        let released_locks = Arc::new(Mutex::new(Vec::new()));
+        let released_clone = Arc::clone(&released_locks);
+
+        let stats = cleanup_orphaned_slots(
+            &slots,
+            now,
+            |pid, _birth| pid == dead_pid + 1,
+            |txn_id| {
+                released_clone.lock().unwrap().push(txn_id);
+            },
+        );
+
+        assert_eq!(stats.scanned, 4, "bead_id={BEAD_2XNS} case=e2e_scanned");
+        assert_eq!(
+            stats.orphans_found, 2,
+            "bead_id={BEAD_2XNS} case=e2e_orphans"
+        );
+
+        assert!(
+            slots[0].is_free(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=e2e_slot0_still_free"
+        );
+        assert!(
+            slots[1].is_free(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=e2e_slot1_freed"
+        );
+        assert!(
+            !slots[2].is_free(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=e2e_slot2_alive"
+        );
+        assert!(
+            slots[3].is_free(Ordering::Acquire),
+            "bead_id={BEAD_2XNS} case=e2e_slot3_freed"
+        );
+
+        let mut released = released_locks.lock().unwrap().clone();
+        released.sort_unstable();
+        assert_eq!(
+            released,
+            vec![42, 44],
+            "bead_id={BEAD_2XNS} case=e2e_released_locks"
+        );
+
+        let old_horizon = CommitSeq::new(50);
+        let commit_seq = CommitSeq::new(200);
+        let result = raise_gc_horizon(&slots, old_horizon, commit_seq);
+        assert_eq!(
+            result.new_horizon,
+            CommitSeq::new(150),
+            "bead_id={BEAD_2XNS} case=e2e_horizon_advances"
+        );
+        assert_eq!(result.active_slots, 1);
+        assert_eq!(result.sentinel_blockers, 0);
     }
 }

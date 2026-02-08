@@ -620,10 +620,19 @@ impl SharedMemoryLayout {
             let pid_birth = self.serialized_writer_pid_birth.load(Ordering::Acquire);
             let lease_expiry = self.serialized_writer_lease_expiry.load(Ordering::Acquire);
 
-            let lease_expired = lease_expiry != 0 && now_epoch_secs >= lease_expiry;
+            let lease_set = lease_expiry != 0;
+            let lease_expired = lease_set && now_epoch_secs >= lease_expiry;
             let process_dead = pid != 0 && pid_birth != 0 && !process_alive(pid, pid_birth);
 
-            if !lease_expired && !process_dead {
+            // If a lease is set, it is authoritative. Only fall back to process
+            // liveness when the lease field is missing.
+            let writer_live = if lease_set {
+                !lease_expired
+            } else {
+                !process_dead
+            };
+
+            if writer_live {
                 tracing::warn!(
                     token,
                     pid,
@@ -1303,7 +1312,7 @@ mod tests {
         let mut injected = false;
         let res = layout.check_serialized_writer_exclusion_with_hook(
             now,
-            |_pid, _birth| false,
+            |_pid, _birth| true,
             &mut |token| {
                 if injected {
                     return;

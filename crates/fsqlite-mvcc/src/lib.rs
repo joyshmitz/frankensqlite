@@ -4,7 +4,9 @@
 //! primitives and the cross-process witness/lock-table coordination types.
 
 pub mod cache_aligned;
+pub mod compat;
 pub mod core_types;
+pub mod gc;
 pub mod invariants;
 pub mod lifecycle;
 pub mod shared_lock_table;
@@ -20,11 +22,20 @@ pub use cache_aligned::{
     decode_payload, decode_tag, encode_claiming, encode_cleaning, is_sentinel, rcri_bloom,
     slot_mode, slot_state,
 };
+pub use compat::{
+    CompatMode, CoordinatorProbeResult, HybridShmState, ReadLockOutcome, RecoveryPlan,
+    UpdatedLegacyShm, begin_concurrent_check, choose_reader_slot,
+};
 pub use core_types::{
     CommitIndex, CommitLog, CommitRecord, DrainProgress, DrainResult, GcHorizonResult,
-    InProcessPageLockTable, LOCK_TABLE_SHARDS, RebuildError, RebuildResult, SlotCleanupResult,
-    Transaction, TransactionMode, TransactionState, VersionArena, VersionIdx,
-    cleanup_and_raise_gc_horizon, raise_gc_horizon, try_cleanup_sentinel_slot,
+    InProcessPageLockTable, LOCK_TABLE_SHARDS, OrphanedSlotCleanupStats, RebuildError,
+    RebuildResult, SlotCleanupResult, Transaction, TransactionMode, TransactionState, VersionArena,
+    VersionIdx, cleanup_and_raise_gc_horizon, cleanup_orphaned_slots, raise_gc_horizon,
+    try_cleanup_orphaned_slot, try_cleanup_sentinel_slot,
+};
+pub use gc::{
+    GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GC_VERSIONS_BUDGET,
+    GcScheduler, GcTickResult, GcTodo, PruneResult, gc_tick, prune_page_chain,
 };
 pub use invariants::{
     SerializedWriteMutex, TxnManager, VersionStore, idx_to_version_pointer, visible,

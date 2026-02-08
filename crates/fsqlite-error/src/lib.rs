@@ -140,6 +140,10 @@ pub enum FrankenError {
     #[error("database is busy (recovery in progress)")]
     BusyRecovery,
 
+    /// BEGIN CONCURRENT is not available without fsqlite-shm (§5.6.6.2).
+    #[error("BEGIN CONCURRENT unavailable: fsqlite-shm not present (multi-writer MVCC requires shared memory coordination)")]
+    ConcurrentUnavailable,
+
     // === Type Errors ===
     /// Type mismatch in column access.
     #[error("type mismatch: expected {expected}, got {actual}")]
@@ -333,7 +337,8 @@ impl FrankenError {
             | Self::TooManyAttached { .. }
             | Self::TooManyArguments { .. }
             | Self::NotImplemented(_)
-            | Self::FunctionError(_) => ErrorCode::Error,
+            | Self::FunctionError(_)
+            | Self::ConcurrentUnavailable => ErrorCode::Error,
             Self::UniqueViolation { .. }
             | Self::NotNullViolation { .. }
             | Self::CheckViolation { .. }
@@ -392,6 +397,9 @@ impl FrankenError {
             }
             Self::TooBig => Some("Reduce the size of the value being inserted"),
             Self::NotImplemented(_) => Some("This feature is not yet available in FrankenSQLite"),
+            Self::ConcurrentUnavailable => Some(
+                "Use a filesystem that supports shared memory, or use BEGIN (serialized) instead",
+            ),
             _ => None,
         }
     }

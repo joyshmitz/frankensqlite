@@ -1,5 +1,117 @@
 use std::fmt;
 
+use fsqlite_types::{PageNumber, RangeKey, WitnessKey};
+use xxhash_rust::xxh3::xxh3_64;
+
+// ---------------------------------------------------------------------------
+// §5.6.4.4 RangeKey: Hierarchical Buckets Over WitnessKey Hash Space
+// ---------------------------------------------------------------------------
+
+/// Canonical-encode a `WitnessKey` to deterministic bytes for hashing (§5.6.4.4 step 1).
+///
+/// The encoding is domain-separated per variant so different key types cannot
+/// collide even when their payloads happen to be identical.
+#[must_use]
+pub fn witness_key_canonical_bytes(key: &WitnessKey) -> Vec<u8> {
+    match key {
+        WitnessKey::Page(pgno) => {
+            let mut buf = Vec::with_capacity(5);
+            buf.push(0x01); // discriminant
+            buf.extend_from_slice(&pgno.get().to_le_bytes());
+            buf
+        }
+        WitnessKey::Cell { btree_root, tag } => {
+            let mut buf = Vec::with_capacity(13);
+            buf.push(0x02);
+            buf.extend_from_slice(&btree_root.get().to_le_bytes());
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf
+        }
+        WitnessKey::ByteRange { page, start, len } => {
+            let mut buf = Vec::with_capacity(13);
+            buf.push(0x03);
+            buf.extend_from_slice(&page.get().to_le_bytes());
+            buf.extend_from_slice(&start.to_le_bytes());
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf
+        }
+        WitnessKey::KeyRange {
+            btree_root,
+            lo,
+            hi,
+        } => {
+            let mut buf = Vec::with_capacity(13 + lo.len() + hi.len());
+            buf.push(0x04);
+            buf.extend_from_slice(&btree_root.get().to_le_bytes());
+            buf.extend_from_slice(&u32::try_from(lo.len()).unwrap_or(u32::MAX).to_le_bytes());
+            buf.extend_from_slice(lo);
+            buf.extend_from_slice(&u32::try_from(hi.len()).unwrap_or(u32::MAX).to_le_bytes());
+            buf.extend_from_slice(hi);
+            buf
+        }
+        WitnessKey::Custom { namespace, bytes } => {
+            let mut buf = Vec::with_capacity(5 + bytes.len());
+            buf.push(0x05);
+            buf.extend_from_slice(&namespace.to_le_bytes());
+            buf.extend_from_slice(bytes);
+            buf
+        }
+    }
+}
+
+/// Compute `KeyHash := xxh3_64(WitnessKeyBytes)` (§5.6.4.4 step 2).
+#[must_use]
+pub fn witness_key_hash(key: &WitnessKey) -> u64 {
+    let bytes = witness_key_canonical_bytes(key);
+    xxh3_64(&bytes)
+}
+
+/// Extract the top `prefix_bits` of a 64-bit hash as a u32 prefix (§5.6.4.4 step 3).
+///
+/// Returns the top `prefix_bits` bits of `hash` as a right-aligned u32.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn extract_prefix(hash: u64, prefix_bits: u8) -> u32 {
+    if prefix_bits == 0 || prefix_bits > 32 {
+        return 0;
+    }
+    (hash >> (64 - u32::from(prefix_bits))) as u32
+}
+
+/// Derive `RangeKey`s at all configured hierarchy levels for a witness key (§5.6.4.4).
+///
+/// Returns one `RangeKey` per level (L0, L1, L2).
+#[must_use]
+pub fn derive_range_keys(key: &WitnessKey, config: &WitnessHierarchyConfigV1) -> Vec<RangeKey> {
+    let hash = witness_key_hash(key);
+    config
+        .levels()
+        .iter()
+        .enumerate()
+        .map(|(level_idx, &prefix_bits)| {
+            let hash_prefix = extract_prefix(hash, prefix_bits);
+            RangeKey {
+                level: u8::try_from(level_idx).unwrap_or(u8::MAX),
+                hash_prefix,
+            }
+        })
+        .collect()
+}
+
+/// Compute a bucket index for a `RangeKey` within a power-of-2 hash table.
+///
+/// Uses Fibonacci hashing for good distribution under linear probing.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn range_key_bucket_index(range_key: &RangeKey, mask: u32) -> u32 {
+    // Combine level + prefix into a single key for hashing.
+    let combined = u64::from(range_key.level) << 32 | u64::from(range_key.hash_prefix);
+    // Fibonacci hash: multiply by golden ratio constant, take top bits.
+    let fib = combined.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let shift = mask.count_ones(); // log2(capacity)
+    ((fib >> (64 - shift)) as u32) & mask
+}
+
 /// Default V1 witness hierarchy prefix sizes, in bits (Section 5.6.4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WitnessHierarchyConfigV1 {

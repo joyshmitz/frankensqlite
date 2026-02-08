@@ -16,9 +16,11 @@
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageSize;
 
 // ---------------------------------------------------------------------------
@@ -178,18 +180,16 @@ fn allocate_aligned(page_size: usize) -> (Vec<u8>, usize) {
 struct PageBufPoolInner {
     page_size: usize,
     free: Mutex<Vec<(Vec<u8>, usize)>>,
-    capacity: usize,
+    max_buffers: usize,
+    total_buffers: AtomicUsize,
 }
 
 impl PageBufPoolInner {
     /// Return a backing allocation to the free list (if not at capacity).
     fn return_buf(&self, backing: Vec<u8>, offset: usize) {
         let mut free = self.free.lock();
-        if free.len() < self.capacity {
-            free.push((backing, offset));
-        }
+        free.push((backing, offset));
         drop(free);
-        // If pool is full, the backing Vec drops and frees.
     }
 }
 
@@ -208,25 +208,28 @@ pub struct PageBufPool {
 impl PageBufPool {
     /// Create a new pool for the given `page_size`.
     ///
-    /// `capacity` is the maximum number of idle buffers kept in the pool.
+    /// `max_buffers` is the maximum number of outstanding buffers the pool will
+    /// allow to exist (idle + in-use). Once the bound is reached, further
+    /// acquisitions fail with [`FrankenError::OutOfMemory`].
     #[must_use]
-    pub fn new(page_size: PageSize, capacity: usize) -> Self {
+    pub fn new(page_size: PageSize, max_buffers: usize) -> Self {
         Self {
             inner: Arc::new(PageBufPoolInner {
                 page_size: page_size.as_usize(),
-                free: Mutex::new(Vec::with_capacity(capacity)),
-                capacity,
+                free: Mutex::new(Vec::with_capacity(max_buffers)),
+                max_buffers,
+                total_buffers: AtomicUsize::new(0),
             }),
         }
     }
 
     /// Acquire a page-aligned buffer from the pool.
     ///
-    /// Returns a recycled buffer if one is available, or allocates a new one.
+    /// Returns a recycled buffer if one is available, or allocates a new one
+    /// if the pool has not yet reached its `max_buffers` bound.
     /// Freshly allocated buffers are zero-filled; recycled buffers retain
     /// their previous contents (callers should overwrite via I/O).
-    #[must_use]
-    pub fn acquire(&self) -> PageBuf {
+    pub fn acquire(&self) -> Result<PageBuf> {
         let page_size = self.inner.page_size;
 
         let recycled = {
@@ -235,21 +238,37 @@ impl PageBufPool {
         };
 
         if let Some((backing, offset)) = recycled {
-            PageBuf {
+            return Ok(PageBuf {
                 backing: Some(backing),
                 offset,
                 page_size,
                 pool: Some(Arc::clone(&self.inner)),
+            });
+        }
+
+        loop {
+            let current = self.inner.total_buffers.load(Ordering::Acquire);
+            if current >= self.inner.max_buffers {
+                return Err(FrankenError::OutOfMemory);
             }
-        } else {
-            let (backing, offset) = allocate_aligned(page_size);
-            PageBuf {
-                backing: Some(backing),
-                offset,
-                page_size,
-                pool: Some(Arc::clone(&self.inner)),
+            if self
+                .inner
+                .total_buffers
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
             }
         }
+
+        let (backing, offset) = allocate_aligned(page_size);
+        Ok(PageBuf {
+            backing: Some(backing),
+            offset,
+            page_size,
+            pool: Some(Arc::clone(&self.inner)),
+        })
+    }
     }
 
     /// The page size (in bytes) this pool serves.
@@ -265,11 +284,11 @@ impl PageBufPool {
         self.inner.free.lock().len()
     }
 
-    /// Maximum number of idle buffers the pool will hold.
+    /// Maximum number of outstanding buffers the pool will allow.
     #[inline]
     #[must_use]
     pub fn capacity(&self) -> usize {
-        self.inner.capacity
+        self.inner.max_buffers
     }
 }
 
@@ -277,7 +296,7 @@ impl fmt::Debug for PageBufPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PageBufPool")
             .field("page_size", &self.inner.page_size)
-            .field("capacity", &self.inner.capacity)
+            .field("capacity", &self.inner.max_buffers)
             .field("available", &self.available())
             .finish()
     }
@@ -384,13 +403,13 @@ mod tests {
         assert_eq!(pool.available(), 0);
 
         // Acquire and drop — should return to pool.
-        let buf = pool.acquire();
+        let buf = pool.acquire().unwrap();
         let ptr1 = buf.as_ptr() as usize;
         drop(buf);
         assert_eq!(pool.available(), 1);
 
         // Acquire again — should reuse the same allocation.
-        let buf2 = pool.acquire();
+        let buf2 = pool.acquire().unwrap();
         let ptr2 = buf2.as_ptr() as usize;
         assert_eq!(
             ptr1, ptr2,
@@ -404,7 +423,7 @@ mod tests {
         let pool = PageBufPool::new(PageSize::DEFAULT, 4);
         assert_eq!(pool.available(), 0);
         {
-            let _buf = pool.acquire();
+            let _buf = pool.acquire().unwrap();
             assert_eq!(pool.available(), 0);
         }
         assert_eq!(pool.available(), 1, "dropped buffers must be recycled");
@@ -414,33 +433,26 @@ mod tests {
     fn test_page_buf_pool_capacity_limit() {
         let pool = PageBufPool::new(PageSize::DEFAULT, 2);
 
-        let b1 = pool.acquire();
-        let b2 = pool.acquire();
-        let b3 = pool.acquire();
+        let b1 = pool.acquire().unwrap();
+        let b2 = pool.acquire().unwrap();
+        assert!(pool.acquire().is_err(), "pool must enforce max_buffers bound");
 
-        // Drop all 3 — only 2 should be kept (capacity = 2).
         drop(b1);
         drop(b2);
-        drop(b3);
-        assert_eq!(
-            pool.available(),
-            2,
-            "bead_id={BEAD_ID} case=pool_capacity_limit"
-        );
+        assert_eq!(pool.available(), 2, "pool should retain returned buffers");
     }
 
     #[test]
     fn test_page_buf_pool_bounded() {
         let pool = PageBufPool::new(PageSize::DEFAULT, 2);
 
-        let b1 = pool.acquire();
-        let b2 = pool.acquire();
-        let b3 = pool.acquire();
-        drop(b1);
-        drop(b2);
-        drop(b3);
-
-        assert_eq!(pool.available(), 2, "pool must enforce idle capacity bound");
+        let _b1 = pool.acquire().unwrap();
+        let _b2 = pool.acquire().unwrap();
+        let err = pool.acquire().unwrap_err();
+        assert!(
+            matches!(err, FrankenError::OutOfMemory),
+            "pool must fail when capacity is exhausted: {err}"
+        );
     }
 
     #[test]
@@ -448,7 +460,7 @@ mod tests {
         for &size in &[512u32, 1024, 4096, 16384, 65536] {
             let ps = PageSize::new(size).expect("valid page size");
             let pool = PageBufPool::new(ps, 4);
-            let buf = pool.acquire();
+            let buf = pool.acquire().unwrap();
             let ptr = buf.as_ptr() as usize;
             assert_eq!(
                 ptr % (size as usize),
@@ -465,8 +477,8 @@ mod tests {
         let pool_8k = PageBufPool::new(PageSize::new(8192).unwrap(), 4);
 
         {
-            let _buf_4k = pool_4k.acquire();
-            let _buf_8k = pool_8k.acquire();
+            let _buf_4k = pool_4k.acquire().unwrap();
+            let _buf_8k = pool_8k.acquire().unwrap();
             assert_eq!(pool_4k.page_size(), 4096);
             assert_eq!(pool_8k.page_size(), 8192);
         }
@@ -479,10 +491,10 @@ mod tests {
     fn test_page_buf_pool_recycled_alignment() {
         // Acquire, drop, re-acquire — recycled buffer must still be aligned.
         let pool = PageBufPool::new(PageSize::DEFAULT, 4);
-        let buf = pool.acquire();
+        let buf = pool.acquire().unwrap();
         drop(buf);
 
-        let buf2 = pool.acquire();
+        let buf2 = pool.acquire().unwrap();
         let ptr = buf2.as_ptr() as usize;
         assert_eq!(ptr % 4096, 0, "bead_id={BEAD_ID} case=recycled_alignment");
     }
@@ -498,7 +510,7 @@ mod tests {
     #[test]
     fn test_page_buf_pooled() {
         let pool = PageBufPool::new(PageSize::DEFAULT, 4);
-        let buf = pool.acquire();
+        let buf = pool.acquire().unwrap();
         assert!(buf.is_pooled());
     }
 
@@ -544,7 +556,7 @@ mod tests {
         let pool1 = PageBufPool::new(PageSize::DEFAULT, 4);
         let pool2 = pool1.clone();
 
-        let buf = pool1.acquire();
+        let buf = pool1.acquire().unwrap();
         drop(buf);
 
         // Both clones see the returned buffer.

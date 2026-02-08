@@ -40,8 +40,8 @@ pub struct PageCache {
 impl PageCache {
     /// Create a new page cache.
     ///
-    /// `pool_capacity` is the maximum number of idle buffers kept in the
-    /// underlying pool (not the max number of cached pages).
+    /// `pool_capacity` is the maximum number of outstanding page buffers the
+    /// underlying pool will allow (idle + in-use).
     #[must_use]
     pub fn new(page_size: PageSize, pool_capacity: usize) -> Self {
         Self {
@@ -141,7 +141,7 @@ impl PageCache {
         page_no: PageNumber,
     ) -> Result<&[u8]> {
         if !self.pages.contains_key(&page_no) {
-            let mut buf = self.pool.acquire();
+            let mut buf = self.pool.acquire()?;
             let offset = page_offset(page_no, self.page_size);
             let _ = file.read(cx, buf.as_mut_slice(), offset)?;
             self.pages.insert(page_no, buf);
@@ -168,19 +168,20 @@ impl PageCache {
     /// Insert a fresh (zeroed) page into the cache.
     ///
     /// Returns a mutable reference so the caller can populate it.
-    pub fn insert_fresh(&mut self, page_no: PageNumber) -> &mut [u8] {
+    pub fn insert_fresh(&mut self, page_no: PageNumber) -> Result<&mut [u8]> {
         // Freshly acquired buffers from the pool may contain stale data.
         // Zero the buffer to match the "new page" semantics.
-        let mut buf = self.pool.acquire();
+        let mut buf = self.pool.acquire()?;
         buf.as_mut_slice().fill(0);
 
-        match self.pages.entry(page_no) {
+        let out = match self.pages.entry(page_no) {
             Entry::Occupied(mut entry) => {
                 entry.insert(buf);
                 entry.into_mut().as_mut_slice()
             }
             Entry::Vacant(entry) => entry.insert(buf).as_mut_slice(),
-        }
+        };
+        Ok(out)
     }
 
     // --- Eviction ---
@@ -337,7 +338,7 @@ mod tests {
 
         // Acquire a PageBuf from the pool and read directly into it.
         let pool = PageBufPool::new(PageSize::DEFAULT, 4);
-        let mut buf = pool.acquire();
+        let mut buf = pool.acquire().unwrap();
         let ptr_before = buf.as_ptr();
 
         // VfsFile::read takes &mut [u8] — PageBuf::as_mut_slice gives us
@@ -366,7 +367,7 @@ mod tests {
         let (cx, mut file) = setup();
 
         let pool = PageBufPool::new(PageSize::DEFAULT, 4);
-        let mut buf = pool.acquire();
+        let mut buf = pool.acquire().unwrap();
 
         // Fill with a recognizable pattern.
         for (i, b) in buf.as_mut_slice().iter_mut().enumerate() {
@@ -561,7 +562,7 @@ mod tests {
         let mut cache = PageCache::new(PageSize::DEFAULT, 4);
         let page1 = PageNumber::ONE;
 
-        let data = cache.insert_fresh(page1);
+        let data = cache.insert_fresh(page1).unwrap();
         assert!(
             data.iter().all(|&b| b == 0),
             "bead_id={BEAD_ID} case=insert_fresh_zeroed"
@@ -575,7 +576,7 @@ mod tests {
         let mut cache = PageCache::new(PageSize::DEFAULT, 4);
         let page1 = PageNumber::ONE;
 
-        cache.insert_fresh(page1);
+        cache.insert_fresh(page1).unwrap();
         let data = cache.get_mut(page1).unwrap();
         data[0] = 0xFF;
         data[4095] = 0xEE;
@@ -591,7 +592,7 @@ mod tests {
         let page1 = PageNumber::ONE;
 
         assert_eq!(cache.pool().available(), 0);
-        cache.insert_fresh(page1);
+        cache.insert_fresh(page1).unwrap();
         assert_eq!(cache.pool().available(), 0); // buffer is in use
 
         assert!(cache.evict(page1));
@@ -617,7 +618,7 @@ mod tests {
 
         for i in 1..=5u32 {
             let pn = PageNumber::new(i).unwrap();
-            cache.insert_fresh(pn);
+            cache.insert_fresh(pn).unwrap();
         }
         assert_eq!(cache.len(), 5);
         assert_eq!(cache.pool().available(), 0);
@@ -666,7 +667,7 @@ mod tests {
         let page1 = PageNumber::ONE;
 
         // Insert a fresh page, modify it, write to VFS.
-        let data = cache.insert_fresh(page1);
+        let data = cache.insert_fresh(page1).unwrap();
         data.fill(0xCD);
 
         cache.write_page(&cx, &mut file, page1).unwrap();
@@ -849,7 +850,7 @@ mod tests {
         let page1 = PageNumber::ONE;
 
         // Insert a fresh page and write a sentinel.
-        let fresh = cache.insert_fresh(page1);
+        let fresh = cache.insert_fresh(page1).unwrap();
         fresh[0] = 0xAA;
         let ptr_after_insert = cache.get(page1).unwrap().as_ptr();
 

@@ -1418,7 +1418,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         let m2 = Arc::clone(&m);
-        std::thread::spawn(move || {
+        let starter = std::thread::spawn(move || {
             let got = m2.begin(BeginKind::Immediate);
             tx.send(got).unwrap();
         });
@@ -1426,9 +1426,10 @@ mod tests {
         // Step 2 must happen before drain completes: indicator becomes visible.
         let wait_start = Instant::now();
         while m.shm.check_serialized_writer().is_none() {
-            if wait_start.elapsed() > Duration::from_millis(50) {
-                panic!("timed out waiting for serialized writer indicator");
-            }
+            assert!(
+                wait_start.elapsed() <= Duration::from_millis(50),
+                "timed out waiting for serialized writer indicator"
+            );
             std::thread::yield_now();
         }
 
@@ -1447,6 +1448,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(ser.serialized_write_lock_held);
+        starter.join().expect("begin thread panicked");
 
         // Step 5: clear indicator before releasing mutex (observable as indicator==None after abort).
         m.abort(&mut ser);
