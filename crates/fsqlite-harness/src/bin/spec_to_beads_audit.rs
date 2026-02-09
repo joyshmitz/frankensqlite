@@ -60,13 +60,16 @@ fn real_main() -> Result<(), String> {
     write_report_json(&report_path, &report).map_err(|err| err.to_string())?;
 
     println!(
-        "spec_to_beads_audit mode={} pass={} checked={} missing={} open_task_failures={} dependency_failures={} report={}",
+        "spec_to_beads_audit mode={} pass={} checked={} missing={} open_task_failures={} dependency_failures={} scope_phrase_violations={} excluded_feature_violations={} defer_without_follow_up={} report={}",
         report.mode,
         report.pass,
         report.coverage.total_checked_lines,
         report.coverage.missing_lines,
         report.open_task_structure_failures.len(),
         report.dependency_failures.len(),
+        report.scope_doctrine_gate.scope_phrase_violations.len(),
+        report.scope_doctrine_gate.excluded_feature_violations.len(),
+        report.scope_doctrine_gate.defer_without_follow_up.len(),
         report_path.display(),
     );
 

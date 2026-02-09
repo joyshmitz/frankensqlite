@@ -450,12 +450,17 @@ pub fn check_segment_integrity(segment_data: &[u8]) -> Result<u64, MarkerError> 
         return Err(MarkerError::HeaderTooShort);
     }
 
+    // Header must be valid before we reason about record layout.
+    let _header = MarkerSegmentHeader::decode(&segment_data[..MARKER_SEGMENT_HEADER_BYTES])?;
+
     let record_region = &segment_data[MARKER_SEGMENT_HEADER_BYTES..];
     let complete_records = record_region.len() / COMMIT_MARKER_RECORD_BYTES;
     let trailing = record_region.len() % COMMIT_MARKER_RECORD_BYTES;
 
-    // Verify all complete records.
-    let valid = valid_record_prefix_count(record_region);
+    // Verify all complete records up to the first decode failure while also
+    // enforcing density (`commit_seq = start_commit_seq + slot`).
+    let recovered = recover_valid_prefix(segment_data)?;
+    let valid = u64::try_from(recovered.len()).expect("record count always fits in u64");
 
     #[allow(clippy::cast_possible_truncation)]
     let complete_u64 = complete_records as u64;
@@ -474,6 +479,44 @@ pub fn check_segment_integrity(segment_data: &[u8]) -> Result<u64, MarkerError> 
     }
 
     Ok(valid)
+}
+
+/// Recover the valid, density-checked prefix of commit markers from a segment.
+///
+/// This helper is intentionally tolerant of torn tails: it stops at the first
+/// undecodable record and returns the valid prefix. Density violations are
+/// fail-closed and returned as [`MarkerError::CommitSeqMismatch`].
+pub fn recover_valid_prefix(segment_data: &[u8]) -> Result<Vec<CommitMarkerRecord>, MarkerError> {
+    if segment_data.len() < MARKER_SEGMENT_HEADER_BYTES {
+        return Err(MarkerError::HeaderTooShort);
+    }
+
+    let header = MarkerSegmentHeader::decode(&segment_data[..MARKER_SEGMENT_HEADER_BYTES])?;
+    let record_region = &segment_data[MARKER_SEGMENT_HEADER_BYTES..];
+
+    let mut records = Vec::new();
+    let mut offset = 0usize;
+
+    while offset + COMMIT_MARKER_RECORD_BYTES <= record_region.len() {
+        let record_bytes = &record_region[offset..offset + COMMIT_MARKER_RECORD_BYTES];
+        let Ok(record) = CommitMarkerRecord::decode(record_bytes) else {
+            break;
+        };
+
+        let expected = header.start_commit_seq
+            + u64::try_from(records.len()).expect("record vector length always fits in u64");
+        if record.commit_seq != expected {
+            return Err(MarkerError::CommitSeqMismatch {
+                expected,
+                actual: record.commit_seq,
+            });
+        }
+
+        records.push(record);
+        offset += COMMIT_MARKER_RECORD_BYTES;
+    }
+
+    Ok(records)
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +569,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     // ===================================================================
     // bd-1hi.23 — Commit Marker Stream Format (§3.5.4)
@@ -712,6 +756,27 @@ mod tests {
                 assert_eq!(complete_records, 4, "valid prefix is records 0-3");
             }
             other => panic!("expected TornTail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_commit_seq_mismatch_detected() {
+        let start_seq = 100u64;
+        let header = MarkerSegmentHeader::new(0, start_seq);
+        let mut segment = Vec::from(header.encode());
+
+        let first = make_test_record(start_seq, [0u8; ID_SIZE]);
+        let second = make_test_record(start_seq + 2, first.marker_id);
+        segment.extend_from_slice(&first.encode());
+        segment.extend_from_slice(&second.encode());
+
+        let result = check_segment_integrity(&segment);
+        match result {
+            Err(MarkerError::CommitSeqMismatch { expected, actual }) => {
+                assert_eq!(expected, start_seq + 1);
+                assert_eq!(actual, start_seq + 2);
+            }
+            other => panic!("expected CommitSeqMismatch, got {other:?}"),
         }
     }
 
@@ -977,5 +1042,146 @@ mod tests {
         // Different input → different output.
         let id3 = compute_marker_id(2, 100, &capsule, &proof, &prev);
         assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn prop_marker_id_unique() {
+        let mut rng_state = 0xDEAD_BEEF_CAFE_BABE_u64;
+        let mut observed_ids = HashSet::new();
+
+        for i in 0..2048u64 {
+            // Deterministic pseudo-random generation to avoid flaky tests.
+            rng_state = rng_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let mut capsule = [0u8; ID_SIZE];
+            let mut proof = [0u8; ID_SIZE];
+            let mut prev = [0u8; ID_SIZE];
+
+            capsule[..8].copy_from_slice(&rng_state.to_le_bytes());
+            proof[..8].copy_from_slice(&rng_state.rotate_left(13).to_le_bytes());
+            prev[..8].copy_from_slice(&rng_state.rotate_right(7).to_le_bytes());
+            capsule[8..16].copy_from_slice(&i.to_le_bytes());
+            proof[8..16].copy_from_slice(&(i ^ rng_state).to_le_bytes());
+            prev[8..16].copy_from_slice(&(i.wrapping_mul(17)).to_le_bytes());
+
+            let marker_id =
+                compute_marker_id(i, 1_700_000_000_000_000_000 + i, &capsule, &proof, &prev);
+            assert!(
+                observed_ids.insert(marker_id),
+                "marker_id collision at sample {i}: {marker_id:02X?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prop_density_invariant_holds() {
+        for count in 1..=256u64 {
+            let start_seq = 10_000 + count * 31;
+            let header = MarkerSegmentHeader::new(segment_id_for_commit_seq(start_seq), start_seq);
+            let mut segment = Vec::from(header.encode());
+            let mut prev = [0u8; ID_SIZE];
+
+            for i in 0..count {
+                let record = make_test_record(start_seq + i, prev);
+                prev = record.marker_id;
+                segment.extend_from_slice(&record.encode());
+            }
+
+            let integrity = check_segment_integrity(&segment).expect("segment should be dense");
+            assert_eq!(integrity, count);
+        }
+    }
+
+    #[test]
+    fn test_e2e_marker_stream_recovery() {
+        let start_seq = 20_000u64;
+        let header = MarkerSegmentHeader::new(segment_id_for_commit_seq(start_seq), start_seq);
+        let mut segment = Vec::from(header.encode());
+        let mut expected = Vec::new();
+        let mut prev = [0u8; ID_SIZE];
+
+        for i in 0..1000u64 {
+            let record = make_test_record(start_seq + i, prev);
+            prev = record.marker_id;
+            segment.extend_from_slice(&record.encode());
+            expected.push(record);
+        }
+
+        // Simulate crash: truncate in the middle of the final record.
+        segment.truncate(segment.len() - (COMMIT_MARKER_RECORD_BYTES / 2));
+
+        let recovered = recover_valid_prefix(&segment).expect("recovery should succeed");
+        assert_eq!(recovered.len(), expected.len() - 1);
+        assert_eq!(recovered, expected[..expected.len() - 1]);
+
+        let integrity = check_segment_integrity(&segment);
+        match integrity {
+            Err(MarkerError::TornTail {
+                complete_records,
+                trailing_bytes,
+            }) => {
+                assert_eq!(complete_records, 999);
+                assert_eq!(trailing_bytes, COMMIT_MARKER_RECORD_BYTES / 2);
+            }
+            other => panic!("expected torn-tail integrity result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_e2e_time_travel_query() {
+        let start_seq = 5_000u64;
+        let count = 256u64;
+        let base_ns = 1_900_000_000_000_000_000u64;
+        let mut prev = [0u8; ID_SIZE];
+        let mut records = Vec::new();
+
+        for i in 0..count {
+            let capsule = [(i & 0xFF) as u8; ID_SIZE];
+            let proof = [((i >> 8) & 0xFF) as u8; ID_SIZE];
+            let record = CommitMarkerRecord::new(
+                start_seq + i,
+                base_ns + i * 2_000_000,
+                capsule,
+                proof,
+                prev,
+            );
+            prev = record.marker_id;
+            records.push(record);
+        }
+
+        let lookup = |seq: u64| -> Option<CommitMarkerRecord> {
+            if seq < start_seq {
+                return None;
+            }
+            let idx = usize::try_from(seq - start_seq).ok()?;
+            records.get(idx).cloned()
+        };
+
+        // Before the first marker.
+        assert_eq!(
+            binary_search_by_time(start_seq, count, base_ns - 1, lookup),
+            None
+        );
+        // Exact hit.
+        assert_eq!(
+            binary_search_by_time(start_seq, count, base_ns + 40 * 2_000_000, lookup),
+            Some(start_seq + 40)
+        );
+        // Between two commits should select the lower commit_seq.
+        assert_eq!(
+            binary_search_by_time(
+                start_seq,
+                count,
+                base_ns + 40 * 2_000_000 + 1_000_000,
+                lookup
+            ),
+            Some(start_seq + 40)
+        );
+        // After the final marker.
+        assert_eq!(
+            binary_search_by_time(start_seq, count, u64::MAX, lookup),
+            Some(start_seq + count - 1)
+        );
     }
 }

@@ -10,6 +10,8 @@ use fsqlite_error::{FrankenError, Result};
 const STRICT_MIN_MEANINGFUL_LEN: usize = 10;
 const FAST_MIN_MEANINGFUL_LEN: usize = 20;
 const MAX_LINE_TEXT_LEN: usize = 200;
+const SCOPE_REDUCTION_PHRASES: [&str; 4] = ["out of scope", "v1 scope", "optional in v1", "later"];
+const SECTION_15_REF_TOKENS: [&str; 3] = ["§15", "section 15", "sec 15"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditMode {
@@ -53,6 +55,7 @@ pub struct SpecToBeadsAuditReport {
     pub open_task_structure_failures: Vec<OpenTaskStructureFailure>,
     pub dependency_failures: Vec<DependencyFailure>,
     pub closed_rollup_hygiene_warnings: Vec<ClosedRollupHygieneWarning>,
+    pub scope_doctrine_gate: ScopeDoctrineGateReport,
     pub pass: bool,
 }
 
@@ -88,6 +91,53 @@ pub struct DependencyFailure {
 pub struct ClosedRollupHygieneWarning {
     pub issue_id: String,
     pub warning: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ScopeDoctrineGateReport {
+    pub pass: bool,
+    pub section_0_1_present: bool,
+    pub no_v1_scope_statement_present: bool,
+    pub section_15_present: bool,
+    pub exclusions_checked: usize,
+    pub exclusions_missing_rationale: Vec<ExclusionRationaleFailure>,
+    pub scope_phrase_violations: Vec<ScopePhraseViolation>,
+    pub excluded_feature_violations: Vec<ExcludedFeatureViolation>,
+    pub defer_without_follow_up: Vec<DeferredDecisionViolation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExclusionRationaleFailure {
+    pub line_no: usize,
+    pub exclusion_name: String,
+    pub line_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopePhraseViolation {
+    pub source_kind: String,
+    pub source_id: String,
+    pub line_no: usize,
+    pub phrase: String,
+    pub line_text: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExcludedFeatureViolation {
+    pub feature_name: String,
+    pub file_path: String,
+    pub line_no: usize,
+    pub line_text: String,
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeferredDecisionViolation {
+    pub issue_id: String,
+    pub title: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +240,7 @@ pub fn run_spec_to_beads_audit(config: &AuditConfig) -> Result<SpecToBeadsAuditR
     let mut open_task_structure_failures = lint_open_task_structure(&issues);
     let mut dependency_failures = lint_dependency_integrity(&issues);
     let mut closed_rollup_hygiene_warnings = lint_closed_rollup_hygiene(&issues);
+    let scope_doctrine_gate = lint_scope_doctrine_gate(config, &spec_text, &issues);
 
     missing_spec_lines.sort_by_key(|entry| entry.spec_line_no);
     open_task_structure_failures.sort_by(|a, b| a.issue_id.cmp(&b.issue_id));
@@ -210,7 +261,8 @@ pub fn run_spec_to_beads_audit(config: &AuditConfig) -> Result<SpecToBeadsAuditR
     let coverage_bps = coverage_basis_points(covered_lines, total_checked_lines);
     let pass = missing_spec_lines.is_empty()
         && open_task_structure_failures.is_empty()
-        && dependency_failures.is_empty();
+        && dependency_failures.is_empty()
+        && scope_doctrine_gate.pass;
 
     info!(
         mode = config.mode.as_str(),
@@ -220,6 +272,9 @@ pub fn run_spec_to_beads_audit(config: &AuditConfig) -> Result<SpecToBeadsAuditR
         open_task_structure_failures = open_task_structure_failures.len(),
         dependency_failures = dependency_failures.len(),
         closed_rollup_hygiene_warnings = closed_rollup_hygiene_warnings.len(),
+        scope_phrase_violations = scope_doctrine_gate.scope_phrase_violations.len(),
+        excluded_feature_violations = scope_doctrine_gate.excluded_feature_violations.len(),
+        defer_without_follow_up = scope_doctrine_gate.defer_without_follow_up.len(),
         pass,
         "spec-to-beads audit completed"
     );
@@ -229,6 +284,9 @@ pub fn run_spec_to_beads_audit(config: &AuditConfig) -> Result<SpecToBeadsAuditR
             missing_lines,
             open_task_structure_failures = open_task_structure_failures.len(),
             dependency_failures = dependency_failures.len(),
+            scope_phrase_violations = scope_doctrine_gate.scope_phrase_violations.len(),
+            excluded_feature_violations = scope_doctrine_gate.excluded_feature_violations.len(),
+            defer_without_follow_up = scope_doctrine_gate.defer_without_follow_up.len(),
             "spec-to-beads audit failed"
         );
     }
@@ -248,6 +306,7 @@ pub fn run_spec_to_beads_audit(config: &AuditConfig) -> Result<SpecToBeadsAuditR
         open_task_structure_failures,
         dependency_failures,
         closed_rollup_hygiene_warnings,
+        scope_doctrine_gate,
         pass,
     })
 }
@@ -707,6 +766,529 @@ fn lint_closed_rollup_hygiene(issues: &[Issue]) -> Vec<ClosedRollupHygieneWarnin
     }
 
     warnings
+}
+
+#[derive(Debug, Clone)]
+struct ExclusionItem {
+    line_no: usize,
+    name: String,
+    rationale: String,
+    line_text: String,
+}
+
+#[allow(clippy::too_many_lines)]
+fn lint_scope_doctrine_gate(
+    config: &AuditConfig,
+    spec_text: &str,
+    issues: &[Issue],
+) -> ScopeDoctrineGateReport {
+    let spec_lines: Vec<&str> = spec_text.lines().collect();
+    let section_0_1 = find_spec_section_bounds(&spec_lines, &["§0.1", "0.1"]);
+    let section_15 = find_spec_section_bounds(&spec_lines, &["§15", "15", "exclusions"]);
+
+    let section_0_1_present = section_0_1.is_some();
+    let section_15_present = section_15.is_some();
+
+    let no_v1_scope_statement_present = section_0_1.is_some_and(|bounds| {
+        bounds
+            .slice(&spec_lines)
+            .iter()
+            .map(|line| line.to_ascii_lowercase())
+            .any(|line| {
+                line.contains("no v1 scope")
+                    || line.contains("there is no v1 scope")
+                    || line.contains("there is no \"v1 scope\"")
+            })
+    });
+
+    let exclusions = section_15
+        .map(|bounds| parse_exclusion_items(&spec_lines, bounds))
+        .unwrap_or_default();
+    let exclusions_checked = exclusions.len();
+
+    let mut exclusions_missing_rationale: Vec<ExclusionRationaleFailure> = exclusions
+        .iter()
+        .filter(|item| item.rationale.chars().count() < STRICT_MIN_MEANINGFUL_LEN)
+        .map(|item| ExclusionRationaleFailure {
+            line_no: item.line_no,
+            exclusion_name: item.name.clone(),
+            line_text: item.line_text.clone(),
+        })
+        .collect();
+    exclusions_missing_rationale.sort_by(|a, b| {
+        a.line_no
+            .cmp(&b.line_no)
+            .then_with(|| a.exclusion_name.cmp(&b.exclusion_name))
+    });
+
+    let mut scope_phrase_violations = lint_scope_phrase_violations(config, issues);
+    scope_phrase_violations.sort_by(|a, b| {
+        a.source_kind
+            .cmp(&b.source_kind)
+            .then_with(|| a.source_id.cmp(&b.source_id))
+            .then_with(|| a.line_no.cmp(&b.line_no))
+            .then_with(|| a.phrase.cmp(&b.phrase))
+    });
+
+    let mut excluded_feature_violations = lint_excluded_feature_reintroduction(config, &exclusions);
+    excluded_feature_violations.sort_by(|a, b| {
+        a.feature_name
+            .cmp(&b.feature_name)
+            .then_with(|| a.file_path.cmp(&b.file_path))
+            .then_with(|| a.line_no.cmp(&b.line_no))
+    });
+
+    let mut defer_without_follow_up = lint_deferred_decisions(issues);
+    defer_without_follow_up.sort_by(|a, b| {
+        a.issue_id
+            .cmp(&b.issue_id)
+            .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
+
+    if !section_0_1_present {
+        error!("scope doctrine gate: missing §0.1 section in spec");
+    }
+    if !no_v1_scope_statement_present {
+        error!("scope doctrine gate: missing explicit 'no V1 scope' statement in §0.1");
+    }
+    if !section_15_present {
+        error!("scope doctrine gate: missing §15 exclusions section in spec");
+    }
+
+    for failure in &exclusions_missing_rationale {
+        warn!(
+            line_no = failure.line_no,
+            exclusion = %failure.exclusion_name,
+            "scope doctrine gate: exclusion missing technical rationale"
+        );
+    }
+    for violation in &scope_phrase_violations {
+        warn!(
+            source_kind = %violation.source_kind,
+            source_id = %violation.source_id,
+            line_no = violation.line_no,
+            phrase = %violation.phrase,
+            "scope doctrine gate: found scope-reduction language without §15 reference"
+        );
+    }
+    for violation in &excluded_feature_violations {
+        error!(
+            feature = %violation.feature_name,
+            file_path = %violation.file_path,
+            line_no = violation.line_no,
+            "scope doctrine gate: excluded feature appears in implementation sources"
+        );
+    }
+    for violation in &defer_without_follow_up {
+        warn!(
+            issue_id = %violation.issue_id,
+            detail = %violation.detail,
+            "scope doctrine gate: deferred decision missing reason or follow-up bead"
+        );
+    }
+
+    let pass = section_0_1_present
+        && no_v1_scope_statement_present
+        && section_15_present
+        && exclusions_missing_rationale.is_empty()
+        && scope_phrase_violations.is_empty()
+        && excluded_feature_violations.is_empty()
+        && defer_without_follow_up.is_empty();
+
+    info!(
+        section_0_1_present,
+        no_v1_scope_statement_present,
+        section_15_present,
+        exclusions_checked,
+        exclusions_missing_rationale = exclusions_missing_rationale.len(),
+        scope_phrase_violations = scope_phrase_violations.len(),
+        excluded_feature_violations = excluded_feature_violations.len(),
+        defer_without_follow_up = defer_without_follow_up.len(),
+        pass,
+        "scope doctrine gate completed"
+    );
+
+    ScopeDoctrineGateReport {
+        pass,
+        section_0_1_present,
+        no_v1_scope_statement_present,
+        section_15_present,
+        exclusions_checked,
+        exclusions_missing_rationale,
+        scope_phrase_violations,
+        excluded_feature_violations,
+        defer_without_follow_up,
+    }
+}
+
+fn lint_scope_phrase_violations(
+    config: &AuditConfig,
+    issues: &[Issue],
+) -> Vec<ScopePhraseViolation> {
+    let mut violations = Vec::new();
+
+    for issue in issues {
+        let full_text = issue.full_text();
+        let has_section_15_ref = references_section_15(&full_text);
+        for (line_idx, line) in full_text.lines().enumerate() {
+            let line_lower = line.to_ascii_lowercase();
+            for phrase in SCOPE_REDUCTION_PHRASES {
+                if !contains_scope_phrase(&line_lower, phrase) {
+                    continue;
+                }
+                if has_section_15_ref || references_section_15(line) {
+                    continue;
+                }
+
+                violations.push(ScopePhraseViolation {
+                    source_kind: "bead".to_string(),
+                    source_id: issue.id.clone(),
+                    line_no: line_idx + 1,
+                    phrase: phrase.to_string(),
+                    line_text: truncate_line(line.trim(), MAX_LINE_TEXT_LEN),
+                    remediation: "Reference §15 explicitly or replace with scheduling language."
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    let workspace_root = config
+        .spec_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    for path in collect_markdown_files(&workspace_root) {
+        if path == config.spec_path {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let has_section_15_ref = references_section_15(&contents);
+        for (line_idx, line) in contents.lines().enumerate() {
+            let line_lower = line.to_ascii_lowercase();
+            for phrase in SCOPE_REDUCTION_PHRASES {
+                if !contains_scope_phrase(&line_lower, phrase) {
+                    continue;
+                }
+                if has_section_15_ref || references_section_15(line) {
+                    continue;
+                }
+
+                violations.push(ScopePhraseViolation {
+                    source_kind: "doc".to_string(),
+                    source_id: relativize_path(&workspace_root, &path),
+                    line_no: line_idx + 1,
+                    phrase: phrase.to_string(),
+                    line_text: truncate_line(line.trim(), MAX_LINE_TEXT_LEN),
+                    remediation: "Add a §15 reference or remove scope-reduction wording."
+                        .to_string(),
+                });
+            }
+        }
+    }
+
+    violations
+}
+
+fn lint_excluded_feature_reintroduction(
+    config: &AuditConfig,
+    exclusions: &[ExclusionItem],
+) -> Vec<ExcludedFeatureViolation> {
+    let workspace_root = config
+        .spec_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let mut violations = Vec::new();
+
+    let excluded_names: BTreeSet<String> = exclusions
+        .iter()
+        .map(|item| item.name.to_ascii_lowercase())
+        .map(|name| normalize_whitespace(&name))
+        .filter(|name| name.chars().count() >= 8)
+        .filter(|name| name.split_whitespace().count() >= 2)
+        .collect();
+
+    if excluded_names.is_empty() {
+        return violations;
+    }
+
+    for path in collect_implementation_source_files(&workspace_root) {
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let contents_lower = contents.to_ascii_lowercase();
+        for excluded_name in &excluded_names {
+            if !contents_lower.contains(excluded_name) {
+                continue;
+            }
+
+            if contents.contains("§15") || contents.to_ascii_lowercase().contains("section 15") {
+                continue;
+            }
+
+            for (line_idx, line) in contents.lines().enumerate() {
+                let line_lower = line.to_ascii_lowercase();
+                if !line_lower.contains(excluded_name) {
+                    continue;
+                }
+                violations.push(ExcludedFeatureViolation {
+                    feature_name: excluded_name.clone(),
+                    file_path: relativize_path(&workspace_root, &path),
+                    line_no: line_idx + 1,
+                    line_text: truncate_line(line.trim(), MAX_LINE_TEXT_LEN),
+                    remediation:
+                        "Either remove this implementation mention or explicitly re-scope via spec update."
+                            .to_string(),
+                });
+            }
+        }
+    }
+
+    violations
+}
+
+fn lint_deferred_decisions(issues: &[Issue]) -> Vec<DeferredDecisionViolation> {
+    let mut violations = Vec::new();
+
+    for issue in issues {
+        let full_text = issue.full_text();
+        let lower = full_text.to_ascii_lowercase();
+        let has_defer = contains_word(&lower, "defer")
+            || contains_word(&lower, "deferred")
+            || contains_word(&lower, "postpone")
+            || lower.contains("defer ");
+        if !has_defer {
+            continue;
+        }
+
+        let has_reason = ["because", "due to", "reason", "rationale"]
+            .iter()
+            .any(|needle| lower.contains(needle));
+        let has_follow_up = extract_bead_ids(&full_text)
+            .into_iter()
+            .any(|id| id != issue.id.to_ascii_lowercase());
+
+        if has_reason && has_follow_up {
+            continue;
+        }
+
+        let mut detail = String::new();
+        if !has_reason {
+            detail.push_str("missing explicit reason");
+        }
+        if !has_reason && !has_follow_up {
+            detail.push_str("; ");
+        }
+        if !has_follow_up {
+            detail.push_str("missing follow-up bead id (bd-...)");
+        }
+
+        violations.push(DeferredDecisionViolation {
+            issue_id: issue.id.clone(),
+            title: issue.title.clone(),
+            detail,
+        });
+    }
+
+    violations
+}
+
+fn find_spec_section_bounds(spec_lines: &[&str], markers: &[&str]) -> Option<SectionBounds> {
+    let start_idx = spec_lines.iter().position(|line| {
+        let trimmed = line.trim();
+        if !is_markdown_heading(trimmed) {
+            return false;
+        }
+
+        let heading_lower = strip_markdown_heading(trimmed).to_ascii_lowercase();
+        markers
+            .iter()
+            .map(|marker| marker.to_ascii_lowercase())
+            .any(|marker| heading_lower.contains(&marker))
+    })?;
+
+    let start = start_idx + 1;
+    let mut end = spec_lines.len();
+    for (idx, line) in spec_lines.iter().enumerate().skip(start) {
+        if is_markdown_heading(line.trim()) {
+            end = idx;
+            break;
+        }
+    }
+    Some(SectionBounds { start, end })
+}
+
+fn parse_exclusion_items(spec_lines: &[&str], section: SectionBounds) -> Vec<ExclusionItem> {
+    let mut items = Vec::new();
+    for (line_idx, line) in spec_lines
+        .iter()
+        .enumerate()
+        .take(section.end)
+        .skip(section.start)
+    {
+        let raw = line.trim();
+        let Some(body) = strip_bullet_prefix(raw) else {
+            continue;
+        };
+
+        let clean = clean_markdown_inline(body);
+        if clean.is_empty() {
+            continue;
+        }
+        let (name, rationale) = split_name_and_rationale(&clean);
+        items.push(ExclusionItem {
+            line_no: line_idx + 1,
+            name,
+            rationale,
+            line_text: truncate_line(raw, MAX_LINE_TEXT_LEN),
+        });
+    }
+    items
+}
+
+fn split_name_and_rationale(input: &str) -> (String, String) {
+    let delimiters = [" — ", " – ", ": ", " - "];
+    for delimiter in delimiters {
+        if let Some((name, rationale)) = input.split_once(delimiter) {
+            return (
+                normalize_whitespace(name),
+                normalize_whitespace(rationale.trim()),
+            );
+        }
+    }
+
+    let lower = input.to_ascii_lowercase();
+    if let Some(pos) = lower.find(" because ") {
+        let (name, rationale_with_keyword) = input.split_at(pos);
+        let rationale = rationale_with_keyword.trim_start_matches(" because ");
+        return (normalize_whitespace(name), normalize_whitespace(rationale));
+    }
+
+    (normalize_whitespace(input), String::new())
+}
+
+fn clean_markdown_inline(input: &str) -> String {
+    let stripped = input
+        .replace("**", "")
+        .replace(['*', '`', '[', ']'], "")
+        .replace(['(', ')'], " ");
+    normalize_whitespace(&stripped)
+}
+
+fn strip_bullet_prefix(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        return Some(trimmed[2..].trim());
+    }
+
+    let digit_count = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if digit_count > 0 {
+        let suffix = &trimmed[digit_count..];
+        if let Some(stripped) = suffix.strip_prefix(". ") {
+            return Some(stripped.trim());
+        }
+    }
+
+    None
+}
+
+fn references_section_15(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    SECTION_15_REF_TOKENS
+        .iter()
+        .any(|token| lower.contains(&token.to_ascii_lowercase()))
+}
+
+fn contains_scope_phrase(line_lower: &str, phrase: &str) -> bool {
+    if phrase != "later" {
+        return line_lower.contains(phrase);
+    }
+
+    contains_word(line_lower, "later")
+        && (line_lower.contains("v1")
+            || line_lower.contains("scope")
+            || line_lower.contains("defer"))
+}
+
+fn contains_word(text: &str, needle: &str) -> bool {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .any(|token| token.eq_ignore_ascii_case(needle))
+}
+
+fn collect_markdown_files(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(workspace_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+                out.push(path);
+                continue;
+            }
+
+            if path.is_dir() && path.file_name().and_then(|name| name.to_str()) == Some("docs") {
+                collect_files_with_extension(&path, "md", &mut out);
+            }
+        }
+    }
+
+    out.sort();
+    out
+}
+
+fn collect_implementation_source_files(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for rel in ["crates", "src", "tests"] {
+        let path = workspace_root.join(rel);
+        if path.is_dir() {
+            collect_files_with_extension(&path, "rs", &mut out);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn collect_files_with_extension(root: &Path, extension: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+
+    for path in paths {
+        if path.is_dir() {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if matches!(
+                name,
+                ".git"
+                    | ".beads"
+                    | "target"
+                    | "target_lilaccave"
+                    | "legacy_sqlite_code"
+                    | "node_modules"
+            ) {
+                continue;
+            }
+            collect_files_with_extension(&path, extension, out);
+            continue;
+        }
+
+        if path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
+            out.push(path);
+        }
+    }
+}
+
+fn relativize_path(workspace_root: &Path, path: &Path) -> String {
+    path.strip_prefix(workspace_root).map_or_else(
+        |_| path.display().to_string(),
+        |rel| rel.display().to_string(),
+    )
 }
 
 fn extract_bead_ids(text: &str) -> BTreeSet<String> {

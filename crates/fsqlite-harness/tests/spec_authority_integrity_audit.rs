@@ -272,7 +272,7 @@ fn build_integrity_report() -> SpecIntegrityReport {
                 toc_alignment_errors.push(format!(
                     "TOC title mismatch for section {}: toc='{}' header='{}'",
                     entry.number, entry.title, actual_title
-                ))
+                ));
             }
             Some(_) => {}
         }

@@ -20,9 +20,9 @@
 //! (no I/O), keeping it short.
 
 use std::collections::HashMap;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use fsqlite_types::{CommitSeq, PageNumber};
 use parking_lot::{Condvar, Mutex};
@@ -1333,8 +1333,8 @@ impl std::fmt::Debug for ArcCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::thread;
     use std::time::Duration;
 
