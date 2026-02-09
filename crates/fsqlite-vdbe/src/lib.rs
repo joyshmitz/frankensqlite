@@ -1076,7 +1076,6 @@ mod tests {
     // ── PRAGMA handling (bd-iwu.5) ───────────────────────────────────────
 
     use std::fs;
-    use std::path::Path;
 
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
@@ -1359,6 +1358,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_e2e_bd_1hi_12_compliance() {
         let dir = tempdir().expect("tempdir");
         let sidecar = dir.path().join("e2e.wal-fec");
@@ -1439,7 +1439,9 @@ mod tests {
             WalFecRecoveryOutcome::Recovered(group) => {
                 assert_eq!(group.recovered_pages.len(), k_source);
             }
-            other => panic!("expected recovered outcome, got {other:?}"),
+            WalFecRecoveryOutcome::TruncateBeforeGroup { .. } => {
+                panic!("expected recovered outcome");
+            }
         }
 
         let mut corrupt_five_frames = Vec::new();

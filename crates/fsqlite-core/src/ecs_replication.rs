@@ -161,11 +161,7 @@ impl AntiEntropySession {
     }
 
     /// Step 1: Set local and remote tips.
-    pub fn exchange_tips(
-        &mut self,
-        local: ReplicaTip,
-        remote: ReplicaTip,
-    ) -> Result<()> {
+    pub fn exchange_tips(&mut self, local: ReplicaTip, remote: ReplicaTip) -> Result<()> {
         if self.phase != AntiEntropyPhase::ExchangeTips {
             return Err(FrankenError::Internal(format!(
                 "anti-entropy: expected ExchangeTips, got {:?}",
@@ -197,8 +193,10 @@ impl AntiEntropySession {
             )));
         }
 
-        let needed: BTreeSet<ObjectId> = remote_objects.difference(local_objects).copied().collect();
-        let to_offer: BTreeSet<ObjectId> = local_objects.difference(remote_objects).copied().collect();
+        let needed: BTreeSet<ObjectId> =
+            remote_objects.difference(local_objects).copied().collect();
+        let to_offer: BTreeSet<ObjectId> =
+            local_objects.difference(remote_objects).copied().collect();
 
         debug!(
             bead_id = BEAD_ID,
@@ -233,7 +231,11 @@ impl AntiEntropySession {
 
         // Check if all needed objects are decoded.
         if let Some(missing) = &self.missing {
-            if missing.needed.iter().all(|id| self.decoded_objects.contains(id)) {
+            if missing
+                .needed
+                .iter()
+                .all(|id| self.decoded_objects.contains(id))
+            {
                 debug!(
                     bead_id = BEAD_ID,
                     decoded_count = self.decoded_objects.len(),
@@ -403,9 +405,7 @@ impl ConsistentHashRing {
         }
         let key = Self::hash_symbol(object_id, esi);
         // Binary search for the first ring entry >= key.
-        let idx = self
-            .ring
-            .partition_point(|&(h, _)| h < key);
+        let idx = self.ring.partition_point(|&(h, _)| h < key);
         let idx = if idx >= self.ring.len() { 0 } else { idx };
         Some(self.ring[idx].1)
     }
@@ -652,7 +652,7 @@ pub struct TraceEvent {
 }
 
 /// Type of trace event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TraceEventType {
     Published,
     Received,
@@ -769,7 +769,11 @@ pub fn export_tla_trace(events: &[TraceEvent]) -> String {
     let _ = writeln!(out);
 
     for (i, ev) in events.iter().enumerate() {
-        let _ = writeln!(out, "\\* Step {i}: node={}, seq={}", ev.node_id, ev.commit_seq);
+        let _ = writeln!(
+            out,
+            "\\* Step {i}: node={}, seq={}",
+            ev.node_id, ev.commit_seq
+        );
         match ev.event_type {
             TraceEventType::Published => {
                 let _ = writeln!(
@@ -866,7 +870,9 @@ mod tests {
 
         let local_objects: BTreeSet<ObjectId> = [make_oid(10), make_oid(20)].into();
         let remote_objects: BTreeSet<ObjectId> = [make_oid(20), make_oid(30)].into();
-        let missing = session.compute_missing(&local_objects, &remote_objects).unwrap();
+        let missing = session
+            .compute_missing(&local_objects, &remote_objects)
+            .unwrap();
         assert!(missing.needed.contains(&make_oid(30)));
 
         session.record_decoded(make_oid(30)).unwrap();
@@ -1060,7 +1066,7 @@ mod tests {
 
     #[test]
     fn test_symbol_routing_add_node_minimal_reroute() {
-        let ring3 = ConsistentHashRing::new(&[1, 2, 3], 100);
+        let mut ring3 = ConsistentHashRing::new(&[1, 2, 3], 100);
         let ring4 = ring3.add_node(4);
         assert_eq!(ring4.node_count(), 4);
 
@@ -1211,12 +1217,8 @@ mod tests {
     fn prop_anti_entropy_convergence() {
         // For various random-ish object sets, anti-entropy always converges.
         for seed in 0..20_u8 {
-            let local: BTreeSet<ObjectId> = (0..seed)
-                .map(|i| make_oid(i * 2))
-                .collect();
-            let remote: BTreeSet<ObjectId> = (0..seed)
-                .map(|i| make_oid(i * 2 + 1))
-                .collect();
+            let local: BTreeSet<ObjectId> = (0..seed).map(|i| make_oid(i * 2)).collect();
+            let remote: BTreeSet<ObjectId> = (0..seed).map(|i| make_oid(i * 2 + 1)).collect();
 
             let mut session = AntiEntropySession::new();
             session
@@ -1242,8 +1244,7 @@ mod tests {
             }
             // Either converged (had missing objects) or still at RequestSymbols (nothing missing).
             assert!(
-                session.is_converged()
-                    || session.phase() == AntiEntropyPhase::RequestSymbols,
+                session.is_converged() || session.phase() == AntiEntropyPhase::RequestSymbols,
                 "failed to converge for seed={seed}"
             );
         }

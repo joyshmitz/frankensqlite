@@ -528,4 +528,137 @@ mod tests {
         assert_eq!(ten_header_size, 11);
         assert!(ten_col[1..11].iter().all(|&serial| serial == 0x01));
     }
+
+    // -----------------------------------------------------------------------
+    // bd-2sm1 §17.2 proptest: record format round-trip
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Strategy to generate an arbitrary `SqliteValue`.
+    fn arb_sqlite_value() -> BoxedStrategy<SqliteValue> {
+        prop_oneof![
+            5 => Just(SqliteValue::Null),
+            10 => any::<i64>().prop_map(SqliteValue::Integer),
+            5 => prop_oneof![
+                Just(0_i64),
+                Just(1_i64),
+                Just(-1_i64),
+                Just(127_i64),
+                Just(-128_i64),
+                Just(128_i64),
+                Just(32767_i64),
+                Just(-32768_i64),
+                Just(8_388_607_i64),
+                Just(-8_388_608_i64),
+                Just(2_147_483_647_i64),
+                Just(-2_147_483_648_i64),
+                Just(i64::MAX),
+                Just(i64::MIN),
+            ].prop_map(SqliteValue::Integer),
+            // Exclude NaN/Inf since they roundtrip but NaN != NaN in PartialEq.
+            5 => (-1e15_f64..1e15_f64).prop_map(SqliteValue::Float),
+            5 => prop_oneof![
+                Just(0.0_f64),
+                Just(-0.0_f64),
+                Just(1.0_f64),
+                Just(-1.0_f64),
+                Just(3.14_f64),
+                Just(f64::MAX),
+                Just(f64::MIN),
+                Just(f64::MIN_POSITIVE),
+            ].prop_map(SqliteValue::Float),
+            10 => "[a-zA-Z0-9 _]{0,200}".prop_map(SqliteValue::Text),
+            5 => proptest::collection::vec(any::<u8>(), 0..200)
+                .prop_map(SqliteValue::Blob),
+        ]
+        .boxed()
+    }
+
+    /// Bitwise equality for SqliteValue (handles NaN and -0.0 correctly).
+    fn values_bitwise_eq(a: &SqliteValue, b: &SqliteValue) -> bool {
+        match (a, b) {
+            (SqliteValue::Null, SqliteValue::Null) => true,
+            (SqliteValue::Integer(x), SqliteValue::Integer(y)) => x == y,
+            (SqliteValue::Float(x), SqliteValue::Float(y)) => x.to_bits() == y.to_bits(),
+            (SqliteValue::Text(x), SqliteValue::Text(y)) => x == y,
+            (SqliteValue::Blob(x), SqliteValue::Blob(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
+
+        /// INV-PBT-3: Record encode/decode round-trip for arbitrary value vectors.
+        #[test]
+        fn prop_record_roundtrip_arbitrary(
+            values in proptest::collection::vec(arb_sqlite_value(), 0..100)
+        ) {
+            let encoded = serialize_record(&values);
+            let decoded = parse_record(&encoded)
+                .expect("serialize_record output must always parse");
+            prop_assert_eq!(
+                values.len(),
+                decoded.len(),
+                "bead_id=bd-2sm1 case=record_roundtrip_len_mismatch expected={} got={}",
+                values.len(),
+                decoded.len()
+            );
+            for (i, (orig, parsed)) in values.iter().zip(decoded.iter()).enumerate() {
+                prop_assert!(
+                    values_bitwise_eq(orig, parsed),
+                    "bead_id=bd-2sm1 case=record_roundtrip_value_mismatch col={} orig={:?} parsed={:?}",
+                    i,
+                    orig,
+                    parsed
+                );
+            }
+        }
+
+        /// INV-PBT-3: Edge cases at varint encoding boundaries.
+        #[test]
+        fn prop_record_roundtrip_varint_boundaries(
+            n_cols in 1_usize..50
+        ) {
+            // Use values at varint boundaries to stress header encoding.
+            let boundary_values: Vec<i64> = vec![
+                0, 1, -1, 127, -128, 128, -129, 32767, -32768, 32768,
+                8_388_607, -8_388_608, 2_147_483_647, -2_147_483_648,
+                i64::MAX, i64::MIN,
+            ];
+            let values: Vec<SqliteValue> = (0..n_cols)
+                .map(|i| SqliteValue::Integer(boundary_values[i % boundary_values.len()]))
+                .collect();
+            let encoded = serialize_record(&values);
+            let decoded = parse_record(&encoded).expect("valid boundary record");
+            prop_assert_eq!(
+                values.len(),
+                decoded.len(),
+                "bead_id=bd-2sm1 case=varint_boundary_len"
+            );
+            for (i, (orig, parsed)) in values.iter().zip(decoded.iter()).enumerate() {
+                prop_assert!(
+                    values_bitwise_eq(orig, parsed),
+                    "bead_id=bd-2sm1 case=varint_boundary_mismatch col={}",
+                    i
+                );
+            }
+        }
+
+        /// INV-PBT-3: Empty and single-value records.
+        #[test]
+        fn prop_record_roundtrip_single_value(value in arb_sqlite_value()) {
+            let values = vec![value];
+            let encoded = serialize_record(&values);
+            let decoded = parse_record(&encoded).expect("valid single-value record");
+            prop_assert_eq!(decoded.len(), 1, "bead_id=bd-2sm1 case=single_value_len");
+            prop_assert!(
+                values_bitwise_eq(&values[0], &decoded[0]),
+                "bead_id=bd-2sm1 case=single_value_mismatch orig={:?} parsed={:?}",
+                values[0],
+                decoded[0]
+            );
+        }
+    }
 }

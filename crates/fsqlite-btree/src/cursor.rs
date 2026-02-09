@@ -2918,5 +2918,70 @@ mod tests {
             }
             proptest::prop_assert_eq!(scanned.len(), live.len());
         }
+
+        /// bd-2sm1: B-tree order matches BTreeMap reference after random ops.
+        /// Unlike prop_btree_order_invariant, this allows duplicate inserts
+        /// (which produce PrimaryKeyViolation) and verifies exact rowid-set
+        /// equality with a reference BTreeMap.
+        #[test]
+        fn prop_btree_vs_btreemap_reference(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    3 => (1..=2000_i64, proptest::collection::vec(proptest::num::u8::ANY, 10..100))
+                        .prop_map(|(r, p)| (true, r, p)),
+                    1 => (1..=2000_i64,).prop_map(|(r,)| (false, r, Vec::new())),
+                ],
+                1..500
+            )
+        ) {
+            let mut store = MemPageStore::default();
+            store.pages.insert(2, build_leaf_table(&[]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
+                std::collections::BTreeMap::new();
+
+            for (is_insert, rowid, payload) in &ops {
+                if *is_insert {
+                    if reference.contains_key(rowid) {
+                        // Duplicate: should fail (PrimaryKeyViolation).
+                        let result = cursor.table_insert(&cx, *rowid, payload);
+                        proptest::prop_assert!(
+                            result.is_err(),
+                            "duplicate rowid {} should error",
+                            rowid
+                        );
+                    } else {
+                        cursor.table_insert(&cx, *rowid, payload).unwrap();
+                        reference.insert(*rowid, payload.clone());
+                    }
+                } else if reference.contains_key(rowid) {
+                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
+                    if seek.is_found() {
+                        cursor.delete(&cx).unwrap();
+                        reference.remove(rowid);
+                    }
+                }
+            }
+
+            // Scan and compare with reference.
+            let mut scanned_rowids = Vec::new();
+            if cursor.first(&cx).unwrap() {
+                loop {
+                    scanned_rowids.push(cursor.rowid(&cx).unwrap());
+                    if !cursor.next(&cx).unwrap() {
+                        break;
+                    }
+                }
+            }
+
+            let ref_rowids: Vec<i64> = reference.keys().copied().collect();
+            proptest::prop_assert_eq!(
+                &scanned_rowids,
+                &ref_rowids,
+                "bead_id=bd-2sm1 case=btree_vs_btreemap rowids mismatch"
+            );
+        }
     }
 }

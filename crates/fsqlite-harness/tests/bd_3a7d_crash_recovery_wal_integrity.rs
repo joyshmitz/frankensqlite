@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 
 use fsqlite_harness::fault_vfs::{FaultSpec, FaultState, SyncDecision, WriteDecision};
 use fsqlite_wal::{
+    SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WalFecRepairOutcome, WalSalts,
     attempt_wal_fec_repair, compute_wal_frame_checksum, crc32c_checksum,
     integrity_check_level1_page, integrity_check_level2_btree,
     integrity_check_level3_overflow_chain, integrity_check_level4_cross_reference,
     integrity_check_level5_schema, merge_integrity_reports, wal_fec_source_hash_xxh3_128,
-    write_wal_frame_checksum, write_wal_frame_salts, SqliteWalChecksum, WalFecRepairOutcome,
-    WalSalts, WAL_FRAME_HEADER_SIZE,
+    write_wal_frame_checksum, write_wal_frame_salts,
 };
 use proptest::prelude::proptest;
 use proptest::test_runner::TestCaseError;

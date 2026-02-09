@@ -8,6 +8,7 @@ pub mod commit_marker;
 pub mod commit_repair;
 pub mod db_fec;
 pub mod decode_proofs;
+pub mod ecs_replication;
 pub mod epoch;
 pub mod raptorq_integration;
 pub mod region;

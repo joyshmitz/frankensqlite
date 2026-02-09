@@ -947,7 +947,9 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
     // 'A' (65) = BLOB, 'B' (66) = TEXT, 'C' (67) = NUMERIC,
     // 'D' (68) = INTEGER, 'E' (69) = REAL
     // But more commonly p2 is used as an affinity character.
-    match target as u8 {
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let target_byte = target as u8;
+    match target_byte {
         b'A' | b'a' => SqliteValue::Blob(match val {
             SqliteValue::Blob(b) => b,
             SqliteValue::Text(s) => s.into_bytes(),
@@ -965,7 +967,6 @@ fn char_to_affinity(ch: char) -> fsqlite_types::TypeAffinity {
     match ch {
         'd' | 'D' => fsqlite_types::TypeAffinity::Integer,
         'e' | 'E' => fsqlite_types::TypeAffinity::Real,
-        'B' => fsqlite_types::TypeAffinity::Blob,
         'C' | 'c' => fsqlite_types::TypeAffinity::Text,
         'A' | 'a' => fsqlite_types::TypeAffinity::Numeric,
         _ => fsqlite_types::TypeAffinity::Blob,
