@@ -1547,6 +1547,11 @@ mod tests {
     }
 
     #[test]
+    fn test_json_valid_flags_strict() {
+        assert_eq!(json_valid("invalid", Some(JSON_VALID_RFC_8259_FLAG)), 0);
+    }
+
+    #[test]
     fn test_json_valid_flags_jsonb() {
         let payload = jsonb(r#"{"a":[1,2,3]}"#).unwrap();
         assert_eq!(
@@ -1687,6 +1692,14 @@ mod tests {
     }
 
     #[test]
+    fn test_json_array_length_path() {
+        assert_eq!(
+            json_array_length(r#"{"a":[1,2,3]}"#, Some("$.a")).unwrap(),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn test_json_error_position_valid() {
         assert_eq!(json_error_position(r#"{"a":1}"#), 0);
     }
@@ -1777,6 +1790,34 @@ mod tests {
     }
 
     #[test]
+    fn test_jsonb_insert_variant() {
+        let blob = jsonb_insert(r#"{"a":1}"#, &[("$.b", SqliteValue::Integer(2))]).unwrap();
+        let text = json_from_jsonb(&blob).unwrap();
+        assert_eq!(text, r#"{"a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn test_jsonb_replace_variant() {
+        let blob = jsonb_replace(r#"{"a":1}"#, &[("$.a", SqliteValue::Integer(5))]).unwrap();
+        let text = json_from_jsonb(&blob).unwrap();
+        assert_eq!(text, r#"{"a":5}"#);
+    }
+
+    #[test]
+    fn test_jsonb_remove_variant() {
+        let blob = jsonb_remove(r#"{"a":1,"b":2}"#, &["$.a"]).unwrap();
+        let text = json_from_jsonb(&blob).unwrap();
+        assert_eq!(text, r#"{"b":2}"#);
+    }
+
+    #[test]
+    fn test_jsonb_patch_variant() {
+        let blob = jsonb_patch(r#"{"a":1,"b":2}"#, r#"{"b":7}"#).unwrap();
+        let text = json_from_jsonb(&blob).unwrap();
+        assert_eq!(text, r#"{"a":1,"b":7}"#);
+    }
+
+    #[test]
     fn test_json_group_array_includes_nulls() {
         let out = json_group_array(&[
             SqliteValue::Integer(1),
@@ -1785,6 +1826,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(out, "[1,null,3]");
+    }
+
+    #[test]
+    fn test_json_group_array_basic() {
+        let out = json_group_array(&[
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(2),
+            SqliteValue::Integer(3),
+        ])
+        .unwrap();
+        assert_eq!(out, "[1,2,3]");
+    }
+
+    #[test]
+    fn test_json_group_object_basic() {
+        let out = json_group_object(&[
+            (SqliteValue::Text("a".to_owned()), SqliteValue::Integer(1)),
+            (SqliteValue::Text("b".to_owned()), SqliteValue::Integer(2)),
+        ])
+        .unwrap();
+        assert_eq!(out, r#"{"a":1,"b":2}"#);
     }
 
     #[test]
@@ -1826,6 +1888,14 @@ mod tests {
         assert_eq!(rows[1].key, SqliteValue::Text("b".to_owned()));
         assert_eq!(rows[0].value, SqliteValue::Integer(1));
         assert_eq!(rows[1].value, SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_json_each_path() {
+        let rows = json_each(r#"{"a":{"b":1,"c":2}}"#, Some("$.a")).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].path, "$.a");
+        assert_eq!(rows[1].path, "$.a");
     }
 
     #[test]
@@ -1908,5 +1978,16 @@ mod tests {
         }
 
         assert_eq!(fullkeys, vec!["$.a".to_owned(), "$.a.b".to_owned()]);
+    }
+
+    #[test]
+    fn test_jsonb_chain_validity() {
+        let first = jsonb_set(r#"{"a":1}"#, &[("$.a", SqliteValue::Integer(9))]).unwrap();
+        let first_text = json_from_jsonb(&first).unwrap();
+        let second = jsonb_patch(&first_text, r#"{"b":2}"#).unwrap();
+        assert_eq!(
+            json_valid_blob(&second, Some(JSON_VALID_JSONB_STRICT_FLAG)),
+            1
+        );
     }
 }
