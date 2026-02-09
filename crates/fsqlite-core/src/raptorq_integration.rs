@@ -504,15 +504,15 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
-    use asupersync::raptorq::decoder::InactivationDecoder;
-    use asupersync::raptorq::systematic::ConstraintMatrix;
+    use asupersync::error::ErrorKind as AsErrorKind;
+    use asupersync::raptorq::RaptorQReceiverBuilder;
     use asupersync::raptorq::RaptorQSenderBuilder;
     use asupersync::security::AuthenticationTag;
     use asupersync::security::authenticated::AuthenticatedSymbol;
     use asupersync::transport::error::{SinkError, StreamError};
     use asupersync::transport::sink::SymbolSink;
     use asupersync::transport::stream::SymbolStream;
-    use asupersync::types::{ObjectId as AsObjectId, Symbol};
+    use asupersync::types::{ObjectId as AsObjectId, ObjectParams, Symbol, SymbolId, SymbolKind};
     use asupersync::{Cx as AsCx, RaptorQConfig};
 
     use super::*;
@@ -598,6 +598,75 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct VecTransportStream {
+        symbols: VecDeque<AuthenticatedSymbol>,
+    }
+
+    impl VecTransportStream {
+        fn new(symbols: Vec<Symbol>) -> Self {
+            let symbols = symbols
+                .into_iter()
+                .map(|symbol| AuthenticatedSymbol::new_verified(symbol, AuthenticationTag::zero()))
+                .collect();
+            Self { symbols }
+        }
+    }
+
+    impl SymbolStream for VecTransportStream {
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<std::result::Result<AuthenticatedSymbol, StreamError>>> {
+            match self.symbols.pop_front() {
+                Some(symbol) => Poll::Ready(Some(Ok(symbol))),
+                None => Poll::Ready(None),
+            }
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (self.symbols.len(), Some(self.symbols.len()))
+        }
+
+        fn is_exhausted(&self) -> bool {
+            self.symbols.is_empty()
+        }
+    }
+
+    const TEST_OBJECT_ID: u64 = 0xBD_1A15;
+    const TEST_MAX_BLOCK_SIZE: usize = 64 * 1024;
+    const PACKED_KIND_REPAIR_BIT: u32 = 1_u32 << 31;
+    const PACKED_SBN_SHIFT: u32 = 23;
+    const PACKED_SBN_MASK: u32 = 0xFF;
+    const PACKED_ESI_MASK: u32 = 0x7F_FFFF;
+
+    fn pack_symbol_key(kind: SymbolKind, sbn: u8, esi: u32) -> Result<u32> {
+        if esi > PACKED_ESI_MASK {
+            return Err(FrankenError::OutOfRange {
+                what: "packed symbol esi (must fit 23 bits)".to_owned(),
+                value: esi.to_string(),
+            });
+        }
+
+        let kind_bit = if kind.is_repair() {
+            PACKED_KIND_REPAIR_BIT
+        } else {
+            0
+        };
+        Ok(kind_bit | (u32::from(sbn) << PACKED_SBN_SHIFT) | esi)
+    }
+
+    fn unpack_symbol_key(packed: u32) -> (SymbolKind, u8, u32) {
+        let kind = if packed & PACKED_KIND_REPAIR_BIT == 0 {
+            SymbolKind::Source
+        } else {
+            SymbolKind::Repair
+        };
+        let sbn = ((packed >> PACKED_SBN_SHIFT) & PACKED_SBN_MASK) as u8;
+        let esi = packed & PACKED_ESI_MASK;
+        (kind, sbn, esi)
+    }
+
     impl SymbolSink for VecTransportSink {
         fn poll_send(
             mut self: Pin<&mut Self>,
@@ -630,41 +699,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct VecTransportStream {
-        q: VecDeque<AuthenticatedSymbol>,
-    }
-
-    impl VecTransportStream {
-        fn new(symbols: Vec<Symbol>) -> Self {
-            let q = symbols
-                .into_iter()
-                .map(|s| AuthenticatedSymbol::new_verified(s, AuthenticationTag::zero()))
-                .collect();
-            Self { q }
-        }
-    }
-
-    impl SymbolStream for VecTransportStream {
-        fn poll_next(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Option<std::result::Result<AuthenticatedSymbol, StreamError>>> {
-            match self.q.pop_front() {
-                Some(s) => Poll::Ready(Some(Ok(s))),
-                None => Poll::Ready(None),
-            }
-        }
-
-        fn size_hint(&self) -> (usize, Option<usize>) {
-            (self.q.len(), Some(self.q.len()))
-        }
-
-        fn is_exhausted(&self) -> bool {
-            self.q.is_empty()
-        }
-    }
-
     /// SymbolCodec backed by asupersync.
     struct AsupersyncCodec;
 
@@ -677,11 +711,11 @@ mod tests {
         ) -> Result<CodecEncodeResult> {
             let mut config = RaptorQConfig::default();
             config.encoding.symbol_size = symbol_size as u16;
-            config.encoding.max_block_size = 64 * 1024;
+            config.encoding.max_block_size = TEST_MAX_BLOCK_SIZE;
             config.encoding.repair_overhead = repair_overhead;
 
             let cx = AsCx::for_testing();
-            let object_id = AsObjectId::new_for_test(0xBD_1A15);
+            let object_id = AsObjectId::new_for_test(TEST_OBJECT_ID);
             let mut sender = RaptorQSenderBuilder::new()
                 .config(config)
                 .transport(VecTransportSink::new())
@@ -698,11 +732,11 @@ mod tests {
             let mut source_symbols = Vec::new();
             let mut repair_symbols = Vec::new();
             for s in &symbols {
-                let esi = s.esi();
-                if esi < k {
-                    source_symbols.push((esi, s.data().to_vec()));
+                let packed_key = pack_symbol_key(s.kind(), s.sbn(), s.esi())?;
+                if s.kind().is_source() {
+                    source_symbols.push((packed_key, s.data().to_vec()));
                 } else {
-                    repair_symbols.push((esi, s.data().to_vec()));
+                    repair_symbols.push((packed_key, s.data().to_vec()));
                 }
             }
 
@@ -727,70 +761,82 @@ mod tests {
                 });
             }
 
-            // Use low-level decoder for detailed stats.
-            let seed = 0xBD_1A15_u64;
-            let decoder = InactivationDecoder::new(k_source as usize, symbol_size as usize, seed);
-            let params = decoder.params();
-            let base_rows = params.s + params.h;
-            let constraints = ConstraintMatrix::build(params, seed);
+            let object_id = AsObjectId::new_for_test(TEST_OBJECT_ID);
+            let mut config = RaptorQConfig::default();
+            config.encoding.symbol_size = symbol_size as u16;
+            config.encoding.max_block_size = TEST_MAX_BLOCK_SIZE;
 
-            let mut received = decoder.constraint_symbols();
-            for (esi, data) in symbols {
-                let esi_usize = *esi as usize;
-                if esi_usize < k_source as usize {
-                    // Source symbol: construct LT equation from constraint matrix.
-                    let row = base_rows + esi_usize;
-                    let mut columns = Vec::new();
-                    let mut coefficients = Vec::new();
-                    for col in 0..constraints.cols {
-                        let coeff = constraints.get(row, col);
-                        if !coeff.is_zero() {
-                            columns.push(col);
-                            coefficients.push(coeff);
-                        }
-                    }
-                    received.push(asupersync::raptorq::decoder::ReceivedSymbol {
-                        esi: *esi,
-                        is_source: true,
-                        columns,
-                        coefficients,
-                        data: data.clone(),
-                    });
-                } else {
-                    // Repair symbol: use the decoder's repair equation.
-                    let (columns, coefficients) = decoder.repair_equation(*esi);
-                    received.push(asupersync::raptorq::decoder::ReceivedSymbol::repair(
-                        *esi,
-                        columns,
-                        coefficients,
-                        data.clone(),
-                    ));
-                }
+            let symbol_size_usize =
+                usize::try_from(symbol_size).map_err(|_| FrankenError::OutOfRange {
+                    what: "symbol_size as usize".to_owned(),
+                    value: symbol_size.to_string(),
+                })?;
+            let symbols_per_block = u32::try_from((TEST_MAX_BLOCK_SIZE / symbol_size_usize).max(1))
+                .map_err(|_| FrankenError::OutOfRange {
+                    what: "symbols_per_block as u32".to_owned(),
+                    value: (TEST_MAX_BLOCK_SIZE / symbol_size_usize).to_string(),
+                })?;
+            let source_blocks = k_source.div_ceil(symbols_per_block).max(1);
+            let object_size = u64::from(k_source)
+                .checked_mul(u64::from(symbol_size))
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: "object_size for decode params".to_owned(),
+                    value: format!("{k_source}*{symbol_size}"),
+                })?;
+            let params = ObjectParams::new(
+                object_id,
+                object_size,
+                u16::try_from(symbol_size).map_err(|_| FrankenError::OutOfRange {
+                    what: "symbol_size as u16".to_owned(),
+                    value: symbol_size.to_string(),
+                })?,
+                u8::try_from(source_blocks).map_err(|_| FrankenError::OutOfRange {
+                    what: "source_blocks as u8".to_owned(),
+                    value: source_blocks.to_string(),
+                })?,
+                u16::try_from(symbols_per_block).map_err(|_| FrankenError::OutOfRange {
+                    what: "symbols_per_block as u16".to_owned(),
+                    value: symbols_per_block.to_string(),
+                })?,
+            );
+
+            let mut rebuilt = Vec::with_capacity(symbols.len());
+            for (packed, data) in symbols {
+                let (kind, sbn, esi) = unpack_symbol_key(*packed);
+                rebuilt.push(Symbol::new(
+                    SymbolId::new(object_id, sbn, esi),
+                    data.clone(),
+                    kind,
+                ));
             }
 
-            match decoder.decode(&received) {
-                Ok(result) => {
-                    let flat: Vec<u8> = result
-                        .source
-                        .into_iter()
-                        .flat_map(|v| v.into_iter())
-                        .collect();
-                    Ok(CodecDecodeResult::Success {
-                        data: flat,
-                        symbols_used: symbols.len() as u32,
-                        peeled_count: result.stats.peeled as u32,
-                        inactivated_count: result.stats.inactivated as u32,
+            let cx = AsCx::for_testing();
+            let mut receiver = RaptorQReceiverBuilder::new()
+                .config(config)
+                .source(VecTransportStream::new(rebuilt))
+                .build()
+                .map_err(|e| FrankenError::Internal(format!("receiver build: {e}")))?;
+
+            match receiver.receive_object(&cx, &params) {
+                Ok(outcome) => Ok(CodecDecodeResult::Success {
+                    data: outcome.data,
+                    symbols_used: outcome.symbols_received as u32,
+                    peeled_count: 0,
+                    inactivated_count: 0,
+                }),
+                Err(err) => {
+                    let reason = match err.kind() {
+                        AsErrorKind::InsufficientSymbols => {
+                            DecodeFailureReason::InsufficientSymbols
+                        }
+                        _ => DecodeFailureReason::SingularMatrix,
+                    };
+                    Ok(CodecDecodeResult::Failure {
+                        reason,
+                        symbols_received: symbols.len() as u32,
+                        k_required: k_source,
                     })
                 }
-                Err(_) => Ok(CodecDecodeResult::Failure {
-                    reason: if (symbols.len() as u32) < k_source {
-                        DecodeFailureReason::InsufficientSymbols
-                    } else {
-                        DecodeFailureReason::SingularMatrix
-                    },
-                    symbols_received: symbols.len() as u32,
-                    k_required: k_source,
-                }),
             }
         }
     }
@@ -1307,6 +1353,57 @@ mod tests {
             DecodeOutcome::Failure(f) => {
                 panic!(
                     "bead_id={BEAD_ID} case=e2e_64_failure reason={:?}",
+                    f.reason
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_e2e_bd_1hi_5() {
+        let config = PipelineConfig::for_page_size(4096);
+        let encoder =
+            RaptorQPageEncoder::new(config.clone(), default_codec()).expect("encoder build");
+        let decoder =
+            RaptorQPageDecoder::new(config.clone(), default_codec()).expect("decoder build");
+        let cx = test_cx();
+
+        // Realistic load for this lane: 64 pages (256 KiB) with symbol loss.
+        let k = 64_usize;
+        let data = deterministic_page_data(k, config.symbol_size as usize, 0xB1D1_5005);
+        let mut sink = VecPageSink::new();
+        let outcome = encoder
+            .encode_pages(&cx, &data, &mut sink)
+            .expect("encode must succeed");
+
+        // Drop one source symbol per source block; keep all repair symbols.
+        let mut dropped = 0_u32;
+        let mut degraded = BTreeMap::new();
+        for (packed_key, symbol_bytes) in &sink.symbols {
+            let (kind, _sbn, esi) = unpack_symbol_key(*packed_key);
+            if kind.is_source() && esi == 0 {
+                dropped += 1;
+                continue;
+            }
+            degraded.insert(*packed_key, symbol_bytes.clone());
+        }
+        assert!(dropped > 0, "bead_id={BEAD_ID} case=e2e_named_dropped_some");
+
+        let mut source = VecPageSource::from_map(degraded);
+        let decode_result = decoder
+            .decode_pages(&cx, &mut source, outcome.source_count)
+            .expect("decode must complete");
+
+        match decode_result {
+            DecodeOutcome::Success(success) => {
+                assert_eq!(
+                    success.data, data,
+                    "bead_id={BEAD_ID} case=e2e_named_byte_perfect_recovery"
+                );
+            }
+            DecodeOutcome::Failure(f) => {
+                panic!(
+                    "bead_id={BEAD_ID} case=e2e_named_unexpected_failure reason={:?}",
                     f.reason
                 );
             }
