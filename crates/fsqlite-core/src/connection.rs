@@ -58,22 +58,22 @@ pub struct PreparedStatement {
 impl PreparedStatement {
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
-        let mut engine = VdbeEngine::new(self.program.register_count());
-        match engine.execute(&self.program)? {
-            ExecOutcome::Done => Ok(engine
-                .take_results()
-                .into_iter()
-                .map(|values| Row { values })
-                .collect()),
-            ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
-                "VDBE halted with code {code}: {message}",
-            ))),
-        }
+        execute_program(&self.program, None)
+    }
+
+    /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
+    pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        execute_program(&self.program, Some(params))
     }
 
     /// Execute and return affected/output row count.
     pub fn execute(&self) -> Result<usize> {
         Ok(self.query()?.len())
+    }
+
+    /// Execute with bound SQL parameters and return affected/output row count.
+    pub fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize> {
+        Ok(self.query_with_params(params)?.len())
     }
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
@@ -120,10 +120,67 @@ impl Connection {
         self.prepare(sql)?.query()
     }
 
+    /// Prepare and execute SQL as a query with bound SQL parameters.
+    pub fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        self.prepare(sql)?.query_with_params(params)
+    }
+
     /// Prepare and execute SQL, returning output/affected row count.
     pub fn execute(&self, sql: &str) -> Result<usize> {
         self.prepare(sql)?.execute()
     }
+
+    /// Prepare and execute SQL with bound SQL parameters.
+    pub fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
+        self.prepare(sql)?.execute_with_params(params)
+    }
+}
+
+fn execute_program(program: &VdbeProgram, params: Option<&[SqliteValue]>) -> Result<Vec<Row>> {
+    let mut engine = VdbeEngine::new(program.register_count());
+    if let Some(params) = params {
+        validate_bound_parameters(program, params)?;
+        engine.set_bindings(params.to_vec());
+    }
+
+    match engine.execute(program)? {
+        ExecOutcome::Done => Ok(engine
+            .take_results()
+            .into_iter()
+            .map(|values| Row { values })
+            .collect()),
+        ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
+            "VDBE halted with code {code}: {message}",
+        ))),
+    }
+}
+
+fn validate_bound_parameters(program: &VdbeProgram, params: &[SqliteValue]) -> Result<()> {
+    let mut max_required: usize = 0;
+    for op in program.ops() {
+        if op.opcode != Opcode::Variable {
+            continue;
+        }
+        let one_based = usize::try_from(op.p1).map_err(|_| FrankenError::OutOfRange {
+            what: "bind parameter index".to_owned(),
+            value: op.p1.to_string(),
+        })?;
+        if one_based == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "bind parameter index".to_owned(),
+                value: op.p1.to_string(),
+            });
+        }
+        max_required = max_required.max(one_based);
+    }
+
+    if max_required > params.len() {
+        return Err(FrankenError::OutOfRange {
+            what: "bind parameter index".to_owned(),
+            value: max_required.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_single_statement(sql: &str) -> Result<Statement> {
@@ -818,5 +875,44 @@ mod tests {
             .query("VALUES (1), (2, 3);")
             .expect_err("mismatched VALUES row widths must fail");
         assert!(matches!(error, FrankenError::ParseError { .. }));
+    }
+
+    #[test]
+    fn test_query_with_params_numbered_placeholders() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query_with_params(
+                "SELECT ?1 + ?2, ?3 WHERE ?4;",
+                &[
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(5),
+                    SqliteValue::Text("ok".to_owned()),
+                    SqliteValue::Integer(1),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(7), SqliteValue::Text("ok".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_query_with_params_missing_required_param_rejected() {
+        let conn = Connection::open(":memory:").unwrap();
+        let error = conn
+            .query_with_params("SELECT ?1 + ?2;", &[SqliteValue::Integer(1)])
+            .expect_err("missing bind param should fail");
+        assert!(matches!(error, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn test_prepared_statement_query_with_params() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn.prepare("SELECT ?1 + 1;").unwrap();
+        let rows = stmt.query_with_params(&[SqliteValue::Integer(9)]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(10)]);
     }
 }

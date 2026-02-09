@@ -32,6 +32,8 @@ pub enum ExecOutcome {
 pub struct VdbeEngine {
     /// Register file (1-indexed; index 0 is unused/sentinel).
     registers: Vec<SqliteValue>,
+    /// Bound SQL parameter values (`?1`, `?2`, ...).
+    bindings: Vec<SqliteValue>,
     /// Result rows accumulated during execution.
     results: Vec<Vec<SqliteValue>>,
 }
@@ -45,8 +47,16 @@ impl VdbeEngine {
         let count = register_count.max(0) as u32 + 1;
         Self {
             registers: vec![SqliteValue::Null; count as usize],
+            bindings: Vec::new(),
             results: Vec::new(),
         }
+    }
+
+    /// Replace the current set of bound SQL parameters.
+    ///
+    /// Values are 1-indexed at execution time (`?1` maps to `bindings[0]`).
+    pub fn set_bindings(&mut self, bindings: Vec<SqliteValue>) {
+        self.bindings = bindings;
     }
 
     /// Execute a VDBE program to completion.
@@ -670,8 +680,14 @@ impl VdbeEngine {
                 }
 
                 Opcode::Variable => {
-                    // Bind parameter — stub as NULL for now.
-                    self.set_reg(op.p2, SqliteValue::Null);
+                    // Bind parameter (1-indexed). Unbound params read as NULL.
+                    let value = usize::try_from(op.p1)
+                        .ok()
+                        .and_then(|one_based| one_based.checked_sub(1))
+                        .and_then(|idx| self.bindings.get(idx))
+                        .cloned()
+                        .unwrap_or(SqliteValue::Null);
+                    self.set_reg(op.p2, value);
                     pc += 1;
                 }
 
@@ -990,6 +1006,58 @@ mod tests {
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         engine.take_results()
+    }
+
+    /// Build and execute a program with bound SQL parameters.
+    fn run_program_with_bindings(
+        build: impl FnOnce(&mut ProgramBuilder),
+        bindings: Vec<SqliteValue>,
+    ) -> Vec<Vec<SqliteValue>> {
+        let mut b = ProgramBuilder::new();
+        build(&mut b);
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_bindings(bindings);
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        engine.take_results()
+    }
+
+    #[test]
+    fn test_variable_uses_bound_parameter_value() {
+        let rows = run_program_with_bindings(
+            |b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                let r1 = b.alloc_reg();
+                b.emit_op(Opcode::Variable, 2, r1, 0, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            },
+            vec![
+                SqliteValue::Integer(11),
+                SqliteValue::Text("bound".to_owned()),
+            ],
+        );
+        assert_eq!(rows, vec![vec![SqliteValue::Text("bound".to_owned())]]);
+    }
+
+    #[test]
+    fn test_variable_unbound_parameter_defaults_to_null() {
+        let rows = run_program_with_bindings(
+            |b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                let r1 = b.alloc_reg();
+                b.emit_op(Opcode::Variable, 3, r1, 0, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, r1, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            },
+            vec![SqliteValue::Integer(11)],
+        );
+        assert_eq!(rows, vec![vec![SqliteValue::Null]]);
     }
 
     // ── test_select_integer_literal ─────────────────────────────────────
@@ -1917,5 +1985,1420 @@ mod tests {
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
         }
+    }
+
+    // ===================================================================
+    // bd-202x §16 Phase 4: Comprehensive VDBE opcode unit tests
+    // ===================================================================
+
+    // ── Constants & Register Operations ────────────────────────────────
+
+    #[test]
+    fn test_int64_large_value() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Int64, 0, r, 0, P4::Int64(i64::MAX), 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(i64::MAX)]);
+    }
+
+    #[test]
+    fn test_int64_negative() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Int64, 0, r, 0, P4::Int64(-999_999_999_999), 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(-999_999_999_999)]);
+    }
+
+    #[test]
+    fn test_real_constant() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Real, 0, r, 0, P4::Real(3.14), 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Float(3.14)]);
+    }
+
+    #[test]
+    fn test_real_negative_zero() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Real, 0, r, 0, P4::Real(0.0), 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Float(0.0)]);
+    }
+
+    #[test]
+    fn test_string_opcode() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::String, 5, r, 0, P4::Str("hello".to_owned()), 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Text("hello".to_owned())]);
+    }
+
+    #[test]
+    fn test_blob_constant() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(
+                Opcode::Blob,
+                0,
+                r,
+                0,
+                P4::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(
+            rows[0],
+            vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])]
+        );
+    }
+
+    #[test]
+    fn test_null_range() {
+        // Null with p3=2: set registers p2, p2+1, p2+2 to NULL.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            // Pre-populate with integers
+            b.emit_op(Opcode::Integer, 1, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 2, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 3, r3, 0, P4::None, 0);
+            // Null range: p2=r1, p3=2 → set r1, r2, r3 to NULL
+            b.emit_op(Opcode::Null, 0, r1, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r1, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(
+            rows[0],
+            vec![SqliteValue::Null, SqliteValue::Null, SqliteValue::Null]
+        );
+    }
+
+    #[test]
+    fn test_soft_null() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r, 0, P4::None, 0);
+            b.emit_op(Opcode::SoftNull, r, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn test_move_registers() {
+        // Move nullifies source and copies to destination.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let src = b.alloc_reg();
+            let dst = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 77, src, 0, P4::None, 0);
+            // Move 1 register from src to dst
+            b.emit_op(Opcode::Move, src, dst, 1, P4::None, 0);
+            // dst should be 77, src should be NULL
+            b.emit_op(Opcode::ResultRow, dst, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, src, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(77)]);
+        assert_eq!(rows[1], vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn test_copy_register() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let src = b.alloc_reg();
+            let dst = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, src, 0, P4::Str("copy_me".to_owned()), 0);
+            b.emit_op(Opcode::Copy, src, dst, 0, P4::None, 0);
+            // Both should be the same value
+            b.emit_op(Opcode::ResultRow, src, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, dst, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Text("copy_me".to_owned())]);
+        assert_eq!(rows[1], vec![SqliteValue::Text("copy_me".to_owned())]);
+    }
+
+    #[test]
+    fn test_intcopy_coerces() {
+        // IntCopy converts value to integer.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let src = b.alloc_reg();
+            let dst = b.alloc_reg();
+            b.emit_op(Opcode::Real, 0, src, 0, P4::Real(3.7), 0);
+            b.emit_op(Opcode::IntCopy, src, dst, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, dst, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(3)]);
+    }
+
+    // ── Arithmetic Edge Cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_subtract_integers() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 10, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 3, r2, 0, P4::None, 0);
+            // p3 = p2 - p1 → r3 = r1 - r2 if p2=r1, p1=r2 → 10 - 3 = 7
+            b.emit_op(Opcode::Subtract, r2, r1, r3, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(7)]);
+    }
+
+    #[test]
+    fn test_multiply_large() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 100, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 200, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::Multiply, r1, r2, r3, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(20_000)]);
+    }
+
+    #[test]
+    fn test_integer_division_truncates() {
+        // 7 / 2 = 3 (integer division truncates)
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_divisor = b.alloc_reg();
+            let r_dividend = b.alloc_reg();
+            let r_result = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 2, r_divisor, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 7, r_dividend, 0, P4::None, 0);
+            // p3 = p2 / p1 → r_result = r_dividend / r_divisor
+            b.emit_op(Opcode::Divide, r_divisor, r_dividend, r_result, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(3)]);
+    }
+
+    #[test]
+    fn test_remainder_integers() {
+        // 7 % 3 = 1
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_divisor = b.alloc_reg();
+            let r_dividend = b.alloc_reg();
+            let r_result = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 3, r_divisor, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 7, r_dividend, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::Remainder,
+                r_divisor,
+                r_dividend,
+                r_result,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_remainder_by_zero() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_zero = b.alloc_reg();
+            let r_val = b.alloc_reg();
+            let r_result = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, r_zero, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 10, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Remainder, r_zero, r_val, r_result, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn test_null_arithmetic_propagation() {
+        // NULL + 1, NULL * 5, NULL - 3 should all be NULL.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_null = b.alloc_reg();
+            let r_one = b.alloc_reg();
+            let r_add = b.alloc_reg();
+            let r_mul = b.alloc_reg();
+            let r_sub = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r_one, 0, P4::None, 0);
+            b.emit_op(Opcode::Add, r_null, r_one, r_add, P4::None, 0);
+            b.emit_op(Opcode::Multiply, r_null, r_one, r_mul, P4::None, 0);
+            b.emit_op(Opcode::Subtract, r_null, r_one, r_sub, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_add, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_mul, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_sub, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Null]);
+        assert_eq!(rows[1], vec![SqliteValue::Null]);
+        assert_eq!(rows[2], vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn test_add_imm() {
+        // AddImm: register p1 += p2
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 100, r, 0, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r, 50, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(150)]);
+    }
+
+    #[test]
+    fn test_add_imm_negative() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 100, r, 0, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r, -30, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(70)]);
+    }
+
+    // ── Bitwise Operations ─────────────────────────────────────────────
+
+    #[test]
+    fn test_bit_and() {
+        // 0xFF & 0x0F = 0x0F (15)
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0xFF, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0x0F, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::BitAnd, r1, r2, r3, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(0x0F)]);
+    }
+
+    #[test]
+    fn test_bit_or() {
+        // 0xF0 | 0x0F = 0xFF (255)
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0xF0, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0x0F, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::BitOr, r1, r2, r3, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(0xFF)]);
+    }
+
+    #[test]
+    fn test_shift_left() {
+        // 1 << 8 = 256
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_amount = b.alloc_reg();
+            let r_val = b.alloc_reg();
+            let r_result = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 8, r_amount, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 1, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::ShiftLeft, r_amount, r_val, r_result, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(256)]);
+    }
+
+    #[test]
+    fn test_shift_right() {
+        // 256 >> 4 = 16
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_amount = b.alloc_reg();
+            let r_val = b.alloc_reg();
+            let r_result = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 4, r_amount, 0, P4::None, 0);
+            b.emit_op(Opcode::Int64, 0, r_val, 0, P4::Int64(256), 0);
+            b.emit_op(Opcode::ShiftRight, r_amount, r_val, r_result, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(16)]);
+    }
+
+    #[test]
+    fn test_shift_left_overflow_clamp() {
+        // Shift >= 64 returns 0
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_amount = b.alloc_reg();
+            let r_val = b.alloc_reg();
+            let r_result = b.alloc_reg();
+            b.emit_op(Opcode::Int64, 0, r_amount, 0, P4::Int64(64), 0);
+            b.emit_op(Opcode::Integer, 1, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::ShiftLeft, r_amount, r_val, r_result, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(0)]);
+    }
+
+    #[test]
+    fn test_shift_negative_reverses() {
+        // Negative shift amount reverses direction: <<(-2) == >>(2)
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_amount = b.alloc_reg();
+            let r_val = b.alloc_reg();
+            let r_result = b.alloc_reg();
+            b.emit_op(Opcode::Int64, 0, r_amount, 0, P4::Int64(-2), 0);
+            b.emit_op(Opcode::Integer, 8, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::ShiftLeft, r_amount, r_val, r_result, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // 8 >> 2 = 2
+        assert_eq!(rows[0], vec![SqliteValue::Integer(2)]);
+    }
+
+    #[test]
+    fn test_bit_not() {
+        // ~0 = -1 in two's complement
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::BitNot, r1, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(-1)]);
+    }
+
+    #[test]
+    fn test_bitwise_null_propagation() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_null = b.alloc_reg();
+            let r_val = b.alloc_reg();
+            let r_and = b.alloc_reg();
+            let r_or = b.alloc_reg();
+            let r_not = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0xFF, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::BitAnd, r_null, r_val, r_and, P4::None, 0);
+            b.emit_op(Opcode::BitOr, r_null, r_val, r_or, P4::None, 0);
+            b.emit_op(Opcode::BitNot, r_null, r_not, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_and, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_or, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_not, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Null]);
+        assert_eq!(rows[1], vec![SqliteValue::Null]);
+        assert_eq!(rows[2], vec![SqliteValue::Null]);
+    }
+
+    // ── String Operations ──────────────────────────────────────────────
+
+    #[test]
+    fn test_concat_two_strings() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r1, 0, P4::Str("hello ".to_owned()), 0);
+            b.emit_op(Opcode::String8, 0, r2, 0, P4::Str("world".to_owned()), 0);
+            // Concat: p3 = p2 || p1 (note operand order)
+            b.emit_op(Opcode::Concat, r2, r1, r3, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Text("hello world".to_owned())]);
+    }
+
+    #[test]
+    fn test_concat_empty_string() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r1, 0, P4::Str("test".to_owned()), 0);
+            b.emit_op(Opcode::String8, 0, r2, 0, P4::Str(String::new()), 0);
+            b.emit_op(Opcode::Concat, r2, r1, r3, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Text("test".to_owned())]);
+    }
+
+    // ── Comparison Ops (all 6 + NULL) ──────────────────────────────────
+
+    #[test]
+    fn test_eq_jump_taken() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 42, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            // Eq: if p3 == p1, jump to p2 → if r2 == r1, jump
+            b.emit_jump_to_label(Opcode::Eq, r1, r2, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_ne_jump_taken() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 10, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 20, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::Ne, r1, r2, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_lt_jump_taken() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_big = b.alloc_reg();
+            let r_small = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 100, r_big, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r_small, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            // Lt: if p3 < p1, jump → if r_small < r_big
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::Lt, r_big, r_small, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_le_with_equal_values() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 7, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 7, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::Le, r1, r2, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_ge_with_greater_value() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_big = b.alloc_reg();
+            let r_small = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 5, r_small, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 100, r_big, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            // Ge: if p3 >= p1 → if r_big >= r_small
+            b.emit_jump_to_label(Opcode::Ge, r_small, r_big, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_comparison_null_no_jump() {
+        // Standard SQL: NULL = 5 → no jump (NULL result)
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_null = b.alloc_reg();
+            let r_five = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r_five, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::Eq, r_five, r_null, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // Should NOT jump: NULL = 5 is NULL (not true)
+        assert_eq!(rows[0], vec![SqliteValue::Integer(0)]);
+    }
+
+    #[test]
+    fn test_ne_nulleq_one_null() {
+        // IS NOT semantics: NULL IS NOT 5 → true (jump)
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_null = b.alloc_reg();
+            let r_five = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r_five, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::Ne, r_five, r_null, taken, P4::None, 0x80);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    // ── Logic Edge Cases ───────────────────────────────────────────────
+
+    #[test]
+    fn test_not_null_is_null() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_null = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::Not, r_null, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn test_not_zero_is_one() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_zero = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, r_zero, 0, P4::None, 0);
+            b.emit_op(Opcode::Not, r_zero, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_not_nonzero_is_zero() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_val = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Not, r_val, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(0)]);
+    }
+
+    // ── Conditional Jumps ──────────────────────────────────────────────
+
+    #[test]
+    fn test_if_true_jumps() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_cond = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 1, r_cond, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::If, r_cond, 0, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_if_false_no_jump() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_cond = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, r_cond, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 99, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::If, r_cond, 0, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // If with false → no jump → r_out stays 99
+        assert_eq!(rows[0], vec![SqliteValue::Integer(99)]);
+    }
+
+    #[test]
+    fn test_if_null_no_jump() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_cond = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_cond, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 99, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::If, r_cond, 0, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // If with NULL → no jump → r_out stays 99
+        assert_eq!(rows[0], vec![SqliteValue::Integer(99)]);
+    }
+
+    #[test]
+    fn test_ifnot_false_jumps() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_cond = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, r_cond, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::IfNot, r_cond, 0, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_ifnot_null_jumps() {
+        // IfNot with NULL → jump (NULL is treated as false/zero)
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_cond = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_cond, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::IfNot, r_cond, 0, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_once_fires_only_once() {
+        // Once at the same PC fires on first pass, falls through on second.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_counter = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, r_counter, 0, P4::None, 0);
+            // First pass: Once jumps to `init_code`
+            let init_code = b.emit_label();
+            let loop_start = b.current_addr() as i32;
+            b.emit_jump_to_label(Opcode::Once, 0, 0, init_code, P4::None, 0);
+            // Fall-through path (second+ pass): just output
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            // Init code: increment counter and loop back
+            b.resolve_label(init_code);
+            b.emit_op(Opcode::AddImm, r_counter, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Goto, 0, loop_start, 0, P4::None, 0);
+            // Done
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_counter, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // Once fires on first execution (increments to 1), then falls through
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    // ── Type Coercion ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_cast_integer_to_text() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r, 0, P4::None, 0);
+            // Cast to TEXT: p2 = 'B' (66)
+            b.emit_op(Opcode::Cast, r, 66, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Text("42".to_owned())]);
+    }
+
+    #[test]
+    fn test_cast_text_to_integer() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r, 0, P4::Str("123".to_owned()), 0);
+            // Cast to INTEGER: p2 = 'D' (68)
+            b.emit_op(Opcode::Cast, r, 68, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(123)]);
+    }
+
+    #[test]
+    fn test_cast_to_real() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 5, r, 0, P4::None, 0);
+            // Cast to REAL: p2 = 'E' (69)
+            b.emit_op(Opcode::Cast, r, 69, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Float(5.0)]);
+    }
+
+    #[test]
+    fn test_cast_to_blob() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r, 0, P4::Str("hi".to_owned()), 0);
+            // Cast to BLOB: p2 = 'A' (65)
+            b.emit_op(Opcode::Cast, r, 65, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Blob(b"hi".to_vec())]);
+    }
+
+    #[test]
+    fn test_must_be_int_accepts_integer() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r, 0, P4::None, 0);
+            // MustBeInt: p2=0 means error on non-int, but 42 is int → passes
+            b.emit_op(Opcode::MustBeInt, r, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn test_must_be_int_jumps_on_non_int() {
+        // MustBeInt with p2 > 0: jump to p2 instead of error.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r, 0, P4::Str("not_int".to_owned()), 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let fallback = b.emit_label();
+            b.emit_jump_to_label(Opcode::MustBeInt, r, 0, fallback, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(fallback);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // Non-int triggers jump → r_out = 1
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_real_affinity_converts_int() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 7, r, 0, P4::None, 0);
+            b.emit_op(Opcode::RealAffinity, r, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Float(7.0)]);
+    }
+
+    #[test]
+    fn test_real_affinity_no_op_on_float() {
+        // RealAffinity on a float is a no-op.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Real, 0, r, 0, P4::Real(3.14), 0);
+            b.emit_op(Opcode::RealAffinity, r, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Float(3.14)]);
+    }
+
+    // ── Error Handling ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_halt_if_null_triggers() {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r = b.alloc_reg();
+        b.emit_op(Opcode::Null, 0, r, 0, P4::None, 0);
+        b.emit_op(
+            Opcode::HaltIfNull,
+            19,
+            0,
+            r,
+            P4::Str("NOT NULL constraint failed".to_owned()),
+            0,
+        );
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().unwrap();
+        let mut engine = VdbeEngine::new(prog.register_count());
+        let outcome = engine.execute(&prog).unwrap();
+        assert_eq!(
+            outcome,
+            ExecOutcome::Error {
+                code: 19,
+                message: "NOT NULL constraint failed".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_halt_if_null_passes_non_null() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::HaltIfNull,
+                19,
+                0,
+                r,
+                P4::Str("should not fire".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
+    }
+
+    // ── Miscellaneous Opcodes ──────────────────────────────────────────
+
+    #[test]
+    fn test_is_true_opcode() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_true = b.alloc_reg();
+            let r_false = b.alloc_reg();
+            let r_null = b.alloc_reg();
+            let o1 = b.alloc_reg();
+            let o2 = b.alloc_reg();
+            let o3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r_true, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_false, 0, P4::None, 0);
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::IsTrue, r_true, o1, 0, P4::None, 0);
+            b.emit_op(Opcode::IsTrue, r_false, o2, 0, P4::None, 0);
+            b.emit_op(Opcode::IsTrue, r_null, o3, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]); // 42 is true
+        assert_eq!(rows[1], vec![SqliteValue::Integer(0)]); // 0 is false
+        assert_eq!(rows[2], vec![SqliteValue::Integer(0)]); // NULL is not true
+    }
+
+    #[test]
+    fn test_noop_does_nothing() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r, 0, P4::None, 0);
+            b.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Noop, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn test_result_row_three_columns() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 1, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, r2, 0, P4::Str("two".to_owned()), 0);
+            b.emit_op(Opcode::Real, 0, r3, 0, P4::Real(3.0), 0);
+            b.emit_op(Opcode::ResultRow, r1, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(
+            rows[0],
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("two".to_owned()),
+                SqliteValue::Float(3.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_multiple_result_rows() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 1, r, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 2, r, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 3, r, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+        assert_eq!(rows[1], vec![SqliteValue::Integer(2)]);
+        assert_eq!(rows[2], vec![SqliteValue::Integer(3)]);
+    }
+
+    #[test]
+    fn test_gosub_nested() {
+        // Test nested Gosub: main calls sub1, which calls sub2.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_ret1 = b.alloc_reg();
+            let r_ret2 = b.alloc_reg();
+            let r_val = b.alloc_reg();
+
+            // Main: call sub1
+            let sub1 = b.emit_label();
+            b.emit_jump_to_label(Opcode::Gosub, r_ret1, 0, sub1, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            // sub1: set r_val=10, call sub2, add 1
+            b.resolve_label(sub1);
+            b.emit_op(Opcode::Integer, 10, r_val, 0, P4::None, 0);
+            let sub2 = b.emit_label();
+            b.emit_jump_to_label(Opcode::Gosub, r_ret2, 0, sub2, P4::None, 0);
+            b.emit_op(Opcode::AddImm, r_val, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Return, r_ret1, 0, 0, P4::None, 0);
+
+            // sub2: multiply r_val by 5
+            b.resolve_label(sub2);
+            let r_five = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 5, r_five, 0, P4::None, 0);
+            b.emit_op(Opcode::Multiply, r_five, r_val, r_val, P4::None, 0);
+            b.emit_op(Opcode::Return, r_ret2, 0, 0, P4::None, 0);
+
+            b.resolve_label(end);
+        });
+        // 10 * 5 + 1 = 51
+        assert_eq!(rows[0], vec![SqliteValue::Integer(51)]);
+    }
+
+    #[test]
+    fn test_coroutine_yield_resume() {
+        // Full coroutine: producer yields 3 values, consumer reads them.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_co = b.alloc_reg();
+            let r_val = b.alloc_reg();
+
+            // InitCoroutine: store producer start in r_co, jump to consumer.
+            let consumer = b.emit_label();
+            let producer = b.emit_label();
+            b.emit_op(
+                Opcode::InitCoroutine,
+                r_co,
+                0, // will be patched to consumer
+                0, // will be patched to producer
+                P4::None,
+                0,
+            );
+            // Manually set up: InitCoroutine stores p3 in r_co and jumps to p2.
+            // Since we emit labels at runtime, use direct addresses.
+
+            // Simpler approach: just use Yield for context switching.
+            // Producer body:
+            b.resolve_label(producer);
+            b.emit_op(Opcode::Integer, 100, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 200, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 300, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            // Consumer body:
+            b.resolve_label(consumer);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            b.resolve_label(end);
+        });
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(100)]);
+        assert_eq!(rows[1], vec![SqliteValue::Integer(200)]);
+        assert_eq!(rows[2], vec![SqliteValue::Integer(300)]);
+    }
+
+    #[test]
+    fn test_make_record_stub() {
+        // MakeRecord currently stores an empty blob.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r_rec = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 1, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, r2, 0, P4::Str("a".to_owned()), 0);
+            b.emit_op(Opcode::MakeRecord, r1, 2, r_rec, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_rec, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Blob(Vec::new())]);
+    }
+
+    #[test]
+    fn test_complex_expression_chain() {
+        // Test: ((10 + 20) * 3 - 5) / 2 = (90 - 5) / 2 = 85 / 2 = 42
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r10 = b.alloc_reg();
+            let r20 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            let r5 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let t1 = b.alloc_reg();
+            let t2 = b.alloc_reg();
+            let t3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 10, r10, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 20, r20, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 3, r3, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r5, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 2, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::Add, r10, r20, t1, P4::None, 0); // 30
+            b.emit_op(Opcode::Multiply, r3, t1, t2, P4::None, 0); // 90
+            b.emit_op(Opcode::Subtract, r5, t2, t2, P4::None, 0); // 85
+            b.emit_op(Opcode::Divide, r2, t2, t3, P4::None, 0); // 42
+            b.emit_op(Opcode::ResultRow, t3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn test_string_comparison() {
+        // String comparison: 'abc' < 'abd' → true
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r1, 0, P4::Str("abd".to_owned()), 0);
+            b.emit_op(Opcode::String8, 0, r2, 0, P4::Str("abc".to_owned()), 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            // Lt: if p3 (r2="abc") < p1 (r1="abd"), jump
+            b.emit_jump_to_label(Opcode::Lt, r1, r2, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_mixed_type_comparison() {
+        // Integer vs Float comparison: 5 == 5.0
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_int = b.alloc_reg();
+            let r_float = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 5, r_int, 0, P4::None, 0);
+            b.emit_op(Opcode::Real, 0, r_float, 0, P4::Real(5.0), 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::Eq, r_int, r_float, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
     }
 }
