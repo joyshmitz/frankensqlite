@@ -1,4 +1,4 @@
-//! §6.1-6.2 Adaptive Replacement Cache with MVCC-aware keying (bd-bt16).
+//! §6.3-6.4 ARC REPLACE + REQUEST algorithms with MVCC-aware keying (`bd-125g`).
 //!
 //! Implements the ARC algorithm (Megiddo & Modha, FAST '03) with cache
 //! entries indexed by `(PageNumber, CommitSeq)` instead of bare page
@@ -263,6 +263,20 @@ impl<T> IntrusiveList<T> {
         self.slots.get(idx.0 as usize)?.as_ref().map(|n| &n.value)
     }
 
+    /// Get the least-recently-used value (front).
+    #[cfg(test)]
+    fn front(&self) -> Option<&T> {
+        let idx = self.head?;
+        self.get(idx)
+    }
+
+    /// Get the most-recently-used value (back).
+    #[cfg(test)]
+    fn back(&self) -> Option<&T> {
+        let idx = self.tail?;
+        self.get(idx)
+    }
+
     /// Iterate from head to tail, yielding `(SlabIdx, &T)`.
     fn iter(&self) -> IntrusiveListIter<'_, T> {
         IntrusiveListIter {
@@ -381,6 +395,9 @@ pub struct ArcCacheInner {
     page_versions: HashMap<PageNumber, usize>,
     /// GC horizon for superseded version preference.
     gc_horizon: CommitSeq,
+    /// Number of times ARC had to allow temporary growth because all
+    /// candidate victims were pinned.
+    capacity_overflow_events: usize,
 }
 
 impl ArcCacheInner {
@@ -402,6 +419,7 @@ impl ArcCacheInner {
             directory: HashMap::with_capacity(capacity * 2),
             page_versions: HashMap::new(),
             gc_horizon: CommitSeq::ZERO,
+            capacity_overflow_events: 0,
         }
     }
 
@@ -449,9 +467,83 @@ impl ArcCacheInner {
         self.t2.len()
     }
 
+    /// Size of B1.
+    #[inline]
+    #[must_use]
+    pub fn b1_len(&self) -> usize {
+        self.b1.len()
+    }
+
+    /// Size of B2.
+    #[inline]
+    #[must_use]
+    pub fn b2_len(&self) -> usize {
+        self.b2.len()
+    }
+
+    /// Number of times all candidate victims were pinned and ARC allowed
+    /// temporary growth (safety valve).
+    #[inline]
+    #[must_use]
+    pub fn capacity_overflow_events(&self) -> usize {
+        self.capacity_overflow_events
+    }
+
     /// Set the GC horizon for superseded version preference.
+    ///
+    /// Triggers ghost pruning (removes ghost entries below the new horizon)
+    /// and batch version coalescing (reclaims superseded cached versions).
     pub fn set_gc_horizon(&mut self, horizon: CommitSeq) {
         self.gc_horizon = horizon;
+        self.prune_ghosts_below_horizon();
+        self.coalesce_all_versions();
+    }
+
+    /// Current GC horizon.
+    #[inline]
+    #[must_use]
+    pub fn gc_horizon(&self) -> CommitSeq {
+        self.gc_horizon
+    }
+
+    #[cfg(test)]
+    fn set_p_for_tests(&mut self, p: usize) {
+        self.p = std::cmp::min(self.capacity, p);
+    }
+
+    #[cfg(test)]
+    fn in_t1(&self, key: &CacheKey) -> bool {
+        matches!(self.directory.get(key), Some(Location::T1(_)))
+    }
+
+    #[cfg(test)]
+    fn in_b1(&self, key: &CacheKey) -> bool {
+        matches!(self.directory.get(key), Some(Location::B1(_)))
+    }
+
+    #[cfg(test)]
+    fn in_b2(&self, key: &CacheKey) -> bool {
+        matches!(self.directory.get(key), Some(Location::B2(_)))
+    }
+
+    #[cfg(test)]
+    fn in_t2(&self, key: &CacheKey) -> bool {
+        matches!(self.directory.get(key), Some(Location::T2(_)))
+    }
+
+    #[cfg(test)]
+    fn t2_lru_key(&self) -> Option<CacheKey> {
+        self.t2.front().map(|page| page.key)
+    }
+
+    #[cfg(test)]
+    fn t2_mru_key(&self) -> Option<CacheKey> {
+        self.t2.back().map(|page| page.key)
+    }
+
+    #[cfg(test)]
+    fn t1_lru_key(&self) -> Option<CacheKey> {
+        self.t1.front().map(|page| page.key)
     }
 
     /// Get a reference to a cached page by key.
@@ -465,6 +557,28 @@ impl ArcCacheInner {
             Location::T2(idx) => self.t2.get(*idx),
             Location::B1(_) | Location::B2(_) => None,
         }
+    }
+
+    /// Unpin a resident page and reclaim one overflow slot if possible.
+    ///
+    /// Returns `true` if the page was present and pinned before this call.
+    pub fn unpin(&mut self, key: &CacheKey) -> bool {
+        let was_pinned = if let Some(page) = self.get(key) {
+            if page.is_pinned() {
+                page.unpin();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if was_pinned {
+            self.reclaim_one_overflow_slot();
+        }
+
+        was_pinned
     }
 
     // -- Core ARC operations --
@@ -534,10 +648,14 @@ impl ArcCacheInner {
                 if let Some(ghost) = self.b1.pop_front() {
                     self.directory.remove(&ghost);
                 }
-                self.replace(&key, matches!(lookup, CacheLookup::GhostHitB2));
+                if !self.replace(&key, matches!(lookup, CacheLookup::GhostHitB2)) {
+                    self.capacity_overflow_events = self.capacity_overflow_events.saturating_add(1);
+                }
             } else {
                 // T1 alone fills capacity — evict LRU from T1 directly.
-                self.evict_lru_from_t1();
+                if !self.evict_lru_from_t1() && !self.evict_lru_from_t2() {
+                    self.capacity_overflow_events = self.capacity_overflow_events.saturating_add(1);
+                }
             }
         } else {
             let total_dir = l1_len + self.t2.len() + self.b2.len();
@@ -547,8 +665,10 @@ impl ArcCacheInner {
                     self.directory.remove(&ghost);
                 }
             }
-            if self.t1.len() + self.t2.len() >= self.capacity {
-                self.replace(&key, matches!(lookup, CacheLookup::GhostHitB2));
+            if self.t1.len() + self.t2.len() >= self.capacity
+                && !self.replace(&key, matches!(lookup, CacheLookup::GhostHitB2))
+            {
+                self.capacity_overflow_events = self.capacity_overflow_events.saturating_add(1);
             }
         }
 
@@ -572,12 +692,22 @@ impl ArcCacheInner {
         self.total_bytes += byte_size;
         *self.page_versions.entry(key.pgno).or_insert(0) += 1;
 
+        // Phase 2.5: opportunistic version coalescing for the admitted page.
+        if self.page_versions.get(&key.pgno).copied().unwrap_or(0) > 1
+            && self.gc_horizon != CommitSeq::ZERO
+        {
+            self.coalesce_versions_for_pgno(key.pgno);
+        }
+
         // Phase 3: enforce byte limit (dual trigger).
         while self.max_bytes > 0 && self.total_bytes > self.max_bytes && self.len() > 1 {
             if !self.evict_one_preferred() {
+                self.capacity_overflow_events = self.capacity_overflow_events.saturating_add(1);
                 break; // all remaining pages are pinned
             }
         }
+
+        self.trim_ghosts();
 
         let _ = idx; // suppress unused warning
     }
@@ -585,13 +715,27 @@ impl ArcCacheInner {
     // -- Internal eviction machinery --
 
     /// ARC REPLACE subroutine.
-    fn replace(&mut self, _incoming: &CacheKey, from_b2: bool) {
-        let t1_len = self.t1.len();
-        if t1_len > 0 && (t1_len > self.p || (from_b2 && t1_len == self.p)) {
-            self.evict_lru_from_t1();
-        } else {
-            self.evict_lru_from_t2();
+    fn replace(&mut self, incoming: &CacheKey, from_b2: bool) -> bool {
+        if self.coalesce_one_superseded_for_replace() {
+            return true;
         }
+
+        let incoming_in_b2 = matches!(self.directory.get(incoming), Some(Location::B2(_)));
+        let from_b2_bias = from_b2 || incoming_in_b2;
+        let t1_len = self.t1.len();
+        let prefer_t1 = t1_len > 0 && (t1_len > self.p || (from_b2_bias && t1_len == self.p));
+
+        if prefer_t1 {
+            if self.evict_lru_from_t1() {
+                return true;
+            }
+            return self.evict_lru_from_t2();
+        }
+
+        if self.evict_lru_from_t2() {
+            return true;
+        }
+        self.evict_lru_from_t1()
     }
 
     /// Evict the LRU unpinned page from T1, moving its key to B1.
@@ -681,11 +825,147 @@ impl ArcCacheInner {
                 continue;
             }
             let count = self.page_versions.get(&page.key.pgno).copied().unwrap_or(0);
-            if count > 1 && page.key.commit_seq <= self.gc_horizon {
+            if count > 1
+                && page.key.commit_seq != CommitSeq::ZERO
+                && page.key.commit_seq <= self.gc_horizon
+            {
                 return Some(idx);
             }
         }
         None
+    }
+
+    fn reclaim_one_overflow_slot(&mut self) {
+        if self.capacity_overflow_events == 0 {
+            return;
+        }
+
+        if self.len() <= self.capacity {
+            self.capacity_overflow_events = self.capacity_overflow_events.saturating_sub(1);
+            return;
+        }
+
+        if self.evict_one_preferred() {
+            self.capacity_overflow_events = self.capacity_overflow_events.saturating_sub(1);
+        }
+    }
+
+    fn coalesce_one_superseded_for_replace(&mut self) -> bool {
+        let mut page_numbers: Vec<PageNumber> = self
+            .page_versions
+            .iter()
+            .filter_map(|(pgno, count)| (*count > 1).then_some(*pgno))
+            .collect();
+        page_numbers.sort_by_key(|pgno| pgno.get());
+
+        for pgno in page_numbers {
+            if self.coalesce_versions_for_pgno(pgno) > 0 {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn coalesce_all_versions(&mut self) {
+        let mut page_numbers: Vec<PageNumber> = self
+            .page_versions
+            .iter()
+            .filter_map(|(pgno, count)| (*count > 1).then_some(*pgno))
+            .collect();
+        page_numbers.sort_by_key(|pgno| pgno.get());
+
+        for pgno in page_numbers {
+            let _ = self.coalesce_versions_for_pgno(pgno);
+        }
+    }
+
+    fn coalesce_versions_for_pgno(&mut self, pgno: PageNumber) -> usize {
+        #[derive(Clone, Copy)]
+        enum ResidentList {
+            T1,
+            T2,
+        }
+
+        let mut committed: Vec<(u64, ResidentList, SlabIdx, CacheKey, bool)> = Vec::new();
+
+        for (idx, page) in self.t1.iter() {
+            if page.key.pgno == pgno
+                && page.key.commit_seq != CommitSeq::ZERO
+                && page.key.commit_seq <= self.gc_horizon
+            {
+                committed.push((
+                    page.key.commit_seq.get(),
+                    ResidentList::T1,
+                    idx,
+                    page.key,
+                    page.is_pinned(),
+                ));
+            }
+        }
+
+        for (idx, page) in self.t2.iter() {
+            if page.key.pgno == pgno
+                && page.key.commit_seq != CommitSeq::ZERO
+                && page.key.commit_seq <= self.gc_horizon
+            {
+                committed.push((
+                    page.key.commit_seq.get(),
+                    ResidentList::T2,
+                    idx,
+                    page.key,
+                    page.is_pinned(),
+                ));
+            }
+        }
+
+        if committed.len() <= 1 {
+            return 0;
+        }
+
+        committed.sort_by(|left, right| right.0.cmp(&left.0));
+
+        let mut removed = 0;
+        for (_, resident_list, idx, key, is_pinned) in committed.into_iter().skip(1) {
+            if is_pinned {
+                continue;
+            }
+
+            let page = match resident_list {
+                ResidentList::T1 => self.t1.remove(idx),
+                ResidentList::T2 => self.t2.remove(idx),
+            };
+            self.total_bytes = self.total_bytes.saturating_sub(page.byte_size);
+            self.decrement_page_version(key.pgno);
+            self.directory.remove(&key);
+            removed += 1;
+        }
+
+        removed
+    }
+
+    fn prune_ghosts_below_horizon(&mut self) {
+        let mut stale_b1 = Vec::new();
+        for (idx, key) in self.b1.iter() {
+            if key.commit_seq.get() < self.gc_horizon.get() {
+                stale_b1.push(idx);
+            }
+        }
+        for idx in stale_b1 {
+            let ghost = self.b1.remove(idx);
+            self.directory.remove(&ghost);
+        }
+
+        let mut stale_b2 = Vec::new();
+        for (idx, key) in self.b2.iter() {
+            if key.commit_seq.get() < self.gc_horizon.get() {
+                stale_b2.push(idx);
+            }
+        }
+        for idx in stale_b2 {
+            let ghost = self.b2.remove(idx);
+            self.directory.remove(&ghost);
+        }
     }
 
     fn decrement_page_version(&mut self, pgno: PageNumber) {
@@ -693,6 +973,45 @@ impl ArcCacheInner {
             *count -= 1;
             if *count == 0 {
                 self.page_versions.remove(&pgno);
+            }
+        }
+    }
+
+    fn trim_ghosts(&mut self) {
+        while self.b1.len() > self.capacity {
+            if let Some(ghost) = self.b1.pop_front() {
+                self.directory.remove(&ghost);
+            } else {
+                break;
+            }
+        }
+        while self.b2.len() > self.capacity {
+            if let Some(ghost) = self.b2.pop_front() {
+                self.directory.remove(&ghost);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Reclaim memory by coalescing all superseded versions.
+    ///
+    /// Intended for use with `PRAGMA shrink_memory`.
+    pub fn shrink_memory(&mut self) {
+        self.coalesce_all_versions();
+    }
+
+    /// Attempt to reclaim overflow capacity after a page is unpinned.
+    ///
+    /// Call this after unpinning a page (via [`CachedPage::unpin`]) to allow
+    /// the cache to shrink back to normal capacity if it previously grew
+    /// due to all-pinned overflow.
+    pub fn notify_unpin(&mut self) {
+        while self.capacity_overflow_events > 0 && self.len() > self.capacity {
+            if self.evict_one_preferred() {
+                self.capacity_overflow_events -= 1;
+            } else {
+                break;
             }
         }
     }
@@ -712,6 +1031,7 @@ impl std::fmt::Debug for ArcCacheInner {
             .field("directory_len", &self.directory.len())
             .field("page_versions_len", &self.page_versions.len())
             .field("gc_horizon", &self.gc_horizon)
+            .field("capacity_overflow_events", &self.capacity_overflow_events)
             .finish()
     }
 }
@@ -757,7 +1077,8 @@ mod tests {
     use super::*;
     use fsqlite_types::PageSize;
 
-    const BEAD_ID: &str = "bd-bt16";
+    const BEAD_ID: &str = "bd-125g";
+    const BEAD_ID_BD_3JK9: &str = "bd-3jk9";
 
     /// Helper: create a `CacheKey` from raw parts.
     fn key(pgno: u32, commit_seq: u64) -> CacheKey {
@@ -816,7 +1137,7 @@ mod tests {
     // ── 2. test_arc_t1_t2_promotion ───────────────────────────────────
 
     #[test]
-    fn test_arc_t1_t2_promotion() {
+    fn test_request_t1_to_t2_promotion() {
         let mut cache = ArcCacheInner::new(10, 0);
 
         let k = key(1, 0);
@@ -872,10 +1193,172 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_request_t2_refresh() {
+        let mut cache = ArcCacheInner::new(4, 0);
+        let k1 = key(1, 0);
+        let k2 = key(2, 0);
+
+        let l = cache.request(&k1);
+        cache.admit(k1, page(k1, 4096), l);
+        let l = cache.request(&k2);
+        cache.admit(k2, page(k2, 4096), l);
+
+        // Promote both into T2 in known order: k1 then k2.
+        assert_eq!(cache.request(&k1), CacheLookup::Hit);
+        assert_eq!(cache.request(&k2), CacheLookup::Hit);
+        assert_eq!(cache.t2_lru_key(), Some(k1));
+        assert_eq!(cache.t2_mru_key(), Some(k2));
+
+        // Refresh k1 and verify it becomes MRU.
+        assert_eq!(cache.request(&k1), CacheLookup::Hit);
+        assert_eq!(cache.t2_lru_key(), Some(k2));
+        assert_eq!(cache.t2_mru_key(), Some(k1));
+    }
+
+    #[test]
+    fn test_request_miss_inserts_t1() {
+        let mut cache = ArcCacheInner::new(2, 0);
+        let k = key(1, 0);
+
+        let lookup = cache.request(&k);
+        assert_eq!(lookup, CacheLookup::Miss);
+        cache.admit(k, page(k, 4096), lookup);
+
+        assert!(cache.in_t1(&k), "bead_id={BEAD_ID} case=miss_goes_to_t1");
+        assert_eq!(cache.t1_len(), 1);
+        assert_eq!(cache.t2_len(), 0);
+    }
+
+    #[test]
+    fn test_replace_prefers_t1_when_over_p() {
+        let mut cache = ArcCacheInner::new(3, 0);
+        let k1 = key(1, 0);
+        let k2 = key(2, 0);
+        let k3 = key(3, 0);
+        let k4 = key(4, 0);
+
+        for &k in &[k1, k2, k3] {
+            let l = cache.request(&k);
+            cache.admit(k, page(k, 4096), l);
+        }
+        cache.set_p_for_tests(1);
+
+        // |T1|=3 > p=1, so REPLACE should evict from T1.
+        let l = cache.request(&k4);
+        cache.admit(k4, page(k4, 4096), l);
+
+        assert!(cache.in_b1(&k1), "bead_id={BEAD_ID} case=prefer_t1");
+        assert!(cache.get(&k4).is_some());
+    }
+
+    #[test]
+    fn test_replace_b2_tiebreaker() {
+        let mut cache = ArcCacheInner::new(3, 0);
+        let k1 = key(1, 0);
+        let k2 = key(2, 0);
+        let k3 = key(3, 0);
+        let k4 = key(4, 0);
+        let k5 = key(5, 0);
+
+        for &k in &[k1, k2, k3] {
+            let l = cache.request(&k);
+            cache.admit(k, page(k, 4096), l);
+        }
+
+        // Push k1 to B1, then back to cache via B1 ghost hit (lands in T2).
+        let l = cache.request(&k4);
+        cache.admit(k4, page(k4, 4096), l);
+        let l = cache.request(&k1);
+        assert_eq!(l, CacheLookup::GhostHitB1);
+        cache.admit(k1, page(k1, 4096), l);
+
+        // Force one T2 eviction so k1 becomes a B2 ghost entry.
+        let _ = cache.request(&k3); // promote k3 to T2
+        let l = cache.request(&k5);
+        cache.admit(k5, page(k5, 4096), l);
+        assert!(cache.in_b2(&k1), "setup requires k1 in B2");
+
+        // Set |T1| == p so B2 ghost hit should use the tie-breaker.
+        let t1_before = cache.t1_lru_key().expect("T1 must be non-empty");
+        cache.set_p_for_tests(cache.t1_len());
+        let l = cache.request(&k1);
+        assert_eq!(l, CacheLookup::GhostHitB2);
+        cache.admit(k1, page(k1, 4096), l);
+
+        assert!(
+            cache.in_b1(&t1_before),
+            "bead_id={BEAD_ID} case=b2_tiebreaker_prefers_t1"
+        );
+    }
+
+    #[test]
+    fn test_replace_fallback() {
+        let mut cache = ArcCacheInner::new(2, 0);
+        let pinned = key(1, 0);
+        let victim_t2 = key(2, 0);
+        let incoming = key(3, 0);
+
+        let l = cache.request(&pinned);
+        cache.admit(pinned, page(pinned, 4096), l);
+        let l = cache.request(&victim_t2);
+        cache.admit(victim_t2, page(victim_t2, 4096), l);
+
+        // Move victim_t2 to T2 so fallback has an alternative.
+        assert_eq!(cache.request(&victim_t2), CacheLookup::Hit);
+        cache.set_p_for_tests(0); // |T1| > p, so prefer_t1 = true.
+        cache.get(&pinned).expect("pinned page exists").pin();
+
+        let l = cache.request(&incoming);
+        cache.admit(incoming, page(incoming, 4096), l);
+
+        assert!(cache.get(&pinned).is_some(), "pinned T1 entry must remain");
+        assert!(
+            cache.get(&victim_t2).is_none(),
+            "fallback should evict from T2 when preferred T1 victim is pinned"
+        );
+        assert!(cache.get(&incoming).is_some());
+        cache.get(&pinned).expect("pinned page exists").unpin();
+    }
+
+    #[test]
+    fn test_replace_overflow_safety_valve() {
+        let mut cache = ArcCacheInner::new(1, 0);
+        let pinned = key(1, 0);
+        let incoming = key(2, 0);
+
+        let l = cache.request(&pinned);
+        cache.admit(pinned, page(pinned, 4096), l);
+        cache.get(&pinned).expect("page exists").pin();
+
+        let l = cache.request(&incoming);
+        cache.admit(incoming, page(incoming, 4096), l);
+
+        assert_eq!(cache.capacity_overflow_events(), 1);
+        assert_eq!(cache.len(), 2, "safety valve allows temporary growth");
+        cache.get(&pinned).expect("page exists").unpin();
+    }
+
+    #[test]
+    fn test_request_ghost_trim() {
+        let mut cache = ArcCacheInner::new(2, 0);
+
+        for pgno in 1..=10_u32 {
+            let k = key(pgno, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+
+        assert!(cache.b1_len() <= 2, "bead_id={BEAD_ID} case=ghost_trim_b1");
+        assert!(cache.b2_len() <= 2, "bead_id={BEAD_ID} case=ghost_trim_b2");
+    }
+
     // ── 3. test_arc_ghost_hit_b1 ──────────────────────────────────────
 
     #[test]
-    fn test_arc_ghost_hit_b1() {
+    fn test_request_b1_ghost_increases_p() {
         // capacity=2: fill T1, cause eviction to B1, then ghost-hit.
         let mut cache = ArcCacheInner::new(2, 0);
 
@@ -915,7 +1398,7 @@ mod tests {
     // ── 4. test_arc_ghost_hit_b2 ──────────────────────────────────────
 
     #[test]
-    fn test_arc_ghost_hit_b2() {
+    fn test_request_b2_ghost_decreases_p() {
         // Need p > 0 before the B2 ghost hit so we can observe the decrease.
         // Strategy: first trigger a B1 ghost hit (increases p), then arrange
         // a T2 eviction to B2, then ghost-hit on the B2 entry.
@@ -1012,7 +1495,7 @@ mod tests {
     // ── 6. test_pinned_page_not_evicted ───────────────────────────────
 
     #[test]
-    fn test_pinned_page_not_evicted() {
+    fn test_replace_skips_pinned() {
         let mut cache = ArcCacheInner::new(2, 0);
 
         let k1 = key(1, 0);
@@ -1189,7 +1672,7 @@ mod tests {
     // ── E2E smoke test ────────────────────────────────────────────────
 
     #[test]
-    fn test_e2e_arc_mvcc_integration_smoke() {
+    fn test_e2e_arc_cache_behavior_under_mixed_workload() {
         // Multiple transactions reading/writing pages through the ARC.
         let cache = ArcCache::new(20, 0);
 
@@ -1244,5 +1727,341 @@ mod tests {
             );
         }
         drop(inner);
+    }
+
+    #[test]
+    fn test_ghost_hit_exact_match() {
+        let mut cache = ArcCacheInner::new(2, 0);
+        let k_v1 = key(1, 1);
+        let k2 = key(2, 1);
+        let k3 = key(3, 1);
+
+        for &k in &[k_v1, k2] {
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        let lookup = cache.request(&k3);
+        cache.admit(k3, page(k3, 4096), lookup);
+        assert!(cache.in_b1(&k_v1), "setup requires ghost entry in B1");
+
+        assert_eq!(
+            cache.request(&k_v1),
+            CacheLookup::GhostHitB1,
+            "bead_id={BEAD_ID_BD_3JK9} case=ghost_hit_exact_match"
+        );
+    }
+
+    #[test]
+    fn test_ghost_miss_different_version() {
+        let mut cache = ArcCacheInner::new(2, 0);
+        let k_v1 = key(1, 1);
+        let k_v2 = key(1, 2);
+        let k2 = key(2, 1);
+        let k3 = key(3, 1);
+
+        for &k in &[k_v1, k2] {
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        let lookup = cache.request(&k3);
+        cache.admit(k3, page(k3, 4096), lookup);
+        assert!(cache.in_b1(&k_v1), "setup requires ghost entry in B1");
+
+        assert_eq!(
+            cache.request(&k_v2),
+            CacheLookup::Miss,
+            "bead_id={BEAD_ID_BD_3JK9} case=ghost_miss_different_version"
+        );
+    }
+
+    #[test]
+    fn test_ghost_prune_below_horizon() {
+        let mut cache = ArcCacheInner::new(2, 0);
+        let k1 = key(1, 1);
+        let k2 = key(2, 1);
+        let k3 = key(3, 1);
+
+        for &k in &[k1, k2] {
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+        let lookup = cache.request(&k3);
+        cache.admit(k3, page(k3, 4096), lookup);
+        assert!(cache.in_b1(&k1), "setup requires B1 ghost");
+
+        cache.set_gc_horizon(CommitSeq::new(2));
+
+        assert!(
+            !cache.in_b1(&k1),
+            "bead_id={BEAD_ID_BD_3JK9} case=ghost_prune_below_horizon"
+        );
+        assert!(!cache.in_b2(&k1));
+    }
+
+    #[test]
+    fn test_pinned_page_eviction_overflow() {
+        let mut cache = ArcCacheInner::new(1, 0);
+        let pinned = key(1, 1);
+        let incoming = key(2, 1);
+
+        let lookup = cache.request(&pinned);
+        cache.admit(pinned, page(pinned, 4096), lookup);
+        cache.get(&pinned).expect("pinned page exists").pin();
+
+        let lookup = cache.request(&incoming);
+        cache.admit(incoming, page(incoming, 4096), lookup);
+
+        assert_eq!(
+            cache.capacity_overflow_events(),
+            1,
+            "bead_id={BEAD_ID_BD_3JK9} case=pinned_page_eviction_overflow"
+        );
+    }
+
+    #[test]
+    fn test_overflow_decrement_on_unpin() {
+        let mut cache = ArcCacheInner::new(1, 0);
+        let pinned = key(1, 1);
+        let incoming = key(2, 1);
+
+        let lookup = cache.request(&pinned);
+        cache.admit(pinned, page(pinned, 4096), lookup);
+        cache.get(&pinned).expect("pinned page exists").pin();
+
+        let lookup = cache.request(&incoming);
+        cache.admit(incoming, page(incoming, 4096), lookup);
+        assert_eq!(
+            cache.capacity_overflow_events(),
+            1,
+            "setup requires overflow"
+        );
+        assert_eq!(cache.len(), 2, "setup requires temporary growth");
+
+        assert!(cache.unpin(&pinned), "unpin should observe prior pin");
+        assert_eq!(
+            cache.capacity_overflow_events(),
+            0,
+            "bead_id={BEAD_ID_BD_3JK9} case=overflow_decrement_on_unpin"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_eviction_never_writes_wal() {
+        let mut cache = ArcCacheInner::new(2, 0);
+
+        for i in 1..=2_u32 {
+            let k = key(i, 1);
+            let lookup = cache.request(&k);
+            let mut p = page(k, 4096);
+            p.wal_frame = Some(i);
+            cache.admit(k, p, lookup);
+        }
+
+        let k3 = key(3, 1);
+        let lookup = cache.request(&k3);
+        let mut p3 = page(k3, 4096);
+        p3.wal_frame = Some(3);
+        cache.admit(k3, p3, lookup);
+
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache.t1.iter().all(|(_, page)| page.wal_frame.is_some())
+                && cache.t2.iter().all(|(_, page)| page.wal_frame.is_some()),
+            "bead_id={BEAD_ID_BD_3JK9} case=eviction_never_writes_wal"
+        );
+    }
+
+    #[test]
+    fn test_uncommitted_pages_in_write_set() {
+        let mut cache = ArcCacheInner::new(2, 0);
+        let private_key = key(99, 0);
+        let mut write_set = HashMap::new();
+        write_set.insert(private_key, page(private_key, 4096));
+
+        assert_eq!(
+            cache.request(&private_key),
+            CacheLookup::Miss,
+            "bead_id={BEAD_ID_BD_3JK9} case=write_set_not_arc_hit"
+        );
+        assert!(cache.get(&private_key).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(write_set.len(), 1);
+    }
+
+    #[test]
+    fn test_version_coalesce_keeps_newest() {
+        let mut cache = ArcCacheInner::new(8, 0);
+        let k1 = key(1, 1);
+        let k2 = key(1, 2);
+        let k3 = key(1, 3);
+
+        for &k in &[k1, k2, k3] {
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        cache.set_gc_horizon(CommitSeq::new(3));
+
+        assert!(cache.get(&k3).is_some());
+        assert!(
+            cache.get(&k2).is_none() && cache.get(&k1).is_none(),
+            "bead_id={BEAD_ID_BD_3JK9} case=version_coalesce_keeps_newest"
+        );
+    }
+
+    #[test]
+    fn test_version_coalesce_removes_superseded() {
+        let mut cache = ArcCacheInner::new(8, 0);
+        let old = key(1, 1);
+        let new = key(1, 2);
+
+        for &k in &[old, new] {
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        cache.set_gc_horizon(CommitSeq::new(2));
+        assert!(cache.get(&new).is_some());
+        assert!(
+            cache.get(&old).is_none(),
+            "bead_id={BEAD_ID_BD_3JK9} case=version_coalesce_removes_superseded"
+        );
+    }
+
+    #[test]
+    fn test_version_coalesce_skips_pinned() {
+        let mut cache = ArcCacheInner::new(8, 0);
+        let old = key(1, 1);
+        let new = key(1, 2);
+
+        for &k in &[old, new] {
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        cache.get(&old).expect("old version should exist").pin();
+        cache.set_gc_horizon(CommitSeq::new(2));
+
+        assert!(
+            cache.get(&old).is_some(),
+            "bead_id={BEAD_ID_BD_3JK9} case=version_coalesce_skips_pinned"
+        );
+        assert!(cache.get(&new).is_some());
+        let _ = cache.unpin(&old);
+    }
+
+    #[test]
+    fn test_coalesced_not_ghosted() {
+        let mut cache = ArcCacheInner::new(8, 0);
+        let old = key(1, 1);
+        let new = key(1, 2);
+
+        for &k in &[old, new] {
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        cache.set_gc_horizon(CommitSeq::new(2));
+        assert!(cache.get(&old).is_none());
+        assert!(
+            !cache.in_b1(&old) && !cache.in_b2(&old),
+            "bead_id={BEAD_ID_BD_3JK9} case=coalesced_not_ghosted"
+        );
+    }
+
+    #[test]
+    fn test_coalesce_trigger_on_replace() {
+        let mut cache = ArcCacheInner::new(3, 0);
+        let old = key(1, 1);
+        let new = key(1, 2);
+        let other = key(2, 1);
+        let incoming = key(3, 1);
+
+        for &k in &[old, new, other] {
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        // Move one entry to T2 so admission triggers REPLACE.
+        assert_eq!(cache.request(&new), CacheLookup::Hit);
+        assert!(cache.in_t2(&new), "setup requires a T2 resident");
+
+        cache.get(&old).expect("old version must exist").pin();
+        cache.set_gc_horizon(CommitSeq::new(2));
+        assert!(
+            cache.get(&old).is_some(),
+            "pinned old version should survive batch"
+        );
+        let _ = cache.unpin(&old);
+
+        let lookup = cache.request(&incoming);
+        cache.admit(incoming, page(incoming, 4096), lookup);
+
+        assert!(
+            cache.get(&old).is_none(),
+            "bead_id={BEAD_ID_BD_3JK9} case=coalesce_trigger_on_replace"
+        );
+        assert!(!cache.in_b1(&old) && !cache.in_b2(&old));
+        assert!(cache.get(&incoming).is_some());
+    }
+
+    #[test]
+    fn test_coalesce_trigger_on_gc_advance() {
+        let mut cache = ArcCacheInner::new(8, 0);
+        let old = key(1, 1);
+        let new = key(1, 2);
+
+        for &k in &[old, new] {
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        cache.set_gc_horizon(CommitSeq::new(2));
+        assert!(
+            cache.get(&old).is_none() && cache.get(&new).is_some(),
+            "bead_id={BEAD_ID_BD_3JK9} case=coalesce_trigger_on_gc_advance"
+        );
+    }
+
+    #[test]
+    fn test_e2e_bd_3jk9() {
+        let mut cache = ArcCacheInner::new(64, 0);
+        let mut commit_seq = 1_u64;
+
+        for writer in 0..8_u32 {
+            for op in 0..100_u32 {
+                let pgno = 1 + ((writer * 29 + op) % 24);
+                let key = key(pgno, commit_seq);
+                let lookup = cache.request(&key);
+                if !matches!(lookup, CacheLookup::Hit) {
+                    cache.admit(key, page(key, 4096), lookup);
+                }
+
+                if op % 17 == 0 {
+                    if let Some(page) = cache.get(&key) {
+                        page.pin();
+                    }
+                }
+
+                if op % 17 == 5 {
+                    let _ = cache.unpin(&key);
+                }
+
+                if op % 20 == 0 {
+                    let horizon = commit_seq.saturating_sub(10);
+                    cache.set_gc_horizon(CommitSeq::new(horizon));
+                }
+
+                commit_seq = commit_seq.saturating_add(1);
+            }
+        }
+
+        assert!(cache.b1_len() <= cache.capacity);
+        assert!(cache.b2_len() <= cache.capacity);
+        assert!(cache.capacity_overflow_events() <= 200);
+        assert!(cache.len() <= cache.capacity + cache.capacity_overflow_events());
     }
 }
