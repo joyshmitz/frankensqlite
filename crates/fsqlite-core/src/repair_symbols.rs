@@ -28,6 +28,9 @@ use fsqlite_types::ObjectId;
 use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
+#[path = "policy_controller.rs"]
+pub mod policy_controller;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------

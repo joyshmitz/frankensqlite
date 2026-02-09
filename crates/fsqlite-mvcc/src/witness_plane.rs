@@ -160,8 +160,6 @@ pub fn witness_keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
             WitnessKey::KeyRange { btree_root: ra, .. },
             WitnessKey::KeyRange { btree_root: rb, .. },
         ) => ra == rb,
-        (WitnessKey::KeyRange { btree_root, .. }, WitnessKey::Page(p))
-        | (WitnessKey::Page(p), WitnessKey::KeyRange { btree_root, .. }) => p == btree_root,
         (
             WitnessKey::KeyRange {
                 btree_root: range_root,
@@ -198,8 +196,14 @@ pub fn witness_keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
         ) => range_root == page,
         // Page overlaps with Cell if the page could contain that cell's btree.
         // Conservative: always overlap when page matches btree_root.
-        (WitnessKey::Page(p), WitnessKey::Cell { btree_root, .. })
-        | (WitnessKey::Cell { btree_root, .. }, WitnessKey::Page(p)) => p == btree_root,
+        (
+            WitnessKey::Page(p),
+            WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. },
+        )
+        | (
+            WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. },
+            WitnessKey::Page(p),
+        ) => p == btree_root,
         (
             WitnessKey::ByteRange {
                 page: pa,
