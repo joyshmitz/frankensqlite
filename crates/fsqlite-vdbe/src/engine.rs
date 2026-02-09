@@ -1582,6 +1582,38 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
+                // ── LIMIT/OFFSET support ────────────────────────────────
+                // DecrJumpZero: decrement register p1; if result is zero,
+                // jump to p2. Used to count down remaining LIMIT rows.
+                Opcode::DecrJumpZero => {
+                    let val = self.get_reg(op.p1).to_integer() - 1;
+                    self.set_reg(op.p1, SqliteValue::Integer(val));
+                    if val == 0 {
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            pc = op.p2 as usize;
+                        }
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                // IfPos: if register p1 > 0, subtract p3, then jump to p2.
+                // Used for OFFSET counting (skip rows while offset > 0).
+                Opcode::IfPos => {
+                    let val = self.get_reg(op.p1).to_integer();
+                    if val > 0 {
+                        let decremented = val - i64::from(op.p3);
+                        self.set_reg(op.p1, SqliteValue::Integer(decremented));
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            pc = op.p2 as usize;
+                        }
+                    } else {
+                        pc += 1;
+                    }
+                }
+
                 // ── Catch-all for remaining opcodes ─────────────────────
                 _ => {
                     // Unimplemented opcode: skip (no-op for now).

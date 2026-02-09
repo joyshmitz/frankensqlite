@@ -471,6 +471,13 @@ version = "0.1.0"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
+ "fsqlite-ext-fts3",
+ "fsqlite-ext-fts5",
+ "fsqlite-ext-icu",
+ "fsqlite-ext-json",
+ "fsqlite-ext-misc",
+ "fsqlite-ext-rtree",
+ "fsqlite-ext-session",
  "fsqlite-types",
  "fsqlite-vfs",
 ]

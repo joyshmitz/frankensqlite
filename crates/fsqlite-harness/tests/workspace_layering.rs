@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 
 const BEAD_ID: &str = "bd-1wwc";
 const ARCH_BEAD_ID: &str = "bd-3an";
+const DEP_BUILD_BEAD_ID: &str = "bd-2v8x";
+const DESC_BEAD_ID: &str = "bd-sxm2";
 
 /// The 23 crates specified in §8.1.
 const EXPECTED_CRATES: [&str; 23] = [
@@ -275,6 +277,92 @@ fn workspace_cargo_toml() -> Result<String, String> {
     })
 }
 
+fn fsqlite_cargo_toml() -> Result<String, String> {
+    let path = workspace_root().join("crates/fsqlite/Cargo.toml");
+    fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "bead_id={DEP_BUILD_BEAD_ID} case=read_fsqlite_cargo_toml \
+             path={} error={error}",
+            path.display()
+        )
+    })
+}
+
+fn spec_section_8_3() -> Result<String, String> {
+    let path = workspace_root().join("COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md");
+    let spec = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "bead_id={DESC_BEAD_ID} case=read_comprehensive_spec path={} error={error}",
+            path.display()
+        )
+    })?;
+
+    let section_start = spec
+        .find("### 8.3 Per-Crate Detailed Descriptions")
+        .ok_or_else(|| {
+            format!("bead_id={DESC_BEAD_ID} case=section_8_3_start_missing path={path:?}")
+        })?;
+    let section_end = spec
+        .find("### 8.4 Dependency Edges with Rationale")
+        .ok_or_else(|| {
+            format!("bead_id={DESC_BEAD_ID} case=section_8_4_start_missing path={path:?}")
+        })?;
+
+    if section_end <= section_start {
+        return Err(format!(
+            "bead_id={DESC_BEAD_ID} case=section_bounds_invalid start={section_start} end={section_end}"
+        ));
+    }
+
+    Ok(spec[section_start..section_end].to_string())
+}
+
+fn spec_section_8_4() -> Result<String, String> {
+    let path = workspace_root().join("COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md");
+    let spec = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "bead_id={DESC_BEAD_ID} case=read_comprehensive_spec path={} error={error}",
+            path.display()
+        )
+    })?;
+
+    let section_start = spec
+        .find("### 8.4 Dependency Edges with Rationale")
+        .ok_or_else(|| {
+            format!("bead_id={DESC_BEAD_ID} case=section_8_4_start_missing path={path:?}")
+        })?;
+    let section_end = spec.find("### 8.5 Feature Flags").ok_or_else(|| {
+        format!("bead_id={DESC_BEAD_ID} case=section_8_5_start_missing path={path:?}")
+    })?;
+
+    if section_end <= section_start {
+        return Err(format!(
+            "bead_id={DESC_BEAD_ID} case=section_bounds_invalid start={section_start} end={section_end}"
+        ));
+    }
+
+    Ok(spec[section_start..section_end].to_string())
+}
+
+fn crate_description_block<'a>(section: &'a str, crate_name: &str) -> Option<&'a str> {
+    let marker = format!("**`{crate_name}`**");
+    let start = section.find(&marker)?;
+    let after_marker = &section[start + marker.len()..];
+    let end = after_marker
+        .find("\n**`")
+        .or_else(|| after_marker.find("\n### "))
+        .unwrap_or(after_marker.len());
+    Some(after_marker[..end].trim())
+}
+
+fn concise_description_allowed(crate_name: &str) -> bool {
+    crate_name.starts_with("fsqlite-ext-")
+        || matches!(
+            crate_name,
+            "fsqlite" | "fsqlite-cli" | "fsqlite-harness" | "fsqlite-error"
+        )
+}
+
 // ---------------------------------------------------------------------------
 // §8.1 tests
 // ---------------------------------------------------------------------------
@@ -499,6 +587,248 @@ fn test_build_configuration_matches_spec() -> Result<(), String> {
     assert!(
         missing.is_empty(),
         "bead_id={ARCH_BEAD_ID} case=build_configuration_matches_spec missing={missing:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_workspace_members_match_spec_list() {
+    let metadata = cargo_metadata_cached();
+    let members = workspace_member_names(metadata);
+    let expected: BTreeSet<String> = EXPECTED_CRATES
+        .iter()
+        .map(|crate_name| (*crate_name).to_string())
+        .collect();
+
+    assert_eq!(
+        members, expected,
+        "bead_id={DEP_BUILD_BEAD_ID} case=workspace_members_match_spec_list"
+    );
+}
+
+#[test]
+fn test_forbidden_dependency_edges() {
+    let metadata = cargo_metadata_cached();
+    let graph = internal_dep_graph(metadata);
+    let forbidden_edges = [("fsqlite-wal", "fsqlite-pager")];
+
+    let violations = forbidden_edges
+        .iter()
+        .filter_map(|(from, to)| {
+            graph.get(*from).and_then(|deps| {
+                if deps.contains(*to) {
+                    Some(format!("{from} -> {to}"))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        violations.is_empty(),
+        "bead_id={DEP_BUILD_BEAD_ID} case=forbidden_dependency_edges violations={violations:?}"
+    );
+}
+
+#[test]
+fn test_feature_flags_declared_on_fsqlite_manifest() -> Result<(), String> {
+    let manifest = fsqlite_cargo_toml()?;
+    let required_markers = [
+        "[features]",
+        "default = [\"json\", \"fts5\", \"rtree\"]",
+        "json = [\"dep:fsqlite-ext-json\"]",
+        "fts5 = [\"dep:fsqlite-ext-fts5\"]",
+        "fts3 = [\"dep:fsqlite-ext-fts3\"]",
+        "rtree = [\"dep:fsqlite-ext-rtree\"]",
+        "session = [\"dep:fsqlite-ext-session\"]",
+        "icu = [\"dep:fsqlite-ext-icu\"]",
+        "misc = [\"dep:fsqlite-ext-misc\"]",
+        "raptorq = []",
+        "mvcc = []",
+    ];
+
+    let missing = required_markers
+        .iter()
+        .copied()
+        .filter(|marker| !manifest.contains(marker))
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "bead_id={DEP_BUILD_BEAD_ID} case=feature_flags_declared missing={missing:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_release_profiles_exist() -> Result<(), String> {
+    let workspace_manifest = workspace_cargo_toml()?;
+    let required_markers = [
+        "[profile.release]",
+        "opt-level = \"z\"",
+        "lto = true",
+        "codegen-units = 1",
+        "panic = \"abort\"",
+        "strip = true",
+        "[profile.release-perf]",
+        "inherits = \"release\"",
+        "opt-level = 3",
+    ];
+
+    let missing = required_markers
+        .iter()
+        .copied()
+        .filter(|marker| !workspace_manifest.contains(marker))
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "bead_id={DEP_BUILD_BEAD_ID} case=release_profiles_exist missing={missing:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_every_workspace_crate_has_description() -> Result<(), String> {
+    let section = spec_section_8_3()?;
+    let missing = EXPECTED_CRATES
+        .iter()
+        .copied()
+        .filter(|crate_name| crate_description_block(&section, crate_name).is_none())
+        .collect::<Vec<_>>();
+
+    assert!(
+        missing.is_empty(),
+        "bead_id={DESC_BEAD_ID} case=every_workspace_crate_has_description missing={missing:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_description_includes_purpose_and_key_modules() -> Result<(), String> {
+    let section = spec_section_8_3()?;
+    let dep_section = spec_section_8_4()?;
+    for crate_name in EXPECTED_CRATES {
+        let Some(block) = crate_description_block(&section, crate_name) else {
+            return Err(format!(
+                "bead_id={DESC_BEAD_ID} case=missing_block crate={crate_name}"
+            ));
+        };
+
+        assert!(
+            block.len() >= 80,
+            "bead_id={DESC_BEAD_ID} case=description_too_short crate={crate_name} len={}",
+            block.len()
+        );
+
+        let has_nonempty_summary_line = block
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| line.chars().any(|ch| ch.is_ascii_alphabetic()));
+        assert!(
+            has_nonempty_summary_line,
+            "bead_id={DESC_BEAD_ID} case=summary_line_missing crate={crate_name}"
+        );
+
+        let module_line_count = block
+            .lines()
+            .filter(|line| line.trim_start().starts_with("- `") && line.contains(".rs"))
+            .count();
+        let has_module_listing =
+            block.contains("Modules:") || block.to_ascii_lowercase().contains("modules:");
+        if has_module_listing {
+            assert!(
+                (3..=12).contains(&module_line_count),
+                "bead_id={DESC_BEAD_ID} case=module_count_out_of_range \
+                 crate={crate_name} module_count={module_line_count}"
+            );
+        } else {
+            assert!(
+                concise_description_allowed(crate_name),
+                "bead_id={DESC_BEAD_ID} case=modules_missing_for_non_concise crate={crate_name}"
+            );
+        }
+
+        let has_dependency_direction = block.contains("Dependency rationale:")
+            || dep_section.contains(crate_name)
+            || concise_description_allowed(crate_name);
+        assert!(
+            has_dependency_direction,
+            "bead_id={DESC_BEAD_ID} case=dependency_direction_missing crate={crate_name}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_sxm2_unit_compliance_gate() -> Result<(), String> {
+    test_every_workspace_crate_has_description()?;
+    test_description_includes_purpose_and_key_modules()?;
+    Ok(())
+}
+
+#[test]
+fn prop_bd_sxm2_structure_compliance() -> Result<(), String> {
+    let section = spec_section_8_3()?;
+    let mut non_unique = Vec::new();
+
+    for crate_name in EXPECTED_CRATES {
+        let marker = format!("**`{crate_name}`**");
+        let count = section.match_indices(&marker).count();
+        if count != 1 {
+            non_unique.push(format!("{crate_name}:{count}"));
+        }
+    }
+
+    assert!(
+        non_unique.is_empty(),
+        "bead_id={DESC_BEAD_ID} case=structure_compliance non_unique={non_unique:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_e2e_bd_sxm2_compliance() -> Result<(), String> {
+    let section = spec_section_8_3()?;
+    let described_count = EXPECTED_CRATES
+        .iter()
+        .filter(|crate_name| crate_description_block(&section, crate_name).is_some())
+        .count();
+    let module_listed_count = EXPECTED_CRATES
+        .iter()
+        .filter_map(|crate_name| crate_description_block(&section, crate_name))
+        .filter(|block| block.contains("Modules:"))
+        .count();
+
+    eprintln!(
+        "bead_id={DESC_BEAD_ID} level=DEBUG case=e2e_sxm2 scanned_crates={}",
+        EXPECTED_CRATES.len()
+    );
+    eprintln!(
+        "bead_id={DESC_BEAD_ID} level=INFO case=e2e_sxm2 described_count={described_count} module_listed_count={module_listed_count}"
+    );
+    eprintln!(
+        "bead_id={DESC_BEAD_ID} level=WARN case=e2e_sxm2 degraded_mode_count=0 reference=bd-1fpm"
+    );
+    eprintln!(
+        "bead_id={DESC_BEAD_ID} level=ERROR case=e2e_sxm2 terminal_failure_count=0 reference=bd-1fpm"
+    );
+
+    assert_eq!(
+        described_count,
+        EXPECTED_CRATES.len(),
+        "bead_id={DESC_BEAD_ID} case=e2e_sxm2_described_count_mismatch"
+    );
+    assert!(
+        module_listed_count >= 11,
+        "bead_id={DESC_BEAD_ID} case=e2e_sxm2_module_listed_count_too_low count={module_listed_count}"
     );
 
     Ok(())

@@ -1679,7 +1679,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(1), SqliteValue::Text("ALICE".to_owned())]
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("ALICE".to_owned())
+            ]
         );
         assert_eq!(
             row_values(&rows[1]),
@@ -1765,5 +1768,189 @@ mod tests {
             row_values(&rows[0]),
             vec![SqliteValue::Integer(2), SqliteValue::Text("BOB".to_owned())]
         );
+    }
+
+    // ── Function registry wiring tests ──────────────────────────────────
+
+    #[test]
+    fn test_scalar_function_abs() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT abs(-42), abs(2.5);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(42), SqliteValue::Float(2.5_f64)],
+        );
+    }
+
+    #[test]
+    fn test_scalar_function_length() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT length('hello');").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(5)]);
+    }
+
+    #[test]
+    fn test_scalar_function_upper_lower() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT upper('hello'), lower('WORLD');")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("HELLO".to_owned()),
+                SqliteValue::Text("world".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_scalar_function_coalesce() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT coalesce(NULL, NULL, 42, 99);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn test_scalar_function_typeof_via_registry() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT typeof(42), typeof('hi'), typeof(NULL);")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("integer".to_owned()),
+                SqliteValue::Text("text".to_owned()),
+                SqliteValue::Text("null".to_owned()),
+            ],
+        );
+    }
+
+    // ── BETWEEN expression tests ────────────────────────────────────────
+
+    #[test]
+    fn test_between_true() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 5 BETWEEN 1 AND 10;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_between_false() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 15 BETWEEN 1 AND 10;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(0)]);
+    }
+
+    #[test]
+    fn test_between_boundary_inclusive() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 1 BETWEEN 1 AND 10, 10 BETWEEN 1 AND 10;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(1)],
+        );
+    }
+
+    #[test]
+    fn test_not_between() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 5 NOT BETWEEN 1 AND 10, 15 NOT BETWEEN 1 AND 10;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(0), SqliteValue::Integer(1)],
+        );
+    }
+
+    // ── IN expression tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_in_list_found() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 3 IN (1, 2, 3, 4);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_in_list_not_found() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 5 IN (1, 2, 3, 4);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(0)]);
+    }
+
+    #[test]
+    fn test_not_in_list() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 3 NOT IN (1, 2, 3), 5 NOT IN (1, 2, 3);")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(0), SqliteValue::Integer(1)],
+        );
+    }
+
+    #[test]
+    fn test_in_string_list() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 'b' IN ('a', 'b', 'c');").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    // ── LIKE expression tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_like_match() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 'hello' LIKE 'hel%';").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_like_no_match() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 'hello' LIKE 'world%';").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(0)]);
+    }
+
+    #[test]
+    fn test_not_like() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 'hello' NOT LIKE 'hel%', 'hello' NOT LIKE 'xyz%';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(0), SqliteValue::Integer(1)],
+        );
+    }
+
+    #[test]
+    fn test_like_underscore_wildcard() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 'abc' LIKE 'a_c';").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
     }
 }

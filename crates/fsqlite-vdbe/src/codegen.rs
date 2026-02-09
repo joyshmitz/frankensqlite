@@ -253,6 +253,7 @@ pub fn codegen_select(
                 cursor,
                 table,
                 columns,
+                where_clause.as_deref(),
                 out_regs,
                 out_col_count,
                 done_label,
@@ -266,6 +267,7 @@ pub fn codegen_select(
             cursor,
             table,
             columns,
+            where_clause.as_deref(),
             out_regs,
             out_col_count,
             done_label,
@@ -284,13 +286,14 @@ pub fn codegen_select(
     Ok(())
 }
 
-/// Codegen for a full table scan SELECT.
+/// Codegen for a full table scan SELECT with optional WHERE filtering.
 #[allow(clippy::too_many_arguments)]
 fn codegen_select_full_scan(
     b: &mut ProgramBuilder,
     cursor: i32,
     table: &TableSchema,
     columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
@@ -309,11 +312,20 @@ fn codegen_select_full_scan(
     let loop_start = b.current_addr();
     b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
 
+    // Evaluate WHERE condition (if any) and skip non-matching rows.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(b, where_expr, cursor, table, skip_label);
+    }
+
     // Read columns.
     emit_column_reads(b, cursor, columns, table, out_regs)?;
 
     // ResultRow.
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    // Skip label for WHERE-filtered rows.
+    b.resolve_label(skip_label);
 
     // Next: jump back to start of loop body (the instruction after Rewind).
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -476,12 +488,8 @@ pub fn codegen_update(
     // Transaction (write).
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
 
-    // Bind parameters: new values first, then rowid.
-    // For UPDATE t SET b = ? WHERE rowid = ?, we have two bind params.
-    let mut param_idx = 1_i32;
-
-    // Allocate registers for new values.
-    let new_val_regs: Vec<(usize, i32)> = stmt
+    // Resolve assignment targets to column indices.
+    let assignment_cols: Vec<usize> = stmt
         .assignments
         .iter()
         .map(|assign| {
@@ -491,30 +499,15 @@ pub fn codegen_update(
                     names.first().map_or("", |n| n.as_str())
                 }
             };
-            let col_idx = table
+            table
                 .column_index(col_name)
                 .ok_or_else(|| CodegenError::ColumnNotFound {
                     table: table.name.clone(),
                     column: col_name.to_owned(),
                 })
-                .expect("column must exist");
-            let reg = b.alloc_reg();
-            (col_idx, reg)
+                .expect("column must exist")
         })
         .collect();
-
-    // Emit Variable ops for new values.
-    for (_col_idx, reg) in &new_val_regs {
-        emit_expr_or_variable(b, param_idx, *reg);
-        param_idx += 1;
-    }
-
-    // Rowid bind parameter.
-    let rowid_reg = b.alloc_reg();
-    let rowid_param = extract_rowid_bind_param(stmt.where_clause.as_ref());
-    if rowid_param.is_some() {
-        b.emit_op(Opcode::Variable, param_idx, rowid_reg, 0, P4::None, 0);
-    }
 
     // OpenWrite.
     b.emit_op(
@@ -526,12 +519,14 @@ pub fn codegen_update(
         0,
     );
 
-    // NotExists: if rowid doesn't exist, jump to done.
-    b.emit_jump_to_label(Opcode::NotExists, cursor, 0, done_label, P4::None, 0);
-    // Patch: NotExists needs the rowid in p3.
-    let ne_addr = b.current_addr() - 1;
-    if let Some(op) = b.op_at_mut(ne_addr) {
-        op.p3 = rowid_reg;
+    // Full table scan: Rewind → loop body → Next.
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+
+    // Evaluate WHERE condition (if any) and skip non-matching rows.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = &stmt.where_clause {
+        emit_where_filter(b, where_expr, cursor, table, skip_label);
     }
 
     // Read ALL existing columns into registers.
@@ -549,12 +544,16 @@ pub fn codegen_update(
         );
     }
 
-    // Overwrite changed columns with new values.
-    for (col_idx, new_reg) in &new_val_regs {
+    // Evaluate new values from AST expressions and overwrite changed columns.
+    for (assign_idx, col_idx) in assignment_cols.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let target = col_regs + *col_idx as i32;
-        b.emit_op(Opcode::Copy, *new_reg, target, 0, P4::None, 0);
+        emit_expr(b, &stmt.assignments[assign_idx].value, target);
     }
+
+    // Get the current rowid for re-insertion.
+    let rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::Rowid, cursor, rowid_reg, 0, P4::None, 0);
 
     // MakeRecord with ALL columns.
     let rec_reg = b.alloc_reg();
@@ -579,6 +578,14 @@ pub fn codegen_update(
         0x08, // OPFLAG_ISUPDATE
     );
 
+    // Skip label for WHERE-filtered rows.
+    b.resolve_label(skip_label);
+
+    // Next: jump back to loop body.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+
     // Done: Close + Halt.
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
@@ -596,10 +603,11 @@ pub fn codegen_update(
 
 /// Generate VDBE bytecode for a DELETE statement.
 ///
-/// Pattern: `DELETE FROM t WHERE rowid = ?`
+/// Handles both rowid-equality WHERE and general column-based WHERE via
+/// a full table scan with filter.
 ///
-/// Init → Transaction(write) → Variable → OpenWrite →
-/// NotExists → Delete → Close → Halt
+/// Init → Transaction(write) → OpenWrite → Rewind → [WHERE filter] →
+/// Delete → Next → Close → Halt
 pub fn codegen_delete(
     b: &mut ProgramBuilder,
     stmt: &DeleteStatement,
@@ -619,10 +627,6 @@ pub fn codegen_delete(
     // Transaction (write).
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
 
-    // Bind rowid parameter.
-    let rowid_reg = b.alloc_reg();
-    b.emit_op(Opcode::Variable, 1, rowid_reg, 0, P4::None, 0);
-
     // OpenWrite.
     b.emit_op(
         Opcode::OpenWrite,
@@ -633,11 +637,15 @@ pub fn codegen_delete(
         0,
     );
 
-    // NotExists: if rowid not found, skip delete.
-    b.emit_jump_to_label(Opcode::NotExists, cursor, 0, done_label, P4::None, 0);
-    let ne_addr = b.current_addr() - 1;
-    if let Some(op) = b.op_at_mut(ne_addr) {
-        op.p3 = rowid_reg;
+    // Reverse scan (Last/Prev) so that delete_at(pos) does not shift
+    // indices of rows we haven't visited yet.
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Last, cursor, 0, done_label, P4::None, 0);
+
+    // Evaluate WHERE condition (if any) and skip non-matching rows.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = &stmt.where_clause {
+        emit_where_filter(b, where_expr, cursor, table, skip_label);
     }
 
     // Delete at cursor position.
@@ -649,6 +657,14 @@ pub fn codegen_delete(
         P4::Table(table.name.clone()),
         0,
     );
+
+    // Skip label for WHERE-filtered rows.
+    b.resolve_label(skip_label);
+
+    // Prev: iterate backwards to avoid index-shift issues.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(Opcode::Prev, cursor, loop_body, 0, P4::None, 0);
 
     // Done: Close + Halt.
     b.resolve_label(done_label);
@@ -731,6 +747,77 @@ fn emit_column_reads(
         }
     }
     Ok(())
+}
+
+/// Emit a WHERE filter for scan-based UPDATE/DELETE.
+///
+/// Evaluates the WHERE expression against the current cursor row. If the
+/// condition is false, jumps to `skip_label` (skipping the DML operation).
+///
+/// Handles `col = expr` comparisons by reading the column from the cursor
+/// and comparing with the literal/expression value.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_where_filter(
+    b: &mut ProgramBuilder,
+    where_expr: &Expr,
+    cursor: i32,
+    table: &TableSchema,
+    skip_label: crate::Label,
+) {
+    match where_expr {
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Eq,
+            right,
+            ..
+        } => {
+            // Try col = expr or expr = col.
+            if let Some(col_idx) = resolve_column_ref(left, table) {
+                let col_reg = b.alloc_temp();
+                let val_reg = b.alloc_temp();
+                b.emit_op(Opcode::Column, cursor, col_idx as i32, col_reg, P4::None, 0);
+                emit_expr(b, right, val_reg);
+                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0);
+                b.free_temp(val_reg);
+                b.free_temp(col_reg);
+            } else if let Some(col_idx) = resolve_column_ref(right, table) {
+                let col_reg = b.alloc_temp();
+                let val_reg = b.alloc_temp();
+                b.emit_op(Opcode::Column, cursor, col_idx as i32, col_reg, P4::None, 0);
+                emit_expr(b, left, val_reg);
+                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0);
+                b.free_temp(val_reg);
+                b.free_temp(col_reg);
+            }
+            // If neither side is a column ref, skip filtering (match all).
+        }
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } => {
+            // AND: both conditions must pass.
+            emit_where_filter(b, left, cursor, table, skip_label);
+            emit_where_filter(b, right, cursor, table, skip_label);
+        }
+        _ => {
+            // Unsupported WHERE form — evaluate as expression and test truthiness.
+            let cond_reg = b.alloc_temp();
+            emit_expr(b, where_expr, cond_reg);
+            b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
+            b.free_temp(cond_reg);
+        }
+    }
+}
+
+/// Resolve a column reference expression to its 0-based column index.
+fn resolve_column_ref(expr: &Expr, table: &TableSchema) -> Option<usize> {
+    if let Expr::Column(col_ref, _) = expr {
+        table.column_index(&col_ref.column)
+    } else {
+        None
+    }
 }
 
 /// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
@@ -1149,11 +1236,6 @@ fn type_name_to_affinity(type_name: &fsqlite_ast::TypeName) -> u8 {
     }
 }
 
-/// Emit a Variable instruction for a bind parameter.
-fn emit_expr_or_variable(b: &mut ProgramBuilder, param_idx: i32, reg: i32) {
-    b.emit_op(Opcode::Variable, param_idx, reg, 0, P4::None, 0);
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1417,21 +1499,22 @@ mod tests {
         codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // Verify: reads ALL columns, then overwrites changed one.
+        // Verify scan-based update: Rewind loop, read all columns,
+        // overwrite changed column (Variable for bind param), re-insert.
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Init,
                 Opcode::Transaction,
-                Opcode::Variable, // new value
-                Opcode::Variable, // rowid
                 Opcode::OpenWrite,
-                Opcode::NotExists,
+                Opcode::Rewind,     // full scan
                 Opcode::Column,     // read existing col a
                 Opcode::Column,     // read existing col b
-                Opcode::Copy,       // overwrite b with new value
+                Opcode::Variable,   // new value for b
+                Opcode::Rowid,      // get current rowid
                 Opcode::MakeRecord, // pack ALL columns
                 Opcode::Insert,     // write back
+                Opcode::Next,       // loop
                 Opcode::Close,
                 Opcode::Halt,
             ]
@@ -1472,15 +1555,16 @@ mod tests {
         codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
+        // Verify scan-based delete with reverse iteration (Last/Prev).
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Init,
                 Opcode::Transaction,
-                Opcode::Variable,
                 Opcode::OpenWrite,
-                Opcode::NotExists,
-                Opcode::Delete,
+                Opcode::Last,   // start from end
+                Opcode::Delete, // delete matching row
+                Opcode::Prev,   // iterate backwards
                 Opcode::Close,
                 Opcode::Halt,
             ]
