@@ -1234,22 +1234,35 @@ mod tests {
     fn test_sql_inf_propagates_when_not_nan() {
         let pos_inf = SqliteValue::Float(f64::INFINITY);
         let one = SqliteValue::Integer(1);
-        match pos_inf.sql_add(&one) {
-            SqliteValue::Float(v) => assert!(v.is_infinite() && v.is_sign_positive()),
-            other => panic!("expected +Inf propagation, got {other:?}"),
-        }
+        let add_result = pos_inf.sql_add(&one);
+        assert!(
+            matches!(add_result, SqliteValue::Float(v) if v.is_infinite() && v.is_sign_positive()),
+            "expected +Inf propagation, got {add_result:?}"
+        );
 
         let neg_inf = SqliteValue::Float(f64::NEG_INFINITY);
-        match neg_inf.sql_sub(&one) {
-            SqliteValue::Float(v) => assert!(v.is_infinite() && v.is_sign_negative()),
-            other => panic!("expected -Inf propagation, got {other:?}"),
-        }
+        let sub_result = neg_inf.sql_sub(&one);
+        assert!(
+            matches!(sub_result, SqliteValue::Float(v) if v.is_infinite() && v.is_sign_negative()),
+            "expected -Inf propagation, got {sub_result:?}"
+        );
     }
 
     #[test]
     fn test_from_f64_nan_normalizes_to_null() {
         let value = SqliteValue::from(f64::NAN);
         assert!(value.is_null());
+    }
+
+    #[test]
+    fn test_inf_comparisons_against_finite_values() {
+        let pos_inf = SqliteValue::Float(f64::INFINITY);
+        let neg_inf = SqliteValue::Float(f64::NEG_INFINITY);
+        let finite_hi = SqliteValue::Float(1.0e308);
+        let finite_lo = SqliteValue::Float(-1.0e308);
+
+        assert_eq!(pos_inf.partial_cmp(&finite_hi), Some(Ordering::Greater));
+        assert_eq!(neg_inf.partial_cmp(&finite_lo), Some(Ordering::Less));
     }
 
     // ── bd-13r.7: Empty String vs NULL Semantics ──

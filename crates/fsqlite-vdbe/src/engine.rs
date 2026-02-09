@@ -1646,7 +1646,10 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
-        self.registers[idx] = val;
+        self.registers[idx] = match val {
+            SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
+            other => other,
+        };
     }
 
     /// Read a column value from the cursor's current row.
@@ -2009,7 +2012,12 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
         if b == 0.0 {
             SqliteValue::Null
         } else {
-            SqliteValue::Float(dividend.to_float() / b)
+            let result = dividend.to_float() / b;
+            if result.is_nan() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Float(result)
+            }
         }
     }
 }
@@ -2452,6 +2460,32 @@ mod tests {
         });
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], vec![SqliteValue::Null]); // div by zero → NULL
+    }
+
+    #[test]
+    fn test_vdbe_nan_arithmetic_normalized_to_null() {
+        // +Inf - +Inf and 0 * +Inf both produce NaN at IEEE-754 level.
+        // VDBE register writes must normalize NaN to SQL NULL.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_inf = b.alloc_reg();
+            let r_zero = b.alloc_reg();
+            let r_sub = b.alloc_reg();
+            let r_mul = b.alloc_reg();
+
+            b.emit_op(Opcode::Real, 0, r_inf, 0, P4::Real(f64::INFINITY), 0);
+            b.emit_op(Opcode::Real, 0, r_zero, 0, P4::Real(0.0), 0);
+            b.emit_op(Opcode::Subtract, r_inf, r_inf, r_sub, P4::None, 0); // Inf - Inf
+            b.emit_op(Opcode::Multiply, r_inf, r_zero, r_mul, P4::None, 0); // 0 * Inf
+            b.emit_op(Opcode::ResultRow, r_sub, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec![SqliteValue::Null, SqliteValue::Null]);
     }
 
     // ── test_vdbe_string_concat_null ────────────────────────────────────

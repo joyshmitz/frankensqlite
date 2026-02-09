@@ -2857,6 +2857,23 @@ mod tests {
         assert!(registry.find_scalar("min", 2).is_some());
         assert!(registry.find_scalar("sign", 1).is_some());
         assert!(registry.find_scalar("random", 0).is_some());
+
+        // Newer SQLite scalar functions (3.41+)
+        assert!(registry.find_scalar("concat_ws", 3).is_some());
+        assert!(registry.find_scalar("octet_length", 1).is_some());
+        assert!(registry.find_scalar("unhex", 1).is_some());
+        assert!(registry.find_scalar("timediff", 2).is_some());
+        assert!(registry.find_scalar("unistr", 1).is_some());
+
+        // Percentile family enabled by default.
+        assert!(registry.find_aggregate("median", 1).is_some());
+        assert!(registry.find_aggregate("percentile", 2).is_some());
+        assert!(registry.find_aggregate("percentile_cont", 2).is_some());
+        assert!(registry.find_aggregate("percentile_disc", 2).is_some());
+
+        // Loadable extensions are not exposed as SQL function by default.
+        assert!(registry.find_scalar("load_extension", 1).is_none());
+        assert!(registry.find_scalar("load_extension", 2).is_none());
     }
 
     #[test]

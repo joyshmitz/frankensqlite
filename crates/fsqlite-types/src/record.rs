@@ -126,7 +126,14 @@ fn serial_type_for_value(value: &SqliteValue) -> u64 {
     match value {
         SqliteValue::Null => 0,
         SqliteValue::Integer(i) => serial_type_for_integer(*i),
-        SqliteValue::Float(_) => 7,
+        // SQLite normalizes NaN to NULL for deterministic storage.
+        SqliteValue::Float(f) => {
+            if f.is_nan() {
+                0
+            } else {
+                7
+            }
+        }
         SqliteValue::Text(s) => serial_type_for_text(s.len() as u64),
         SqliteValue::Blob(b) => serial_type_for_blob(b.len() as u64),
     }
@@ -148,7 +155,12 @@ fn decode_value(serial_type: u64, bytes: &[u8]) -> Option<SqliteValue> {
                 return None;
             }
             let bits = u64::from_be_bytes(bytes.try_into().ok()?);
-            Some(SqliteValue::Float(f64::from_bits(bits)))
+            let value = f64::from_bits(bits);
+            if value.is_nan() {
+                Some(SqliteValue::Null)
+            } else {
+                Some(SqliteValue::Float(value))
+            }
         }
         SerialTypeClass::Text => {
             let s = std::str::from_utf8(bytes).ok()?;
@@ -191,6 +203,9 @@ fn encode_value(value: &SqliteValue, serial_type: u64, buf: &mut [u8]) {
             // Zero and One serial types have no data bytes.
         }
         SqliteValue::Float(f) => {
+            if f.is_nan() {
+                return;
+            }
             let bits = f.to_bits();
             buf.copy_from_slice(&bits.to_be_bytes());
         }
@@ -292,6 +307,15 @@ mod tests {
             let parsed = parse_record(&data).unwrap();
             assert_eq!(parsed[0].as_float().unwrap().to_bits(), val.to_bits());
         }
+    }
+
+    #[test]
+    fn float_nan_normalized_to_null_for_storage() {
+        let values = vec![SqliteValue::Float(f64::NAN)];
+        let data = serialize_record(&values);
+        let parsed = parse_record(&data).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed[0].is_null());
     }
 
     #[test]
