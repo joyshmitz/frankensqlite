@@ -608,6 +608,20 @@ impl Parser {
 
     fn parse_in(&mut self, lhs: Expr, not: bool) -> Result<Expr, ParseError> {
         let start = lhs.span();
+
+        // SQLite supports both "x IN ( ... )" and "x IN table_name".
+        if !self.at_kind(&TokenKind::LeftParen) {
+            let table = self.parse_qualified_name()?;
+            let end = self.tokens[self.pos.saturating_sub(1)].span;
+            let span = start.merge(end);
+            return Ok(Expr::In {
+                expr: Box::new(lhs),
+                set: InSet::Table(table),
+                not,
+                span,
+            });
+        }
+
         self.expect_kind(&TokenKind::LeftParen)?;
 
         if matches!(self.peek_kind(), TokenKind::KwSelect) {
@@ -1140,6 +1154,47 @@ mod tests {
     fn test_not_in() {
         let expr = parse("x NOT IN (1, 2)");
         assert!(matches!(expr, Expr::In { not: true, .. }));
+    }
+
+    #[test]
+    fn test_in_table_name() {
+        let expr = parse("x IN t");
+        assert!(matches!(
+            expr,
+            Expr::In {
+                not: false,
+                set: InSet::Table(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_not_in_table_name() {
+        let expr = parse("x NOT IN t");
+        assert!(matches!(
+            expr,
+            Expr::In {
+                not: true,
+                set: InSet::Table(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_in_schema_table_name() {
+        let expr = parse("x IN main.t");
+        match expr {
+            Expr::In {
+                set: InSet::Table(name),
+                ..
+            } => {
+                assert_eq!(name.schema.as_deref(), Some("main"));
+                assert_eq!(name.name, "t");
+            }
+            other => unreachable!("expected IN table form, got {other:?}"),
+        }
     }
 
     // ── BETWEEN ─────────────────────────────────────────────────────────

@@ -2267,6 +2267,30 @@ mod tests {
     }
 
     #[test]
+    fn test_comparison_both_blob_no_coercion() {
+        assert_eq!(
+            TypeAffinity::comparison_affinity(TypeAffinity::Blob, TypeAffinity::Blob),
+            None
+        );
+    }
+
+    #[test]
+    fn test_affinity_applied_to_needing_operand_only() {
+        let left = SqliteValue::Integer(42);
+        let right = SqliteValue::Text("123".to_string());
+        let affinity = TypeAffinity::comparison_affinity(left.affinity(), right.affinity())
+            .expect("numeric-vs-text comparison must request numeric coercion");
+
+        // Numeric side should remain unchanged.
+        let left_after = left.clone();
+        // Text side is the side that needs conversion for numeric comparison.
+        let right_after = right.apply_affinity(affinity);
+
+        assert_eq!(left_after, left);
+        assert_eq!(right_after, SqliteValue::Integer(123));
+    }
+
+    #[test]
     fn test_comparison_numeric_subtypes() {
         // INTEGER vs REAL: both numeric, different variants but no coercion needed
         // per SQLite rules (they share the numeric class).
