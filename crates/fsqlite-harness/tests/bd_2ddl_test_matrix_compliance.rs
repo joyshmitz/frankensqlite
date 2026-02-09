@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -115,6 +116,71 @@ fn evaluate_description(description: &str) -> ComplianceEvaluation {
     }
 }
 
+fn count_tests_in_tree(root: &Path) -> Result<usize, String> {
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut total = 0_usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|error| format!("read_dir_failed path={} error={error}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!("read_dir_entry_failed path={} error={error}", dir.display())
+            })?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension() != Some(OsStr::new("rs")) {
+                continue;
+            }
+
+            let raw = fs::read_to_string(&path).map_err(|error| {
+                format!("read_file_failed path={} error={error}", path.display())
+            })?;
+            total += raw.matches("#[test]").count();
+        }
+    }
+
+    Ok(total)
+}
+
+fn crate_test_counts() -> Result<Vec<(String, usize)>, String> {
+    let workspace_crates_dir = workspace_root()?.join("crates");
+    let entries = fs::read_dir(&workspace_crates_dir).map_err(|error| {
+        format!(
+            "crates_dir_read_failed path={} error={error}",
+            workspace_crates_dir.display()
+        )
+    })?;
+
+    let mut counts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "crates_dir_entry_read_failed path={} error={error}",
+                workspace_crates_dir.display()
+            )
+        })?;
+        let package_dir = entry.path();
+        if !package_dir.is_dir() || !package_dir.join("Cargo.toml").is_file() {
+            continue;
+        }
+
+        let crate_name = entry.file_name().to_string_lossy().into_owned();
+        let src_count = count_tests_in_tree(&package_dir.join("src"))?;
+        let tests_count = count_tests_in_tree(&package_dir.join("tests"))?;
+        counts.push((crate_name, src_count + tests_count));
+    }
+    counts.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+
+    Ok(counts)
+}
+
 #[test]
 fn test_bd_2ddl_unit_compliance_gate() -> Result<(), String> {
     let description = load_issue_description(BEAD_ID)?;
@@ -141,6 +207,24 @@ fn test_bd_2ddl_unit_compliance_gate() -> Result<(), String> {
     if evaluation.missing_log_standard_ref {
         return Err(format!(
             "bead_id={BEAD_ID} case=logging_standard_missing expected_ref={LOG_STANDARD_REF}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_all_workspace_crates_have_at_least_one_unit_test() -> Result<(), String> {
+    let counts = crate_test_counts()?;
+    let missing = counts
+        .iter()
+        .filter(|(_crate_name, count)| *count == 0)
+        .map(|(crate_name, _count)| crate_name.clone())
+        .collect::<Vec<_>>();
+
+    if !missing.is_empty() {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=zero_test_crates missing={missing:?}"
         ));
     }
 
@@ -176,13 +260,26 @@ proptest! {
 fn test_e2e_bd_2ddl_compliance() -> Result<(), String> {
     let description = load_issue_description(BEAD_ID)?;
     let evaluation = evaluate_description(&description);
+    let counts = crate_test_counts()?;
+    let missing_crates = counts
+        .iter()
+        .filter(|(_crate_name, count)| *count == 0)
+        .map(|(crate_name, _count)| crate_name.clone())
+        .collect::<Vec<_>>();
 
     eprintln!(
-        "INFO bead_id={BEAD_ID} case=e2e_summary missing_unit_ids={} missing_e2e_ids={} missing_log_levels={} missing_log_standard_ref={}",
+        "DEBUG bead_id={BEAD_ID} case=test_inventory crates_total={} zero_test_crates={}",
+        counts.len(),
+        missing_crates.len()
+    );
+
+    eprintln!(
+        "INFO bead_id={BEAD_ID} case=e2e_summary missing_unit_ids={} missing_e2e_ids={} missing_log_levels={} missing_log_standard_ref={} zero_test_crates={}",
         evaluation.missing_unit_ids.len(),
         evaluation.missing_e2e_ids.len(),
         evaluation.missing_log_levels.len(),
-        evaluation.missing_log_standard_ref
+        evaluation.missing_log_standard_ref,
+        missing_crates.len()
     );
 
     for id in &evaluation.missing_unit_ids {
@@ -199,10 +296,16 @@ fn test_e2e_bd_2ddl_compliance() -> Result<(), String> {
             "ERROR bead_id={BEAD_ID} case=missing_log_standard_ref expected={LOG_STANDARD_REF}"
         );
     }
+    for crate_name in &missing_crates {
+        eprintln!("WARN bead_id={BEAD_ID} case=missing_test_crate crate={crate_name}");
+    }
+    if !missing_crates.is_empty() {
+        eprintln!("ERROR bead_id={BEAD_ID} case=zero_test_crates missing={missing_crates:?}");
+    }
 
-    if !evaluation.is_compliant() {
+    if !evaluation.is_compliant() || !missing_crates.is_empty() {
         return Err(format!(
-            "bead_id={BEAD_ID} case=e2e_compliance_failure evaluation={evaluation:?}"
+            "bead_id={BEAD_ID} case=e2e_compliance_failure evaluation={evaluation:?} missing_crates={missing_crates:?}"
         ));
     }
 
