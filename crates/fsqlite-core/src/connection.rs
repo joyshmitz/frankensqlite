@@ -185,7 +185,11 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
         ));
     }
 
-    let (columns, where_clause) = match &select.body.select {
+    let mut builder = ProgramBuilder::new();
+    let init_target = builder.emit_label();
+    builder.emit_jump_to_label(Opcode::Init, 0, 0, init_target, P4::None, 0);
+
+    match &select.body.select {
         SelectCore::Select {
             distinct,
             columns,
@@ -220,64 +224,103 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
                     "WINDOW is not supported in this connection path".to_owned(),
                 ));
             }
-            (columns, where_clause.as_ref())
-        }
-        SelectCore::Values(_) => {
-            return Err(FrankenError::NotImplemented(
-                "VALUES is not supported in this connection path".to_owned(),
-            ));
-        }
-    };
-
-    if columns.is_empty() {
-        return Err(FrankenError::ParseError {
-            offset: 0,
-            detail: "SELECT must include at least one result column".to_owned(),
-        });
-    }
-
-    let mut builder = ProgramBuilder::new();
-    let init_target = builder.emit_label();
-    builder.emit_jump_to_label(Opcode::Init, 0, 0, init_target, P4::None, 0);
-
-    let out_count = i32::try_from(columns.len()).map_err(|_| FrankenError::TooManyColumns {
-        count: columns.len(),
-        max: i32::MAX as usize,
-    })?;
-    let out_first_reg = builder.alloc_regs(out_count);
-    let skip_row_label = if let Some(predicate) = where_clause {
-        let predicate_reg = builder.alloc_temp();
-        emit_expr(&mut builder, predicate, predicate_reg)?;
-        let skip_label = builder.emit_label();
-        builder.emit_jump_to_label(Opcode::IfNot, predicate_reg, 0, skip_label, P4::None, 0);
-        builder.free_temp(predicate_reg);
-        Some(skip_label)
-    } else {
-        None
-    };
-
-    for (idx, column) in columns.iter().enumerate() {
-        let expr = match column {
-            ResultColumn::Expr { expr, .. } => expr,
-            ResultColumn::Star | ResultColumn::TableStar(_) => {
-                return Err(FrankenError::NotImplemented(
-                    "star expansion requires name resolution and FROM sources".to_owned(),
-                ));
+            if columns.is_empty() {
+                return Err(FrankenError::ParseError {
+                    offset: 0,
+                    detail: "SELECT must include at least one result column".to_owned(),
+                });
             }
-        };
 
-        let idx_i32 = i32::try_from(idx).map_err(|_| FrankenError::OutOfRange {
-            what: "result column index".to_owned(),
-            value: idx.to_string(),
-        })?;
-        let output_reg = out_first_reg + idx_i32;
-        emit_expr(&mut builder, expr, output_reg)?;
+            let out_count =
+                i32::try_from(columns.len()).map_err(|_| FrankenError::TooManyColumns {
+                    count: columns.len(),
+                    max: i32::MAX as usize,
+                })?;
+            let out_first_reg = builder.alloc_regs(out_count);
+            let skip_row_label = if let Some(predicate) = where_clause.as_ref() {
+                let predicate_reg = builder.alloc_temp();
+                emit_expr(&mut builder, predicate, predicate_reg)?;
+                let skip_label = builder.emit_label();
+                builder.emit_jump_to_label(
+                    Opcode::IfNot,
+                    predicate_reg,
+                    0,
+                    skip_label,
+                    P4::None,
+                    0,
+                );
+                builder.free_temp(predicate_reg);
+                Some(skip_label)
+            } else {
+                None
+            };
+
+            for (idx, column) in columns.iter().enumerate() {
+                let expr = match column {
+                    ResultColumn::Expr { expr, .. } => expr,
+                    ResultColumn::Star | ResultColumn::TableStar(_) => {
+                        return Err(FrankenError::NotImplemented(
+                            "star expansion requires name resolution and FROM sources".to_owned(),
+                        ));
+                    }
+                };
+
+                let idx_i32 = i32::try_from(idx).map_err(|_| FrankenError::OutOfRange {
+                    what: "result column index".to_owned(),
+                    value: idx.to_string(),
+                })?;
+                let output_reg = out_first_reg + idx_i32;
+                emit_expr(&mut builder, expr, output_reg)?;
+            }
+
+            builder.emit_op(Opcode::ResultRow, out_first_reg, out_count, 0, P4::None, 0);
+            if let Some(skip_label) = skip_row_label {
+                builder.resolve_label(skip_label);
+            }
+        }
+        SelectCore::Values(rows) => {
+            if rows.is_empty() {
+                return Err(FrankenError::ParseError {
+                    offset: 0,
+                    detail: "VALUES must include at least one row".to_owned(),
+                });
+            }
+            let first_row_len = rows[0].len();
+            if first_row_len == 0 {
+                return Err(FrankenError::ParseError {
+                    offset: 0,
+                    detail: "VALUES row must include at least one expression".to_owned(),
+                });
+            }
+            for row in rows {
+                if row.len() != first_row_len {
+                    return Err(FrankenError::ParseError {
+                        offset: 0,
+                        detail: "VALUES rows must have matching column counts".to_owned(),
+                    });
+                }
+            }
+
+            let out_count =
+                i32::try_from(first_row_len).map_err(|_| FrankenError::TooManyColumns {
+                    count: first_row_len,
+                    max: i32::MAX as usize,
+                })?;
+            let out_first_reg = builder.alloc_regs(out_count);
+
+            for row in rows {
+                for (idx, expr) in row.iter().enumerate() {
+                    let idx_i32 = i32::try_from(idx).map_err(|_| FrankenError::OutOfRange {
+                        what: "VALUES column index".to_owned(),
+                        value: idx.to_string(),
+                    })?;
+                    emit_expr(&mut builder, expr, out_first_reg + idx_i32)?;
+                }
+                builder.emit_op(Opcode::ResultRow, out_first_reg, out_count, 0, P4::None, 0);
+            }
+        }
     }
 
-    builder.emit_op(Opcode::ResultRow, out_first_reg, out_count, 0, P4::None, 0);
-    if let Some(skip_label) = skip_row_label {
-        builder.resolve_label(skip_label);
-    }
     builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
     builder.resolve_label(init_target);
     builder.finish()
@@ -751,5 +794,29 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT 1 WHERE NULL;").unwrap();
         assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_values_multiple_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("VALUES (1, 'a'), (2, 'b');").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_values_mismatched_column_count_rejected() {
+        let conn = Connection::open(":memory:").unwrap();
+        let error = conn
+            .query("VALUES (1), (2, 3);")
+            .expect_err("mismatched VALUES row widths must fail");
+        assert!(matches!(error, FrankenError::ParseError { .. }));
     }
 }
