@@ -1,11 +1,11 @@
 use std::collections::{BTreeSet, HashMap};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_vfs::host_fs;
 
 const STRICT_MIN_MEANINGFUL_LEN: usize = 10;
 const FAST_MIN_MEANINGFUL_LEN: usize = 20;
@@ -209,7 +209,7 @@ struct SectionBounds {
 }
 
 pub fn run_spec_to_beads_audit(config: &AuditConfig) -> Result<SpecToBeadsAuditReport> {
-    let spec_text = fs::read_to_string(&config.spec_path).map_err(|err| {
+    let spec_text = host_fs::read_to_string(&config.spec_path).map_err(|err| {
         internal_error(format!(
             "failed reading spec file '{}': {err}",
             config.spec_path.display()
@@ -313,7 +313,7 @@ pub fn run_spec_to_beads_audit(config: &AuditConfig) -> Result<SpecToBeadsAuditR
 
 pub fn write_report_json(path: &Path, report: &SpecToBeadsAuditReport) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
+        host_fs::create_dir_all(parent).map_err(|err| {
             internal_error(format!(
                 "failed creating report directory '{}': {err}",
                 parent.display()
@@ -323,7 +323,7 @@ pub fn write_report_json(path: &Path, report: &SpecToBeadsAuditReport) -> Result
 
     let encoded = serde_json::to_vec_pretty(report)
         .map_err(|err| internal_error(format!("failed to encode audit report JSON: {err}")))?;
-    fs::write(path, encoded).map_err(|err| {
+    host_fs::write(path, encoded).map_err(|err| {
         internal_error(format!(
             "failed writing report file '{}': {err}",
             path.display()
@@ -353,7 +353,7 @@ pub fn normalize_whitespace(input: &str) -> String {
 }
 
 fn load_issues(path: &Path) -> Result<Vec<Issue>> {
-    let contents = fs::read_to_string(path).map_err(|err| {
+    let contents = host_fs::read_to_string(path).map_err(|err| {
         internal_error(format!(
             "failed reading issues JSONL '{}': {err}",
             path.display()
@@ -962,7 +962,7 @@ fn lint_scope_phrase_violations(
         if path == config.spec_path {
             continue;
         }
-        let Ok(contents) = fs::read_to_string(&path) else {
+        let Ok(contents) = host_fs::read_to_string(&path) else {
             continue;
         };
         let has_section_15_ref = references_section_15(&contents);
@@ -1015,7 +1015,7 @@ fn lint_excluded_feature_reintroduction(
     }
 
     for path in collect_implementation_source_files(&workspace_root) {
-        let Ok(contents) = fs::read_to_string(&path) else {
+        let Ok(contents) = host_fs::read_to_string(&path) else {
             continue;
         };
         let contents_lower = contents.to_ascii_lowercase();
@@ -1220,9 +1220,8 @@ fn contains_word(text: &str, needle: &str) -> bool {
 fn collect_markdown_files(workspace_root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
 
-    if let Ok(entries) = fs::read_dir(workspace_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
+    if let Ok(entries) = host_fs::read_dir_paths(workspace_root) {
+        for path in entries {
             if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("md") {
                 out.push(path);
                 continue;
@@ -1251,11 +1250,11 @@ fn collect_implementation_source_files(workspace_root: &Path) -> Vec<PathBuf> {
 }
 
 fn collect_files_with_extension(root: &Path, extension: &str, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
+    let Ok(entries) = host_fs::read_dir_paths(root) else {
         return;
     };
 
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    let mut paths = entries;
     paths.sort();
 
     for path in paths {

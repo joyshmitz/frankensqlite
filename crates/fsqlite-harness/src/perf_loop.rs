@@ -8,10 +8,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use fsqlite_error::FrankenError;
+use fsqlite_vfs::host_fs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -431,9 +432,9 @@ pub fn enforce_one_lever_rule(paths: &[PathBuf]) -> Result<OptimizationLever, Pe
 
 /// Enforce that baseline evidence is present and non-empty.
 pub fn enforce_baseline_capture(baseline_artifact: &Path) -> Result<(), PerfLoopError> {
-    let metadata = match fs::metadata(baseline_artifact) {
+    let metadata = match host_fs::metadata(baseline_artifact) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(FrankenError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(PerfLoopError::MissingBaselineArtifact {
                 path: baseline_artifact.to_path_buf(),
             });
@@ -487,7 +488,7 @@ pub fn capture_golden_checksums(
         writeln!(output, "{digest} *{file_name}").expect("String write infallible");
     }
 
-    fs::write(checksum_file, output).map_err(|error| PerfLoopError::Io {
+    host_fs::write(checksum_file, output).map_err(|error| PerfLoopError::Io {
         path: checksum_file.to_path_buf(),
         message: error.to_string(),
     })
@@ -504,7 +505,7 @@ pub fn verify_golden_checksums(
         });
     }
 
-    let raw = fs::read_to_string(checksum_file).map_err(|error| PerfLoopError::Io {
+    let raw = host_fs::read_to_string(checksum_file).map_err(|error| PerfLoopError::Io {
         path: checksum_file.to_path_buf(),
         message: error.to_string(),
     })?;
@@ -812,7 +813,7 @@ pub fn write_measurement_artifact_bundle(
         path: output_path.to_path_buf(),
         message: error.to_string(),
     })?;
-    fs::write(output_path, bytes).map_err(|error| PerfLoopError::Io {
+    host_fs::write(output_path, bytes).map_err(|error| PerfLoopError::Io {
         path: output_path.to_path_buf(),
         message: error.to_string(),
     })
@@ -1057,7 +1058,7 @@ pub fn validate_profiling_metadata(
 
 /// Validate flamegraph output is a non-empty SVG file.
 pub fn validate_flamegraph_output(path: &Path) -> Result<(), PerfLoopError> {
-    let content = fs::read_to_string(path).map_err(|error| PerfLoopError::Io {
+    let content = host_fs::read_to_string(path).map_err(|error| PerfLoopError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
@@ -1076,7 +1077,7 @@ pub fn validate_flamegraph_output(path: &Path) -> Result<(), PerfLoopError> {
 
 /// Validate hyperfine JSON output has the expected shape.
 pub fn validate_hyperfine_json_output(path: &Path) -> Result<(), PerfLoopError> {
-    let content = fs::read_to_string(path).map_err(|error| PerfLoopError::Io {
+    let content = host_fs::read_to_string(path).map_err(|error| PerfLoopError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
@@ -1252,7 +1253,7 @@ pub struct PerfSmokeSystem {
 pub fn ensure_baseline_layout(root: &Path) -> Result<(), PerfLoopError> {
     for name in REQUIRED_BASELINE_DIRS {
         let directory = root.join(name);
-        fs::create_dir_all(&directory).map_err(|error| PerfLoopError::Io {
+        host_fs::create_dir_all(&directory).map_err(|error| PerfLoopError::Io {
             path: directory,
             message: error.to_string(),
         })?;
@@ -1265,7 +1266,7 @@ pub fn validate_baseline_layout(root: &Path) -> Result<(), PerfLoopError> {
     for name in REQUIRED_BASELINE_DIRS {
         let directory = root.join(name);
         let metadata =
-            fs::metadata(&directory).map_err(|_| PerfLoopError::MissingBaselineDirectory {
+            host_fs::metadata(&directory).map_err(|_| PerfLoopError::MissingBaselineDirectory {
                 path: directory.clone(),
             })?;
         if !metadata.is_dir() {
@@ -1319,7 +1320,7 @@ pub fn write_baseline_gitkeep_files(root: &Path) -> Result<(), PerfLoopError> {
     for name in REQUIRED_BASELINE_DIRS {
         let keep_path = root.join(name).join(".gitkeep");
         if !keep_path.exists() {
-            fs::write(&keep_path, "").map_err(|error| PerfLoopError::Io {
+            host_fs::write(&keep_path, "").map_err(|error| PerfLoopError::Io {
                 path: keep_path.clone(),
                 message: error.to_string(),
             })?;
@@ -1330,7 +1331,7 @@ pub fn write_baseline_gitkeep_files(root: &Path) -> Result<(), PerfLoopError> {
 
 /// Read a smoke report JSON file and validate required fields.
 pub fn load_and_validate_smoke_report(path: &Path) -> Result<PerfSmokeReport, PerfLoopError> {
-    let raw = fs::read_to_string(path).map_err(|error| PerfLoopError::Io {
+    let raw = host_fs::read_to_string(path).map_err(|error| PerfLoopError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
@@ -1367,17 +1368,12 @@ fn parse_checksum_line(line: &str) -> Option<(String, String)> {
 
 fn read_top_level_files_sorted(dir: &Path) -> Result<Vec<PathBuf>, PerfLoopError> {
     let mut paths = Vec::new();
-    let entries = fs::read_dir(dir).map_err(|error| PerfLoopError::Io {
+    let entries = host_fs::read_dir_paths(dir).map_err(|error| PerfLoopError::Io {
         path: dir.to_path_buf(),
         message: error.to_string(),
     })?;
 
-    for entry_result in entries {
-        let entry = entry_result.map_err(|error| PerfLoopError::Io {
-            path: dir.to_path_buf(),
-            message: error.to_string(),
-        })?;
-        let path = entry.path();
+    for path in entries {
         if path.is_file() {
             paths.push(path);
         }

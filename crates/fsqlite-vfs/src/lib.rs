@@ -28,6 +28,10 @@ pub mod host_fs {
         Ok(std::fs::read_to_string(path)?)
     }
 
+    pub fn metadata(path: &Path) -> Result<std::fs::Metadata> {
+        Ok(std::fs::metadata(path)?)
+    }
+
     pub fn read_dir_paths(dir: &Path) -> Result<Vec<PathBuf>> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir)? {
