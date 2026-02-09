@@ -45,6 +45,7 @@ pub struct EcsDecodeProof {
 impl EcsDecodeProof {
     /// Create a proof for a successful decode operation.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn success(
         object_id: ObjectId,
         k_source: u32,
@@ -80,6 +81,7 @@ impl EcsDecodeProof {
 
     /// Create a proof for a failed decode operation.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn failure(
         object_id: ObjectId,
         k_source: u32,

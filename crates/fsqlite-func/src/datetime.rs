@@ -90,6 +90,11 @@ fn ymdhms_to_jdn(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64, frac: f64) ->
 
 /// Unix epoch as JDN.
 const UNIX_EPOCH_JDN: f64 = 2_440_587.5;
+/// Upper bound for values interpreted as Julian day by the `auto` modifier.
+const AUTO_JDN_MAX: f64 = 5_373_484.499_999;
+/// Unix timestamp bounds used by SQLite's `auto` modifier.
+const AUTO_UNIX_MIN: f64 = -210_866_760_000.0;
+const AUTO_UNIX_MAX: f64 = 253_402_300_799.0;
 
 fn jdn_to_unix(jdn: f64) -> i64 {
     ((jdn - UNIX_EPOCH_JDN) * 86400.0).round() as i64
@@ -201,7 +206,7 @@ fn parse_time_part(s: &str) -> Option<(i64, i64, i64, f64)> {
     }
     let h = parts[0].parse::<i64>().ok()?;
     let mi = parts[1].parse::<i64>().ok()?;
-    if h > 23 || mi > 59 {
+    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) {
         return None;
     }
 
@@ -215,13 +220,13 @@ fn parse_time_part(s: &str) -> Option<(i64, i64, i64, f64)> {
         let sec = sec_str[..dot_pos].parse::<i64>().ok()?;
         let frac_str = &sec_str[dot_pos..]; // ".SSS"
         let frac = frac_str.parse::<f64>().ok()?;
-        if sec > 59 {
+        if !(0..=59).contains(&sec) {
             return None;
         }
         Some((h, mi, sec, frac))
     } else {
         let sec = sec_str.parse::<i64>().ok()?;
-        if sec > 59 {
+        if !(0..=59).contains(&sec) {
             return None;
         }
         Some((h, mi, sec, 0.0))
@@ -259,21 +264,18 @@ fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
         return Some(jdn);
     }
 
-    // 'auto' — if the number is small enough to be a Unix timestamp, treat
-    // it as such; otherwise treat as JDN.
+    // 'auto' — apply SQLite numeric auto-detection:
+    //   0.0..=5373484.499999          => Julian day number
+    //   -210866760000..=253402300799  => Unix timestamp
+    //   otherwise                      => NULL
     if m == "auto" {
-        // SQLite heuristic: values < 5373484.5 are JDN, values ≥ that
-        // (i.e., dates past 9999-12-31) are Unix timestamps.  But in
-        // practice, 'auto' treats anything that looks like a Unix timestamp
-        // range as Unix.  The cutoff in C SQLite is:
-        //   JDN < 5373484.5   → already JDN
-        //   JDN >= 5373484.5  → Unix epoch seconds
-        // But since our input is the raw number from the time string,
-        // we use the heuristic: if value > 4e9, it's Unix timestamp.
-        if jdn > 4_000_000_000.0 {
+        if (0.0..=AUTO_JDN_MAX).contains(&jdn) {
+            return Some(jdn);
+        }
+        if (AUTO_UNIX_MIN..=AUTO_UNIX_MAX).contains(&jdn) {
             return Some(unix_to_jdn(jdn));
         }
-        return Some(jdn);
+        return None;
     }
 
     // 'localtime' / 'utc' — timezone conversion stubs.
@@ -551,29 +553,67 @@ fn iso_week(y: i64, m: i64, d: i64) -> (i64, i64) {
 // ── timediff ──────────────────────────────────────────────────────────────
 
 fn timediff_impl(jdn1: f64, jdn2: f64) -> String {
-    let diff = jdn1 - jdn2;
-    let sign = if diff >= 0.0 { '+' } else { '-' };
-    let diff = diff.abs();
+    let (sign, start_jdn, end_jdn) = if jdn1 >= jdn2 {
+        ('+', jdn2, jdn1)
+    } else {
+        ('-', jdn1, jdn2)
+    };
 
-    // Convert to full date difference.
-    let total_secs = (diff * 86400.0).round() as i64;
-    let days = total_secs / 86400;
-    let rem = total_secs % 86400;
-    let h = rem / 3600;
-    let m = (rem % 3600) / 60;
-    let s = rem % 60;
+    let (start_y, start_mo, start_d) = jdn_to_ymd(start_jdn);
+    let (start_h, start_mi, start_s, start_frac) = jdn_to_hms(start_jdn);
+    let mut start_ms = (start_frac * 1000.0).round() as i64;
+    if start_ms >= 1000 {
+        start_ms = 999;
+    }
 
-    // Approximate years/months/days.
-    let years = days / 365;
-    let rem_days = days % 365;
-    let months = rem_days / 30;
-    let d = rem_days % 30;
+    let (end_y, end_mo, end_d) = jdn_to_ymd(end_jdn);
+    let (end_h, end_mi, end_s, end_frac) = jdn_to_hms(end_jdn);
+    let mut end_ms = (end_frac * 1000.0).round() as i64;
+    if end_ms >= 1000 {
+        end_ms = 999;
+    }
 
-    // Fractional seconds.
-    let frac_secs = (diff * 86400.0) - (total_secs as f64);
-    let ms = (frac_secs.abs() * 1000.0).round() as i64;
+    let mut years = end_y - start_y;
+    let mut months = end_mo - start_mo;
+    let mut days = end_d - start_d;
+    let mut hours = end_h - start_h;
+    let mut minutes = end_mi - start_mi;
+    let mut seconds = end_s - start_s;
+    let mut millis = end_ms - start_ms;
 
-    format!("{sign}{years:04}-{months:02}-{d:02} {h:02}:{m:02}:{s:02}.{ms:03}")
+    if millis < 0 {
+        millis += 1000;
+        seconds -= 1;
+    }
+    if seconds < 0 {
+        seconds += 60;
+        minutes -= 1;
+    }
+    if minutes < 0 {
+        minutes += 60;
+        hours -= 1;
+    }
+    if hours < 0 {
+        hours += 24;
+        days -= 1;
+    }
+    if days < 0 {
+        months -= 1;
+        let (borrow_y, borrow_mo) = if end_mo == 1 {
+            (end_y - 1, 12)
+        } else {
+            (end_y, end_mo - 1)
+        };
+        days += days_in_month(borrow_y, borrow_mo);
+    }
+    if months < 0 {
+        months += 12;
+        years -= 1;
+    }
+
+    format!(
+        "{sign}{years:04}-{months:02}-{days:02} {hours:02}:{minutes:02}:{seconds:02}.{millis:03}"
+    )
 }
 
 // ── Scalar Function Implementations ───────────────────────────────────────
@@ -926,6 +966,47 @@ mod tests {
     }
 
     #[test]
+    fn test_modifier_weekday() {
+        // 2024-03-15 is Friday. `weekday 0` advances to the next Sunday.
+        let r = DateFunc
+            .invoke(&[text("2024-03-15"), text("weekday 0")])
+            .unwrap();
+        assert_text(&r, "2024-03-17");
+    }
+
+    #[test]
+    fn test_modifier_auto_unixepoch() {
+        let ts = int(1_710_531_045);
+        let r = DateTimeFunc.invoke(&[ts.clone(), text("auto")]).unwrap();
+        let expected = DateTimeFunc.invoke(&[ts, text("unixepoch")]).unwrap();
+        assert_eq!(
+            r, expected,
+            "auto and unixepoch should agree for unix-like values"
+        );
+    }
+
+    #[test]
+    fn test_modifier_auto_julian_day() {
+        let r = DateFunc
+            .invoke(&[float(2_460_384.5), text("auto")])
+            .unwrap();
+        assert_text(&r, "2024-03-15");
+    }
+
+    #[test]
+    fn test_modifier_localtime_utc_roundtrip() {
+        let r = DateTimeFunc
+            .invoke(&[
+                text("2024-03-15 14:30:45"),
+                text("utc"),
+                text("localtime"),
+                text("utc"),
+            ])
+            .unwrap();
+        assert_text(&r, "2024-03-15 14:30:45");
+    }
+
+    #[test]
     fn test_modifier_order_matters() {
         // 'start of month' then '+1 day' = March 2nd.
         let r1 = DateFunc
@@ -1055,6 +1136,54 @@ mod tests {
     }
 
     #[test]
+    fn test_strftime_all_specifiers_presence() {
+        let fmt = "%d|%e|%f|%H|%I|%j|%J|%k|%l|%m|%M|%p|%P|%R|%s|%S|%T|%u|%w|%W|%G|%g|%V|%Y|%%";
+        let r = StrftimeFunc
+            .invoke(&[text(fmt), text("2024-03-15 14:30:45.123")])
+            .unwrap();
+
+        let s = match r {
+            SqliteValue::Text(v) => v,
+            other => panic!("expected Text, got {other:?}"),
+        };
+        let parts: Vec<&str> = s.split('|').collect();
+        assert_eq!(parts.len(), 25, "unexpected specifier output: {s}");
+        assert_eq!(parts[0], "15"); // %d
+        assert_eq!(parts[1], "15"); // %e
+        assert_eq!(parts[2], "45.123"); // %f
+        assert_eq!(parts[3], "14"); // %H
+        assert_eq!(parts[4], "02"); // %I
+        assert_eq!(parts[5], "075"); // %j
+        assert!(
+            parts[6].parse::<f64>().is_ok(),
+            "expected numeric %J output, got {}",
+            parts[6]
+        );
+        assert_eq!(parts[7], "14"); // %k
+        assert_eq!(parts[8], " 2"); // %l
+        assert_eq!(parts[9], "03"); // %m
+        assert_eq!(parts[10], "30"); // %M
+        assert_eq!(parts[11], "PM"); // %p
+        assert_eq!(parts[12], "pm"); // %P
+        assert_eq!(parts[13], "14:30"); // %R
+        assert!(
+            parts[14].parse::<i64>().is_ok(),
+            "expected numeric %s output, got {}",
+            parts[14]
+        );
+        assert_eq!(parts[15], "45"); // %S
+        assert_eq!(parts[16], "14:30:45"); // %T
+        assert_eq!(parts[17], "5"); // %u
+        assert_eq!(parts[18], "5"); // %w
+        assert_eq!(parts[19], "11"); // %W
+        assert_eq!(parts[20], "2024"); // %G
+        assert_eq!(parts[21], "24"); // %g
+        assert_eq!(parts[22], "11"); // %V
+        assert_eq!(parts[23], "2024"); // %Y
+        assert_eq!(parts[24], "%"); // %%
+    }
+
+    #[test]
     fn test_strftime_null() {
         assert_eq!(
             StrftimeFunc.invoke(&[null(), text("2024-01-01")]).unwrap(),
@@ -1073,13 +1202,7 @@ mod tests {
         let r = TimediffFunc
             .invoke(&[text("2024-03-15"), text("2024-03-10")])
             .unwrap();
-        match &r {
-            SqliteValue::Text(s) => {
-                assert!(s.starts_with('+'), "expected positive diff: {s}");
-                assert!(s.contains("05"), "expected 5 days in diff: {s}");
-            }
-            other => panic!("expected Text, got {other:?}"),
-        }
+        assert_text(&r, "+0000-00-05 00:00:00.000");
     }
 
     #[test]
@@ -1087,10 +1210,15 @@ mod tests {
         let r = TimediffFunc
             .invoke(&[text("2024-03-10"), text("2024-03-15")])
             .unwrap();
-        match &r {
-            SqliteValue::Text(s) => assert!(s.starts_with('-'), "expected negative diff: {s}"),
-            other => panic!("expected Text, got {other:?}"),
-        }
+        assert_text(&r, "-0000-00-05 00:00:00.000");
+    }
+
+    #[test]
+    fn test_timediff_year_boundary() {
+        let r = TimediffFunc
+            .invoke(&[text("2024-01-01 01:00:00"), text("2023-12-31 23:00:00")])
+            .unwrap();
+        assert_text(&r, "+0000-00-00 02:00:00.000");
     }
 
     // ── Subsec modifier ───────────────────────────────────────────────

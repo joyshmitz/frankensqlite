@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use tracing::{debug, info};
+
 use fsqlite_types::{
     BTreePageHeader, BTreePageType, BtreeRef, CommitSeq, IntentOp, MergePageKind, PageNumber,
     PageSize, SchemaEpoch, SemanticKeyKind, SemanticKeyRef, Snapshot, TableId,
@@ -839,7 +841,7 @@ pub enum MergeLadderResult {
 ///
 /// Returns [`MergeError::SchemaEpochMismatch`] if the schema epoch changed,
 /// or propagates errors from the parse/merge/repack pipeline.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn evaluate_merge_ladder(
     policy: WriteMergePolicy,
     base_page: &[u8],
@@ -858,16 +860,35 @@ pub fn evaluate_merge_ladder(
 ) -> Result<MergeLadderResult, MergeError> {
     // Policy OFF → always abort
     if policy == WriteMergePolicy::Off {
+        info!(
+            ladder_step = "off",
+            result = "abort",
+            reason = "policy OFF",
+            "merge_ladder: policy OFF — skipping all merge attempts"
+        );
         return Ok(MergeLadderResult::AbortBusySnapshot);
     }
 
     // Level 1: No conflict — base unchanged
     if base_page == committed_page {
+        info!(
+            ladder_step = "level1",
+            result = "no_conflict",
+            "merge_ladder: base unchanged since snapshot"
+        );
         return Ok(MergeLadderResult::NoConflict);
     }
 
     // Schema epoch check (required before any merge attempt)
     if snapshot_schema_epoch != current_schema_epoch {
+        info!(
+            ladder_step = "schema_check",
+            result = "abort",
+            reason = "schema epoch mismatch",
+            expected = snapshot_schema_epoch,
+            actual = current_schema_epoch,
+            "merge_ladder: schema epoch mismatch"
+        );
         return Err(MergeError::SchemaEpochMismatch {
             expected: snapshot_schema_epoch,
             actual: current_schema_epoch,
@@ -887,6 +908,13 @@ pub fn evaluate_merge_ladder(
                 let no_unique = crate::index_regen::NoOpUniqueChecker;
                 if let Ok(result) = deterministic_rebase(log, snapshot, reader, schema, &no_unique)
                 {
+                    info!(
+                        ladder_step = "level2",
+                        result = "merge",
+                        reason = "deterministic rebase succeeded",
+                        rebased_op_count = result.rebased_ops.len(),
+                        "merge_ladder: deterministic rebase succeeded"
+                    );
                     return Ok(MergeLadderResult::RebaseSucceeded {
                         rebased_ops: result.rebased_ops,
                     });
@@ -913,8 +941,18 @@ pub fn evaluate_merge_ladder(
         let patch_committed = diff_parsed_pages(&base_parsed, &committed_parsed)?;
         let patch_txn = diff_parsed_pages(&base_parsed, &txn_parsed)?;
 
+        debug!(
+            committed_cell_ops = patch_committed.cell_ops.len(),
+            txn_cell_ops = patch_txn.cell_ops.len(),
+            "merge_ladder: attempting cell-level structured merge"
+        );
+
         match merge_structured_patches(&patch_committed, &patch_txn, page_kind) {
             Ok(merged_patch) => {
+                debug!(
+                    merged_cell_ops = merged_patch.cell_ops.len(),
+                    "merge_ladder: patch merge succeeded, applying"
+                );
                 let merged_cells = apply_patch(&base_parsed, &merged_patch)?;
                 let merged_page = repack_btree_page(
                     &merged_cells,
@@ -924,10 +962,23 @@ pub fn evaluate_merge_ladder(
                     is_page1,
                     base_parsed.header.right_most_child,
                 )?;
+                info!(
+                    ladder_step = "level3",
+                    result = "merge",
+                    reason = "cell-disjoint physical merge",
+                    cell_count = merged_cells.len(),
+                    "merge_ladder: structured merge succeeded"
+                );
                 return Ok(MergeLadderResult::StructuredMergeSucceeded { merged_page });
             }
-            Err(MergeError::CellOverlap { .. }) => {
-                // Level 4: Cell overlap → abort
+            Err(MergeError::CellOverlap { cell_key_digest }) => {
+                info!(
+                    ladder_step = "level4",
+                    result = "abort",
+                    reason = "cell overlap",
+                    digest = ?cell_key_digest,
+                    "merge_ladder: cell overlap — SQLITE_BUSY_SNAPSHOT"
+                );
                 return Ok(MergeLadderResult::AbortBusySnapshot);
             }
             Err(e) => return Err(e),
@@ -935,6 +986,12 @@ pub fn evaluate_merge_ladder(
     }
 
     // Level 4: No safe merge found
+    info!(
+        ladder_step = "level4",
+        result = "abort",
+        reason = "no safe merge found for unstructured page",
+        "merge_ladder: abort — no safe merge available"
+    );
     Ok(MergeLadderResult::AbortBusySnapshot)
 }
 
@@ -1601,6 +1658,209 @@ mod tests {
                 assert_eq!(parsed.cells[0].rowid, Some(2));
             }
             other => panic!("expected StructuredMergeSucceeded, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E Test: Merge ladder with concurrent writers (bd-3dv4)
+    // -----------------------------------------------------------------------
+
+    /// Simulate two concurrent writers inserting disjoint rowids on the same
+    /// leaf page, then verify the merge ladder produces the correct outcome.
+    /// Also covers the conflicting case (same rowid → abort).
+    ///
+    /// This exercises the full pipeline:
+    ///   base snapshot → writer T1 commits → writer T2 attempts commit
+    ///   → merge ladder evaluates → result matches serial schedule.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_e2e_merge_ladder_concurrent_writers() {
+        let ps = default_page_size();
+        let tid = table_id_1();
+
+        // ---- CASE 1: Commuting writes (disjoint rowids) ----
+        //
+        // Base state: {row 1 = "init"}
+        // Writer T1 (commits first): inserts row 5 → committed = {1, 5}
+        // Writer T2 (attempts commit): inserts row 10 → tentative = {1, 10}
+        //
+        // Serial schedule equivalent: T1 then T2 → {1, 5, 10}
+        let base = build_leaf_table_page(&[(1, b"init")], ps);
+        let t1_committed = build_leaf_table_page(&[(1, b"init"), (5, b"t1val")], ps);
+        let t2_tentative = build_leaf_table_page(&[(1, b"init"), (10, b"t2val")], ps);
+
+        let result = evaluate_merge_ladder(
+            WriteMergePolicy::Safe,
+            &base,
+            &t1_committed,
+            &t2_tentative,
+            ps,
+            0,
+            false,
+            MergePageKind::BtreeLeafTable,
+            tid,
+            1, // snapshot epoch
+            1, // current epoch (same)
+            None,
+            None,
+            None,
+        )
+        .expect("disjoint merge should succeed");
+
+        match result {
+            MergeLadderResult::StructuredMergeSucceeded { ref merged_page } => {
+                let parsed = parse_btree_page(merged_page, ps, 0, false, tid).unwrap();
+                assert_eq!(
+                    parsed.cells.len(),
+                    3,
+                    "bead_id=bd-3dv4 case=e2e_commuting expected 3 rows after merge"
+                );
+                let rowids: Vec<i64> = parsed.cells.iter().filter_map(|c| c.rowid).collect();
+                assert!(
+                    rowids.contains(&1),
+                    "bead_id=bd-3dv4 case=e2e_commuting missing row 1"
+                );
+                assert!(
+                    rowids.contains(&5),
+                    "bead_id=bd-3dv4 case=e2e_commuting missing row 5"
+                );
+                assert!(
+                    rowids.contains(&10),
+                    "bead_id=bd-3dv4 case=e2e_commuting missing row 10"
+                );
+
+                // Verify result matches serial schedule (T1 then T2).
+                let serial =
+                    build_leaf_table_page(&[(1, b"init"), (5, b"t1val"), (10, b"t2val")], ps);
+                let serial_parsed = parse_btree_page(&serial, ps, 0, false, tid).unwrap();
+
+                // Same number of cells
+                assert_eq!(parsed.cells.len(), serial_parsed.cells.len());
+
+                // Same rowids
+                let serial_rowids: Vec<i64> =
+                    serial_parsed.cells.iter().filter_map(|c| c.rowid).collect();
+                assert_eq!(rowids, serial_rowids);
+
+                // Same cell data (key digests and bytes)
+                for (merged_cell, serial_cell) in
+                    parsed.cells.iter().zip(serial_parsed.cells.iter())
+                {
+                    assert_eq!(
+                        merged_cell.cell_key_digest, serial_cell.cell_key_digest,
+                        "bead_id=bd-3dv4 case=e2e_commuting digest mismatch"
+                    );
+                    assert_eq!(
+                        merged_cell.cell_bytes, serial_cell.cell_bytes,
+                        "bead_id=bd-3dv4 case=e2e_commuting cell bytes mismatch for rowid {:?}",
+                        merged_cell.rowid
+                    );
+                }
+            }
+            other => panic!(
+                "bead_id=bd-3dv4 case=e2e_commuting expected StructuredMergeSucceeded, got {other:?}"
+            ),
+        }
+
+        // ---- CASE 2: Non-commuting writes (same rowid → abort) ----
+        //
+        // Base state: {row 1 = "init"}
+        // Writer T1 (commits first): modifies row 1 → {row 1 = "t1mod"}
+        // Writer T2 (attempts commit): modifies row 1 → {row 1 = "t2mod"}
+        //
+        // Same cell modified by both → SQLITE_BUSY_SNAPSHOT
+        let t1_conflict = build_leaf_table_page(&[(1, b"t1mod")], ps);
+        let t2_conflict = build_leaf_table_page(&[(1, b"t2mod")], ps);
+
+        let conflict_result = evaluate_merge_ladder(
+            WriteMergePolicy::Safe,
+            &base,
+            &t1_conflict,
+            &t2_conflict,
+            ps,
+            0,
+            false,
+            MergePageKind::BtreeLeafTable,
+            tid,
+            1,
+            1,
+            None,
+            None,
+            None,
+        )
+        .expect("conflict should return AbortBusySnapshot, not error");
+
+        assert_eq!(
+            conflict_result,
+            MergeLadderResult::AbortBusySnapshot,
+            "bead_id=bd-3dv4 case=e2e_conflict expected abort for same-rowid conflict"
+        );
+
+        // ---- CASE 3: Multiple disjoint writers on same page ----
+        //
+        // Base state: {row 1 = "base"}
+        // T1 inserts rows 2 and 3 (keeps row 1 unchanged)
+        // T2 inserts rows 100 and 200 (keeps row 1 unchanged)
+        // Expected: all 5 rows present after merge
+        let base_multi = build_leaf_table_page(&[(1, b"base")], ps);
+        let t1_multi = build_leaf_table_page(&[(1, b"base"), (2, b"t1a"), (3, b"t1b")], ps);
+        let t2_multi = build_leaf_table_page(&[(1, b"base"), (100, b"t2a"), (200, b"t2b")], ps);
+
+        let multi_result = evaluate_merge_ladder(
+            WriteMergePolicy::Safe,
+            &base_multi,
+            &t1_multi,
+            &t2_multi,
+            ps,
+            0,
+            false,
+            MergePageKind::BtreeLeafTable,
+            tid,
+            1,
+            1,
+            None,
+            None,
+            None,
+        )
+        .expect("multi-insert disjoint merge should succeed");
+
+        match multi_result {
+            MergeLadderResult::StructuredMergeSucceeded { ref merged_page } => {
+                let parsed = parse_btree_page(merged_page, ps, 0, false, tid).unwrap();
+                assert_eq!(
+                    parsed.cells.len(),
+                    5,
+                    "bead_id=bd-3dv4 case=e2e_multi expected 5 rows"
+                );
+                let rowids: Vec<i64> = parsed.cells.iter().filter_map(|c| c.rowid).collect();
+                for expected in &[1, 2, 3, 100, 200] {
+                    assert!(
+                        rowids.contains(expected),
+                        "bead_id=bd-3dv4 case=e2e_multi missing row {expected}"
+                    );
+                }
+
+                // Compare against serial schedule
+                let serial = build_leaf_table_page(
+                    &[
+                        (1, b"base"),
+                        (2, b"t1a"),
+                        (3, b"t1b"),
+                        (100, b"t2a"),
+                        (200, b"t2b"),
+                    ],
+                    ps,
+                );
+                let serial_parsed = parse_btree_page(&serial, ps, 0, false, tid).unwrap();
+                assert_eq!(parsed.cells.len(), serial_parsed.cells.len());
+                for (mc, sc) in parsed.cells.iter().zip(serial_parsed.cells.iter()) {
+                    assert_eq!(mc.cell_key_digest, sc.cell_key_digest);
+                    assert_eq!(mc.cell_bytes, sc.cell_bytes);
+                }
+            }
+            other => panic!(
+                "bead_id=bd-3dv4 case=e2e_multi expected StructuredMergeSucceeded, got {other:?}"
+            ),
         }
     }
 }

@@ -20,7 +20,7 @@
 use fsqlite_ast::{
     BinaryOp, ColumnRef, Distinctness, Expr, FromClause, FunctionArgs, InSet, JsonArrow, LikeOp,
     Literal, PlaceholderType, QualifiedName, RaiseAction, ResultColumn, SelectBody, SelectCore,
-    SelectStatement, Span, TableOrSubquery, TypeName, UnaryOp,
+    SelectStatement, Span, TableOrSubquery, TypeName, UnaryOp, WindowSpec,
 };
 
 use crate::parser::{ParseError, Parser};
@@ -678,41 +678,62 @@ impl Parser {
     fn parse_function_call(&mut self, name: String, start: Span) -> Result<Expr, ParseError> {
         self.expect_kind(&TokenKind::LeftParen)?;
 
-        // func(*)
-        if matches!(self.peek_kind(), TokenKind::Star) {
+        let (args, distinct) = if matches!(self.peek_kind(), TokenKind::Star) {
             self.advance_token();
-            let end = self.expect_kind(&TokenKind::RightParen)?;
-            let span = start.merge(end);
-            return Ok(Expr::FunctionCall {
-                name,
-                args: FunctionArgs::Star,
-                distinct: false,
-                filter: None,
-                over: None,
-                span,
-            });
-        }
-
-        let distinct = self.eat_kind(&TokenKind::KwDistinct);
-
-        let args = if matches!(self.peek_kind(), TokenKind::RightParen) {
-            FunctionArgs::List(Vec::new())
+            (FunctionArgs::Star, false)
         } else {
-            let mut list = vec![self.parse_expr()?];
-            while self.eat_kind(&TokenKind::Comma) {
-                list.push(self.parse_expr()?);
-            }
-            FunctionArgs::List(list)
+            let distinct = self.eat_kind(&TokenKind::KwDistinct);
+            let args = if matches!(self.peek_kind(), TokenKind::RightParen) {
+                FunctionArgs::List(Vec::new())
+            } else {
+                let mut list = vec![self.parse_expr()?];
+                while self.eat_kind(&TokenKind::Comma) {
+                    list.push(self.parse_expr()?);
+                }
+                FunctionArgs::List(list)
+            };
+            (args, distinct)
         };
 
-        let end = self.expect_kind(&TokenKind::RightParen)?;
+        let mut end = self.expect_kind(&TokenKind::RightParen)?;
+        let filter = if self.eat_kind(&TokenKind::KwFilter) {
+            self.expect_kind(&TokenKind::LeftParen)?;
+            self.expect_kind(&TokenKind::KwWhere)?;
+            let predicate = self.parse_expr()?;
+            let filter_end = self.expect_kind(&TokenKind::RightParen)?;
+            end = end.merge(filter_end);
+            Some(Box::new(predicate))
+        } else {
+            None
+        };
+        let over = if self.eat_kind(&TokenKind::KwOver) {
+            if self.eat_kind(&TokenKind::LeftParen) {
+                let spec = self.parse_window_spec()?;
+                let over_end = self.expect_kind(&TokenKind::RightParen)?;
+                end = end.merge(over_end);
+                Some(spec)
+            } else {
+                let base_window = self.parse_identifier()?;
+                let base_span = self.tokens[self.pos.saturating_sub(1)].span;
+                end = end.merge(base_span);
+                Some(WindowSpec {
+                    base_window: Some(base_window),
+                    partition_by: Vec::new(),
+                    order_by: Vec::new(),
+                    frame: None,
+                })
+            }
+        } else {
+            None
+        };
+
         let span = start.merge(end);
         Ok(Expr::FunctionCall {
             name,
             args,
             distinct,
-            filter: None,
-            over: None,
+            filter,
+            over,
             span,
         })
     }
@@ -1307,6 +1328,90 @@ mod tests {
     fn test_count_distinct() {
         let expr = parse("count(DISTINCT x)");
         assert!(matches!(expr, Expr::FunctionCall { distinct: true, .. }));
+    }
+
+    #[test]
+    fn test_function_call_filter_clause() {
+        let expr = parse("count(x) FILTER (WHERE x > 0)");
+        match expr {
+            Expr::FunctionCall {
+                filter: Some(filter),
+                over: None,
+                ..
+            } => {
+                assert!(matches!(
+                    filter.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Gt,
+                        ..
+                    }
+                ));
+            }
+            other => unreachable!("expected function call with FILTER, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_function_call_over_named_window() {
+        let expr = parse("sum(x) OVER win");
+        match expr {
+            Expr::FunctionCall {
+                over: Some(over),
+                filter: None,
+                ..
+            } => {
+                assert_eq!(over.base_window.as_deref(), Some("win"));
+                assert!(over.partition_by.is_empty());
+                assert!(over.order_by.is_empty());
+                assert!(over.frame.is_none());
+            }
+            other => unreachable!("expected function call with OVER win, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_function_call_over_window_spec() {
+        let expr = parse(
+            "sum(x) OVER (PARTITION BY y ORDER BY z \
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
+        );
+        match expr {
+            Expr::FunctionCall {
+                over: Some(over), ..
+            } => {
+                assert!(over.base_window.is_none());
+                assert_eq!(over.partition_by.len(), 1);
+                assert_eq!(over.order_by.len(), 1);
+                match over.frame {
+                    Some(fsqlite_ast::FrameSpec {
+                        frame_type: fsqlite_ast::FrameType::Rows,
+                        start: fsqlite_ast::FrameBound::Preceding(expr),
+                        end: Some(fsqlite_ast::FrameBound::CurrentRow),
+                        ..
+                    }) => {
+                        assert!(matches!(
+                            expr.as_ref(),
+                            Expr::Literal(Literal::Integer(1), _)
+                        ));
+                    }
+                    other => unreachable!("expected ROWS frame, got {other:?}"),
+                }
+            }
+            other => unreachable!("expected function call with OVER spec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_function_call_filter_then_over() {
+        let expr = parse("sum(x) FILTER (WHERE x > 10) OVER win");
+        match expr {
+            Expr::FunctionCall {
+                filter: Some(_),
+                over: Some(over),
+                ..
+            } => assert_eq!(over.base_window.as_deref(), Some("win")),
+            other => unreachable!("expected FILTER + OVER, got {other:?}"),
+        }
     }
 
     // ── Literals & placeholders ─────────────────────────────────────────

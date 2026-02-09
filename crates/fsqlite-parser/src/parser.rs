@@ -1973,6 +1973,42 @@ mod tests {
     }
 
     #[test]
+    fn select_window_function_over_clause() {
+        let stmt = parse_one(
+            "SELECT sum(x) OVER (PARTITION BY y ORDER BY z \
+             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+        );
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr:
+                            Expr::FunctionCall {
+                                over: Some(over), ..
+                            },
+                        ..
+                    } => {
+                        assert_eq!(over.partition_by.len(), 1);
+                        assert_eq!(over.order_by.len(), 1);
+                        assert!(matches!(
+                            over.frame,
+                            Some(FrameSpec {
+                                frame_type: FrameType::Rows,
+                                ..
+                            })
+                        ));
+                    }
+                    other => unreachable!("expected window function result column, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
     fn insert_values() {
         let stmt = parse_one("INSERT INTO t (a, b) VALUES (1, 2), (3, 4)");
         assert!(matches!(stmt, Statement::Insert(_)));
