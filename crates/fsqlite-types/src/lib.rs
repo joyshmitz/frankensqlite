@@ -4,6 +4,7 @@ pub mod encoding;
 pub mod flags;
 pub mod glossary;
 pub mod limits;
+pub mod obligation;
 pub mod opcode;
 pub mod record;
 pub mod serial_type;
