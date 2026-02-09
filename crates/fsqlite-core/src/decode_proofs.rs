@@ -7,12 +7,94 @@
 //! This module provides the FrankenSQLite-side `EcsDecodeProof` type that
 //! wraps asupersync's `DecodeProof` with ECS-specific metadata.
 
+use std::fmt;
+
 use fsqlite_types::ObjectId;
 use tracing::{debug, info, warn};
+use xxhash_rust::xxh3::xxh3_64;
 
 // ---------------------------------------------------------------------------
 // ECS Decode Proof (§3.5.8)
 // ---------------------------------------------------------------------------
+
+/// Stable schema version for `EcsDecodeProof`.
+pub const DECODE_PROOF_SCHEMA_VERSION_V1: u16 = 1;
+
+/// Default policy identifier for deterministic decode proof emission.
+pub const DEFAULT_DECODE_PROOF_POLICY_ID: u32 = 1;
+
+/// Why a symbol was rejected before decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SymbolRejectionReason {
+    HashMismatch,
+    InvalidAuthTag,
+    DuplicateEsi,
+    FormatViolation,
+}
+
+impl fmt::Display for SymbolRejectionReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HashMismatch => write!(f, "hash_mismatch"),
+            Self::InvalidAuthTag => write!(f, "invalid_auth_tag"),
+            Self::DuplicateEsi => write!(f, "duplicate_esi"),
+            Self::FormatViolation => write!(f, "format_violation"),
+        }
+    }
+}
+
+/// Rejected-symbol evidence item.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RejectedSymbol {
+    pub esi: u32,
+    pub reason: SymbolRejectionReason,
+}
+
+/// Reason for decode failure when `decode_success == false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DecodeFailureReason {
+    InsufficientSymbols,
+    RankDeficiency,
+    IntegrityMismatch,
+    Unknown,
+}
+
+impl fmt::Display for DecodeFailureReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InsufficientSymbols => write!(f, "insufficient_symbols"),
+            Self::RankDeficiency => write!(f, "rank_deficiency"),
+            Self::IntegrityMismatch => write!(f, "integrity_mismatch"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Redaction policy for proof payload material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeProofPayloadMode {
+    /// Only metadata + hashes are persisted.
+    HashesOnly,
+    /// Lab/debug mode may include raw payload bytes.
+    IncludeBytesLabOnly,
+}
+
+/// Hash of an accepted symbol input (replay-verification artifact).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SymbolDigest {
+    pub esi: u32,
+    pub digest_xxh3: u64,
+}
+
+/// Deterministic digest set for replay verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofInputHashes {
+    pub metadata_xxh3: u64,
+    pub source_esis_xxh3: u64,
+    pub repair_esis_xxh3: u64,
+    pub rejected_symbols_xxh3: u64,
+    pub symbol_digests_xxh3: u64,
+}
 
 /// A decode proof recording the outcome and metadata of an ECS decode
 /// operation (§3.5.8).
@@ -22,24 +104,48 @@ use tracing::{debug, info, warn};
 /// vs repair partitions, success/failure, intermediate rank, timing, seed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EcsDecodeProof {
+    /// Stable schema version (load-bearing for replay tooling).
+    pub schema_version: u16,
+    /// Policy identifier used when this proof was emitted.
+    pub policy_id: u32,
     /// The object being decoded.
     pub object_id: ObjectId,
+    /// Optional changeset identifier (replication path).
+    pub changeset_id: Option<[u8; 16]>,
     /// Number of source symbols (K).
     pub k_source: u32,
+    /// Number of repair symbols configured for the decode budget (R).
+    pub repair_count: u32,
+    /// Symbol size (T) in bytes (0 when unavailable in this layer).
+    pub symbol_size: u32,
+    /// RaptorQ OTI/codec metadata hash (if available).
+    pub oti: Option<u64>,
     /// ESIs of all symbols fed to the decoder.
     pub symbols_received: Vec<u32>,
     /// Subset of received ESIs that were source symbols.
     pub source_esis: Vec<u32>,
     /// Subset of received ESIs that were repair symbols.
     pub repair_esis: Vec<u32>,
+    /// Rejected symbols and reasons (integrity/auth/format/dup).
+    pub rejected_symbols: Vec<RejectedSymbol>,
+    /// Hashes of accepted symbols for replay verification.
+    pub symbol_digests: Vec<SymbolDigest>,
     /// Whether the decode succeeded.
     pub decode_success: bool,
+    /// Failure reason when decode did not succeed.
+    pub failure_reason: Option<DecodeFailureReason>,
     /// Decoder matrix rank at success/failure (if available).
     pub intermediate_rank: Option<u32>,
     /// Timing: wall-clock nanoseconds or virtual time under `LabRuntime`.
     pub timing_ns: u64,
     /// RaptorQ seed used for encoding.
     pub seed: u64,
+    /// Redaction mode for payload material in this proof.
+    pub payload_mode: DecodeProofPayloadMode,
+    /// Optional symbol payload bytes (lab/debug only).
+    pub debug_symbol_payloads: Option<Vec<Vec<u8>>>,
+    /// Deterministic digest summary for replay verification.
+    pub input_hashes: ProofInputHashes,
 }
 
 impl EcsDecodeProof {
@@ -56,27 +162,34 @@ impl EcsDecodeProof {
         timing_ns: u64,
         seed: u64,
     ) -> Self {
-        info!(
-            bead_id = "bd-1hi.28",
-            object_id = ?object_id,
-            k_source,
-            received = symbols_received.len(),
-            source = source_esis.len(),
-            repair = repair_esis.len(),
-            timing_ns,
-            "decode proof: SUCCESS"
-        );
-        Self {
+        let proof = Self::from_parts(
             object_id,
+            None,
             k_source,
             symbols_received,
             source_esis,
             repair_esis,
-            decode_success: true,
+            Vec::new(),
+            Vec::new(),
+            true,
+            None,
             intermediate_rank,
             timing_ns,
             seed,
-        }
+        );
+        info!(
+            bead_id = "bd-awqq",
+            object_id = ?proof.object_id,
+            k_source = proof.k_source,
+            received = proof.symbols_received.len(),
+            source = proof.source_esis.len(),
+            repair = proof.repair_esis.len(),
+            timing_ns = proof.timing_ns,
+            schema_version = proof.schema_version,
+            policy_id = proof.policy_id,
+            "decode proof: SUCCESS"
+        );
+        proof
     }
 
     /// Create a proof for a failed decode operation.
@@ -92,26 +205,32 @@ impl EcsDecodeProof {
         timing_ns: u64,
         seed: u64,
     ) -> Self {
-        warn!(
-            bead_id = "bd-1hi.28",
-            object_id = ?object_id,
-            k_source,
-            received = symbols_received.len(),
-            intermediate_rank,
-            timing_ns,
-            "decode proof: FAILURE"
-        );
-        Self {
+        let proof = Self::from_parts(
             object_id,
+            None,
             k_source,
             symbols_received,
             source_esis,
             repair_esis,
-            decode_success: false,
+            Vec::new(),
+            Vec::new(),
+            false,
+            Some(DecodeFailureReason::Unknown),
             intermediate_rank,
             timing_ns,
             seed,
-        }
+        );
+        warn!(
+            bead_id = "bd-awqq",
+            object_id = ?proof.object_id,
+            k_source = proof.k_source,
+            received = proof.symbols_received.len(),
+            intermediate_rank = proof.intermediate_rank,
+            timing_ns = proof.timing_ns,
+            failure_reason = ?proof.failure_reason,
+            "decode proof: FAILURE"
+        );
+        proof
     }
 
     /// Build an `EcsDecodeProof` from raw received-symbol ESIs.
@@ -127,41 +246,41 @@ impl EcsDecodeProof {
         timing_ns: u64,
         seed: u64,
     ) -> Self {
-        let mut source_esis = Vec::new();
-        let mut repair_esis = Vec::new();
+        let mut source_partition = Vec::new();
+        let mut repair_partition = Vec::new();
         for &esi in all_esis {
             if esi < k_source {
-                source_esis.push(esi);
+                source_partition.push(esi);
             } else {
-                repair_esis.push(esi);
+                repair_partition.push(esi);
             }
         }
-        source_esis.sort_unstable();
-        repair_esis.sort_unstable();
-        let symbols_received = {
-            let mut v = all_esis.to_vec();
-            v.sort_unstable();
-            v
-        };
+        let symbols_received = canonicalize_esis(all_esis.to_vec());
+        source_partition = canonicalize_esis(source_partition);
+        repair_partition = canonicalize_esis(repair_partition);
 
         debug!(
-            bead_id = "bd-1hi.28",
-            source_count = source_esis.len(),
-            repair_count = repair_esis.len(),
+            bead_id = "bd-awqq",
+            source_count = source_partition.len(),
+            repair_count = repair_partition.len(),
             "partitioned received ESIs into source/repair"
         );
 
-        Self {
+        Self::from_parts(
             object_id,
+            None,
             k_source,
             symbols_received,
-            source_esis,
-            repair_esis,
+            source_partition,
+            repair_partition,
+            Vec::new(),
+            Vec::new(),
             decode_success,
+            (!decode_success).then_some(DecodeFailureReason::Unknown),
             intermediate_rank,
             timing_ns,
             seed,
-        }
+        )
     }
 
     /// Whether this proof records a repair operation (i.e., repair symbols used).
@@ -184,22 +303,299 @@ impl EcsDecodeProof {
     /// all ESI partitions are correct.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
-        let total = self.source_esis.len() + self.repair_esis.len();
-        if total != self.symbols_received.len() {
+        if self.schema_version != DECODE_PROOF_SCHEMA_VERSION_V1 {
             return false;
         }
-        // Source ESIs must all be < k_source
+        if self.decode_success && self.failure_reason.is_some() {
+            return false;
+        }
+        if !self.decode_success && self.failure_reason.is_none() {
+            return false;
+        }
+        if self.payload_mode == DecodeProofPayloadMode::HashesOnly
+            && self.debug_symbol_payloads.is_some()
+        {
+            return false;
+        }
+        if self.repair_count != u32::try_from(self.repair_esis.len()).unwrap_or(u32::MAX) {
+            return false;
+        }
+
+        if !is_sorted_unique(&self.symbols_received)
+            || !is_sorted_unique(&self.source_esis)
+            || !is_sorted_unique(&self.repair_esis)
+        {
+            return false;
+        }
+        if !is_sorted_unique(&self.rejected_symbols) || !is_sorted_unique(&self.symbol_digests) {
+            return false;
+        }
+
+        let mut union = self.source_esis.clone();
+        union.extend(self.repair_esis.iter().copied());
+        union = canonicalize_esis(union);
+        if union != self.symbols_received {
+            return false;
+        }
+
         if self.source_esis.iter().any(|&e| e >= self.k_source) {
             return false;
         }
-        // Repair ESIs must all be >= k_source
         if self.repair_esis.iter().any(|&e| e < self.k_source) {
             return false;
         }
-        true
+
+        if self
+            .symbol_digests
+            .iter()
+            .any(|digest| !self.symbols_received.contains(&digest.esi))
+        {
+            return false;
+        }
+
+        self.input_hashes == self.compute_input_hashes()
+    }
+
+    /// Attach changeset identity metadata and recompute integrity hashes.
+    #[must_use]
+    pub fn with_changeset_id(mut self, changeset_id: [u8; 16]) -> Self {
+        self.changeset_id = Some(changeset_id);
+        self.input_hashes = self.compute_input_hashes();
+        self
+    }
+
+    /// Attach rejected-symbol evidence and recompute integrity hashes.
+    #[must_use]
+    pub fn with_rejected_symbols(mut self, rejected_symbols: Vec<RejectedSymbol>) -> Self {
+        self.rejected_symbols = canonicalize_rejected_symbols(rejected_symbols);
+        self.input_hashes = self.compute_input_hashes();
+        self
+    }
+
+    /// Attach accepted-symbol digests and recompute integrity hashes.
+    #[must_use]
+    pub fn with_symbol_digests(mut self, symbol_digests: Vec<SymbolDigest>) -> Self {
+        self.symbol_digests = canonicalize_symbol_digests(symbol_digests);
+        self.input_hashes = self.compute_input_hashes();
+        self
+    }
+
+    /// Switch proof to debug payload mode and embed symbol payload bytes.
+    #[must_use]
+    pub fn with_debug_symbol_payloads(mut self, payloads: Vec<Vec<u8>>) -> Self {
+        self.payload_mode = DecodeProofPayloadMode::IncludeBytesLabOnly;
+        self.debug_symbol_payloads = Some(payloads);
+        self.input_hashes = self.compute_input_hashes();
+        self
+    }
+
+    /// Replay verification: ensure digest evidence matches this proof.
+    #[must_use]
+    pub fn replay_verifies(
+        &self,
+        symbol_digests: &[SymbolDigest],
+        rejected_symbols: &[RejectedSymbol],
+    ) -> bool {
+        let expected_symbol_digests = canonicalize_symbol_digests(symbol_digests.to_vec());
+        let expected_rejected = canonicalize_rejected_symbols(rejected_symbols.to_vec());
+        if self.symbol_digests != expected_symbol_digests {
+            return false;
+        }
+        if self.rejected_symbols != expected_rejected {
+            return false;
+        }
+        self.input_hashes.symbol_digests_xxh3 == hash_symbol_digests(&expected_symbol_digests)
+            && self.input_hashes.rejected_symbols_xxh3 == hash_rejected_symbols(&expected_rejected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        object_id: ObjectId,
+        changeset_id: Option<[u8; 16]>,
+        k_source: u32,
+        symbols_received: Vec<u32>,
+        source_esis: Vec<u32>,
+        repair_esis: Vec<u32>,
+        rejected_symbols: Vec<RejectedSymbol>,
+        symbol_digests: Vec<SymbolDigest>,
+        decode_success: bool,
+        failure_reason: Option<DecodeFailureReason>,
+        intermediate_rank: Option<u32>,
+        timing_ns: u64,
+        seed: u64,
+    ) -> Self {
+        let mut proof = Self {
+            schema_version: DECODE_PROOF_SCHEMA_VERSION_V1,
+            policy_id: DEFAULT_DECODE_PROOF_POLICY_ID,
+            object_id,
+            changeset_id,
+            k_source,
+            repair_count: u32::try_from(repair_esis.len()).unwrap_or(u32::MAX),
+            symbol_size: 0,
+            oti: None,
+            symbols_received: canonicalize_esis(symbols_received),
+            source_esis: canonicalize_esis(source_esis),
+            repair_esis: canonicalize_esis(repair_esis),
+            rejected_symbols: canonicalize_rejected_symbols(rejected_symbols),
+            symbol_digests: canonicalize_symbol_digests(symbol_digests),
+            decode_success,
+            failure_reason,
+            intermediate_rank,
+            timing_ns,
+            seed,
+            payload_mode: DecodeProofPayloadMode::HashesOnly,
+            debug_symbol_payloads: None,
+            input_hashes: ProofInputHashes {
+                metadata_xxh3: 0,
+                source_esis_xxh3: 0,
+                repair_esis_xxh3: 0,
+                rejected_symbols_xxh3: 0,
+                symbol_digests_xxh3: 0,
+            },
+        };
+        proof.input_hashes = proof.compute_input_hashes();
+        proof
+    }
+
+    fn compute_input_hashes(&self) -> ProofInputHashes {
+        ProofInputHashes {
+            metadata_xxh3: hash_metadata(self),
+            source_esis_xxh3: hash_u32_list("source_esis", &self.source_esis),
+            repair_esis_xxh3: hash_u32_list("repair_esis", &self.repair_esis),
+            rejected_symbols_xxh3: hash_rejected_symbols(&self.rejected_symbols),
+            symbol_digests_xxh3: hash_symbol_digests(&self.symbol_digests),
+        }
     }
 }
 
+fn canonicalize_esis(mut values: Vec<u32>) -> Vec<u32> {
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn canonicalize_rejected_symbols(mut values: Vec<RejectedSymbol>) -> Vec<RejectedSymbol> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn canonicalize_symbol_digests(mut values: Vec<SymbolDigest>) -> Vec<SymbolDigest> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn is_sorted_unique<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn hash_u32_list(domain: &str, values: &[u32]) -> u64 {
+    let mut bytes = Vec::with_capacity(domain.len() + values.len() * 4);
+    bytes.extend_from_slice(domain.as_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    xxh3_64(&bytes)
+}
+
+fn rejection_reason_code(reason: SymbolRejectionReason) -> u8 {
+    match reason {
+        SymbolRejectionReason::HashMismatch => 1,
+        SymbolRejectionReason::InvalidAuthTag => 2,
+        SymbolRejectionReason::DuplicateEsi => 3,
+        SymbolRejectionReason::FormatViolation => 4,
+    }
+}
+
+fn failure_reason_code(reason: DecodeFailureReason) -> u8 {
+    match reason {
+        DecodeFailureReason::InsufficientSymbols => 1,
+        DecodeFailureReason::RankDeficiency => 2,
+        DecodeFailureReason::IntegrityMismatch => 3,
+        DecodeFailureReason::Unknown => 255,
+    }
+}
+
+fn hash_rejected_symbols(values: &[RejectedSymbol]) -> u64 {
+    let mut bytes = Vec::with_capacity("rejected".len() + values.len() * 5);
+    bytes.extend_from_slice(b"rejected");
+    for value in values {
+        bytes.extend_from_slice(&value.esi.to_le_bytes());
+        bytes.push(rejection_reason_code(value.reason));
+    }
+    xxh3_64(&bytes)
+}
+
+fn hash_symbol_digests(values: &[SymbolDigest]) -> u64 {
+    let mut bytes = Vec::with_capacity("symbol_digests".len() + values.len() * 12);
+    bytes.extend_from_slice(b"symbol_digests");
+    for value in values {
+        bytes.extend_from_slice(&value.esi.to_le_bytes());
+        bytes.extend_from_slice(&value.digest_xxh3.to_le_bytes());
+    }
+    xxh3_64(&bytes)
+}
+
+fn hash_debug_payloads(payloads: Option<&[Vec<u8>]>) -> u64 {
+    let Some(payloads) = payloads else {
+        return 0;
+    };
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"debug_payloads");
+    for payload in payloads {
+        let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(&xxh3_64(payload).to_le_bytes());
+    }
+    xxh3_64(&bytes)
+}
+
+fn hash_metadata(proof: &EcsDecodeProof) -> u64 {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"decode_proof_metadata");
+    bytes.extend_from_slice(&proof.schema_version.to_le_bytes());
+    bytes.extend_from_slice(&proof.policy_id.to_le_bytes());
+    bytes.extend_from_slice(proof.object_id.as_bytes());
+    if let Some(changeset_id) = proof.changeset_id {
+        bytes.push(1);
+        bytes.extend_from_slice(&changeset_id);
+    } else {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&proof.k_source.to_le_bytes());
+    bytes.extend_from_slice(&proof.repair_count.to_le_bytes());
+    bytes.extend_from_slice(&proof.symbol_size.to_le_bytes());
+    bytes.extend_from_slice(&proof.seed.to_le_bytes());
+    if let Some(oti) = proof.oti {
+        bytes.push(1);
+        bytes.extend_from_slice(&oti.to_le_bytes());
+    } else {
+        bytes.push(0);
+    }
+    bytes.push(u8::from(proof.decode_success));
+    if let Some(reason) = proof.failure_reason {
+        bytes.push(1);
+        bytes.push(failure_reason_code(reason));
+    } else {
+        bytes.push(0);
+    }
+    if let Some(rank) = proof.intermediate_rank {
+        bytes.push(1);
+        bytes.extend_from_slice(&rank.to_le_bytes());
+    } else {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&proof.timing_ns.to_le_bytes());
+    bytes.push(match proof.payload_mode {
+        DecodeProofPayloadMode::HashesOnly => 0,
+        DecodeProofPayloadMode::IncludeBytesLabOnly => 1,
+    });
+    bytes.extend_from_slice(
+        &hash_debug_payloads(proof.debug_symbol_payloads.as_deref()).to_le_bytes(),
+    );
+    xxh3_64(&bytes)
+}
 // ---------------------------------------------------------------------------
 // Decode Audit Trail
 // ---------------------------------------------------------------------------
@@ -470,5 +866,90 @@ mod tests {
             !proof_extra.is_minimum_decode(),
             "K=10 received=12 should not be minimum decode"
         );
+    }
+
+    // -- bd-awqq schema tests --
+
+    #[test]
+    fn test_decode_proof_schema_versioned_defaults() {
+        let oid = test_object_id(0xAAAA);
+        let proof = EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3], true, Some(4), 42, 99);
+        assert_eq!(proof.schema_version, DECODE_PROOF_SCHEMA_VERSION_V1);
+        assert_eq!(proof.policy_id, DEFAULT_DECODE_PROOF_POLICY_ID);
+        assert_eq!(proof.payload_mode, DecodeProofPayloadMode::HashesOnly);
+        assert!(proof.debug_symbol_payloads.is_none());
+        assert!(proof.is_consistent());
+    }
+
+    #[test]
+    fn test_decode_proof_replay_verification_with_digests_and_rejections() {
+        let oid = test_object_id(0xBBBB);
+        let symbol_digests = vec![
+            SymbolDigest {
+                esi: 0,
+                digest_xxh3: 11,
+            },
+            SymbolDigest {
+                esi: 1,
+                digest_xxh3: 22,
+            },
+        ];
+        let rejected = vec![RejectedSymbol {
+            esi: 9,
+            reason: SymbolRejectionReason::InvalidAuthTag,
+        }];
+        let proof = EcsDecodeProof::from_esis(oid, 2, &[0, 1, 2], true, Some(2), 100, 17)
+            .with_symbol_digests(symbol_digests.clone())
+            .with_rejected_symbols(rejected.clone());
+
+        assert!(proof.replay_verifies(&symbol_digests, &rejected));
+        assert!(!proof.replay_verifies(
+            &[SymbolDigest {
+                esi: 0,
+                digest_xxh3: 999
+            }],
+            &rejected
+        ));
+    }
+
+    #[test]
+    fn test_decode_proof_canonicalization_is_deterministic() {
+        let oid = test_object_id(0xCCCC);
+        let a = EcsDecodeProof::from_esis(oid, 4, &[3, 0, 1, 3, 2, 4, 4], false, Some(3), 77, 5)
+            .with_rejected_symbols(vec![
+                RejectedSymbol {
+                    esi: 8,
+                    reason: SymbolRejectionReason::HashMismatch,
+                },
+                RejectedSymbol {
+                    esi: 8,
+                    reason: SymbolRejectionReason::HashMismatch,
+                },
+            ]);
+        let b = EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3, 4], false, Some(3), 77, 5)
+            .with_rejected_symbols(vec![RejectedSymbol {
+                esi: 8,
+                reason: SymbolRejectionReason::HashMismatch,
+            }]);
+        assert_eq!(a, b, "canonicalization must make output deterministic");
+        assert!(a.is_consistent());
+    }
+
+    #[test]
+    fn test_decode_proof_failure_reason_consistency() {
+        let oid = test_object_id(0xDDDD);
+        let proof = EcsDecodeProof::failure(
+            oid,
+            8,
+            vec![0, 1, 2],
+            vec![0, 1, 2],
+            vec![],
+            Some(3),
+            900,
+            33,
+        );
+        assert_eq!(proof.failure_reason, Some(DecodeFailureReason::Unknown));
+        assert!(!proof.decode_success);
+        assert!(proof.is_consistent());
     }
 }
