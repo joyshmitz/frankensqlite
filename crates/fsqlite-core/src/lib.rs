@@ -11,6 +11,7 @@ pub mod epoch;
 pub mod raptorq_integration;
 pub mod region;
 pub mod repair_symbols;
+pub mod source_block_partition;
 pub mod symbol_size_policy;
 
 use std::num::NonZeroUsize;
