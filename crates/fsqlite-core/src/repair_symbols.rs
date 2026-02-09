@@ -21,8 +21,11 @@
 //! This makes "the object" a platonic mathematical entity: any replica can
 //! regenerate missing repair symbols (within policy) without coordination.
 
+use std::collections::HashMap;
+use std::fmt;
+
 use fsqlite_types::ObjectId;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 // ---------------------------------------------------------------------------
@@ -34,6 +37,21 @@ pub const DEFAULT_SLACK_DECODE: u32 = 2;
 
 /// Default overhead percentage.
 pub const DEFAULT_OVERHEAD_PERCENT: u32 = 20;
+
+/// E-value threshold at which failure drift alerts fire.
+pub const DEFAULT_FAILURE_ALERT_THRESHOLD: f64 = 20.0;
+
+/// Wilson interval z-score used for conservative upper-bound monitoring.
+pub const DEFAULT_WILSON_Z: f64 = 3.0;
+
+/// Default debug throttling interval for monitor updates.
+pub const DEFAULT_DEBUG_EVERY_ATTEMPTS: u64 = 64;
+
+/// Minimum sample count before WARN drift diagnostics are emitted.
+pub const MIN_ATTEMPTS_FOR_WARN: u64 = 64;
+
+/// Minimum sample count before INFO alert decisions are emitted.
+pub const MIN_ATTEMPTS_FOR_ALERT: u64 = 128;
 
 // ---------------------------------------------------------------------------
 // Repair Config
@@ -182,6 +200,519 @@ pub struct OverheadRetuneEntry {
     pub new_loss_fraction_max_permille: u32,
     /// K_source at the time of retune.
     pub k_source: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Failure Probability Monitoring (§3.1.1)
+// ---------------------------------------------------------------------------
+
+/// Object type for decode-attempt telemetry bucketing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecodeObjectType {
+    /// WAL commit-group decode.
+    WalCommitGroup,
+    /// Snapshot block decode.
+    SnapshotBlock,
+    /// Generic ECS object decode.
+    EcsObject,
+}
+
+/// Decode attempt sample used by failure-rate monitoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeAttempt {
+    /// Number of source symbols K.
+    pub k_source: u32,
+    /// Number of received symbols used for decode.
+    pub symbols_received: u32,
+    /// Overhead symbols (`symbols_received - k_source`, saturating).
+    pub overhead: u32,
+    /// Symbol size in bytes.
+    pub symbol_size: u32,
+    /// `true` if decode succeeded.
+    pub success: bool,
+    /// Decode duration in microseconds.
+    pub decode_time_us: u64,
+    /// Decode object class.
+    pub object_type: DecodeObjectType,
+}
+
+impl DecodeAttempt {
+    /// Create a decode-attempt sample.
+    #[must_use]
+    pub const fn new(
+        k_source: u32,
+        symbols_received: u32,
+        symbol_size: u32,
+        success: bool,
+        decode_time_us: u64,
+        object_type: DecodeObjectType,
+    ) -> Self {
+        Self {
+            k_source,
+            symbols_received,
+            overhead: symbols_received.saturating_sub(k_source),
+            symbol_size,
+            success,
+            decode_time_us,
+            object_type,
+        }
+    }
+}
+
+/// K-buckets used by the monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KRangeBucket {
+    /// K in [1, 10].
+    K1To10,
+    /// K in [11, 100].
+    K11To100,
+    /// K in [101, 1000].
+    K101To1000,
+    /// K in [1001, 10000].
+    K1001To10000,
+    /// K in [10001, 56403].
+    K10001To56403,
+    /// K outside RFC 6330 V1 block limit.
+    KAbove56403,
+}
+
+impl KRangeBucket {
+    /// Map a `k_source` value to its monitor bucket.
+    #[must_use]
+    pub const fn from_k(k_source: u32) -> Self {
+        match k_source {
+            0..=10 => Self::K1To10,
+            11..=100 => Self::K11To100,
+            101..=1000 => Self::K101To1000,
+            1001..=10_000 => Self::K1001To10000,
+            10_001..=56_403 => Self::K10001To56403,
+            _ => Self::KAbove56403,
+        }
+    }
+}
+
+impl fmt::Display for KRangeBucket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::K1To10 => write!(f, "[1,10]"),
+            Self::K11To100 => write!(f, "[11,100]"),
+            Self::K101To1000 => write!(f, "[101,1000]"),
+            Self::K1001To10000 => write!(f, "[1001,10000]"),
+            Self::K10001To56403 => write!(f, "[10001,56403]"),
+            Self::KAbove56403 => write!(f, ">56403"),
+        }
+    }
+}
+
+/// Monitor bucket key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FailureBucketKey {
+    /// K-range bucket.
+    pub k_range: KRangeBucket,
+    /// Overhead bucket: 0, 1, 2, or 3 (= 3+).
+    pub overhead_bucket: u32,
+}
+
+impl FailureBucketKey {
+    /// Build a bucket key from an attempt.
+    #[must_use]
+    pub const fn from_attempt(attempt: DecodeAttempt) -> Self {
+        let overhead_bucket = if attempt.overhead > 3 {
+            3
+        } else {
+            attempt.overhead
+        };
+        Self {
+            k_range: KRangeBucket::from_k(attempt.k_source),
+            overhead_bucket,
+        }
+    }
+}
+
+/// E-process state for one `(K-range, overhead)` bucket.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FailureEProcessState {
+    /// Running e-value.
+    pub e_value: f64,
+    /// Observed attempts in this bucket.
+    pub total_attempts: u64,
+    /// Observed failures in this bucket.
+    pub total_failures: u64,
+    /// Null bound `P_fail <= null_rate`.
+    pub null_rate: f64,
+    /// Alert threshold on e-value.
+    pub alert_threshold: f64,
+    /// Conservative upper bound on observed failure rate.
+    pub p_upper: f64,
+    /// Whether a WARN has already been emitted.
+    pub warned: bool,
+    /// Whether an INFO alert has already been emitted.
+    pub alerted: bool,
+}
+
+impl FailureEProcessState {
+    /// Create a fresh e-process state.
+    #[must_use]
+    pub const fn new(null_rate: f64, alert_threshold: f64) -> Self {
+        Self {
+            e_value: 1.0,
+            total_attempts: 0,
+            total_failures: 0,
+            null_rate,
+            alert_threshold,
+            p_upper: 1.0,
+            warned: false,
+            alerted: false,
+        }
+    }
+
+    /// Point estimate (for diagnostics only, not alerting decisions).
+    #[must_use]
+    pub fn observed_rate_point(self) -> f64 {
+        if self.total_attempts == 0 {
+            0.0
+        } else {
+            self.total_failures as f64 / self.total_attempts as f64
+        }
+    }
+}
+
+/// Monitor log levels aligned to harness logging standards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorLogLevel {
+    /// DEBUG-level diagnostic event.
+    Debug,
+    /// INFO-level alert event.
+    Info,
+    /// WARN-level approaching-threshold event.
+    Warn,
+    /// ERROR-level unrecoverable event.
+    Error,
+}
+
+/// Structured monitor event emitted by [`FailureRateMonitor::update`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MonitorEvent {
+    /// Event severity.
+    pub level: MonitorLogLevel,
+    /// Bucket for this event.
+    pub bucket: FailureBucketKey,
+    /// Attempts observed in this bucket.
+    pub attempts: u64,
+    /// Failures observed in this bucket.
+    pub failures: u64,
+    /// Current e-value for the bucket.
+    pub e_value: f64,
+    /// Conservative upper bound for failure rate.
+    pub p_upper: f64,
+    /// Null-rate budget for the bucket.
+    pub null_rate: f64,
+    /// Static event message.
+    pub message: &'static str,
+}
+
+/// Result of updating the failure monitor with one attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MonitorUpdate {
+    /// Bucket that was updated.
+    pub bucket: FailureBucketKey,
+    /// Updated state snapshot.
+    pub state: FailureEProcessState,
+    /// Emitted monitor events for this update.
+    pub events: Vec<MonitorEvent>,
+}
+
+/// Runtime monitor for RaptorQ decode failure probability (§3.1.1).
+#[derive(Debug)]
+pub struct FailureRateMonitor {
+    buckets: HashMap<FailureBucketKey, FailureEProcessState>,
+    debug_every_attempts: u64,
+    wilson_z: f64,
+}
+
+impl FailureRateMonitor {
+    /// Create a monitor with default policy.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            debug_every_attempts: DEFAULT_DEBUG_EVERY_ATTEMPTS,
+            wilson_z: DEFAULT_WILSON_Z,
+        }
+    }
+
+    /// Create a monitor with explicit debug and confidence controls.
+    #[must_use]
+    pub fn with_policy(debug_every_attempts: u64, wilson_z: f64) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            debug_every_attempts: debug_every_attempts.max(1),
+            wilson_z: if wilson_z > 0.0 {
+                wilson_z
+            } else {
+                DEFAULT_WILSON_Z
+            },
+        }
+    }
+
+    /// Read state for a specific bucket.
+    #[must_use]
+    pub fn state_for(&self, key: FailureBucketKey) -> Option<FailureEProcessState> {
+        self.buckets.get(&key).copied()
+    }
+
+    /// Adaptive redundancy signal: increase repair overhead under drift.
+    ///
+    /// Returns:
+    /// - `0` when no adjustment is needed
+    /// - `1` when warning-level drift is observed
+    /// - `2` when alert-level drift is observed
+    #[must_use]
+    pub fn recommended_redundancy_bump(&self, attempt: DecodeAttempt) -> u32 {
+        let key = FailureBucketKey::from_attempt(attempt);
+        let Some(state) = self.state_for(key) else {
+            return 0;
+        };
+        if state.alerted {
+            2
+        } else {
+            u32::from(state.warned)
+        }
+    }
+
+    /// Update monitor state with one decode attempt.
+    #[allow(clippy::too_many_lines)]
+    pub fn update(&mut self, attempt: DecodeAttempt) -> MonitorUpdate {
+        let bucket = FailureBucketKey::from_attempt(attempt);
+        let null_rate = conservative_null_rate(bucket.overhead_bucket);
+        let state = self.buckets.entry(bucket).or_insert_with(|| {
+            FailureEProcessState::new(null_rate, DEFAULT_FAILURE_ALERT_THRESHOLD)
+        });
+
+        let x = if attempt.success { 0.0 } else { 1.0 };
+        let lambda = eprocess_bet_size(state.null_rate);
+        let factor = lambda.mul_add(x - state.null_rate, 1.0).max(1e-12);
+        state.e_value *= factor;
+        state.total_attempts += 1;
+        if !attempt.success {
+            state.total_failures += 1;
+        }
+        state.p_upper =
+            wilson_upper_bound(state.total_failures, state.total_attempts, self.wilson_z);
+
+        let mut events = Vec::new();
+        let should_emit_debug =
+            !attempt.success || state.total_attempts % self.debug_every_attempts == 0;
+        if should_emit_debug {
+            debug!(
+                k_range = %bucket.k_range,
+                overhead_bucket = bucket.overhead_bucket,
+                attempts = state.total_attempts,
+                failures = state.total_failures,
+                p_upper = state.p_upper,
+                p_hat = state.observed_rate_point(),
+                null_rate = state.null_rate,
+                e_value = state.e_value,
+                decode_time_us = attempt.decode_time_us,
+                symbol_size = attempt.symbol_size,
+                object_type = ?attempt.object_type,
+                "failure monitor update"
+            );
+            events.push(MonitorEvent {
+                level: MonitorLogLevel::Debug,
+                bucket,
+                attempts: state.total_attempts,
+                failures: state.total_failures,
+                e_value: state.e_value,
+                p_upper: state.p_upper,
+                null_rate: state.null_rate,
+                message: "failure monitor update",
+            });
+        }
+
+        let warn_rate_budget = (state.null_rate * 1.25).max(0.08);
+        let near_threshold = state.total_attempts >= MIN_ATTEMPTS_FOR_WARN
+            && (state.e_value >= state.alert_threshold * 0.5 || state.p_upper > warn_rate_budget);
+        if near_threshold && !state.warned {
+            state.warned = true;
+            warn!(
+                k_range = %bucket.k_range,
+                overhead_bucket = bucket.overhead_bucket,
+                attempts = state.total_attempts,
+                failures = state.total_failures,
+                p_upper = state.p_upper,
+                null_rate = state.null_rate,
+                e_value = state.e_value,
+                "decode failure drift approaching threshold"
+            );
+            events.push(MonitorEvent {
+                level: MonitorLogLevel::Warn,
+                bucket,
+                attempts: state.total_attempts,
+                failures: state.total_failures,
+                e_value: state.e_value,
+                p_upper: state.p_upper,
+                null_rate: state.null_rate,
+                message: "decode failure drift approaching threshold",
+            });
+        }
+
+        let alert_rate_budget = (state.null_rate * 2.0).max(0.15);
+        let alert = state.total_attempts >= MIN_ATTEMPTS_FOR_ALERT
+            && (state.e_value >= state.alert_threshold || state.p_upper > alert_rate_budget);
+        if alert && !state.alerted {
+            state.alerted = true;
+            info!(
+                k_range = %bucket.k_range,
+                overhead_bucket = bucket.overhead_bucket,
+                attempts = state.total_attempts,
+                failures = state.total_failures,
+                p_upper = state.p_upper,
+                null_rate = state.null_rate,
+                e_value = state.e_value,
+                "decode failure drift alert triggered"
+            );
+            events.push(MonitorEvent {
+                level: MonitorLogLevel::Info,
+                bucket,
+                attempts: state.total_attempts,
+                failures: state.total_failures,
+                e_value: state.e_value,
+                p_upper: state.p_upper,
+                null_rate: state.null_rate,
+                message: "decode failure drift alert triggered",
+            });
+        }
+
+        let k_plus_two_failure = !attempt.success
+            && attempt.symbols_received >= attempt.k_source.saturating_add(2)
+            && attempt.k_source > 0;
+        if k_plus_two_failure {
+            error!(
+                k_source = attempt.k_source,
+                symbols_received = attempt.symbols_received,
+                overhead = attempt.overhead,
+                symbol_size = attempt.symbol_size,
+                object_type = ?attempt.object_type,
+                "decode failed despite conservative K+2 policy"
+            );
+            events.push(MonitorEvent {
+                level: MonitorLogLevel::Error,
+                bucket,
+                attempts: state.total_attempts,
+                failures: state.total_failures,
+                e_value: state.e_value,
+                p_upper: state.p_upper,
+                null_rate: state.null_rate,
+                message: "decode failed despite conservative K+2 policy",
+            });
+        }
+
+        MonitorUpdate {
+            bucket,
+            state: *state,
+            events,
+        }
+    }
+}
+
+impl Default for FailureRateMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Conservative null-rate bound from RFC 6330 Annex B guidance.
+#[must_use]
+pub const fn conservative_null_rate(overhead_bucket: u32) -> f64 {
+    match overhead_bucket {
+        0 => 0.02,
+        1 => 0.001,
+        _ => 0.000_01,
+    }
+}
+
+/// Betting weight for the one-step e-process update.
+#[must_use]
+pub fn eprocess_bet_size(null_rate: f64) -> f64 {
+    if null_rate <= 0.001 { 0.5 } else { 0.75 }
+}
+
+/// Conservative upper bound for Bernoulli failure probability via Wilson interval.
+#[must_use]
+pub fn wilson_upper_bound(failures: u64, attempts: u64, z: f64) -> f64 {
+    if attempts == 0 {
+        return 1.0;
+    }
+
+    let n = attempts as f64;
+    let p_hat = failures as f64 / n;
+    let z2 = z * z;
+    let center = p_hat + z2 / (2.0 * n);
+    let margin = z * (p_hat.mul_add(1.0 - p_hat, z2 / (4.0 * n)) / n).sqrt();
+    ((center + margin) / (1.0 + z2 / n)).clamp(0.0, 1.0)
+}
+
+/// Decode-failure probability under i.i.d. symbol loss.
+///
+/// Formula: `P(loss) = Σ_{i=(N-K+1)}^{N} C(N,i) p^i (1-p)^(N-i)`.
+///
+/// Where:
+/// - `N` = `total_symbols`
+/// - `K` = `k_required`
+/// - `p` = per-symbol loss probability
+#[must_use]
+pub fn failure_probability_formula(
+    total_symbols: u32,
+    k_required: u32,
+    loss_probability: f64,
+) -> f64 {
+    if k_required == 0 {
+        return 0.0;
+    }
+    if k_required > total_symbols {
+        return 1.0;
+    }
+
+    let p = loss_probability.clamp(0.0, 1.0);
+    if p <= f64::EPSILON {
+        return 0.0;
+    }
+    if (1.0 - p) <= f64::EPSILON {
+        return 1.0;
+    }
+
+    let max_losses_without_failure = total_symbols - k_required;
+    let mut probability = 0.0;
+    for losses in max_losses_without_failure + 1..=total_symbols {
+        probability += binomial_probability(total_symbols, losses, p);
+    }
+    probability.clamp(0.0, 1.0)
+}
+
+fn binomial_probability(n: u32, k: u32, p: f64) -> f64 {
+    if k > n {
+        return 0.0;
+    }
+    let ln_comb = ln_n_choose_k(n, k);
+    let failures_term = f64::from(k) * p.ln();
+    let successes_term = f64::from(n - k) * (1.0 - p).ln();
+    (ln_comb + failures_term + successes_term).exp()
+}
+
+fn ln_n_choose_k(n: u32, k: u32) -> f64 {
+    let k_small = k.min(n - k);
+    if k_small == 0 {
+        return 0.0;
+    }
+
+    let mut acc = 0.0;
+    for i in 1..=k_small {
+        let numerator = f64::from(n - k_small + i);
+        let denominator = f64::from(i);
+        acc += (numerator / denominator).ln();
+    }
+    acc
 }
 
 /// Record an adaptive overhead retune in the evidence ledger (§3.5.3).
@@ -448,5 +979,133 @@ mod tests {
                 b_high.loss_fraction_max_permille
             );
         }
+    }
+
+    // -- bd-1hi.7 test 9: test_failure_probability_formula --
+
+    #[test]
+    fn test_failure_probability_formula() {
+        // N=3, K=2, p=0.1:
+        // P(loss) = C(3,2)*0.1^2*0.9 + C(3,3)*0.1^3 = 0.027 + 0.001 = 0.028
+        let p = failure_probability_formula(3, 2, 0.1);
+        assert!((p - 0.028).abs() < 1e-12, "expected 0.028, got {p:.12}");
+
+        // Exactly-K decode with N=K=5 and p=0.2:
+        // failure when >=1 symbol lost => 1 - (0.8^5) = 0.67232
+        let p = failure_probability_formula(5, 5, 0.2);
+        assert!(
+            (p - 0.672_32).abs() < 1e-10,
+            "expected 0.67232, got {p:.12}"
+        );
+    }
+
+    // -- bd-1hi.7 test 10: test_failure_monitoring_e_process --
+
+    #[test]
+    fn test_failure_monitoring_e_process() {
+        let mut monitor = FailureRateMonitor::new();
+        let attempt = DecodeAttempt::new(100, 102, 4096, true, 250, DecodeObjectType::EcsObject);
+
+        for _ in 0..500 {
+            let _ = monitor.update(attempt);
+        }
+
+        let key = FailureBucketKey::from_attempt(attempt);
+        let state = monitor
+            .state_for(key)
+            .expect("monitor state should exist after updates");
+
+        assert_eq!(state.total_attempts, 500);
+        assert_eq!(state.total_failures, 0);
+        assert!(
+            state.e_value < 1.0,
+            "success-only stream should not inflate e-value"
+        );
+        assert!(
+            !state.alerted,
+            "no alert expected under stable success stream"
+        );
+    }
+
+    // -- bd-1hi.7 test 11: test_failure_alert_on_drift --
+
+    #[test]
+    fn test_failure_alert_on_drift() {
+        let mut monitor = FailureRateMonitor::new();
+
+        // Baseline stable period.
+        for _ in 0..100 {
+            let _ = monitor.update(DecodeAttempt::new(
+                100,
+                102,
+                4096,
+                true,
+                250,
+                DecodeObjectType::WalCommitGroup,
+            ));
+        }
+
+        // Deterministic elevated-failure phase.
+        let mut saw_alert = false;
+        for i in 0..500 {
+            let success = i % 3 != 0; // ~33% failures, far above K+2 null.
+            let update = monitor.update(DecodeAttempt::new(
+                100,
+                102,
+                4096,
+                success,
+                250,
+                DecodeObjectType::WalCommitGroup,
+            ));
+            saw_alert |= update
+                .events
+                .iter()
+                .any(|event| event.level == MonitorLogLevel::Info);
+        }
+
+        assert!(
+            saw_alert,
+            "monitor must emit INFO alert when drift exceeds conservative envelope"
+        );
+    }
+
+    // -- bd-1hi.7 test 12: test_failure_p_upper_conservative --
+
+    #[test]
+    fn test_failure_p_upper_conservative() {
+        let mut monitor = FailureRateMonitor::with_policy(8, DEFAULT_WILSON_Z);
+
+        // 1 failure in 100 observations.
+        for i in 0..100 {
+            let success = i != 50;
+            let _ = monitor.update(DecodeAttempt::new(
+                100,
+                100,
+                4096,
+                success,
+                300,
+                DecodeObjectType::SnapshotBlock,
+            ));
+        }
+
+        let key = FailureBucketKey {
+            k_range: KRangeBucket::K11To100,
+            overhead_bucket: 0,
+        };
+        let state = monitor
+            .state_for(key)
+            .expect("state should exist for overhead-0 bucket");
+
+        let p_hat = state.observed_rate_point();
+        assert!(
+            state.p_upper >= p_hat,
+            "p_upper must be conservative: p_upper={} p_hat={}",
+            state.p_upper,
+            p_hat
+        );
+        assert!(
+            state.p_upper > 0.01,
+            "with 1/100 failures and z=3, p_upper should stay conservative"
+        );
     }
 }

@@ -1056,7 +1056,7 @@ mod tests {
 
             let mut decode_ready = false;
             for pkt in &packets {
-                if let Ok(PacketResult::DecodeReady) = receiver.process_packet(pkt) {
+                if matches!(receiver.process_packet(pkt), Ok(PacketResult::DecodeReady)) {
                     decode_ready = true;
                     break;
                 }
@@ -1185,20 +1185,16 @@ mod tests {
 
         let mut decode_count = 0_u32;
         for pkt in &all_packets {
-            match receiver.process_packet(pkt) {
-                Ok(PacketResult::DecodeReady) => {
-                    decode_count += 1;
-                    // Apply immediately and reset if needed.
-                    if receiver.state() == ReceiverState::Applying {
-                        let _ = receiver.apply_pending();
-                        // If more decoders remain, go back to collecting.
-                        if !receiver.decoders.is_empty() {
-                            receiver.state = ReceiverState::Collecting;
-                        }
+            if matches!(receiver.process_packet(pkt), Ok(PacketResult::DecodeReady)) {
+                decode_count += 1;
+                // Apply immediately and reset if needed.
+                if receiver.state() == ReceiverState::Applying {
+                    let _ = receiver.apply_pending();
+                    // If more decoders remain, go back to collecting.
+                    if !receiver.decoders.is_empty() {
+                        receiver.state = ReceiverState::Collecting;
                     }
                 }
-                Ok(_) => {}
-                Err(_) => {} // May error if state transitions are unexpected
             }
         }
 
