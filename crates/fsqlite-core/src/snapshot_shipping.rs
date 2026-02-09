@@ -1216,7 +1216,7 @@ mod tests {
         let page_size = 256_u32;
         let n_pages = 30_u32;
         let original_pages = make_pages(page_size, &(1..=n_pages).collect::<Vec<_>>());
-        let mut pages = original_pages.clone();
+        let mut pages = original_pages;
 
         let config = SenderConfig {
             symbol_size: 256,

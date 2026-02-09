@@ -1336,6 +1336,8 @@ pub enum TransactionMode {
     Deferred,
     Immediate,
     Exclusive,
+    /// FrankenSQLite extension: MVCC concurrent writer mode with Snapshot Isolation.
+    Concurrent,
 }
 
 /// A ROLLBACK statement.

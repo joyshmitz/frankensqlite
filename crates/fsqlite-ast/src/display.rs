@@ -1471,6 +1471,7 @@ impl fmt::Display for TransactionMode {
             Self::Deferred => "DEFERRED",
             Self::Immediate => "IMMEDIATE",
             Self::Exclusive => "EXCLUSIVE",
+            Self::Concurrent => "CONCURRENT",
         })
     }
 }

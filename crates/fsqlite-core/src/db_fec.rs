@@ -848,12 +848,12 @@ mod tests {
     fn test_segment_offset_o1() {
         let page_size: u32 = 4096;
         let seg1_len = group_segment_size(1, HEADER_PAGE_R_REPAIR, page_size);
-        let segg_len = group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, page_size);
+        let general_seg_len = group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, page_size);
 
         // Sequential layout check.
         for g in 0..10_u32 {
-            let off = segment_offset(g, seg1_len, segg_len);
-            let expected = DB_FEC_HEADER_SIZE + seg1_len + g as usize * segg_len;
+            let off = segment_offset(g, seg1_len, general_seg_len);
+            let expected = DB_FEC_HEADER_SIZE + seg1_len + g as usize * general_seg_len;
             assert_eq!(off, expected, "segment offset mismatch for g={g}");
         }
     }
@@ -951,7 +951,7 @@ mod tests {
         let page_data: Vec<Vec<u8>> = (0..4_u8).map(|i| vec![i + 1; page_size as usize]).collect();
         let hashes: Vec<[u8; 16]> = page_data.iter().map(|d| page_xxh3_128(d)).collect();
         let digest = compute_db_gen_digest(1, 5, 0, 1);
-        let meta = DbFecGroupMeta::new(page_size, 2, 4, 4, hashes.clone(), digest);
+        let meta = DbFecGroupMeta::new(page_size, 2, 4, 4, hashes, digest);
 
         // Compute XOR parity of all 4 source pages.
         let mut parity = vec![0u8; page_size as usize];
@@ -1060,8 +1060,7 @@ mod tests {
     #[test]
     fn test_overflow_threshold_g64_r4() {
         // Overhead = R/G = 4/64 = 6.25%.
-        #[allow(clippy::cast_precision_loss)]
-        let overhead = DEFAULT_R_REPAIR as f64 / DEFAULT_GROUP_SIZE as f64;
+        let overhead = f64::from(DEFAULT_R_REPAIR) / f64::from(DEFAULT_GROUP_SIZE);
         assert!((overhead - 0.0625).abs() < f64::EPSILON);
     }
 
@@ -1077,11 +1076,11 @@ mod tests {
         // is computed from the full-group formula for stable seekability).
         let page_size = 4096_u32;
         let seg1_len = group_segment_size(1, HEADER_PAGE_R_REPAIR, page_size);
-        let segg_len = group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, page_size);
-        let off = segment_offset(1, seg1_len, segg_len);
+        let general_seg_len = group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, page_size);
+        let off = segment_offset(1, seg1_len, general_seg_len);
         assert_eq!(
             off,
-            DB_FEC_HEADER_SIZE + seg1_len + segg_len,
+            DB_FEC_HEADER_SIZE + seg1_len + general_seg_len,
             "second full-group offset"
         );
     }
@@ -1151,10 +1150,12 @@ mod tests {
 
         // Verify segment offset monotonicity.
         let seg1_len = group_segment_size(1, HEADER_PAGE_R_REPAIR, page_size);
-        let segg_len = group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, page_size);
+        let general_seg_len = group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, page_size);
         let mut prev_off = 0;
-        for g in 0..groups.len().saturating_sub(1) as u32 {
-            let off = segment_offset(g, seg1_len, segg_len);
+        #[allow(clippy::cast_possible_truncation)]
+        let group_count = groups.len().saturating_sub(1) as u32;
+        for g in 0..group_count {
+            let off = segment_offset(g, seg1_len, general_seg_len);
             assert!(
                 off > prev_off || g == 0,
                 "offsets must be monotonically increasing"
@@ -1180,19 +1181,19 @@ mod tests {
     fn prop_group_segment_sizes_consistent() {
         for ps in [512_u32, 1024, 4096, 8192, 16384, 32768, 65536] {
             let seg1 = group_segment_size(1, HEADER_PAGE_R_REPAIR, ps);
-            let segg = group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, ps);
+            let general_seg = group_segment_size(DEFAULT_GROUP_SIZE, DEFAULT_R_REPAIR, ps);
 
             // seg1 should be smaller (fewer source pages = fewer hashes).
-            assert!(seg1 < segg, "page-1 segment should be smaller");
+            assert!(seg1 < general_seg, "page-1 segment should be smaller");
 
             // Verify formula: meta_size + R * page_size.
             let expected_seg1 = DbFecGroupMeta::serialized_size_for(1)
                 + HEADER_PAGE_R_REPAIR as usize * ps as usize;
             assert_eq!(seg1, expected_seg1);
 
-            let expected_segg = DbFecGroupMeta::serialized_size_for(DEFAULT_GROUP_SIZE)
+            let expected_general_seg = DbFecGroupMeta::serialized_size_for(DEFAULT_GROUP_SIZE)
                 + DEFAULT_R_REPAIR as usize * ps as usize;
-            assert_eq!(segg, expected_segg);
+            assert_eq!(general_seg, expected_general_seg);
         }
     }
 }
