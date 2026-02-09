@@ -166,6 +166,67 @@ pub fn geopoly_within(inner: &[Point], outer: &[Point]) -> bool {
         .all(|point| geopoly_contains_point(outer, point))
 }
 
+#[must_use]
+pub fn geopoly_ccw(vertices: &[Point]) -> Vec<Point> {
+    if vertices.len() < 3 {
+        return vertices.to_vec();
+    }
+
+    let mut normalized = vertices.to_vec();
+    if signed_twice_area(&normalized) < 0.0 {
+        normalized.reverse();
+    }
+    normalized
+}
+
+#[must_use]
+pub fn geopoly_regular(center_x: f64, center_y: f64, radius: f64, sides: usize) -> Vec<Point> {
+    if sides < 3 || !radius.is_finite() || radius <= 0.0 {
+        return Vec::new();
+    }
+
+    let Ok(sides_u32) = u32::try_from(sides) else {
+        return Vec::new();
+    };
+    let Ok(capacity) = usize::try_from(sides_u32) else {
+        return Vec::new();
+    };
+
+    let step = std::f64::consts::TAU / f64::from(sides_u32);
+    let mut vertices = Vec::with_capacity(capacity);
+    for index in 0..sides_u32 {
+        let angle = step * f64::from(index);
+        vertices.push(Point::new(
+            center_x + (radius * angle.cos()),
+            center_y + (radius * angle.sin()),
+        ));
+    }
+
+    vertices
+}
+
+#[must_use]
+pub fn geopoly_xform(
+    vertices: &[Point],
+    a: f64,
+    b: f64,
+    c: f64,
+    d: f64,
+    e: f64,
+    f: f64,
+) -> Vec<Point> {
+    vertices
+        .iter()
+        .copied()
+        .map(|vertex| {
+            Point::new(
+                a.mul_add(vertex.x, b.mul_add(vertex.y, e)),
+                c.mul_add(vertex.x, d.mul_add(vertex.y, f)),
+            )
+        })
+        .collect()
+}
+
 fn segments_intersect(a_start: Point, a_end: Point, b_start: Point, b_end: Point) -> bool {
     let o1 = orientation(a_start, a_end, b_start);
     let o2 = orientation(a_start, a_end, b_end);
@@ -215,11 +276,26 @@ fn point_on_segment(start: Point, end: Point, point: Point) -> bool {
         && point.y <= start.y.max(end.y)
 }
 
+fn signed_twice_area(vertices: &[Point]) -> f64 {
+    if vertices.len() < 3 {
+        return 0.0;
+    }
+
+    let mut twice_area = 0.0;
+    for index in 0..vertices.len() {
+        let current = vertices[index];
+        let next = vertices[(index + 1) % vertices.len()];
+        twice_area += current.x.mul_add(next.y, -(next.x * current.y));
+    }
+    twice_area
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Point, extension_name, geopoly_area, geopoly_bbox, geopoly_contains_point,
-        geopoly_group_bbox, geopoly_overlap, geopoly_within,
+        geopoly_ccw, geopoly_group_bbox, geopoly_overlap, geopoly_regular, geopoly_within,
+        geopoly_xform, signed_twice_area,
     };
 
     fn approx_eq(left: f64, right: f64) -> bool {
@@ -304,5 +380,36 @@ mod tests {
         assert!(approx_eq(grouped.min_y, -2.0));
         assert!(approx_eq(grouped.max_x, 7.0));
         assert!(approx_eq(grouped.max_y, 1.0));
+    }
+
+    #[test]
+    fn test_geopoly_regular_hexagon() {
+        let hexagon = geopoly_regular(0.0, 0.0, 2.0, 6);
+        assert_eq!(hexagon.len(), 6);
+        for vertex in &hexagon {
+            let distance = (vertex.x * vertex.x + vertex.y * vertex.y).sqrt();
+            assert!(approx_eq(distance, 2.0));
+        }
+    }
+
+    #[test]
+    fn test_geopoly_ccw_winding() {
+        let clockwise = [
+            Point::new(0.0, 0.0),
+            Point::new(0.0, 1.0),
+            Point::new(1.0, 1.0),
+            Point::new(1.0, 0.0),
+        ];
+        assert!(signed_twice_area(&clockwise) < 0.0);
+        let ccw = geopoly_ccw(&clockwise);
+        assert!(signed_twice_area(&ccw) > 0.0);
+    }
+
+    #[test]
+    fn test_geopoly_xform_translate() {
+        let polygon = square(1.0, 2.0, 1.0);
+        let translated = geopoly_xform(&polygon, 1.0, 0.0, 0.0, 1.0, 5.0, -3.0);
+        assert!(approx_eq(translated[0].x, 6.0));
+        assert!(approx_eq(translated[0].y, -1.0));
     }
 }
