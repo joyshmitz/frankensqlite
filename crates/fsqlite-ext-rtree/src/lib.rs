@@ -1242,4 +1242,352 @@ mod tests {
         // Union is [0,3,0,3] = 9, a volume = 4, enlargement = 5
         assert!(approx_eq(a.enlargement(&b), 5.0));
     }
+
+    // ── MBoundingBox: construction edge cases ────────────────────────────
+
+    #[test]
+    fn test_mbounding_box_odd_length_fails() {
+        assert!(MBoundingBox::new(vec![1.0, 2.0, 3.0]).is_none());
+    }
+
+    #[test]
+    fn test_mbounding_box_empty_fails() {
+        assert!(MBoundingBox::new(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn test_mbounding_box_1d() {
+        let bbox = MBoundingBox::new(vec![5.0, 10.0]).unwrap();
+        assert_eq!(bbox.dimensions(), 1);
+        assert!(approx_eq(bbox.min_coord(0), 5.0));
+        assert!(approx_eq(bbox.max_coord(0), 10.0));
+    }
+
+    #[test]
+    fn test_mbounding_box_volume_1d() {
+        let bbox = MBoundingBox::new(vec![0.0, 7.0]).unwrap();
+        assert!(approx_eq(bbox.volume(), 7.0));
+    }
+
+    #[test]
+    fn test_mbounding_box_union() {
+        let a = MBoundingBox::new(vec![0.0, 2.0, 0.0, 2.0]).unwrap();
+        let b = MBoundingBox::new(vec![1.0, 5.0, 1.0, 5.0]).unwrap();
+        let u = a.union(&b);
+        assert!(approx_eq(u.min_coord(0), 0.0));
+        assert!(approx_eq(u.max_coord(0), 5.0));
+        assert!(approx_eq(u.min_coord(1), 0.0));
+        assert!(approx_eq(u.max_coord(1), 5.0));
+    }
+
+    #[test]
+    fn test_mbounding_box_no_overlap_disjoint() {
+        let a = MBoundingBox::new(vec![0.0, 1.0, 0.0, 1.0]).unwrap();
+        let b = MBoundingBox::new(vec![5.0, 6.0, 5.0, 6.0]).unwrap();
+        assert!(!a.overlaps(&b));
+        assert!(!b.overlaps(&a));
+    }
+
+    #[test]
+    fn test_mbounding_box_self_overlap() {
+        let a = MBoundingBox::new(vec![1.0, 3.0, 1.0, 3.0]).unwrap();
+        assert!(a.overlaps(&a));
+    }
+
+    #[test]
+    fn test_mbounding_box_point_bbox() {
+        // Degenerate bbox where min == max
+        let point = MBoundingBox::new(vec![5.0, 5.0, 5.0, 5.0]).unwrap();
+        assert!(approx_eq(point.volume(), 0.0));
+    }
+
+    // ── RtreeConfig ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rtree_config_zero_dimensions_fails() {
+        assert!(RtreeConfig::new(0, RtreeCoordType::Float32).is_none());
+    }
+
+    #[test]
+    fn test_rtree_config_max_dimensions() {
+        // 5 dimensions is the typical max for R*-tree
+        let config = RtreeConfig::new(5, RtreeCoordType::Float32);
+        assert!(config.is_some());
+    }
+
+    // ── RtreeIndex: edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn test_rtree_delete_nonexistent() {
+        let config = RtreeConfig::new(2, RtreeCoordType::Float32).unwrap();
+        let mut index = RtreeIndex::new(config);
+        assert!(!index.delete(999));
+    }
+
+    #[test]
+    fn test_rtree_update_nonexistent() {
+        let config = RtreeConfig::new(2, RtreeCoordType::Float32).unwrap();
+        let mut index = RtreeIndex::new(config);
+        let bbox = MBoundingBox::new(vec![0.0, 1.0, 0.0, 1.0]).unwrap();
+        assert!(!index.update(999, bbox));
+    }
+
+    #[test]
+    fn test_rtree_empty_range_query() {
+        let config = RtreeConfig::new(2, RtreeCoordType::Float32).unwrap();
+        let index = RtreeIndex::new(config);
+        let query = MBoundingBox::new(vec![0.0, 10.0, 0.0, 10.0]).unwrap();
+        assert!(index.range_query(&query).is_empty());
+    }
+
+    #[test]
+    fn test_rtree_is_empty() {
+        let config = RtreeConfig::new(2, RtreeCoordType::Float32).unwrap();
+        let mut index = RtreeIndex::new(config);
+        assert!(index.is_empty());
+        assert_eq!(index.len(), 0);
+
+        let bbox = MBoundingBox::new(vec![0.0, 1.0, 0.0, 1.0]).unwrap();
+        index.insert(RtreeEntry { id: 1, bbox });
+        assert!(!index.is_empty());
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn test_rtree_dimensions_and_coord_type() {
+        let config = RtreeConfig::new(3, RtreeCoordType::Int32).unwrap();
+        let index = RtreeIndex::new(config);
+        assert_eq!(index.dimensions(), 3);
+        assert_eq!(index.coord_type(), RtreeCoordType::Int32);
+    }
+
+    #[test]
+    fn test_rtree_geometry_query_no_registered() {
+        let config = RtreeConfig::new(2, RtreeCoordType::Float32).unwrap();
+        let index = RtreeIndex::new(config);
+        assert!(index.geometry_query("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn test_rtree_geometry_query_detailed_no_registered() {
+        let config = RtreeConfig::new(2, RtreeCoordType::Float32).unwrap();
+        let index = RtreeIndex::new(config);
+        assert!(index.geometry_query_detailed("nonexistent").is_empty());
+    }
+
+    // ── Geopoly: edge cases ──────────────────────────────────────────────
+
+    #[test]
+    fn test_geopoly_area_degenerate_line() {
+        // Two collinear points → zero area
+        let line = [Point::new(0.0, 0.0), Point::new(1.0, 0.0)];
+        assert!(approx_eq(geopoly_area(&line), 0.0));
+    }
+
+    #[test]
+    fn test_geopoly_area_single_point() {
+        let single = [Point::new(5.0, 5.0)];
+        assert!(approx_eq(geopoly_area(&single), 0.0));
+    }
+
+    #[test]
+    fn test_geopoly_bbox_empty() {
+        assert!(geopoly_bbox(&[]).is_none());
+    }
+
+    #[test]
+    fn test_geopoly_bbox_single_point() {
+        let bbox = geopoly_bbox(&[Point::new(3.0, 4.0)]).unwrap();
+        assert!(approx_eq(bbox.min_x, 3.0));
+        assert!(approx_eq(bbox.max_x, 3.0));
+        assert!(approx_eq(bbox.min_y, 4.0));
+        assert!(approx_eq(bbox.max_y, 4.0));
+    }
+
+    #[test]
+    fn test_geopoly_group_bbox_empty() {
+        assert!(geopoly_group_bbox(&[]).is_none());
+    }
+
+    #[test]
+    fn test_geopoly_blob_decode_empty() {
+        assert!(geopoly_blob_decode(&[]).is_none());
+    }
+
+    #[test]
+    fn test_geopoly_json_decode_empty() {
+        assert!(geopoly_json_decode("").is_none());
+    }
+
+    #[test]
+    fn test_geopoly_json_decode_malformed() {
+        assert!(geopoly_json_decode("not json").is_none());
+        assert!(geopoly_json_decode("[").is_none());
+    }
+
+    #[test]
+    fn test_geopoly_contains_point_empty_polygon() {
+        assert!(!geopoly_contains_point(&[], Point::new(0.0, 0.0)));
+    }
+
+    #[test]
+    fn test_geopoly_overlap_empty_polygon() {
+        let sq = square(0.0, 0.0, 1.0);
+        assert!(!geopoly_overlap(&[], &sq));
+        assert!(!geopoly_overlap(&sq, &[]));
+    }
+
+    #[test]
+    fn test_geopoly_within_empty_polygon() {
+        let sq = square(0.0, 0.0, 1.0);
+        assert!(!geopoly_within(&[], &sq));
+        assert!(!geopoly_within(&sq, &[]));
+    }
+
+    #[test]
+    fn test_geopoly_regular_triangle() {
+        let tri = geopoly_regular(0.0, 0.0, 1.0, 3);
+        assert_eq!(tri.len(), 3);
+    }
+
+    #[test]
+    fn test_geopoly_regular_square() {
+        let sq = geopoly_regular(0.0, 0.0, 1.0, 4);
+        assert_eq!(sq.len(), 4);
+    }
+
+    #[test]
+    fn test_geopoly_svg_triangle() {
+        let tri = [
+            Point::new(0.0, 0.0),
+            Point::new(1.0, 0.0),
+            Point::new(0.5, 1.0),
+        ];
+        let svg = geopoly_svg(&tri);
+        assert!(svg.contains('M'));
+        assert!(svg.contains('L'));
+        assert!(svg.contains('Z'));
+    }
+
+    #[test]
+    fn test_geopoly_svg_empty() {
+        let svg = geopoly_svg(&[]);
+        // Should produce a valid but empty SVG path or empty string
+        assert!(svg.is_empty() || svg.contains('M'));
+    }
+
+    #[test]
+    fn test_geopoly_xform_identity() {
+        let sq = square(1.0, 1.0, 2.0);
+        // Identity transform: a=1, b=0, c=0, d=1, e=0, f=0
+        let result = geopoly_xform(&sq, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+        for (orig, transformed) in sq.iter().zip(result.iter()) {
+            assert!(approx_eq(orig.x, transformed.x));
+            assert!(approx_eq(orig.y, transformed.y));
+        }
+    }
+
+    #[test]
+    fn test_geopoly_ccw_already_ccw() {
+        // Counter-clockwise triangle
+        let ccw_tri = [
+            Point::new(0.0, 0.0),
+            Point::new(1.0, 0.0),
+            Point::new(0.0, 1.0),
+        ];
+        let result = geopoly_ccw(&ccw_tri);
+        // Should be the same orientation (may or may not reverse)
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_geopoly_ccw_clockwise_reversed() {
+        // Clockwise triangle
+        let cw_tri = [
+            Point::new(0.0, 0.0),
+            Point::new(0.0, 1.0),
+            Point::new(1.0, 0.0),
+        ];
+        let result = geopoly_ccw(&cw_tri);
+        assert_eq!(result.len(), 3);
+    }
+
+    // ── Point / BoundingBox ──────────────────────────────────────────────
+
+    #[test]
+    fn test_point_new() {
+        let p = Point::new(3.14, 2.72);
+        assert!(approx_eq(p.x, 3.14));
+        assert!(approx_eq(p.y, 2.72));
+    }
+
+    #[test]
+    fn test_bounding_box_contains_point() {
+        let bbox = BoundingBox {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 10.0,
+            max_y: 10.0,
+        };
+        assert!(bbox.contains_point(Point::new(5.0, 5.0)));
+        assert!(bbox.contains_point(Point::new(0.0, 0.0)));
+        assert!(!bbox.contains_point(Point::new(-1.0, 5.0)));
+        assert!(!bbox.contains_point(Point::new(5.0, 11.0)));
+    }
+
+    #[test]
+    fn test_bounding_box_contains_box() {
+        let outer = BoundingBox {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 10.0,
+            max_y: 10.0,
+        };
+        let inner = BoundingBox {
+            min_x: 2.0,
+            min_y: 2.0,
+            max_x: 8.0,
+            max_y: 8.0,
+        };
+        let outside = BoundingBox {
+            min_x: 20.0,
+            min_y: 20.0,
+            max_x: 30.0,
+            max_y: 30.0,
+        };
+        assert!(outer.contains_box(inner));
+        assert!(!outer.contains_box(outside));
+        assert!(!inner.contains_box(outer));
+    }
+
+    #[test]
+    fn test_geopoly_overlap_identical() {
+        let sq = square(0.0, 0.0, 1.0);
+        assert!(geopoly_overlap(&sq, &sq));
+    }
+
+    #[test]
+    fn test_geopoly_within_identical() {
+        let sq = square(0.0, 0.0, 1.0);
+        assert!(geopoly_within(&sq, &sq));
+    }
+
+    #[test]
+    fn test_rtree_insert_multiple_range_query() {
+        let config = RtreeConfig::new(2, RtreeCoordType::Float32).unwrap();
+        let mut index = RtreeIndex::new(config);
+        for i in 0..10 {
+            let f = f64::from(i);
+            let bbox = MBoundingBox::new(vec![f, f + 1.0, f, f + 1.0]).unwrap();
+            index.insert(RtreeEntry {
+                id: i64::from(i),
+                bbox,
+            });
+        }
+        assert_eq!(index.len(), 10);
+        // Query should find overlapping entries
+        let query = MBoundingBox::new(vec![3.5, 5.5, 3.5, 5.5]).unwrap();
+        let results = index.range_query(&query);
+        assert!(!results.is_empty());
+    }
 }

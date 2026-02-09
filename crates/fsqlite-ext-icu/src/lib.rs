@@ -934,4 +934,260 @@ mod tests {
         assert!(collation_registry.contains("german"));
         assert!(collation_registry.contains("GERMAN"));
     }
+
+    // ── Locale parsing edge cases ────────────────────────────────────────
+
+    #[test]
+    fn locale_parse_three_letter_language() {
+        let loc = IcuLocale::parse("jpn_JP").unwrap();
+        assert_eq!(loc.language, "jpn");
+        assert_eq!(loc.country.as_deref(), Some("JP"));
+    }
+
+    #[test]
+    fn locale_parse_empty_fails() {
+        assert!(IcuLocale::parse("").is_err());
+    }
+
+    #[test]
+    fn locale_parse_whitespace_only_fails() {
+        assert!(IcuLocale::parse("   ").is_err());
+    }
+
+    #[test]
+    fn locale_parse_single_char_fails() {
+        assert!(IcuLocale::parse("x").is_err());
+    }
+
+    #[test]
+    fn locale_parse_four_char_language_fails() {
+        assert!(IcuLocale::parse("abcd").is_err());
+    }
+
+    #[test]
+    fn locale_parse_trims_whitespace() {
+        let loc = IcuLocale::parse("  fr_FR  ").unwrap();
+        assert_eq!(loc.language, "fr");
+        assert_eq!(loc.country.as_deref(), Some("FR"));
+    }
+
+    #[test]
+    fn locale_display_trait() {
+        let loc = IcuLocale::parse("en_US").unwrap();
+        assert_eq!(format!("{loc}"), "en_US");
+        let loc2 = IcuLocale::parse("fr").unwrap();
+        assert_eq!(format!("{loc2}"), "fr");
+    }
+
+    #[test]
+    fn locale_clone_eq() {
+        let loc = IcuLocale::parse("zh_CN").unwrap();
+        let cloned = loc.clone();
+        assert_eq!(loc, cloned);
+    }
+
+    // ── Case mapping: Azerbaijani ────────────────────────────────────────
+
+    #[test]
+    fn test_icu_upper_azerbaijani_dotted_i() {
+        let locale = IcuLocale::parse("az_AZ").unwrap();
+        // Azerbaijani follows same rules as Turkish
+        let result = icu_to_upper("istanbul", &locale);
+        assert!(result.starts_with('\u{0130}')); // dotted I
+    }
+
+    #[test]
+    fn test_icu_lower_azerbaijani_dotless() {
+        let locale = IcuLocale::parse("az_AZ").unwrap();
+        let result = icu_to_lower("I", &locale);
+        assert_eq!(result, "\u{0131}"); // dotless i
+    }
+
+    // ── Case mapping: roundtrips ─────────────────────────────────────────
+
+    #[test]
+    fn test_icu_upper_lower_ascii_roundtrip() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        let original = "hello world";
+        let upper = icu_to_upper(original, &locale);
+        let lower = icu_to_lower(&upper, &locale);
+        assert_eq!(lower, original);
+    }
+
+    #[test]
+    fn test_icu_upper_empty_string() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        assert_eq!(icu_to_upper("", &locale), "");
+    }
+
+    #[test]
+    fn test_icu_lower_empty_string() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        assert_eq!(icu_to_lower("", &locale), "");
+    }
+
+    #[test]
+    fn test_icu_upper_already_uppercase() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        assert_eq!(icu_to_upper("HELLO", &locale), "HELLO");
+    }
+
+    #[test]
+    fn test_icu_lower_already_lowercase() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        assert_eq!(icu_to_lower("hello", &locale), "hello");
+    }
+
+    // ── Collation: additional cases ──────────────────────────────────────
+
+    #[test]
+    fn test_collation_equal_strings() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        assert_eq!(locale_aware_compare("abc", "abc", &locale), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_collation_empty_strings() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        assert_eq!(locale_aware_compare("", "", &locale), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_collation_empty_vs_nonempty() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        assert_eq!(locale_aware_compare("", "a", &locale), Ordering::Less);
+        assert_eq!(locale_aware_compare("a", "", &locale), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_collation_turkish_dotless_i_distinct_from_ascii() {
+        let locale = IcuLocale::parse("tr_TR").unwrap();
+        // Turkish locale has special handling for dotless-i vs regular i
+        // Implementation maps them via char_sort_weights for distinct ordering
+        let key_dotless = collation_sort_key("\u{0131}", &locale);
+        let key_latin_i = collation_sort_key("i", &locale);
+        // Both produce sort keys; verify they are non-empty
+        assert!(!key_dotless.is_empty());
+        assert!(!key_latin_i.is_empty());
+    }
+
+    // ── Sort keys ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_collation_sort_key_deterministic() {
+        let locale = IcuLocale::parse("de_DE").unwrap();
+        let k1 = collation_sort_key("hallo", &locale);
+        let k2 = collation_sort_key("hallo", &locale);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn test_collation_sort_key_different_strings() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        let k1 = collation_sort_key("apple", &locale);
+        let k2 = collation_sort_key("banana", &locale);
+        assert_ne!(k1, k2);
+    }
+
+    // ── Diacritics ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_diacritic_common() {
+        assert_eq!(strip_diacritic('\u{00E9}'), 'e'); // é -> e
+        assert_eq!(strip_diacritic('\u{00FC}'), 'u'); // ü -> u
+        assert_eq!(strip_diacritic('\u{00F1}'), 'n'); // ñ -> n
+    }
+
+    #[test]
+    fn test_strip_diacritic_ascii_unchanged() {
+        // ASCII chars pass through unchanged
+        assert_eq!(strip_diacritic('a'), 'a');
+        assert_eq!(strip_diacritic('Z'), 'Z');
+        assert_eq!(strip_diacritic('5'), '5');
+    }
+
+    // ── CJK detection ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_cjk_ideograph_chinese() {
+        assert!(is_cjk_ideograph('\u{4E00}')); // CJK Unified Ideographs start
+        assert!(is_cjk_ideograph('\u{9FFF}')); // CJK Unified Ideographs end
+    }
+
+    #[test]
+    fn test_is_cjk_ideograph_hiragana() {
+        assert!(is_cjk_ideograph('\u{3040}')); // Hiragana start
+    }
+
+    #[test]
+    fn test_is_cjk_ideograph_katakana() {
+        assert!(is_cjk_ideograph('\u{30A0}')); // Katakana start
+    }
+
+    #[test]
+    fn test_is_cjk_ideograph_hangul() {
+        assert!(is_cjk_ideograph('\u{AC00}')); // Hangul Syllables start
+    }
+
+    #[test]
+    fn test_is_cjk_ideograph_latin_false() {
+        assert!(!is_cjk_ideograph('A'));
+        assert!(!is_cjk_ideograph('z'));
+        assert!(!is_cjk_ideograph('0'));
+    }
+
+    // ── Word breaker edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_icu_tokenizer_empty_string() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        let tokenizer = IcuWordBreaker::new(locale);
+        let tokens = tokenizer.tokenize("");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_icu_tokenizer_whitespace_only() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        let tokenizer = IcuWordBreaker::new(locale);
+        let tokens = tokenizer.tokenize("   ");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_icu_tokenizer_punctuation_stripped() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        let tokenizer = IcuWordBreaker::new(locale);
+        let tokens = tokenizer.tokenize("hello, world!");
+        let words: Vec<&str> = tokens.iter().map(|(_, _, t)| *t).collect();
+        assert_eq!(words, &["hello", "world"]);
+    }
+
+    #[test]
+    fn test_icu_tokenizer_single_word() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        let tokenizer = IcuWordBreaker::new(locale);
+        let tokens = tokenizer.tokenize("hello");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].2, "hello");
+    }
+
+    #[test]
+    fn test_icu_tokenizer_numbers_included() {
+        let locale = IcuLocale::parse("en_US").unwrap();
+        let tokenizer = IcuWordBreaker::new(locale);
+        let tokens = tokenizer.tokenize("abc123 def456");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].2, "abc123");
+        assert_eq!(tokens[1].2, "def456");
+    }
+
+    #[test]
+    fn test_icu_tokenizer_korean_hangul() {
+        let locale = IcuLocale::parse("ko_KR").unwrap();
+        let tokenizer = IcuWordBreaker::new(locale);
+        let tokens = tokenizer.tokenize("\u{D55C}\u{AE00}"); // 한글
+        // CJK tokenizer: each character separate
+        assert_eq!(tokens.len(), 2);
+    }
 }

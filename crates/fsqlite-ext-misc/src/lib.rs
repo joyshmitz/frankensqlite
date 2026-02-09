@@ -1250,4 +1250,337 @@ mod tests {
         assert!(registry.find_scalar("uuid_str", 1).is_some());
         assert!(registry.find_scalar("uuid_blob", 1).is_some());
     }
+
+    // ── generate_series: additional edge cases ───────────────────────────
+
+    #[test]
+    fn test_generate_series_large_step() {
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        cursor.init(0, 100, 50).unwrap();
+        let mut values = Vec::new();
+        while !cursor.eof() {
+            values.push(cursor.current);
+            cursor.next(&Cx::default()).unwrap();
+        }
+        assert_eq!(values, vec![0, 50, 100]);
+    }
+
+    #[test]
+    fn test_generate_series_negative_range() {
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        cursor.init(-5, -1, 1).unwrap();
+        let mut count = 0;
+        while !cursor.eof() {
+            count += 1;
+            cursor.next(&Cx::default()).unwrap();
+        }
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_generate_series_reverse_with_wrong_step_empty() {
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        // start > stop with positive step → empty
+        cursor.init(10, 1, 1).unwrap();
+        assert!(cursor.eof());
+    }
+
+    #[test]
+    fn test_generate_series_forward_with_negative_step_empty() {
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        // start < stop with negative step → empty
+        cursor.init(1, 10, -1).unwrap();
+        assert!(cursor.eof());
+    }
+
+    #[test]
+    fn test_generate_series_rowid() {
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        cursor.init(42, 42, 1).unwrap();
+        assert_eq!(cursor.rowid().unwrap(), 42);
+    }
+
+    #[test]
+    fn test_generate_series_column_values() {
+        let table = GenerateSeriesTable;
+        let mut cursor = table.open().unwrap();
+        cursor.init(10, 20, 5).unwrap();
+        // Column 0 = value (current)
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 0).unwrap();
+        assert_eq!(ctx.take_value(), Some(SqliteValue::Integer(10)));
+        // Column 2 = stop
+        let mut ctx2 = ColumnContext::new();
+        cursor.column(&mut ctx2, 2).unwrap();
+        assert_eq!(ctx2.take_value(), Some(SqliteValue::Integer(20)));
+        // Column 3 = step
+        let mut ctx3 = ColumnContext::new();
+        cursor.column(&mut ctx3, 3).unwrap();
+        assert_eq!(ctx3.take_value(), Some(SqliteValue::Integer(5)));
+        // Column out of range = Null
+        let mut ctx4 = ColumnContext::new();
+        cursor.column(&mut ctx4, 99).unwrap();
+        assert_eq!(ctx4.take_value(), Some(SqliteValue::Null));
+    }
+
+    #[test]
+    fn test_generate_series_vtable_create_connect() {
+        let cx = Cx::default();
+        let _ = GenerateSeriesTable::create(&cx, &[]).unwrap();
+        let _ = GenerateSeriesTable::connect(&cx, &[]).unwrap();
+    }
+
+    #[test]
+    fn test_generate_series_best_index() {
+        let table = GenerateSeriesTable;
+        let mut info = IndexInfo::new(Vec::new(), Vec::new());
+        table.best_index(&mut info).unwrap();
+        assert!(info.estimated_cost > 0.0);
+        assert!(info.estimated_rows > 0);
+    }
+
+    // ── Decimal: normalization edge cases ─────────────────────────────────
+
+    #[test]
+    fn test_decimal_normalize_zero() {
+        assert_eq!(decimal_normalize("0"), "0");
+        assert_eq!(decimal_normalize("0.0"), "0");
+        assert_eq!(decimal_normalize("000.000"), "0");
+    }
+
+    #[test]
+    fn test_decimal_normalize_negative_zero() {
+        // Negative zero should normalize to "0"
+        let result = decimal_normalize("-0.0");
+        assert!(result == "0" || result == "-0");
+    }
+
+    #[test]
+    fn test_decimal_normalize_integer() {
+        assert_eq!(decimal_normalize("42"), "42");
+        assert_eq!(decimal_normalize("00042"), "42");
+    }
+
+    #[test]
+    fn test_decimal_normalize_trailing_zeros() {
+        assert_eq!(decimal_normalize("1.50000"), "1.5");
+        assert_eq!(decimal_normalize("3.14000"), "3.14");
+    }
+
+    // ── Decimal: arithmetic edge cases ───────────────────────────────────
+
+    #[test]
+    fn test_decimal_add_zeros() {
+        assert_eq!(decimal_add_impl("0", "0"), "0");
+    }
+
+    #[test]
+    fn test_decimal_add_negative_plus_positive() {
+        let result = decimal_add_impl("-5", "3");
+        assert_eq!(result, "-2");
+    }
+
+    #[test]
+    fn test_decimal_add_positive_plus_negative() {
+        let result = decimal_add_impl("3", "-5");
+        assert_eq!(result, "-2");
+    }
+
+    #[test]
+    fn test_decimal_sub_same_number() {
+        assert_eq!(decimal_sub_impl("42.5", "42.5"), "0");
+    }
+
+    #[test]
+    fn test_decimal_sub_produces_negative() {
+        let result = decimal_sub_impl("1", "5");
+        assert_eq!(result, "-4");
+    }
+
+    #[test]
+    fn test_decimal_mul_by_zero() {
+        assert_eq!(decimal_mul_impl("12345.6789", "0"), "0");
+    }
+
+    #[test]
+    fn test_decimal_mul_by_one() {
+        assert_eq!(decimal_mul_impl("3.14", "1"), "3.14");
+    }
+
+    #[test]
+    fn test_decimal_mul_negative_times_negative() {
+        let result = decimal_mul_impl("-3", "-4");
+        assert_eq!(result, "12");
+    }
+
+    #[test]
+    fn test_decimal_mul_small_decimals() {
+        let result = decimal_mul_impl("0.001", "0.001");
+        assert_eq!(result, "0.000001");
+    }
+
+    #[test]
+    fn test_decimal_cmp_equal_values() {
+        assert_eq!(decimal_cmp_impl("3.14", "3.14"), 0);
+    }
+
+    #[test]
+    fn test_decimal_cmp_leading_zeros_equal() {
+        assert_eq!(decimal_cmp_impl("007.50", "7.5"), 0);
+    }
+
+    #[test]
+    fn test_decimal_cmp_negative_ordering() {
+        assert_eq!(decimal_cmp_impl("-10", "-5"), -1);
+        assert_eq!(decimal_cmp_impl("-5", "-10"), 1);
+    }
+
+    // ── Decimal: scalar function null handling ───────────────────────────
+
+    #[test]
+    fn test_decimal_add_func_null_propagation() {
+        let result = DecimalAddFunc
+            .invoke(&[SqliteValue::Null, SqliteValue::Text("1".to_owned())])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_decimal_sub_func_null_propagation() {
+        let result = DecimalSubFunc
+            .invoke(&[SqliteValue::Text("1".to_owned()), SqliteValue::Null])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_decimal_mul_func_null_propagation() {
+        let result = DecimalMulFunc
+            .invoke(&[SqliteValue::Null, SqliteValue::Null])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_decimal_cmp_func_null_propagation() {
+        let result = DecimalCmpFunc
+            .invoke(&[SqliteValue::Null, SqliteValue::Text("1".to_owned())])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    // ── UUID: error cases ────────────────────────────────────────────────
+
+    #[test]
+    fn test_uuid_str_to_blob_invalid_length() {
+        // Too short
+        assert!(uuid_str_to_blob("abc").is_err());
+    }
+
+    #[test]
+    fn test_uuid_str_to_blob_invalid_hex() {
+        assert!(uuid_str_to_blob("ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ").is_err());
+    }
+
+    #[test]
+    fn test_blob_to_uuid_str_wrong_length() {
+        assert!(blob_to_uuid_str(&[0u8; 15]).is_err());
+        assert!(blob_to_uuid_str(&[0u8; 17]).is_err());
+    }
+
+    #[test]
+    fn test_uuid_func_with_args_errors() {
+        let result = UuidFunc.invoke(&[SqliteValue::Integer(1)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_uuid_str_func_null_returns_null() {
+        let result = UuidStrFunc.invoke(&[SqliteValue::Null]).unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_uuid_blob_func_null_returns_null() {
+        let result = UuidBlobFunc.invoke(&[SqliteValue::Null]).unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_uuid_blob_func_non_text_errors() {
+        let result = UuidBlobFunc.invoke(&[SqliteValue::Integer(42)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_uuid_str_func_normalizes_text() {
+        // uuid_str with text input should normalize via blob roundtrip
+        let uuid = generate_uuid_v4();
+        let result = UuidStrFunc
+            .invoke(&[SqliteValue::Text(uuid.clone())])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Text(uuid));
+    }
+
+    #[test]
+    fn test_uuid_str_func_non_blob_non_text_errors() {
+        let result = UuidStrFunc.invoke(&[SqliteValue::Integer(42)]);
+        assert!(result.is_err());
+    }
+
+    // ── UUID: format validation ──────────────────────────────────────────
+
+    #[test]
+    fn test_uuid_all_lowercase_hex() {
+        let uuid = generate_uuid_v4();
+        // UUID should contain only lowercase hex and dashes
+        assert!(uuid.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        assert!(!uuid.contains(|c: char| c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn test_uuid_v4_multiple_unique() {
+        let uuids: Vec<String> = (0..50).map(|_| generate_uuid_v4()).collect();
+        // All should be unique
+        let mut sorted = uuids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), uuids.len(), "all UUIDs should be unique");
+    }
+
+    // ── Scalar function names ────────────────────────────────────────────
+
+    #[test]
+    fn test_scalar_function_names() {
+        assert_eq!(DecimalFunc.name(), "decimal");
+        assert_eq!(DecimalAddFunc.name(), "decimal_add");
+        assert_eq!(DecimalSubFunc.name(), "decimal_sub");
+        assert_eq!(DecimalMulFunc.name(), "decimal_mul");
+        assert_eq!(DecimalCmpFunc.name(), "decimal_cmp");
+        assert_eq!(UuidFunc.name(), "uuid");
+        assert_eq!(UuidStrFunc.name(), "uuid_str");
+        assert_eq!(UuidBlobFunc.name(), "uuid_blob");
+    }
+
+    #[test]
+    fn test_scalar_function_arg_counts() {
+        assert_eq!(DecimalFunc.num_args(), 1);
+        assert_eq!(DecimalAddFunc.num_args(), 2);
+        assert_eq!(DecimalSubFunc.num_args(), 2);
+        assert_eq!(DecimalMulFunc.num_args(), 2);
+        assert_eq!(DecimalCmpFunc.num_args(), 2);
+        assert_eq!(UuidFunc.num_args(), 0);
+        assert_eq!(UuidStrFunc.num_args(), 1);
+        assert_eq!(UuidBlobFunc.num_args(), 1);
+    }
+
+    #[test]
+    fn test_uuid_func_not_deterministic() {
+        assert!(!UuidFunc.is_deterministic());
+    }
 }

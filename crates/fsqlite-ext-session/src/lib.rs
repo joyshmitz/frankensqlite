@@ -1881,4 +1881,713 @@ mod tests {
             SqliteValue::Blob(vec![0xAB])
         );
     }
+
+    // -----------------------------------------------------------------------
+    // ChangeOp edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_change_op_from_byte_exhaustive_invalid() {
+        for b in 0..=255u8 {
+            if matches!(b, 0x12 | 0x09 | 0x17) {
+                assert!(ChangeOp::from_byte(b).is_some());
+            } else {
+                assert!(
+                    ChangeOp::from_byte(b).is_none(),
+                    "byte {b:#x} should be None"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_change_op_copy_clone_eq() {
+        let a = ChangeOp::Insert;
+        let b = a;
+        assert_eq!(a, b);
+        assert_ne!(ChangeOp::Insert, ChangeOp::Delete);
+        assert_ne!(ChangeOp::Delete, ChangeOp::Update);
+    }
+
+    #[test]
+    fn test_change_op_debug() {
+        let s = format!("{:?}", ChangeOp::Insert);
+        assert_eq!(s, "Insert");
+    }
+
+    // -----------------------------------------------------------------------
+    // ChangesetValue edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_changeset_value_integer_boundaries() {
+        for &val in &[i64::MIN, i64::MAX, 0, -1, 1] {
+            let mut buf = Vec::new();
+            ChangesetValue::Integer(val).encode(&mut buf);
+            let (decoded, _) = ChangesetValue::decode(&buf, 0).unwrap();
+            assert_eq!(decoded, ChangesetValue::Integer(val));
+        }
+    }
+
+    #[test]
+    fn test_changeset_value_real_special() {
+        for &val in &[
+            0.0,
+            -0.0,
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            f64::EPSILON,
+        ] {
+            let mut buf = Vec::new();
+            ChangesetValue::Real(val).encode(&mut buf);
+            let (decoded, _) = ChangesetValue::decode(&buf, 0).unwrap();
+            assert_eq!(decoded, ChangesetValue::Real(val));
+        }
+    }
+
+    #[test]
+    fn test_changeset_value_real_nan_roundtrip() {
+        let mut buf = Vec::new();
+        ChangesetValue::Real(f64::NAN).encode(&mut buf);
+        let (decoded, _) = ChangesetValue::decode(&buf, 0).unwrap();
+        if let ChangesetValue::Real(f) = decoded {
+            assert!(f.is_nan());
+        } else {
+            panic!("expected Real");
+        }
+    }
+
+    #[test]
+    fn test_changeset_value_blob_empty() {
+        let mut buf = Vec::new();
+        ChangesetValue::Blob(Vec::new()).encode(&mut buf);
+        let (decoded, consumed) = ChangesetValue::decode(&buf, 0).unwrap();
+        assert_eq!(decoded, ChangesetValue::Blob(Vec::new()));
+        assert_eq!(consumed, 2); // type + varint(0)
+    }
+
+    #[test]
+    fn test_changeset_value_text_unicode() {
+        let text = "\u{1F600}\u{1F4A9}\u{2603}"; // emoji + snowman
+        let mut buf = Vec::new();
+        ChangesetValue::Text(text.to_owned()).encode(&mut buf);
+        let (decoded, _) = ChangesetValue::decode(&buf, 0).unwrap();
+        assert_eq!(decoded, ChangesetValue::Text(text.to_owned()));
+    }
+
+    #[test]
+    fn test_changeset_value_decode_at_offset() {
+        let mut buf = Vec::new();
+        ChangesetValue::Null.encode(&mut buf); // 1 byte
+        ChangesetValue::Integer(42).encode(&mut buf); // 9 bytes
+        let (val, consumed) = ChangesetValue::decode(&buf, 1).unwrap();
+        assert_eq!(val, ChangesetValue::Integer(42));
+        assert_eq!(consumed, 9);
+    }
+
+    #[test]
+    fn test_changeset_value_decode_empty_slice() {
+        assert!(ChangesetValue::decode(&[], 0).is_none());
+    }
+
+    #[test]
+    fn test_changeset_value_decode_offset_beyond_len() {
+        assert!(ChangesetValue::decode(&[VAL_NULL], 5).is_none());
+    }
+
+    #[test]
+    fn test_changeset_value_decode_truncated_real() {
+        assert!(ChangesetValue::decode(&[VAL_REAL, 0, 0, 0], 0).is_none());
+    }
+
+    #[test]
+    fn test_changeset_value_decode_truncated_text() {
+        // Type byte + varint(10) but only 3 content bytes
+        let mut buf = vec![VAL_TEXT, 10, b'a', b'b', b'c'];
+        assert!(ChangesetValue::decode(&buf, 0).is_none());
+        // Fix: provide exactly 10 bytes
+        buf.extend_from_slice(&[0; 7]);
+        // Non-UTF8 bytes should fail
+        buf[5] = 0xFF;
+        assert!(ChangesetValue::decode(&buf, 0).is_none());
+    }
+
+    #[test]
+    fn test_changeset_value_decode_truncated_blob() {
+        let buf = vec![VAL_BLOB, 5, 1, 2]; // says 5 bytes, only has 2
+        assert!(ChangesetValue::decode(&buf, 0).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ChangesetValue <-> SqliteValue round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_changeset_value_sqlite_roundtrip_all_types() {
+        let values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Float(3.14),
+            SqliteValue::Text(String::new()),
+            SqliteValue::Text("test".to_owned()),
+            SqliteValue::Blob(vec![]),
+            SqliteValue::Blob(vec![1, 2, 3]),
+        ];
+        for sv in &values {
+            let cv = ChangesetValue::from_sqlite(sv);
+            let back = cv.to_sqlite();
+            assert_eq!(&back, sv);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TableInfo edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_table_info_single_column() {
+        let info = TableInfo {
+            name: "x".to_owned(),
+            column_count: 1,
+            pk_flags: vec![true],
+        };
+        let mut buf = Vec::new();
+        info.encode(&mut buf);
+        let (decoded, consumed) = TableInfo::decode(&buf, 0).unwrap();
+        assert_eq!(decoded, info);
+        assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn test_table_info_no_pk_columns() {
+        let info = TableInfo {
+            name: "t".to_owned(),
+            column_count: 3,
+            pk_flags: vec![false, false, false],
+        };
+        let mut buf = Vec::new();
+        info.encode(&mut buf);
+        let (decoded, _) = TableInfo::decode(&buf, 0).unwrap();
+        assert_eq!(decoded.pk_flags, vec![false, false, false]);
+    }
+
+    #[test]
+    fn test_table_info_unicode_name() {
+        let info = TableInfo {
+            name: "\u{00FC}berschrift".to_owned(),
+            column_count: 1,
+            pk_flags: vec![true],
+        };
+        let mut buf = Vec::new();
+        info.encode(&mut buf);
+        let (decoded, _) = TableInfo::decode(&buf, 0).unwrap();
+        assert_eq!(decoded.name, "\u{00FC}berschrift");
+    }
+
+    #[test]
+    fn test_table_info_decode_wrong_header() {
+        assert!(TableInfo::decode(&[0x00, 0x01, 0x01, b't', 0x00], 0).is_none());
+    }
+
+    #[test]
+    fn test_table_info_decode_truncated() {
+        assert!(TableInfo::decode(&[TABLE_HEADER_BYTE], 0).is_none());
+        assert!(TableInfo::decode(&[TABLE_HEADER_BYTE, 3, 1], 0).is_none());
+    }
+
+    #[test]
+    fn test_table_info_decode_at_offset() {
+        let mut buf = vec![0xFF, 0xFF]; // padding
+        let info = TableInfo {
+            name: "t".to_owned(),
+            column_count: 1,
+            pk_flags: vec![true],
+        };
+        info.encode(&mut buf);
+        let (decoded, _) = TableInfo::decode(&buf, 2).unwrap();
+        assert_eq!(decoded, info);
+    }
+
+    // -----------------------------------------------------------------------
+    // ChangesetRow edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_changeset_row_invert_double_is_identity() {
+        let row = ChangesetRow {
+            op: ChangeOp::Update,
+            old_values: vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("old".to_owned()),
+            ],
+            new_values: vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("new".to_owned()),
+            ],
+        };
+        let double_inverted = row.invert().invert();
+        assert_eq!(double_inverted, row);
+    }
+
+    #[test]
+    fn test_changeset_row_encode_decode_all_ops() {
+        let col_count = 2;
+        for op in [ChangeOp::Insert, ChangeOp::Delete, ChangeOp::Update] {
+            let row = match op {
+                ChangeOp::Insert => ChangesetRow {
+                    op,
+                    old_values: Vec::new(),
+                    new_values: vec![ChangesetValue::Integer(1), ChangesetValue::Null],
+                },
+                ChangeOp::Delete => ChangesetRow {
+                    op,
+                    old_values: vec![ChangesetValue::Integer(1), ChangesetValue::Null],
+                    new_values: Vec::new(),
+                },
+                ChangeOp::Update => ChangesetRow {
+                    op,
+                    old_values: vec![
+                        ChangesetValue::Integer(1),
+                        ChangesetValue::Text("a".to_owned()),
+                    ],
+                    new_values: vec![
+                        ChangesetValue::Undefined,
+                        ChangesetValue::Text("b".to_owned()),
+                    ],
+                },
+            };
+            let mut buf = Vec::new();
+            row.encode_changeset(&mut buf);
+            let (decoded, consumed) = ChangesetRow::decode_changeset(&buf, 0, col_count).unwrap();
+            assert_eq!(decoded, row);
+            assert_eq!(consumed, buf.len());
+        }
+    }
+
+    #[test]
+    fn test_changeset_row_decode_bad_op() {
+        assert!(ChangesetRow::decode_changeset(&[0xFF, VAL_NULL], 0, 1).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Patchset UPDATE: PK-only old values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_patchset_update_only_pk_old() {
+        let pk_flags = vec![true, false, false];
+        let row = ChangesetRow {
+            op: ChangeOp::Update,
+            old_values: vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("old_name".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+            new_values: vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Undefined,
+            ],
+        };
+        let mut cs_buf = Vec::new();
+        row.encode_changeset(&mut cs_buf);
+        let mut ps_buf = Vec::new();
+        row.encode_patchset(&mut ps_buf, &pk_flags);
+        assert!(ps_buf.len() < cs_buf.len());
+    }
+
+    #[test]
+    fn test_patchset_delete_same_as_changeset() {
+        let pk_flags = vec![true, false];
+        let row = ChangesetRow {
+            op: ChangeOp::Delete,
+            old_values: vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("a".to_owned()),
+            ],
+            new_values: Vec::new(),
+        };
+        let mut cs_buf = Vec::new();
+        row.encode_changeset(&mut cs_buf);
+        let mut ps_buf = Vec::new();
+        row.encode_patchset(&mut ps_buf, &pk_flags);
+        assert_eq!(cs_buf, ps_buf);
+    }
+
+    // -----------------------------------------------------------------------
+    // Session: unattached table
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_session_unattached_table_inferred() {
+        let mut session = Session::new();
+        // Record changes without attaching the table first
+        session.record_insert("auto", vec![ChangesetValue::Integer(1)]);
+        let cs = session.changeset();
+        assert_eq!(cs.tables.len(), 1);
+        assert_eq!(cs.tables[0].info.name, "auto");
+        assert_eq!(cs.tables[0].info.column_count, 1);
+        assert_eq!(cs.tables[0].info.pk_flags, vec![false]); // all non-PK
+    }
+
+    #[test]
+    fn test_session_empty_changeset() {
+        let session = Session::new();
+        let cs = session.changeset();
+        assert!(cs.tables.is_empty());
+        assert!(cs.encode().is_empty());
+    }
+
+    #[test]
+    fn test_session_empty_patchset() {
+        let session = Session::new();
+        assert!(session.patchset().is_empty());
+    }
+
+    #[test]
+    fn test_session_default_trait() {
+        let session = Session::default();
+        assert!(session.tables.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Changeset edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_changeset_default_trait() {
+        let cs = Changeset::default();
+        assert!(cs.tables.is_empty());
+    }
+
+    #[test]
+    fn test_changeset_empty_encode_decode() {
+        let cs = Changeset::new();
+        let encoded = cs.encode();
+        assert!(encoded.is_empty());
+        let decoded = Changeset::decode(&encoded).unwrap();
+        assert!(decoded.tables.is_empty());
+    }
+
+    #[test]
+    fn test_changeset_invert_is_self_inverse() {
+        let mut session = Session::new();
+        session.attach_table("t", 2, vec![true, false]);
+        session.record_insert(
+            "t",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("a".to_owned()),
+            ],
+        );
+        session.record_delete(
+            "t",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("b".to_owned()),
+            ],
+        );
+        session.record_update(
+            "t",
+            vec![
+                ChangesetValue::Integer(3),
+                ChangesetValue::Text("c".to_owned()),
+            ],
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("d".to_owned()),
+            ],
+        );
+
+        let cs = session.changeset();
+        let double_inv = cs.invert().invert();
+        assert_eq!(double_inv, cs);
+    }
+
+    #[test]
+    fn test_changeset_multi_table_encode_decode() {
+        let mut session = Session::new();
+        session.attach_table("a", 1, vec![true]);
+        session.attach_table("b", 2, vec![true, false]);
+        session.record_insert("a", vec![ChangesetValue::Integer(1)]);
+        session.record_insert(
+            "b",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("x".to_owned()),
+            ],
+        );
+        session.record_delete("a", vec![ChangesetValue::Integer(3)]);
+
+        let cs = session.changeset();
+        let encoded = cs.encode();
+        let decoded = Changeset::decode(&encoded).unwrap();
+        assert_eq!(decoded, cs);
+    }
+
+    // -----------------------------------------------------------------------
+    // Apply: additional conflict scenarios
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_update_data_conflict_replace() {
+        let mut target = SimpleTarget::default();
+        target.tables.insert(
+            "t".to_owned(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("actual".to_owned()),
+            ]],
+        );
+
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 2,
+                    pk_flags: vec![true, false],
+                },
+                rows: vec![ChangesetRow {
+                    op: ChangeOp::Update,
+                    old_values: vec![
+                        ChangesetValue::Integer(1),
+                        ChangesetValue::Text("expected".to_owned()),
+                    ],
+                    new_values: vec![
+                        ChangesetValue::Undefined,
+                        ChangesetValue::Text("new".to_owned()),
+                    ],
+                }],
+            }],
+        };
+
+        let outcome = target.apply(&cs, |_, _| ConflictAction::Replace);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Success {
+                applied: 1,
+                skipped: 0
+            }
+        );
+        assert_eq!(
+            target.tables["t"][0][1],
+            SqliteValue::Text("new".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_apply_delete_data_conflict_replace_removes() {
+        let mut target = SimpleTarget::default();
+        target.tables.insert(
+            "t".to_owned(),
+            vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("actual".to_owned()),
+            ]],
+        );
+
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 2,
+                    pk_flags: vec![true, false],
+                },
+                rows: vec![ChangesetRow {
+                    op: ChangeOp::Delete,
+                    old_values: vec![
+                        ChangesetValue::Integer(1),
+                        ChangesetValue::Text("expected".to_owned()),
+                    ],
+                    new_values: Vec::new(),
+                }],
+            }],
+        };
+
+        let outcome = target.apply(&cs, |_, _| ConflictAction::Replace);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Success {
+                applied: 1,
+                skipped: 0
+            }
+        );
+        assert!(target.tables["t"].is_empty());
+    }
+
+    #[test]
+    fn test_apply_update_not_found_abort() {
+        let mut target = SimpleTarget::default();
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 1,
+                    pk_flags: vec![true],
+                },
+                rows: vec![ChangesetRow {
+                    op: ChangeOp::Update,
+                    old_values: vec![ChangesetValue::Integer(1)],
+                    new_values: vec![ChangesetValue::Integer(2)],
+                }],
+            }],
+        };
+        let outcome = target.apply(&cs, |_, _| ConflictAction::Abort);
+        assert_eq!(outcome, ApplyOutcome::Aborted { applied: 0 });
+    }
+
+    #[test]
+    fn test_apply_multiple_rows_mixed() {
+        let mut target = SimpleTarget::default();
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 2,
+                    pk_flags: vec![true, false],
+                },
+                rows: vec![
+                    ChangesetRow {
+                        op: ChangeOp::Insert,
+                        old_values: Vec::new(),
+                        new_values: vec![
+                            ChangesetValue::Integer(1),
+                            ChangesetValue::Text("a".to_owned()),
+                        ],
+                    },
+                    ChangesetRow {
+                        op: ChangeOp::Insert,
+                        old_values: Vec::new(),
+                        new_values: vec![
+                            ChangesetValue::Integer(2),
+                            ChangesetValue::Text("b".to_owned()),
+                        ],
+                    },
+                ],
+            }],
+        };
+        let outcome = target.apply(&cs, |_, _| ConflictAction::Abort);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Success {
+                applied: 2,
+                skipped: 0
+            }
+        );
+        assert_eq!(target.tables["t"].len(), 2);
+    }
+
+    #[test]
+    fn test_apply_empty_changeset() {
+        let mut target = SimpleTarget::default();
+        let cs = Changeset::new();
+        let outcome = target.apply(&cs, |_, _| ConflictAction::Abort);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Success {
+                applied: 0,
+                skipped: 0
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TableChangeset encoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_table_changeset_encode_patchset() {
+        let tc = TableChangeset {
+            info: TableInfo {
+                name: "t".to_owned(),
+                column_count: 2,
+                pk_flags: vec![true, false],
+            },
+            rows: vec![ChangesetRow {
+                op: ChangeOp::Insert,
+                old_values: Vec::new(),
+                new_values: vec![ChangesetValue::Integer(1), ChangesetValue::Null],
+            }],
+        };
+        let mut cs_buf = Vec::new();
+        tc.encode_changeset(&mut cs_buf);
+        let mut ps_buf = Vec::new();
+        tc.encode_patchset(&mut ps_buf);
+        // For INSERT, patchset = changeset
+        assert_eq!(cs_buf, ps_buf);
+    }
+
+    // -----------------------------------------------------------------------
+    // changeset_varint_len
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_changeset_varint_len_values() {
+        assert_eq!(changeset_varint_len(0), 1);
+        assert_eq!(changeset_varint_len(127), 1);
+        assert_eq!(changeset_varint_len(128), 2);
+        assert!(changeset_varint_len(u64::MAX) > 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // ConflictType / ConflictAction traits
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_conflict_type_eq() {
+        assert_eq!(ConflictType::Data, ConflictType::Data);
+        assert_ne!(ConflictType::Data, ConflictType::NotFound);
+        assert_ne!(ConflictType::Conflict, ConflictType::Constraint);
+        assert_ne!(ConflictType::Constraint, ConflictType::ForeignKey);
+    }
+
+    #[test]
+    fn test_conflict_action_eq() {
+        assert_eq!(ConflictAction::OmitChange, ConflictAction::OmitChange);
+        assert_ne!(ConflictAction::OmitChange, ConflictAction::Replace);
+        assert_ne!(ConflictAction::Replace, ConflictAction::Abort);
+    }
+
+    #[test]
+    fn test_conflict_type_debug() {
+        assert_eq!(format!("{:?}", ConflictType::ForeignKey), "ForeignKey");
+    }
+
+    // -----------------------------------------------------------------------
+    // Extension name
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extension_name_value() {
+        assert_eq!(extension_name(), "session");
+    }
+
+    // -----------------------------------------------------------------------
+    // ApplyOutcome
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_outcome_debug() {
+        let outcome = ApplyOutcome::Success {
+            applied: 5,
+            skipped: 2,
+        };
+        let s = format!("{:?}", outcome);
+        assert!(s.contains("5"));
+        assert!(s.contains("2"));
+    }
+
+    #[test]
+    fn test_apply_outcome_aborted_eq() {
+        assert_eq!(
+            ApplyOutcome::Aborted { applied: 3 },
+            ApplyOutcome::Aborted { applied: 3 }
+        );
+        assert_ne!(
+            ApplyOutcome::Aborted { applied: 3 },
+            ApplyOutcome::Aborted { applied: 4 }
+        );
+    }
 }

@@ -559,7 +559,7 @@ pub fn parse_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>,
     let tokens = tokenize_fts5_query(query)?;
     validate_fts5_parentheses(&tokens)?;
     validate_fts5_not_binary(&tokens)?;
-    insert_implicit_and(tokens)
+    Ok(insert_implicit_and(&tokens))
 }
 
 fn tokenize_fts5_query(query: &str) -> std::result::Result<Vec<Fts5QueryToken>, Fts5QueryError> {
@@ -723,9 +723,7 @@ fn validate_fts5_not_binary(tokens: &[Fts5QueryToken]) -> std::result::Result<()
 }
 
 /// Insert implicit AND tokens between adjacent expressions in FTS5.
-fn insert_implicit_and(
-    tokens: Vec<Fts5QueryToken>,
-) -> std::result::Result<Vec<Fts5QueryToken>, Fts5QueryError> {
+fn insert_implicit_and(tokens: &[Fts5QueryToken]) -> Vec<Fts5QueryToken> {
     let mut result = Vec::with_capacity(tokens.len() * 2);
 
     for (i, token) in tokens.iter().enumerate() {
@@ -759,7 +757,7 @@ fn insert_implicit_and(
         result.push(token.clone());
     }
 
-    Ok(result)
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -772,12 +770,12 @@ pub enum Fts5Expr {
     Term(String),
     Prefix(String),
     Phrase(Vec<String>),
-    And(Box<Fts5Expr>, Box<Fts5Expr>),
-    Or(Box<Fts5Expr>, Box<Fts5Expr>),
-    Not(Box<Fts5Expr>, Box<Fts5Expr>),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+    Not(Box<Self>, Box<Self>),
     Near(Vec<String>, u32),
-    ColumnFilter(String, Box<Fts5Expr>),
-    InitialToken(Box<Fts5Expr>),
+    ColumnFilter(String, Box<Self>),
+    InitialToken(Box<Self>),
 }
 
 /// Build an expression tree from parsed FTS5 query tokens.
@@ -881,9 +879,9 @@ fn parse_primary(
             // NEAR(term1 term2, N)
             // Simplified: just parse as AND for now; collect nearby terms
             let rest = &tokens[1..];
-            if rest
+            if !rest
                 .first()
-                .map_or(true, |t| t.kind != Fts5QueryTokenKind::LParen)
+                .is_some_and(|t| t.kind == Fts5QueryTokenKind::LParen)
             {
                 return Err(Fts5QueryError::InvalidNearSyntax);
             }
@@ -1081,7 +1079,7 @@ pub fn bm25_score(
         }
 
         // IDF component
-        let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+        let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();
 
         // Get per-column frequencies for weighting
         let postings = index.get_postings(term);
@@ -1093,7 +1091,7 @@ pub fn bm25_score(
             let col_weight = weights.get(posting.column as usize).copied().unwrap_or(1.0);
 
             let denom = if avgdl > 0.0 {
-                tf + BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl)
+                BM25_K1.mul_add(1.0 - BM25_B + BM25_B * dl / avgdl, tf)
             } else {
                 tf + BM25_K1
             };
@@ -2477,5 +2475,660 @@ mod tests {
             format!("{}", Fts5QueryError::UnaryNotForbidden),
             "FTS5 NOT is binary-only; unary NOT is not allowed"
         );
+    }
+
+    // -- Additional edge case tests --
+
+    #[test]
+    fn test_query_error_display_all_variants() {
+        assert_eq!(
+            format!("{}", Fts5QueryError::UnclosedPhrase),
+            "unclosed phrase literal"
+        );
+        assert_eq!(
+            format!("{}", Fts5QueryError::UnbalancedParentheses),
+            "unbalanced parentheses"
+        );
+        assert_eq!(
+            format!("{}", Fts5QueryError::InvalidColumnFilter("foo".to_owned())),
+            "invalid column filter: foo"
+        );
+        assert_eq!(
+            format!("{}", Fts5QueryError::InvalidNearSyntax),
+            "invalid NEAR syntax"
+        );
+    }
+
+    #[test]
+    fn test_parse_bool_like_all_values() {
+        assert_eq!(parse_bool_like("1"), Some(true));
+        assert_eq!(parse_bool_like("on"), Some(true));
+        assert_eq!(parse_bool_like("true"), Some(true));
+        assert_eq!(parse_bool_like("TRUE"), Some(true));
+        assert_eq!(parse_bool_like("  On  "), Some(true));
+        assert_eq!(parse_bool_like("0"), Some(false));
+        assert_eq!(parse_bool_like("off"), Some(false));
+        assert_eq!(parse_bool_like("false"), Some(false));
+        assert_eq!(parse_bool_like("FALSE"), Some(false));
+        assert_eq!(parse_bool_like("maybe"), None);
+        assert_eq!(parse_bool_like(""), None);
+    }
+
+    #[test]
+    fn test_config_apply_no_equals() {
+        let mut config = Fts5Config::default();
+        assert!(!config.apply_control_command("noequals"));
+    }
+
+    #[test]
+    fn test_unicode61_custom_separators() {
+        let tok = Unicode61Tokenizer {
+            separators: ".".to_owned(),
+            token_chars: String::new(),
+            remove_diacritics: 0,
+        };
+        let tokens = tok.tokenize("hello.world");
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+        assert_eq!(terms, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn test_unicode61_custom_token_chars() {
+        let tok = Unicode61Tokenizer {
+            separators: String::new(),
+            token_chars: "-".to_owned(),
+            remove_diacritics: 0,
+        };
+        let tokens = tok.tokenize("well-known");
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+        // '-' is treated as a token character, so the whole thing is one token.
+        assert_eq!(terms, vec!["well-known"]);
+    }
+
+    #[test]
+    fn test_unicode61_empty_input() {
+        let tok = Unicode61Tokenizer::new();
+        assert!(tok.tokenize("").is_empty());
+    }
+
+    #[test]
+    fn test_unicode61_only_separators() {
+        let tok = Unicode61Tokenizer::new();
+        assert!(tok.tokenize("   ...   ").is_empty());
+    }
+
+    #[test]
+    fn test_ascii_tokenizer_non_ascii_dropped() {
+        let tok = AsciiTokenizer;
+        let tokens = tok.tokenize("café hello");
+        let terms: Vec<&str> = tokens.iter().map(|t| t.term.as_str()).collect();
+        // 'é' is not ASCII alphanumeric, so "caf" and "hello" are separate tokens.
+        assert_eq!(terms, vec!["caf", "hello"]);
+    }
+
+    #[test]
+    fn test_ascii_tokenizer_empty() {
+        let tok = AsciiTokenizer;
+        assert!(tok.tokenize("").is_empty());
+    }
+
+    #[test]
+    fn test_ascii_tokenizer_name() {
+        let tok = AsciiTokenizer;
+        assert_eq!(Fts5Tokenizer::name(&tok), "ascii");
+    }
+
+    #[test]
+    fn test_porter_tokenizer_debug() {
+        let tok = PorterTokenizer::new(Box::new(Unicode61Tokenizer::new()));
+        let debug = format!("{tok:?}");
+        assert!(debug.contains("PorterTokenizer"));
+        assert!(debug.contains("unicode61"));
+    }
+
+    #[test]
+    fn test_porter_tokenizer_name() {
+        let tok = PorterTokenizer::new(Box::new(Unicode61Tokenizer::new()));
+        assert_eq!(Fts5Tokenizer::name(&tok), "porter");
+    }
+
+    #[test]
+    fn test_porter_stem_step1b_at_suffix() {
+        // "conflated" -> strip "ed" -> "conflat" -> fixup: ends with "at" -> "conflate"
+        assert_eq!(porter_stem("conflated"), "conflate");
+    }
+
+    #[test]
+    fn test_porter_stem_step1b_bl_suffix() {
+        assert_eq!(porter_stem("troubled"), "trouble");
+    }
+
+    #[test]
+    fn test_porter_stem_step1b_iz_suffix() {
+        assert_eq!(porter_stem("sized"), "size");
+    }
+
+    #[test]
+    fn test_porter_stem_step1b_double_consonant() {
+        // "hopping" -> strip "ing" -> "hopp" -> double consonant, not l/s/z -> "hop"
+        assert_eq!(porter_stem("hopping"), "hop");
+    }
+
+    #[test]
+    fn test_porter_stem_eed() {
+        // "agreed" -> "eed" suffix -> base "agr" (len > 1) -> "agree"
+        assert_eq!(porter_stem("agreed"), "agree");
+    }
+
+    #[test]
+    fn test_porter_stem_terminal_y() {
+        // "happy" -> step1c: terminal y with vowel in stem -> "happi"
+        assert_eq!(porter_stem("happy"), "happi");
+    }
+
+    #[test]
+    fn test_porter_stem_step2_ational() {
+        assert_eq!(porter_stem("relational"), "relate");
+    }
+
+    #[test]
+    fn test_porter_stem_step3_ful() {
+        assert_eq!(porter_stem("hopeful"), "hope");
+    }
+
+    #[test]
+    fn test_porter_stem_short_word() {
+        assert_eq!(porter_stem("a"), "a");
+        assert_eq!(porter_stem("an"), "an");
+    }
+
+    #[test]
+    fn test_measure_function() {
+        assert_eq!(measure(""), 0);
+        assert_eq!(measure("a"), 0);
+        assert_eq!(measure("ab"), 1);
+        assert_eq!(measure("abc"), 1);
+        assert_eq!(measure("abab"), 2);
+    }
+
+    #[test]
+    fn test_contains_vowel_function() {
+        assert!(contains_vowel("hello"));
+        assert!(contains_vowel("a"));
+        assert!(!contains_vowel("xyz"));
+        assert!(!contains_vowel(""));
+    }
+
+    #[test]
+    fn test_trigram_case_sensitive() {
+        let tok = TrigramTokenizer {
+            case_sensitive: true,
+        };
+        let tokens = tok.tokenize("ABC");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].term, "ABC");
+    }
+
+    #[test]
+    fn test_trigram_case_insensitive() {
+        let tok = TrigramTokenizer {
+            case_sensitive: false,
+        };
+        let tokens = tok.tokenize("ABC");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].term, "abc");
+    }
+
+    #[test]
+    fn test_trigram_unicode() {
+        let tok = TrigramTokenizer::default();
+        let tokens = tok.tokenize("café");
+        assert!(!tokens.is_empty());
+        // "café" has 4 chars, so we get 2 trigrams.
+        assert_eq!(tokens.len(), 2);
+    }
+
+    #[test]
+    fn test_trigram_exact_3_chars() {
+        let tok = TrigramTokenizer::default();
+        let tokens = tok.tokenize("abc");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].term, "abc");
+        assert_eq!(tokens[0].start, 0);
+        assert_eq!(tokens[0].end, 3);
+    }
+
+    #[test]
+    fn test_trigram_tokenizer_name() {
+        let tok = TrigramTokenizer::default();
+        assert_eq!(Fts5Tokenizer::name(&tok), "trigram");
+    }
+
+    #[test]
+    fn test_create_tokenizer_case_insensitive() {
+        assert!(create_tokenizer("UNICODE61").is_some());
+        assert!(create_tokenizer("ASCII").is_some());
+        assert!(create_tokenizer("Porter").is_some());
+        assert!(create_tokenizer("Trigram").is_some());
+    }
+
+    #[test]
+    fn test_query_caret_token() {
+        let tokens = parse_fts5_query("^hello").unwrap();
+        assert_eq!(tokens[0].kind, Fts5QueryTokenKind::Caret);
+        assert_eq!(tokens[1].kind, Fts5QueryTokenKind::Term);
+    }
+
+    #[test]
+    fn test_query_nested_parens() {
+        let tokens = parse_fts5_query("((hello))").unwrap();
+        let kinds: Vec<Fts5QueryTokenKind> = tokens.iter().map(|t| t.kind).collect();
+        assert_eq!(kinds[0], Fts5QueryTokenKind::LParen);
+        assert_eq!(kinds[1], Fts5QueryTokenKind::LParen);
+    }
+
+    #[test]
+    fn test_query_extra_close_paren() {
+        let err = parse_fts5_query(")hello").unwrap_err();
+        assert_eq!(err, Fts5QueryError::UnbalancedParentheses);
+    }
+
+    #[test]
+    fn test_query_empty_phrase_ignored() {
+        // Empty phrase (just "") should be ignored and result in EmptyQuery.
+        let err = parse_fts5_query(r#""""#).unwrap_err();
+        assert_eq!(err, Fts5QueryError::EmptyQuery);
+    }
+
+    #[test]
+    fn test_query_not_after_or_is_unary() {
+        let err = parse_fts5_query("hello OR NOT world").unwrap_err();
+        assert_eq!(err, Fts5QueryError::UnaryNotForbidden);
+    }
+
+    #[test]
+    fn test_build_expr_term() {
+        let tokens = parse_fts5_query("hello").unwrap();
+        let expr = build_expr(&tokens).unwrap();
+        assert!(matches!(expr, Fts5Expr::Term(_)));
+    }
+
+    #[test]
+    fn test_build_expr_and_or_precedence() {
+        // "a OR b c" should parse as "a OR (b AND c)" due to AND having higher precedence.
+        let tokens = parse_fts5_query("a OR b c").unwrap();
+        let expr = build_expr(&tokens).unwrap();
+        assert!(matches!(expr, Fts5Expr::Or(_, _)));
+    }
+
+    #[test]
+    fn test_build_expr_near_invalid() {
+        // NEAR without parens is invalid.
+        let tokens = parse_fts5_query("NEAR hello").unwrap();
+        let err = build_expr(&tokens);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_inverted_index_empty() {
+        let index = InvertedIndex::new();
+        assert_eq!(index.total_docs(), 0);
+        assert_eq!(index.doc_frequency("anything"), 0);
+        assert_eq!(index.term_frequency("anything", 1), 0);
+        assert!(index.avg_doc_length().abs() < f64::EPSILON);
+        assert_eq!(index.doc_length(1), 0);
+        assert!(index.get_postings("nothing").is_empty());
+        assert!(index.get_prefix_postings("n").is_empty());
+    }
+
+    #[test]
+    fn test_inverted_index_multi_column() {
+        let mut index = InvertedIndex::new();
+        let tok = Unicode61Tokenizer::new();
+
+        index.add_document(1, 0, &tok.tokenize("title words"));
+        index.add_document(1, 1, &tok.tokenize("body words here"));
+
+        assert_eq!(index.total_docs(), 1);
+        assert_eq!(index.doc_length(1), 5); // 2 + 3
+        assert_eq!(index.doc_frequency("words"), 1); // same docid
+    }
+
+    #[test]
+    fn test_inverted_index_remove_nonexistent() {
+        let mut index = InvertedIndex::new();
+        index.remove_document(999); // should not panic
+        assert_eq!(index.total_docs(), 0);
+    }
+
+    #[test]
+    fn test_evaluate_phrase_empty() {
+        let index = InvertedIndex::new();
+        let expr = Fts5Expr::Phrase(vec![]);
+        let docs = evaluate_expr(&index, &expr);
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_near_single_term() {
+        let index = InvertedIndex::new();
+        let expr = Fts5Expr::Near(vec!["only".to_owned()], 5);
+        let docs = evaluate_expr(&index, &expr);
+        assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_evaluate_column_filter() {
+        let mut index = InvertedIndex::new();
+        let tok = Unicode61Tokenizer::new();
+        index.add_document(1, 0, &tok.tokenize("hello world"));
+
+        let expr = Fts5Expr::ColumnFilter(
+            "title".to_owned(),
+            Box::new(Fts5Expr::Term("hello".to_owned())),
+        );
+        let docs = evaluate_expr(&index, &expr);
+        // Simplified implementation doesn't filter by column.
+        assert_eq!(docs, vec![1]);
+    }
+
+    #[test]
+    fn test_intersect_sorted_disjoint() {
+        let result = intersect_sorted(&[1, 3, 5], &[2, 4, 6]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_intersect_sorted_empty() {
+        assert!(intersect_sorted(&[], &[1, 2, 3]).is_empty());
+        assert!(intersect_sorted(&[1, 2, 3], &[]).is_empty());
+    }
+
+    #[test]
+    fn test_union_sorted_no_overlap() {
+        let result = union_sorted(&[1, 3], &[2, 4]);
+        assert_eq!(result, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_union_sorted_empty() {
+        assert_eq!(union_sorted(&[], &[1, 2]), vec![1, 2]);
+        assert_eq!(union_sorted(&[1, 2], &[]), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_difference_sorted_all_excluded() {
+        let result = difference_sorted(&[1, 2, 3], &[1, 2, 3]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_difference_sorted_none_excluded() {
+        let result = difference_sorted(&[1, 2, 3], &[4, 5]);
+        assert_eq!(result, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_bm25_no_matching_terms() {
+        let mut index = InvertedIndex::new();
+        let tok = Unicode61Tokenizer::new();
+        index.add_document(1, 0, &tok.tokenize("hello world"));
+
+        let score = bm25_score(&index, 1, &["nonexistent".to_owned()], &[1.0]);
+        assert!(score.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_bm25_weighted_columns() {
+        let mut index = InvertedIndex::new();
+        let tok = Unicode61Tokenizer::new();
+        index.add_document(1, 0, &tok.tokenize("rust"));
+        index.add_document(1, 1, &tok.tokenize("other stuff"));
+
+        let low_weight = bm25_score(&index, 1, &["rust".to_owned()], &[0.1, 1.0]);
+        let high_weight = bm25_score(&index, 1, &["rust".to_owned()], &[10.0, 1.0]);
+
+        // Higher column weight should produce a more negative (better) score.
+        assert!(high_weight < low_weight);
+    }
+
+    #[test]
+    fn test_fts5_table_get_document() {
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        table.insert_document(1, &["hello world".to_owned()]);
+
+        let doc = table.get_document(1).unwrap();
+        assert_eq!(doc, &["hello world"]);
+
+        assert!(table.get_document(99).is_none());
+    }
+
+    #[test]
+    fn test_fts5_table_search_no_results() {
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        table.insert_document(1, &["hello world".to_owned()]);
+
+        let results = table.search("nonexistent").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_fts5_table_auto_rowid() {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
+
+        // Insert without explicit rowid.
+        let r1 = vtab
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Text("first".to_owned()),
+                ],
+            )
+            .unwrap();
+        let r2 = vtab
+            .update(
+                &cx,
+                &[
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Text("second".to_owned()),
+                ],
+            )
+            .unwrap();
+
+        assert_ne!(r1, r2);
+    }
+
+    #[test]
+    fn test_fts5_vtab_update_modify() {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
+
+        vtab.update(
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Integer(1),
+                SqliteValue::Text("original".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        // Update: old_rowid=1, new_rowid=1, new_content="modified"
+        vtab.update(
+            &cx,
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("modified".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        let doc = vtab.get_document(1).unwrap();
+        assert_eq!(doc, &["modified"]);
+    }
+
+    #[test]
+    fn test_fts5_vtab_update_empty_args() {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
+        assert!(vtab.update(&cx, &[]).is_err());
+    }
+
+    #[test]
+    fn test_fts5_vtab_contentless_delete_rejected() {
+        let cx = Cx::new();
+        let mut vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
+        *vtab.config_mut() = Fts5Config::new(ContentMode::Contentless);
+
+        vtab.insert_document(1, &["data".to_owned()]);
+
+        let result = vtab.update(&cx, &[SqliteValue::Integer(1)]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_fts5_cursor_set_results() {
+        let mut cursor = Fts5Cursor {
+            results: Vec::new(),
+            position: 0,
+            columns: vec!["content".to_owned()],
+        };
+
+        assert!(cursor.eof());
+
+        cursor.set_results(vec![
+            (1, -1.5, vec!["hello".to_owned()]),
+            (2, -0.5, vec!["world".to_owned()]),
+        ]);
+
+        assert!(!cursor.eof());
+        assert_eq!(cursor.rowid().unwrap(), 1);
+
+        let cx = Cx::new();
+        cursor.next(&cx).unwrap();
+        assert!(!cursor.eof());
+        assert_eq!(cursor.rowid().unwrap(), 2);
+
+        cursor.next(&cx).unwrap();
+        assert!(cursor.eof());
+        assert_eq!(cursor.rowid().unwrap(), 0); // past end returns 0
+    }
+
+    #[test]
+    fn test_fts5_cursor_column() {
+        let mut cursor = Fts5Cursor {
+            results: Vec::new(),
+            position: 0,
+            columns: vec!["content".to_owned()],
+        };
+
+        cursor.set_results(vec![(1, -1.0, vec!["hello world".to_owned()])]);
+
+        let mut ctx = ColumnContext::new();
+        cursor.column(&mut ctx, 0).unwrap();
+        assert_eq!(
+            ctx.take_value(),
+            Some(SqliteValue::Text("hello world".to_owned()))
+        );
+
+        // Rank column (beyond column count).
+        let mut ctx2 = ColumnContext::new();
+        cursor.column(&mut ctx2, 1).unwrap();
+        assert_eq!(ctx2.take_value(), Some(SqliteValue::Float(-1.0)));
+    }
+
+    #[test]
+    fn test_highlight_no_matches() {
+        let result = highlight("hello world", &["nonexistent".to_owned()], "<b>", "</b>");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_highlight_empty_text() {
+        let result = highlight("", &["hello".to_owned()], "<b>", "</b>");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_snippet_no_matches() {
+        let result = snippet(
+            "hello world",
+            &["nonexistent".to_owned()],
+            "<b>",
+            "</b>",
+            "...",
+            3,
+        );
+        // Should still return something from the start.
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_snippet_empty_text() {
+        let result = snippet("", &["hello".to_owned()], "<b>", "</b>", "...", 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_extract_query_terms() {
+        let expr = Fts5Expr::And(
+            Box::new(Fts5Expr::Term("Hello".to_owned())),
+            Box::new(Fts5Expr::Or(
+                Box::new(Fts5Expr::Prefix("Wor".to_owned())),
+                Box::new(Fts5Expr::Phrase(vec![
+                    "exact".to_owned(),
+                    "match".to_owned(),
+                ])),
+            )),
+        );
+        let terms = extract_query_terms(&expr);
+        assert_eq!(terms, vec!["hello", "wor", "exact", "match"]);
+    }
+
+    #[test]
+    fn test_fts5_source_id_func_num_args() {
+        let func = Fts5SourceIdFunc;
+        assert_eq!(func.num_args(), 0);
+        assert_eq!(func.name(), "fts5_source_id");
+    }
+
+    #[test]
+    fn test_fts5_config_content_mode_accessor() {
+        let config = Fts5Config::new(ContentMode::Contentless);
+        assert_eq!(config.content_mode(), ContentMode::Contentless);
+    }
+
+    #[test]
+    fn test_fts5_table_config_accessors() {
+        let mut table = Fts5Table::with_columns(vec!["c".to_owned()]);
+        assert_eq!(table.config().content_mode(), ContentMode::Stored);
+        table.config_mut().apply_control_command("secure-delete=1");
+        assert!(table.config().secure_delete_enabled());
+    }
+
+    #[test]
+    fn test_fts5_token_colocated_field() {
+        let token = Fts5Token {
+            term: "test".to_owned(),
+            start: 0,
+            end: 4,
+            colocated: true,
+        };
+        assert!(token.colocated);
+    }
+
+    #[test]
+    fn test_fts5_vtab_best_index_full_scan() {
+        let cx = Cx::new();
+        let vtab = Fts5Table::connect(&cx, &["fts5", "main", "t", "content"]).unwrap();
+        let mut info = IndexInfo::new(vec![], vec![]);
+        vtab.best_index(&mut info).unwrap();
+        assert_eq!(info.idx_num, 0); // full scan
+        assert!(info.estimated_cost > 100_000.0);
     }
 }

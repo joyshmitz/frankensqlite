@@ -2033,4 +2033,557 @@ mod tests {
             1
         );
     }
+
+    // -----------------------------------------------------------------------
+    // json() edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_minify_whitespace() {
+        assert_eq!(json("  { \"a\" : 1 }  ").unwrap(), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_json_scalar_string() {
+        assert_eq!(json(r#""hello""#).unwrap(), r#""hello""#);
+    }
+
+    #[test]
+    fn test_json_scalar_number() {
+        assert_eq!(json("42").unwrap(), "42");
+    }
+
+    #[test]
+    fn test_json_scalar_null() {
+        assert_eq!(json("null").unwrap(), "null");
+    }
+
+    #[test]
+    fn test_json_scalar_bool() {
+        assert_eq!(json("true").unwrap(), "true");
+        assert_eq!(json("false").unwrap(), "false");
+    }
+
+    #[test]
+    fn test_json_nested_structure() {
+        let input = r#"{"a":{"b":[1,2,{"c":3}]}}"#;
+        assert_eq!(json(input).unwrap(), input);
+    }
+
+    #[test]
+    fn test_json_unicode() {
+        let input = r#"{"key":"\u00fc\u00e9"}"#;
+        let result = json(input).unwrap();
+        // After parse/re-serialize, unicode escapes become literal chars
+        assert!(result.contains("key"));
+    }
+
+    // -----------------------------------------------------------------------
+    // json_valid edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_valid_zero_flags() {
+        assert_eq!(json_valid(r#"{"a":1}"#, Some(0)), 0);
+    }
+
+    #[test]
+    fn test_json_valid_empty_string() {
+        assert_eq!(json_valid("", None), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_type all variants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_type_null() {
+        assert_eq!(json_type("null", None).unwrap(), Some("null"));
+    }
+
+    #[test]
+    fn test_json_type_true() {
+        assert_eq!(json_type("true", None).unwrap(), Some("true"));
+    }
+
+    #[test]
+    fn test_json_type_false() {
+        assert_eq!(json_type("false", None).unwrap(), Some("false"));
+    }
+
+    #[test]
+    fn test_json_type_real() {
+        assert_eq!(json_type("3.14", None).unwrap(), Some("real"));
+    }
+
+    #[test]
+    fn test_json_type_text() {
+        assert_eq!(json_type(r#""hello""#, None).unwrap(), Some("text"));
+    }
+
+    #[test]
+    fn test_json_type_array() {
+        assert_eq!(json_type("[1,2]", None).unwrap(), Some("array"));
+    }
+
+    // -----------------------------------------------------------------------
+    // json_extract edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_extract_missing_path_null() {
+        let result = json_extract(r#"{"a":1}"#, &["$.b"]).unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_json_extract_no_paths_error() {
+        let empty: &[&str] = &[];
+        assert!(json_extract(r#"{"a":1}"#, empty).is_err());
+    }
+
+    #[test]
+    fn test_json_extract_null_value() {
+        let result = json_extract(r#"{"a":null}"#, &["$.a"]).unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_json_extract_boolean() {
+        let result = json_extract(r#"{"a":true}"#, &["$.a"]).unwrap();
+        assert_eq!(result, SqliteValue::Integer(1));
+        let result = json_extract(r#"{"a":false}"#, &["$.a"]).unwrap();
+        assert_eq!(result, SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn test_json_extract_nested_array() {
+        let result = json_extract(r#"{"a":[[1,2],[3,4]]}"#, &["$.a[1][0]"]).unwrap();
+        assert_eq!(result, SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_json_extract_multiple_with_missing() {
+        let result = json_extract(r#"{"a":1}"#, &["$.a", "$.b"]).unwrap();
+        assert_eq!(result, SqliteValue::Text("[1,null]".to_owned()));
+    }
+
+    // -----------------------------------------------------------------------
+    // json_arrow edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_arrow_missing_path_null() {
+        let result = json_arrow(r#"{"a":1}"#, "$.b").unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_json_arrow_number() {
+        let result = json_arrow(r#"{"a":42}"#, "$.a").unwrap();
+        assert_eq!(result, SqliteValue::Text("42".to_owned()));
+    }
+
+    #[test]
+    fn test_json_arrow_null() {
+        let result = json_arrow(r#"{"a":null}"#, "$.a").unwrap();
+        assert_eq!(result, SqliteValue::Text("null".to_owned()));
+    }
+
+    // -----------------------------------------------------------------------
+    // json_array_length edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_array_length_nested_not_array() {
+        assert_eq!(
+            json_array_length(r#"{"a":"text"}"#, Some("$.a")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_json_array_length_missing_path() {
+        assert_eq!(json_array_length(r#"{"a":1}"#, Some("$.b")).unwrap(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_error_position edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_error_position_empty() {
+        assert!(json_error_position("") > 0);
+    }
+
+    #[test]
+    fn test_json_error_position_just_brace() {
+        assert!(json_error_position("{") > 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_pretty edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_pretty_empty_array() {
+        assert_eq!(json_pretty("[]", None).unwrap(), "[]");
+    }
+
+    #[test]
+    fn test_json_pretty_empty_object() {
+        assert_eq!(json_pretty("{}", None).unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_json_pretty_scalar() {
+        assert_eq!(json_pretty("42", None).unwrap(), "42");
+    }
+
+    #[test]
+    fn test_json_pretty_nested() {
+        let result = json_pretty(r#"{"a":[1,2]}"#, None).unwrap();
+        assert!(result.contains('\n'));
+        assert!(result.contains("\"a\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // json_quote edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_quote_integer() {
+        assert_eq!(json_quote(&SqliteValue::Integer(42)), "42");
+        assert_eq!(json_quote(&SqliteValue::Integer(-1)), "-1");
+    }
+
+    #[test]
+    fn test_json_quote_float() {
+        let result = json_quote(&SqliteValue::Float(3.14));
+        assert!(result.starts_with("3.14"));
+    }
+
+    #[test]
+    fn test_json_quote_float_infinity() {
+        assert_eq!(json_quote(&SqliteValue::Float(f64::INFINITY)), "null");
+        assert_eq!(json_quote(&SqliteValue::Float(f64::NEG_INFINITY)), "null");
+        assert_eq!(json_quote(&SqliteValue::Float(f64::NAN)), "null");
+    }
+
+    #[test]
+    fn test_json_quote_blob() {
+        let result = json_quote(&SqliteValue::Blob(vec![0xDE, 0xAD]));
+        assert_eq!(result, r#""dead""#);
+    }
+
+    #[test]
+    fn test_json_quote_text_special_chars() {
+        let result = json_quote(&SqliteValue::Text("a\"b\\c".to_owned()));
+        assert!(result.contains("\\\""));
+        assert!(result.contains("\\\\"));
+    }
+
+    // -----------------------------------------------------------------------
+    // json_object edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_object_odd_args_error() {
+        let err = json_object(&[
+            SqliteValue::Text("a".to_owned()),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("b".to_owned()),
+        ]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_json_object_non_text_key_error() {
+        let err = json_object(&[SqliteValue::Integer(1), SqliteValue::Integer(2)]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_json_object_empty() {
+        assert_eq!(json_object(&[]).unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_json_object_duplicate_keys() {
+        let out = json_object(&[
+            SqliteValue::Text("k".to_owned()),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("k".to_owned()),
+            SqliteValue::Integer(2),
+        ])
+        .unwrap();
+        assert_eq!(out, r#"{"k":2}"#);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_set/insert/replace array index
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_set_array_element() {
+        let out = json_set("[1,2,3]", &[("$[1]", SqliteValue::Integer(99))]).unwrap();
+        assert_eq!(out, "[1,99,3]");
+    }
+
+    #[test]
+    fn test_json_replace_array_element() {
+        let out = json_replace("[1,2,3]", &[("$[0]", SqliteValue::Integer(0))]).unwrap();
+        assert_eq!(out, "[0,2,3]");
+    }
+
+    #[test]
+    fn test_json_set_multiple_paths() {
+        let out = json_set(
+            r#"{"a":1,"b":2}"#,
+            &[
+                ("$.a", SqliteValue::Integer(10)),
+                ("$.c", SqliteValue::Integer(30)),
+            ],
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["a"], 10);
+        assert_eq!(parsed["c"], 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_remove edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_remove_missing_key_no_change() {
+        let out = json_remove(r#"{"a":1}"#, &["$.b"]).unwrap();
+        assert_eq!(out, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_json_remove_multiple_paths() {
+        let out = json_remove(r#"{"a":1,"b":2,"c":3}"#, &["$.a", "$.c"]).unwrap();
+        assert_eq!(out, r#"{"b":2}"#);
+    }
+
+    #[test]
+    fn test_json_remove_from_end_index() {
+        let out = json_remove("[1,2,3]", &["$[#-1]"]).unwrap();
+        assert_eq!(out, "[1,2]");
+    }
+
+    // -----------------------------------------------------------------------
+    // json_patch edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_patch_non_object_replaces() {
+        let out = json_patch(r#"{"a":1}"#, "42").unwrap();
+        assert_eq!(out, "42");
+    }
+
+    #[test]
+    fn test_json_patch_nested_merge() {
+        let out = json_patch(r#"{"a":{"b":1,"c":2}}"#, r#"{"a":{"b":10,"d":4}}"#).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["a"]["b"], 10);
+        assert_eq!(parsed["a"]["c"], 2);
+        assert_eq!(parsed["a"]["d"], 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_each edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_each_scalar() {
+        let rows = json_each("42", None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, SqliteValue::Null);
+        assert_eq!(rows[0].value, SqliteValue::Integer(42));
+        assert_eq!(rows[0].type_name, "integer");
+    }
+
+    #[test]
+    fn test_json_each_empty_array() {
+        let rows = json_each("[]", None).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_json_each_empty_object() {
+        let rows = json_each("{}", None).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_json_each_missing_path() {
+        let rows = json_each(r#"{"a":1}"#, Some("$.b")).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_json_each_nested_value_is_json_text() {
+        let rows = json_each(r#"{"a":[1,2]}"#, None).unwrap();
+        assert_eq!(rows[0].value, SqliteValue::Text("[1,2]".to_owned()));
+        assert_eq!(rows[0].atom, SqliteValue::Null); // arrays have null atom
+    }
+
+    // -----------------------------------------------------------------------
+    // json_tree edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_tree_scalar() {
+        let rows = json_tree("42", None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].type_name, "integer");
+    }
+
+    #[test]
+    fn test_json_tree_empty_array() {
+        let rows = json_tree("[]", None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].type_name, "array");
+    }
+
+    #[test]
+    fn test_json_tree_parent_ids() {
+        let rows = json_tree(r#"{"a":1}"#, None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].parent, SqliteValue::Null); // root
+        assert_eq!(rows[1].parent, SqliteValue::Integer(rows[0].id)); // child
+    }
+
+    #[test]
+    fn test_json_tree_missing_path() {
+        let rows = json_tree(r#"{"a":1}"#, Some("$.b")).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // JSONB edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_jsonb_null() {
+        let blob = jsonb("null").unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "null");
+    }
+
+    #[test]
+    fn test_jsonb_booleans() {
+        assert_eq!(json_from_jsonb(&jsonb("true").unwrap()).unwrap(), "true");
+        assert_eq!(json_from_jsonb(&jsonb("false").unwrap()).unwrap(), "false");
+    }
+
+    #[test]
+    fn test_jsonb_integer() {
+        let blob = jsonb("42").unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "42");
+    }
+
+    #[test]
+    fn test_jsonb_float() {
+        let blob = jsonb("3.14").unwrap();
+        let text = json_from_jsonb(&blob).unwrap();
+        assert!(text.starts_with("3.14"));
+    }
+
+    #[test]
+    fn test_jsonb_nested_array() {
+        let blob = jsonb("[[1],[2,3]]").unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "[[1],[2,3]]");
+    }
+
+    #[test]
+    fn test_jsonb_empty_string() {
+        let blob = jsonb(r#""""#).unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#""""#);
+    }
+
+    #[test]
+    fn test_jsonb_extract_multiple_paths() {
+        let blob = jsonb_extract(r#"{"a":1,"b":2}"#, &["$.a", "$.b"]).unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "[1,2]");
+    }
+
+    #[test]
+    fn test_jsonb_extract_no_paths_error() {
+        let empty: &[&str] = &[];
+        assert!(jsonb_extract(r#"{"a":1}"#, empty).is_err());
+    }
+
+    #[test]
+    fn test_jsonb_decode_trailing_bytes() {
+        let mut blob = jsonb("42").unwrap();
+        blob.push(0xFF); // trailing garbage
+        assert!(json_from_jsonb(&blob).is_err());
+    }
+
+    #[test]
+    fn test_jsonb_decode_empty() {
+        assert!(json_from_jsonb(&[]).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Path parsing edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_path_invalid_no_dollar() {
+        assert!(json_extract(r#"{"a":1}"#, &["a"]).is_err());
+    }
+
+    #[test]
+    fn test_path_empty_key_error() {
+        assert!(json_extract(r#"{"a":1}"#, &["$."]).is_err());
+    }
+
+    #[test]
+    fn test_path_unclosed_bracket() {
+        assert!(json_extract(r#"[1,2]"#, &["$[0"]).is_err());
+    }
+
+    #[test]
+    fn test_path_from_end_zero_error() {
+        assert!(json_extract("[1,2,3]", &["$[#-0]"]).is_err());
+    }
+
+    #[test]
+    fn test_path_from_end_beyond_length() {
+        let result = json_extract("[1,2,3]", &["$[#-10]"]).unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    // -----------------------------------------------------------------------
+    // json_group_object edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_group_object_non_text_key_error() {
+        let err = json_group_object(&[(SqliteValue::Integer(1), SqliteValue::Integer(2))]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_json_group_object_empty() {
+        assert_eq!(json_group_object(&[]).unwrap(), "{}");
+    }
+
+    // -----------------------------------------------------------------------
+    // json_array edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_array_empty() {
+        assert_eq!(json_array(&[]).unwrap(), "[]");
+    }
+
+    #[test]
+    fn test_json_array_with_blob() {
+        let out = json_array(&[SqliteValue::Blob(vec![0xCA, 0xFE])]).unwrap();
+        assert_eq!(out, r#"["cafe"]"#);
+    }
 }

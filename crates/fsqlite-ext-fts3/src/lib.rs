@@ -322,9 +322,9 @@ pub fn format_offsets(entries: &[OffsetEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FtsDialect, MatchinfoFormatError, OffsetsParseError, QueryTokenKind, QueryValidationError,
-        extension_name, format_offsets, matchinfo_u32_width, parse_offsets, parse_query,
-        supports_column_level_match, supports_dialect, supports_unary_not,
+        FtsDialect, MatchinfoFormatError, OffsetsParseError, QueryToken, QueryTokenKind,
+        QueryValidationError, extension_name, format_offsets, matchinfo_u32_width, parse_offsets,
+        parse_query, supports_column_level_match, supports_dialect, supports_unary_not,
         validate_matchinfo_format,
     };
 
@@ -429,5 +429,285 @@ mod tests {
             parse_offsets("0 1 NaN 4"),
             Err(OffsetsParseError::InvalidInteger("NaN".to_owned()))
         );
+    }
+
+    // ── Query tokenization ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_query_empty_returns_error() {
+        assert_eq!(parse_query(""), Err(QueryValidationError::EmptyQuery));
+    }
+
+    #[test]
+    fn parse_query_whitespace_only_returns_error() {
+        assert_eq!(parse_query("   "), Err(QueryValidationError::EmptyQuery));
+    }
+
+    #[test]
+    fn parse_query_unclosed_phrase_returns_error() {
+        assert_eq!(
+            parse_query(r#""unclosed phrase"#),
+            Err(QueryValidationError::UnclosedPhrase)
+        );
+    }
+
+    #[test]
+    fn parse_query_single_term() {
+        let tokens = parse_query("hello").unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind(), QueryTokenKind::Term);
+        assert_eq!(tokens[0].lexeme(), "hello");
+    }
+
+    #[test]
+    fn parse_query_phrase_token() {
+        let tokens = parse_query(r#""foo bar""#).unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind(), QueryTokenKind::Phrase);
+        assert_eq!(tokens[0].lexeme(), "foo bar");
+    }
+
+    #[test]
+    fn parse_query_near_keyword() {
+        let tokens = parse_query("alpha NEAR beta").unwrap();
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[1].kind(), QueryTokenKind::Near);
+    }
+
+    #[test]
+    fn parse_query_parenthesized_expression() {
+        let tokens = parse_query("(alpha OR beta)").unwrap();
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens[0].kind(), QueryTokenKind::LParen);
+        assert_eq!(tokens[4].kind(), QueryTokenKind::RParen);
+    }
+
+    #[test]
+    fn parse_query_implicit_and_after_phrase() {
+        assert!(matches!(
+            parse_query(r#""phrase one" term"#),
+            Err(QueryValidationError::ImplicitAnd { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_query_implicit_and_before_paren() {
+        assert!(matches!(
+            parse_query("term (other)"),
+            Err(QueryValidationError::ImplicitAnd { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_query_rparen_then_term_is_implicit_and() {
+        assert!(matches!(
+            parse_query("(alpha) beta"),
+            Err(QueryValidationError::ImplicitAnd { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_query_extra_rparen_unbalanced() {
+        assert_eq!(
+            parse_query("alpha)"),
+            Err(QueryValidationError::UnbalancedParentheses)
+        );
+    }
+
+    #[test]
+    fn parse_query_case_insensitive_operators() {
+        // AND/OR/NOT should be recognized case-insensitively
+        let tokens = parse_query("alpha and beta or gamma not delta").unwrap();
+        let kinds: Vec<_> = tokens.iter().map(QueryToken::kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                QueryTokenKind::Term,
+                QueryTokenKind::And,
+                QueryTokenKind::Term,
+                QueryTokenKind::Or,
+                QueryTokenKind::Term,
+                QueryTokenKind::Not,
+                QueryTokenKind::Term,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_empty_phrase_ignored() {
+        // An empty quoted string `""` should be skipped, so just the operator+term remains
+        let tokens = parse_query("\"\" OR hello").unwrap();
+        // After skipping empty phrase: OR hello
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].kind(), QueryTokenKind::Or);
+        assert_eq!(tokens[1].kind(), QueryTokenKind::Term);
+    }
+
+    // ── matchinfo format validation ──────────────────────────────────────
+
+    #[test]
+    fn validate_matchinfo_format_empty() {
+        assert_eq!(
+            validate_matchinfo_format(""),
+            Err(MatchinfoFormatError::EmptyFormat)
+        );
+    }
+
+    #[test]
+    fn validate_matchinfo_format_single_chars() {
+        for ch in ['p', 'c', 'n', 'a', 'l', 's', 'x'] {
+            assert_eq!(
+                validate_matchinfo_format(&ch.to_string()),
+                Ok(()),
+                "char '{ch}' should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_matchinfo_format_uppercase_rejected() {
+        assert_eq!(
+            validate_matchinfo_format("P"),
+            Err(MatchinfoFormatError::InvalidChar('P'))
+        );
+    }
+
+    #[test]
+    fn is_matchinfo_format_char_coverage() {
+        use super::is_matchinfo_format_char;
+        assert!(is_matchinfo_format_char('p'));
+        assert!(is_matchinfo_format_char('x'));
+        assert!(!is_matchinfo_format_char('z'));
+        assert!(!is_matchinfo_format_char('P'));
+    }
+
+    // ── matchinfo_u32_width ──────────────────────────────────────────────
+
+    #[test]
+    fn matchinfo_u32_width_single_p() {
+        assert_eq!(matchinfo_u32_width("p", 5, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn matchinfo_u32_width_single_c() {
+        assert_eq!(matchinfo_u32_width("c", 5, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn matchinfo_u32_width_single_n() {
+        assert_eq!(matchinfo_u32_width("n", 5, 3).unwrap(), 1);
+    }
+
+    #[test]
+    fn matchinfo_u32_width_single_a() {
+        // 'a' contributes column_count
+        assert_eq!(matchinfo_u32_width("a", 5, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn matchinfo_u32_width_single_l() {
+        assert_eq!(matchinfo_u32_width("l", 5, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn matchinfo_u32_width_single_s() {
+        assert_eq!(matchinfo_u32_width("s", 5, 3).unwrap(), 3);
+    }
+
+    #[test]
+    fn matchinfo_u32_width_single_x() {
+        // 'x' contributes 3 * phrase_count * column_count
+        assert_eq!(matchinfo_u32_width("x", 2, 4).unwrap(), 24);
+    }
+
+    #[test]
+    fn matchinfo_u32_width_overflow_x() {
+        // Very large phrase_count * column_count should overflow
+        assert_eq!(
+            matchinfo_u32_width("x", u32::MAX, u32::MAX),
+            Err(MatchinfoFormatError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn matchinfo_u32_width_addend_overflow() {
+        // Combined format that overflows on accumulation
+        assert_eq!(
+            matchinfo_u32_width("xx", u32::MAX / 4, u32::MAX / 4),
+            Err(MatchinfoFormatError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn matchinfo_u32_width_invalid_char_in_format() {
+        assert_eq!(
+            matchinfo_u32_width("pz", 1, 1),
+            Err(MatchinfoFormatError::InvalidChar('z'))
+        );
+    }
+
+    // ── Offsets ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_offsets_empty_string() {
+        let entries = parse_offsets("").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_offsets_whitespace_only() {
+        let entries = parse_offsets("   ").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_offsets_single_entry() {
+        let entries = parse_offsets("0 0 10 5").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].column, 0);
+        assert_eq!(entries[0].term, 0);
+        assert_eq!(entries[0].byte_offset, 10);
+        assert_eq!(entries[0].byte_length, 5);
+    }
+
+    #[test]
+    fn parse_offsets_multiple_entries() {
+        let entries = parse_offsets("0 0 10 5 1 0 20 3 2 1 30 7").unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].column, 2);
+        assert_eq!(entries[2].byte_length, 7);
+    }
+
+    #[test]
+    fn parse_offsets_field_count_5() {
+        assert_eq!(
+            parse_offsets("0 1 2 3 4"),
+            Err(OffsetsParseError::InvalidFieldCount(5))
+        );
+    }
+
+    #[test]
+    fn format_offsets_empty() {
+        assert_eq!(format_offsets(&[]), "");
+    }
+
+    #[test]
+    fn format_offsets_single() {
+        use super::OffsetEntry;
+        let entries = vec![OffsetEntry {
+            column: 1,
+            term: 2,
+            byte_offset: 100,
+            byte_length: 10,
+        }];
+        assert_eq!(format_offsets(&entries), "1 2 100 10");
+    }
+
+    #[test]
+    fn parse_offsets_negative_rejected() {
+        assert!(matches!(
+            parse_offsets("0 0 -1 4"),
+            Err(OffsetsParseError::InvalidInteger(_))
+        ));
     }
 }
