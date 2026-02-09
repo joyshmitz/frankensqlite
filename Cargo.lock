@@ -619,6 +619,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "trybuild",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -665,6 +666,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-types",
  "memchr",
+ "proptest",
 ]
 
 [[package]]

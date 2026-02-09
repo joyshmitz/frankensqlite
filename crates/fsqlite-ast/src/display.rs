@@ -61,10 +61,14 @@ fn write_ident(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
     }
 }
 
-/// Write an expression, wrapping in parentheses if it is a binary op.
-/// This ensures correct precedence round-trips through parse → display → re-parse.
-fn write_paren_if_binop(f: &mut fmt::Formatter<'_>, expr: &crate::Expr) -> fmt::Result {
-    if matches!(expr, crate::Expr::BinaryOp { .. }) {
+/// Write an expression, wrapping in parentheses if it is a binary or unary op.
+/// This ensures correct precedence round-trips through parse → display → re-parse
+/// and prevents operator merging (e.g. `--x` which becomes a line comment).
+fn write_paren_if_compound(f: &mut fmt::Formatter<'_>, expr: &crate::Expr) -> fmt::Result {
+    if matches!(
+        expr,
+        crate::Expr::BinaryOp { .. } | crate::Expr::UnaryOp { .. }
+    ) {
         write!(f, "({expr})")
     } else {
         write!(f, "{expr}")
@@ -195,9 +199,9 @@ impl fmt::Display for Expr {
             Self::BinaryOp {
                 left, op, right, ..
             } => {
-                write_paren_if_binop(f, left)?;
+                write_paren_if_compound(f, left)?;
                 write!(f, " {op} ")?;
-                write_paren_if_binop(f, right)
+                write_paren_if_compound(f, right)
             }
             Self::UnaryOp { op, expr, .. } => {
                 if matches!(op, UnaryOp::Not) {
@@ -205,7 +209,7 @@ impl fmt::Display for Expr {
                 } else {
                     write!(f, "{op}")?;
                 }
-                write_paren_if_binop(f, expr)
+                write_paren_if_compound(f, expr)
             }
             Self::Between {
                 expr,
@@ -214,17 +218,17 @@ impl fmt::Display for Expr {
                 not,
                 ..
             } => {
-                write_paren_if_binop(f, expr)?;
+                write_paren_if_compound(f, expr)?;
                 if *not {
                     f.write_str(" NOT")?;
                 }
                 f.write_str(" BETWEEN ")?;
-                write_paren_if_binop(f, low)?;
+                write_paren_if_compound(f, low)?;
                 f.write_str(" AND ")?;
-                write_paren_if_binop(f, high)
+                write_paren_if_compound(f, high)
             }
             Self::In { expr, set, not, .. } => {
-                write_paren_if_binop(f, expr)?;
+                write_paren_if_compound(f, expr)?;
                 if *not {
                     f.write_str(" NOT")?;
                 }
@@ -247,15 +251,15 @@ impl fmt::Display for Expr {
                 not,
                 ..
             } => {
-                write_paren_if_binop(f, expr)?;
+                write_paren_if_compound(f, expr)?;
                 if *not {
                     f.write_str(" NOT")?;
                 }
                 write!(f, " {op} ")?;
-                write_paren_if_binop(f, pattern)?;
+                write_paren_if_compound(f, pattern)?;
                 if let Some(esc) = escape {
                     f.write_str(" ESCAPE ")?;
-                    write_paren_if_binop(f, esc)?;
+                    write_paren_if_compound(f, esc)?;
                 }
                 Ok(())
             }
@@ -321,11 +325,11 @@ impl fmt::Display for Expr {
             Self::Collate {
                 expr, collation, ..
             } => {
-                write_paren_if_binop(f, expr)?;
+                write_paren_if_compound(f, expr)?;
                 write!(f, " COLLATE {collation}")
             }
             Self::IsNull { expr, not, .. } => {
-                write_paren_if_binop(f, expr)?;
+                write_paren_if_compound(f, expr)?;
                 if *not {
                     f.write_str(" IS NOT NULL")
                 } else {
@@ -345,12 +349,12 @@ impl fmt::Display for Expr {
             Self::JsonAccess {
                 expr, path, arrow, ..
             } => {
-                write_paren_if_binop(f, expr)?;
+                write_paren_if_compound(f, expr)?;
                 match arrow {
                     JsonArrow::Arrow => f.write_str(" -> ")?,
                     JsonArrow::DoubleArrow => f.write_str(" ->> ")?,
                 }
-                write_paren_if_binop(f, path)
+                write_paren_if_compound(f, path)
             }
             Self::RowValue(exprs, _) => {
                 f.write_str("(")?;
