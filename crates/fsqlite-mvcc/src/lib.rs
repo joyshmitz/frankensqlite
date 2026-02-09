@@ -14,9 +14,11 @@ pub mod gc;
 pub mod hot_witness_index;
 pub mod invariants;
 pub mod lifecycle;
+pub mod rowid_alloc;
 pub mod shared_lock_table;
 pub mod shm;
 pub mod witness_hierarchy;
+pub mod witness_objects;
 pub mod witness_plane;
 pub mod witness_publication;
 pub mod xor_delta;
@@ -50,6 +52,10 @@ pub use invariants::{
     SerializedWriteMutex, TxnManager, VersionStore, idx_to_version_pointer, visible,
 };
 pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
+pub use rowid_alloc::{
+    AllocatorKey, ConcurrentRowIdAllocator, DEFAULT_RANGE_SIZE, LocalRowIdCache, RangeReservation,
+    RowIdAllocError, SQLITE_FULL, SQLITE_SCHEMA,
+};
 pub use shared_lock_table::{
     AcquireResult, DEFAULT_TABLE_CAPACITY, DrainStatus, RebuildLeaseError,
     RebuildResult as SharedRebuildResult, SharedPageLockTable,
@@ -59,6 +65,12 @@ pub use witness_hierarchy::{
     HotWitnessIndexDerivationV1, HotWitnessIndexSizingV1, WitnessHierarchyConfigV1,
     WitnessHotIndexManifestV1, WitnessSizingError, derive_range_keys, extract_prefix,
     range_key_bucket_index, witness_key_canonical_bytes, witness_key_hash,
+};
+pub use witness_objects::{
+    AbortPolicy, AbortReason, AbortWitness, ColdPlaneRefinementResult, DependencyEdgeKind,
+    EcsCommitProof, EcsDependencyEdge, EcsReadWitness, EcsWriteWitness, EdgeKeyBasis,
+    HotPlaneCandidates, KeySummary, KeySummaryChunk, LogicalTime, WitnessDelta, WitnessDeltaKind,
+    WitnessParticipation, WriteKind, cold_plane_refine, hot_plane_discover,
 };
 pub use witness_plane::{WitnessSet, validate_txn_token, witness_keys_overlap};
 pub use witness_publication::{

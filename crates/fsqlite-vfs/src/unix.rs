@@ -439,12 +439,28 @@ impl ShmTable {
         }
     }
 
-    fn get_or_create(&self, path: PathBuf, file: Arc<File>) -> Arc<Mutex<ShmInfo>> {
+    fn get_or_create(&self, path: PathBuf) -> Result<Arc<Mutex<ShmInfo>>> {
+        // IMPORTANT: POSIX fcntl locks are per-process. If we open and then close a new
+        // fd to an already-locked `*-shm` file, we can drop all locks held by this
+        // process on that file. To avoid that, only ever open `*-shm` while holding
+        // this mutex and only when we're definitely creating the canonical entry.
         let mut map = self.map.lock().expect("shm table lock poisoned");
-        Arc::clone(
-            map.entry(path)
-                .or_insert_with(|| Arc::new(Mutex::new(ShmInfo::new(file)))),
-        )
+        if let Some(existing) = map.get(&path) {
+            return Ok(Arc::clone(existing));
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(FrankenError::Io)?;
+
+        let info = Arc::new(Mutex::new(ShmInfo::new(Arc::new(file))));
+        map.insert(path, Arc::clone(&info));
+        drop(map);
+        Ok(info)
     }
 
     fn remove_if_orphaned(&self, path: &Path) {
@@ -727,14 +743,7 @@ impl UnixFile {
             return Ok(Arc::clone(info));
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.shm_path)
-            .map_err(FrankenError::Io)?;
-        let info = global_shm_table().get_or_create(self.shm_path.clone(), Arc::new(file));
+        let info = global_shm_table().get_or_create(self.shm_path.clone())?;
         {
             let mut guard = info.lock().expect("shm info lock poisoned");
             *guard.owner_refs.entry(self.shm_owner_id).or_insert(0) += 1;
@@ -915,6 +924,44 @@ impl UnixFile {
             observed_mode = Self::observed_mode(slot_state),
             ?read_marks,
             "acquired shm DMS shared lock"
+        );
+        Ok(())
+    }
+
+    fn release_shm_dms_shared(&self, info: &mut ShmInfo) -> Result<()> {
+        let lock_byte = sqlite_shm_dms_lock_byte();
+        let slot_idx = usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
+        let read_marks = info.read_marks();
+        let slot_state = &mut info.slots[slot_idx];
+        let Some(holder_count) = slot_state.shared_holders.get_mut(&self.shm_owner_id) else {
+            Self::log_lock_conflict(
+                SQLITE_SHM_DMS_SLOT,
+                "unlock-shared",
+                Self::observed_mode(slot_state),
+                read_marks,
+            );
+            return Err(FrankenError::LockFailed {
+                detail: format!("owner {} does not hold shared DMS slot", self.shm_owner_id),
+            });
+        };
+
+        if *holder_count > 1 {
+            *holder_count -= 1;
+        } else {
+            slot_state.shared_holders.remove(&self.shm_owner_id);
+        }
+
+        if slot_state.exclusive_owner.is_none() && slot_state.shared_holders.is_empty() {
+            posix_unlock(&*info.file, lock_byte, 1)?;
+        }
+
+        lock_debug!(
+            slot = SQLITE_SHM_DMS_SLOT,
+            lock_byte,
+            requested_mode = "unlock-shared",
+            observed_mode = Self::observed_mode(slot_state),
+            ?read_marks,
+            "released shm DMS shared lock"
         );
         Ok(())
     }
@@ -1177,27 +1224,64 @@ impl UnixFile {
     }
 
     pub fn compat_writer_hold_wal_write_lock(&mut self, cx: &Cx) -> Result<()> {
+        // Hold a SHARED lock on the main db file so legacy SQLite cannot take an
+        // EXCLUSIVE lock on close and delete `*-wal`/`*-shm` while our coordinator
+        // is alive.
+        self.lock(cx, LockLevel::Shared)?;
+
         // Hold the DMS ("deadman switch") byte in SHARED mode so legacy SQLite
         // openers do not truncate `*-shm` while we hold WAL_WRITE_LOCK.
-        self.compat_shm_hold_dms_shared(cx)?;
+        if let Err(err) = self.compat_shm_hold_dms_shared(cx) {
+            let _ = self.unlock(cx, LockLevel::None);
+            return Err(err);
+        }
 
-        self.shm_lock(
+        if let Err(err) = self.shm_lock(
             cx,
             WAL_WRITE_LOCK,
             1,
             SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
-        )?;
-        self.compat_writer_init_wal_shm_header_if_needed(cx)?;
+        ) {
+            let _ = self.compat_shm_release_dms_shared(cx);
+            let _ = self.unlock(cx, LockLevel::None);
+            return Err(err);
+        }
+
+        if let Err(err) = self.compat_writer_init_wal_shm_header_if_needed(cx) {
+            let _ = self.shm_lock(
+                cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            );
+            let _ = self.compat_shm_release_dms_shared(cx);
+            let _ = self.unlock(cx, LockLevel::None);
+            return Err(err);
+        }
         Ok(())
     }
 
     pub fn compat_writer_release_wal_write_lock(&mut self, cx: &Cx) -> Result<()> {
-        self.shm_lock(
-            cx,
-            WAL_WRITE_LOCK,
-            1,
-            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
-        )
+        let mut first_error = self
+            .shm_lock(cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .err();
+
+        if let Err(err) = self.compat_shm_release_dms_shared(cx) {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+
+        if let Err(err) = self.unlock(cx, LockLevel::None) {
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     fn compat_shm_hold_dms_shared(&mut self, cx: &Cx) -> Result<()> {
@@ -1205,6 +1289,13 @@ impl UnixFile {
         let shm_info = self.ensure_shm_info()?;
         let mut info = shm_info.lock().expect("shm info lock poisoned");
         self.acquire_shm_dms_shared(&mut info)
+    }
+
+    fn compat_shm_release_dms_shared(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let shm_info = self.ensure_shm_info()?;
+        let mut info = shm_info.lock().expect("shm info lock poisoned");
+        self.release_shm_dms_shared(&mut info)
     }
 
     fn compat_writer_init_wal_shm_header_if_needed(&mut self, cx: &Cx) -> Result<()> {
@@ -1695,16 +1786,17 @@ mod tests {
     use super::*;
     use std::process::{Command, Output};
 
-    fn debug_dump_sqlite_wal_files(db_path: &Path) {
+    fn debug_dump_sqlite_wal_files(coordinator: &mut UnixFile) {
         if std::env::var_os("FSQLITE_DEBUG_SQLITE_WAL_INTEROP").is_none() {
             return;
         }
 
-        let shm_path = sqlite_shm_path(db_path);
+        let db_path = &coordinator.path;
+        let shm_path = &coordinator.shm_path;
         let wal_path = sqlite_wal_path(db_path);
 
         let db_len = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-        let shm_len = fs::metadata(&shm_path).map(|m| m.len()).unwrap_or(0);
+        let shm_len = fs::metadata(shm_path).map(|m| m.len()).unwrap_or(0);
         let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
 
         eprintln!(
@@ -1714,9 +1806,13 @@ mod tests {
             wal_path.display(),
         );
 
-        if let Ok(file) = File::open(&shm_path) {
+        if let Ok(shm_info) = coordinator.ensure_shm_info() {
+            let shm_file = {
+                let info = shm_info.lock().expect("shm info lock poisoned");
+                Arc::clone(&info.file)
+            };
             let mut header = [0_u8; SQLITE_WAL_SHM_HEADER_BYTES];
-            let n = file.read_at(&mut header, 0).unwrap_or(0);
+            let n = shm_file.read_at(&mut header, 0).unwrap_or(0);
             let valid = sqlite_wal_shm_header_is_valid(&header).unwrap_or(false);
             eprintln!("[debug] shm header read_at(0) -> {n} bytes, valid={valid}");
 
@@ -2186,7 +2282,7 @@ mod tests {
 
         let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
-        debug_dump_sqlite_wal_files(&path);
+        debug_dump_sqlite_wal_files(&mut coordinator);
 
         let reader_output = sqlite3_exec(&path, "PRAGMA busy_timeout=0; SELECT COUNT(*) FROM t;");
         assert!(
@@ -2218,7 +2314,7 @@ mod tests {
 
         let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
-        debug_dump_sqlite_wal_files(&path);
+        debug_dump_sqlite_wal_files(&mut coordinator);
 
         let writer_output = sqlite3_exec(
             &path,
@@ -2258,7 +2354,7 @@ mod tests {
 
         let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
-        debug_dump_sqlite_wal_files(&path);
+        debug_dump_sqlite_wal_files(&mut coordinator);
 
         // Reader interop while coordinator holds WAL_WRITE_LOCK.
         let read_output = sqlite3_exec(&path, "PRAGMA busy_timeout=0; SELECT SUM(id) FROM t;");
