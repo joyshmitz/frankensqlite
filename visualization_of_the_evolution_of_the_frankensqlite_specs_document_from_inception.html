@@ -937,7 +937,7 @@
 <script type="module">
     import { animate, stagger, spring } from "https://cdn.jsdelivr.net/npm/motion@10.18.0/+esm";
 
-    const DB_URL = "spec_evolution_v1.sqlite3";
+    const DB_URL = "spec_evolution_v1.sqlite3?v=2";
     const BUCKETS = [
         { id: 1, name: "Logic/Math", color: "#39ff14", desc: "Fixing outright mistakes in logic, math, or reasoning." },
         { id: 2, name: "Legacy SQLite", color: "#adff2f", desc: "Fixing inaccurate statements about the existing sqlite legacy codebase." },
@@ -988,6 +988,134 @@
             xhr.onerror = () => reject(new Error(`Network error fetching ${url}`));
             xhr.send();
         });
+    }
+
+    const PREFERS_REDUCED_MOTION =
+        typeof window !== "undefined" &&
+        typeof window.matchMedia === "function" &&
+        window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    const LAB_EFFECTS = {
+        disabled: new Set(),
+        logged: new Set(),
+    };
+
+    function logOnce(key, payload) {
+        if (LAB_EFFECTS.logged.has(key)) return;
+        LAB_EFFECTS.logged.add(key);
+        console.info(JSON.stringify(payload));
+    }
+
+    function disableEffect(effect, reason, error) {
+        LAB_EFFECTS.disabled.add(effect);
+        logOnce(`disabled:${effect}`, {
+            event: "spec_viz_effect_disabled",
+            effect,
+            reason,
+            error: error ? String(error && (error.message || error)) : undefined,
+        });
+    }
+
+    function runEffect(effect, fn) {
+        if (PREFERS_REDUCED_MOTION) return;
+        if (LAB_EFFECTS.disabled.has(effect)) return;
+        try {
+            fn();
+        } catch (e) {
+            disableEffect(effect, "exception", e);
+        }
+    }
+
+    function createDataPacket() {
+        // Optional visual flourish: never allow this to crash the viz.
+        const body = document.body;
+        if (!body) return;
+
+        const packet = document.createElement("div");
+        packet.setAttribute("data-spec-viz-packet", "1");
+        packet.style.position = "fixed";
+        packet.style.zIndex = "9999";
+        packet.style.width = "6px";
+        packet.style.height = "6px";
+        packet.style.borderRadius = "999px";
+        packet.style.background = "rgba(57, 255, 20, 0.9)";
+        packet.style.boxShadow = "0 0 12px rgba(57, 255, 20, 0.55)";
+        packet.style.pointerEvents = "none";
+
+        const w = Math.max(1, window.innerWidth || 1);
+        const h = Math.max(1, window.innerHeight || 1);
+        const startX = Math.floor(Math.random() * w * 0.3);
+        const endX = Math.floor(w * (0.7 + Math.random() * 0.3));
+        const y = Math.floor(h * (0.55 + Math.random() * 0.35));
+
+        packet.style.left = `${startX}px`;
+        packet.style.top = `${y}px`;
+        packet.style.opacity = "0";
+        body.appendChild(packet);
+
+        const cleanup = () => packet.remove();
+
+        if (typeof packet.animate === "function") {
+            const anim = packet.animate(
+                [
+                    { transform: "translate3d(0, 0, 0) scale(0.8)", opacity: 0 },
+                    { transform: `translate3d(${endX - startX}px, -16px, 0) scale(1)`, opacity: 1 },
+                    { transform: `translate3d(${endX - startX}px, -24px, 0) scale(0.9)`, opacity: 0 },
+                ],
+                {
+                    duration: 900,
+                    iterations: 1,
+                    easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+                    fill: "forwards",
+                }
+            );
+            anim.addEventListener("finish", cleanup, { once: true });
+            anim.addEventListener("cancel", cleanup, { once: true });
+            return;
+        }
+
+        // Fallback: no WAAPI support; best-effort render and remove.
+        packet.style.opacity = "1";
+        setTimeout(cleanup, 900);
+    }
+
+    function isSelftestMode() {
+        const params = new URLSearchParams(window.location.search);
+        return params.get("selftest") === "1" || window.location.hash.includes("selftest");
+    }
+
+    function renderSelftestResult(ok, error) {
+        const el = document.createElement("div");
+        el.id = "specVizSelftest";
+        el.textContent = ok ? "SPEC_VIZ_SELFTEST_PASS" : "SPEC_VIZ_SELFTEST_FAIL";
+        el.style.position = "fixed";
+        el.style.left = "8px";
+        el.style.bottom = "8px";
+        el.style.zIndex = "10000";
+        el.style.fontFamily = "JetBrains Mono, ui-monospace, SFMono-Regular, Menlo, monospace";
+        el.style.fontSize = "11px";
+        el.style.padding = "6px 8px";
+        el.style.border = "1px solid rgba(255,255,255,0.12)";
+        el.style.background = "rgba(0,0,0,0.72)";
+        el.style.color = ok ? "rgba(57, 255, 20, 0.95)" : "rgba(255, 0, 60, 0.95)";
+        document.body.appendChild(el);
+
+        console.info(
+            JSON.stringify({
+                event: "spec_viz_selftest",
+                result: ok ? "pass" : "fail",
+                error: error ? String(error && (error.message || error)) : undefined,
+            })
+        );
+    }
+
+    function runSelftest() {
+        try {
+            createDataPacket();
+            renderSelftestResult(true, null);
+        } catch (e) {
+            renderSelftestResult(false, e);
+        }
     }
 
     async function init() {
@@ -1095,6 +1223,9 @@
         if (!isAuto) document.querySelectorAll(".scroll-pane").forEach(el => el.scrollTop = 0);
 
         await updateView();
+
+        // Optional effects are never allowed to crash the viz.
+        runEffect("createDataPacket", createDataPacket);
     };
 
     function initBucketFilters() {
@@ -1723,7 +1854,8 @@
         return res;
     }
 
-    init();
+    if (isSelftestMode()) runSelftest();
+    else init();
 </script>
 </body>
 </html>
