@@ -17,6 +17,7 @@ pub mod lifecycle;
 pub mod rowid_alloc;
 pub mod shared_lock_table;
 pub mod shm;
+pub mod ssi_validation;
 pub mod witness_hierarchy;
 pub mod witness_objects;
 pub mod witness_plane;
@@ -61,6 +62,11 @@ pub use shared_lock_table::{
     RebuildResult as SharedRebuildResult, SharedPageLockTable,
 };
 pub use shm::{SharedMemoryLayout, ShmSnapshot};
+pub use ssi_validation::{
+    ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
+    SsiBusySnapshot, SsiState, SsiValidationOk, discover_incoming_edges, discover_outgoing_edges,
+    ssi_validate_and_publish,
+};
 pub use witness_hierarchy::{
     HotWitnessIndexDerivationV1, HotWitnessIndexSizingV1, WitnessHierarchyConfigV1,
     WitnessHotIndexManifestV1, WitnessSizingError, derive_range_keys, extract_prefix,
