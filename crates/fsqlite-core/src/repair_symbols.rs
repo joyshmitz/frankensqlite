@@ -100,8 +100,7 @@ pub struct RepairBudget {
 #[must_use]
 pub fn compute_repair_budget(k_source: u32, config: &RepairConfig) -> RepairBudget {
     // R = max(slack_decode, ceil(K_source * overhead_percent / 100))
-    let overhead_r = (u64::from(k_source) * u64::from(config.overhead_percent))
-        .div_ceil(100);
+    let overhead_r = (u64::from(k_source) * u64::from(config.overhead_percent)).div_ceil(100);
     #[allow(clippy::cast_possible_truncation)]
     let overhead_r = overhead_r as u32;
     let repair_count = config.slack_decode.max(overhead_r);
@@ -410,10 +409,7 @@ mod tests {
             let oid = ObjectId::derive_from_canonical_bytes(&payload);
             let seed_a = derive_repair_seed(&oid);
             let seed_b = derive_repair_seed(&oid);
-            assert_eq!(
-                seed_a, seed_b,
-                "seed must be deterministic for payload {i}"
-            );
+            assert_eq!(seed_a, seed_b, "seed must be deterministic for payload {i}");
         }
     }
 

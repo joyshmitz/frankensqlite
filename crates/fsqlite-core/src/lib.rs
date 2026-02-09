@@ -6,6 +6,7 @@
 
 pub mod commit_repair;
 pub mod region;
+pub mod repair_symbols;
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
