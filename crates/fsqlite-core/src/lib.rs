@@ -7,6 +7,7 @@
 pub mod commit_marker;
 pub mod commit_repair;
 pub mod decode_proofs;
+pub mod epoch;
 pub mod raptorq_integration;
 pub mod region;
 pub mod repair_symbols;

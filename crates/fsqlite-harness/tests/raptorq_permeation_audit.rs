@@ -18,8 +18,8 @@ use fsqlite_types::ecs::{
     SymbolRecordFlags, VersionPointer as EcsVersionPointer,
 };
 use fsqlite_types::{
-    CommitCapsule, CommitMarker, CommitProof, CommitSeq, DependencyEdge, ObjectId, Oti, PageNumber,
-    RootManifest, SchemaEpoch, TxnId, WitnessKey,
+    CommitCapsule, CommitMarker, CommitProof, CommitSeq, DependencyEdge, EpochId, ObjectId, Oti,
+    PageNumber, RootManifest, SchemaEpoch, TxnId, WitnessKey,
 };
 
 const BEAD_ID: &str = "bd-1wx.2";
@@ -282,6 +282,7 @@ fn test_root_manifest_is_ecs() {
     let manifest = RootManifest {
         schema_epoch: SchemaEpoch::new(3),
         root_page,
+        ecs_epoch: EpochId::ZERO,
     };
     assert_eq!(
         manifest.root_page.get(),

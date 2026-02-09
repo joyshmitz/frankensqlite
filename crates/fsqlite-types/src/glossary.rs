@@ -524,6 +524,9 @@ pub enum Outcome {
 pub struct EpochId(u64);
 
 impl EpochId {
+    /// The zero epoch (initial/bootstrap).
+    pub const ZERO: Self = Self(0);
+
     #[inline]
     pub const fn new(raw: u64) -> Self {
         Self(raw)
@@ -532,6 +535,17 @@ impl EpochId {
     #[inline]
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    /// Return the next epoch (current + 1).
+    ///
+    /// Returns `None` on overflow (saturated at `u64::MAX`).
+    #[must_use]
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(val) => Some(Self(val)),
+            None => None,
+        }
     }
 }
 
@@ -549,6 +563,24 @@ impl SymbolValidityWindow {
             from_epoch,
             to_epoch,
         }
+    }
+
+    /// Build the default validity window `[0, current_epoch]` per §4.18.1.
+    #[must_use]
+    pub const fn default_window(current_epoch: EpochId) -> Self {
+        Self {
+            from_epoch: EpochId::ZERO,
+            to_epoch: current_epoch,
+        }
+    }
+
+    /// Check whether `epoch` falls within this window (inclusive bounds).
+    ///
+    /// Fail-closed: returns `false` for any epoch outside the window,
+    /// including future epochs (§4.18.1 normative requirement).
+    #[must_use]
+    pub const fn contains(&self, epoch: EpochId) -> bool {
+        epoch.0 >= self.from_epoch.0 && epoch.0 <= self.to_epoch.0
     }
 }
 
@@ -1166,10 +1198,15 @@ pub struct PageHistory {
 pub struct ArcCache;
 
 /// Root manifest tying together the durable roots of the database state.
+///
+/// `ecs_epoch` is the monotone epoch counter stored durably here and mirrored
+/// in `SharedMemoryLayout.ecs_epoch` (§4.18, §5.6.1).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RootManifest {
     pub schema_epoch: SchemaEpoch,
     pub root_page: PageNumber,
+    /// Global ECS epoch — monotonically increasing, never reused (§4.18).
+    pub ecs_epoch: EpochId,
 }
 
 /// Transaction slot index (cross-process shared memory slot).
