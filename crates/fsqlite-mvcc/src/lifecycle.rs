@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite_types::{
-    CommitSeq, MergePageKind, PageData, PageNumber, PageSize, PageVersion,
-    SchemaEpoch, Snapshot, TxnEpoch, TxnId, TxnToken,
+    CommitSeq, MergePageKind, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
+    TxnEpoch, TxnId, TxnToken,
 };
 
 use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};

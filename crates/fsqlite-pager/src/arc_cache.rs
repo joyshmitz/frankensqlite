@@ -2159,4 +2159,192 @@ mod tests {
         assert!(cache.capacity_overflow_events() <= 200);
         assert!(cache.len() <= cache.capacity + cache.capacity_overflow_events());
     }
+
+    #[test]
+    fn test_visibility_committed_below_high() {
+        assert!(ArcCacheInner::is_visible(
+            CommitSeq::new(3),
+            CommitSeq::new(7)
+        ));
+    }
+
+    #[test]
+    fn test_visibility_committed_above_high() {
+        assert!(!ArcCacheInner::is_visible(
+            CommitSeq::new(9),
+            CommitSeq::new(7)
+        ));
+    }
+
+    #[test]
+    fn test_visibility_uncommitted() {
+        assert!(!ArcCacheInner::is_visible(
+            CommitSeq::ZERO,
+            CommitSeq::new(7)
+        ));
+    }
+
+    #[test]
+    fn test_self_visibility_via_write_set() {
+        assert!(ArcCacheInner::is_visible_or_self(
+            CommitSeq::ZERO,
+            CommitSeq::new(7),
+            true
+        ));
+        assert!(!ArcCacheInner::is_visible_or_self(
+            CommitSeq::ZERO,
+            CommitSeq::new(7),
+            false
+        ));
+    }
+
+    #[test]
+    fn test_dual_eviction_by_count() {
+        let mut cache = ArcCacheInner::new(2, 0);
+
+        for pgno in 1..=3_u32 {
+            let k = key(pgno, 1);
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_dual_eviction_by_bytes() {
+        let mut cache = ArcCacheInner::new(10, 5000);
+        let k1 = key(1, 1);
+        let k2 = key(2, 1);
+
+        let lookup = cache.request(&k1);
+        cache.admit(k1, page(k1, 4096), lookup);
+        let lookup = cache.request(&k2);
+        cache.admit(k2, page(k2, 4096), lookup);
+
+        assert!(
+            cache.total_bytes() <= 5000,
+            "bead_id={BEAD_ID_BD_1ZLA} case=dual_eviction_by_bytes"
+        );
+    }
+
+    #[test]
+    fn test_memory_accounting_delta_vs_full() {
+        let mut cache = ArcCacheInner::new(10, 0);
+        let full = key(1, 1);
+        let delta = key(2, 1);
+
+        let lookup = cache.request(&full);
+        cache.admit(full, page(full, 4096), lookup);
+        let lookup = cache.request(&delta);
+        cache.admit(delta, page(delta, 200), lookup);
+
+        assert_eq!(
+            cache.total_bytes(),
+            4296,
+            "bead_id={BEAD_ID_BD_1ZLA} case=memory_accounting_delta_vs_full"
+        );
+    }
+
+    #[test]
+    fn test_pragma_cache_size_positive() {
+        let mut cache = ArcCacheInner::new(1, 1);
+        cache.apply_pragma_cache_size(500, 4096);
+
+        assert_eq!(cache.capacity(), 500);
+        assert_eq!(cache.max_bytes(), 500 * 4096);
+    }
+
+    #[test]
+    fn test_pragma_cache_size_negative() {
+        let mut cache = ArcCacheInner::new(1, 1);
+        cache.apply_pragma_cache_size(-2000, 4096);
+
+        assert_eq!(cache.max_bytes(), 2_048_000);
+        assert_eq!(cache.capacity(), 500);
+    }
+
+    #[test]
+    fn test_pragma_cache_size_zero() {
+        let mut cache = ArcCacheInner::new(4, 0);
+        for pgno in 1..=4_u32 {
+            let k = key(pgno, 1);
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        cache.apply_pragma_cache_size(0, 4096);
+        assert_eq!(cache.capacity(), 0);
+        assert_eq!(cache.max_bytes(), 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_cache_resize_evicts() {
+        let mut cache = ArcCacheInner::new(4, 0);
+
+        for pgno in 1..=4_u32 {
+            let k = key(pgno, 1);
+            let lookup = cache.request(&k);
+            cache.admit(k, page(k, 4096), lookup);
+        }
+
+        cache.resize(2, 0);
+        assert!(cache.len() <= 2);
+    }
+
+    #[test]
+    fn test_cache_resize_trims_ghosts() {
+        let mut cache = ArcCacheInner::new(4, 0);
+        for pgno in 1..=12_u32 {
+            let k = key(pgno, 1);
+            let lookup = cache.request(&k);
+            if !matches!(lookup, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), lookup);
+            }
+        }
+
+        cache.resize(1, 0);
+        assert!(cache.b1_len() <= 1);
+        assert!(cache.b2_len() <= 1);
+    }
+
+    #[test]
+    fn test_cache_resize_clamps_p() {
+        let mut cache = ArcCacheInner::new(8, 0);
+        cache.set_p_for_tests(8);
+        cache.resize(2, 0);
+        assert_eq!(cache.p(), 2);
+    }
+
+    #[test]
+    fn test_e2e_bd_1zla() {
+        let mut cache = ArcCacheInner::new(16, 16 * 4096);
+
+        for i in 1_u32..=200 {
+            if i == 50 {
+                cache.apply_pragma_cache_size(64, 4096);
+            } else if i == 100 {
+                cache.apply_pragma_cache_size(-2000, 4096);
+            } else if i == 150 {
+                cache.apply_pragma_cache_size(0, 4096);
+            } else if i == 170 {
+                cache.apply_pragma_cache_size(32, 4096);
+            }
+
+            let pgno = 1 + ((i - 1) % 64);
+            let k = key(pgno, u64::from(i));
+            let size = if i % 3 == 0 { 200 } else { 4096 };
+            let lookup = cache.request(&k);
+            if !matches!(lookup, CacheLookup::Hit) {
+                cache.admit(k, page(k, size), lookup);
+            }
+        }
+
+        assert!(cache.b1_len() <= cache.capacity());
+        assert!(cache.b2_len() <= cache.capacity());
+        if cache.max_bytes() > 0 {
+            assert!(cache.total_bytes() <= cache.max_bytes());
+        }
+    }
 }

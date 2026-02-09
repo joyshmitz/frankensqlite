@@ -929,14 +929,16 @@ pub fn canonical_profiling_cookbook_commands(
 pub fn validate_cookbook_commands_exist(
     commands: &ProfilingCookbookCommands,
 ) -> Result<(), PerfLoopError> {
-    validate_non_empty(&commands.cpu_flamegraph, "cpu_flamegraph")
-        .map_err(|_| PerfLoopError::InvalidProfilingField {
+    validate_non_empty(&commands.cpu_flamegraph, "cpu_flamegraph").map_err(|_| {
+        PerfLoopError::InvalidProfilingField {
             field: "cpu_flamegraph",
-        })?;
-    validate_non_empty(&commands.hyperfine_baseline, "hyperfine_baseline")
-        .map_err(|_| PerfLoopError::InvalidProfilingField {
+        }
+    })?;
+    validate_non_empty(&commands.hyperfine_baseline, "hyperfine_baseline").map_err(|_| {
+        PerfLoopError::InvalidProfilingField {
             field: "hyperfine_baseline",
-        })?;
+        }
+    })?;
     validate_non_empty(&commands.allocation_profile, "allocation_profile").map_err(|_| {
         PerfLoopError::InvalidProfilingField {
             field: "allocation_profile",
@@ -979,7 +981,9 @@ pub fn record_profiling_metadata(
 }
 
 /// Validate mandatory profiling metadata fields.
-pub fn validate_profiling_metadata(metadata: &BTreeMap<String, String>) -> Result<(), PerfLoopError> {
+pub fn validate_profiling_metadata(
+    metadata: &BTreeMap<String, String>,
+) -> Result<(), PerfLoopError> {
     for key in REQUIRED_PROFILING_METADATA_KEYS {
         let value = metadata
             .get(key)
@@ -1016,10 +1020,11 @@ pub fn validate_hyperfine_json_output(path: &Path) -> Result<(), PerfLoopError> 
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    let value: serde_json::Value = serde_json::from_str(&content).map_err(|error| PerfLoopError::Io {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|error| PerfLoopError::Io {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
 
     if value.get("results").is_none() {
         return Err(PerfLoopError::InvalidProfilingField {
@@ -1102,7 +1107,9 @@ where
 }
 
 /// Validate a profiling artifact report schema and required metadata.
-pub fn validate_profiling_artifact_report(report: &ProfilingArtifactReport) -> Result<(), PerfLoopError> {
+pub fn validate_profiling_artifact_report(
+    report: &ProfilingArtifactReport,
+) -> Result<(), PerfLoopError> {
     if report.trace_id.trim().is_empty() {
         return Err(PerfLoopError::InvalidProfilingField { field: "trace_id" });
     }
