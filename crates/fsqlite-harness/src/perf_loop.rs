@@ -21,6 +21,8 @@ pub const BEAD_ID: &str = "bd-3cl3.1";
 pub const DETERMINISTIC_MEASUREMENT_BEAD_ID: &str = "bd-3cl3.2";
 /// Opportunity matrix gate bead identifier.
 pub const OPPORTUNITY_MATRIX_BEAD_ID: &str = "bd-3cl3.3";
+/// Golden checksum behavior lock bead identifier.
+pub const GOLDEN_BEHAVIOR_LOCK_BEAD_ID: &str = "bd-3cl3.6";
 /// Profiling cookbook gate bead identifier.
 pub const PROFILING_COOKBOOK_BEAD_ID: &str = "bd-3cl3.5";
 /// Baseline layout bead identifier.
@@ -49,6 +51,9 @@ pub const REQUIRED_PROFILING_ARTIFACT_KEYS: [&str; 4] =
 /// Required profiling tool names.
 pub const REQUIRED_PROFILING_TOOLS: [&str; 4] =
     ["cargo-flamegraph", "hyperfine", "heaptrack", "strace"];
+/// Conformance artifacts that MUST be covered by behavior-lock checksums.
+pub const REQUIRED_CONFORMANCE_ARTIFACT_NAMES: [&str; 3] =
+    ["CommitMarker", "CommitProof", "AbortWitness"];
 
 /// High-level optimization lever classification used by the one-lever gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -158,6 +163,9 @@ pub enum PerfLoopError {
     ToolUnavailable {
         tool: String,
         remediation: String,
+    },
+    MissingConformanceArtifact {
+        name: &'static str,
     },
 }
 
@@ -295,6 +303,10 @@ impl fmt::Display for PerfLoopError {
             Self::ToolUnavailable { tool, remediation } => write!(
                 f,
                 "bead_id={PROFILING_COOKBOOK_BEAD_ID} tool unavailable: {tool}; remediation: {remediation}"
+            ),
+            Self::MissingConformanceArtifact { name } => write!(
+                f,
+                "bead_id={GOLDEN_BEHAVIOR_LOCK_BEAD_ID} missing conformance artifact in golden output set: {name}"
             ),
         }
     }
@@ -520,6 +532,50 @@ pub fn verify_golden_checksums(
     }
 
     Ok(())
+}
+
+/// Validate that golden outputs include required conformance artifacts.
+pub fn validate_conformance_artifacts_included(golden_output_dir: &Path) -> Result<(), PerfLoopError> {
+    let files = read_top_level_files_sorted(golden_output_dir)?;
+    let names: Vec<String> = files
+        .iter()
+        .filter_map(|path| path.file_name())
+        .filter_map(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase)
+        .collect();
+
+    for required in REQUIRED_CONFORMANCE_ARTIFACT_NAMES {
+        let required_lower = required.to_ascii_lowercase();
+        let found = names
+            .iter()
+            .any(|name| name.contains(&required_lower));
+        if !found {
+            return Err(PerfLoopError::MissingConformanceArtifact { name: required });
+        }
+    }
+    Ok(())
+}
+
+/// Capture behavior-lock checksums and enforce conformance artifact coverage.
+pub fn capture_behavior_lock_checksums(
+    golden_output_dir: &Path,
+    checksum_file: &Path,
+) -> Result<(), PerfLoopError> {
+    validate_conformance_artifacts_included(golden_output_dir)?;
+    capture_golden_checksums(golden_output_dir, checksum_file)
+}
+
+/// CI gate for perf-only changes: conformance artifacts must be included and checksums must match.
+pub fn enforce_behavior_lock_ci(
+    perf_only_change: bool,
+    golden_output_dir: &Path,
+    checksum_file: &Path,
+) -> Result<(), PerfLoopError> {
+    if !perf_only_change {
+        return Ok(());
+    }
+    validate_conformance_artifacts_included(golden_output_dir)?;
+    verify_golden_checksums(golden_output_dir, checksum_file)
 }
 
 /// Combined §17.8.1 gate:

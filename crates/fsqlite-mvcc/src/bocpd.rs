@@ -948,7 +948,14 @@ mod tests {
 
     /// Approximate inverse normal CDF (Abramowitz & Stegun rational approximation).
     fn inverse_normal_cdf(p: f64) -> f64 {
-        // Rational approximation for 0 < p < 1.
+        // Abramowitz & Stegun 26.2.23 rational approximation for 0 < p < 1.
+        const C0: f64 = 2.515_517;
+        const C1: f64 = 0.802_853;
+        const C2: f64 = 0.010_328;
+        const D1: f64 = 1.432_788;
+        const D2: f64 = 0.189_269;
+        const D3: f64 = 0.001_308;
+
         if p <= 0.0 {
             return f64::NEG_INFINITY;
         }
@@ -959,23 +966,11 @@ mod tests {
             return 0.0;
         }
 
-        // Abramowitz & Stegun 26.2.23.
-        const C0: f64 = 2.515_517;
-        const C1: f64 = 0.802_853;
-        const C2: f64 = 0.010_328;
-        const D1: f64 = 1.432_788;
-        const D2: f64 = 0.189_269;
-        const D3: f64 = 0.001_308;
-
-        let sign;
-        let pp;
-        if p < 0.5 {
-            sign = -1.0;
-            pp = p;
+        let (sign, pp) = if p < 0.5 {
+            (-1.0, p)
         } else {
-            sign = 1.0;
-            pp = 1.0 - p;
-        }
+            (1.0, 1.0 - p)
+        };
 
         let t = (-2.0 * pp.ln()).sqrt();
 
