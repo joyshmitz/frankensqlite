@@ -14,5 +14,6 @@ cp og-image.png dist/
 cp twitter-image.png dist/
 cp frankensqlite_illustration.webp dist/
 cp frankensqlite_diagram.webp dist/
+cp _headers dist/
 
 npx wrangler pages deploy dist --project-name frankensqlite-spec-evolution --branch main --commit-dirty=true

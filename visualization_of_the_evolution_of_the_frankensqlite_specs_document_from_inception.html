@@ -974,13 +974,33 @@
 
     // --- Initialization ---
 
+    function fetchAsArrayBuffer(url) {
+        // XHR handles binary responses more reliably than fetch on iOS Safari,
+        // where Brotli-compressed arrayBuffer() responses can arrive corrupted.
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open("GET", url, true);
+            xhr.responseType = "arraybuffer";
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.response);
+                else reject(new Error(`HTTP ${xhr.status} fetching ${url}`));
+            };
+            xhr.onerror = () => reject(new Error(`Network error fetching ${url}`));
+            xhr.send();
+        });
+    }
+
     async function init() {
         try {
             const SQL = await window.initSqlJs({ locateFile: file => `https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}` });
-            const res = await fetch(DB_URL);
-            if (!res.ok) throw new Error("Database fetch failed");
-            const buf = await res.arrayBuffer();
-            DB = new SQL.Database(new Uint8Array(buf));
+            const buf = await fetchAsArrayBuffer(DB_URL);
+            const bytes = new Uint8Array(buf);
+            // Validate SQLite magic header: "SQLite format 3\0"
+            const magic = new TextDecoder().decode(bytes.slice(0, 15));
+            if (magic !== "SQLite format 3") {
+                throw new Error(`Not a SQLite file (${bytes.byteLength} bytes, starts with "${magic.slice(0,12)}...")`);
+            }
+            DB = new SQL.Database(bytes);
             
             const baseRes = DB.exec("SELECT text FROM base_doc LIMIT 1");
             if (baseRes.length) BASE_DOC = baseRes[0].values[0][0];
