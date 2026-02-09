@@ -102,9 +102,10 @@ pub fn partition_page_groups(db_size_pages: u32) -> Vec<PageGroup> {
 // db_gen_digest — staleness guard
 // ---------------------------------------------------------------------------
 
-/// Compute `db_gen_digest` from `.db` header fields at big-endian u32 offsets 24, 28, 36, 40:
-///   Trunc128(BLAKE3("fsqlite:compat:dbgen:v1" || be_u32(change_counter) ||
-///   be_u32(page_count) || be_u32(freelist_count) || be_u32(schema_cookie)))
+/// Compute `db_gen_digest` from `.db` header fields.
+///
+/// Uses offsets 24, 28, 36, 40 (big-endian u32):
+/// `Trunc128(BLAKE3(domain || change_counter || page_count || freelist_count || schema_cookie))`.
 #[must_use]
 pub fn compute_db_gen_digest(
     change_counter: u32,
@@ -295,7 +296,7 @@ impl DbFecGroupMeta {
         db_gen_digest: [u8; 16],
     ) -> Self {
         assert!(
-            source_page_xxh3_128.len() as u32 == group_size,
+            source_page_xxh3_128.len() == group_size as usize,
             "source_page_xxh3_128.len() must equal group_size"
         );
         let mut meta = Self {
@@ -499,9 +500,9 @@ pub fn segment_offset(g: u32, segment_1_len: usize, full_segment_len: usize) -> 
     DB_FEC_HEADER_SIZE + segment_1_len + g as usize * full_segment_len
 }
 
-/// Compute the total size of one repair-symbol record: just the raw symbol data
-/// (page_size bytes, since each RaptorQ symbol equals one page for .db-fec).
-/// For a group with R repair symbols, the segment stores meta + R * page_size.
+/// Compute the total size of a group segment.
+///
+/// Each segment stores its `DbFecGroupMeta` plus R repair symbols of `page_size` bytes each.
 #[must_use]
 pub fn group_segment_size(group_size: u32, r_repair: u32, page_size: u32) -> usize {
     DbFecGroupMeta::serialized_size_for(group_size) + r_repair as usize * page_size as usize
@@ -612,8 +613,9 @@ pub fn attempt_page_repair(
         "collected symbols for repair"
     );
 
-    if (available.len() as u32) < k {
-        let _missing = k - available.len() as u32;
+    #[allow(clippy::cast_possible_truncation)]
+    let available_count = available.len() as u32;
+    if available_count < k {
         error!(
             bead_id = BEAD_ID,
             target_pgno,
@@ -682,7 +684,7 @@ pub fn attempt_page_repair(
             recovered,
             RepairResult::Repaired {
                 pgno: target_pgno,
-                symbols_used: available.len() as u32,
+                symbols_used: available_count,
             },
         ))
     } else {
