@@ -1238,7 +1238,91 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     }
 
     writer.write_page(cx, parent_page_no, &final_page)?;
+
+    // Balance-shallower: when the root page has zero cells after merging
+    // children, copy the single right-child's content into the root and
+    // free the child page, reducing tree depth by one.  This is the
+    // inverse of balance_deeper and corresponds to SQLite's
+    // "balance-shallower" sub-algorithm (btree.c ~8942-8967).
+    if parent_is_root && final_cells.is_empty() {
+        if let Some(child_pgno) = right_child {
+            balance_shallower(cx, writer, parent_page_no, child_pgno, usable_size)?;
+        }
+    }
+
     Ok(BalanceResult::Done)
+}
+
+// ---------------------------------------------------------------------------
+// balance_shallower: root collapse (inverse of balance_deeper)
+// ---------------------------------------------------------------------------
+
+/// Collapse the root by copying the single right-child's content into
+/// the root page and freeing the child.
+///
+/// Preconditions:
+/// - `root_page_no` is an interior page with zero cells.
+/// - `child_pgno` is its sole right-child.
+///
+/// After this call the root inherits whatever page type and content the
+/// child had (which may itself be interior or leaf).  If the child is
+/// also an interior page with zero cells, the caller is responsible for
+/// repeating the collapse (handled by the cursor's upward propagation
+/// loop).
+fn balance_shallower<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    root_page_no: PageNumber,
+    child_pgno: PageNumber,
+    usable_size: u32,
+) -> Result<()> {
+    let child_data = writer.read_page(cx, child_pgno)?;
+    let root_offset = header_offset_for_page(root_page_no);
+    let child_offset = header_offset_for_page(child_pgno);
+    let child_header = BtreePageHeader::parse(&child_data, child_offset)?;
+
+    // Build the new root page from the child's content.
+    let mut new_root = vec![0u8; usable_size as usize];
+
+    #[allow(clippy::cast_possible_truncation)]
+    if root_offset == child_offset {
+        // Same header offset — direct copy of the child page data.
+        new_root[..usable_size as usize].copy_from_slice(&child_data[..usable_size as usize]);
+    } else {
+        // Root is page 1 (root_offset = 100), child is offset 0.
+        // All byte offsets must shift up by root_offset.
+        let delta = root_offset as u32;
+        let child_ptrs = read_cell_pointers(&child_data, &child_header, child_offset)?;
+
+        let mut new_header = child_header;
+        new_header.cell_content_offset = child_header.cell_content_offset.saturating_add(delta);
+        new_header.write(&mut new_root, root_offset);
+
+        // Adjust cell pointers by +delta.
+        let adjusted: Vec<u16> = child_ptrs
+            .iter()
+            .map(|&p| p.saturating_add(delta as u16))
+            .collect();
+        write_cell_pointers(&mut new_root, root_offset, &new_header, &adjusted);
+
+        // Copy the cell content area.
+        let child_content_start = child_header.cell_content_offset as usize;
+        let content_len = usable_size as usize - child_content_start;
+        let root_content_start = new_header.cell_content_offset as usize;
+        new_root[root_content_start..root_content_start + content_len]
+            .copy_from_slice(&child_data[child_content_start..child_content_start + content_len]);
+    }
+
+    // Preserve the database file header on page 1.
+    if root_offset > 0 {
+        let original_root = writer.read_page(cx, root_page_no)?;
+        new_root[..root_offset].copy_from_slice(&original_root[..root_offset]);
+    }
+
+    writer.write_page(cx, root_page_no, &new_root)?;
+    writer.free_page(cx, child_pgno)?;
+
+    Ok(())
 }
 
 fn page_fits(
@@ -2080,32 +2164,15 @@ mod tests {
         assert!(matches!(outcome, BalanceResult::Done));
 
         // With tiny cells on 4096-byte pages, all 6 cells fit on one page.
-        // The parent should have 0 dividers and just a right_child.
-        let parent_data = store.pages.get(&2).unwrap();
-        let parent_header = BtreePageHeader::parse(parent_data, 0).unwrap();
+        // balance_shallower collapses the root — it now directly holds
+        // all cells as a leaf page.
+        let root_data = store.pages.get(&2).unwrap();
+        let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
         assert!(
-            parent_header.right_child.is_some(),
-            "parent should have right child"
+            root_header.page_type.is_leaf(),
+            "root should collapse to leaf after small-cell merge"
         );
-
-        // Count total cells across all children.
-        let parent_ptrs = read_cell_pointers(parent_data, &parent_header, 0).unwrap();
-        let mut total_cells = 0u16;
-        for &ptr in &parent_ptrs {
-            let cell =
-                CellRef::parse(parent_data, ptr as usize, parent_header.page_type, USABLE).unwrap();
-            let child_pgno = cell.left_child.unwrap();
-            let child_data = store.pages.get(&child_pgno.get()).unwrap();
-            let child_header = BtreePageHeader::parse(child_data, 0).unwrap();
-            total_cells += child_header.cell_count;
-        }
-        // Add right child.
-        let rc = parent_header.right_child.unwrap();
-        let rc_data = store.pages.get(&rc.get()).unwrap();
-        let rc_header = BtreePageHeader::parse(rc_data, 0).unwrap();
-        total_cells += rc_header.cell_count;
-
-        assert_eq!(total_cells, 6, "total cells should be preserved");
+        assert_eq!(root_header.cell_count, 6, "total cells should be preserved");
     }
 
     #[test]
@@ -2141,27 +2208,19 @@ mod tests {
             balance_nonroot(&cx, &mut store, pn(2), 0, &overflow_cells, 2, USABLE, true).unwrap();
         assert!(matches!(outcome, BalanceResult::Done));
 
-        // Count total cells across all children.
-        let parent_data = store.pages.get(&2).unwrap();
-        let parent_header = BtreePageHeader::parse(parent_data, 0).unwrap();
-        let parent_ptrs = read_cell_pointers(parent_data, &parent_header, 0).unwrap();
-
-        let mut total = 0u16;
-        for &ptr in &parent_ptrs {
-            let cell =
-                CellRef::parse(parent_data, ptr as usize, parent_header.page_type, USABLE).unwrap();
-            let pgno = cell.left_child.unwrap();
-            let data = store.pages.get(&pgno.get()).unwrap();
-            let hdr = BtreePageHeader::parse(data, 0).unwrap();
-            total += hdr.cell_count;
-        }
-        let rc = parent_header.right_child.unwrap();
-        let rc_data = store.pages.get(&rc.get()).unwrap();
-        let rc_header = BtreePageHeader::parse(rc_data, 0).unwrap();
-        total += rc_header.cell_count;
-
+        // With small cells plus the overflow, all 5 cells fit on one page.
+        // balance_shallower collapses the root to a leaf.
+        let root_data = store.pages.get(&2).unwrap();
+        let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
+        assert!(
+            root_header.page_type.is_leaf(),
+            "root should collapse to leaf after small-cell merge with overflow"
+        );
         // Original: 4 cells + 1 overflow = 5 total.
-        assert_eq!(total, 5, "all cells including overflow should be preserved");
+        assert_eq!(
+            root_header.cell_count, 5,
+            "all cells including overflow should be preserved"
+        );
     }
 
     // -- insert_cell_into_page test --
