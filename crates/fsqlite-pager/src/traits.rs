@@ -138,6 +138,28 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// local write-set and release page locks), but returns `Result` for
     /// consistency with the trait surface.
     fn rollback(&mut self, cx: &Cx) -> Result<()>;
+
+    /// Create a named savepoint, snapshotting the current write-set.
+    ///
+    /// Corresponds to SQL `SAVEPOINT name`. The snapshot captures the
+    /// write-set and freed-pages state at this point so that
+    /// [`rollback_to_savepoint`](Self::rollback_to_savepoint) can restore it.
+    fn savepoint(&mut self, cx: &Cx, name: &str) -> Result<()>;
+
+    /// Release (collapse) a named savepoint without rolling back.
+    ///
+    /// Corresponds to SQL `RELEASE name`. All changes since the savepoint
+    /// are kept, and the savepoint is removed from the stack. Savepoints
+    /// created after the named one are also released.
+    fn release_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()>;
+
+    /// Roll back to a named savepoint, restoring the snapshotted state.
+    ///
+    /// Corresponds to SQL `ROLLBACK TO name`. The write-set and freed-pages
+    /// are restored to their state at the time the savepoint was created.
+    /// The savepoint itself is retained (it can be rolled back to again).
+    /// Savepoints created after the named one are discarded.
+    fn rollback_to_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +203,7 @@ impl MvccPager for MockMvccPager {
         Ok(MockTransaction {
             committed: false,
             next_page: 2,
+            savepoint_names: Vec::new(),
         })
     }
 }
@@ -190,6 +213,7 @@ impl MvccPager for MockMvccPager {
 pub struct MockTransaction {
     committed: bool,
     next_page: u32,
+    savepoint_names: Vec<String>,
 }
 
 impl sealed::Sealed for MockTransaction {}
@@ -225,6 +249,33 @@ impl TransactionHandle for MockTransaction {
 
     fn rollback(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
+    }
+
+    fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.savepoint_names.push(name.to_owned());
+        Ok(())
+    }
+
+    fn release_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        if let Some(pos) = self.savepoint_names.iter().rposition(|n| n == name) {
+            self.savepoint_names.truncate(pos);
+            Ok(())
+        } else {
+            Err(fsqlite_error::FrankenError::internal(format!(
+                "no savepoint named '{name}'"
+            )))
+        }
+    }
+
+    fn rollback_to_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        if let Some(pos) = self.savepoint_names.iter().rposition(|n| n == name) {
+            self.savepoint_names.truncate(pos + 1);
+            Ok(())
+        } else {
+            Err(fsqlite_error::FrankenError::internal(format!(
+                "no savepoint named '{name}'"
+            )))
+        }
     }
 }
 

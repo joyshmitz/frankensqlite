@@ -6,6 +6,7 @@
 //! This crate is intentionally small in early phases: it defines the core MVCC
 //! primitives and the cross-process witness/lock-table coordination types.
 
+pub mod begin_concurrent;
 pub mod bocpd;
 pub mod cache_aligned;
 pub mod compat;
@@ -26,6 +27,8 @@ pub mod sheaf_conformal;
 pub mod shm;
 pub mod ssi_abort_policy;
 pub mod ssi_validation;
+pub mod time_travel;
+pub mod two_phase_commit;
 pub mod witness_hierarchy;
 pub mod witness_objects;
 pub mod witness_plane;
@@ -34,6 +37,11 @@ pub mod witness_refinement;
 pub mod write_coordinator;
 pub mod xor_delta;
 
+pub use begin_concurrent::{
+    ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult, MAX_CONCURRENT_WRITERS,
+    concurrent_abort, concurrent_commit, concurrent_read_page, concurrent_rollback_to_savepoint,
+    concurrent_savepoint, concurrent_write_page, is_concurrent_mode, validate_first_committer_wins,
+};
 pub use bocpd::{BocpdConfig, BocpdMonitor, ConjugateModel, HazardFunction, RegimeStats};
 pub use cache_aligned::{
     CACHE_LINE_BYTES, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, RcriEntry,
@@ -110,7 +118,7 @@ pub use shared_lock_table::{
 pub use sheaf_conformal::{
     ConformalCalibratorConfig, ConformalOracleCalibrator, ConformalPrediction, InvariantScore,
     OpportunityScore, OracleReport, PredictionSetEntry, Section, SheafObstruction, SheafResult,
-    check_sheaf_consistency,
+    check_sheaf_consistency, check_sheaf_consistency_with_chains,
 };
 pub use shm::{SharedMemoryLayout, ShmSnapshot};
 pub use ssi_abort_policy::{
@@ -121,6 +129,15 @@ pub use ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
     SsiBusySnapshot, SsiState, SsiValidationOk, discover_incoming_edges, discover_outgoing_edges,
     ssi_validate_and_publish,
+};
+pub use time_travel::{
+    TimeTravelError, TimeTravelSnapshot, TimeTravelTarget, create_time_travel_snapshot,
+    resolve_page_at_commit, resolve_timestamp_via_commit_log,
+};
+pub use two_phase_commit::{
+    COMMIT_MARKER_MAGIC, COMMIT_MARKER_MIN_SIZE, DatabaseId, GlobalCommitMarker, MAIN_DB_ID,
+    MAX_TOTAL_DATABASES, ParticipantState, PrepareResult, RecoveryAction, SQLITE_MAX_ATTACHED,
+    TEMP_DB_ID, TwoPhaseCoordinator, TwoPhaseError, TwoPhaseState,
 };
 pub use witness_hierarchy::{
     HotWitnessIndexDerivationV1, HotWitnessIndexSizingV1, WitnessHierarchyConfigV1,

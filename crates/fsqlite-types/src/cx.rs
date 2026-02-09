@@ -1081,6 +1081,10 @@ mod tests {
         // Forbidden outside VFS boundary (outside cfg(test) modules).
         let non_vfs_forbidden = ["std::fs::"];
 
+        // Crates that are test infrastructure, not runtime code.
+        // They legitimately need ambient time/process/fs APIs.
+        let exempt_crates = ["fsqlite-harness"];
+
         let mut violations: Vec<String> = Vec::new();
         let mut crate_dirs: Vec<PathBuf> = Vec::new();
         for entry in std::fs::read_dir(&crates_dir).expect("read crates/ dir") {
@@ -1096,6 +1100,9 @@ mod tests {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("<unknown>");
+            if exempt_crates.contains(&crate_name) {
+                continue;
+            }
             let src_dir = crate_dir.join("src");
             if !src_dir.is_dir() {
                 continue;

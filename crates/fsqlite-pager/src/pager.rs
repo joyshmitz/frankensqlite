@@ -120,6 +120,7 @@ where
             is_writer: eager_writer,
             committed: false,
             original_db_size,
+            savepoint_stack: Vec::new(),
         })
     }
 }
@@ -260,6 +261,16 @@ where
     }
 }
 
+/// A snapshot of the transaction state at a savepoint boundary.
+struct SavepointEntry {
+    /// The user-supplied savepoint name.
+    name: String,
+    /// Snapshot of the write-set at the time the savepoint was created.
+    write_set_snapshot: HashMap<PageNumber, Vec<u8>>,
+    /// Snapshot of freed pages at the time the savepoint was created.
+    freed_pages_snapshot: Vec<PageNumber>,
+}
+
 /// Transaction handle produced by [`SimplePager`].
 pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
@@ -271,6 +282,8 @@ pub struct SimpleTransaction<V: Vfs> {
     is_writer: bool,
     committed: bool,
     original_db_size: u32,
+    /// Stack of savepoints, pushed on SAVEPOINT and popped on RELEASE.
+    savepoint_stack: Vec<SavepointEntry>,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
@@ -461,6 +474,7 @@ where
     fn rollback(&mut self, cx: &Cx) -> Result<()> {
         self.write_set.clear();
         self.freed_pages.clear();
+        self.savepoint_stack.clear();
         if self.is_writer {
             let mut inner = self
                 .inner
@@ -473,6 +487,43 @@ where
             let _ = self.vfs.delete(cx, &self.journal_path, true);
         }
         self.committed = false;
+        Ok(())
+    }
+
+    fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        self.savepoint_stack.push(SavepointEntry {
+            name: name.to_owned(),
+            write_set_snapshot: self.write_set.clone(),
+            freed_pages_snapshot: self.freed_pages.clone(),
+        });
+        Ok(())
+    }
+
+    fn release_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        let pos = self
+            .savepoint_stack
+            .iter()
+            .rposition(|sp| sp.name == name)
+            .ok_or_else(|| FrankenError::internal(format!("no savepoint named '{name}'")))?;
+        // RELEASE removes the named savepoint and all savepoints above it.
+        // Changes since the savepoint are kept (merged into the parent).
+        self.savepoint_stack.truncate(pos);
+        Ok(())
+    }
+
+    fn rollback_to_savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        let pos = self
+            .savepoint_stack
+            .iter()
+            .rposition(|sp| sp.name == name)
+            .ok_or_else(|| FrankenError::internal(format!("no savepoint named '{name}'")))?;
+        // Restore write-set and freed-pages to the snapshot state.
+        let entry = &self.savepoint_stack[pos];
+        self.write_set = entry.write_set_snapshot.clone();
+        self.freed_pages = entry.freed_pages_snapshot.clone();
+        // Discard savepoints created after the named one, but keep
+        // the named savepoint itself (it can be rolled back to again).
+        self.savepoint_stack.truncate(pos + 1);
         Ok(())
     }
 }
@@ -1107,6 +1158,356 @@ mod tests {
         assert!(
             !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
             "bead_id={BEAD_ID} case=journal_deleted_on_rollback"
+        );
+    }
+
+    // ── Savepoint tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_savepoint_basic_rollback_to() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+
+        // Create savepoint after first write.
+        txn.savepoint(&cx, "sp1").unwrap();
+
+        // Second write (after savepoint).
+        let p2 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p2, &vec![0x22; ps]).unwrap();
+        // Overwrite p1 after savepoint.
+        txn.write_page(&cx, p1, &vec![0x33; ps]).unwrap();
+
+        // Rollback to sp1 — should undo second write and p1 overwrite.
+        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+
+        // p1 should have the value from before the savepoint.
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x11,
+            "bead_id={BEAD_ID} case=savepoint_rollback_restores_p1"
+        );
+
+        // p2 should no longer be in the write-set (reads zeros from disk).
+        let data2 = txn.get_page(&cx, p2).unwrap();
+        assert_eq!(
+            data2.as_ref()[0],
+            0x00,
+            "bead_id={BEAD_ID} case=savepoint_rollback_removes_p2"
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_release_keeps_changes() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0xAA; ps]).unwrap();
+
+        txn.savepoint(&cx, "sp1").unwrap();
+
+        // Write after savepoint.
+        txn.write_page(&cx, p1, &vec![0xBB; ps]).unwrap();
+
+        // Release — changes after savepoint are kept.
+        txn.release_savepoint(&cx, "sp1").unwrap();
+
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0xBB,
+            "bead_id={BEAD_ID} case=release_keeps_changes"
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_nested_rollback_to_inner() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+
+        txn.savepoint(&cx, "outer").unwrap();
+        txn.write_page(&cx, p1, &vec![0x22; ps]).unwrap();
+
+        txn.savepoint(&cx, "inner").unwrap();
+        txn.write_page(&cx, p1, &vec![0x33; ps]).unwrap();
+
+        // Rollback to inner — should restore to 0x22 (state at "inner" creation).
+        txn.rollback_to_savepoint(&cx, "inner").unwrap();
+
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x22,
+            "bead_id={BEAD_ID} case=nested_rollback_inner"
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_nested_rollback_to_outer() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+
+        txn.savepoint(&cx, "outer").unwrap();
+        txn.write_page(&cx, p1, &vec![0x22; ps]).unwrap();
+
+        txn.savepoint(&cx, "inner").unwrap();
+        txn.write_page(&cx, p1, &vec![0x33; ps]).unwrap();
+
+        // Rollback to outer — should restore to 0x11 and discard inner savepoint.
+        txn.rollback_to_savepoint(&cx, "outer").unwrap();
+
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x11,
+            "bead_id={BEAD_ID} case=nested_rollback_outer"
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_rollback_to_preserves_savepoint() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+
+        txn.savepoint(&cx, "sp1").unwrap();
+
+        // First modification + rollback.
+        txn.write_page(&cx, p1, &vec![0x22; ps]).unwrap();
+        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+
+        // Second modification + rollback (savepoint still exists).
+        txn.write_page(&cx, p1, &vec![0x33; ps]).unwrap();
+        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x11,
+            "bead_id={BEAD_ID} case=rollback_to_preserves_savepoint"
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_freed_pages_restored_on_rollback() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        let p2 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0xAA; ps]).unwrap();
+        txn.write_page(&cx, p2, &vec![0xBB; ps]).unwrap();
+
+        txn.savepoint(&cx, "sp1").unwrap();
+
+        // Free p2 after savepoint.
+        txn.free_page(&cx, p2).unwrap();
+
+        // Rollback — p2 should no longer be freed.
+        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+
+        // p2 should still be in the write-set (not freed).
+        let data = txn.get_page(&cx, p2).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0xBB,
+            "bead_id={BEAD_ID} case=freed_pages_restored"
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_unknown_name_errors() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let result = txn.rollback_to_savepoint(&cx, "nonexistent");
+        assert!(
+            result.is_err(),
+            "bead_id={BEAD_ID} case=rollback_to_unknown_savepoint_errors"
+        );
+
+        let result = txn.release_savepoint(&cx, "nonexistent");
+        assert!(
+            result.is_err(),
+            "bead_id={BEAD_ID} case=release_unknown_savepoint_errors"
+        );
+    }
+
+    #[test]
+    fn test_savepoint_release_then_rollback_to_outer() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+
+        txn.savepoint(&cx, "outer").unwrap();
+        txn.write_page(&cx, p1, &vec![0x22; ps]).unwrap();
+
+        txn.savepoint(&cx, "inner").unwrap();
+        txn.write_page(&cx, p1, &vec![0x33; ps]).unwrap();
+
+        // Release inner — changes kept, inner savepoint removed.
+        txn.release_savepoint(&cx, "inner").unwrap();
+
+        // Rollback to outer — should revert to 0x11.
+        txn.rollback_to_savepoint(&cx, "outer").unwrap();
+
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x11,
+            "bead_id={BEAD_ID} case=release_inner_then_rollback_outer"
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_commit_with_active_savepoints() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+
+        txn.savepoint(&cx, "sp1").unwrap();
+        txn.write_page(&cx, p1, &vec![0x22; ps]).unwrap();
+
+        // Commit with active savepoint — all changes should be persisted.
+        txn.commit(&cx).unwrap();
+
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let data = txn2.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x22,
+            "bead_id={BEAD_ID} case=commit_with_savepoints_persists_all"
+        );
+    }
+
+    #[test]
+    fn test_savepoint_full_rollback_clears_savepoints() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+
+        txn.savepoint(&cx, "sp1").unwrap();
+        txn.savepoint(&cx, "sp2").unwrap();
+
+        // Full rollback should clear all savepoints.
+        txn.rollback(&cx).unwrap();
+
+        // Trying to rollback to a savepoint after full rollback should error.
+        let result = txn.rollback_to_savepoint(&cx, "sp1");
+        assert!(
+            result.is_err(),
+            "bead_id={BEAD_ID} case=full_rollback_clears_savepoints"
+        );
+    }
+
+    #[test]
+    fn test_savepoint_three_levels_deep() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+
+        // Level 0: write 0x00
+        txn.write_page(&cx, p1, &vec![0x00; ps]).unwrap();
+        txn.savepoint(&cx, "L0").unwrap();
+
+        // Level 1: write 0x11
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+        txn.savepoint(&cx, "L1").unwrap();
+
+        // Level 2: write 0x22
+        txn.write_page(&cx, p1, &vec![0x22; ps]).unwrap();
+        txn.savepoint(&cx, "L2").unwrap();
+
+        // Level 3: write 0x33
+        txn.write_page(&cx, p1, &vec![0x33; ps]).unwrap();
+
+        // Verify current state
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x33,
+            "bead_id={BEAD_ID} case=3level_current"
+        );
+
+        // Rollback to L2 → should see 0x22
+        txn.rollback_to_savepoint(&cx, "L2").unwrap();
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(data.as_ref()[0], 0x22, "bead_id={BEAD_ID} case=3level_L2");
+
+        // Rollback to L1 → should see 0x11
+        txn.rollback_to_savepoint(&cx, "L1").unwrap();
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(data.as_ref()[0], 0x11, "bead_id={BEAD_ID} case=3level_L1");
+
+        // Rollback to L0 → should see 0x00
+        txn.rollback_to_savepoint(&cx, "L0").unwrap();
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(data.as_ref()[0], 0x00, "bead_id={BEAD_ID} case=3level_L0");
+
+        txn.commit(&cx).unwrap();
+
+        // Verify committed value is 0x00 (state at L0).
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let data = txn2.get_page(&cx, p1).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x00,
+            "bead_id={BEAD_ID} case=3level_committed"
         );
     }
 }

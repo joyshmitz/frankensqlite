@@ -2254,9 +2254,13 @@ mod tests {
 
     #[test]
     fn test_compat_writer_holds_wal_write_lock() {
+        if !sqlite3_available() {
+            return;
+        }
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("compat_writer_lock.db");
+        setup_sqlite_wal_db(&path);
         let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         let (mut contender, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
 
