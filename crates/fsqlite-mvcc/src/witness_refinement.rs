@@ -48,6 +48,12 @@ impl VoiMetrics {
     pub fn voi(&self) -> f64 {
         self.benefit() - self.cost_refine_b
     }
+
+    /// Whether this refinement should be applied under a VOI gate.
+    #[must_use]
+    pub fn should_invest(&self) -> bool {
+        self.voi() > 0.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,6 +429,36 @@ mod tests {
         );
     }
 
+    // -- §2.4 Layer 3: ByteRange refinement is finer than page-only --
+
+    #[test]
+    fn test_byte_range_witness_finer_than_page() {
+        let budget = RefinementBudget::v1_default();
+
+        // Page-level discovered edge on page 10.
+        let in_edges = vec![make_edge(1, 2, 10)];
+
+        // Refinement summary covers a different page: should eliminate.
+        let non_overlap = refine_edges(
+            in_edges,
+            Vec::new(),
+            &[(10_u32, KeySummary::ByteRangeList(vec![(11_u32, 0_u16, 64_u16)]))],
+            &budget,
+        );
+        assert_eq!(non_overlap.eliminated_edges.len(), 1);
+        assert!(non_overlap.confirmed_edges.is_empty());
+
+        // Summary covers the same page with a concrete range: should confirm.
+        let overlap = refine_edges(
+            vec![make_edge(1, 2, 10)],
+            Vec::new(),
+            &[(10_u32, KeySummary::ByteRangeList(vec![(10_u32, 32_u16, 64_u16)]))],
+            &budget,
+        );
+        assert_eq!(overlap.confirmed_edges.len(), 1);
+        assert!(overlap.eliminated_edges.is_empty());
+    }
+
     // -- §5.7.4 test 4: VOI metric computation --
 
     #[test]
@@ -446,6 +482,7 @@ mod tests {
         let voi = metrics.voi();
         assert!((voi - 650.0).abs() < 1e-10, "VOI = benefit - cost");
         assert!(voi > 0.0, "positive VOI means refinement is cost-effective");
+        assert!(metrics.should_invest());
 
         // Negative VOI example: high cost, low benefit.
         let expensive = VoiMetrics {
@@ -459,6 +496,27 @@ mod tests {
             expensive.voi() < 0.0,
             "negative VOI means refinement not worth it"
         );
+        assert!(!expensive.should_invest());
+    }
+
+    #[test]
+    fn test_voi_framework_computes_actionable_score() {
+        let invest = VoiMetrics {
+            c_b: 8.0,
+            fp_b: 0.6,
+            delta_fp_b: 0.5,
+            l_abort: 120.0,
+            cost_refine_b: 100.0,
+        };
+        let skip = VoiMetrics {
+            c_b: 0.2,
+            fp_b: 0.1,
+            delta_fp_b: 0.05,
+            l_abort: 10.0,
+            cost_refine_b: 50.0,
+        };
+        assert!(invest.should_invest(), "VOI>0 should recommend refine");
+        assert!(!skip.should_invest(), "VOI<=0 should recommend skip");
     }
 
     // -- Soundness: disabling refinement never introduces false negatives --

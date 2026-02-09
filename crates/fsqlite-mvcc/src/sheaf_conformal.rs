@@ -127,17 +127,7 @@ pub fn check_sheaf_consistency(
 /// If either observed version is absent from the page chain, the overlap is
 /// treated as an obstruction.
 #[must_use]
-pub fn check_sheaf_consistency_with_chains(
-    sections: &[Section],
-    global_version_chains: &HashMap<u64, Vec<u64>>,
-) -> SheafResult {
-    check_sheaf_consistency_with_chains_hasher(sections, global_version_chains)
-}
-
-/// Internal generic form to keep the public API ergonomic while avoiding
-/// hasher-specific assumptions.
-#[must_use]
-pub fn check_sheaf_consistency_with_chains_hasher<S: std::hash::BuildHasher>(
+pub fn check_sheaf_consistency_with_chains<S: std::hash::BuildHasher>(
     sections: &[Section],
     global_version_chains: &HashMap<u64, Vec<u64>, S>,
 ) -> SheafResult {

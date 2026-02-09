@@ -77,10 +77,21 @@ impl KeySummary {
                     cells.range(page_prefix..=page_end).next().is_some()
                 }
             }
-            Self::ByteRangeList(_ranges) => {
-                // Conservative: byte ranges always potentially overlap.
-                true
-            }
+            Self::ByteRangeList(ranges) => match key {
+                WitnessKey::ByteRange { page, start, len } => ranges.iter().any(
+                    |(range_page, range_start, range_len)| {
+                        *range_page == page.get()
+                            && byte_ranges_overlap(*range_start, *range_len, *start, *len)
+                    },
+                ),
+                WitnessKey::Page(pgno) => ranges.iter().any(|(range_page, _, _)| *range_page == pgno.get()),
+                WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. } => {
+                    ranges
+                        .iter()
+                        .any(|(range_page, _, _)| *range_page == btree_root.get())
+                }
+                WitnessKey::Custom { .. } => true,
+            },
             Self::Chunked(chunks) => chunks.iter().any(|c| c.summary.may_overlap(key)),
         }
     }
@@ -124,6 +135,15 @@ fn page_number_of(key: &WitnessKey) -> u32 {
         WitnessKey::ByteRange { page, .. } => page.get(),
         WitnessKey::Custom { .. } => 0,
     }
+}
+
+#[must_use]
+fn byte_ranges_overlap(a_start: u16, a_len: u16, b_start: u16, b_len: u16) -> bool {
+    let a_start = u32::from(a_start);
+    let b_start = u32::from(b_start);
+    let a_end = a_start.saturating_add(u32::from(a_len));
+    let b_end = b_start.saturating_add(u32::from(b_len));
+    a_start < b_end && b_start < a_end
 }
 
 // ---------------------------------------------------------------------------
@@ -538,8 +558,18 @@ mod tests {
         // ByteRangeList variant
         let ranges = KeySummary::ByteRangeList(vec![(1, 0, 100), (2, 50, 200)]);
         assert_eq!(ranges.len(), 2);
-        // Conservative: always returns true.
-        assert!(ranges.may_overlap(&test_page_key(99)));
+        assert!(ranges.may_overlap(&test_page_key(1)));
+        assert!(!ranges.may_overlap(&test_page_key(99)));
+        assert!(ranges.may_overlap(&WitnessKey::ByteRange {
+            page: PageNumber::new(2).unwrap(),
+            start: 100,
+            len: 20,
+        }));
+        assert!(!ranges.may_overlap(&WitnessKey::ByteRange {
+            page: PageNumber::new(2).unwrap(),
+            start: 400,
+            len: 20,
+        }));
 
         // Chunked variant
         let chunked = KeySummary::Chunked(vec![
