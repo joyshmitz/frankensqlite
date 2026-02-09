@@ -1,14 +1,15 @@
 //! AST-to-VDBE bytecode compilation (§10.6).
 //!
 //! Translates parsed SQL statements into VDBE register-based instructions
-//! using the `ProgramBuilder` from `fsqlite-types`. Handles SELECT, INSERT,
+//! using `ProgramBuilder`. Handles SELECT, INSERT,
 //! UPDATE, and DELETE with correct opcode patterns matching C SQLite behavior.
 
+use crate::ProgramBuilder;
 use fsqlite_ast::{
     ColumnRef, DeleteStatement, Expr, InsertSource, InsertStatement, Literal, QualifiedTableRef,
     ResultColumn, SelectCore, SelectStatement, UpdateStatement,
 };
-use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
+use fsqlite_types::opcode::{Opcode, P4};
 
 // ---------------------------------------------------------------------------
 // Schema metadata (minimal info needed for codegen)
@@ -141,21 +142,16 @@ pub fn codegen_select(
     schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    let core = match &stmt.body.select {
-        SelectCore::Select { .. } => &stmt.body.select,
-        SelectCore::Values(_) => {
-            return Err(CodegenError::Unsupported("VALUES in SELECT".to_owned()));
-        }
-    };
-
-    let (columns, from, where_clause) = match core {
+    let (columns, from, where_clause) = match &stmt.body.select {
         SelectCore::Select {
             columns,
             from,
             where_clause,
             ..
         } => (columns, from, where_clause),
-        SelectCore::Values(_) => unreachable!(),
+        SelectCore::Values(_) => {
+            return Err(CodegenError::Unsupported("VALUES in SELECT".to_owned()));
+        }
     };
 
     // Determine the table from the FROM clause.
@@ -297,8 +293,8 @@ fn codegen_select_full_scan(
     columns: &[ResultColumn],
     out_regs: i32,
     out_col_count: i32,
-    done_label: Label,
-    end_label: Label,
+    done_label: crate::Label,
+    end_label: crate::Label,
 ) -> Result<(), CodegenError> {
     b.emit_op(
         Opcode::OpenRead,
@@ -850,13 +846,14 @@ fn emit_expr_or_variable(b: &mut ProgramBuilder, param_idx: i32, reg: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProgramBuilder;
     use fsqlite_ast::{
         Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
         Distinctness, Expr, FromClause, InsertSource, InsertStatement, PlaceholderType,
         QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore, SelectStatement,
         Span, TableOrSubquery, UpdateStatement,
     };
-    use fsqlite_types::opcode::{Opcode, ProgramBuilder, VdbeProgram};
+    use fsqlite_types::opcode::Opcode;
 
     fn test_schema() -> Vec<TableSchema> {
         vec![TableSchema {
@@ -981,11 +978,11 @@ mod tests {
         }
     }
 
-    fn opcode_sequence(prog: &VdbeProgram) -> Vec<Opcode> {
+    fn opcode_sequence(prog: &crate::VdbeProgram) -> Vec<Opcode> {
         prog.ops().iter().map(|op| op.opcode).collect()
     }
 
-    fn has_opcodes(prog: &VdbeProgram, expected: &[Opcode]) -> bool {
+    fn has_opcodes(prog: &crate::VdbeProgram, expected: &[Opcode]) -> bool {
         let ops = opcode_sequence(prog);
         // Check that expected opcodes appear in order (not necessarily adjacent).
         let mut ops_iter = ops.iter();

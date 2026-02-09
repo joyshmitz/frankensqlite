@@ -7,6 +7,8 @@
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 
+pub mod codegen;
+
 // ── Label System ────────────────────────────────────────────────────────────
 
 /// An opaque handle representing a forward-reference label.
@@ -448,6 +450,100 @@ impl VdbeProgram {
     }
 }
 
+// ── PRAGMA Handling ──────────────────────────────────────────────────────────
+
+/// Minimal PRAGMA dispatch for early phases.
+///
+/// The full engine will execute PRAGMA statements through the SQL pipeline,
+/// but we keep these handlers in VDBE (the execution boundary) so higher layers
+/// can remain declarative.
+pub mod pragma {
+    use fsqlite_ast::{Expr, Literal, PragmaStatement, PragmaValue, QualifiedName};
+    use fsqlite_error::{FrankenError, Result};
+    use fsqlite_mvcc::TransactionManager;
+
+    /// Result of applying a PRAGMA statement.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PragmaOutput {
+        /// PRAGMA not recognized by this handler.
+        Unsupported,
+        /// PRAGMA yields a boolean value (e.g. query or echo after set).
+        Bool(bool),
+    }
+
+    /// Apply a PRAGMA statement to the provided connection-scoped state.
+    ///
+    /// Currently supports:
+    /// - `PRAGMA fsqlite.serializable`
+    /// - `PRAGMA fsqlite.serializable = ON|OFF|TRUE|FALSE|1|0`
+    ///
+    /// Unknown pragmas return [`PragmaOutput::Unsupported`].
+    pub fn apply(mgr: &mut TransactionManager, stmt: &PragmaStatement) -> Result<PragmaOutput> {
+        if !is_fsqlite_serializable(&stmt.name) {
+            return Ok(PragmaOutput::Unsupported);
+        }
+
+        match &stmt.value {
+            None => Ok(PragmaOutput::Bool(mgr.ssi_enabled())),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_bool(expr)?;
+                mgr.set_ssi_enabled(enabled);
+                Ok(PragmaOutput::Bool(mgr.ssi_enabled()))
+            }
+        }
+    }
+
+    fn is_fsqlite_serializable(name: &QualifiedName) -> bool {
+        name.schema
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("fsqlite"))
+            && name.name.eq_ignore_ascii_case("serializable")
+    }
+
+    fn parse_bool(expr: &Expr) -> Result<bool> {
+        let (raw, parsed) = match expr {
+            Expr::Literal(Literal::Integer(n), _) => (format!("{n}"), parse_int_bool(*n)),
+            Expr::Literal(Literal::String(s), _) => (s.clone(), parse_str_bool(s)),
+            Expr::Literal(Literal::True, _) => ("TRUE".to_owned(), Some(true)),
+            Expr::Literal(Literal::False, _) => ("FALSE".to_owned(), Some(false)),
+            Expr::Column(col, _) => (col.column.clone(), parse_str_bool(&col.column)),
+            other => {
+                return Err(FrankenError::TypeMismatch {
+                    expected: "ON|OFF|TRUE|FALSE|1|0".to_owned(),
+                    actual: format!("{other:?}"),
+                });
+            }
+        };
+
+        parsed.ok_or_else(|| FrankenError::TypeMismatch {
+            expected: "ON|OFF|TRUE|FALSE|1|0".to_owned(),
+            actual: raw,
+        })
+    }
+
+    fn parse_int_bool(n: i64) -> Option<bool> {
+        match n {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn parse_str_bool(s: &str) -> Option<bool> {
+        if s.eq_ignore_ascii_case("on") || s.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else if s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else if s == "1" {
+            Some(true)
+        } else if s == "0" {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -667,9 +763,12 @@ mod tests {
         // Every Opcode enum variant (1..=190) has a valid name and can be
         // constructed from its byte value. This ensures no gaps in the enum.
         for byte in 1..=190u8 {
-            let opcode = Opcode::from_byte(byte).unwrap_or_else(|| {
-                panic!("Opcode::from_byte({byte}) returned None — gap in opcode enum");
-            });
+            let opcode = Opcode::from_byte(byte);
+            assert!(
+                opcode.is_some(),
+                "Opcode::from_byte({byte}) returned None — gap in opcode enum"
+            );
+            let opcode = opcode.unwrap();
             let name = opcode.name();
             assert!(!name.is_empty(), "opcode {byte} has empty name");
         }
@@ -831,5 +930,130 @@ mod tests {
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         let prog = b.finish().unwrap();
         assert_eq!(prog.len(), 1);
+    }
+
+    // ── PRAGMA handling (bd-iwu.5) ───────────────────────────────────────
+
+    use fsqlite_ast::Statement;
+    use fsqlite_mvcc::{BeginKind, MvccError, TransactionManager};
+    use fsqlite_parser::Parser;
+    use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
+
+    fn parse_pragma(sql: &str) -> std::result::Result<fsqlite_ast::PragmaStatement, String> {
+        let mut p = Parser::from_sql(sql);
+        let stmt = p.parse_statement().expect("parse statement");
+        match stmt {
+            Statement::Pragma(p) => Ok(p),
+            other => Err(format!("expected PRAGMA, got: {other:?}")),
+        }
+    }
+
+    fn test_page(first_byte: u8) -> PageData {
+        let mut page = PageData::zeroed(PageSize::DEFAULT);
+        page.as_bytes_mut()[0] = first_byte;
+        page
+    }
+
+    #[test]
+    fn test_pragma_serializable_query_returns_current_setting() {
+        let mut mgr = TransactionManager::new(PageSize::DEFAULT);
+
+        let stmt = parse_pragma("PRAGMA fsqlite.serializable").expect("parse pragma");
+        let out = pragma::apply(&mut mgr, &stmt).unwrap();
+        assert_eq!(out, pragma::PragmaOutput::Bool(true));
+    }
+
+    #[test]
+    fn test_pragma_serializable_set_and_query() {
+        let mut mgr = TransactionManager::new(PageSize::DEFAULT);
+
+        let set_off = parse_pragma("PRAGMA fsqlite.serializable = OFF").expect("parse pragma");
+        assert_eq!(
+            pragma::apply(&mut mgr, &set_off).unwrap(),
+            pragma::PragmaOutput::Bool(false)
+        );
+
+        let query = parse_pragma("PRAGMA fsqlite.serializable").expect("parse pragma");
+        assert_eq!(
+            pragma::apply(&mut mgr, &query).unwrap(),
+            pragma::PragmaOutput::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_pragma_scope_per_connection_via_handler() {
+        let mut conn_a = TransactionManager::new(PageSize::DEFAULT);
+        let mut conn_b = TransactionManager::new(PageSize::DEFAULT);
+
+        let set_off = parse_pragma("PRAGMA fsqlite.serializable = OFF").expect("parse pragma");
+        let _ = pragma::apply(&mut conn_a, &set_off).unwrap();
+
+        let query = parse_pragma("PRAGMA fsqlite.serializable").expect("parse pragma");
+        assert_eq!(
+            pragma::apply(&mut conn_a, &query).unwrap(),
+            pragma::PragmaOutput::Bool(false)
+        );
+        assert_eq!(
+            pragma::apply(&mut conn_b, &query).unwrap(),
+            pragma::PragmaOutput::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_pragma_not_retroactive_to_active_txn_via_handler() {
+        let mut mgr = TransactionManager::new(PageSize::DEFAULT);
+
+        let mut txn = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut txn, PageNumber::new(1).unwrap(), test_page(0x01))
+            .unwrap();
+        txn.has_in_rw = true;
+        txn.has_out_rw = true;
+        assert!(txn.has_dangerous_structure());
+
+        // Flip OFF mid-txn; this must not affect the already-begun transaction.
+        let set_off = parse_pragma("PRAGMA fsqlite.serializable = OFF").expect("parse pragma");
+        let _ = pragma::apply(&mut mgr, &set_off).unwrap();
+
+        assert_eq!(
+            mgr.commit(&mut txn).unwrap_err(),
+            MvccError::BusySnapshot,
+            "PRAGMA change must not be retroactive to an active txn"
+        );
+    }
+
+    #[test]
+    fn test_e2e_serializable_pragma_switch_changes_behavior() {
+        let mut mgr = TransactionManager::new(PageSize::DEFAULT);
+
+        // Run workload with serializable=ON: must abort on dangerous structure.
+        let set_on = parse_pragma("PRAGMA fsqlite.serializable = ON").expect("parse pragma");
+        let _ = pragma::apply(&mut mgr, &set_on).unwrap();
+
+        let mut txn_on = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut txn_on, PageNumber::new(1).unwrap(), test_page(0x10))
+            .unwrap();
+        txn_on.has_in_rw = true;
+        txn_on.has_out_rw = true;
+        assert_eq!(
+            mgr.commit(&mut txn_on).unwrap_err(),
+            MvccError::BusySnapshot,
+            "serializable=ON must enforce SSI (abort)"
+        );
+
+        // Run the same workload with serializable=OFF: must commit (plain SI).
+        let set_off = parse_pragma("PRAGMA fsqlite.serializable = OFF").expect("parse pragma");
+        let _ = pragma::apply(&mut mgr, &set_off).unwrap();
+
+        let mut txn_off = mgr.begin(BeginKind::Concurrent).unwrap();
+        mgr.write_page(&mut txn_off, PageNumber::new(2).unwrap(), test_page(0x20))
+            .unwrap();
+        txn_off.has_in_rw = true;
+        txn_off.has_out_rw = true;
+
+        let seq = mgr.commit(&mut txn_off).unwrap();
+        assert!(
+            seq > CommitSeq::ZERO,
+            "serializable=OFF must allow write skew"
+        );
     }
 }

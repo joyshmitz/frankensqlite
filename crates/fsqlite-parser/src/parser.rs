@@ -11,14 +11,14 @@ use fsqlite_ast::{
     CreateIndexStatement, CreateTableBody, CreateTableStatement, CreateTriggerStatement,
     CreateViewStatement, CreateVirtualTableStatement, Cte, CteMaterialized, DefaultValue,
     Deferrable, DeferrableInitially, DeleteStatement, Distinctness, DropObjectType, DropStatement,
-    ForeignKeyAction, ForeignKeyActionType, ForeignKeyClause, ForeignKeyTrigger, FrameBound,
+    Expr, ForeignKeyAction, ForeignKeyActionType, ForeignKeyClause, ForeignKeyTrigger, FrameBound,
     FrameExclude, FrameSpec, FrameType, FromClause, GeneratedStorage, IndexHint, IndexedColumn,
     InsertSource, InsertStatement, JoinClause, JoinConstraint, JoinKind, JoinType, LimitClause,
-    NullsOrder, OrderingTerm, PragmaStatement, PragmaValue, QualifiedName, QualifiedTableRef,
-    ResultColumn, RollbackStatement, SelectBody, SelectCore, SelectStatement, SortDirection, Span,
-    Statement, TableConstraint, TableConstraintKind, TableOrSubquery, TransactionMode,
-    TriggerEvent, TriggerTiming, TypeName, UpdateStatement, UpsertAction, UpsertClause,
-    UpsertTarget, VacuumStatement, WindowDef, WindowSpec, WithClause,
+    Literal, NullsOrder, OrderingTerm, PragmaStatement, PragmaValue, QualifiedName,
+    QualifiedTableRef, ResultColumn, RollbackStatement, SelectBody, SelectCore, SelectStatement,
+    SortDirection, Span, Statement, TableConstraint, TableConstraintKind, TableOrSubquery,
+    TransactionMode, TriggerEvent, TriggerTiming, TypeName, UpdateStatement, UpsertAction,
+    UpsertClause, UpsertTarget, VacuumStatement, WindowDef, WindowSpec, WithClause,
 };
 
 use crate::lexer::Lexer;
@@ -1647,13 +1647,25 @@ impl Parser {
         Ok(Statement::Attach(AttachStatement { expr, schema }))
     }
 
+    fn parse_pragma_value_expr(&mut self) -> Result<Expr, ParseError> {
+        // SQLite allows ON/OFF for many boolean pragmas. Treat `ON` as `TRUE`
+        // in PRAGMA value position (OFF is tokenized as an identifier, so the
+        // regular expression parser handles it).
+        if self.check_kw(&TokenKind::KwOn) {
+            let sp = self.current_span();
+            self.advance();
+            return Ok(Expr::Literal(Literal::True, sp));
+        }
+        self.parse_expr()
+    }
+
     fn parse_pragma(&mut self) -> Result<Statement, ParseError> {
         self.expect_kw(&TokenKind::KwPragma)?;
         let name = self.parse_qualified_name()?;
         let value = if self.eat(&TokenKind::Eq) || self.eat(&TokenKind::EqEq) {
-            Some(PragmaValue::Assign(self.parse_expr()?))
+            Some(PragmaValue::Assign(self.parse_pragma_value_expr()?))
         } else if self.eat(&TokenKind::LeftParen) {
-            let v = self.parse_expr()?;
+            let v = self.parse_pragma_value_expr()?;
             self.expect_token(&TokenKind::RightParen)?;
             Some(PragmaValue::Call(v))
         } else {
@@ -2052,6 +2064,12 @@ mod tests {
     #[test]
     fn pragma() {
         let stmt = parse_one("PRAGMA journal_mode = WAL");
+        assert!(matches!(stmt, Statement::Pragma(_)));
+    }
+
+    #[test]
+    fn pragma_allows_on_value() {
+        let stmt = parse_one("PRAGMA fsqlite.serializable = ON");
         assert!(matches!(stmt, Statement::Pragma(_)));
     }
 

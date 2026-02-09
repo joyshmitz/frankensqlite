@@ -12,6 +12,11 @@ fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-pager = { workspace = true }
 fsqlite-btree = { workspace = true }
+fsqlite-ast = { workspace = true }
+fsqlite-mvcc = { workspace = true }
+
+[dev-dependencies]
+fsqlite-parser = { workspace = true }
 
 [lints]
 workspace = true

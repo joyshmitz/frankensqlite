@@ -591,7 +591,6 @@ dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
  "fsqlite-types",
- "fsqlite-vdbe",
  "tracing",
 ]
 
@@ -601,6 +600,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.10.0",
  "blake3",
+ "fsqlite-error",
  "proptest",
  "serde",
  "serde_json",
@@ -612,9 +612,12 @@ dependencies = [
 name = "fsqlite-vdbe"
 version = "0.1.0"
 dependencies = [
+ "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-error",
+ "fsqlite-mvcc",
  "fsqlite-pager",
+ "fsqlite-parser",
  "fsqlite-types",
 ]
 
