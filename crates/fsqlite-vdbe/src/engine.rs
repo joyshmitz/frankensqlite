@@ -1462,4 +1462,460 @@ mod tests {
         assert_eq!(engine.results().len(), 1);
         assert_eq!(engine.results()[0], vec![SqliteValue::Integer(200)]);
     }
+
+    // ── Codegen → Engine Integration Tests ──────────────────────────────
+
+    mod codegen_integration {
+        use super::*;
+        use crate::codegen::{
+            CodegenContext, ColumnInfo, TableSchema, codegen_delete, codegen_insert,
+            codegen_select, codegen_update,
+        };
+        use fsqlite_ast::{
+            Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
+            Distinctness, Expr, FromClause, InsertSource, InsertStatement, Literal,
+            PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody,
+            SelectCore, SelectStatement, Span, TableOrSubquery, UpdateStatement,
+        };
+
+        fn test_schema() -> Vec<TableSchema> {
+            vec![TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "a".to_owned(),
+                        affinity: 'd',
+                    },
+                    ColumnInfo {
+                        name: "b".to_owned(),
+                        affinity: 'C',
+                    },
+                ],
+                indexes: vec![],
+            }]
+        }
+
+        fn from_table(name: &str) -> FromClause {
+            FromClause {
+                source: TableOrSubquery::Table {
+                    name: QualifiedName {
+                        schema: None,
+                        name: name.to_owned(),
+                    },
+                    alias: None,
+                    index_hint: None,
+                },
+                joins: Vec::new(),
+            }
+        }
+
+        fn span() -> Span {
+            Span { start: 0, end: 0 }
+        }
+
+        /// Verify codegen_insert produces a program that executes without panic.
+        #[test]
+        fn test_codegen_insert_executes() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::Literal(Literal::Integer(42), span()),
+                    Expr::Literal(Literal::String("hello".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+        }
+
+        /// Verify codegen_select (full scan) produces a program that executes.
+        #[test]
+        fn test_codegen_select_full_scan_executes() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            let stmt = SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: SelectCore::Select {
+                        distinct: Distinctness::All,
+                        columns: vec![ResultColumn::Star],
+                        from: Some(from_table("t")),
+                        where_clause: None,
+                        group_by: vec![],
+                        having: None,
+                        windows: vec![],
+                    },
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_select(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            // Engine should execute without panic (cursor ops are stubbed).
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+        }
+
+        /// Verify codegen_update produces a program that executes.
+        #[test]
+        fn test_codegen_update_executes() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            let stmt = UpdateStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedTableRef {
+                    name: QualifiedName {
+                        schema: None,
+                        name: "t".to_owned(),
+                    },
+                    alias: None,
+                    index_hint: None,
+                },
+                assignments: vec![Assignment {
+                    target: AssignmentTarget::Column("b".to_owned()),
+                    value: Expr::Placeholder(PlaceholderType::Numbered(1), span()),
+                }],
+                from: None,
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(
+                        ColumnRef {
+                            table: None,
+                            column: "rowid".to_owned(),
+                        },
+                        span(),
+                    )),
+                    op: AstBinaryOp::Eq,
+                    right: Box::new(Expr::Placeholder(PlaceholderType::Numbered(2), span())),
+                    span: span(),
+                }),
+                returning: vec![],
+                order_by: vec![],
+                limit: None,
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_update(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+        }
+
+        /// Verify codegen_delete produces a program that executes.
+        #[test]
+        fn test_codegen_delete_executes() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            let stmt = DeleteStatement {
+                with: None,
+                table: QualifiedTableRef {
+                    name: QualifiedName {
+                        schema: None,
+                        name: "t".to_owned(),
+                    },
+                    alias: None,
+                    index_hint: None,
+                },
+                where_clause: Some(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(
+                        ColumnRef {
+                            table: None,
+                            column: "rowid".to_owned(),
+                        },
+                        span(),
+                    )),
+                    op: AstBinaryOp::Eq,
+                    right: Box::new(Expr::Placeholder(PlaceholderType::Numbered(1), span())),
+                    span: span(),
+                }),
+                returning: vec![],
+                order_by: vec![],
+                limit: None,
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_delete(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+        }
+
+        /// Verify codegen_insert with RETURNING produces a ResultRow.
+        #[test]
+        fn test_codegen_insert_returning_produces_result() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::Literal(Literal::Integer(7), span()),
+                    Expr::Literal(Literal::String("world".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![ResultColumn::Star],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+            // RETURNING emits a ResultRow with the new rowid.
+            assert_eq!(engine.results().len(), 1);
+        }
+
+        /// Verify INSERT with literal values emits the correct value registers.
+        #[test]
+        fn test_codegen_insert_literal_values_disassemble() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::Literal(Literal::Integer(99), span()),
+                    Expr::Literal(Literal::String("test".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let asm = prog.disassemble();
+            assert!(asm.contains("Init"), "should have Init opcode");
+            assert!(asm.contains("OpenWrite"), "should have OpenWrite opcode");
+            assert!(asm.contains("NewRowid"), "should have NewRowid opcode");
+            assert!(
+                asm.contains("Integer"),
+                "should have Integer opcode for literal 99"
+            );
+            assert!(
+                asm.contains("String8"),
+                "should have String8 opcode for literal 'test'"
+            );
+            assert!(asm.contains("MakeRecord"), "should have MakeRecord opcode");
+            assert!(asm.contains("Insert"), "should have Insert opcode");
+            assert!(asm.contains("Halt"), "should have Halt opcode");
+        }
+
+        /// Verify emit_expr handles arithmetic BinaryOp in INSERT values.
+        #[test]
+        fn test_codegen_insert_arithmetic_expr() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            // INSERT INTO t VALUES (2 + 3, 'hi')
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::BinaryOp {
+                        left: Box::new(Expr::Literal(Literal::Integer(2), span())),
+                        op: AstBinaryOp::Add,
+                        right: Box::new(Expr::Literal(Literal::Integer(3), span())),
+                        span: span(),
+                    },
+                    Expr::Literal(Literal::String("hi".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let asm = prog.disassemble();
+            assert!(asm.contains("Add"), "should have Add opcode for 2+3");
+            assert!(asm.contains("Integer"), "should have Integer opcodes");
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+        }
+
+        /// Verify emit_expr handles UnaryOp (negation) in INSERT values.
+        #[test]
+        fn test_codegen_insert_negation_expr() {
+            use fsqlite_ast::UnaryOp as AstUnaryOp;
+
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            // INSERT INTO t VALUES (-42, 'neg')
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::UnaryOp {
+                        op: AstUnaryOp::Negate,
+                        expr: Box::new(Expr::Literal(Literal::Integer(42), span())),
+                        span: span(),
+                    },
+                    Expr::Literal(Literal::String("neg".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let asm = prog.disassemble();
+            assert!(asm.contains("Multiply"), "negation emits Multiply by -1");
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+        }
+
+        /// Verify emit_expr handles CASE expression in INSERT values.
+        #[test]
+        fn test_codegen_insert_case_expr() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            // INSERT INTO t VALUES (CASE WHEN TRUE THEN 10 ELSE 20 END, 'case')
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::Case {
+                        operand: None,
+                        whens: vec![(
+                            Expr::Literal(Literal::True, span()),
+                            Expr::Literal(Literal::Integer(10), span()),
+                        )],
+                        else_expr: Some(Box::new(Expr::Literal(Literal::Integer(20), span()))),
+                        span: span(),
+                    },
+                    Expr::Literal(Literal::String("case".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let asm = prog.disassemble();
+            assert!(asm.contains("IfNot"), "searched CASE emits IfNot");
+            assert!(asm.contains("Goto"), "CASE branches with Goto");
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+        }
+
+        /// Verify emit_expr handles comparison expression producing 0/1 result.
+        #[test]
+        fn test_codegen_insert_comparison_expr() {
+            let schema = test_schema();
+            let ctx = CodegenContext::default();
+
+            // INSERT INTO t VALUES (3 > 2, 'cmp') — should produce integer 1
+            let stmt = InsertStatement {
+                with: None,
+                or_conflict: None,
+                table: QualifiedName {
+                    schema: None,
+                    name: "t".to_owned(),
+                },
+                alias: None,
+                columns: vec![],
+                source: InsertSource::Values(vec![vec![
+                    Expr::BinaryOp {
+                        left: Box::new(Expr::Literal(Literal::Integer(3), span())),
+                        op: AstBinaryOp::Gt,
+                        right: Box::new(Expr::Literal(Literal::Integer(2), span())),
+                        span: span(),
+                    },
+                    Expr::Literal(Literal::String("cmp".to_owned()), span()),
+                ]]),
+                upsert: vec![],
+                returning: vec![],
+            };
+
+            let mut b = ProgramBuilder::new();
+            codegen_insert(&mut b, &stmt, &schema, &ctx).expect("codegen should succeed");
+            let prog = b.finish().expect("program should build");
+
+            let asm = prog.disassemble();
+            assert!(asm.contains("Gt"), "comparison emits Gt opcode");
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+        }
+    }
 }

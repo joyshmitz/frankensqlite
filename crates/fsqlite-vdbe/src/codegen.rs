@@ -805,8 +805,16 @@ fn bind_param_index(expr: &Expr) -> Option<i32> {
 /// Emit an expression value into a register.
 ///
 /// For bind parameters, emits a Variable instruction.
-/// For literals, emits the appropriate constant instruction.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+/// Emit bytecode for an expression, placing the result in `reg`.
+///
+/// Handles literals, bind parameters, binary/unary operators, CASE, and CAST.
+/// Column references and other cursor-dependent expressions fall back to Null
+/// until Phase 5 cursor integration.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines
+)]
 fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
     match expr {
         Expr::Placeholder(pt, _) => {
@@ -820,17 +828,309 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
             Literal::Integer(n) => {
                 b.emit_op(Opcode::Integer, *n as i32, reg, 0, P4::None, 0);
             }
+            Literal::Float(f) => {
+                b.emit_op(Opcode::Real, 0, reg, 0, P4::Real(*f), 0);
+            }
             Literal::String(s) => {
                 b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(s.clone()), 0);
             }
+            Literal::Blob(bytes) => {
+                b.emit_op(Opcode::Blob, bytes.len() as i32, reg, 0, P4::None, 0);
+            }
+            Literal::True => {
+                b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+            }
+            Literal::False => {
+                b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+            }
+            // CURRENT_TIME, CURRENT_DATE, CURRENT_TIMESTAMP — emit Null for now.
             _ => {
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             }
         },
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            emit_binary_op(b, left, *op, right, reg);
+        }
+        Expr::UnaryOp {
+            op, expr: operand, ..
+        } => {
+            emit_expr(b, operand, reg);
+            match op {
+                fsqlite_ast::UnaryOp::Negate => {
+                    // Multiply by -1: Integer(-1) into temp, then Multiply.
+                    let tmp = b.alloc_temp();
+                    b.emit_op(Opcode::Integer, -1, tmp, 0, P4::None, 0);
+                    b.emit_op(Opcode::Multiply, tmp, reg, reg, P4::None, 0);
+                    b.free_temp(tmp);
+                }
+                fsqlite_ast::UnaryOp::Plus => { /* no-op */ }
+                fsqlite_ast::UnaryOp::BitNot => {
+                    b.emit_op(Opcode::BitNot, reg, reg, 0, P4::None, 0);
+                }
+                fsqlite_ast::UnaryOp::Not => {
+                    b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
+                }
+            }
+        }
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            ..
+        } => {
+            emit_expr(b, inner, reg);
+            let affinity = type_name_to_affinity(type_name);
+            b.emit_op(Opcode::Cast, reg, i32::from(affinity), 0, P4::None, 0);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            emit_case_expr(b, operand.as_deref(), whens, else_expr.as_deref(), reg);
+        }
+        Expr::IsNull {
+            expr: inner, not, ..
+        } => {
+            // IS NULL → result 1 if null, 0 otherwise.
+            // IS NOT NULL → result 0 if null, 1 otherwise.
+            emit_expr(b, inner, reg);
+            let lbl_null = b.emit_label();
+            let lbl_done = b.emit_label();
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, lbl_null, P4::None, 0);
+            // Not null path.
+            let val_not_null = i32::from(*not); // IS NOT NULL: 1; IS NULL: 0
+            let val_null = i32::from(!*not); // IS NOT NULL: 0; IS NULL: 1
+            b.emit_op(Opcode::Integer, val_not_null, reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_done, P4::None, 0);
+            b.resolve_label(lbl_null);
+            b.emit_op(Opcode::Integer, val_null, reg, 0, P4::None, 0);
+            b.resolve_label(lbl_done);
+        }
         _ => {
-            // For complex expressions, emit a placeholder (Null).
+            // Column refs and other cursor-dependent expressions: emit Null placeholder.
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         }
+    }
+}
+
+/// Map an AST `BinaryOp` to the corresponding VDBE opcode.
+fn binary_op_to_opcode(op: fsqlite_ast::BinaryOp) -> Opcode {
+    match op {
+        fsqlite_ast::BinaryOp::Add => Opcode::Add,
+        fsqlite_ast::BinaryOp::Subtract => Opcode::Subtract,
+        fsqlite_ast::BinaryOp::Multiply => Opcode::Multiply,
+        fsqlite_ast::BinaryOp::Divide => Opcode::Divide,
+        fsqlite_ast::BinaryOp::Modulo => Opcode::Remainder,
+        fsqlite_ast::BinaryOp::Concat => Opcode::Concat,
+        fsqlite_ast::BinaryOp::BitAnd => Opcode::BitAnd,
+        fsqlite_ast::BinaryOp::BitOr => Opcode::BitOr,
+        fsqlite_ast::BinaryOp::ShiftLeft => Opcode::ShiftLeft,
+        fsqlite_ast::BinaryOp::ShiftRight => Opcode::ShiftRight,
+        fsqlite_ast::BinaryOp::And => Opcode::And,
+        fsqlite_ast::BinaryOp::Or => Opcode::Or,
+        // Comparison ops use jump instructions; map to Eq as placeholder.
+        fsqlite_ast::BinaryOp::Eq
+        | fsqlite_ast::BinaryOp::Ne
+        | fsqlite_ast::BinaryOp::Lt
+        | fsqlite_ast::BinaryOp::Le
+        | fsqlite_ast::BinaryOp::Gt
+        | fsqlite_ast::BinaryOp::Ge
+        | fsqlite_ast::BinaryOp::Is
+        | fsqlite_ast::BinaryOp::IsNot => Opcode::Eq, // handled separately
+    }
+}
+
+/// Emit bytecode for a binary operation expression.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_binary_op(
+    b: &mut ProgramBuilder,
+    left: &Expr,
+    op: fsqlite_ast::BinaryOp,
+    right: &Expr,
+    reg: i32,
+) {
+    // For comparison operators, emit a conditional jump pattern that
+    // produces 1 (true) or 0 (false) as an integer result.
+    if matches!(
+        op,
+        fsqlite_ast::BinaryOp::Eq
+            | fsqlite_ast::BinaryOp::Ne
+            | fsqlite_ast::BinaryOp::Lt
+            | fsqlite_ast::BinaryOp::Le
+            | fsqlite_ast::BinaryOp::Gt
+            | fsqlite_ast::BinaryOp::Ge
+    ) {
+        emit_comparison(b, left, op, right, reg);
+        return;
+    }
+
+    if matches!(op, fsqlite_ast::BinaryOp::Is | fsqlite_ast::BinaryOp::IsNot) {
+        emit_is_comparison(b, left, op, right, reg);
+        return;
+    }
+
+    // Arithmetic / logical / bitwise: evaluate left into reg, right into tmp,
+    // then apply the opcode.
+    let tmp = b.alloc_temp();
+    emit_expr(b, left, reg);
+    emit_expr(b, right, tmp);
+    let opcode = binary_op_to_opcode(op);
+    // VDBE arithmetic: OP p1=rhs, p2=lhs, p3=dest
+    b.emit_op(opcode, tmp, reg, reg, P4::None, 0);
+    b.free_temp(tmp);
+}
+
+/// Emit a comparison expression that produces 1 (true) or 0 (false).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_comparison(
+    b: &mut ProgramBuilder,
+    left: &Expr,
+    op: fsqlite_ast::BinaryOp,
+    right: &Expr,
+    reg: i32,
+) {
+    let r_left = b.alloc_temp();
+    let r_right = b.alloc_temp();
+    emit_expr(b, left, r_left);
+    emit_expr(b, right, r_right);
+
+    let cmp_opcode = match op {
+        fsqlite_ast::BinaryOp::Eq => Opcode::Eq,
+        fsqlite_ast::BinaryOp::Ne => Opcode::Ne,
+        fsqlite_ast::BinaryOp::Lt => Opcode::Lt,
+        fsqlite_ast::BinaryOp::Le => Opcode::Le,
+        fsqlite_ast::BinaryOp::Gt => Opcode::Gt,
+        fsqlite_ast::BinaryOp::Ge => Opcode::Ge,
+        _ => unreachable!(),
+    };
+
+    // Pattern: assume false (0), jump to true_label if condition holds.
+    let true_label = b.emit_label();
+    let done_label = b.emit_label();
+
+    // Comparison: p1=rhs_reg, p2=jump_target (label), p3=lhs_reg
+    b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.resolve_label(true_label);
+    b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+    b.resolve_label(done_label);
+
+    b.free_temp(r_right);
+    b.free_temp(r_left);
+}
+
+/// Emit IS / IS NOT comparison (NULLEQ semantics).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_is_comparison(
+    b: &mut ProgramBuilder,
+    left: &Expr,
+    op: fsqlite_ast::BinaryOp,
+    right: &Expr,
+    reg: i32,
+) {
+    let r_left = b.alloc_temp();
+    let r_right = b.alloc_temp();
+    emit_expr(b, left, r_left);
+    emit_expr(b, right, r_right);
+
+    let true_label = b.emit_label();
+    let done_label = b.emit_label();
+
+    // IS uses Eq with NULLEQ flag (p5=0x80). IS NOT uses Ne with NULLEQ.
+    let (cmp_opcode, nulleq_flag) = match op {
+        fsqlite_ast::BinaryOp::Is => (Opcode::Eq, 0x80_u16),
+        fsqlite_ast::BinaryOp::IsNot => (Opcode::Ne, 0x80_u16),
+        _ => unreachable!(),
+    };
+
+    b.emit_jump_to_label(
+        cmp_opcode,
+        r_right,
+        r_left,
+        true_label,
+        P4::None,
+        nulleq_flag,
+    );
+    b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.resolve_label(true_label);
+    b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+    b.resolve_label(done_label);
+
+    b.free_temp(r_right);
+    b.free_temp(r_left);
+}
+
+/// Emit CASE [operand] WHEN ... THEN ... [ELSE ...] END.
+fn emit_case_expr(
+    b: &mut ProgramBuilder,
+    operand: Option<&Expr>,
+    whens: &[(Expr, Expr)],
+    else_expr: Option<&Expr>,
+    reg: i32,
+) {
+    let done_label = b.emit_label();
+    let r_operand = operand.map(|op_expr| {
+        let r = b.alloc_temp();
+        emit_expr(b, op_expr, r);
+        r
+    });
+
+    for (when_expr, then_expr) in whens {
+        let next_when = b.emit_label();
+
+        if let Some(r_op) = r_operand {
+            // Simple CASE: compare operand to each WHEN value.
+            let r_when = b.alloc_temp();
+            emit_expr(b, when_expr, r_when);
+            // If operand != when_value, skip to next WHEN.
+            b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, 0);
+            b.free_temp(r_when);
+        } else {
+            // Searched CASE: each WHEN is a boolean condition.
+            emit_expr(b, when_expr, reg);
+            // If condition is false/null, skip to next WHEN.
+            b.emit_jump_to_label(Opcode::IfNot, reg, 1, next_when, P4::None, 0);
+        }
+
+        // Emit THEN expression.
+        emit_expr(b, then_expr, reg);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+        b.resolve_label(next_when);
+    }
+
+    // ELSE clause (or NULL if no ELSE).
+    if let Some(el) = else_expr {
+        emit_expr(b, el, reg);
+    } else {
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+    }
+
+    b.resolve_label(done_label);
+
+    if let Some(r_op) = r_operand {
+        b.free_temp(r_op);
+    }
+}
+
+/// Convert a SQL type name to an affinity character code.
+fn type_name_to_affinity(type_name: &fsqlite_ast::TypeName) -> u8 {
+    let name = type_name.name.to_uppercase();
+    if name.contains("INT") {
+        b'D' // INTEGER affinity
+    } else if name.contains("CHAR") || name.contains("TEXT") || name.contains("CLOB") {
+        b'C' // TEXT affinity
+    } else if name.contains("BLOB") || name.is_empty() {
+        b'A' // BLOB affinity
+    } else if name.contains("REAL") || name.contains("FLOA") || name.contains("DOUB") {
+        b'E' // REAL affinity
+    } else {
+        b'B' // NUMERIC affinity
     }
 }
 
