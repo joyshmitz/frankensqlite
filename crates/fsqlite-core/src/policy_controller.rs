@@ -6,6 +6,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
+use super::{
+    DEFAULT_OVERHEAD_PERCENT, INITIAL_REPAIR_POLICY_EPOCH, MAX_OVERHEAD_PERCENT,
+    MIN_OVERHEAD_PERCENT, RepairBudget, RepairObjectClass, compute_repair_budget_for_object,
+};
+
 /// Runtime profile exposed through `PRAGMA fsqlite.profile`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AutoTuneProfile {
@@ -149,6 +154,251 @@ impl Default for AutoTunePragmaConfig {
             remote_max_in_flight: 0,
             commit_encode_max: 0,
         }
+    }
+}
+
+/// Version tag for persisted `PRAGMA raptorq_overhead` metadata.
+pub const RAPTORQ_OVERHEAD_METADATA_VERSION: u16 = 1;
+
+#[must_use]
+fn clamp_overhead_percent(raw_percent: i64) -> u32 {
+    let clamped = raw_percent.clamp(
+        i64::from(MIN_OVERHEAD_PERCENT),
+        i64::from(MAX_OVERHEAD_PERCENT),
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        clamped as u32
+    }
+}
+
+#[must_use]
+fn round_basis_points_to_percent(raw_basis_points: i64) -> i64 {
+    // Deterministic rounding to nearest percent, ties away from zero.
+    if raw_basis_points >= 0 {
+        (raw_basis_points + 50).div_euclid(100)
+    } else {
+        (raw_basis_points - 50).div_euclid(100)
+    }
+}
+
+/// Stable key used to persist per-object policy rows in deterministic order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ObjectClassKey {
+    CommitMarker,
+    CommitProof,
+    PageHistory,
+    SnapshotBlock,
+    WalFecGroup,
+    GenericEcs,
+}
+
+impl From<RepairObjectClass> for ObjectClassKey {
+    fn from(value: RepairObjectClass) -> Self {
+        match value {
+            RepairObjectClass::CommitMarker => Self::CommitMarker,
+            RepairObjectClass::CommitProof => Self::CommitProof,
+            RepairObjectClass::PageHistory => Self::PageHistory,
+            RepairObjectClass::SnapshotBlock => Self::SnapshotBlock,
+            RepairObjectClass::WalFecGroup => Self::WalFecGroup,
+            RepairObjectClass::GenericEcs => Self::GenericEcs,
+        }
+    }
+}
+
+/// Source of truth used for effective overhead policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverheadPolicyScope {
+    /// SQLite-style connection-local setting (default).
+    ConnectionLocal,
+    /// Versioned metadata persisted with the database for replay determinism.
+    PersistedMetadata,
+}
+
+/// Effective overhead policy for one object class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveOverheadPolicy {
+    pub object_class: RepairObjectClass,
+    pub overhead_percent: u32,
+    pub policy_epoch: u64,
+    pub metadata_version: u16,
+    pub scope: OverheadPolicyScope,
+}
+
+/// Persisted metadata representation for `PRAGMA raptorq_overhead`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedOverheadPolicy {
+    pub metadata_version: u16,
+    pub policy_epoch: u64,
+    pub default_overhead_percent: u32,
+    pub object_overrides: BTreeMap<ObjectClassKey, u32>,
+}
+
+impl PersistedOverheadPolicy {
+    #[must_use]
+    pub fn new(policy_epoch: u64, default_overhead_percent: u32) -> Self {
+        Self {
+            metadata_version: RAPTORQ_OVERHEAD_METADATA_VERSION,
+            policy_epoch,
+            default_overhead_percent: clamp_overhead_percent(i64::from(default_overhead_percent)),
+            object_overrides: BTreeMap::new(),
+        }
+    }
+
+    pub fn set_override_percent(
+        &mut self,
+        object_class: RepairObjectClass,
+        raw_percent: i64,
+    ) -> u32 {
+        let clamped = clamp_overhead_percent(raw_percent);
+        self.object_overrides
+            .insert(ObjectClassKey::from(object_class), clamped);
+        clamped
+    }
+
+    #[must_use]
+    pub fn effective_percent_for_object(&self, object_class: RepairObjectClass) -> u32 {
+        self.object_overrides
+            .get(&ObjectClassKey::from(object_class))
+            .copied()
+            .unwrap_or(self.default_overhead_percent)
+    }
+
+    #[must_use]
+    pub fn override_percent_for_object(&self, object_class: RepairObjectClass) -> Option<u32> {
+        self.object_overrides
+            .get(&ObjectClassKey::from(object_class))
+            .copied()
+    }
+}
+
+/// Deterministic state for `PRAGMA raptorq_overhead`.
+///
+/// Behavior:
+/// - default scope is SQLite-style connection-local policy,
+/// - callers may persist a versioned snapshot into metadata for replay-stable
+///   replication/proof behavior,
+/// - per-object overrides are supported even when only a global PRAGMA is
+///   exposed publicly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaptorQOverheadPragmaState {
+    default_overhead_percent: u32,
+    object_overrides: BTreeMap<ObjectClassKey, u32>,
+    persisted_policy: Option<PersistedOverheadPolicy>,
+}
+
+impl Default for RaptorQOverheadPragmaState {
+    fn default() -> Self {
+        Self {
+            default_overhead_percent: DEFAULT_OVERHEAD_PERCENT,
+            object_overrides: BTreeMap::new(),
+            persisted_policy: None,
+        }
+    }
+}
+
+impl RaptorQOverheadPragmaState {
+    #[must_use]
+    pub fn default_overhead_percent(&self) -> u32 {
+        self.default_overhead_percent
+    }
+
+    pub fn set_default_percent_from_pragma(&mut self, raw_percent: i64) -> u32 {
+        let clamped = clamp_overhead_percent(raw_percent);
+        self.default_overhead_percent = clamped;
+        clamped
+    }
+
+    /// Parse percent in basis points and store rounded+clamped value.
+    ///
+    /// Example: `2_549 bps` => `25 %`.
+    pub fn set_default_percent_from_basis_points(&mut self, raw_basis_points: i64) -> u32 {
+        let rounded = round_basis_points_to_percent(raw_basis_points);
+        self.set_default_percent_from_pragma(rounded)
+    }
+
+    pub fn set_object_override_from_pragma(
+        &mut self,
+        object_class: RepairObjectClass,
+        raw_percent: i64,
+    ) -> u32 {
+        let clamped = clamp_overhead_percent(raw_percent);
+        self.object_overrides
+            .insert(ObjectClassKey::from(object_class), clamped);
+        clamped
+    }
+
+    pub fn clear_object_override(&mut self, object_class: RepairObjectClass) -> Option<u32> {
+        self.object_overrides
+            .remove(&ObjectClassKey::from(object_class))
+    }
+
+    #[must_use]
+    pub fn persisted_policy(&self) -> Option<&PersistedOverheadPolicy> {
+        self.persisted_policy.as_ref()
+    }
+
+    pub fn apply_persisted_policy(&mut self, policy: PersistedOverheadPolicy) {
+        self.persisted_policy = Some(policy);
+    }
+
+    pub fn clear_persisted_policy(&mut self) {
+        self.persisted_policy = None;
+    }
+
+    /// Snapshot connection-local state into versioned persisted metadata.
+    pub fn persist_connection_policy(&mut self, policy_epoch: u64) -> PersistedOverheadPolicy {
+        let persisted_epoch = policy_epoch.max(INITIAL_REPAIR_POLICY_EPOCH.saturating_add(1));
+        let mut persisted =
+            PersistedOverheadPolicy::new(persisted_epoch, self.default_overhead_percent);
+        persisted.object_overrides = self.object_overrides.clone();
+        self.persisted_policy = Some(persisted.clone());
+        persisted
+    }
+
+    #[must_use]
+    pub fn effective_policy_for_object(
+        &self,
+        object_class: RepairObjectClass,
+    ) -> EffectiveOverheadPolicy {
+        if let Some(persisted) = &self.persisted_policy {
+            return EffectiveOverheadPolicy {
+                object_class,
+                overhead_percent: persisted.effective_percent_for_object(object_class),
+                policy_epoch: persisted.policy_epoch,
+                metadata_version: persisted.metadata_version,
+                scope: OverheadPolicyScope::PersistedMetadata,
+            };
+        }
+
+        let overhead_percent = self
+            .object_overrides
+            .get(&ObjectClassKey::from(object_class))
+            .copied()
+            .unwrap_or(self.default_overhead_percent);
+        EffectiveOverheadPolicy {
+            object_class,
+            overhead_percent,
+            policy_epoch: INITIAL_REPAIR_POLICY_EPOCH,
+            metadata_version: RAPTORQ_OVERHEAD_METADATA_VERSION,
+            scope: OverheadPolicyScope::ConnectionLocal,
+        }
+    }
+
+    /// Compute deterministic repair budget and expose effective overhead used.
+    #[must_use]
+    pub fn compute_budget_for_object(
+        &self,
+        k_source: u32,
+        object_class: RepairObjectClass,
+    ) -> RepairBudget {
+        let effective = self.effective_policy_for_object(object_class);
+        compute_repair_budget_for_object(
+            k_source,
+            object_class,
+            Some(effective.overhead_percent),
+            effective.policy_epoch,
+        )
     }
 }
 
@@ -1080,5 +1330,82 @@ mod tests {
         );
         assert_eq!(out.reason, DecisionReason::FallbackTelemetryUnavailable);
         assert_eq!(controller.effective_limits(), baseline);
+    }
+
+    #[test]
+    fn test_pragma_raptorq_overhead_bounds_clamped() {
+        let mut state = RaptorQOverheadPragmaState::default();
+        let low = state.set_default_percent_from_pragma(-100);
+        let high = state.set_default_percent_from_pragma(9999);
+        assert_eq!(low, MIN_OVERHEAD_PERCENT);
+        assert_eq!(high, MAX_OVERHEAD_PERCENT);
+    }
+
+    #[test]
+    fn test_pragma_raptorq_overhead_rounding_behavior() {
+        let mut state = RaptorQOverheadPragmaState::default();
+        let rounded = state.set_default_percent_from_basis_points(2_549);
+        assert_eq!(rounded, 25);
+
+        let budget = state.compute_budget_for_object(9, RepairObjectClass::PageHistory);
+        // ceil(9 * 25 / 100) = ceil(2.25) = 3 (no small-K clamp at K=9).
+        assert_eq!(budget.repair_count, 3);
+        assert_eq!(budget.overhead_percent_applied, 25);
+    }
+
+    #[test]
+    fn test_pragma_raptorq_overhead_small_k_no_underprovision() {
+        let mut state = RaptorQOverheadPragmaState::default();
+        state.set_default_percent_from_pragma(1);
+
+        let budget = state.compute_budget_for_object(1, RepairObjectClass::PageHistory);
+        assert!(budget.repair_count >= 3);
+        assert!(!budget.underprovisioned);
+        assert!(budget.small_k_clamped);
+    }
+
+    #[test]
+    fn test_pragma_raptorq_overhead_per_object_override_and_exposure() {
+        let mut state = RaptorQOverheadPragmaState::default();
+        state.set_default_percent_from_pragma(20);
+        state.set_object_override_from_pragma(RepairObjectClass::CommitMarker, 60);
+
+        let marker_effective = state.effective_policy_for_object(RepairObjectClass::CommitMarker);
+        let history_effective = state.effective_policy_for_object(RepairObjectClass::PageHistory);
+        assert_eq!(marker_effective.overhead_percent, 60);
+        assert_eq!(history_effective.overhead_percent, 20);
+
+        let marker_budget = state.compute_budget_for_object(10, RepairObjectClass::CommitMarker);
+        let history_budget = state.compute_budget_for_object(10, RepairObjectClass::PageHistory);
+        assert_eq!(marker_budget.overhead_percent_applied, 60);
+        assert_eq!(history_budget.overhead_percent_applied, 20);
+        assert!(marker_budget.repair_count > history_budget.repair_count);
+    }
+
+    #[test]
+    fn test_pragma_raptorq_overhead_persisted_metadata_is_versioned_and_deterministic() {
+        let mut state = RaptorQOverheadPragmaState::default();
+        state.set_default_percent_from_pragma(33);
+        state.set_object_override_from_pragma(RepairObjectClass::SnapshotBlock, 41);
+        let persisted = state.persist_connection_policy(9);
+
+        assert_eq!(
+            persisted.metadata_version,
+            RAPTORQ_OVERHEAD_METADATA_VERSION
+        );
+        assert_eq!(persisted.policy_epoch, 9);
+        assert_eq!(persisted.default_overhead_percent, 33);
+        assert_eq!(
+            persisted.override_percent_for_object(RepairObjectClass::SnapshotBlock),
+            Some(41)
+        );
+
+        let effective = state.effective_policy_for_object(RepairObjectClass::SnapshotBlock);
+        assert_eq!(effective.scope, OverheadPolicyScope::PersistedMetadata);
+        assert_eq!(effective.policy_epoch, 9);
+        assert_eq!(
+            effective.metadata_version,
+            RAPTORQ_OVERHEAD_METADATA_VERSION
+        );
     }
 }
