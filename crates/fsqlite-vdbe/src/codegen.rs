@@ -2847,4 +2847,391 @@ mod tests {
             "SorterNext should jump back to SorterData"
         );
     }
+
+    // ── Aggregate test helpers ──
+
+    /// Build `SELECT count(*) FROM table`.
+    fn agg_count_star(table: &str) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    /// Build `SELECT func(col) FROM table`.
+    fn agg_func_col(func: &str, col: &str, table: &str) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: func.to_owned(),
+                            args: FunctionArgs::List(vec![Expr::Column(
+                                ColumnRef::bare(col),
+                                Span::ZERO,
+                            )]),
+                            distinct: false,
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    /// Build `SELECT count(*), sum(col) FROM table`.
+    fn agg_count_star_and_sum(col: &str, table: &str) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "count".to_owned(),
+                                args: FunctionArgs::Star,
+                                distinct: false,
+                                filter: None,
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "sum".to_owned(),
+                                args: FunctionArgs::List(vec![Expr::Column(
+                                    ColumnRef::bare(col),
+                                    Span::ZERO,
+                                )]),
+                                distinct: false,
+                                filter: None,
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    // === Test 20: SELECT count(*) ===
+    #[test]
+    fn test_codegen_select_count_star() {
+        let stmt = agg_count_star("t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should have: Init, Transaction, Null (accum init), OpenRead,
+        // Rewind, AggStep, Next, AggFinal, ResultRow, Close, Halt.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::Null,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::AggStep,
+                Opcode::Next,
+                Opcode::AggFinal,
+                Opcode::ResultRow,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+
+        // ResultRow should cover 1 column.
+        let rr = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::ResultRow)
+            .unwrap();
+        assert_eq!(rr.p2, 1, "count(*) produces 1 result column");
+
+        // AggStep should have P4 = FuncName("count").
+        let step = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::AggStep)
+            .unwrap();
+        assert!(
+            matches!(&step.p4, P4::FuncName(f) if f == "count"),
+            "AggStep P4 should be FuncName(count), got {:?}",
+            step.p4
+        );
+    }
+
+    // === Test 21: SELECT sum(col) ===
+    #[test]
+    fn test_codegen_select_sum_col() {
+        let stmt = agg_func_col("sum", "a", "t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should have Column (read arg) + AggStep in the loop.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::AggStep,
+                Opcode::Next,
+                Opcode::AggFinal,
+                Opcode::ResultRow,
+            ]
+        ));
+
+        // AggStep p5 = 1 (one argument).
+        let step = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::AggStep)
+            .unwrap();
+        assert_eq!(step.p5, 1, "sum(col) should have p5=1 (one arg)");
+
+        // AggFinal P4 should be FuncName("sum").
+        let fin = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::AggFinal)
+            .unwrap();
+        assert!(
+            matches!(&fin.p4, P4::FuncName(f) if f == "sum"),
+            "AggFinal P4 should be FuncName(sum), got {:?}",
+            fin.p4
+        );
+    }
+
+    // === Test 22: SELECT count(*), sum(a) ===
+    #[test]
+    fn test_codegen_select_multiple_aggregates() {
+        let stmt = agg_count_star_and_sum("a", "t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should have two AggStep and two AggFinal.
+        let step_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggStep)
+            .count();
+        assert_eq!(step_count, 2, "two aggregates = two AggStep");
+
+        let final_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggFinal)
+            .count();
+        assert_eq!(final_count, 2, "two aggregates = two AggFinal");
+
+        // ResultRow should cover 2 columns.
+        let rr = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::ResultRow)
+            .unwrap();
+        assert_eq!(rr.p2, 2, "two aggregate columns");
+
+        // Verify function names in order: count then sum.
+        let steps: Vec<_> = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggStep)
+            .collect();
+        assert!(matches!(&steps[0].p4, P4::FuncName(f) if f == "count"));
+        assert!(matches!(&steps[1].p4, P4::FuncName(f) if f == "sum"));
+    }
+
+    // === Test 23: Non-aggregate SELECT does not emit AggStep ===
+    #[test]
+    fn test_codegen_select_no_agg_no_aggstep() {
+        let stmt = star_select("t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let agg_count = prog
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::AggStep | Opcode::AggFinal | Opcode::AggValue
+                )
+            })
+            .count();
+        assert_eq!(agg_count, 0, "no aggregate opcodes in non-aggregate SELECT");
+    }
+
+    // === Test 24: Aggregate labels properly resolved ===
+    #[test]
+    fn test_codegen_select_aggregate_labels_resolved() {
+        let stmt = agg_count_star("t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        for op in prog.ops() {
+            if op.opcode.is_jump() {
+                assert!(
+                    op.p2 >= 0,
+                    "unresolved jump at {:?}: p2 = {}",
+                    op.opcode,
+                    op.p2
+                );
+                assert!(
+                    usize::try_from(op.p2).unwrap() <= prog.len(),
+                    "jump target out of range at {:?}: p2 = {} (prog len = {})",
+                    op.opcode,
+                    op.p2,
+                    prog.len()
+                );
+            }
+        }
+    }
+
+    // === Test 25: Mixed aggregate + non-aggregate rejected ===
+    #[test]
+    fn test_codegen_select_mixed_agg_rejected() {
+        // SELECT count(*), a FROM t — should be rejected (no GROUP BY).
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "count".to_owned(),
+                                args: FunctionArgs::Star,
+                                distinct: false,
+                                filter: None,
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("mixed aggregate/non-aggregate should fail");
+        assert!(
+            matches!(&err, CodegenError::Unsupported(msg) if msg.contains("mixed")),
+            "error should mention mixed columns, got: {err}"
+        );
+    }
+
+    // === Test 26: AVG aggregate ===
+    #[test]
+    fn test_codegen_select_avg() {
+        let stmt = agg_func_col("avg", "a", "t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // AggStep P4 should be "avg".
+        let step = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::AggStep)
+            .unwrap();
+        assert!(
+            matches!(&step.p4, P4::FuncName(f) if f == "avg"),
+            "AggStep P4 should be FuncName(avg), got {:?}",
+            step.p4
+        );
+
+        // AggFinal should also be "avg".
+        let fin = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::AggFinal)
+            .unwrap();
+        assert!(
+            matches!(&fin.p4, P4::FuncName(f) if f == "avg"),
+            "AggFinal P4 should be FuncName(avg), got {:?}",
+            fin.p4
+        );
+    }
 }
