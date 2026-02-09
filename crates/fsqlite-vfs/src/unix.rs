@@ -1792,11 +1792,11 @@ mod tests {
     use std::process::{Command, Output};
 
     fn debug_dump_sqlite_wal_files(coordinator: &mut UnixFile) {
+        use std::fmt::Write as _;
+
         if std::env::var_os("FSQLITE_DEBUG_SQLITE_WAL_INTEROP").is_none() {
             return;
         }
-
-        use std::fmt::Write as _;
 
         let db_path = &coordinator.path;
         let shm_path = &coordinator.shm_path;

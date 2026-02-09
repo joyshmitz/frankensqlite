@@ -15,6 +15,7 @@ use std::fmt;
 /// `L_miss` = cost of letting an anomaly through (data corruption risk).
 /// `L_fp`   = cost of a false-positive abort (wasted work, retry).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)] // f64 does not impl Eq
 pub struct LossMatrix {
     /// Cost of a missed anomaly (default: 1000).
     pub l_miss: f64,
@@ -64,7 +65,7 @@ impl LossMatrix {
 // ---------------------------------------------------------------------------
 
 /// Approximation of `L(T)` = cost of aborting a transaction.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxnCost {
     /// Number of pages in the write set.
     pub write_set_size: u32,
