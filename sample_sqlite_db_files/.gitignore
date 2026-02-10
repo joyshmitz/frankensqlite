@@ -1,0 +1,15 @@
+# Ignore all database binary files — only manifests and metadata are tracked.
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Working copies are ephemeral — never commit them.
+work/
+
+# Allow manifest JSON and README to be tracked.
+!manifests/**/*.json
+!README.md
+!.gitignore
