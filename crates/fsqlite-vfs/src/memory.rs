@@ -826,7 +826,8 @@ mod tests {
         let cx = Cx::new();
         let vfs = make_vfs();
         let result = vfs.full_pathname(&cx, Path::new("foo/bar.db")).unwrap();
-        assert_eq!(result, Path::new("/foo/bar.db"));
+        let expected = std::env::current_dir().unwrap().join("foo/bar.db");
+        assert_eq!(result, expected);
     }
 
     #[test]
