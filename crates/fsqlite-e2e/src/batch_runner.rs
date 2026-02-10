@@ -143,6 +143,12 @@ impl BatchResult {
     }
 }
 
+/// Convert elapsed duration to milliseconds as u64 (saturating).
+fn elapsed_ms(start: Instant) -> u64 {
+    let ms = start.elapsed().as_millis();
+    u64::try_from(ms).unwrap_or(u64::MAX)
+}
+
 // ── Preset dispatch ────────────────────────────────────────────────────
 
 /// Default scale values per preset.  Each returns a reasonable small-test
@@ -223,7 +229,7 @@ fn run_cell(
             preset_name: preset.name.clone(),
             concurrency,
             seed,
-            wall_time_ms: cell_start.elapsed().as_millis() as u64,
+            wall_time_ms: elapsed_ms(cell_start),
             sqlite_report: None,
             fsqlite_report: None,
             tiered_comparison: None,
@@ -232,46 +238,34 @@ fn run_cell(
     };
 
     // 2. Create isolated workspace with two DB copies.
-    let workspace = match run_workspace::create_workspace_with_label(
+    let Ok(workspace) = run_workspace::create_workspace_with_label(
         workspace_config,
         &[fixture_id],
         &format!(
             "batch_{}_{}_c{}_s{}",
             preset.name, fixture_id, concurrency, seed
         ),
-    ) {
-        Ok(ws) => ws,
-        Err(e) => {
-            return CellResult {
-                fixture_id: fixture_id.to_owned(),
-                preset_name: preset.name.clone(),
-                concurrency,
-                seed,
-                wall_time_ms: cell_start.elapsed().as_millis() as u64,
-                sqlite_report: None,
-                fsqlite_report: None,
-                tiered_comparison: None,
-                verdict: CellVerdict::Error(format!("workspace creation failed: {e}")),
-            };
-        }
+    ) else {
+        return make_error_cell(
+            fixture_id,
+            &preset.name,
+            concurrency,
+            seed,
+            cell_start,
+            "workspace creation failed".to_owned(),
+        );
     };
 
     // Find the DB path in the workspace.
-    let db_entry = match workspace.databases.iter().find(|d| d.db_id == fixture_id) {
-        Some(entry) => entry,
-        None => {
-            return CellResult {
-                fixture_id: fixture_id.to_owned(),
-                preset_name: preset.name.clone(),
-                concurrency,
-                seed,
-                wall_time_ms: cell_start.elapsed().as_millis() as u64,
-                sqlite_report: None,
-                fsqlite_report: None,
-                tiered_comparison: None,
-                verdict: CellVerdict::Error(format!("fixture {fixture_id} not found in workspace")),
-            };
-        }
+    let Some(db_entry) = workspace.databases.iter().find(|d| d.db_id == fixture_id) else {
+        return make_error_cell(
+            fixture_id,
+            &preset.name,
+            concurrency,
+            seed,
+            cell_start,
+            format!("fixture {fixture_id} not found in workspace"),
+        );
     };
 
     // Create two separate copies: one for each engine.
@@ -325,7 +319,7 @@ fn run_cell(
                 preset_name: preset.name.clone(),
                 concurrency,
                 seed,
-                wall_time_ms: cell_start.elapsed().as_millis() as u64,
+                wall_time_ms: elapsed_ms(cell_start),
                 sqlite_report: Some(sqlite_report),
                 fsqlite_report: None,
                 tiered_comparison: None,
@@ -343,7 +337,7 @@ fn run_cell(
                 preset_name: preset.name.clone(),
                 concurrency,
                 seed,
-                wall_time_ms: cell_start.elapsed().as_millis() as u64,
+                wall_time_ms: elapsed_ms(cell_start),
                 sqlite_report: Some(sqlite_report),
                 fsqlite_report: Some(fsqlite_report),
                 tiered_comparison: None,
@@ -370,7 +364,7 @@ fn run_cell(
         preset_name: preset.name.clone(),
         concurrency,
         seed,
-        wall_time_ms: cell_start.elapsed().as_millis() as u64,
+        wall_time_ms: elapsed_ms(cell_start),
         sqlite_report: Some(sqlite_report),
         fsqlite_report: Some(fsqlite_report),
         tiered_comparison: Some(comparison),
@@ -391,7 +385,7 @@ fn make_error_cell(
         preset_name: preset_name.to_owned(),
         concurrency,
         seed,
-        wall_time_ms: start.elapsed().as_millis() as u64,
+        wall_time_ms: elapsed_ms(start),
         sqlite_report: None,
         fsqlite_report: None,
         tiered_comparison: None,
