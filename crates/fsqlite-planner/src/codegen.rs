@@ -712,8 +712,9 @@ fn emit_column_reads(
                     })?;
                     b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
                 } else {
-                    // For non-column expressions, emit the column at position 0 as fallback.
-                    b.emit_op(Opcode::Column, cursor, 0, reg, P4::None, 0);
+                    // For non-column expressions (literals, placeholders, etc.),
+                    // evaluate the expression directly rather than reading a column.
+                    emit_expr(b, expr, reg);
                 }
                 reg += 1;
             }

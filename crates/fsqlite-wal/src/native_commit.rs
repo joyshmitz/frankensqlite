@@ -748,7 +748,7 @@ mod tests {
                 CommitResult::Committed { commit_seq, .. } => {
                     assert_eq!(commit_seq.get(), (i as u64) + 1);
                 }
-                other => panic!("expected Committed, got {other:?}"),
+                other => unreachable!("expected Committed, got {other:?}"),
             }
         }
 

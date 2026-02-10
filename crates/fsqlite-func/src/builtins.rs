@@ -1060,7 +1060,7 @@ pub struct SoundexFunc;
 impl ScalarFunction for SoundexFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args[0].is_null() {
-            return Ok(SqliteValue::Text("?000".to_owned()));
+            return Ok(SqliteValue::Null);
         }
         let s = args[0].to_text();
         Ok(SqliteValue::Text(soundex(&s)))
