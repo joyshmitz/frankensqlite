@@ -992,6 +992,16 @@ impl Connection {
         if !path.exists() {
             return Ok(());
         }
+
+        // Detect file format: real SQLite binary vs legacy SQL text dump.
+        if crate::compat_persist::is_sqlite_format(path) {
+            let loaded = crate::compat_persist::load_from_sqlite(path)?;
+            *self.schema.borrow_mut() = loaded.schema;
+            *self.db.borrow_mut() = loaded.db;
+            return Ok(());
+        }
+
+        // Legacy SQL text dump fallback.
         let sql_dump = fsqlite_vfs::host_fs::read_to_string(path)?;
         if sql_dump.trim().is_empty() {
             return Ok(());
@@ -1019,28 +1029,9 @@ impl Connection {
         if *self.persist_suspended.borrow() {
             return Ok(());
         }
-        let dump = self.build_persistence_dump()?;
-        fsqlite_vfs::host_fs::write(Path::new(path), dump.as_bytes())?;
-        Ok(())
-    }
-
-    fn build_persistence_dump(&self) -> Result<String> {
-        let schema = self.schema.borrow().clone();
-        let mut statements = Vec::new();
-        for table in &schema {
-            statements.push(build_create_table_sql(table));
-
-            let select_sql = build_dump_select_sql(table);
-            let rows = self.query(&select_sql)?;
-            for row in rows {
-                statements.push(build_insert_row_sql(table, row.values()));
-            }
-        }
-        if statements.is_empty() {
-            Ok(String::new())
-        } else {
-            Ok(format!("{}\n", statements.join("\n")))
-        }
+        let schema = self.schema.borrow();
+        let db = self.db.borrow();
+        crate::compat_persist::persist_to_sqlite(Path::new(path), &schema, &db)
     }
 }
 
@@ -2555,81 +2546,6 @@ fn emit_like_expr(
     }
 
     Ok(())
-}
-
-/// Reconstruct a `CREATE TABLE` statement from a [`TableSchema`].
-///
-/// Since only the affinity character is stored (not the original SQL type
-/// name), we map each affinity back to a canonical type keyword.
-fn build_create_table_sql(table: &TableSchema) -> String {
-    use std::fmt::Write as _;
-    let mut sql = format!("CREATE TABLE \"{}\" (", table.name);
-    for (i, col) in table.columns.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        let type_kw = affinity_char_to_type(col.affinity);
-        let _ = write!(sql, "\"{}\" {type_kw}", col.name);
-    }
-    sql.push_str(");");
-    sql
-}
-
-/// Build a `SELECT *` query for dumping all rows from a table.
-fn build_dump_select_sql(table: &TableSchema) -> String {
-    format!("SELECT * FROM \"{}\";", table.name)
-}
-
-/// Build an `INSERT INTO` statement that reproduces a single row.
-fn build_insert_row_sql(table: &TableSchema, values: &[SqliteValue]) -> String {
-    use std::fmt::Write as _;
-    let mut sql = format!("INSERT INTO \"{}\" VALUES (", table.name);
-    for (i, val) in values.iter().enumerate() {
-        if i > 0 {
-            sql.push_str(", ");
-        }
-        match val {
-            SqliteValue::Null => sql.push_str("NULL"),
-            SqliteValue::Integer(n) => {
-                let _ = write!(sql, "{n}");
-            }
-            SqliteValue::Float(f) => {
-                let _ = write!(sql, "{f:?}");
-            }
-            SqliteValue::Text(s) => {
-                sql.push('\'');
-                for ch in s.chars() {
-                    if ch == '\'' {
-                        sql.push_str("''");
-                    } else {
-                        sql.push(ch);
-                    }
-                }
-                sql.push('\'');
-            }
-            SqliteValue::Blob(b) => {
-                sql.push_str("X'");
-                for byte in b {
-                    let _ = write!(sql, "{byte:02X}");
-                }
-                sql.push('\'');
-            }
-        }
-    }
-    sql.push_str(");");
-    sql
-}
-
-/// Map an affinity character back to a canonical SQL type keyword.
-fn affinity_char_to_type(affinity: char) -> &'static str {
-    match affinity {
-        'd' => "INTEGER",
-        'C' => "TEXT",
-        'E' => "REAL",
-        'A' => "NUMERIC",
-        // 'B' (blob) and any unknown affinity default to BLOB.
-        _ => "BLOB",
-    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 pub mod attach;
 pub mod commit_marker;
 pub mod commit_repair;
+pub mod compat_persist;
 pub mod connection;
 pub mod db_fec;
 pub mod decode_proofs;

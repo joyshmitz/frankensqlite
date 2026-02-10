@@ -566,6 +566,7 @@ dependencies = [
  "fsqlite-vfs",
  "fsqlite-wal",
  "proptest",
+ "rusqlite",
  "serde",
  "tempfile",
  "tracing",
