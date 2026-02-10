@@ -48,6 +48,8 @@ Runs all six Criterion benchmark harnesses (`e2e_bench`,
 | `realdb-e2e` | Single-engine workload runner + corpus management |
 | `profile-db` | Extract JSON metadata from golden database files |
 | `e2e-dashboard` | TUI dashboard for interactive result viewing |
+| `e2e-viewer` | TUI viewer for JSONL run records and benchmark summaries |
+| `corruption-demo` | Guided corruption + recovery walkthrough demo (narrative or JSON) |
 
 ---
 

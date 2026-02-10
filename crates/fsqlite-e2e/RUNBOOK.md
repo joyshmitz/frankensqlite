@@ -103,6 +103,12 @@ cargo run -p fsqlite-e2e --bin realdb-e2e -- run \
   --concurrency 1 --repeat 5 --output-jsonl /tmp/perf.jsonl
 ```
 
+Optional: browse the JSONL output in a TUI viewer:
+
+```bash
+cargo run -p fsqlite-e2e --bin e2e-viewer -- /tmp/perf.jsonl
+```
+
 ### Step 2 — Scaling Sweep
 
 ```bash
@@ -151,7 +157,17 @@ cargo run -p fsqlite-e2e --bin e2e-runner -- run-recovery
 Runs three corruption scenarios: bitflip, page-zero, and header-zero.
 Each verifies that corruption is detected (hash changes after injection).
 
-### Step 2 — Detailed Corruption Demo
+### Step 2 — One-Command Walkthrough (Demo-Friendly)
+
+```bash
+cargo run -p fsqlite-e2e --bin corruption-demo
+cargo run -p fsqlite-e2e --bin corruption-demo -- --json
+```
+
+This runs a guided corruption + recovery narrative across 4 representative
+scenarios and exits non-zero on any mismatch.
+
+### Step 3 — Detailed Corruption Demo
 
 See [CORRUPTION_DEMO_RUNBOOK.md](CORRUPTION_DEMO_RUNBOOK.md) for the full
 walkthrough covering:
@@ -161,7 +177,7 @@ walkthrough covering:
 - FrankenSQLite recovery mode (RaptorQ repair from sidecar)
 - Verification of repair success
 
-### Step 3 — Manual Corruption Injection (CLI)
+### Step 4 — Manual Corruption Injection (CLI)
 
 ```bash
 cargo run -p fsqlite-e2e --bin realdb-e2e -- corrupt \
@@ -171,7 +187,8 @@ cargo run -p fsqlite-e2e --bin realdb-e2e -- corrupt \
   --db chinook --strategy page --page 1 --seed 42
 ```
 
-(Note: CLI corruption subcommand not yet fully implemented; see bd-1w6k.7.2.)
+The `corrupt` subcommand is copy-only: it refuses to modify anything under
+`sample_sqlite_db_files/golden/`.
 
 ---
 
