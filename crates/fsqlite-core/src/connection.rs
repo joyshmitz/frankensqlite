@@ -300,16 +300,13 @@ impl Connection {
                 let distinct = is_distinct_select(select);
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
-                    let mut rows = execute_program_with_postprocess(
+                    execute_program_with_postprocess(
                         &compile_expression_select(select)?,
                         params,
                         Some(&self.func_registry),
                         Some(&build_expression_postprocess(select)),
-                    )?;
-                    if distinct {
-                        dedup_rows(&mut rows);
-                    }
-                    Ok(rows)
+                        distinct,
+                    )
                 } else if has_group_by(select) {
                     let mut rows = self.execute_group_by_select(select, params)?;
                     if distinct {
@@ -317,10 +314,21 @@ impl Connection {
                     }
                     Ok(rows)
                 } else {
-                    let program = self.compile_table_select(select)?;
+                    let limit_clause = select.limit.clone();
+                    let program = if distinct && limit_clause.is_some() {
+                        let mut unbounded = select.clone();
+                        unbounded.limit = None;
+                        self.compile_table_select(&unbounded)?
+                    } else {
+                        self.compile_table_select(select)?
+                    };
+
                     let mut rows = self.execute_table_program(&program, params)?;
                     if distinct {
                         dedup_rows(&mut rows);
+                        if let Some(limit_clause) = limit_clause.as_ref() {
+                            apply_limit_clause(&mut rows, limit_clause)?;
+                        }
                     }
                     Ok(rows)
                 }
@@ -597,8 +605,7 @@ impl Connection {
         }
         if !select.body.compounds.is_empty() {
             return Err(FrankenError::NotImplemented(
-                "compound SELECT is not supported with GROUP BY in this connection path"
-                    .to_owned(),
+                "compound SELECT is not supported with GROUP BY in this connection path".to_owned(),
             ));
         }
 

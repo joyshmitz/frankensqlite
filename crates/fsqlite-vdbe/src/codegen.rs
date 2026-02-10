@@ -947,6 +947,7 @@ enum GroupByOutputCol {
 /// a list of group-key table-column indices, and a list of aggregate metadata.
 ///
 /// Returns `(output_cols, group_key_table_cols, agg_columns)`.
+#[allow(clippy::type_complexity)]
 fn parse_group_by_output(
     columns: &[ResultColumn],
     table: &TableSchema,
@@ -995,10 +996,7 @@ fn parse_group_by_output(
                                         "non-column argument in aggregate function".to_owned(),
                                     )
                                 })?;
-                            #[allow(
-                                clippy::cast_possible_truncation,
-                                clippy::cast_possible_wrap
-                            )]
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             agg_columns.push(AggColumn {
                                 name: lower_name,
                                 num_args: exprs.len() as i32,
@@ -1020,9 +1018,7 @@ fn parse_group_by_output(
                     .iter()
                     .position(|&k| k == col_idx)
                     .ok_or_else(|| {
-                        CodegenError::Unsupported(
-                            "result column not in GROUP BY clause".to_owned(),
-                        )
+                        CodegenError::Unsupported("result column not in GROUP BY clause".to_owned())
                     })?;
                 output_cols.push(GroupByOutputCol::GroupKey {
                     key_index,
@@ -1342,14 +1338,14 @@ fn codegen_select_group_by_aggregate(
                 P4::None,
                 0,
             );
-            let num_args = u16::try_from(agg.num_args).unwrap_or_default();
+            let step_p5 = u16::try_from(agg.num_args).unwrap_or_default();
             b.emit_op(
                 Opcode::AggStep,
                 0,
                 arg_reg,
                 accum_reg,
                 P4::FuncName(agg.name.clone()),
-                num_args,
+                step_p5,
             );
             b.free_temp(arg_reg);
         }
