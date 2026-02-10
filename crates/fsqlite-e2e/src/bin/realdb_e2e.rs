@@ -233,10 +233,11 @@ fn cmd_corpus_scan(argv: &[String]) -> i32 {
     }
 }
 
-fn cmd_corpus_import(_argv: &[String]) -> i32 {
-    if _argv.is_empty() || _argv.iter().any(|a| a == "-h" || a == "--help") {
+#[allow(clippy::too_many_lines)]
+fn cmd_corpus_import(argv: &[String]) -> i32 {
+    if argv.is_empty() || argv.iter().any(|a| a == "-h" || a == "--help") {
         print_corpus_help();
-        return if _argv.is_empty() { 2 } else { 0 };
+        return if argv.is_empty() { 2 } else { 0 };
     }
 
     let mut db_arg: Option<String> = None;
@@ -251,72 +252,72 @@ fn cmd_corpus_import(_argv: &[String]) -> i32 {
     let mut write_metadata = true;
 
     let mut i = 0;
-    while i < _argv.len() {
-        match _argv[i].as_str() {
+    while i < argv.len() {
+        match argv[i].as_str() {
             "--db" => {
                 i += 1;
-                if i >= _argv.len() {
+                if i >= argv.len() {
                     eprintln!("error: --db requires a path or discovery name");
                     return 2;
                 }
-                db_arg = Some(_argv[i].clone());
+                db_arg = Some(argv[i].clone());
             }
             "--id" => {
                 i += 1;
-                if i >= _argv.len() {
+                if i >= argv.len() {
                     eprintln!("error: --id requires a fixture identifier");
                     return 2;
                 }
-                id_override = Some(_argv[i].clone());
+                id_override = Some(argv[i].clone());
             }
             "--tag" => {
                 i += 1;
-                if i >= _argv.len() {
+                if i >= argv.len() {
                     eprintln!("error: --tag requires a label");
                     return 2;
                 }
-                tag = Some(_argv[i].clone());
+                tag = Some(argv[i].clone());
             }
             "--golden-dir" => {
                 i += 1;
-                if i >= _argv.len() {
+                if i >= argv.len() {
                     eprintln!("error: --golden-dir requires a directory path");
                     return 2;
                 }
-                golden_dir = PathBuf::from(&_argv[i]);
+                golden_dir = PathBuf::from(&argv[i]);
             }
             "--metadata-dir" => {
                 i += 1;
-                if i >= _argv.len() {
+                if i >= argv.len() {
                     eprintln!("error: --metadata-dir requires a directory path");
                     return 2;
                 }
-                metadata_dir = PathBuf::from(&_argv[i]);
+                metadata_dir = PathBuf::from(&argv[i]);
             }
             "--checksums" => {
                 i += 1;
-                if i >= _argv.len() {
+                if i >= argv.len() {
                     eprintln!("error: --checksums requires a file path");
                     return 2;
                 }
-                checksums_path = PathBuf::from(&_argv[i]);
+                checksums_path = PathBuf::from(&argv[i]);
             }
             "--root" => {
                 i += 1;
-                if i >= _argv.len() {
+                if i >= argv.len() {
                     eprintln!("error: --root requires a directory path");
                     return 2;
                 }
-                root = PathBuf::from(&_argv[i]);
+                root = PathBuf::from(&argv[i]);
             }
             "--max-depth" => {
                 i += 1;
-                if i >= _argv.len() {
+                if i >= argv.len() {
                     eprintln!("error: --max-depth requires an integer");
                     return 2;
                 }
-                let Ok(n) = _argv[i].parse::<usize>() else {
-                    eprintln!("error: invalid integer for --max-depth: `{}`", _argv[i]);
+                let Ok(n) = argv[i].parse::<usize>() else {
+                    eprintln!("error: invalid integer for --max-depth: `{}`", argv[i]);
                     return 2;
                 };
                 max_depth = n;
@@ -369,7 +370,10 @@ fn cmd_corpus_import(_argv: &[String]) -> i32 {
     };
 
     if let Err(e) = fs::create_dir_all(&golden_dir) {
-        eprintln!("error: failed to create golden dir {}: {e}", golden_dir.display());
+        eprintln!(
+            "error: failed to create golden dir {}: {e}",
+            golden_dir.display()
+        );
         return 1;
     }
 
@@ -379,7 +383,10 @@ fn cmd_corpus_import(_argv: &[String]) -> i32 {
     let source_sha = match sha256_file(&source_path) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("error: cannot hash source db {}: {e}", source_path.display());
+            eprintln!(
+                "error: cannot hash source db {}: {e}",
+                source_path.display()
+            );
             return 1;
         }
     };
@@ -388,7 +395,10 @@ fn cmd_corpus_import(_argv: &[String]) -> i32 {
         let dest_sha = match sha256_file(&dest_db) {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("error: cannot hash existing golden db {}: {e}", dest_db.display());
+                eprintln!(
+                    "error: cannot hash existing golden db {}: {e}",
+                    dest_db.display()
+                );
                 return 1;
             }
         };
@@ -397,7 +407,10 @@ fn cmd_corpus_import(_argv: &[String]) -> i32 {
             eprintln!("  dest: {}", dest_db.display());
             eprintln!("  dest sha256:   {dest_sha}");
             eprintln!("  source sha256: {source_sha}");
-            eprintln!("hint: pass --id <new_id> (e.g. {fixture_id}_{}).", &source_sha[..8]);
+            eprintln!(
+                "hint: pass --id <new_id> (e.g. {fixture_id}_{}).",
+                &source_sha[..8]
+            );
             return 1;
         }
         println!("Already imported: {} (sha256 match)", dest_db.display());
@@ -421,7 +434,10 @@ fn cmd_corpus_import(_argv: &[String]) -> i32 {
 
     // Best-effort: mark golden copies read-only.
     if let Err(e) = set_read_only(&dest_db) {
-        eprintln!("warning: failed to mark read-only {}: {e}", dest_db.display());
+        eprintln!(
+            "warning: failed to mark read-only {}: {e}",
+            dest_db.display()
+        );
     }
     for s in &copied_sidecars {
         if let Err(e) = set_read_only(s) {
@@ -458,7 +474,10 @@ fn cmd_corpus_import(_argv: &[String]) -> i32 {
                 match serde_json::to_string_pretty(&profile) {
                     Ok(json) => {
                         if let Err(e) = fs::write(&out_path, json.as_bytes()) {
-                            eprintln!("error: failed to write metadata {}: {e}", out_path.display());
+                            eprintln!(
+                                "error: failed to write metadata {}: {e}",
+                                out_path.display()
+                            );
                             return 1;
                         }
                         println!("Wrote metadata: {}", out_path.display());
@@ -490,7 +509,10 @@ fn cmd_corpus_import(_argv: &[String]) -> i32 {
     }
     println!("  sidecars: {}", copied_sidecars.len());
     for s in copied_sidecars {
-        println!("    - {}", s.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+        println!(
+            "    - {}",
+            s.file_name().and_then(|n| n.to_str()).unwrap_or("")
+        );
     }
 
     0
@@ -1244,6 +1266,7 @@ OPTIONS:
 
 // ── bench ───────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn cmd_bench(argv: &[String]) -> i32 {
     if argv.iter().any(|a| a == "-h" || a == "--help") {
         print_bench_help();
@@ -1321,7 +1344,7 @@ fn cmd_bench(argv: &[String]) -> i32 {
                     eprintln!("error: --engine requires sqlite3|fsqlite|both");
                     return 2;
                 }
-                engine = argv[i].clone();
+                engine.clone_from(&argv[i]);
             }
             "--mvcc" => mvcc = true,
             "--warmup" => {
@@ -1335,6 +1358,23 @@ fn cmd_bench(argv: &[String]) -> i32 {
                     return 2;
                 };
                 warmup_iterations = n;
+            }
+            "--repeat" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --repeat requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u32>() else {
+                    eprintln!("error: invalid integer for --repeat: `{}`", argv[i]);
+                    return 2;
+                };
+                if n == 0 {
+                    eprintln!("error: --repeat must be >= 1");
+                    return 2;
+                }
+                min_iterations = n;
+                measurement_time_secs = 0;
             }
             "--min-iters" => {
                 i += 1;
@@ -1364,6 +1404,14 @@ fn cmd_bench(argv: &[String]) -> i32 {
                 i += 1;
                 if i >= argv.len() {
                     eprintln!("error: --output-jsonl requires a path");
+                    return 2;
+                }
+                output_jsonl = Some(PathBuf::from(&argv[i]));
+            }
+            "--output" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --output requires a path");
                     return 2;
                 }
                 output_jsonl = Some(PathBuf::from(&argv[i]));
@@ -1413,6 +1461,29 @@ fn cmd_bench(argv: &[String]) -> i32 {
     let mut summaries: Vec<BenchmarkSummary> = Vec::new();
     let mut any_iteration_error = false;
 
+    // If an output file is specified, truncate it up front so this run produces a
+    // clean report artifact (rather than appending to an existing file).
+    if let Some(ref path) = output_jsonl {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!(
+                        "error: failed to create output directory {}: {e}",
+                        parent.display()
+                    );
+                    return 1;
+                }
+            }
+        }
+        if let Err(e) = fs::File::create(path) {
+            eprintln!(
+                "error: failed to create output file {}: {e}",
+                path.display()
+            );
+            return 1;
+        }
+    }
+
     for fixture_id in &fixture_ids {
         let golden_path = match resolve_golden_db_in(&golden_dir, fixture_id) {
             Ok(p) => p,
@@ -1429,7 +1500,9 @@ fn cmd_bench(argv: &[String]) -> i32 {
                     "fsqlite" => vec![("fsqlite", mvcc)],
                     "both" => vec![("sqlite3", false), ("fsqlite", mvcc)],
                     other => {
-                        eprintln!("error: unknown --engine `{other}` (expected sqlite3|fsqlite|both)");
+                        eprintln!(
+                            "error: unknown --engine `{other}` (expected sqlite3|fsqlite|both)"
+                        );
                         return 2;
                     }
                 };
@@ -1501,7 +1574,9 @@ fn cmd_bench(argv: &[String]) -> i32 {
                         let compact = match summary.to_jsonl() {
                             Ok(t) => t,
                             Err(e) => {
-                                eprintln!("error: failed to serialize benchmark for JSONL output: {e}");
+                                eprintln!(
+                                    "error: failed to serialize benchmark for JSONL output: {e}"
+                                );
                                 return 1;
                             }
                         };
@@ -1523,13 +1598,19 @@ fn cmd_bench(argv: &[String]) -> i32 {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 if let Err(e) = fs::create_dir_all(parent) {
-                    eprintln!("error: failed to create output directory {}: {e}", parent.display());
+                    eprintln!(
+                        "error: failed to create output directory {}: {e}",
+                        parent.display()
+                    );
                     return 1;
                 }
             }
         }
         if let Err(e) = fs::write(path, md.as_bytes()) {
-            eprintln!("error: failed to write markdown report {}: {e}", path.display());
+            eprintln!(
+                "error: failed to write markdown report {}: {e}",
+                path.display()
+            );
             return 1;
         }
         eprintln!("Wrote markdown report: {}", path.display());
@@ -1553,8 +1634,10 @@ OPTIONS:
     --engine <NAME>         sqlite3 | fsqlite | both (default: both)
     --mvcc                  For fsqlite: enable MVCC concurrent_mode
     --warmup <N>            Warmup iterations discarded (default: methodology default)
+    --repeat <N>            Exact measurement iterations (sets --min-iters=N and --time-secs=0)
     --min-iters <N>         Minimum measurement iterations (default: methodology default)
     --time-secs <N>         Measurement time floor in seconds (default: methodology default)
+    --output <PATH>         Alias for --output-jsonl
     --output-jsonl <PATH>   Append compact JSONL BenchmarkSummary records to PATH
     --output-md <PATH>      Write a Markdown report to PATH (rendered from summaries)
     --pretty                Pretty-print JSON to stdout (default: JSONL)
@@ -1565,6 +1648,7 @@ OPTIONS:
 
 // ── corrupt ─────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn cmd_corrupt(argv: &[String]) -> i32 {
     if argv.iter().any(|a| a == "-h" || a == "--help") {
         print_corrupt_help();
@@ -1696,24 +1780,7 @@ fn cmd_corrupt(argv: &[String]) -> i32 {
         return 2;
     };
 
-    // Validate the golden fixture exists up front.
-    let golden_path = match resolve_golden_db_in(&golden_dir, db_id) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
-        }
-    };
-    let _ = golden_path; // only used for existence validation here.
-
     // Create a working workspace containing the selected golden DB.
-    let project_root = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: failed to get current dir: {e}");
-            return 1;
-        }
-    };
     let ws_cfg = WorkspaceConfig {
         golden_dir,
         working_base,
@@ -1907,8 +1974,8 @@ fn profile_database_for_metadata(
     tag: Option<&str>,
     discovery_tags: &[String],
 ) -> Result<DbProfile, String> {
-    let meta = fs::metadata(db_path)
-        .map_err(|e| format!("cannot stat {}: {e}", db_path.display()))?;
+    let meta =
+        fs::metadata(db_path).map_err(|e| format!("cannot stat {}: {e}", db_path.display()))?;
 
     let conn = Connection::open_with_flags(
         db_path,
@@ -1964,22 +2031,14 @@ fn profile_database_for_metadata(
 }
 
 fn collect_names(conn: &Connection, ty: &str) -> Result<Vec<String>, String> {
-    let sql = format!(
-        "SELECT name FROM sqlite_master WHERE type='{ty}' ORDER BY name"
-    );
+    let sql = format!("SELECT name FROM sqlite_master WHERE type='{ty}' ORDER BY name");
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("sqlite_master({ty}) prepare: {e}"))?;
     let rows = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .map_err(|e| format!("sqlite_master({ty}) query: {e}"))?;
-    let mut out: Vec<String> = Vec::new();
-    for r in rows {
-        if let Ok(name) = r {
-            out.push(name);
-        }
-    }
-    Ok(out)
+    Ok(rows.flatten().collect())
 }
 
 fn collect_tables(conn: &Connection) -> Result<Vec<TableProfile>, String> {
@@ -2025,9 +2084,12 @@ fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnPro
     {
         let name: String = r.get(1).map_err(|e| format!("col.name: {e}"))?;
         let col_type: String = r.get(2).map_err(|e| format!("col.type: {e}"))?;
-        let not_null: bool = r.get::<_, i32>(3).map(|v| v != 0).unwrap_or(false);
-        let default_value: Option<String> = r.get(4).ok();
-        let primary_key: bool = r.get::<_, i32>(5).map(|v| v != 0).unwrap_or(false);
+        let not_null_raw: i32 = r.get(3).map_err(|e| format!("col.not_null flag: {e}"))?;
+        let not_null: bool = not_null_raw != 0;
+        let default_value: Option<String> =
+            r.get(4).map_err(|e| format!("col.default_value: {e}"))?;
+        let primary_key_raw: i32 = r.get(5).map_err(|e| format!("col.pk flag: {e}"))?;
+        let primary_key: bool = primary_key_raw != 0;
         cols.push(ColumnProfile {
             name,
             col_type,
@@ -2069,8 +2131,6 @@ fn sanitize_db_id(raw: &str) -> Result<String, &'static str> {
         let c = ch.to_ascii_lowercase();
         if c.is_ascii_alphanumeric() {
             out.push(c);
-        } else if c == '-' || c == '_' || c == '.' {
-            out.push('_');
         } else {
             out.push('_');
         }
@@ -2091,8 +2151,8 @@ fn resolve_source_db(
 ) -> Result<(PathBuf, Vec<String>, bool), String> {
     let as_path = PathBuf::from(db_arg);
     if as_path.exists() {
-        let header_ok = sqlite_magic_header_ok(&as_path)
-            .map_err(|e| format!("header check failed: {e}"))?;
+        let header_ok =
+            sqlite_magic_header_ok(&as_path).map_err(|e| format!("header check failed: {e}"))?;
         return Ok((as_path, Vec::new(), header_ok));
     }
 
@@ -2107,16 +2167,8 @@ fn resolve_source_db(
 
     let mut matches = Vec::new();
     for c in candidates {
-        let filename = c
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        let stem = c
-            .path
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let filename = c.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let stem = c.path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
 
         if filename == db_arg || stem == db_arg {
             matches.push(c);
@@ -2198,7 +2250,11 @@ fn copy_db_with_sidecars(src_db: &Path, dest_db: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn upsert_checksum(checksums_path: &Path, golden_db: &Path, sha256_hex: &str) -> Result<(), String> {
+fn upsert_checksum(
+    checksums_path: &Path,
+    golden_db: &Path,
+    sha256_hex: &str,
+) -> Result<(), String> {
     let filename = golden_db
         .file_name()
         .and_then(|n| n.to_str())
@@ -2224,7 +2280,7 @@ fn upsert_checksum(checksums_path: &Path, golden_db: &Path, sha256_hex: &str) ->
     let mut replaced = false;
     for (name, hex) in &mut lines {
         if name == &filename {
-            *hex = sha256_hex.to_owned();
+            sha256_hex.clone_into(hex);
             replaced = true;
         }
     }

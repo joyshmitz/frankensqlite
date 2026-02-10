@@ -177,7 +177,9 @@ cargo run -p fsqlite-e2e --bin realdb-e2e -- run \
 cargo run -p fsqlite-e2e --bin realdb-e2e -- bench --db chinook --preset all
 ```
 
-(Not yet fully implemented; see bd-312d.)
+Runs the benchmark matrix and prints `BenchmarkSummary` JSON to stdout.
+Use `--output-jsonl` to append compact JSONL records and `--output-md` to
+write a Markdown report rendered from the collected summaries.
 
 ### corrupt
 
@@ -188,7 +190,8 @@ cargo run -p fsqlite-e2e --bin realdb-e2e -- corrupt \
   --db chinook --strategy page --page 1 --seed 42
 ```
 
-(Not yet fully implemented; see bd-1w6k.7.2.)
+Injects deterministic corruption into a working copy and prints a before/after
+SHA-256 proof (or `--json` for a structured report).
 
 ---
 
