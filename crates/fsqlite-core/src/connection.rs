@@ -746,7 +746,7 @@ impl Connection {
         }
 
         // Post-process: LIMIT / OFFSET.
-        if let Some(limit_clause) = &select.limit {
+        if let Some(ref limit_clause) = select.limit {
             apply_limit_offset_postprocess(&mut result, limit_clause);
         }
 
@@ -1082,6 +1082,78 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
         (SqliteValue::Text(a), SqliteValue::Text(b)) => a.cmp(b),
         _ => Ordering::Equal,
     }
+}
+
+/// Sort result rows by ORDER BY terms (for GROUP BY post-processing).
+#[allow(dead_code)]
+fn sort_rows_by_order_terms(
+    rows: &mut [Row],
+    order_by: &[OrderingTerm],
+    columns: &[ResultColumn],
+) -> Result<()> {
+    let resolved: Vec<(usize, bool)> = order_by
+        .iter()
+        .map(|term| {
+            let col_name = expr_col_name(&term.expr).ok_or_else(|| {
+                FrankenError::NotImplemented(
+                    "only column references are supported in GROUP BY ORDER BY".to_owned(),
+                )
+            })?;
+            let idx = columns
+                .iter()
+                .position(|c| match c {
+                    ResultColumn::Expr {
+                        expr: Expr::Column(r, _),
+                        ..
+                    } => r.column.eq_ignore_ascii_case(col_name),
+                    ResultColumn::Expr {
+                        alias: Some(alias), ..
+                    } => alias.eq_ignore_ascii_case(col_name),
+                    _ => false,
+                })
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "ORDER BY column '{col_name}' not found in SELECT list"
+                    ))
+                })?;
+            let desc = matches!(term.direction, Some(SortDirection::Desc));
+            Ok((idx, desc))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    rows.sort_by(|a, b| {
+        for &(idx, desc) in &resolved {
+            let ord = cmp_sqlite_values(&a.values()[idx], &b.values()[idx]);
+            let ord = if desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+
+    Ok(())
+}
+
+/// Apply LIMIT and OFFSET to a result set (GROUP BY post-processing).
+#[allow(dead_code, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn apply_limit_offset_postprocess(rows: &mut Vec<Row>, limit_clause: &LimitClause) {
+    let limit_val = match &limit_clause.limit {
+        Expr::Literal(Literal::Integer(n), _) => *n as usize,
+        _ => return,
+    };
+    let offset_val = limit_clause
+        .offset
+        .as_ref()
+        .and_then(|off| match off {
+            Expr::Literal(Literal::Integer(n), _) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    let start = offset_val.min(rows.len());
+    let end = (start + limit_val).min(rows.len());
+    *rows = rows[start..end].to_vec();
 }
 
 /// Map an AST type name to a codegen affinity character.
