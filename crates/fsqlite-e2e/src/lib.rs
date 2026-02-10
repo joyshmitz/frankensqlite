@@ -23,6 +23,7 @@ pub mod methodology;
 pub mod oplog;
 pub mod recovery_demo;
 pub mod report;
+pub mod report_render;
 pub mod run_workspace;
 pub mod smoke;
 pub mod sqlite_executor;
