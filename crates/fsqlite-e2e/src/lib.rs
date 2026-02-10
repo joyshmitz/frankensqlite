@@ -9,6 +9,7 @@
 pub mod comparison;
 pub mod corruption;
 pub mod golden;
+pub mod oplog;
 pub mod report;
 pub mod workload;
 
