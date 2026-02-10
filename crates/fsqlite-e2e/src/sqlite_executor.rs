@@ -99,15 +99,12 @@ pub fn run_oplog_sqlite(
     // Run setup SQL on a single connection first.
     if setup_len > 0 {
         let setup_conn = Connection::open(db_path)?;
-        for pragma in &config.pragmas {
-            setup_conn.execute_batch(pragma)?;
-        }
+        apply_pragmas(&setup_conn, &config.pragmas)?;
         for rec in &oplog.records[..setup_len] {
             if let OpKind::Sql { statement } = &rec.kind {
                 setup_conn.execute_batch(statement)?;
             }
         }
-        drop(setup_conn);
     }
 
     // Partition remaining records by worker.
@@ -155,6 +152,7 @@ pub fn run_oplog_sqlite(
 
     let wall = started.elapsed();
     let wall_ms = duration_to_u64_ms(wall);
+    let wall_secs = wall.as_secs_f64();
 
     let ops_ok = worker_stats.iter().map(|s| s.ops_ok).sum::<u64>();
     let ops_err = worker_stats.iter().map(|s| s.ops_err).sum::<u64>();
@@ -173,8 +171,9 @@ pub fn run_oplog_sqlite(
         });
 
     let ops_total = ops_ok + ops_err;
-    let ops_per_sec = if wall.as_secs_f64() > 0.0 {
-        (ops_ok as f64) / wall.as_secs_f64()
+    #[allow(clippy::cast_precision_loss)]
+    let ops_per_sec = if wall_secs > 0.0 {
+        (ops_ok as f64) / wall_secs
     } else {
         0.0
     };
@@ -350,9 +349,7 @@ fn execute_batch(conn: &mut Connection, batch: &Batch) -> Result<(u64, u64), Bat
         match execute_op(&tx, op) {
             Ok(()) => ok = ok.saturating_add(1),
             Err(OpError::Busy(msg)) => return Err(BatchError::Busy(msg)),
-            Err(OpError::Fatal(msg)) => {
-                return Err(BatchError::Fatal(msg));
-            }
+            Err(OpError::Fatal(msg)) => return Err(BatchError::Fatal(msg)),
         }
     }
 
@@ -566,11 +563,10 @@ fn classify_rusqlite_error_as_op(err: &rusqlite::Error) -> OpError {
 fn backoff_duration(config: &SqliteExecConfig, attempt: u32) -> Duration {
     // Exponential backoff with cap.
     let shift = attempt.min(31);
-    let factor: u32 = 1_u32 << shift;
-    let ms = u64::from(factor);
     let base_ms = duration_to_u64_ms(config.busy_backoff);
     let max_ms = duration_to_u64_ms(config.busy_backoff_max);
-    let raw = base_ms.saturating_mul(ms);
+    let factor_ms = 1_u64 << shift;
+    let raw = base_ms.saturating_mul(factor_ms);
     Duration::from_millis(raw.min(max_ms))
 }
 
