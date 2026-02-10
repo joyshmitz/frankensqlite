@@ -18,6 +18,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
 
 use crate::VdbeProgram;
@@ -1730,7 +1731,7 @@ impl VdbeEngine {
                 return Ok(SqliteValue::Null);
             }
             let payload = cursor.cursor.payload(&cursor.cx)?;
-            let values = decode_mem_record(&SqliteValue::Blob(payload));
+            let values = decode_record(&SqliteValue::Blob(payload))?;
             return Ok(values.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
         }
 
@@ -2238,9 +2239,10 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
             other => other.to_text().into_bytes(),
         }),
         b'B' | b'b' => SqliteValue::Text(val.to_text()),
+        b'C' | b'c' => val.apply_affinity(fsqlite_types::TypeAffinity::Numeric),
         b'D' | b'd' => SqliteValue::Integer(val.to_integer()),
         b'E' | b'e' => SqliteValue::Float(val.to_float()),
-        _ => val, // NUMERIC / unknown: no-op
+        _ => val, // unknown: no-op
     }
 }
 

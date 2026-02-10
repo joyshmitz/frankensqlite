@@ -226,10 +226,16 @@ impl BtreeCursorOps for MockBtreeCursor {
     }
 
     fn prev(&mut self, _cx: &Cx) -> Result<bool> {
+        // Match the real cursor's contract: once at EOF, navigation opcodes
+        // should not "revive" the cursor implicitly.
+        if self.at_eof || self.entries.is_empty() {
+            return Ok(false);
+        }
         if self.pos == 0 {
             return Ok(false);
         }
         self.pos -= 1;
+        self.at_eof = false;
         self.current_rowid = self.entries[self.pos].0;
         Ok(true)
     }
@@ -385,5 +391,21 @@ mod tests {
     fn test_seek_result_is_found() {
         assert!(SeekResult::Found.is_found());
         assert!(!SeekResult::NotFound.is_found());
+    }
+
+    #[test]
+    fn test_mock_cursor_prev_from_eof_returns_false() {
+        let entries = vec![(1, b"one".to_vec()), (2, b"two".to_vec())];
+        let mut cursor = MockBtreeCursor::new(entries);
+        let cx = Cx::new();
+
+        assert!(cursor.first(&cx).unwrap());
+        assert!(cursor.next(&cx).unwrap());
+        assert!(!cursor.next(&cx).unwrap());
+        assert!(cursor.eof());
+
+        // Once at EOF, prev() should not claim to move while leaving the cursor at EOF.
+        assert!(!cursor.prev(&cx).unwrap());
+        assert!(cursor.eof());
     }
 }

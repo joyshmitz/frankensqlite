@@ -1540,7 +1540,14 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
                 b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(s.clone()), 0);
             }
             Literal::Blob(bytes) => {
-                b.emit_op(Opcode::Blob, bytes.len() as i32, reg, 0, P4::None, 0);
+                b.emit_op(
+                    Opcode::Blob,
+                    bytes.len() as i32,
+                    reg,
+                    0,
+                    P4::Blob(bytes.clone()),
+                    0,
+                );
             }
             Literal::True => {
                 b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
@@ -1825,17 +1832,19 @@ fn emit_case_expr(
 
 /// Convert a SQL type name to an affinity character code.
 fn type_name_to_affinity(type_name: &fsqlite_ast::TypeName) -> u8 {
+    // Encoding: A..E maps to BLOB, TEXT, NUMERIC, INTEGER, REAL:
+    // 'A' = BLOB, 'B' = TEXT, 'C' = NUMERIC, 'D' = INTEGER, 'E' = REAL.
     let name = type_name.name.to_uppercase();
     if name.contains("INT") {
         b'D' // INTEGER affinity
     } else if name.contains("CHAR") || name.contains("TEXT") || name.contains("CLOB") {
-        b'C' // TEXT affinity
+        b'B' // TEXT affinity
     } else if name.contains("BLOB") || name.is_empty() {
         b'A' // BLOB affinity
     } else if name.contains("REAL") || name.contains("FLOA") || name.contains("DOUB") {
         b'E' // REAL affinity
     } else {
-        b'B' // NUMERIC affinity
+        b'C' // NUMERIC affinity
     }
 }
 

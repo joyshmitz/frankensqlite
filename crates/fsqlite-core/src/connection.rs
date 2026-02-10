@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use fsqlite_ast::{
@@ -39,18 +40,21 @@ fn default_function_registry() -> Arc<FunctionRegistry> {
 }
 
 /// Map a SQL type name to its SQLite affinity byte (§3.1 Type Affinity Rules).
+///
+/// Encoding: A..E maps to BLOB, TEXT, NUMERIC, INTEGER, REAL:
+/// `'A'` = BLOB, `'B'` = TEXT, `'C'` = NUMERIC, `'D'` = INTEGER, `'E'` = REAL.
 fn type_name_to_affinity(name: &str) -> u8 {
     let upper = name.to_uppercase();
     if upper.contains("INT") {
         b'D' // INTEGER affinity
     } else if upper.contains("CHAR") || upper.contains("TEXT") || upper.contains("CLOB") {
-        b'C' // TEXT affinity
+        b'B' // TEXT affinity
     } else if upper.contains("BLOB") || upper.is_empty() {
         b'A' // BLOB affinity
     } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
         b'E' // REAL affinity
     } else {
-        b'B' // NUMERIC affinity
+        b'C' // NUMERIC affinity
     }
 }
 
@@ -184,6 +188,10 @@ pub struct Connection {
     /// Savepoint stack: each SAVEPOINT pushes a snapshot, RELEASE pops,
     /// ROLLBACK TO restores to the named savepoint (without popping).
     savepoints: RefCell<Vec<SavepointEntry>>,
+    /// Optional on-disk persistence path for non-`:memory:` connections.
+    persist_path: Option<String>,
+    /// Internal guard to suppress persistence while restoring from disk.
+    persist_suspended: RefCell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -207,7 +215,8 @@ impl Connection {
                 path: std::path::PathBuf::from(path),
             });
         }
-        Ok(Self {
+        let persist_path = (path != ":memory:").then(|| path.clone());
+        let conn = Self {
             path,
             db: RefCell::new(MemDatabase::new()),
             schema: RefCell::new(Vec::new()),
@@ -215,7 +224,11 @@ impl Connection {
             in_transaction: RefCell::new(false),
             txn_snapshot: RefCell::new(None),
             savepoints: RefCell::new(Vec::new()),
-        })
+            persist_path,
+            persist_suspended: RefCell::new(false),
+        };
+        conn.load_persisted_state_if_present()?;
+        Ok(conn)
     }
 
     /// Returns the configured database path.
@@ -277,6 +290,7 @@ impl Connection {
         match statement {
             Statement::CreateTable(create) => {
                 self.execute_create_table(&create)?;
+                self.persist_if_needed()?;
                 Ok(Vec::new())
             }
             Statement::Select(ref select) => {
@@ -296,15 +310,21 @@ impl Connection {
             }
             Statement::Insert(ref insert) => {
                 let program = self.compile_table_insert(insert)?;
-                self.execute_table_program(&program, params)
+                let rows = self.execute_table_program(&program, params)?;
+                self.persist_if_needed()?;
+                Ok(rows)
             }
             Statement::Update(ref update) => {
                 let program = self.compile_table_update(update)?;
-                self.execute_table_program(&program, params)
+                let rows = self.execute_table_program(&program, params)?;
+                self.persist_if_needed()?;
+                Ok(rows)
             }
             Statement::Delete(ref delete) => {
                 let program = self.compile_table_delete(delete)?;
-                self.execute_table_program(&program, params)
+                let rows = self.execute_table_program(&program, params)?;
+                self.persist_if_needed()?;
+                Ok(rows)
             }
             Statement::Begin(begin) => {
                 self.execute_begin(begin)?;
@@ -312,10 +332,12 @@ impl Connection {
             }
             Statement::Commit => {
                 self.execute_commit()?;
+                self.persist_if_needed()?;
                 Ok(Vec::new())
             }
             Statement::Rollback(ref rb) => {
                 self.execute_rollback(rb)?;
+                self.persist_if_needed()?;
                 Ok(Vec::new())
             }
             Statement::Savepoint(ref name) => {
@@ -600,6 +622,65 @@ impl Connection {
             ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
                 "VDBE halted with code {code}: {message}",
             ))),
+        }
+    }
+
+    fn load_persisted_state_if_present(&self) -> Result<()> {
+        let Some(path) = self.persist_path.as_deref() else {
+            return Ok(());
+        };
+        let path = Path::new(path);
+        if !path.exists() {
+            return Ok(());
+        }
+        let sql_dump = fsqlite_vfs::host_fs::read_to_string(path)?;
+        if sql_dump.trim().is_empty() {
+            return Ok(());
+        }
+        self.with_persistence_suspended(|| {
+            for statement in parse_statements(&sql_dump)? {
+                let _ = self.execute_statement(statement, None)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn with_persistence_suspended<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let prev = *self.persist_suspended.borrow();
+        *self.persist_suspended.borrow_mut() = true;
+        let result = f();
+        *self.persist_suspended.borrow_mut() = prev;
+        result
+    }
+
+    fn persist_if_needed(&self) -> Result<()> {
+        let Some(path) = self.persist_path.as_deref() else {
+            return Ok(());
+        };
+        if *self.persist_suspended.borrow() {
+            return Ok(());
+        }
+        let dump = self.build_persistence_dump()?;
+        fsqlite_vfs::host_fs::write(Path::new(path), dump.as_bytes())?;
+        Ok(())
+    }
+
+    fn build_persistence_dump(&self) -> Result<String> {
+        let schema = self.schema.borrow().clone();
+        let mut statements = Vec::new();
+        for table in &schema {
+            statements.push(build_create_table_sql(table));
+
+            let select_sql = build_dump_select_sql(table);
+            let rows = self.query(&select_sql)?;
+            for row in rows {
+                statements.push(build_insert_row_sql(table, row.values()));
+            }
+        }
+        if statements.is_empty() {
+            Ok(String::new())
+        } else {
+            Ok(format!("{}\n", statements.join("\n")))
         }
     }
 }
@@ -1736,6 +1817,81 @@ fn emit_like_expr(
     Ok(())
 }
 
+/// Reconstruct a `CREATE TABLE` statement from a [`TableSchema`].
+///
+/// Since only the affinity character is stored (not the original SQL type
+/// name), we map each affinity back to a canonical type keyword.
+fn build_create_table_sql(table: &TableSchema) -> String {
+    use std::fmt::Write as _;
+    let mut sql = format!("CREATE TABLE \"{}\" (", table.name);
+    for (i, col) in table.columns.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        let type_kw = affinity_char_to_type(col.affinity);
+        let _ = write!(sql, "\"{}\" {type_kw}", col.name);
+    }
+    sql.push_str(");");
+    sql
+}
+
+/// Build a `SELECT *` query for dumping all rows from a table.
+fn build_dump_select_sql(table: &TableSchema) -> String {
+    format!("SELECT * FROM \"{}\";", table.name)
+}
+
+/// Build an `INSERT INTO` statement that reproduces a single row.
+fn build_insert_row_sql(table: &TableSchema, values: &[SqliteValue]) -> String {
+    use std::fmt::Write as _;
+    let mut sql = format!("INSERT INTO \"{}\" VALUES (", table.name);
+    for (i, val) in values.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        match val {
+            SqliteValue::Null => sql.push_str("NULL"),
+            SqliteValue::Integer(n) => {
+                let _ = write!(sql, "{n}");
+            }
+            SqliteValue::Float(f) => {
+                let _ = write!(sql, "{f:?}");
+            }
+            SqliteValue::Text(s) => {
+                sql.push('\'');
+                for ch in s.chars() {
+                    if ch == '\'' {
+                        sql.push_str("''");
+                    } else {
+                        sql.push(ch);
+                    }
+                }
+                sql.push('\'');
+            }
+            SqliteValue::Blob(b) => {
+                sql.push_str("X'");
+                for byte in b {
+                    let _ = write!(sql, "{byte:02X}");
+                }
+                sql.push('\'');
+            }
+        }
+    }
+    sql.push_str(");");
+    sql
+}
+
+/// Map an affinity character back to a canonical SQL type keyword.
+fn affinity_char_to_type(affinity: char) -> &'static str {
+    match affinity {
+        'd' => "INTEGER",
+        'C' => "TEXT",
+        'E' => "REAL",
+        'A' => "NUMERIC",
+        // 'B' (blob) and any unknown affinity default to BLOB.
+        _ => "BLOB",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Connection, Row};
@@ -2782,5 +2938,213 @@ mod tests {
 
         let rows = conn.query("SELECT x FROM t;").unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    // ── bd-121m: Persistence round-trip tests ──────────────────────────
+
+    #[test]
+    fn test_persistence_create_insert_reopen_select() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roundtrip.db");
+        let path_str = path.to_str().unwrap();
+
+        // Phase 1: create, insert, drop connection.
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'hello');").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 'world');").unwrap();
+        }
+
+        // Phase 2: reopen and verify data survived.
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let rows = conn.query("SELECT a, b FROM t;").unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("hello".to_owned())
+                ],
+            );
+            assert_eq!(
+                row_values(&rows[1]),
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("world".to_owned())
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn test_persistence_multiple_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+                .unwrap();
+            conn.execute("CREATE TABLE items (id INTEGER, label TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+                .unwrap();
+            conn.execute("INSERT INTO items VALUES (10, 'widget');")
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let users = conn.query("SELECT id, name FROM users;").unwrap();
+            assert_eq!(users.len(), 1);
+            assert_eq!(
+                row_values(&users[0]),
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("Alice".to_owned())
+                ],
+            );
+
+            let items = conn.query("SELECT id, label FROM items;").unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(
+                row_values(&items[0]),
+                vec![
+                    SqliteValue::Integer(10),
+                    SqliteValue::Text("widget".to_owned()),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn test_persistence_all_value_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("types.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE t (i INTEGER, r REAL, tx TEXT, bl BLOB, n INTEGER);")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (42, 3.14, 'it''s a test', X'DEADBEEF', NULL);")
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let rows = conn.query("SELECT i, r, tx, bl, n FROM t;").unwrap();
+            assert_eq!(rows.len(), 1);
+            let vals = row_values(&rows[0]);
+            assert_eq!(vals[0], SqliteValue::Integer(42));
+            assert_eq!(vals[1], SqliteValue::Float(314.0 / 100.0));
+            assert_eq!(vals[2], SqliteValue::Text("it's a test".to_owned()));
+            assert_eq!(vals[3], SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+            assert_eq!(vals[4], SqliteValue::Null);
+        }
+    }
+
+    #[test]
+    fn test_persistence_memory_path_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        drop(conn);
+
+        // No file should have been created anywhere.
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "in-memory connection must not write files",
+        );
+    }
+
+    #[test]
+    fn test_persistence_empty_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.db");
+        let path_str = path.to_str().unwrap();
+
+        // Open and close without creating any tables.
+        {
+            let _conn = Connection::open(path_str).unwrap();
+        }
+
+        // Reopen — should succeed with no tables.
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let err = conn.query("SELECT 1 FROM t;");
+            assert!(err.is_err(), "querying nonexistent table should fail");
+        }
+    }
+
+    #[test]
+    fn test_persistence_rollback_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+            conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+            // Begin a transaction, insert, then rollback.
+            conn.execute("BEGIN;").unwrap();
+            conn.execute("INSERT INTO t VALUES (2);").unwrap();
+            conn.execute("ROLLBACK;").unwrap();
+        }
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let rows = conn.query("SELECT x FROM t;").unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "rolled-back INSERT must not survive persistence",
+            );
+            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+        }
+    }
+
+    #[test]
+    fn test_persistence_update_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upddel.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER, val TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+            conn.execute("INSERT INTO t VALUES (3, 'c');").unwrap();
+
+            conn.execute("UPDATE t SET val = 'updated' WHERE id = 2;")
+                .unwrap();
+            conn.execute("DELETE FROM t WHERE id = 3;").unwrap();
+        }
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            let rows = conn.query("SELECT id, val FROM t;").unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                row_values(&rows[0]),
+                vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())],
+            );
+            assert_eq!(
+                row_values(&rows[1]),
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("updated".to_owned()),
+                ],
+            );
+        }
     }
 }

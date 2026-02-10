@@ -24,6 +24,7 @@ use crate::cell::{self, BtreePageHeader, CellRef};
 use crate::overflow;
 use crate::traits::{BtreeCursorOps, SeekResult, sealed};
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::serial_type::write_varint;
@@ -59,6 +60,58 @@ pub trait PageWriter: PageReader {
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber>;
     /// Free a page.
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()>;
+}
+
+// ---------------------------------------------------------------------------
+// TransactionHandle adapter (pager -> btree)
+// ---------------------------------------------------------------------------
+
+/// Adapter implementing [`PageReader`] and [`PageWriter`] by forwarding to a
+/// [`TransactionHandle`].
+///
+/// This is the glue layer that lets `BtCursor` operate directly on top of the
+/// MVCC pager transaction surface without any intermediate page store.
+#[derive(Debug)]
+pub struct TransactionPageIo<'a, T: TransactionHandle + ?Sized> {
+    txn: &'a mut T,
+}
+
+impl<'a, T: TransactionHandle + ?Sized> TransactionPageIo<'a, T> {
+    /// Wrap a pager transaction handle for use as a B-tree page I/O backend.
+    #[must_use]
+    pub fn new(txn: &'a mut T) -> Self {
+        Self { txn }
+    }
+
+    /// Access the underlying transaction handle immutably.
+    pub fn txn(&self) -> &T {
+        &*self.txn
+    }
+
+    /// Access the underlying transaction handle mutably.
+    pub fn txn_mut(&mut self) -> &mut T {
+        self.txn
+    }
+}
+
+impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
+    fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        Ok(self.txn.get_page(cx, page_no)?.into_vec())
+    }
+}
+
+impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        self.txn.write_page(cx, page_no, data)
+    }
+
+    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+        self.txn.allocate_page(cx)
+    }
+
+    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        self.txn.free_page(cx, page_no)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1270,6 +1323,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
     use fsqlite_types::serial_type::write_varint;
     use proptest::strategy::Strategy as _;
     use std::cell::RefCell;
@@ -1405,6 +1459,59 @@ mod tests {
         }
 
         page
+    }
+
+    #[test]
+    fn test_transaction_page_io_reads_bytes_from_transaction_handle() {
+        let cx = Cx::new();
+        let pager = MockMvccPager;
+        let mut txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .expect("mock transaction begin should succeed");
+        let page_no = PageNumber::new(42).expect("page number must be non-zero");
+
+        let io = TransactionPageIo::new(&mut txn);
+        let bytes = io
+            .read_page(&cx, page_no)
+            .expect("read_page should forward to transaction handle");
+
+        assert_eq!(
+            bytes.get(..4),
+            Some(&page_no.get().to_le_bytes()[..]),
+            "TransactionHandle::get_page stamps page number in first 4 bytes"
+        );
+    }
+
+    #[test]
+    fn test_transaction_page_io_allocates_pages_via_transaction_handle() {
+        let cx = Cx::new();
+        let pager = MockMvccPager;
+        let mut txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .expect("mock transaction begin should succeed");
+
+        let mut io = TransactionPageIo::new(&mut txn);
+        let first = io.allocate_page(&cx).expect("allocate_page should forward");
+        let second = io.allocate_page(&cx).expect("allocate_page should forward");
+
+        assert_eq!(first.get(), 2, "mock allocator starts at page 2");
+        assert_eq!(second.get(), 3, "mock allocator increments page numbers");
+    }
+
+    #[test]
+    fn test_transaction_page_io_writes_and_frees_via_transaction_handle() {
+        let cx = Cx::new();
+        let pager = MockMvccPager;
+        let mut txn = pager
+            .begin(&cx, TransactionMode::Deferred)
+            .expect("mock transaction begin should succeed");
+        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+
+        let mut io = TransactionPageIo::new(&mut txn);
+        io.write_page(&cx, page_no, &[0_u8; 32])
+            .expect("write_page should forward");
+        io.free_page(&cx, page_no)
+            .expect("free_page should forward");
     }
 
     /// Helper: build an interior table page.
