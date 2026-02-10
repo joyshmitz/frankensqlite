@@ -89,10 +89,7 @@ impl FsqliteRecoveryBatchReport {
 ///
 /// Uses the same "snapshot while writer is open" technique as `recovery_demo`
 /// to preserve the WAL file with uncommitted-to-DB frames.
-fn setup_wal_fixture(
-    dir: &Path,
-    row_count: usize,
-) -> (std::path::PathBuf, Vec<(i64, String)>) {
+fn setup_wal_fixture(dir: &Path, row_count: usize) -> (std::path::PathBuf, Vec<(i64, String)>) {
     let live_db = dir.join("live.db");
     let crash_db = dir.join("crash.db");
 
@@ -103,10 +100,8 @@ fn setup_wal_fixture(
         .expect("set sync");
     conn.execute_batch("PRAGMA wal_autocheckpoint=0;")
         .expect("disable autocheckpoint");
-    conn.execute_batch(
-        "CREATE TABLE demo (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);",
-    )
-    .expect("create table");
+    conn.execute_batch("CREATE TABLE demo (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);")
+        .expect("create table");
 
     let mut rows = Vec::with_capacity(row_count);
     for i in 0..row_count {
@@ -276,8 +271,7 @@ pub fn run_scenario(scenario: &CorruptionScenario) -> FsqliteRecoveryReport {
 /// Run all scenarios from the catalog and return a batch report.
 #[must_use]
 pub fn run_all_scenarios(scenarios: &[CorruptionScenario]) -> FsqliteRecoveryBatchReport {
-    let reports: Vec<FsqliteRecoveryReport> =
-        scenarios.iter().map(run_scenario).collect();
+    let reports: Vec<FsqliteRecoveryReport> = scenarios.iter().map(run_scenario).collect();
     FsqliteRecoveryBatchReport::from_reports(reports)
 }
 
@@ -302,8 +296,8 @@ fn inject_scenario_corruption(
         }
     };
 
-    let injector = CorruptionInjector::new(target_path)
-        .map_err(|e| format!("injector creation: {e}"))?;
+    let injector =
+        CorruptionInjector::new(target_path).map_err(|e| format!("injector creation: {e}"))?;
 
     let pattern = scenario
         .pattern
@@ -551,10 +545,7 @@ mod tests {
         // Without a sidecar, recovery should fail gracefully.
         // The report may pass or fail depending on the error path,
         // but it should not panic.
-        assert!(
-            !report.recovery_succeeded,
-            "no-sidecar should not recover"
-        );
+        assert!(!report.recovery_succeeded, "no-sidecar should not recover");
     }
 
     #[test]

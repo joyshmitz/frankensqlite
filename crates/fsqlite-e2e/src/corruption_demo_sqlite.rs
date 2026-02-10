@@ -20,9 +20,7 @@ use rusqlite::Connection;
 
 use crate::E2eResult;
 use crate::corruption::{CorruptionInjector, CorruptionReport};
-use crate::corruption_scenarios::{
-    CorruptionScenario, CorruptionTarget, ExpectedSqliteBehavior, ScenarioCorruptionPattern,
-};
+use crate::corruption_scenarios::{CorruptionScenario, CorruptionTarget, ExpectedSqliteBehavior};
 
 /// Result of running a corruption scenario against C SQLite.
 #[derive(Debug)]
@@ -59,18 +57,22 @@ fn setup_scenario_db(dir: &Path, row_count: usize) -> E2eResult<PathBuf> {
          CREATE TABLE demo(id INTEGER PRIMARY KEY, data TEXT NOT NULL);",
     )?;
     for i in 0..row_count {
+        let id =
+            i64::try_from(i).map_err(|_| std::io::Error::other("row id too large for sqlite3"))?;
         conn.execute(
             "INSERT INTO demo(id, data) VALUES (?1, ?2)",
-            rusqlite::params![i as i64, format!("row-{i}")],
+            rusqlite::params![id, format!("row-{i}")],
         )?;
     }
     // Force a WAL checkpoint to ensure we have both db and wal files.
     conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
     // Insert one more batch to ensure unflushed WAL frames exist.
     for i in row_count..(row_count + 10) {
+        let id =
+            i64::try_from(i).map_err(|_| std::io::Error::other("row id too large for sqlite3"))?;
         conn.execute(
             "INSERT INTO demo(id, data) VALUES (?1, ?2)",
-            rusqlite::params![i as i64, format!("row-{i}")],
+            rusqlite::params![id, format!("row-{i}")],
         )?;
     }
     // Close the connection to release file locks (WAL persists).
@@ -147,7 +149,7 @@ pub fn run_sqlite_corruption_scenario(
         let pattern = scenario
             .pattern
             .to_corruption_pattern(scenario.seed, total_frames);
-        let injector = CorruptionInjector::new(&target_path)?;
+        let injector = CorruptionInjector::new(target_path)?;
         Some(injector.inject(&pattern)?)
     } else {
         None
@@ -177,7 +179,7 @@ pub fn run_sqlite_corruption_scenario(
             let rows_recovered = conn
                 .query_row("SELECT COUNT(*) FROM demo;", [], |row| row.get::<_, i64>(0))
                 .ok()
-                .map(|n| n as usize);
+                .and_then(|n| usize::try_from(n).ok());
 
             drop(conn);
 
@@ -305,7 +307,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = setup_scenario_db(dir.path(), 10).unwrap();
         assert!(db_path.exists(), "database file should exist");
-        let wal_path = target_file_path(&db_path, CorruptionTarget::Wal);
+        let _wal_path = target_file_path(&db_path, CorruptionTarget::Wal);
         // WAL may or may not exist depending on checkpoint behavior,
         // but the db should be valid.
         let conn = Connection::open(&db_path).unwrap();
@@ -339,7 +341,7 @@ mod tests {
         let db_path = setup_scenario_db(dir.path(), 10).unwrap();
 
         // Zero the header.
-        let injector = CorruptionInjector::new(&db_path).unwrap();
+        let injector = CorruptionInjector::new(db_path.clone()).unwrap();
         let _report = injector
             .inject(&crate::corruption::CorruptionPattern::HeaderZero)
             .unwrap();
