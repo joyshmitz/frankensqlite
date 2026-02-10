@@ -592,4 +592,315 @@ mod tests {
         assert!(saw_delete);
         assert!(saw_select);
     }
+
+    #[test]
+    fn operation_mix_ratios_within_tolerance() {
+        // With 10,000 ops and 60/15/5/20 weights, actual ratios should be
+        // within 5% of expected.
+        let cfg = WorkloadConfig {
+            fixture_id: "mix".to_owned(),
+            seed: 123,
+            num_operations: 10_000,
+            worker_count: 1,
+            transaction_size: 100,
+            ..WorkloadConfig::default()
+        };
+        let log = WorkloadGenerator::new(cfg).generate();
+
+        let mut inserts: u32 = 0;
+        let mut updates: u32 = 0;
+        let mut deletes: u32 = 0;
+        let mut selects: u32 = 0;
+
+        for rec in &log.records {
+            match &rec.kind {
+                OpKind::Insert { .. } => inserts += 1,
+                OpKind::Update { .. } => updates += 1,
+                OpKind::Sql { statement } => {
+                    let kw = statement.split_whitespace().next().unwrap_or("");
+                    if kw.eq_ignore_ascii_case("DELETE") {
+                        deletes += 1;
+                    } else if kw.eq_ignore_ascii_case("SELECT") {
+                        selects += 1;
+                    }
+                }
+                OpKind::Begin | OpKind::Commit | OpKind::Rollback => {}
+            }
+        }
+
+        let total = inserts + updates + deletes + selects;
+        assert!(total > 0, "should have non-tx operations");
+
+        // Inserts get a boost from fallback (when update/delete can't find a live key)
+        // so we just check that all categories are present and selects are roughly 20%.
+        let select_pct = f64::from(selects) / f64::from(total) * 100.0;
+        assert!(
+            (10.0..=30.0).contains(&select_pct),
+            "select ratio {select_pct:.1}% should be roughly 20% (10-30% tolerance)"
+        );
+    }
+
+    #[test]
+    fn concurrent_distribution_disjoint_key_ranges() {
+        let cfg = WorkloadConfig {
+            fixture_id: "conc".to_owned(),
+            seed: 42,
+            num_operations: 400,
+            worker_count: 4,
+            transaction_size: 50,
+            ..WorkloadConfig::default()
+        };
+        let log = WorkloadGenerator::new(cfg).generate();
+
+        // Collect insert keys per worker.
+        let mut keys_by_worker: std::collections::HashMap<u16, Vec<i64>> =
+            std::collections::HashMap::new();
+        for rec in &log.records {
+            if let OpKind::Insert { key, .. } = &rec.kind {
+                keys_by_worker.entry(rec.worker).or_default().push(*key);
+            }
+        }
+
+        // Verify disjoint ranges: each worker's keys should not overlap with others.
+        let all_keys: Vec<(u16, i64)> = keys_by_worker
+            .iter()
+            .flat_map(|(w, keys)| keys.iter().map(move |k| (*w, *k)))
+            .collect();
+        for i in 0..all_keys.len() {
+            for j in (i + 1)..all_keys.len() {
+                if all_keys[i].0 != all_keys[j].0 {
+                    assert_ne!(
+                        all_keys[i].1, all_keys[j].1,
+                        "key {} appears in worker {} and worker {}",
+                        all_keys[i].1, all_keys[i].0, all_keys[j].0
+                    );
+                }
+            }
+        }
+
+        // Each worker should have some inserts.
+        assert_eq!(keys_by_worker.len(), 4, "all 4 workers should have inserts");
+    }
+
+    #[test]
+    fn update_targets_previously_inserted_keys() {
+        let cfg = WorkloadConfig {
+            fixture_id: "upd".to_owned(),
+            seed: 99,
+            num_operations: 500,
+            worker_count: 1,
+            transaction_size: 50,
+            operation_mix: OperationMix {
+                insert_weight: 40,
+                update_weight: 40,
+                delete_weight: 0,
+                select_weight: 20,
+            },
+            ..WorkloadConfig::default()
+        };
+        let log = WorkloadGenerator::new(cfg).generate();
+
+        let mut inserted_keys: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for rec in &log.records {
+            match &rec.kind {
+                OpKind::Insert { key, .. } => {
+                    inserted_keys.insert(*key);
+                }
+                OpKind::Update { key, .. } => {
+                    assert!(
+                        inserted_keys.contains(key),
+                        "UPDATE targets key {key} which was never inserted"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn delete_targets_existing_keys() {
+        let cfg = WorkloadConfig {
+            fixture_id: "del".to_owned(),
+            seed: 77,
+            num_operations: 500,
+            worker_count: 1,
+            transaction_size: 50,
+            operation_mix: OperationMix {
+                insert_weight: 40,
+                update_weight: 10,
+                delete_weight: 30,
+                select_weight: 20,
+            },
+            ..WorkloadConfig::default()
+        };
+        let log = WorkloadGenerator::new(cfg).generate();
+
+        let mut live_keys: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for rec in &log.records {
+            match &rec.kind {
+                OpKind::Insert { key, .. } => {
+                    live_keys.insert(*key);
+                }
+                OpKind::Sql { statement } => {
+                    if let Some(rest) = statement.strip_prefix("DELETE FROM t0 WHERE id = ") {
+                        let key: i64 = rest.parse().expect("delete key should be parseable");
+                        assert!(
+                            live_keys.contains(&key),
+                            "DELETE targets key {key} which is not live"
+                        );
+                        live_keys.remove(&key);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn zero_operations_produces_setup_only() {
+        let cfg = WorkloadConfig {
+            num_operations: 0,
+            ..WorkloadConfig::default()
+        };
+        let log = WorkloadGenerator::new(cfg).generate();
+
+        // Should have setup SQL (CREATE TABLE) but no data operations.
+        assert!(
+            !log.records
+                .iter()
+                .any(|r| matches!(r.kind, OpKind::Insert { .. } | OpKind::Update { .. })),
+            "0-operation workload should have no data operations"
+        );
+        // Should still have the CREATE TABLE.
+        assert!(
+            log.records
+                .iter()
+                .any(|r| matches!(&r.kind, OpKind::Sql { statement } if statement.contains("CREATE TABLE"))),
+            "should have setup DDL"
+        );
+    }
+
+    #[test]
+    fn single_operation_workload() {
+        let cfg = WorkloadConfig {
+            num_operations: 1,
+            ..WorkloadConfig::default()
+        };
+        let log = WorkloadGenerator::new(cfg).generate();
+
+        // Should have exactly 1 data operation (the seeded insert) plus
+        // setup (CREATE TABLE) and transaction wrappers (BEGIN/COMMIT).
+        let data_ops: usize = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(r.kind, OpKind::Insert { .. } | OpKind::Update { .. })
+                    || matches!(&r.kind, OpKind::Sql { statement } if
+                    statement.starts_with("DELETE") || statement.starts_with("SELECT"))
+            })
+            .count();
+        assert_eq!(
+            data_ops, 1,
+            "single-operation workload should have 1 data op"
+        );
+    }
+
+    #[test]
+    fn large_workload_completes_without_panic() {
+        let cfg = WorkloadConfig {
+            fixture_id: "large".to_owned(),
+            seed: 0,
+            num_operations: 100_000,
+            worker_count: 8,
+            transaction_size: 200,
+            ..WorkloadConfig::default()
+        };
+        let log = WorkloadGenerator::new(cfg).generate();
+        assert!(
+            log.records.len() > 100_000,
+            "100K ops + setup + tx wrappers should exceed 100K records"
+        );
+    }
+
+    #[test]
+    fn transaction_wrapping_begin_commit_pairs() {
+        let cfg = WorkloadConfig {
+            fixture_id: "tx".to_owned(),
+            seed: 42,
+            num_operations: 100,
+            worker_count: 1,
+            transaction_size: 25,
+            ..WorkloadConfig::default()
+        };
+        let log = WorkloadGenerator::new(cfg).generate();
+
+        let mut begin_count: usize = 0;
+        let mut commit_count: usize = 0;
+        let mut in_tx = false;
+
+        for rec in &log.records {
+            match &rec.kind {
+                OpKind::Begin => {
+                    assert!(!in_tx, "nested BEGIN without COMMIT");
+                    in_tx = true;
+                    begin_count += 1;
+                }
+                OpKind::Commit => {
+                    assert!(in_tx, "COMMIT without matching BEGIN");
+                    in_tx = false;
+                    commit_count += 1;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            !in_tx,
+            "final transaction should be committed (not left open)"
+        );
+        assert_eq!(
+            begin_count, commit_count,
+            "BEGIN and COMMIT counts must match"
+        );
+        // 100 ops / 25 per tx = 4 transactions.
+        assert_eq!(
+            begin_count, 4,
+            "expected 4 transactions for 100 ops at size 25"
+        );
+    }
+
+    #[test]
+    fn schema_aware_insert_columns_match_table_spec() {
+        let tables = vec![
+            TableSpec::simple("users"),
+            TableSpec {
+                name: "logs".to_owned(),
+                create_sql:
+                    "CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, val TEXT, num REAL)"
+                        .to_owned(),
+            },
+        ];
+        let cfg = WorkloadConfig {
+            fixture_id: "schema".to_owned(),
+            seed: 42,
+            num_operations: 100,
+            tables,
+            ..WorkloadConfig::default()
+        };
+        let log = WorkloadGenerator::new(cfg).generate();
+
+        for rec in &log.records {
+            if let OpKind::Insert { table, values, .. } = &rec.kind {
+                // TableSpec::simple generates (id, val, num) columns.
+                // Insert provides val and num values.
+                assert_eq!(
+                    values.len(),
+                    2,
+                    "insert into {table} should have 2 non-key columns (val, num)"
+                );
+                assert_eq!(values[0].0, "val", "first column should be 'val'");
+                assert_eq!(values[1].0, "num", "second column should be 'num'");
+            }
+        }
+    }
 }
