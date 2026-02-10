@@ -49,6 +49,14 @@ path = "src/bin/e2e_dashboard.rs"
 name = "e2e-runner"
 path = "src/bin/e2e_runner.rs"
 
+[[bin]]
+name = "e2e-viewer"
+path = "src/bin/e2e_viewer.rs"
+
+[[bin]]
+name = "corruption-demo"
+path = "src/bin/corruption_demo.rs"
+
 [[bench]]
 name = "e2e_bench"
 harness = false

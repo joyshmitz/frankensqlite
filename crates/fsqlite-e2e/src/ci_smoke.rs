@@ -13,10 +13,10 @@
 //! Target: completes in <10 seconds.  No external files or golden corpus
 //! required — everything is generated in-test.
 
+use crate::E2eResult;
 use crate::comparison::ComparisonRunner;
 use crate::oplog;
 use crate::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
-use crate::E2eResult;
 
 /// Outcome of a CI smoke run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -73,16 +73,11 @@ pub fn run_ci_smoke() -> E2eResult<CiSmokeResult> {
     let db_path = tmp.path().join("ci_smoke.db");
     let oplog = oplog::preset_commutative_inserts_disjoint_keys("ci-smoke", 42, 1, 20);
     let report = run_oplog_sqlite(&db_path, &oplog, &SqliteExecConfig::default())?;
-    let integrity_ok = report
-        .correctness
-        .integrity_check_ok
-        .unwrap_or(false);
+    let integrity_ok = report.correctness.integrity_check_ok.unwrap_or(false);
 
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let passed = comparison.operations_mismatched == 0
-        && hash_cmp.matched
-        && integrity_ok;
+    let passed = comparison.operations_mismatched == 0 && hash_cmp.matched && integrity_ok;
 
     let detail = if passed {
         format!(
@@ -177,7 +172,8 @@ mod tests {
 
         let result = runner.run_and_compare(&stmts);
         assert_eq!(
-            result.operations_mismatched, 0,
+            result.operations_mismatched,
+            0,
             "all ops should match: mismatches={:?}",
             result
                 .mismatches
@@ -195,10 +191,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("oplog_ic.db");
 
-        let oplog =
-            oplog::preset_commutative_inserts_disjoint_keys("ci-smoke-ic", 99, 1, 10);
-        let report =
-            run_oplog_sqlite(&db_path, &oplog, &SqliteExecConfig::default()).unwrap();
+        let oplog = oplog::preset_commutative_inserts_disjoint_keys("ci-smoke-ic", 99, 1, 10);
+        let report = run_oplog_sqlite(&db_path, &oplog, &SqliteExecConfig::default()).unwrap();
 
         assert!(
             report.error.is_none(),

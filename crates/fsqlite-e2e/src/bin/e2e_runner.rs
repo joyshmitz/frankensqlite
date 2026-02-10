@@ -1,4 +1,4 @@
-//! E2E master test runner — orchestrates correctness, benchmarks, and recovery tests.
+//! E2E primary test runner — orchestrates correctness, benchmarks, and recovery tests.
 //!
 //! # Subcommands
 //!
@@ -173,7 +173,7 @@ where
 
 fn print_help() {
     let text = "\
-e2e-runner — FrankenSQLite E2E master test runner
+e2e-runner — FrankenSQLite E2E primary test runner
 
 USAGE:
     e2e-runner [OPTIONS] <SUBCOMMAND>

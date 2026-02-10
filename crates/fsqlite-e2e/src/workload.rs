@@ -111,7 +111,7 @@ impl TableSpec {
 pub struct WorkloadConfig {
     /// Identifier linking this workload to a golden/work fixture.
     pub fixture_id: String,
-    /// Master seed.
+    /// Base seed.
     pub seed: u64,
     /// Total number of non-setup operations to generate across all workers.
     pub num_operations: usize,

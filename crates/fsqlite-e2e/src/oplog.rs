@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpLogHeader {
     /// Identifier linking this log to a golden fixture (copied into `working/` per run).
     pub fixture_id: String,
-    /// Master seed used to derive all per-worker RNG streams.
+    /// Base seed used to derive all per-worker RNG streams.
     pub seed: u64,
     /// RNG algorithm and crate version for reproducibility.
     pub rng: RngSpec,

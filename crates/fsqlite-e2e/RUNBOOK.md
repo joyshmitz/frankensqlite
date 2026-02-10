@@ -8,7 +8,7 @@ knowledge.
 
 | Doc | Contents |
 |-----|----------|
-| **This file** | Master runbook: quick-start, demo walkthroughs |
+| **This file** | Primary runbook: quick-start, demo walkthroughs |
 | [HARNESS.md](HARNESS.md) | Full CLI reference, artifact locations, result interpretation |
 | [METHODOLOGY.md](METHODOLOGY.md) | Benchmark methodology (warmup, statistics, PRAGMA fairness) |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Failure modes, adding fixtures/workloads, debugging tips |

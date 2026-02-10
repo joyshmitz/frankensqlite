@@ -44,7 +44,7 @@ Runs all six Criterion benchmark harnesses (`e2e_bench`,
 
 | Binary | Purpose |
 |--------|---------|
-| `e2e-runner` | Master test runner (smoke, correctness, recovery, report) |
+| `e2e-runner` | Primary test runner (smoke, correctness, recovery, report) |
 | `realdb-e2e` | Single-engine workload runner + corpus management |
 | `profile-db` | Extract JSON metadata from golden database files |
 | `e2e-dashboard` | TUI dashboard for interactive result viewing |
