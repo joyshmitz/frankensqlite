@@ -16,6 +16,9 @@ pub enum GateScope {
     Phase4,
     Phase5,
     Phase6,
+    Phase7,
+    Phase8,
+    Phase9,
 }
 
 /// Execution status for a single gate.
@@ -91,6 +94,45 @@ pub struct CorePhaseGateReport {
     pub gates: Vec<GateExecutionResult>,
 }
 
+/// Machine-readable report for Phase 7-9 verification gates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+#[allow(clippy::struct_field_names)]
+pub struct LatePhaseGateReport {
+    pub schema_version: u32,
+    pub generated_unix_ms: u128,
+    pub workspace_root: String,
+    pub overall_pass: bool,
+    pub phase7_pass: bool,
+    pub phase8_pass: bool,
+    pub phase9_pass: bool,
+    pub blocked_by_phase7_failure: bool,
+    pub blocked_by_phase8_failure: bool,
+    pub gates: Vec<GateExecutionResult>,
+}
+
+/// Summary counters for a gate run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_field_names)]
+pub struct GateRunSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: usize,
+}
+
+/// Machine-readable report for universal verification gates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
+pub struct UniversalGateReport {
+    pub schema_version: u32,
+    pub generated_unix_ms: u128,
+    pub workspace_root: String,
+    pub trace_id: String,
+    pub gates: Vec<GateExecutionResult>,
+    pub summary: GateRunSummary,
+    pub phase_ready: bool,
+}
+
 /// Raw command output captured from gate execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateCommandOutput {
@@ -159,6 +201,12 @@ pub fn phase_4_to_6_gate_plan() -> Vec<GatePlanEntry> {
     core_gate_specs().iter().map(as_plan_entry).collect()
 }
 
+/// Return the canonical Phase 7-9 gate plan.
+#[must_use]
+pub fn phase_7_to_9_gate_plan() -> Vec<GatePlanEntry> {
+    late_phase_gate_specs().iter().map(as_plan_entry).collect()
+}
+
 /// Run Phase 1-3 gates using the default process-backed executor.
 #[must_use]
 pub fn run_phase_1_to_3_gates(workspace_root: &Path) -> PhaseGateReport {
@@ -166,11 +214,64 @@ pub fn run_phase_1_to_3_gates(workspace_root: &Path) -> PhaseGateReport {
     run_phase_1_to_3_gates_with_runner(workspace_root, &runner)
 }
 
+/// Run universal gates using the default process-backed executor.
+#[must_use]
+pub fn run_universal_gates(workspace_root: &Path) -> UniversalGateReport {
+    let runner = ProcessGateCommandRunner;
+    run_universal_gates_with_runner(workspace_root, &runner)
+}
+
 /// Run Phase 4-6 gates using the default process-backed executor.
 #[must_use]
 pub fn run_phase_4_to_6_gates(workspace_root: &Path) -> CorePhaseGateReport {
     let runner = ProcessGateCommandRunner;
     run_phase_4_to_6_gates_with_runner(workspace_root, &runner)
+}
+
+/// Run Phase 7-9 gates using the default process-backed executor.
+#[must_use]
+pub fn run_phase_7_to_9_gates(workspace_root: &Path) -> LatePhaseGateReport {
+    let runner = ProcessGateCommandRunner;
+    run_phase_7_to_9_gates_with_runner(workspace_root, &runner)
+}
+
+/// Run universal gates with a custom executor.
+#[must_use]
+pub fn run_universal_gates_with_runner<R: GateCommandRunner>(
+    workspace_root: &Path,
+    runner: &R,
+) -> UniversalGateReport {
+    let gate_plan = phase_1_to_3_gate_plan();
+    let mut gates = Vec::new();
+    let phase_ready = run_scope(
+        GateScope::Universal,
+        &gate_plan,
+        workspace_root,
+        runner,
+        &mut gates,
+    );
+    let passed = gates
+        .iter()
+        .filter(|gate| gate.status == GateStatus::Passed)
+        .count();
+    let failed = gates
+        .iter()
+        .filter(|gate| gate.status == GateStatus::Failed)
+        .count();
+
+    UniversalGateReport {
+        schema_version: 1,
+        generated_unix_ms: unix_time_ms(),
+        workspace_root: workspace_root.display().to_string(),
+        trace_id: format!("uvg-{}", unix_time_ms()),
+        gates,
+        summary: GateRunSummary {
+            total: passed + failed,
+            passed,
+            failed,
+        },
+        phase_ready,
+    }
 }
 
 /// Run Phase 1-3 gates with a custom executor.
@@ -331,6 +432,85 @@ pub fn run_phase_4_to_6_gates_with_runner<R: GateCommandRunner>(
     }
 }
 
+/// Run Phase 7-9 gates with a custom executor.
+#[must_use]
+pub fn run_phase_7_to_9_gates_with_runner<R: GateCommandRunner>(
+    workspace_root: &Path,
+    runner: &R,
+) -> LatePhaseGateReport {
+    let gate_plan = phase_7_to_9_gate_plan();
+    let mut gates = Vec::with_capacity(gate_plan.len());
+
+    let phase7_pass = run_scope(
+        GateScope::Phase7,
+        &gate_plan,
+        workspace_root,
+        runner,
+        &mut gates,
+    );
+
+    let mut phase8_pass = false;
+    let mut phase9_pass = false;
+    let mut blocked_by_phase7_failure = false;
+    let mut blocked_by_phase8_failure = false;
+
+    if phase7_pass {
+        phase8_pass = run_scope(
+            GateScope::Phase8,
+            &gate_plan,
+            workspace_root,
+            runner,
+            &mut gates,
+        );
+        if phase8_pass {
+            phase9_pass = run_scope(
+                GateScope::Phase9,
+                &gate_plan,
+                workspace_root,
+                runner,
+                &mut gates,
+            );
+        } else {
+            blocked_by_phase8_failure = true;
+            push_skipped_scope(
+                GateScope::Phase9,
+                &gate_plan,
+                "blocked_by_phase8_failure",
+                &mut gates,
+            );
+        }
+    } else {
+        blocked_by_phase7_failure = true;
+        push_skipped_scope(
+            GateScope::Phase8,
+            &gate_plan,
+            "blocked_by_phase7_failure",
+            &mut gates,
+        );
+        push_skipped_scope(
+            GateScope::Phase9,
+            &gate_plan,
+            "blocked_by_phase7_failure",
+            &mut gates,
+        );
+    }
+
+    let overall_pass = phase7_pass && phase8_pass && phase9_pass;
+
+    LatePhaseGateReport {
+        schema_version: 1,
+        generated_unix_ms: unix_time_ms(),
+        workspace_root: workspace_root.display().to_string(),
+        overall_pass,
+        phase7_pass,
+        phase8_pass,
+        phase9_pass,
+        blocked_by_phase7_failure,
+        blocked_by_phase8_failure,
+        gates,
+    }
+}
+
 /// Persist a phase gate report as pretty JSON.
 ///
 /// # Errors
@@ -361,6 +541,36 @@ pub fn write_core_phase_gate_report(path: &Path, report: &CorePhaseGateReport) -
     fs::write(path, json)
 }
 
+/// Persist a late phase gate report as pretty JSON.
+///
+/// # Errors
+///
+/// Returns an error if serialization or writing fails.
+pub fn write_late_phase_gate_report(path: &Path, report: &LatePhaseGateReport) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(report).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("late_phase_gate_report_serialize_failed: {error}"),
+        )
+    })?;
+    fs::write(path, json)
+}
+
+/// Persist a universal gate report as pretty JSON.
+///
+/// # Errors
+///
+/// Returns an error if serialization or writing fails.
+pub fn write_universal_gate_report(path: &Path, report: &UniversalGateReport) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(report).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("universal_gate_report_serialize_failed: {error}"),
+        )
+    })?;
+    fs::write(path, json)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GateSpec {
     gate_id: &'static str,
@@ -378,7 +588,7 @@ fn gate_specs() -> Vec<GateSpec> {
             gate_id: "universal.cargo_check",
             gate_name: "Universal gate: cargo check --all-targets",
             scope: GateScope::Universal,
-            command: &["cargo", "check", "--all-targets"],
+            command: &["cargo", "check", "--workspace", "--all-targets"],
             env: &[],
             expected_exit_code: 0,
         },
@@ -386,7 +596,15 @@ fn gate_specs() -> Vec<GateSpec> {
             gate_id: "universal.cargo_clippy",
             gate_name: "Universal gate: cargo clippy --all-targets -D warnings",
             scope: GateScope::Universal,
-            command: &["cargo", "clippy", "--all-targets", "--", "-D", "warnings"],
+            command: &[
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
             env: &[],
             expected_exit_code: 0,
         },
@@ -394,7 +612,7 @@ fn gate_specs() -> Vec<GateSpec> {
             gate_id: "universal.cargo_fmt",
             gate_name: "Universal gate: cargo fmt --check",
             scope: GateScope::Universal,
-            command: &["cargo", "fmt", "--check"],
+            command: &["cargo", "fmt", "--all", "--", "--check"],
             env: &[],
             expected_exit_code: 0,
         },
@@ -407,10 +625,113 @@ fn gate_specs() -> Vec<GateSpec> {
             expected_exit_code: 0,
         },
         GateSpec {
+            gate_id: "universal.undocumented_ignores",
+            gate_name: "Universal gate: no undocumented #[ignore] annotations",
+            scope: GateScope::Universal,
+            command: &[
+                "bash",
+                "-lc",
+                "set -euo pipefail; undocumented=0; while IFS=: read -r file line _; do prev_line=$((line-1)); prev=\"\"; if [ \"$prev_line\" -ge 1 ]; then prev=$(sed -n \"${prev_line}p\" \"$file\"); fi; cur=$(sed -n \"${line}p\" \"$file\"); if [[ \"$prev\" != *\"//\"* && \"$cur\" != *\"//\"* ]]; then echo \"undocumented_ignore ${file}:${line}\"; undocumented=1; fi; done < <(rg -n --glob '*.rs' '#\\\\[ignore\\\\]' crates tests || true); exit \"$undocumented\"",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
             gate_id: "universal.cargo_doc",
             gate_name: "Universal gate: cargo doc --workspace --no-deps",
             scope: GateScope::Universal,
             command: &["cargo", "doc", "--workspace", "--no-deps"],
+            env: &[("RUSTDOCFLAGS", "-D warnings")],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "universal.no_unsafe_allow_override",
+            gate_name: "Universal gate: forbid allow(unsafe_code) overrides",
+            scope: GateScope::Universal,
+            command: &[
+                "rg",
+                "-n",
+                "allow\\(unsafe_code\\)",
+                "crates",
+                "src",
+                "tests",
+            ],
+            env: &[],
+            expected_exit_code: 1,
+        },
+        GateSpec {
+            gate_id: "universal.no_unsafe_block",
+            gate_name: "Universal gate: forbid unsafe blocks",
+            scope: GateScope::Universal,
+            command: &["rg", "-n", "\\bunsafe\\s*\\{", "crates", "src", "tests"],
+            env: &[],
+            expected_exit_code: 1,
+        },
+        GateSpec {
+            gate_id: "universal.br_dep_cycles",
+            gate_name: "Universal gate: beads dependency graph has no cycles",
+            scope: GateScope::Universal,
+            command: &["br", "dep", "cycles"],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "universal.beads_synced",
+            gate_name: "Universal gate: beads export synced to .beads/",
+            scope: GateScope::Universal,
+            command: &[
+                "bash",
+                "-lc",
+                "set -euo pipefail; br sync --flush-only >/dev/null; git diff --exit-code -- .beads/",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "universal.audit_spec_authority",
+            gate_name: "Universal gate: spec authority + TOC integrity audit",
+            scope: GateScope::Universal,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "--test",
+                "spec_authority_integrity_audit",
+                "test_e2e_bd_1wx_5_compliance",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "universal.audit_scope_doctrine",
+            gate_name: "Universal gate: scope doctrine enforcement audit",
+            scope: GateScope::Universal,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "--test",
+                "spec_to_beads_audit",
+                "test_e2e_bd_1wx_3_compliance",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "universal.audit_spec_beads_completeness",
+            gate_name: "Universal gate: spec-to-beads completeness audit",
+            scope: GateScope::Universal,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "--test",
+                "spec_to_beads_audit",
+                "test_e2e_spec_to_beads_audit_report_schema_stable",
+            ],
             env: &[],
             expected_exit_code: 0,
         },
@@ -599,6 +920,20 @@ fn core_gate_specs() -> Vec<GateSpec> {
             expected_exit_code: 0,
         },
         GateSpec {
+            gate_id: "phase5.raptorq_harness",
+            gate_name: "Phase 5 gate: RaptorQ harness (loss/corruption/perf)",
+            scope: GateScope::Phase5,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_e2e_raptorq_harness",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
             gate_id: "phase6.mvcc_stress",
             gate_name: "Phase 6 gate: MVCC stress (100 writers x 100 ops)",
             scope: GateScope::Phase6,
@@ -769,6 +1104,152 @@ fn core_gate_specs() -> Vec<GateSpec> {
     ]
 }
 
+#[allow(clippy::too_many_lines)]
+fn late_phase_gate_specs() -> Vec<GateSpec> {
+    vec![
+        GateSpec {
+            gate_id: "phase7.index_usage",
+            gate_name: "Phase 7 gate: EXPLAIN QUERY PLAN index usage",
+            scope: GateScope::Phase7,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase7_gate_index_usage",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase7.window_functions",
+            gate_name: "Phase 7 gate: window functions (50 conformance tests)",
+            scope: GateScope::Phase7,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase7_gate_window_functions",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase7.recursive_cte_limit",
+            gate_name: "Phase 7 gate: recursive CTE terminates with LIMIT",
+            scope: GateScope::Phase7,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase7_gate_recursive_cte_limit",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase8.json1",
+            gate_name: "Phase 8 gate: JSON1 conformance (200 tests)",
+            scope: GateScope::Phase8,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase8_gate_json1",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase8.fts5",
+            gate_name: "Phase 8 gate: FTS5 full-text search (100 queries)",
+            scope: GateScope::Phase8,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase8_gate_fts5",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase8.rtree",
+            gate_name: "Phase 8 gate: R*-Tree spatial queries (50 bbox tests)",
+            scope: GateScope::Phase8,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase8_gate_rtree",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase9.conformance_golden",
+            gate_name: "Phase 9 gate: 100% parity target (1,000+ golden files)",
+            scope: GateScope::Phase9,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase9_gate_conformance_golden",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase9.benchmark_3x",
+            gate_name: "Phase 9 gate: single-writer benchmark within 3x of C SQLite",
+            scope: GateScope::Phase9,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase9_gate_benchmark_3x",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase9.no_regression",
+            gate_name: "Phase 9 gate: no regression vs Phase 8 (conformal p-value)",
+            scope: GateScope::Phase9,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase9_gate_no_regression",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
+            gate_id: "phase9.replication_loss",
+            gate_name: "Phase 9 gate: replication under 10% packet loss",
+            scope: GateScope::Phase9,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "test_phase9_gate_replication_loss",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+    ]
+}
+
 fn as_plan_entry(spec: &GateSpec) -> GatePlanEntry {
     GatePlanEntry {
         gate_id: spec.gate_id.to_owned(),
@@ -885,8 +1366,9 @@ mod tests {
 
     use super::{
         GateCommandOutput, GateCommandRunner, GateScope, GateStatus, phase_1_to_3_gate_plan,
-        phase_4_to_6_gate_plan, run_phase_1_to_3_gates_with_runner,
-        run_phase_4_to_6_gates_with_runner,
+        phase_4_to_6_gate_plan, phase_7_to_9_gate_plan, run_phase_1_to_3_gates_with_runner,
+        run_phase_4_to_6_gates_with_runner, run_phase_7_to_9_gates_with_runner,
+        run_universal_gates_with_runner,
     };
 
     #[derive(Debug, Default)]
@@ -934,7 +1416,12 @@ mod tests {
             let exit_code = if self.fail_gate_ids.contains(gate_id) {
                 2
             } else {
-                i32::from(gate_id == "phase2.no_unsafe")
+                match gate_id {
+                    "phase2.no_unsafe"
+                    | "universal.no_unsafe_allow_override"
+                    | "universal.no_unsafe_block" => 1,
+                    _ => 0,
+                }
             };
 
             Ok(GateCommandOutput {
@@ -959,6 +1446,152 @@ mod tests {
 
         assert_eq!(gate.scope, GateScope::Phase2);
         assert!(command.contains("cargo test -p fsqlite-vfs"));
+    }
+
+    #[test]
+    fn test_universal_gate_cargo_check() {
+        let plan = phase_1_to_3_gate_plan();
+        let gate = find_gate(&plan, "universal.cargo_check");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Universal);
+        assert!(command.contains("cargo check --workspace --all-targets"));
+    }
+
+    #[test]
+    fn test_universal_gate_clippy() {
+        let plan = phase_1_to_3_gate_plan();
+        let gate = find_gate(&plan, "universal.cargo_clippy");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Universal);
+        assert!(command.contains("cargo clippy --workspace --all-targets -- -D warnings"));
+    }
+
+    #[test]
+    fn test_universal_gate_fmt() {
+        let plan = phase_1_to_3_gate_plan();
+        let gate = find_gate(&plan, "universal.cargo_fmt");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Universal);
+        assert!(command.contains("cargo fmt --all -- --check"));
+    }
+
+    #[test]
+    fn test_universal_gate_tests() {
+        let plan = phase_1_to_3_gate_plan();
+        let gate = find_gate(&plan, "universal.cargo_test");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Universal);
+        assert!(command.contains("cargo test --workspace"));
+    }
+
+    #[test]
+    fn test_universal_gate_docs() {
+        let plan = phase_1_to_3_gate_plan();
+        let gate = find_gate(&plan, "universal.cargo_doc");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Universal);
+        assert!(command.contains("cargo doc --workspace --no-deps"));
+        assert!(
+            gate.env
+                .contains(&("RUSTDOCFLAGS".to_owned(), "-D warnings".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_gate_fails_on_warning() {
+        let workspace = std::path::Path::new(".");
+        let runner = MockRunner::with_failures(["universal.cargo_check"]);
+        let report = run_universal_gates_with_runner(workspace, &runner);
+
+        assert!(!report.phase_ready);
+        assert_eq!(report.summary.failed, 1);
+        assert!(report.gates.iter().any(|gate| {
+            gate.gate_id == "universal.cargo_check" && gate.status == GateStatus::Failed
+        }));
+    }
+
+    #[test]
+    fn test_gate_fails_on_undocumented_ignore() {
+        let workspace = std::path::Path::new(".");
+        let runner = MockRunner::with_failures(["universal.undocumented_ignores"]);
+        let report = run_universal_gates_with_runner(workspace, &runner);
+
+        assert!(!report.phase_ready);
+        assert!(report.gates.iter().any(|gate| {
+            gate.gate_id == "universal.undocumented_ignores" && gate.status == GateStatus::Failed
+        }));
+    }
+
+    #[test]
+    fn test_universal_gate_no_unsafe() {
+        let plan = phase_1_to_3_gate_plan();
+        let allow_gate = find_gate(&plan, "universal.no_unsafe_allow_override");
+        let unsafe_block_gate = find_gate(&plan, "universal.no_unsafe_block");
+
+        assert_eq!(allow_gate.scope, GateScope::Universal);
+        assert_eq!(allow_gate.expected_exit_code, 1);
+        assert!(
+            allow_gate
+                .command
+                .join(" ")
+                .contains("allow\\(unsafe_code\\)")
+        );
+
+        assert_eq!(unsafe_block_gate.scope, GateScope::Universal);
+        assert_eq!(unsafe_block_gate.expected_exit_code, 1);
+        assert!(
+            unsafe_block_gate
+                .command
+                .join(" ")
+                .contains("\\bunsafe\\s*\\{")
+        );
+    }
+
+    #[test]
+    fn test_universal_gate_beads_and_governance() {
+        let plan = phase_1_to_3_gate_plan();
+        let dep_cycles = find_gate(&plan, "universal.br_dep_cycles");
+        let beads_synced = find_gate(&plan, "universal.beads_synced");
+        let audit_authority = find_gate(&plan, "universal.audit_spec_authority");
+        let audit_scope = find_gate(&plan, "universal.audit_scope_doctrine");
+        let audit_completeness = find_gate(&plan, "universal.audit_spec_beads_completeness");
+
+        assert_eq!(dep_cycles.scope, GateScope::Universal);
+        assert_eq!(beads_synced.scope, GateScope::Universal);
+        assert_eq!(audit_authority.scope, GateScope::Universal);
+        assert_eq!(audit_scope.scope, GateScope::Universal);
+        assert_eq!(audit_completeness.scope, GateScope::Universal);
+
+        assert_eq!(dep_cycles.command.join(" "), "br dep cycles");
+        assert!(
+            beads_synced
+                .command
+                .join(" ")
+                .contains("br sync --flush-only")
+        );
+        assert!(
+            audit_authority
+                .command
+                .join(" ")
+                .contains("spec_authority_integrity_audit")
+        );
+        assert!(
+            audit_scope
+                .command
+                .join(" ")
+                .contains("test_e2e_bd_1wx_3_compliance")
+        );
+        assert!(
+            audit_completeness
+                .command
+                .join(" ")
+                .contains("test_e2e_spec_to_beads_audit_report_schema_stable")
+        );
     }
 
     #[test]
@@ -1138,6 +1771,16 @@ mod tests {
     }
 
     #[test]
+    fn test_phase5_gate_raptorq_harness() {
+        let plan = phase_4_to_6_gate_plan();
+        let gate = find_gate(&plan, "phase5.raptorq_harness");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase5);
+        assert!(command.contains("test_e2e_raptorq_harness"));
+    }
+
+    #[test]
     fn test_phase6_gate_crash_model() {
         let plan = phase_4_to_6_gate_plan();
         let gate = find_gate(&plan, "phase6.crash_model");
@@ -1220,6 +1863,107 @@ mod tests {
         assert!(report.phase6_pass);
         assert!(!report.blocked_by_phase4_failure);
         assert!(!report.blocked_by_phase5_failure);
+        assert!(
+            report
+                .gates
+                .iter()
+                .all(|gate| gate.status == GateStatus::Passed)
+        );
+    }
+
+    #[test]
+    fn test_phase7_gate_index_usage() {
+        let plan = phase_7_to_9_gate_plan();
+        let gate = find_gate(&plan, "phase7.index_usage");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase7);
+        assert!(command.contains("test_phase7_gate_index_usage"));
+    }
+
+    #[test]
+    fn test_phase9_gate_replication_loss() {
+        let plan = phase_7_to_9_gate_plan();
+        let gate = find_gate(&plan, "phase9.replication_loss");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase9);
+        assert!(command.contains("test_phase9_gate_replication_loss"));
+    }
+
+    #[test]
+    fn test_late_gate_runner_blocks_phase8_and_phase9_when_phase7_fails() {
+        let workspace = std::path::Path::new(".");
+        let runner = MockRunner::with_failures(["phase7.window_functions"]);
+        let report = run_phase_7_to_9_gates_with_runner(workspace, &runner);
+
+        assert!(!report.overall_pass);
+        assert!(!report.phase7_pass);
+        assert!(report.blocked_by_phase7_failure);
+        assert!(!report.phase8_pass);
+        assert!(!report.phase9_pass);
+
+        let phase8_statuses = report
+            .gates
+            .iter()
+            .filter(|gate| gate.scope == GateScope::Phase8)
+            .map(|gate| gate.status)
+            .collect::<Vec<_>>();
+        let phase9_statuses = report
+            .gates
+            .iter()
+            .filter(|gate| gate.scope == GateScope::Phase9)
+            .map(|gate| gate.status)
+            .collect::<Vec<_>>();
+
+        assert!(
+            phase8_statuses
+                .iter()
+                .all(|status| *status == GateStatus::Skipped)
+        );
+        assert!(
+            phase9_statuses
+                .iter()
+                .all(|status| *status == GateStatus::Skipped)
+        );
+    }
+
+    #[test]
+    fn test_late_gate_runner_skips_phase9_when_phase8_fails() {
+        let workspace = std::path::Path::new(".");
+        let runner = MockRunner::with_failures(["phase8.json1"]);
+        let report = run_phase_7_to_9_gates_with_runner(workspace, &runner);
+
+        assert!(report.phase7_pass);
+        assert!(!report.phase8_pass);
+        assert!(!report.phase9_pass);
+        assert!(report.blocked_by_phase8_failure);
+
+        let phase9_statuses = report
+            .gates
+            .iter()
+            .filter(|gate| gate.scope == GateScope::Phase9)
+            .map(|gate| gate.status)
+            .collect::<Vec<_>>();
+        assert!(
+            phase9_statuses
+                .iter()
+                .all(|status| *status == GateStatus::Skipped)
+        );
+    }
+
+    #[test]
+    fn test_late_gate_runner_all_pass() {
+        let workspace = std::path::Path::new(".");
+        let runner = MockRunner::default();
+        let report = run_phase_7_to_9_gates_with_runner(workspace, &runner);
+
+        assert!(report.overall_pass);
+        assert!(report.phase7_pass);
+        assert!(report.phase8_pass);
+        assert!(report.phase9_pass);
+        assert!(!report.blocked_by_phase7_failure);
+        assert!(!report.blocked_by_phase8_failure);
         assert!(
             report
                 .gates
