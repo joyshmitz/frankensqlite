@@ -2,6 +2,7 @@
 name = "fsqlite-e2e"
 version = "0.1.0"
 edition.workspace = true
+autobins = false
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
@@ -18,6 +19,7 @@ fsqlite-harness = { workspace = true }
 fsqlite-vfs = { workspace = true }
 fsqlite-types = { workspace = true }
 fsqlite-wal = { workspace = true }
+ftui = { workspace = true, features = ["crossterm"] }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
@@ -37,6 +39,30 @@ path = "src/bin/realdb_e2e.rs"
 name = "profile-db"
 path = "src/bin/profile_db.rs"
 
+[[bin]]
+name = "e2e-dashboard"
+path = "src/bin/e2e_dashboard.rs"
+
 [[bench]]
 name = "e2e_bench"
+harness = false
+
+[[bench]]
+name = "write_throughput_bench"
+harness = false
+
+[[bench]]
+name = "read_heavy_bench"
+harness = false
+
+[[bench]]
+name = "large_txn_bench"
+harness = false
+
+[[bench]]
+name = "mixed_oltp_bench"
+harness = false
+
+[[bench]]
+name = "concurrent_write_bench"
 harness = false

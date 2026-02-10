@@ -78,6 +78,7 @@ fsqlite-harness = { path = "crates/fsqlite-harness" }
 fsqlite-e2e = { path = "crates/fsqlite-e2e" }
 
 # External dependencies
+ftui = { path = "/dp/frankentui/crates/ftui" }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
