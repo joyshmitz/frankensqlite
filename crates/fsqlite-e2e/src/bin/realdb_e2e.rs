@@ -11,7 +11,11 @@
 //! - `corrupt` — Inject corruption into a working copy for recovery testing.
 
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 fn main() {
     let exit_code = run_cli(std::env::args_os());
@@ -206,9 +210,135 @@ fn cmd_corpus_import(_argv: &[String]) -> i32 {
     0
 }
 
-fn cmd_corpus_verify(_argv: &[String]) -> i32 {
-    println!("corpus verify: not yet implemented (see bd-19iw)");
-    0
+/// Default path for the checksums file (relative to workspace root).
+const DEFAULT_CHECKSUMS_PATH: &str = "sample_sqlite_db_files/checksums.sha256";
+
+/// Default directory containing golden database copies.
+const DEFAULT_GOLDEN_DIR: &str = "sample_sqlite_db_files/golden";
+
+fn cmd_corpus_verify(argv: &[String]) -> i32 {
+    let mut checksums_path = PathBuf::from(DEFAULT_CHECKSUMS_PATH);
+    let mut golden_dir = PathBuf::from(DEFAULT_GOLDEN_DIR);
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--checksums" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --checksums requires a path argument");
+                    return 2;
+                }
+                checksums_path = PathBuf::from(&argv[i]);
+            }
+            "--golden-dir" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --golden-dir requires a path argument");
+                    return 2;
+                }
+                golden_dir = PathBuf::from(&argv[i]);
+            }
+            "-h" | "--help" => {
+                print_corpus_help();
+                return 0;
+            }
+            other => {
+                eprintln!("error: unknown option `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    match verify_golden_checksums(&checksums_path, &golden_dir) {
+        Ok(result) => {
+            println!(
+                "\n{} verified, {} failed, {} missing",
+                result.passed, result.failed, result.missing
+            );
+            i32::from(result.failed > 0 || result.missing > 0)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+struct VerifyResult {
+    passed: usize,
+    failed: usize,
+    missing: usize,
+}
+
+/// Read `checksums.sha256`, recompute each hash, and compare.
+fn verify_golden_checksums(
+    checksums_path: &Path,
+    golden_dir: &Path,
+) -> Result<VerifyResult, String> {
+    let contents = fs::read_to_string(checksums_path)
+        .map_err(|e| format!("cannot read {}: {e}", checksums_path.display()))?;
+
+    let mut passed: usize = 0;
+    let mut failed: usize = 0;
+    let mut missing: usize = 0;
+
+    for (line_no, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Format: "<hex>  <filename>" (two-space separator, sha256sum convention).
+        let Some((expected_hex, filename)) = line.split_once("  ") else {
+            eprintln!(
+                "warning: skipping malformed line {} in checksums file",
+                line_no + 1,
+            );
+            continue;
+        };
+        let expected_hex = expected_hex.trim();
+        let filename = filename.trim();
+
+        let file_path = golden_dir.join(filename);
+        if !file_path.exists() {
+            eprintln!("MISSING  {filename}");
+            missing += 1;
+            continue;
+        }
+
+        let actual_hex = match sha256_file(&file_path) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("ERROR    {filename}: {e}");
+                failed += 1;
+                continue;
+            }
+        };
+
+        if actual_hex == expected_hex {
+            println!("OK       {filename}");
+            passed += 1;
+        } else {
+            eprintln!("MISMATCH {filename}");
+            eprintln!("  expected: {expected_hex}");
+            eprintln!("  actual:   {actual_hex}");
+            failed += 1;
+        }
+    }
+
+    Ok(VerifyResult {
+        passed,
+        failed,
+        missing,
+    })
+}
+
+/// Compute the SHA-256 hex digest of a file.
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let data = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let hash = Sha256::digest(&data);
+    Ok(format!("{hash:x}"))
 }
 
 // ── run ─────────────────────────────────────────────────────────────────
@@ -454,6 +584,171 @@ mod tests {
                 dir.path().to_str().unwrap(),
             ]),
             0
+        );
+    }
+
+    // ── corpus verify tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_verify_all_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        fs::create_dir(&golden).unwrap();
+
+        // Create a test file.
+        let content = b"hello golden world";
+        fs::write(golden.join("test.db"), content).unwrap();
+
+        // Compute expected sha256.
+        let expected = format!("{:x}", Sha256::digest(content));
+
+        // Write checksums file.
+        let checksums = dir.path().join("checksums.sha256");
+        fs::write(&checksums, format!("{expected}  test.db\n")).unwrap();
+
+        let result = verify_golden_checksums(&checksums, &golden).unwrap();
+        assert_eq!(result.passed, 1);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.missing, 0);
+    }
+
+    #[test]
+    fn test_verify_mismatch_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        fs::create_dir(&golden).unwrap();
+
+        fs::write(golden.join("bad.db"), b"actual content").unwrap();
+
+        let checksums = dir.path().join("checksums.sha256");
+        let wrong_hash = "0".repeat(64);
+        fs::write(&checksums, format!("{wrong_hash}  bad.db\n")).unwrap();
+
+        let result = verify_golden_checksums(&checksums, &golden).unwrap();
+        assert_eq!(result.passed, 0);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.missing, 0);
+    }
+
+    #[test]
+    fn test_verify_missing_file_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        fs::create_dir(&golden).unwrap();
+
+        let checksums = dir.path().join("checksums.sha256");
+        let hash = "0".repeat(64);
+        fs::write(&checksums, format!("{hash}  nonexistent.db\n")).unwrap();
+
+        let result = verify_golden_checksums(&checksums, &golden).unwrap();
+        assert_eq!(result.passed, 0);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.missing, 1);
+    }
+
+    #[test]
+    fn test_verify_empty_checksums_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        fs::create_dir(&golden).unwrap();
+
+        let checksums = dir.path().join("checksums.sha256");
+        fs::write(&checksums, "\n").unwrap();
+
+        let result = verify_golden_checksums(&checksums, &golden).unwrap();
+        assert_eq!(result.passed, 0);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.missing, 0);
+    }
+
+    #[test]
+    fn test_verify_multiple_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        fs::create_dir(&golden).unwrap();
+
+        let a_content = b"file a";
+        let b_content = b"file b";
+        fs::write(golden.join("a.db"), a_content).unwrap();
+        fs::write(golden.join("b.db"), b_content).unwrap();
+
+        let a_hash = format!("{:x}", Sha256::digest(a_content));
+        let b_hash = format!("{:x}", Sha256::digest(b_content));
+
+        let checksums = dir.path().join("checksums.sha256");
+        fs::write(&checksums, format!("{a_hash}  a.db\n{b_hash}  b.db\n")).unwrap();
+
+        let result = verify_golden_checksums(&checksums, &golden).unwrap();
+        assert_eq!(result.passed, 2);
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.missing, 0);
+    }
+
+    #[test]
+    fn test_verify_via_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        fs::create_dir(&golden).unwrap();
+
+        let content = b"cli test data";
+        fs::write(golden.join("x.db"), content).unwrap();
+
+        let hash = format!("{:x}", Sha256::digest(content));
+        let checksums = dir.path().join("checksums.sha256");
+        fs::write(&checksums, format!("{hash}  x.db\n")).unwrap();
+
+        // Test via CLI interface.
+        assert_eq!(
+            run_with(&[
+                "realdb-e2e",
+                "corpus",
+                "verify",
+                "--checksums",
+                checksums.to_str().unwrap(),
+                "--golden-dir",
+                golden.to_str().unwrap(),
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn test_verify_via_cli_mismatch_exits_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        fs::create_dir(&golden).unwrap();
+
+        fs::write(golden.join("y.db"), b"content").unwrap();
+
+        let checksums = dir.path().join("checksums.sha256");
+        let wrong = "f".repeat(64);
+        fs::write(&checksums, format!("{wrong}  y.db\n")).unwrap();
+
+        assert_eq!(
+            run_with(&[
+                "realdb-e2e",
+                "corpus",
+                "verify",
+                "--checksums",
+                checksums.to_str().unwrap(),
+                "--golden-dir",
+                golden.to_str().unwrap(),
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn test_sha256_file_computes_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        fs::write(&path, b"hello").unwrap();
+
+        let result = sha256_file(&path).unwrap();
+        // Known sha256 of "hello".
+        assert_eq!(
+            result,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
 }
