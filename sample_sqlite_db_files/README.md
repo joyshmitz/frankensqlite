@@ -8,6 +8,59 @@ Local-only corpus of **real SQLite database files** used for end-to-end demos an
 - Always take a consistent snapshot using SQLite's backup API (`sqlite3 ... ".backup '...'"`).
 - Treat `golden/` as immutable. Do work on copies in `working/`.
 
+## Corpus Inclusion Policy (bd-1n0i)
+
+This corpus is curated. The goal is realistic fixtures without accidentally
+ingesting secrets/PII, huge blobs that make CI unusable, or inconsistent
+snapshots from live WAL-mode databases.
+
+### Inclusion Rules (Default Behavior)
+
+- Allowed roots: `/dp` by default (override with `realdb-e2e corpus scan --root ...`).
+- Allowed extensions: `.db`, `.sqlite`, `.sqlite3` (plus common Beads DB names like `beads.db`).
+- Size cap: `realdb-e2e` discovery/import refuses files over **512 MiB** by default.
+  - Override with `--max-file-size-mib <N>` (use `0` to disable the cap; not recommended).
+- WAL/SHM sidecars: import uses SQLite's backup API to capture a consistent snapshot.
+  - Sidecar presence (`-wal`, `-shm`, `-journal`) is recorded in metadata.
+
+### Sensitivity / Redaction Rules
+
+- Golden DB bytes are **never** committed to git (only checksums + metadata + manifests).
+- Metadata must never include row contents.
+- If a DB looks suspicious (tokens, emails, customer data), exclude it from the corpus rather
+  than trying to partially redact it.
+
+### Tagging Taxonomy
+
+`realdb-e2e corpus scan` emits heuristic discovery tags (project name, `beads`, size buckets).
+
+`realdb-e2e corpus import --tag <TAG>` stores a single stable classification tag in metadata:
+
+- `asupersync`, `frankentui`, `flywheel`, `frankensqlite`, `agent-mail`, `beads`, `misc`
+
+### Concrete Examples
+
+Beads DB (safe internal metadata, stable schema):
+
+```bash
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus import \
+  --db /dp/asupersync/.beads/beads.db --tag asupersync
+```
+
+WAL-mode DB with sidecars present at capture time:
+
+```bash
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus import \
+  --db /dp/flywheel_gateway/data/gateway.db --tag flywheel
+```
+
+Larger Beads DB (tens of MiB; fine locally, but consider CI impact):
+
+```bash
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus import \
+  --db /dp/flywheel_connectors/.beads/beads.db --tag flywheel
+```
+
 ## What Goes Where
 
 - `golden/`: immutable golden copies created from `/dp` sources (directory ignored by git).
@@ -42,6 +95,12 @@ src="/dp/asupersync/.beads/beads.db"
 dst="sample_sqlite_db_files/golden/asupersync.db"
 sqlite3 "$src" ".backup '$dst'"
 sqlite3 "$dst" "PRAGMA integrity_check;"
+```
+
+In most cases you should prefer the single command:
+
+```bash
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus import --db "$src" --tag asupersync
 ```
 
 ## How The Harness Uses This Corpus

@@ -24,6 +24,10 @@ use serde::Serialize;
 
 use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
 use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
+use fsqlite_e2e::fixture_metadata::{
+    FIXTURE_METADATA_SCHEMA_VERSION_V1, ColumnProfileV1, FixtureFeaturesV1, FixtureMetadataV1,
+    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
+};
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
@@ -140,12 +144,23 @@ ACTIONS:
 SCAN OPTIONS:
     --root <DIR>        Root directory to scan (default: /dp)
     --max-depth <N>     Maximum traversal depth (default: 6)
+    --max-file-size-mib <N>
+                        Skip files larger than N MiB during discovery (default: 512).
+                        Use 0 to disable the size cap (not recommended).
     --header-only       Only show files with valid SQLite magic header
 
 IMPORT OPTIONS:
     --db <PATH|NAME>        Source database path (preferred) or discovery filename/stem
     --id <DB_ID>            Override destination fixture id (default: sanitized stem)
-    --tag <LABEL>           Classification tag (stored in metadata)
+    --tag <LABEL>           Classification tag (stored in metadata).
+                            Stable tags: asupersync, frankentui, flywheel, frankensqlite,
+                            agent-mail, beads, misc
+    --pii-risk <LEVEL>      PII risk classification for metadata
+                            (unknown|unlikely|possible|likely; default: unknown)
+    --secrets-risk <LEVEL>  Secrets risk classification for metadata
+                            (unknown|unlikely|possible|likely; default: unknown)
+    --allow-for-ci          Mark fixture as allowed_for_ci=true in metadata
+                            (default: false; implicitly true when both risks are unlikely)
     --golden-dir <DIR>      Destination golden directory
                             (default: sample_sqlite_db_files/golden)
     --metadata-dir <DIR>    Destination metadata directory
@@ -156,6 +171,9 @@ IMPORT OPTIONS:
                             (default: /dp)
     --max-depth <N>         Discovery max-depth (only used when resolving NAME)
                             (default: 6)
+    --max-file-size-mib <N>
+                            Refuse to import files larger than N MiB unless overridden
+                            (default: 512). Use 0 to disable the size cap (not recommended).
     --allow-bad-header      Allow importing files failing SQLite magic header check
     --no-metadata           Skip metadata generation
 
@@ -168,6 +186,7 @@ VERIFY OPTIONS:
 fn cmd_corpus_scan(argv: &[String]) -> i32 {
     let mut root = "/dp".to_owned();
     let mut max_depth: usize = 6;
+    let mut max_file_size_mib: u64 = 512;
     let mut header_only = false;
 
     let mut i = 0;
@@ -193,6 +212,21 @@ fn cmd_corpus_scan(argv: &[String]) -> i32 {
                 };
                 max_depth = n;
             }
+            "--max-file-size-mib" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --max-file-size-mib requires an integer argument");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u64>() else {
+                    eprintln!(
+                        "error: invalid integer for --max-file-size-mib: `{}`",
+                        argv[i]
+                    );
+                    return 2;
+                };
+                max_file_size_mib = n;
+            }
             "--header-only" => header_only = true,
             "-h" | "--help" => {
                 print_corpus_help();
@@ -206,11 +240,20 @@ fn cmd_corpus_scan(argv: &[String]) -> i32 {
         i += 1;
     }
 
-    let config = fsqlite_harness::fixture_discovery::DiscoveryConfig {
+    let max_file_size = match mib_to_bytes(max_file_size_mib) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+
+    let mut config = fsqlite_harness::fixture_discovery::DiscoveryConfig {
         roots: vec![root.into()],
         max_depth,
         ..fsqlite_harness::fixture_discovery::DiscoveryConfig::default()
     };
+    config.max_file_size = max_file_size;
 
     match fsqlite_harness::fixture_discovery::discover_sqlite_files(&config) {
         Ok(candidates) => {
@@ -243,11 +286,15 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
     let mut db_arg: Option<String> = None;
     let mut id_override: Option<String> = None;
     let mut tag: Option<String> = None;
+    let mut pii_risk = RiskLevel::Unknown;
+    let mut secrets_risk = RiskLevel::Unknown;
+    let mut allow_for_ci = false;
     let mut golden_dir = PathBuf::from(DEFAULT_GOLDEN_DIR);
     let mut metadata_dir = PathBuf::from(DEFAULT_METADATA_DIR);
     let mut checksums_path = PathBuf::from(DEFAULT_CHECKSUMS_PATH);
     let mut root = PathBuf::from("/dp");
     let mut max_depth: usize = 6;
+    let mut max_file_size_mib: u64 = 512;
     let mut allow_bad_header = false;
     let mut write_metadata = true;
 
@@ -278,6 +325,35 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
                 }
                 tag = Some(argv[i].clone());
             }
+            "--pii-risk" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --pii-risk requires a level");
+                    return 2;
+                }
+                match RiskLevel::parse(&argv[i]) {
+                    Ok(v) => pii_risk = v,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return 2;
+                    }
+                }
+            }
+            "--secrets-risk" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --secrets-risk requires a level");
+                    return 2;
+                }
+                match RiskLevel::parse(&argv[i]) {
+                    Ok(v) => secrets_risk = v,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return 2;
+                    }
+                }
+            }
+            "--allow-for-ci" => allow_for_ci = true,
             "--golden-dir" => {
                 i += 1;
                 if i >= argv.len() {
@@ -322,6 +398,21 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
                 };
                 max_depth = n;
             }
+            "--max-file-size-mib" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --max-file-size-mib requires an integer");
+                    return 2;
+                }
+                let Ok(n) = argv[i].parse::<u64>() else {
+                    eprintln!(
+                        "error: invalid integer for --max-file-size-mib: `{}`",
+                        argv[i]
+                    );
+                    return 2;
+                };
+                max_file_size_mib = n;
+            }
             "--allow-bad-header" => allow_bad_header = true,
             "--no-metadata" => write_metadata = false,
             other => {
@@ -337,14 +428,34 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
         return 2;
     };
 
-    // Resolve source DB path. Prefer literal paths; otherwise do a bounded discovery scan.
-    let (source_path, source_tags, header_ok) = match resolve_source_db(db_arg, &root, max_depth) {
+    let max_file_size = match mib_to_bytes(max_file_size_mib) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
-            return 1;
+            return 2;
         }
     };
+
+    if let Some(tag) = tag.as_deref() {
+        if !fsqlite_harness::fixture_discovery::is_stable_corpus_tag(tag) {
+            eprintln!("error: unknown --tag `{tag}`");
+            eprintln!(
+                "help: allowed tags: {}",
+                fsqlite_harness::fixture_discovery::STABLE_CORPUS_TAGS.join(", ")
+            );
+            return 2;
+        }
+    }
+
+    // Resolve source DB path. Prefer literal paths; otherwise do a bounded discovery scan.
+    let (source_path, source_tags, header_ok) =
+        match resolve_source_db(db_arg, &root, max_depth, max_file_size) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 1;
+            }
+        };
 
     if !allow_bad_header && !header_ok {
         eprintln!(
@@ -353,6 +464,34 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
         );
         return 1;
     }
+
+    // Enforce size cap for literal paths too (discovery scan already does this).
+    let source_meta = match fs::metadata(&source_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: cannot stat {}: {e}", source_path.display());
+            return 1;
+        }
+    };
+    if source_meta.len() > max_file_size {
+        eprintln!(
+            "error: refusing to import {} ({} bytes) because it exceeds max size cap ({} MiB).",
+            source_path.display(),
+            source_meta.len(),
+            max_file_size_mib
+        );
+        eprintln!("help: pass --max-file-size-mib to override (0 disables the cap)");
+        return 2;
+    }
+    if source_meta.len() > 64 * 1024 * 1024 {
+        eprintln!(
+            "warning: importing a relatively large DB ({} bytes). \
+CI and local runs may be slow; prefer smaller fixtures when possible.",
+            source_meta.len()
+        );
+    }
+
+    let source_sidecars_present = detect_sidecars(&source_path);
 
     // Determine destination fixture id.
     let raw_id = id_override.as_deref().unwrap_or_else(|| {
@@ -435,12 +574,28 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
             return 1;
         }
 
+        let Some(golden_filename) = dest_db.file_name().and_then(|s| s.to_str()) else {
+            eprintln!("error: invalid golden filename");
+            return 1;
+        };
+
+        let allowed_for_ci = allow_for_ci
+            || (pii_risk == RiskLevel::Unlikely && secrets_risk == RiskLevel::Unlikely);
+
         match profile_database_for_metadata(
             &dest_db,
             &fixture_id,
             Some(&source_path),
+            golden_filename,
+            &dest_sha,
             tag.as_deref(),
             &source_tags,
+            &source_sidecars_present,
+            FixtureSafetyV1 {
+                pii_risk,
+                secrets_risk,
+                allowed_for_ci,
+            },
         ) {
             Ok(profile) => {
                 let out_path = metadata_dir.join(format!("{fixture_id}.json"));
@@ -479,6 +634,9 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
     }
     if !source_tags.is_empty() {
         println!("  tags: {}", source_tags.join(", "));
+    }
+    if !source_sidecars_present.is_empty() {
+        println!("  sidecars: {}", source_sidecars_present.join(", "));
     }
 
     0
@@ -1896,51 +2054,19 @@ struct CorruptReport {
     sha256_after: String,
 }
 
-/// Profile of a single SQLite database for metadata JSON.
-#[derive(Debug, Serialize)]
-struct DbProfile {
-    name: String,
-    source_path: Option<String>,
-    tag: Option<String>,
-    discovery_tags: Vec<String>,
-    file_size_bytes: u64,
-    page_size: u32,
-    page_count: u32,
-    freelist_count: u32,
-    schema_version: u32,
-    journal_mode: String,
-    user_version: u32,
-    application_id: u32,
-    tables: Vec<TableProfile>,
-    indices: Vec<String>,
-    triggers: Vec<String>,
-    views: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct TableProfile {
-    name: String,
-    row_count: u64,
-    columns: Vec<ColumnProfile>,
-}
-
-#[derive(Debug, Serialize)]
-struct ColumnProfile {
-    name: String,
-    #[serde(rename = "type")]
-    col_type: String,
-    primary_key: bool,
-    not_null: bool,
-    default_value: Option<String>,
-}
+// Fixture metadata is emitted using `fsqlite_e2e::fixture_metadata::FixtureMetadataV1`.
 
 fn profile_database_for_metadata(
     db_path: &Path,
     fixture_id: &str,
     source_path: Option<&Path>,
+    golden_filename: &str,
+    sha256_golden: &str,
     tag: Option<&str>,
     discovery_tags: &[String],
-) -> Result<DbProfile, String> {
+    sidecars_present: &[String],
+    safety: FixtureSafetyV1,
+) -> Result<FixtureMetadataV1, String> {
     let meta =
         fs::metadata(db_path).map_err(|e| format!("cannot stat {}: {e}", db_path.display()))?;
 
@@ -1950,6 +2076,9 @@ fn profile_database_for_metadata(
     )
     .map_err(|e| format!("cannot open {}: {e}", db_path.display()))?;
 
+    let encoding: String = conn
+        .query_row("PRAGMA encoding", [], |r| r.get(0))
+        .map_err(|e| format!("PRAGMA encoding: {e}"))?;
     let page_size: u32 = conn
         .query_row("PRAGMA page_size", [], |r| r.get(0))
         .map_err(|e| format!("PRAGMA page_size: {e}"))?;
@@ -1971,25 +2100,79 @@ fn profile_database_for_metadata(
     let application_id: u32 = conn
         .query_row("PRAGMA application_id", [], |r| r.get(0))
         .map_err(|e| format!("PRAGMA application_id: {e}"))?;
+    let auto_vacuum: u32 = conn
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .map_err(|e| format!("PRAGMA auto_vacuum: {e}"))?;
 
     let tables = collect_tables(&conn)?;
     let indices = collect_names(&conn, "index")?;
     let triggers = collect_names(&conn, "trigger")?;
     let views = collect_names(&conn, "view")?;
 
-    Ok(DbProfile {
-        name: fixture_id.to_owned(),
+    let has_fts = sqlite_master_sql_contains(&conn, "using fts")?;
+    let has_rtree = sqlite_master_sql_contains(&conn, "using rtree")?;
+    let has_foreign_keys = has_foreign_keys(&conn, &tables)?;
+
+    let has_wal_sidecars_observed = sidecars_present
+        .iter()
+        .any(|s| s == "-wal" || s == "-shm");
+
+    let features = FixtureFeaturesV1 {
+        has_wal_sidecars_observed,
+        has_fts,
+        has_rtree,
+        has_triggers: !triggers.is_empty(),
+        has_views: !views.is_empty(),
+        has_foreign_keys,
+    };
+
+    let mut tags: Vec<String> = Vec::new();
+    if let Some(t) = tag {
+        tags.push(t.to_owned());
+    }
+    tags.extend(discovery_tags.iter().cloned());
+    tags.push(size_bucket_tag(meta.len()).to_owned());
+    if journal_mode.eq_ignore_ascii_case("wal") {
+        tags.push("wal".to_owned());
+    }
+    if features.has_fts {
+        tags.push("fts".to_owned());
+    }
+    if features.has_rtree {
+        tags.push("rtree".to_owned());
+    }
+    if indices.len() > 20 {
+        tags.push("many-indexes".to_owned());
+    }
+    if tables.len() > 20 {
+        tags.push("many-tables".to_owned());
+    }
+    if tags.is_empty() {
+        tags.push("misc".to_owned());
+    }
+
+    Ok(FixtureMetadataV1 {
+        schema_version: FIXTURE_METADATA_SCHEMA_VERSION_V1,
+        db_id: fixture_id.to_owned(),
         source_path: source_path.map(|p| p.to_string_lossy().into_owned()),
-        tag: tag.map(str::to_owned),
-        discovery_tags: discovery_tags.to_vec(),
-        file_size_bytes: meta.len(),
-        page_size,
-        page_count,
-        freelist_count,
-        schema_version,
-        journal_mode,
-        user_version,
-        application_id,
+        golden_filename: golden_filename.to_owned(),
+        sha256_golden: sha256_golden.to_owned(),
+        size_bytes: meta.len(),
+        sidecars_present: sidecars_present.to_vec(),
+        sqlite_meta: SqliteMetaV1 {
+            page_size,
+            page_count,
+            freelist_count,
+            schema_version,
+            encoding,
+            user_version,
+            application_id,
+            journal_mode,
+            auto_vacuum,
+        },
+        features,
+        tags: normalize_tags(tags),
+        safety,
         tables,
         indices,
         triggers,
@@ -1997,8 +2180,50 @@ fn profile_database_for_metadata(
     })
 }
 
+fn sqlite_master_sql_contains(conn: &Connection, needle_lower: &str) -> Result<bool, String> {
+    let pattern = format!("%{needle_lower}%");
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM sqlite_master \
+             WHERE sql IS NOT NULL AND lower(sql) LIKE ?1 \
+             LIMIT 1",
+        )
+        .map_err(|e| format!("sqlite_master sql prepare: {e}"))?;
+    let mut rows = stmt
+        .query([pattern])
+        .map_err(|e| format!("sqlite_master sql query: {e}"))?;
+    Ok(rows
+        .next()
+        .map_err(|e| format!("sqlite_master sql next: {e}"))?
+        .is_some())
+}
+
+fn has_foreign_keys(conn: &Connection, tables: &[TableProfileV1]) -> Result<bool, String> {
+    for t in tables {
+        let sql = format!("PRAGMA foreign_key_list({})", quote_ident(&t.name));
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("PRAGMA foreign_key_list({}) prepare: {e}", t.name))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("PRAGMA foreign_key_list({}) query: {e}", t.name))?;
+        if rows
+            .next()
+            .map_err(|e| format!("PRAGMA foreign_key_list({}) next: {e}", t.name))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn collect_names(conn: &Connection, ty: &str) -> Result<Vec<String>, String> {
-    let sql = format!("SELECT name FROM sqlite_master WHERE type='{ty}' ORDER BY name");
+    let sql = format!(
+        "SELECT name FROM sqlite_master \
+         WHERE type='{ty}' AND name NOT LIKE 'sqlite_%' \
+         ORDER BY name"
+    );
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("sqlite_master({ty}) prepare: {e}"))?;
@@ -2008,7 +2233,7 @@ fn collect_names(conn: &Connection, ty: &str) -> Result<Vec<String>, String> {
     Ok(rows.flatten().collect())
 }
 
-fn collect_tables(conn: &Connection) -> Result<Vec<TableProfile>, String> {
+fn collect_tables(conn: &Connection) -> Result<Vec<TableProfileV1>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT name FROM sqlite_master \
@@ -2020,12 +2245,12 @@ fn collect_tables(conn: &Connection) -> Result<Vec<TableProfile>, String> {
         .query_map([], |r| r.get::<_, String>(0))
         .map_err(|e| format!("sqlite_master(table) query: {e}"))?;
 
-    let mut out: Vec<TableProfile> = Vec::new();
+    let mut out: Vec<TableProfileV1> = Vec::new();
     for row in rows {
         let Ok(table) = row else { continue };
         let cols = collect_table_columns(conn, &table)?;
         let row_count = count_rows(conn, &table)?;
-        out.push(TableProfile {
+        out.push(TableProfileV1 {
             name: table,
             row_count,
             columns: cols,
@@ -2034,7 +2259,7 @@ fn collect_tables(conn: &Connection) -> Result<Vec<TableProfile>, String> {
     Ok(out)
 }
 
-fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnProfile>, String> {
+fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnProfileV1>, String> {
     let sql = format!("PRAGMA table_info({})", quote_ident(table));
     let mut stmt = conn
         .prepare(&sql)
@@ -2057,7 +2282,7 @@ fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnPro
             r.get(4).map_err(|e| format!("col.default_value: {e}"))?;
         let primary_key_raw: i32 = r.get(5).map_err(|e| format!("col.pk flag: {e}"))?;
         let primary_key: bool = primary_key_raw != 0;
-        cols.push(ColumnProfile {
+        cols.push(ColumnProfileV1 {
             name,
             col_type,
             primary_key,
@@ -2111,10 +2336,35 @@ fn sanitize_db_id(raw: &str) -> Result<String, &'static str> {
     }
 }
 
+fn mib_to_bytes(mib: u64) -> Result<u64, String> {
+    if mib == 0 {
+        return Ok(u64::MAX);
+    }
+    mib.checked_mul(1024 * 1024)
+        .ok_or_else(|| format!("--max-file-size-mib value {mib} is too large"))
+}
+
+fn detect_sidecars(db_path: &Path) -> Vec<String> {
+    const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+    let mut present = Vec::new();
+
+    for suffix in SIDECARS {
+        let mut os = db_path.as_os_str().to_os_string();
+        os.push(suffix);
+        let path = PathBuf::from(os);
+        if path.exists() {
+            present.push(suffix.to_owned());
+        }
+    }
+
+    present
+}
+
 fn resolve_source_db(
     db_arg: &str,
     root: &Path,
     max_depth: usize,
+    max_file_size: u64,
 ) -> Result<(PathBuf, Vec<String>, bool), String> {
     let as_path = PathBuf::from(db_arg);
     if as_path.exists() {
@@ -2126,6 +2376,7 @@ fn resolve_source_db(
     let config = fsqlite_harness::fixture_discovery::DiscoveryConfig {
         roots: vec![root.to_path_buf()],
         max_depth,
+        max_file_size,
         ..fsqlite_harness::fixture_discovery::DiscoveryConfig::default()
     };
 

@@ -26,6 +26,16 @@ files.
 Every newly ingested golden copy must pass `PRAGMA integrity_check` before being
 used in any test or benchmark.
 
+**Rule 5: Keep fixtures CI-friendly (size caps).**
+Discovery/import defaults to a **512 MiB** size cap to keep scans and CI
+reasonable. Override with `--max-file-size-mib <N>` only when you have a
+compelling reason (use `0` to disable the cap; not recommended).
+
+**Rule 6: Use stable tags.**
+`realdb-e2e corpus import --tag <TAG>` only accepts a small stable tag set
+(`asupersync`, `frankentui`, `flywheel`, `frankensqlite`, `agent-mail`, `beads`,
+`misc`) so fixture selection and reporting stays predictable.
+
 ## Directory Layout
 
 ```
@@ -80,6 +90,15 @@ sqlite3 "$SRC" ".backup '$DST'"
 Do **not** use `cp` or `rsync` -- if the source has an active WAL or journal,
 a raw file copy may produce a corrupt database.
 
+**Preferred (one command):** use `realdb-e2e corpus import`, which performs the
+backup, runs `PRAGMA integrity_check`, updates `checksums.sha256`, and writes
+metadata:
+
+```bash
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus import \
+  --db /dp/asupersync/.beads/beads.db --tag asupersync
+```
+
 ### Step 3: Verify Integrity
 
 ```bash
@@ -91,6 +110,10 @@ If the check fails, the source may have been corrupted or the backup was
 interrupted.  Discard the file and retry.
 
 ### Step 4: Record the SHA-256 Checksum
+
+If you used `realdb-e2e corpus import`, this is done automatically and the tool
+will refuse to overwrite an existing checksum entry (golden files are
+immutable).
 
 ```bash
 sha256sum "$DST" | awk '{print $1 "  " FILENAME}' FILENAME="$(basename "$DST")" \
@@ -105,6 +128,9 @@ sha256sum *.db | sort -k2 > ../checksums.sha256
 ```
 
 ### Step 5: Capture Metadata
+
+If you used `realdb-e2e corpus import`, this is done automatically (and the
+metadata is intentionally schema/PRAGMA-focused: no row contents).
 
 Create a JSON metadata file under `metadata/`:
 
@@ -205,19 +231,16 @@ done < checksums.sha256
 ## Quick Start: Ingest and Smoke Test
 
 ```bash
-# 1. Ingest a fixture
-sqlite3 /dp/frankensqlite/.beads/beads.db \
-  ".backup 'sample_sqlite_db_files/golden/frankensqlite.db'"
+# 1. Ingest a fixture (backup + integrity_check + checksums + metadata)
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus import \
+  --db /dp/frankensqlite/.beads/beads.db --tag frankensqlite
 
-# 2. Verify integrity
-sqlite3 sample_sqlite_db_files/golden/frankensqlite.db \
-  "PRAGMA integrity_check;"
+# 2. Verify golden checksums
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus verify
 
-# 3. Update checksums
-cd sample_sqlite_db_files/golden && sha256sum *.db | sort -k2 > ../checksums.sha256
-
-# 4. Run the E2E smoke test
-cargo run -p fsqlite-e2e --bin realdb-e2e -- smoke
+# 3. Run a simple workload against C SQLite (working copy)
+cargo run -p fsqlite-e2e --bin realdb-e2e -- run \
+  --engine sqlite3 --db frankensqlite --workload commutative_inserts --concurrency 1
 ```
 
 A new contributor who follows these four steps will have a working fixture corpus
@@ -242,10 +265,10 @@ header check and `--allow-bad-header` is used during import.
 | Threshold | Value | Behavior |
 |-----------|-------|----------|
 | Soft cap (discovery) | 512 MiB | Files larger than this are skipped during `corpus scan`. |
-| Hard cap (golden) | No fixed limit | Large files are allowed in `golden/` but tagged `large`. |
+| Hard cap (import) | 512 MiB | `corpus import` refuses files larger than this unless overridden. |
 | CI-friendly subset | < 20 MiB | Tests that need fast turnaround should filter on the `small` or `medium` tags. |
 
-To override the soft cap during scan: increase `DiscoveryConfig::max_file_size`.
+To override the cap: pass `--max-file-size-mib <N>` (use `0` to disable; not recommended).
 
 ### WAL/SHM/Journal Sidecars
 
@@ -268,46 +291,39 @@ Skip a database if any of these apply:
 
 ## Tagging Taxonomy
 
-Tags provide a stable vocabulary for fixture selection and reporting.  Each
-golden file should have at least one project tag and one size tag.
+Two tag surfaces exist:
 
-### Project Tags
+- `tag` (manual, stable): set via `realdb-e2e corpus import --tag <TAG>` and stored in metadata.
+- `discovery_tags` (automatic): emitted by `realdb-e2e corpus scan` via path/size heuristics.
 
-Derived from the source path or assigned manually at import via `--tag`:
+The manual tag is intentionally restricted to a small stable vocabulary so selection/reporting
+doesn’t drift into one-off labels.
 
-| Tag | Description |
-|-----|-------------|
-| `beads` | Beads issue tracker databases (`.beads/beads.db`) |
-| `flywheel` | Flywheel ecosystem databases (connectors, gateway, private) |
-| `agent-tools` | Agent tooling databases (session search, skills, DCG, meta-skill) |
-| `app-data` | Application data databases (brenner-bot, idea-analyzer, prompts) |
-| `infra` | Infrastructure databases (asupersync, NTM, RCH, dp-level) |
-| `frankensqlite` | FrankenSQLite's own beads database |
-| `frankentui` | FrankenTUI's own beads database |
-
-### Size Tags (Auto-assigned)
-
-| Tag | Threshold |
-|-----|-----------|
-| `small` | < 64 KiB |
-| `medium` | 64 KiB - 4 MiB |
-| `large` | > 4 MiB |
-
-### Feature Tags (Optional)
+### Stable Manual Tags
 
 | Tag | When to use |
 |-----|-------------|
-| `wal` | Journal mode is WAL |
-| `many-indexes` | > 20 indexes |
-| `many-tables` | > 20 user tables |
-| `fts` | Contains FTS3/FTS5 virtual tables |
-| `custom-collation` | Uses non-default collation sequences |
+| `asupersync` | Fixtures sourced from `/dp/asupersync/...` |
+| `frankentui` | Fixtures sourced from `/dp/frankentui/...` |
+| `flywheel` | Fixtures sourced from `/dp/flywheel_*/*` (connectors/gateway/etc.) |
+| `frankensqlite` | Fixtures sourced from `/dp/frankensqlite/...` |
+| `agent-mail` | Fixtures sourced from Agent Mail tooling databases |
+| `beads` | Beads issue tracker DBs (`.beads/beads.db`) when a project tag is not needed |
+| `misc` | Anything that doesn’t fit cleanly above (prefer adding a stable tag over time) |
 
-### Tag Usage
+### Discovery Tags (Auto-assigned)
 
-- `realdb-e2e run --tag beads` selects only beads fixtures
-- Reports group results by tag for cross-fixture comparison
-- CI smoke tests filter on `small` + `medium` tags for speed
+Discovery tags are best-effort hints. Current heuristics include:
+
+- Project name tags (e.g., `asupersync`, `flywheel`, `frankensqlite`, `frankentui`)
+- `beads`, `cache`, `sample`, `test`
+- Size buckets: `small` (< 64 KiB), `medium` (64 KiB–4 MiB), `large` (> 4 MiB)
+
+### Notes
+
+- `journal_mode` is recorded in metadata (don’t encode it as a tag).
+- Tag-based selection for `run/bench/corrupt` can be built on top of metadata/manifest
+  (future work); today the CLI prints tags during scan/import.
 
 ## Sensitivity and PII Policy
 
@@ -352,46 +368,49 @@ information have been ingested.
 
 ## Concrete Examples
 
-### Example 1: Beads Database (WAL mode, medium size)
+### Example 1: Beads Database (asupersync)
 
 ```
-Source:  /dp/frankensqlite/.beads/beads.db
-db_id:   frankensqlite
-Tags:    beads, frankensqlite, large, wal
-Size:    ~10 MiB
-Journal: WAL
+Source:  /dp/asupersync/.beads/beads.db
+db_id:   asupersync
+Tags:    (manual) asupersync; (discovery) beads, large
 Tables:  issues, comments, dependencies, events, labels, ...
 PII:     unlikely (issue tracker metadata only)
 ```
 
 Import command:
 ```bash
-realdb-e2e corpus import --db /dp/frankensqlite/.beads/beads.db \
-  --id frankensqlite --tag beads
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus import \
+  --db /dp/asupersync/.beads/beads.db --tag asupersync
 ```
 
-### Example 2: Agent Tool Database (WAL mode, large)
+### Example 2: WAL-Mode DB With Sidecars (flywheel_gateway)
+
+```
+Source:  /dp/flywheel_gateway/data/gateway.db
+db_id:   flywheel_gateway
+Tags:    (manual) flywheel; (discovery) flywheel, large
+Sidecars present at capture: gateway.db-wal, gateway.db-shm
+PII:     unlikely (internal tooling metadata)
+```
+
+Import command:
+```bash
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus import \
+  --db /dp/flywheel_gateway/data/gateway.db --tag flywheel
+```
+
+### Example 3: Larger Beads DB (flywheel_connectors)
 
 ```
 Source:  /dp/flywheel_connectors/.beads/beads.db
 db_id:   flywheel_connectors
-Tags:    flywheel, large, wal, many-indexes
-Size:    ~17 MiB
-Journal: WAL
-Tables:  issues, comments, dependencies, events, labels, ...
-PII:     unlikely (flywheel project metadata)
+Tags:    (manual) flywheel; (discovery) flywheel, beads, large
+PII:     unlikely (internal project metadata)
 ```
 
-### Example 3: Small Infrastructure Database
-
+Import command:
+```bash
+cargo run -p fsqlite-e2e --bin realdb-e2e -- corpus import \
+  --db /dp/flywheel_connectors/.beads/beads.db --tag flywheel
 ```
-Source:  /dp/dp_level/dp_level.db
-db_id:   dp_level
-Tags:    infra, medium, wal
-Size:    ~3 MiB
-Journal: WAL
-Tables:  (project-specific infrastructure tables)
-PII:     unlikely (infrastructure metadata)
-```
-
-This fixture is useful for fast CI smoke tests due to its small size.

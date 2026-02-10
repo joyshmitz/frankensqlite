@@ -1007,11 +1007,6 @@ mod tests {
 
     #[test]
     fn test_comparison_runner_logical_state() {
-        // Known divergence: FrankenSQLite and C SQLite produce different
-        // logical dumps for `SELECT * FROM "t" ORDER BY rowid`, so the
-        // hash comparison is expected to fail until rowid ordering is
-        // fully implemented.  We verify both hashes are non-empty and
-        // that statement-level execution still agrees.
         let runner = ComparisonRunner::new_in_memory().unwrap();
         let stmts = vec![
             "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)".to_owned(),
@@ -1025,7 +1020,11 @@ mod tests {
         let hash = runner.compare_logical_state();
         assert!(!hash.frank_sha256.is_empty());
         assert!(!hash.csqlite_sha256.is_empty());
-        // TODO: assert!(hash.matched) once FrankenSQLite rowid ordering matches C SQLite
+        assert!(
+            hash.matched,
+            "logical state hash mismatch: frank={} csqlite={}",
+            hash.frank_sha256, hash.csqlite_sha256
+        );
     }
 
     #[test]

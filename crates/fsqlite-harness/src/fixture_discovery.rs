@@ -30,6 +30,30 @@ use std::path::{Path, PathBuf};
 
 // ── Configuration ────────────────────────────────────────────────────────
 
+/// Stable tag taxonomy for fixture selection and reporting.
+///
+/// These tags are used by `realdb-e2e` and related tooling. Add new tags
+/// intentionally; the goal is a small, predictable vocabulary (not a grab-bag
+/// of one-off labels).
+pub const STABLE_CORPUS_TAGS: &[&str] = &[
+    // Project/workspace tags.
+    "asupersync",
+    "frankentui",
+    "flywheel",
+    "frankensqlite",
+    "agent-mail",
+    "beads",
+    // Generic buckets.
+    "misc",
+];
+
+/// Returns true if `tag` is part of the stable corpus taxonomy.
+#[must_use]
+pub fn is_stable_corpus_tag(tag: &str) -> bool {
+    let t = tag.trim().to_ascii_lowercase();
+    STABLE_CORPUS_TAGS.iter().any(|v| *v == t)
+}
+
 /// Configuration for the SQLite file discovery scan.
 #[derive(Debug, Clone)]
 pub struct DiscoveryConfig {
@@ -185,38 +209,62 @@ fn check_sqlite_header(path: &Path) -> bool {
     buf == *SQLITE_MAGIC
 }
 
+fn push_tag(tags: &mut Vec<String>, tag: &str) {
+    if !tags.iter().any(|t| t == tag) {
+        tags.push(tag.to_owned());
+    }
+}
+
 /// Classify a file path into tags based on heuristics.
 fn classify_path(path: &Path) -> Vec<String> {
     let s = path.to_string_lossy().to_lowercase();
     let mut tags = Vec::new();
 
-    if s.contains(".beads/") || s.contains("beads.db") {
-        tags.push("beads".to_owned());
+    // Stable taxonomy tags (used for selection/reporting).
+    if s.contains("/dp/asupersync/") || s.contains("asupersync") {
+        push_tag(&mut tags, "asupersync");
     }
+    if s.contains("/dp/frankentui/") || s.contains("frankentui") {
+        push_tag(&mut tags, "frankentui");
+    }
+    if s.contains("/dp/flywheel/") || s.contains("flywheel") {
+        push_tag(&mut tags, "flywheel");
+    }
+    if s.contains("/dp/frankensqlite/") || s.contains("frankensqlite") {
+        push_tag(&mut tags, "frankensqlite");
+    }
+    if s.contains("mcp_agent_mail") || s.contains("agent_mail") || s.contains("agent-mail") {
+        push_tag(&mut tags, "agent-mail");
+    }
+    if s.contains(".beads/") || s.contains("beads.db") {
+        push_tag(&mut tags, "beads");
+    }
+
+    // Non-stable, descriptive tags (helpful during scanning).
     if s.contains("cache") {
-        tags.push("cache".to_owned());
+        push_tag(&mut tags, "cache");
     }
     if s.contains("sample") || s.contains("example") || s.contains("demo") {
-        tags.push("sample".to_owned());
+        push_tag(&mut tags, "sample");
     }
     if s.contains("northwind") {
-        tags.push("northwind".to_owned());
+        push_tag(&mut tags, "northwind");
     }
     if s.contains("chinook") {
-        tags.push("chinook".to_owned());
+        push_tag(&mut tags, "chinook");
     }
     if s.contains("test") {
-        tags.push("test".to_owned());
+        push_tag(&mut tags, "test");
     }
 
     // Size classification from file name patterns.
     let size_hint = path.metadata().map_or(0, |m| m.len());
     if size_hint < 64 * 1024 {
-        tags.push("small".to_owned());
+        push_tag(&mut tags, "small");
     } else if size_hint < 4 * 1024 * 1024 {
-        tags.push("medium".to_owned());
+        push_tag(&mut tags, "medium");
     } else {
-        tags.push("large".to_owned());
+        push_tag(&mut tags, "large");
     }
 
     tags

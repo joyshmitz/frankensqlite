@@ -17,13 +17,22 @@ This folder is intentionally flexible, but metadata should generally include:
 - `source_path` (original `/dp/...` path used to seed the golden copy)
 - `golden_filename` (file under `../golden/`)
 - `sha256_golden` + `size_bytes`
-- `sidecars` present at capture time (`-wal`, `-shm`, `-journal`), if known
+- `sidecars_present` at capture time (`-wal`, `-shm`, `-journal`), if known
 - SQLite PRAGMAs (best-effort):
   - `page_size`, `encoding`, `user_version`, `application_id`, `journal_mode`, `auto_vacuum`
 - Schema summaries (best-effort):
   - list of tables/indexes/views/triggers
   - per-table row counts (optional; can be expensive on large DBs)
   - freelist/page stats (`page_count`, `freelist_count`) for storage-shape diversity
+
+### Tags
+
+`realdb-e2e corpus scan` emits heuristic `discovery_tags` derived from path/size heuristics.
+
+`realdb-e2e corpus import --tag <TAG>` records a single stable `tag` used for selection/reporting.
+Stable tags are intentionally small:
+
+- `asupersync`, `frankentui`, `flywheel`, `frankensqlite`, `agent-mail`, `beads`, `misc`
 
 ## Safety / Redaction
 
