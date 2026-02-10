@@ -1,53 +1,34 @@
-# sample_sqlite_db_files/
+# sample_sqlite_db_files
 
-Fixture staging area for FrankenSQLite E2E integration tests and demos.
-
-## Directory Layout
-
-```
-sample_sqlite_db_files/
-  golden/      Read-only reference copies of real SQLite databases
-  work/        Mutable working copies created at test time (gitignored)
-  manifests/   JSON manifests with metadata, checksums, and run results
-```
+Local-only corpus of **real SQLite database files** used for end-to-end demos and benchmarking.
 
 ## Safety Rules
 
-1. **Never run tests against originals in `/dp/`.** Always copy to `golden/` first via `sqlite3 <src> ".backup '<dst>'"`.
-2. **Golden copies are read-only.** After placing a file in `golden/`, mark it `chmod -w`. Tests must never modify golden files.
-3. **Always operate on `work/` copies.** Before any mutating operation, copy the golden file into `work/` and operate on the copy.
-4. **Verify checksums before use.** Each golden file has a SHA-256 recorded in its manifest. If the checksum changes, fail fast.
-5. **Database bytes are gitignored.** Only manifests (`.json`), this README, and `.gitignore` are committed. Raw `.db`/`.sqlite` files are never checked in.
+- NEVER run tests or demos against `/dp/...` originals.
+- Always take a consistent snapshot using SQLite's backup API (`sqlite3 ... ".backup '...'"`).
+- Treat `golden/` as immutable. Do work on copies in `working/`.
 
-## Adding a New Fixture
+## What Goes Where
+
+- `golden/`: immutable golden copies created from `/dp` sources (directory ignored by git).
+- `working/`: ephemeral mutable copies created per run (directory ignored by git).
+- `metadata/`: tracked JSON/markdown describing each golden DB (schema summary, stats, etc.).
+- `checksums.sha256`: tracked master checksum file for golden DBs (populated by a later task).
+
+## Snapshot Copy (Recommended)
+
+Prefer `.backup` over `cp` because some source DBs may have active WAL/SHM files.
+
+Example:
 
 ```bash
-# 1. Back up the source database (safe, read-only operation)
-sqlite3 /dp/some-project/.beads/beads.db ".backup 'sample_sqlite_db_files/golden/some-project-beads.db'"
-
-# 2. Make it read-only
-chmod -w sample_sqlite_db_files/golden/some-project-beads.db
-
-# 3. Generate checksum
-sha256sum sample_sqlite_db_files/golden/some-project-beads.db
-
-# 4. Add manifest entry in manifests/
+src="/dp/asupersync/.beads/beads.db"
+dst="sample_sqlite_db_files/golden/asupersync.db"
+sqlite3 "$src" ".backup '$dst'"
+sqlite3 "$dst" "PRAGMA integrity_check;"
 ```
 
-## Manifest Format
+## Git Hygiene
 
-Each manifest file in `manifests/` is a JSON array:
+This repo must never commit DB bytes from `/dp`. Only metadata + checksums are tracked.
 
-```json
-[
-  {
-    "name": "some-project-beads",
-    "source": "/dp/some-project/.beads/beads.db",
-    "golden_path": "golden/some-project-beads.db",
-    "sha256": "abc123...",
-    "size_bytes": 12345,
-    "table_count": 3,
-    "tags": ["beads", "small"]
-  }
-]
-```

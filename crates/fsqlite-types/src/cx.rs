@@ -598,7 +598,8 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         let prev = self.inner.mask_depth.fetch_add(1, Ordering::AcqRel);
         if prev >= MAX_MASK_DEPTH {
             self.inner.mask_depth.fetch_sub(1, Ordering::Release);
-            panic!(
+            assert!(
+                prev < MAX_MASK_DEPTH,
                 "MAX_MASK_DEPTH ({MAX_MASK_DEPTH}) exceeded: mask nesting depth would be {}",
                 prev + 1
             );

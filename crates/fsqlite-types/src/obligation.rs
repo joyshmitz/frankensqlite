@@ -180,10 +180,14 @@ impl Drop for Obligation {
             }
             match self.mode {
                 ObligationMode::Lab => {
-                    panic!(
-                        "obligation leak: {:?} id={} created_at={}",
-                        self.kind, self.id, self.created_at
-                    );
+                    // Panicking during unwinding aborts the process; only raise
+                    // a hard failure when we're not already handling a panic.
+                    if !std::thread::panicking() {
+                        std::panic::panic_any(format!(
+                            "obligation leak: {:?} id={} created_at={}",
+                            self.kind, self.id, self.created_at
+                        ));
+                    }
                 }
                 ObligationMode::Production => {
                     // In production, the leak is recorded in the ledger.

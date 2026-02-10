@@ -116,7 +116,7 @@ USAGE:
 ACTIONS:
     scan        Discover SQLite databases under configured roots
     import      Copy a discovered database into golden/ with checksums
-    verify      Verify all golden copies match their manifest entries
+    verify      Verify all golden copies match their checksums entries
 
 SCAN OPTIONS:
     --root <DIR>        Root directory to scan (default: /dp)
@@ -128,7 +128,7 @@ IMPORT OPTIONS:
     --tag <LABEL>       Classification tag (beads, sample, test, etc.)
 
 VERIFY OPTIONS:
-    --manifest <PATH>   Path to manifest JSONL (default: sample_sqlite_db_files/manifests/golden.jsonl)
+    --checksums <PATH>  Path to checksums file (default: sample_sqlite_db_files/checksums.sha256)
 ";
     let _ = io::stdout().write_all(text.as_bytes());
 }
