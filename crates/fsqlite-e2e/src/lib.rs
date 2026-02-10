@@ -9,6 +9,7 @@
 pub mod bench_summary;
 pub mod benchmark;
 pub mod canonicalize;
+pub mod ci_smoke;
 pub mod comparison;
 pub mod corruption;
 pub mod corruption_demo_sqlite;

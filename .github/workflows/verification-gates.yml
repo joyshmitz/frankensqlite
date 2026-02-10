@@ -30,6 +30,16 @@ jobs:
           # If golden .db files are present, verify their hashes match
           cargo test -p fsqlite-e2e --test golden_integrity -- golden_checksum_file_matches_actual_hashes --nocapture
 
+      - name: E2E smoke test (deterministic workload + integrity check)
+        run: |
+          echo "=== E2E smoke test ==="
+          cargo run -p fsqlite-e2e --bin e2e-runner -- run-smoke --json \
+            2>&1 | tee artifacts/e2e_smoke.json
+          echo "=== E2E correctness tests ==="
+          cargo run -p fsqlite-e2e --bin e2e-runner -- \
+            --output artifacts/e2e-correctness --json run-correctness \
+            2>&1 | tee artifacts/e2e_correctness.json
+
       - name: Run Phase 1-3 verification gates
         run: |
           cargo run -p fsqlite-harness --bin phase_1_3_gate_runner -- artifacts/phase_1_3_gate_report.json \
@@ -44,6 +54,19 @@ jobs:
         run: |
           cargo run -p fsqlite-harness --bin phase_7_9_gate_runner -- artifacts/phase_7_9_gate_report.json \
             2>&1 | tee artifacts/phase_7_9_gate_runner.log
+
+      - name: "Perf regression tracking (optional, non-blocking)"
+        continue-on-error: true
+        run: |
+          echo "=== Perf regression: concurrency workload ==="
+          # Create a tiny seed database for the perf workload.
+          mkdir -p /tmp/perf-seed
+          sqlite3 /tmp/perf-seed/seed.db "CREATE TABLE seed (id INTEGER PRIMARY KEY);"
+          cargo run -p fsqlite-e2e --bin realdb-e2e -- run \
+            --engine sqlite3 --db /tmp/perf-seed/seed.db --workload commutative_inserts \
+            --concurrency 1,2,4 --repeat 3 --output-jsonl artifacts/perf_regression.jsonl \
+            2>&1 | tee artifacts/perf_regression.log || true
+          echo "=== Perf data captured (non-blocking) ==="
 
       - name: Upload verification gate artifacts
         if: always()
