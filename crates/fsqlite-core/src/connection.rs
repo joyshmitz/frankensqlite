@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use fsqlite_ast::{
@@ -82,6 +83,9 @@ pub struct PreparedStatement {
     func_registry: Option<Arc<FunctionRegistry>>,
     expression_postprocess: Option<ExpressionPostprocess>,
     distinct: bool,
+    /// For table-backed SELECT, the statement must execute against the same
+    /// MemDatabase as the Connection that prepared it.
+    db: Option<Rc<RefCell<MemDatabase>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -110,12 +114,21 @@ impl std::fmt::Debug for PreparedStatement {
 impl PreparedStatement {
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
-        let mut rows = execute_program_with_postprocess(
-            &self.program,
-            None,
-            self.func_registry.as_ref(),
-            self.expression_postprocess.as_ref(),
-        )?;
+        let mut rows = if let Some(db) = self.db.as_ref() {
+            let Some(registry) = self.func_registry.as_ref() else {
+                return Err(FrankenError::Internal(
+                    "prepared statement missing function registry".to_owned(),
+                ));
+            };
+            execute_table_program_with_db(&self.program, None, registry, db)?
+        } else {
+            execute_program_with_postprocess(
+                &self.program,
+                None,
+                self.func_registry.as_ref(),
+                self.expression_postprocess.as_ref(),
+            )?
+        };
         if self.distinct {
             dedup_rows(&mut rows);
         }
@@ -124,12 +137,21 @@ impl PreparedStatement {
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        let mut rows = execute_program_with_postprocess(
-            &self.program,
-            Some(params),
-            self.func_registry.as_ref(),
-            self.expression_postprocess.as_ref(),
-        )?;
+        let mut rows = if let Some(db) = self.db.as_ref() {
+            let Some(registry) = self.func_registry.as_ref() else {
+                return Err(FrankenError::Internal(
+                    "prepared statement missing function registry".to_owned(),
+                ));
+            };
+            execute_table_program_with_db(&self.program, Some(params), registry, db)?
+        } else {
+            execute_program_with_postprocess(
+                &self.program,
+                Some(params),
+                self.func_registry.as_ref(),
+                self.expression_postprocess.as_ref(),
+            )?
+        };
         if self.distinct {
             dedup_rows(&mut rows);
         }
@@ -185,7 +207,7 @@ struct SavepointEntry {
 pub struct Connection {
     path: String,
     /// In-memory table storage (shared with the VDBE engine during execution).
-    db: RefCell<MemDatabase>,
+    db: Rc<RefCell<MemDatabase>>,
     /// Schema registry: table metadata used by the code generator.
     schema: RefCell<Vec<TableSchema>>,
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
@@ -203,6 +225,10 @@ pub struct Connection {
     persist_suspended: RefCell<bool>,
     /// Number of rows affected by the most recent DML statement.
     last_changes: RefCell<usize>,
+    /// Whether the current transaction was started implicitly by SAVEPOINT
+    /// (as opposed to an explicit BEGIN).  Used by RELEASE to decide whether
+    /// to auto-commit when the last savepoint is released.
+    implicit_txn: RefCell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -229,7 +255,7 @@ impl Connection {
         let persist_path = (path != ":memory:").then(|| path.clone());
         let conn = Self {
             path,
-            db: RefCell::new(MemDatabase::new()),
+            db: Rc::new(RefCell::new(MemDatabase::new())),
             schema: RefCell::new(Vec::new()),
             func_registry: default_function_registry(),
             in_transaction: RefCell::new(false),
@@ -238,6 +264,7 @@ impl Connection {
             persist_path,
             persist_suspended: RefCell::new(false),
             last_changes: RefCell::new(0),
+            implicit_txn: RefCell::new(false),
         };
         conn.load_persisted_state_if_present()?;
         Ok(conn)
@@ -380,7 +407,7 @@ impl Connection {
                     fsqlite_ast::InsertSource::DefaultValues => 1,
                     fsqlite_ast::InsertSource::Select(sel) => {
                         // Run the inner SELECT to determine row count.
-                        self.execute_statement(Statement::Select(*sel.clone()), None)?
+                        self.execute_statement(Statement::Select(*sel.clone()), params)?
                             .len()
                     }
                 };
@@ -448,6 +475,7 @@ impl Connection {
                     func_registry: registry,
                     expression_postprocess,
                     distinct: is_distinct_select(select),
+                    db: None,
                 })
             }
             Statement::Select(select) => {
@@ -457,6 +485,7 @@ impl Connection {
                     func_registry: registry,
                     expression_postprocess: None,
                     distinct: is_distinct_select(select),
+                    db: Some(Rc::clone(&self.db)),
                 })
             }
             _ => Err(FrankenError::NotImplemented(
@@ -581,6 +610,7 @@ impl Connection {
         *self.txn_snapshot.borrow_mut() = None;
         self.savepoints.borrow_mut().clear();
         *self.in_transaction.borrow_mut() = false;
+        *self.implicit_txn.borrow_mut() = false;
         Ok(())
     }
 
@@ -612,6 +642,7 @@ impl Connection {
             *self.txn_snapshot.borrow_mut() = None;
             self.savepoints.borrow_mut().clear();
             *self.in_transaction.borrow_mut() = false;
+            *self.implicit_txn.borrow_mut() = false;
         }
         Ok(())
     }
@@ -623,6 +654,7 @@ impl Connection {
         if !*self.in_transaction.borrow() {
             *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
             *self.in_transaction.borrow_mut() = true;
+            *self.implicit_txn.borrow_mut() = true;
         }
         self.savepoints.borrow_mut().push(SavepointEntry {
             name: name.to_owned(),
@@ -641,10 +673,13 @@ impl Connection {
         // RELEASE removes the named savepoint and all savepoints created after it.
         savepoints.truncate(idx);
         // If no savepoints remain and we started implicitly, end the transaction.
-        if savepoints.is_empty() && self.txn_snapshot.borrow().is_some() {
+        if savepoints.is_empty() && *self.implicit_txn.borrow() {
             drop(savepoints);
             // Implicit transaction via savepoint: commit on final release.
             // (If the user did explicit BEGIN, they still need COMMIT.)
+            *self.txn_snapshot.borrow_mut() = None;
+            *self.in_transaction.borrow_mut() = false;
+            *self.implicit_txn.borrow_mut() = false;
         }
         Ok(())
     }
@@ -924,36 +959,7 @@ impl Connection {
         program: &VdbeProgram,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let mut engine = VdbeEngine::new(program.register_count());
-        if let Some(params) = params {
-            validate_bound_parameters(program, params)?;
-            engine.set_bindings(params.to_vec());
-        }
-
-        engine.set_function_registry(Arc::clone(&self.func_registry));
-        engine.enable_storage_read_cursors(true);
-
-        // Lend the MemDatabase to the engine for the duration of execution.
-        let db = self.db.replace(MemDatabase::new());
-        engine.set_database(db);
-
-        let outcome = engine.execute(program)?;
-
-        // Take the database back from the engine.
-        if let Some(db) = engine.take_database() {
-            *self.db.borrow_mut() = db;
-        }
-
-        match outcome {
-            ExecOutcome::Done => Ok(engine
-                .take_results()
-                .into_iter()
-                .map(|values| Row { values })
-                .collect()),
-            ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
-                "VDBE halted with code {code}: {message}",
-            ))),
-        }
+        execute_table_program_with_db(program, params, &self.func_registry, &self.db)
     }
 
     fn load_persisted_state_if_present(&self) -> Result<()> {
@@ -1163,6 +1169,15 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
     match name {
         "count" => SqliteValue::Integer(values.len() as i64),
         "sum" | "total" => {
+            // SQLite: total() always returns 0.0 for empty input;
+            // sum() returns NULL when all values are NULL (empty after pre-filter).
+            if values.is_empty() {
+                return if name == "total" {
+                    SqliteValue::Float(0.0)
+                } else {
+                    SqliteValue::Null
+                };
+            }
             let mut sum = 0.0_f64;
             let mut has_int = false;
             let mut all_int = true;
@@ -1237,16 +1252,43 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
                     _ => String::new(),
                 })
                 .collect();
-            SqliteValue::Text(parts.join(","))
+            // SQLite: GROUP_CONCAT returns NULL when all values are NULL.
+            if parts.is_empty() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Text(parts.join(","))
+            }
         }
         _ => SqliteValue::Null,
     }
 }
 
-/// Compare two `SqliteValue`s for ordering (used by min/max aggregates).
+/// Compare two `SqliteValue`s for ordering.
+///
+/// SQLite type ordering: NULL < INTEGER/REAL < TEXT < BLOB.
+/// Within the same type class, values compare naturally.
 fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
     use std::cmp::Ordering;
+
+    /// Return a numeric rank for the SQLite type affinity ordering.
+    fn type_rank(v: &SqliteValue) -> u8 {
+        match v {
+            SqliteValue::Null => 0,
+            SqliteValue::Integer(_) | SqliteValue::Float(_) => 1,
+            SqliteValue::Text(_) => 2,
+            SqliteValue::Blob(_) => 3,
+        }
+    }
+
+    let rank_a = type_rank(a);
+    let rank_b = type_rank(b);
+    if rank_a != rank_b {
+        return rank_a.cmp(&rank_b);
+    }
+
+    // Same type class — compare within class.
     match (a, b) {
+        (SqliteValue::Null, SqliteValue::Null) => Ordering::Equal,
         (SqliteValue::Integer(a), SqliteValue::Integer(b)) => a.cmp(b),
         (SqliteValue::Float(a), SqliteValue::Float(b)) => {
             a.partial_cmp(b).unwrap_or(Ordering::Equal)
@@ -1258,12 +1300,12 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
             a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
         }
         (SqliteValue::Text(a), SqliteValue::Text(b)) => a.cmp(b),
-        _ => Ordering::Equal,
+        (SqliteValue::Blob(a), SqliteValue::Blob(b)) => a.cmp(b),
+        _ => unreachable!("unreachable given rank check above"),
     }
 }
 
 /// Sort result rows by ORDER BY terms (for GROUP BY post-processing).
-#[allow(dead_code)]
 fn sort_rows_by_order_terms(
     rows: &mut [Row],
     order_by: &[OrderingTerm],
@@ -1314,7 +1356,7 @@ fn sort_rows_by_order_terms(
 }
 
 /// Apply LIMIT and OFFSET to a result set (GROUP BY post-processing).
-#[allow(dead_code, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn apply_limit_offset_postprocess(rows: &mut Vec<Row>, limit_clause: &LimitClause) {
     let limit_val = match &limit_clause.limit {
         Expr::Literal(Literal::Integer(n), _) => *n as usize,
@@ -1400,6 +1442,44 @@ fn execute_program_with_postprocess(
         apply_expression_postprocess(&mut rows, postprocess)?;
     }
     Ok(rows)
+}
+
+fn execute_table_program_with_db(
+    program: &VdbeProgram,
+    params: Option<&[SqliteValue]>,
+    func_registry: &Arc<FunctionRegistry>,
+    db: &Rc<RefCell<MemDatabase>>,
+) -> Result<Vec<Row>> {
+    let mut engine = VdbeEngine::new(program.register_count());
+    if let Some(params) = params {
+        validate_bound_parameters(program, params)?;
+        engine.set_bindings(params.to_vec());
+    }
+
+    engine.set_function_registry(Arc::clone(func_registry));
+    engine.enable_storage_read_cursors(true);
+
+    // Lend the MemDatabase to the engine for the duration of execution.
+    let db_value = db.replace(MemDatabase::new());
+    engine.set_database(db_value);
+
+    // Always take the DB back, even if execution returns Err.
+    let exec_res = engine.execute(program);
+    if let Some(db_value) = engine.take_database() {
+        *db.borrow_mut() = db_value;
+    }
+    let outcome = exec_res?;
+
+    match outcome {
+        ExecOutcome::Done => Ok(engine
+            .take_results()
+            .into_iter()
+            .map(|values| Row { values })
+            .collect()),
+        ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
+            "VDBE halted with code {code}: {message}",
+        ))),
+    }
 }
 
 fn build_expression_postprocess(select: &SelectStatement) -> ExpressionPostprocess {

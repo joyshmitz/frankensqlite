@@ -210,7 +210,7 @@ fn test_case_when_simple() {
         match id {
             1 => assert_eq!(val, "yes"),
             2 => assert_eq!(val, "no"),
-            _ => panic!("unexpected id {id}"),
+            _ => unreachable!("unexpected id {id}"),
         }
     }
 }
@@ -318,7 +318,7 @@ fn test_aggregate_count_with_group_by() {
         match flag {
             0 => assert_eq!(count, 2),
             1 => assert_eq!(count, 3),
-            _ => panic!("unexpected flag {flag}"),
+            _ => unreachable!("unexpected flag {flag}"),
         }
     }
 }
@@ -399,6 +399,21 @@ fn test_multi_row_insert() {
     assert_eq!(int(&rows[0], 0), 1);
     assert_eq!(int(&rows[1], 0), 2);
     assert_eq!(int(&rows[2], 0), 3);
+}
+
+// ── PreparedStatement (table-backed SELECT) ───────────────────────────────
+
+#[test]
+fn test_prepared_select_from_table_uses_connection_state() {
+    let conn = Connection::open(":memory:").unwrap();
+    conn.execute("CREATE TABLE p (v INTEGER);").unwrap();
+    conn.execute("INSERT INTO p VALUES (1), (2);").unwrap();
+
+    let stmt = conn.prepare("SELECT v FROM p ORDER BY v;").unwrap();
+    let rows = stmt.query().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(int(&rows[0], 0), 1);
+    assert_eq!(int(&rows[1], 0), 2);
 }
 
 // ── CAST expressions ────────────────────────────────────────────────────────

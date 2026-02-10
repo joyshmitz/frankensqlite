@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::env;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fsqlite_error::{FrankenError, Result};
@@ -8,6 +10,10 @@ use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
+use crate::shm::{
+    SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
+    WAL_TOTAL_LOCKS,
+};
 use crate::traits::{Vfs, VfsFile};
 
 /// Shared storage for all files in the memory VFS.
@@ -23,7 +29,53 @@ struct FileStorage {
 #[derive(Debug, Default)]
 struct MemoryVfsInner {
     files: HashMap<PathBuf, Arc<Mutex<FileStorage>>>,
+    shm: HashMap<PathBuf, Arc<Mutex<MemoryShmInfo>>>,
     next_temp_id: u64,
+}
+
+// ---------------------------------------------------------------------------
+// SHM table — in-process SHM region + lock coordination for MemoryVfs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct ShmSlotState {
+    shared_holders: HashMap<u64, u32>,
+    exclusive_owner: Option<u64>,
+}
+
+#[derive(Debug)]
+struct MemoryShmInfo {
+    regions: HashMap<u32, ShmRegion>,
+    slots: Vec<ShmSlotState>,
+    owner_refs: HashMap<u64, u32>,
+}
+
+impl MemoryShmInfo {
+    fn new() -> Self {
+        // Slots 0..WAL_TOTAL_LOCKS are the legacy WAL lock slots.
+        // Slot WAL_TOTAL_LOCKS is reserved (deadman switch in C SQLite).
+        let slot_count =
+            usize::try_from(WAL_TOTAL_LOCKS.saturating_add(1)).expect("WAL lock count fits usize");
+        Self {
+            regions: HashMap::new(),
+            slots: std::iter::repeat_with(ShmSlotState::default)
+                .take(slot_count)
+                .collect(),
+            owner_refs: HashMap::new(),
+        }
+    }
+}
+
+static SHM_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn next_shm_owner_id() -> u64 {
+    SHM_OWNER_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn sqlite_shm_path(path: &Path) -> PathBuf {
+    let mut shm = OsString::from(path.as_os_str());
+    shm.push("-shm");
+    PathBuf::from(shm)
 }
 
 /// An in-memory VFS for testing and in-memory databases.
@@ -93,12 +145,18 @@ impl Vfs for MemoryVfs {
 
         drop(inner);
 
+        let shm_owner_id = next_shm_owner_id();
+        let shm_path = sqlite_shm_path(&resolved_path);
+
         let file = MemoryFile {
             path: resolved_path,
             storage,
             lock_level: LockLevel::None,
             delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
             vfs: Arc::clone(&self.inner),
+            shm_owner_id,
+            shm_path,
+            shm_info: None,
         };
 
         let mut out_flags = flags;
@@ -146,10 +204,202 @@ pub struct MemoryFile {
     lock_level: LockLevel,
     delete_on_close: bool,
     vfs: Arc<Mutex<MemoryVfsInner>>,
+    shm_owner_id: u64,
+    shm_path: PathBuf,
+    shm_info: Option<Arc<Mutex<MemoryShmInfo>>>,
+}
+
+impl MemoryFile {
+    fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<MemoryShmInfo>>> {
+        if let Some(info) = &self.shm_info {
+            return Ok(Arc::clone(info));
+        }
+
+        let info = {
+            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+            Arc::clone(
+                inner
+                    .shm
+                    .entry(self.shm_path.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(MemoryShmInfo::new()))),
+            )
+        };
+
+        {
+            let mut guard = info.lock().map_err(|_| lock_err())?;
+            *guard.owner_refs.entry(self.shm_owner_id).or_insert(0) += 1;
+        }
+
+        self.shm_info = Some(Arc::clone(&info));
+        Ok(info)
+    }
+
+    fn release_shm_owner_state(&mut self, _delete: bool) -> Result<()> {
+        let Some(info_arc) = self.shm_info.take() else {
+            return Ok(());
+        };
+
+        let orphaned = {
+            let mut info = info_arc.lock().map_err(|_| lock_err())?;
+
+            for slot_state in &mut info.slots {
+                if slot_state.exclusive_owner == Some(self.shm_owner_id) {
+                    slot_state.exclusive_owner = None;
+                }
+                slot_state.shared_holders.remove(&self.shm_owner_id);
+            }
+
+            if let Some(count) = info.owner_refs.get_mut(&self.shm_owner_id) {
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    info.owner_refs.remove(&self.shm_owner_id);
+                }
+            }
+
+            info.owner_refs.is_empty()
+        };
+
+        if orphaned {
+            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
+            inner.shm.remove(&self.shm_path);
+        }
+
+        Ok(())
+    }
+
+    fn validate_shm_request(offset: u32, n: u32) -> Result<()> {
+        if n == 0 {
+            return Err(FrankenError::LockFailed {
+                detail: "shm_lock called with n=0".to_string(),
+            });
+        }
+        let Some(end) = offset.checked_add(n) else {
+            return Err(FrankenError::LockFailed {
+                detail: "shm_lock range overflow".to_string(),
+            });
+        };
+        if end > WAL_TOTAL_LOCKS {
+            return Err(FrankenError::LockFailed {
+                detail: format!("shm_lock range {offset}..{end} exceeds WAL lock table"),
+            });
+        }
+        Ok(())
+    }
+
+    fn acquire_shm_shared_slot(&self, info: &mut MemoryShmInfo, slot: u32) -> Result<()> {
+        let slot_idx = usize::try_from(slot).map_err(|_| FrankenError::LockFailed {
+            detail: format!("invalid SHM slot {slot}"),
+        })?;
+        let slot_state = info
+            .slots
+            .get_mut(slot_idx)
+            .ok_or_else(|| FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            })?;
+
+        if let Some(owner) = slot_state.exclusive_owner {
+            if owner != self.shm_owner_id {
+                return Err(FrankenError::Busy);
+            }
+            return Ok(());
+        }
+
+        *slot_state
+            .shared_holders
+            .entry(self.shm_owner_id)
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
+    fn release_shm_shared_slot(&self, info: &mut MemoryShmInfo, slot: u32) -> Result<()> {
+        let slot_idx = usize::try_from(slot).map_err(|_| FrankenError::LockFailed {
+            detail: format!("invalid SHM slot {slot}"),
+        })?;
+        let slot_state = info
+            .slots
+            .get_mut(slot_idx)
+            .ok_or_else(|| FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            })?;
+
+        let Some(holder_count) = slot_state.shared_holders.get_mut(&self.shm_owner_id) else {
+            return Err(FrankenError::LockFailed {
+                detail: format!(
+                    "owner {} does not hold shared slot {slot}",
+                    self.shm_owner_id
+                ),
+            });
+        };
+
+        if *holder_count > 1 {
+            *holder_count -= 1;
+        } else {
+            slot_state.shared_holders.remove(&self.shm_owner_id);
+        }
+        Ok(())
+    }
+
+    fn acquire_shm_exclusive_slot(&self, info: &mut MemoryShmInfo, slot: u32) -> Result<()> {
+        let slot_idx = usize::try_from(slot).map_err(|_| FrankenError::LockFailed {
+            detail: format!("invalid SHM slot {slot}"),
+        })?;
+        let slot_state = info
+            .slots
+            .get_mut(slot_idx)
+            .ok_or_else(|| FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            })?;
+
+        if slot_state.exclusive_owner == Some(self.shm_owner_id) {
+            return Ok(());
+        }
+        if slot_state.exclusive_owner.is_some() {
+            return Err(FrankenError::Busy);
+        }
+
+        let shared_from_others = slot_state
+            .shared_holders
+            .iter()
+            .any(|(owner, count)| *owner != self.shm_owner_id && *count > 0);
+        if shared_from_others {
+            return Err(FrankenError::Busy);
+        }
+
+        // Exclusive lock clears any shared lock held by this owner.
+        slot_state.shared_holders.remove(&self.shm_owner_id);
+        slot_state.exclusive_owner = Some(self.shm_owner_id);
+        Ok(())
+    }
+
+    fn release_shm_exclusive_slot(&self, info: &mut MemoryShmInfo, slot: u32) -> Result<()> {
+        let slot_idx = usize::try_from(slot).map_err(|_| FrankenError::LockFailed {
+            detail: format!("invalid SHM slot {slot}"),
+        })?;
+        let slot_state = info
+            .slots
+            .get_mut(slot_idx)
+            .ok_or_else(|| FrankenError::LockFailed {
+                detail: format!("invalid SHM slot {slot}"),
+            })?;
+
+        if slot_state.exclusive_owner != Some(self.shm_owner_id) {
+            return Err(FrankenError::LockFailed {
+                detail: format!(
+                    "owner {} does not hold exclusive slot {slot}",
+                    self.shm_owner_id
+                ),
+            });
+        }
+
+        slot_state.exclusive_owner = None;
+        Ok(())
+    }
 }
 
 impl VfsFile for MemoryFile {
     fn close(&mut self, _cx: &Cx) -> Result<()> {
+        self.release_shm_owner_state(self.delete_on_close)?;
         if self.delete_on_close {
             self.vfs
                 .lock()
@@ -240,22 +490,105 @@ impl VfsFile for MemoryFile {
 
     fn shm_map(
         &mut self,
-        _cx: &Cx,
-        _region: u32,
-        _size: u32,
-        _extend: bool,
+        cx: &Cx,
+        region: u32,
+        size: u32,
+        extend: bool,
     ) -> Result<crate::shm::ShmRegion> {
-        Err(FrankenError::Unsupported)
+        checkpoint_or_abort(cx)?;
+        if size == 0 {
+            return Err(FrankenError::LockFailed {
+                detail: "shm_map size must be > 0".to_string(),
+            });
+        }
+
+        let shm_info = self.ensure_shm_info()?;
+        let mut info = shm_info.lock().map_err(|_| lock_err())?;
+        if let Some(existing) = info.regions.get(&region).cloned() {
+            drop(info);
+            return Ok(existing);
+        }
+        if !extend {
+            drop(info);
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
+        }
+
+        let map_size = usize::try_from(size).map_err(|_| FrankenError::LockFailed {
+            detail: format!("shm_map size too large: {size}"),
+        })?;
+        let new_region = ShmRegion::new(map_size);
+        info.regions.insert(region, new_region.clone());
+        drop(info);
+        Ok(new_region)
     }
 
-    fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
-        Err(FrankenError::Unsupported)
+    fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        Self::validate_shm_request(offset, n)?;
+
+        let lock_requested = flags & SQLITE_SHM_LOCK != 0;
+        let unlock_requested = flags & SQLITE_SHM_UNLOCK != 0;
+        if lock_requested == unlock_requested {
+            return Err(FrankenError::LockFailed {
+                detail: "invalid shm_lock flags (must set exactly one of LOCK/UNLOCK)".to_string(),
+            });
+        }
+
+        let shared_mode = flags & SQLITE_SHM_SHARED != 0;
+        let exclusive_mode = flags & SQLITE_SHM_EXCLUSIVE != 0;
+        if shared_mode == exclusive_mode {
+            return Err(FrankenError::LockFailed {
+                detail: "invalid shm_lock flags (must set exactly one of SHARED/EXCLUSIVE)"
+                    .to_string(),
+            });
+        }
+
+        let shm_info = self.ensure_shm_info()?;
+        let mut info = shm_info.lock().map_err(|_| lock_err())?;
+
+        if lock_requested {
+            let mut acquired = Vec::new();
+            for slot in offset..offset + n {
+                let result = if exclusive_mode {
+                    self.acquire_shm_exclusive_slot(&mut info, slot)
+                } else {
+                    self.acquire_shm_shared_slot(&mut info, slot)
+                };
+                match result {
+                    Ok(()) => acquired.push(slot),
+                    Err(err) => {
+                        for acquired_slot in acquired.into_iter().rev() {
+                            if exclusive_mode {
+                                let _ = self.release_shm_exclusive_slot(&mut info, acquired_slot);
+                            } else {
+                                let _ = self.release_shm_shared_slot(&mut info, acquired_slot);
+                            }
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        for slot in offset..offset + n {
+            if exclusive_mode {
+                self.release_shm_exclusive_slot(&mut info, slot)?;
+            } else {
+                self.release_shm_shared_slot(&mut info, slot)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn shm_barrier(&self) {}
 
-    fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
-        Ok(())
+    fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        self.release_shm_owner_state(delete)
     }
 }
 
@@ -689,25 +1022,101 @@ mod tests {
     }
 
     #[test]
-    fn shm_map_returns_unsupported() {
+    fn shm_map_roundtrip_shared_between_handles() {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("shm.db")), flags).unwrap();
+        let (mut file1, _) = vfs.open(&cx, Some(Path::new("shm.db")), flags).unwrap();
+        let (mut file2, _) = vfs.open(&cx, Some(Path::new("shm.db")), flags).unwrap();
 
-        let err = file.shm_map(&cx, 0, 4096, true).unwrap_err();
-        assert!(matches!(err, FrankenError::Unsupported));
+        let region1 = file1.shm_map(&cx, 0, 64, true).unwrap();
+        {
+            let mut g = region1.lock();
+            g[0] = 0xAA;
+            g[1] = 0xBB;
+        }
+
+        let region2 = file2.shm_map(&cx, 0, 64, true).unwrap();
+        let (b0, b1) = {
+            let g2 = region2.lock();
+            (g2[0], g2[1])
+        };
+        assert_eq!(b0, 0xAA);
+        assert_eq!(b1, 0xBB);
     }
 
     #[test]
-    fn shm_lock_returns_unsupported() {
+    fn shm_map_extend_false_rejects_missing_region() {
         let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(&cx, Some(Path::new("shml.db")), flags).unwrap();
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("shm_missing.db")), flags)
+            .unwrap();
 
-        let err = file.shm_lock(&cx, 0, 1, 0).unwrap_err();
-        assert!(matches!(err, FrankenError::Unsupported));
+        let err = file.shm_map(&cx, 2, 64, false).unwrap_err();
+        assert!(matches!(err, FrankenError::CannotOpen { .. }));
+    }
+
+    #[test]
+    fn shm_lock_shared_and_exclusive_conflict() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file1, _) = vfs
+            .open(&cx, Some(Path::new("shm_lock.db")), flags)
+            .unwrap();
+        let (mut file2, _) = vfs
+            .open(&cx, Some(Path::new("shm_lock.db")), flags)
+            .unwrap();
+
+        file1
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+        file2
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+
+        let err = file2
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::Busy));
+
+        file2
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+        file1
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+
+        file2
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+        file2
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+    }
+
+    #[test]
+    fn close_releases_shm_locks() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file1, _) = vfs
+            .open(&cx, Some(Path::new("shm_close.db")), flags)
+            .unwrap();
+        let (mut file2, _) = vfs
+            .open(&cx, Some(Path::new("shm_close.db")), flags)
+            .unwrap();
+
+        file1
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+        file1.close(&cx).unwrap();
+
+        file2
+            .shm_lock(&cx, 0, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
     }
 
     #[test]
