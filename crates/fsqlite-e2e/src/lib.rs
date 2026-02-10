@@ -6,6 +6,7 @@
 //! - **Differential comparison**: running identical SQL against FrankenSQLite and C SQLite
 //! - **Corruption injection**: byte/page/sector-level corruption for recovery testing
 
+pub mod batch_runner;
 pub mod bench_summary;
 pub mod benchmark;
 pub mod canonicalize;
@@ -24,6 +25,7 @@ pub mod golden;
 pub mod logging;
 pub mod methodology;
 pub mod oplog;
+pub mod perf_runner;
 pub mod recovery_demo;
 pub mod report;
 pub mod report_render;

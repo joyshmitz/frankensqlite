@@ -9,6 +9,7 @@
 //! - `run` — Execute an OpLog workload against a chosen engine.
 //! - `bench` — Run a Criterion-style benchmark matrix.
 //! - `corrupt` — Inject corruption into a working copy for recovery testing.
+//! - `compare` — Tiered comparison of two database files (bd-2als.3.2).
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -31,6 +32,7 @@ use fsqlite_e2e::fixture_metadata::{
     FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
 };
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
+use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
@@ -67,6 +69,7 @@ where
         "run" => cmd_run(&tail[1..]),
         "bench" => cmd_bench(&tail[1..]),
         "corrupt" => cmd_corrupt(&tail[1..]),
+        "compare" => cmd_compare(&tail[1..]),
         other => {
             eprintln!("error: unknown subcommand `{other}`");
             eprintln!();
@@ -92,6 +95,7 @@ SUBCOMMANDS:
     run                     Execute an OpLog workload against an engine
     bench                   Run the benchmark matrix (Criterion)
     corrupt                 Inject corruption into a working copy
+    compare                 Tiered comparison of two database files
 
 OPTIONS:
     -h, --help              Show this help message
@@ -3154,6 +3158,155 @@ fn set_read_only(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_read_only(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+// ── compare ─────────────────────────────────────────────────────────────
+
+fn print_compare_help() {
+    let text = "\
+realdb-e2e compare — Tiered comparison of two database files (bd-2als.3.2)
+
+Compares two SQLite database files using a three-tier equivalence oracle:
+
+  Tier 1 (canonical_sha256): VACUUM INTO + SHA-256 byte-for-byte identity.
+  Tier 2 (logical):          Schema + row-level comparison with stable ordering.
+  Tier 3 (data_complete):    Row counts + spot checks + integrity_check.
+
+When a mismatch is detected, emits diagnostics: which tier failed, SHA-256
+values, key PRAGMAs, schema diffs, and logical dump diffs.
+
+USAGE:
+    realdb-e2e compare --db-a <PATH> --db-b <PATH> [OPTIONS]
+
+OPTIONS:
+    --db-a <PATH>      Path to the first database file
+    --db-b <PATH>      Path to the second database file
+    --json             Output comparison report as JSON
+    -h, --help         Show this help message
+
+EXIT CODES:
+    0   Match (databases are equivalent at canonical or logical tier)
+    1   Mismatch (databases differ)
+    2   Error (insufficient data or I/O failure)
+";
+    let _ = io::stdout().write_all(text.as_bytes());
+}
+
+fn cmd_compare(argv: &[String]) -> i32 {
+    if argv.iter().any(|a| a == "-h" || a == "--help") {
+        print_compare_help();
+        return 0;
+    }
+
+    let mut db_a: Option<PathBuf> = None;
+    let mut db_b: Option<PathBuf> = None;
+    let mut json_output = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--db-a" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --db-a requires a path argument");
+                    return 2;
+                }
+                db_a = Some(PathBuf::from(&argv[i]));
+            }
+            "--db-b" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --db-b requires a path argument");
+                    return 2;
+                }
+                db_b = Some(PathBuf::from(&argv[i]));
+            }
+            "--json" => {
+                json_output = true;
+            }
+            other => {
+                eprintln!("error: unknown option `{other}`");
+                print_compare_help();
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(path_a) = db_a else {
+        eprintln!("error: --db-a is required");
+        return 2;
+    };
+    let Some(path_b) = db_b else {
+        eprintln!("error: --db-b is required");
+        return 2;
+    };
+
+    if !path_a.exists() {
+        eprintln!("error: database A not found: {}", path_a.display());
+        return 2;
+    }
+    if !path_b.exists() {
+        eprintln!("error: database B not found: {}", path_b.display());
+        return 2;
+    }
+
+    let (report, diagnostic) = match verify_databases(&path_a, &path_b) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: comparison failed: {e}");
+            return 2;
+        }
+    };
+
+    if json_output {
+        #[derive(Serialize)]
+        struct CompareOutput<'a> {
+            verdict: String,
+            explanation: String,
+            tiers: &'a fsqlite_e2e::report::EqualityTiersReport,
+            diagnostic: Option<&'a fsqlite_e2e::golden::MismatchDiagnostic>,
+        }
+
+        let out = CompareOutput {
+            verdict: format!("{:?}", report.verdict),
+            explanation: report.explanation.clone(),
+            tiers: &report.tiers,
+            diagnostic: diagnostic.as_ref(),
+        };
+        match serde_json::to_string_pretty(&out) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("error: failed to serialize report: {e}");
+                return 2;
+            }
+        }
+    } else {
+        println!("Verdict: {:?}", report.verdict);
+        println!("Explanation: {}", report.explanation);
+        println!();
+        println!("Tiers:");
+        println!(
+            "  raw_sha256_match:       {:?}",
+            report.tiers.raw_sha256_match
+        );
+        println!(
+            "  canonical_sha256_match: {:?}",
+            report.tiers.canonical_sha256_match
+        );
+        println!("  logical_match:          {:?}", report.tiers.logical_match);
+
+        if let Some(ref diag) = diagnostic {
+            println!();
+            print!("{}", format_mismatch_diagnostic(diag));
+        }
+    }
+
+    match report.verdict {
+        fsqlite_e2e::report::ComparisonVerdict::Match => 0,
+        fsqlite_e2e::report::ComparisonVerdict::Mismatch => 1,
+        fsqlite_e2e::report::ComparisonVerdict::Error => 2,
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────

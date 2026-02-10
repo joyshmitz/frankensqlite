@@ -855,7 +855,7 @@ pub fn preset_large_txn(
         for r in 0..rows_per_txn {
             let key = base_key + i64::from(r);
             let cat = categories[r as usize % categories.len()];
-            let num_val = f64::from(r) * 3.14;
+            let num_val = f64::from(r) * std::f64::consts::PI;
 
             // Main table insert.
             records.push(OpRecord {
@@ -1127,12 +1127,13 @@ pub fn preset_schema_migration(fixture_id: &str, seed: u64, rows: u32) -> OpLog 
 
     let tag_names = ["rust", "sqlite", "mvcc", "testing", "perf"];
     for (idx, tag) in tag_names.iter().enumerate() {
+        let key = i64::try_from(idx).unwrap_or(i64::MAX);
         records.push(OpRecord {
             op_id,
             worker: 0,
             kind: OpKind::Insert {
                 table: "tags".to_owned(),
-                key: idx as i64,
+                key,
                 values: vec![("name".to_owned(), (*tag).to_owned())],
             },
             expected: Some(ExpectedResult::AffectedRows(1)),
@@ -1182,6 +1183,824 @@ pub fn preset_schema_migration(fixture_id: &str, seed: u64, rows: u32) -> OpLog 
 
     // Verification queries.
     for table in &["users", "articles", "tags", "article_tags"] {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: format!("SELECT COUNT(*) FROM {table}"),
+            },
+            expected: Some(ExpectedResult::RowCount(1)),
+        });
+        op_id += 1;
+    }
+
+    OpLog { header, records }
+}
+
+/// Generate the **B-tree stress (sequential)** preset.
+///
+/// Monotonically increasing key inserts force rightmost B-tree leaf splits.
+/// A subsequent bulk delete of the middle third forces B-tree node merges and
+/// freelist churn.  Finally, reinsertion at the deleted keys tests page reuse.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn preset_btree_stress_sequential(fixture_id: &str, seed: u64, total_rows: u32) -> OpLog {
+    let det_str = |prefix: &str, s: u64, i: u32| -> String {
+        let mixed = s
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .wrapping_add(u64::from(i));
+        format!("{prefix}_{mixed:016x}")
+    };
+
+    let header = OpLogHeader {
+        fixture_id: fixture_id.to_owned(),
+        seed,
+        rng: RngSpec::default(),
+        concurrency: ConcurrencyModel {
+            worker_count: 1,
+            transaction_size: 200,
+            commit_order_policy: "deterministic".to_owned(),
+        },
+        preset: Some("btree_stress_sequential".to_owned()),
+    };
+
+    let mut records = Vec::new();
+    let mut op_id: u64 = 0;
+
+    // Schema: indexed table to amplify split/merge effects.
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "CREATE TABLE IF NOT EXISTS bts (\
+                id INTEGER PRIMARY KEY, \
+                label TEXT NOT NULL, \
+                sort_key INTEGER NOT NULL)"
+                .to_owned(),
+        },
+        expected: None,
+    });
+    op_id += 1;
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "CREATE INDEX IF NOT EXISTS idx_bts_sort ON bts (sort_key)".to_owned(),
+        },
+        expected: None,
+    });
+    op_id += 1;
+
+    // Phase 1: sequential inserts (forces rightmost splits).
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    for i in 0..total_rows {
+        let key = i64::from(i) + 1;
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "bts".to_owned(),
+                key,
+                values: vec![
+                    ("label".to_owned(), det_str("bts", seed, i)),
+                    ("sort_key".to_owned(), format!("{}", key * 10)),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // Phase 2: delete the middle third to force merges.
+    let del_start = total_rows / 3;
+    let del_end = 2 * total_rows / 3;
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    for i in del_start..del_end {
+        let key = i64::from(i) + 1;
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: format!("DELETE FROM bts WHERE id = {key}"),
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // Phase 3: reinsert at the deleted keys with new values.
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    for i in del_start..del_end {
+        let key = i64::from(i) + 1;
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "bts".to_owned(),
+                key,
+                values: vec![
+                    ("label".to_owned(), det_str("bts_re", seed, i)),
+                    ("sort_key".to_owned(), format!("{}", key * 10 + 1)),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // Verification.
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "SELECT COUNT(*) FROM bts".to_owned(),
+        },
+        expected: Some(ExpectedResult::RowCount(1)),
+    });
+
+    OpLog { header, records }
+}
+
+/// Generate the **wide-row overflow** preset.
+///
+/// Inserts rows with large TEXT payloads that exceed typical B-tree leaf page
+/// capacity, forcing overflow page chains.  Tests overflow page allocation,
+/// reading, and freelist management when large rows are deleted.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn preset_wide_row_overflow(
+    fixture_id: &str,
+    seed: u64,
+    row_count: u32,
+    payload_bytes: u32,
+) -> OpLog {
+    let header = OpLogHeader {
+        fixture_id: fixture_id.to_owned(),
+        seed,
+        rng: RngSpec::default(),
+        concurrency: ConcurrencyModel {
+            worker_count: 1,
+            transaction_size: 50,
+            commit_order_policy: "deterministic".to_owned(),
+        },
+        preset: Some("wide_row_overflow".to_owned()),
+    };
+
+    let mut records = Vec::new();
+    let mut op_id: u64 = 0;
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "CREATE TABLE IF NOT EXISTS wro (\
+                id INTEGER PRIMARY KEY, \
+                tag TEXT NOT NULL, \
+                payload TEXT NOT NULL)"
+                .to_owned(),
+        },
+        expected: None,
+    });
+    op_id += 1;
+
+    // Generate large deterministic payloads.
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    for i in 0..row_count {
+        let key = i64::from(i) + 1;
+        // Build a deterministic payload of the requested size.
+        let base = seed
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .wrapping_add(u64::from(i));
+        let pattern = format!("{base:016x}");
+        let repeats = (payload_bytes as usize) / pattern.len() + 1;
+        let payload: String = pattern.repeat(repeats);
+        let payload = &payload[..payload_bytes as usize];
+
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "wro".to_owned(),
+                key,
+                values: vec![
+                    ("tag".to_owned(), format!("row_{i}")),
+                    ("payload".to_owned(), payload.to_owned()),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+
+        // Commit every 50 rows.
+        if (i + 1) % 50 == 0 || i == row_count - 1 {
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Commit,
+                expected: None,
+            });
+            op_id += 1;
+
+            if i < row_count - 1 {
+                records.push(OpRecord {
+                    op_id,
+                    worker: 0,
+                    kind: OpKind::Begin,
+                    expected: None,
+                });
+                op_id += 1;
+            }
+        }
+    }
+
+    // Delete every third row to exercise overflow page freeing.
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    let mut deleted = 0u32;
+    for i in 0..row_count {
+        if i % 3 == 0 {
+            let key = i64::from(i) + 1;
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: format!("DELETE FROM wro WHERE id = {key}"),
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            });
+            op_id += 1;
+            deleted += 1;
+        }
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // Verification.
+    let _ = deleted; // executor uses this
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "SELECT COUNT(*) FROM wro".to_owned(),
+        },
+        expected: Some(ExpectedResult::RowCount(1)),
+    });
+
+    OpLog { header, records }
+}
+
+/// Generate the **bulk delete + reinsert** preset.
+///
+/// Inserts `initial_rows` rows, deletes ~60 % of them (every 5th key survives),
+/// then reinserts at a new key range.  Stresses freelist management, page reuse,
+/// and B-tree rebalancing after mass deletes.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn preset_bulk_delete_reinsert(fixture_id: &str, seed: u64, initial_rows: u32) -> OpLog {
+    let det_str = |prefix: &str, s: u64, i: u32| -> String {
+        let mixed = s
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .wrapping_add(u64::from(i));
+        format!("{prefix}_{mixed:016x}")
+    };
+
+    let header = OpLogHeader {
+        fixture_id: fixture_id.to_owned(),
+        seed,
+        rng: RngSpec::default(),
+        concurrency: ConcurrencyModel {
+            worker_count: 1,
+            transaction_size: 100,
+            commit_order_policy: "deterministic".to_owned(),
+        },
+        preset: Some("bulk_delete_reinsert".to_owned()),
+    };
+
+    let mut records = Vec::new();
+    let mut op_id: u64 = 0;
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "CREATE TABLE IF NOT EXISTS bdr (\
+                id INTEGER PRIMARY KEY, \
+                val TEXT NOT NULL, \
+                counter INTEGER NOT NULL DEFAULT 0)"
+                .to_owned(),
+        },
+        expected: None,
+    });
+    op_id += 1;
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "CREATE INDEX IF NOT EXISTS idx_bdr_counter ON bdr (counter)".to_owned(),
+        },
+        expected: None,
+    });
+    op_id += 1;
+
+    // Phase 1: bulk insert.
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    for i in 0..initial_rows {
+        let key = i64::from(i) + 1;
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "bdr".to_owned(),
+                key,
+                values: vec![
+                    ("val".to_owned(), det_str("bdr", seed, i)),
+                    ("counter".to_owned(), format!("{i}")),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // Phase 2: delete ~60% (keep every 5th row).
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    let mut deleted = 0u32;
+    for i in 0..initial_rows {
+        if i % 5 != 0 {
+            let key = i64::from(i) + 1;
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: format!("DELETE FROM bdr WHERE id = {key}"),
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            });
+            op_id += 1;
+            deleted += 1;
+        }
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // Phase 3: reinsert at new key range.
+    let reinsert_count = deleted;
+    let reinsert_base = i64::from(initial_rows) + 1;
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    for i in 0..reinsert_count {
+        let key = reinsert_base + i64::from(i);
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "bdr".to_owned(),
+                key,
+                values: vec![
+                    ("val".to_owned(), det_str("bdr_re", seed, i)),
+                    ("counter".to_owned(), format!("{}", initial_rows + i)),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // Verification.
+    let surviving = initial_rows - deleted;
+    let _ = surviving;
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "SELECT COUNT(*) FROM bdr".to_owned(),
+        },
+        expected: Some(ExpectedResult::RowCount(1)),
+    });
+
+    OpLog { header, records }
+}
+
+/// Generate the **scatter-write** preset.
+///
+/// Workers insert and update rows at deterministic but non-sequential positions
+/// in a large keyspace.  This exercises random B-tree traversal paths and
+/// non-sequential page access patterns.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn preset_scatter_write(
+    fixture_id: &str,
+    seed: u64,
+    worker_count: u16,
+    ops_per_worker: u32,
+) -> OpLog {
+    let header = OpLogHeader {
+        fixture_id: fixture_id.to_owned(),
+        seed,
+        rng: RngSpec::default(),
+        concurrency: ConcurrencyModel {
+            worker_count,
+            transaction_size: 20,
+            commit_order_policy: "deterministic".to_owned(),
+        },
+        preset: Some("scatter_write".to_owned()),
+    };
+
+    let mut records = Vec::new();
+    let mut op_id: u64 = 0;
+
+    // Keyspace is 10× total ops to keep density low → more scattered pages.
+    let keyspace = (u64::from(worker_count) * u64::from(ops_per_worker) * 10).max(1);
+
+    // Schema setup (worker 0).
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "CREATE TABLE IF NOT EXISTS scw (\
+                id INTEGER PRIMARY KEY, \
+                worker_id INTEGER NOT NULL, \
+                val TEXT NOT NULL)"
+                .to_owned(),
+        },
+        expected: None,
+    });
+    op_id += 1;
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "CREATE INDEX IF NOT EXISTS idx_scw_worker ON scw (worker_id)".to_owned(),
+        },
+        expected: None,
+    });
+    op_id += 1;
+
+    // Deterministic scatter function: maps (seed, worker, op_index) → key.
+    let scatter_key = |s: u64, w: u16, i: u32| -> i64 {
+        let h = s
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(u64::from(w).wrapping_mul(0x517c_c1b7_2722_0a95))
+            .wrapping_add(u64::from(i).wrapping_mul(0x6c62_272e_07bb_0142));
+        // Map into keyspace; add 1 to keep key > 0.
+        let key_u64 = (h % keyspace).saturating_add(1);
+        i64::try_from(key_u64).unwrap_or(i64::MAX)
+    };
+
+    for w in 0..worker_count {
+        for chunk_start in (0..ops_per_worker).step_by(20) {
+            let chunk_end = (chunk_start + 20).min(ops_per_worker);
+
+            records.push(OpRecord {
+                op_id,
+                worker: w,
+                kind: OpKind::Begin,
+                expected: None,
+            });
+            op_id += 1;
+
+            for i in chunk_start..chunk_end {
+                let key = scatter_key(seed, w, i);
+                let val = format!("w{w}_i{i}_{:08x}", seed.wrapping_add(u64::from(i)));
+
+                // First half inserts, second half updates (INSERT OR REPLACE
+                // for simplicity, since scattered keys may not exist yet).
+                if i < ops_per_worker / 2 {
+                    records.push(OpRecord {
+                        op_id,
+                        worker: w,
+                        kind: OpKind::Sql {
+                            statement: format!(
+                                "INSERT OR REPLACE INTO scw (id, worker_id, val) \
+                                 VALUES ({key}, {w}, '{val}')"
+                            ),
+                        },
+                        expected: None,
+                    });
+                } else {
+                    records.push(OpRecord {
+                        op_id,
+                        worker: w,
+                        kind: OpKind::Sql {
+                            statement: format!(
+                                "INSERT OR REPLACE INTO scw (id, worker_id, val) \
+                                 VALUES ({key}, {w}, '{val}_upd')"
+                            ),
+                        },
+                        expected: None,
+                    });
+                }
+                op_id += 1;
+            }
+
+            records.push(OpRecord {
+                op_id,
+                worker: w,
+                kind: OpKind::Commit,
+                expected: None,
+            });
+            op_id += 1;
+        }
+    }
+
+    // Verification.
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "SELECT COUNT(*) FROM scw".to_owned(),
+        },
+        expected: Some(ExpectedResult::RowCount(1)),
+    });
+
+    OpLog { header, records }
+}
+
+/// Generate the **multi-table foreign-key** preset.
+///
+/// Creates a normalized schema (customers → orders → line_items) and populates
+/// it with referentially consistent data.  Tests multi-table B-tree operations
+/// and index maintenance across related tables.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn preset_multi_table_foreign_keys(fixture_id: &str, seed: u64, customer_count: u32) -> OpLog {
+    let det_str = |prefix: &str, s: u64, i: u32| -> String {
+        let mixed = s
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .wrapping_add(u64::from(i));
+        format!("{prefix}_{mixed:016x}")
+    };
+
+    let header = OpLogHeader {
+        fixture_id: fixture_id.to_owned(),
+        seed,
+        rng: RngSpec::default(),
+        concurrency: ConcurrencyModel {
+            worker_count: 1,
+            transaction_size: 100,
+            commit_order_policy: "deterministic".to_owned(),
+        },
+        preset: Some("multi_table_foreign_keys".to_owned()),
+    };
+
+    let mut records = Vec::new();
+    let mut op_id: u64 = 0;
+
+    // Schema: 3 related tables.
+    for ddl in [
+        "CREATE TABLE IF NOT EXISTS customers (\
+            id INTEGER PRIMARY KEY, \
+            name TEXT NOT NULL, \
+            region TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS orders (\
+            id INTEGER PRIMARY KEY, \
+            customer_id INTEGER NOT NULL, \
+            total REAL NOT NULL, \
+            status TEXT NOT NULL DEFAULT 'pending')",
+        "CREATE TABLE IF NOT EXISTS line_items (\
+            id INTEGER PRIMARY KEY, \
+            order_id INTEGER NOT NULL, \
+            product TEXT NOT NULL, \
+            qty INTEGER NOT NULL, \
+            price REAL NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_orders_cust ON orders (customer_id)",
+        "CREATE INDEX IF NOT EXISTS idx_li_order ON line_items (order_id)",
+    ] {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: ddl.to_owned(),
+            },
+            expected: None,
+        });
+        op_id += 1;
+    }
+
+    let regions = ["north", "south", "east", "west"];
+    let products = ["widget", "gadget", "sprocket", "bolt", "nut"];
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    let mut order_id: i64 = 1;
+    let mut li_id: i64 = 1;
+
+    for c in 0..customer_count {
+        let cust_key = i64::from(c) + 1;
+        let region_idx = (seed.wrapping_add(u64::from(c)) % 4) as usize;
+
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "customers".to_owned(),
+                key: cust_key,
+                values: vec![
+                    ("name".to_owned(), det_str("cust", seed, c)),
+                    ("region".to_owned(), regions[region_idx].to_owned()),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+
+        // Deterministic order count: 1-3 per customer.
+        let order_count = (seed.wrapping_add(u64::from(c)) % 3) as u32 + 1;
+
+        for o in 0..order_count {
+            let total = ((seed.wrapping_add(u64::from(c * 10 + o)) % 10000) as f64) / 100.0;
+
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Insert {
+                    table: "orders".to_owned(),
+                    key: order_id,
+                    values: vec![
+                        ("customer_id".to_owned(), format!("{cust_key}")),
+                        ("total".to_owned(), format!("{total:.2}")),
+                        ("status".to_owned(), "pending".to_owned()),
+                    ],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            });
+            op_id += 1;
+
+            // Deterministic line-item count: 1-5 per order.
+            let li_count = (seed.wrapping_add(u64::from(c * 100 + o * 10)) % 5) as u32 + 1;
+
+            for l in 0..li_count {
+                let prod_idx = (seed.wrapping_add(u64::from(c * 1000 + o * 100 + l)) % 5) as usize;
+                let qty = i64::try_from(
+                    seed.wrapping_add(u64::from(c * 10000 + o * 1000 + l * 100)) % 10,
+                )
+                .unwrap_or(0)
+                .saturating_add(1);
+                let price = ((seed.wrapping_add(u64::from(l)) % 5000) as f64) / 100.0 + 1.0;
+
+                records.push(OpRecord {
+                    op_id,
+                    worker: 0,
+                    kind: OpKind::Insert {
+                        table: "line_items".to_owned(),
+                        key: li_id,
+                        values: vec![
+                            ("order_id".to_owned(), format!("{order_id}")),
+                            ("product".to_owned(), products[prod_idx].to_owned()),
+                            ("qty".to_owned(), format!("{qty}")),
+                            ("price".to_owned(), format!("{price:.2}")),
+                        ],
+                    },
+                    expected: Some(ExpectedResult::AffectedRows(1)),
+                });
+                op_id += 1;
+                li_id += 1;
+            }
+
+            order_id += 1;
+        }
+
+        // Commit every 20 customers.
+        if (c + 1) % 20 == 0 || c == customer_count - 1 {
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Commit,
+                expected: None,
+            });
+            op_id += 1;
+
+            if c < customer_count - 1 {
+                records.push(OpRecord {
+                    op_id,
+                    worker: 0,
+                    kind: OpKind::Begin,
+                    expected: None,
+                });
+                op_id += 1;
+            }
+        }
+    }
+
+    // Verification queries.
+    for table in ["customers", "orders", "line_items"] {
         records.push(OpRecord {
             op_id,
             worker: 0,
@@ -1253,6 +2072,7 @@ pub struct PresetMeta {
 
 /// Return the full catalog of built-in workload presets with documented expectations.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn preset_catalog() -> Vec<PresetMeta> {
     vec![
         PresetMeta {
@@ -1350,6 +2170,79 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
                 applicable: false,
             },
             determinism_inputs: vec!["seed".to_owned(), "rows".to_owned()],
+        },
+        PresetMeta {
+            name: "btree_stress_sequential".to_owned(),
+            description: "Monotonic key inserts → middle-third delete → reinsert. \
+                Forces rightmost B-tree splits, then node merges and freelist churn."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier2Canonical,
+            serial_only: true,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1],
+                applicable: false,
+            },
+            determinism_inputs: vec!["seed".to_owned(), "total_rows".to_owned()],
+        },
+        PresetMeta {
+            name: "wide_row_overflow".to_owned(),
+            description: "Large TEXT payloads exceeding leaf page capacity, forcing \
+                overflow page chains. Tests overflow allocation, reading, and freeing."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier2Canonical,
+            serial_only: true,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1],
+                applicable: false,
+            },
+            determinism_inputs: vec![
+                "seed".to_owned(),
+                "row_count".to_owned(),
+                "payload_bytes".to_owned(),
+            ],
+        },
+        PresetMeta {
+            name: "bulk_delete_reinsert".to_owned(),
+            description: "Insert N rows, delete ~60%, reinsert at new keys. \
+                Stresses freelist management, page reuse, and B-tree rebalancing."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier2Canonical,
+            serial_only: true,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1],
+                applicable: false,
+            },
+            determinism_inputs: vec!["seed".to_owned(), "initial_rows".to_owned()],
+        },
+        PresetMeta {
+            name: "scatter_write".to_owned(),
+            description: "Workers insert/update at scattered positions in a sparse keyspace. \
+                Tests random B-tree traversal paths and non-sequential page access."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier3Logical,
+            serial_only: false,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1, 2, 4, 8, 16],
+                applicable: true,
+            },
+            determinism_inputs: vec![
+                "seed".to_owned(),
+                "worker_count".to_owned(),
+                "ops_per_worker".to_owned(),
+            ],
+        },
+        PresetMeta {
+            name: "multi_table_foreign_keys".to_owned(),
+            description: "Normalized schema (customers → orders → line_items) with \
+                referentially consistent inserts. Tests multi-table B-tree and index ops."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier2Canonical,
+            serial_only: true,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1],
+                applicable: false,
+            },
+            determinism_inputs: vec!["seed".to_owned(), "customer_count".to_owned()],
         },
     ]
 }
@@ -1886,8 +2779,8 @@ mod tests {
     fn test_preset_catalog_completeness() {
         let catalog = preset_catalog();
 
-        // All 6 presets should be listed.
-        assert_eq!(catalog.len(), 6, "catalog should have 6 presets");
+        // All 11 presets should be listed.
+        assert_eq!(catalog.len(), 11, "catalog should have 11 presets");
 
         let names: Vec<&str> = catalog.iter().map(|p| p.name.as_str()).collect();
         assert!(names.contains(&"commutative_inserts_disjoint_keys"));
@@ -1896,6 +2789,11 @@ mod tests {
         assert!(names.contains(&"deterministic_transform"));
         assert!(names.contains(&"large_txn"));
         assert!(names.contains(&"schema_migration"));
+        assert!(names.contains(&"btree_stress_sequential"));
+        assert!(names.contains(&"wide_row_overflow"));
+        assert!(names.contains(&"bulk_delete_reinsert"));
+        assert!(names.contains(&"scatter_write"));
+        assert!(names.contains(&"multi_table_foreign_keys"));
     }
 
     #[test]
@@ -1956,5 +2854,383 @@ mod tests {
                 meta.name
             );
         }
+    }
+
+    // ── B-tree Stress Sequential preset tests ─────────────────────────
+
+    #[test]
+    fn test_preset_btree_stress_structure() {
+        let total = 300_u32;
+        let log = preset_btree_stress_sequential("fix-bts", 42, total);
+
+        assert_eq!(
+            log.header.preset.as_deref(),
+            Some("btree_stress_sequential")
+        );
+        assert_eq!(log.header.concurrency.worker_count, 1);
+
+        // DDL: CREATE TABLE + CREATE INDEX.
+        let ddl_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("CREATE"))
+            })
+            .count();
+        assert_eq!(ddl_count, 2, "expected CREATE TABLE + CREATE INDEX");
+
+        // Phase 1: total_rows inserts.
+        let phase1_inserts = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "bts"))
+            .count();
+        // Phase 1 inserts + Phase 3 reinserts.
+        let del_start = total / 3;
+        let del_end = 2 * total / 3;
+        let deleted_row_count = del_end - del_start;
+        assert_eq!(
+            phase1_inserts,
+            (total + deleted_row_count) as usize,
+            "total inserts = initial + reinserted"
+        );
+
+        // Deletes should equal middle third.
+        let delete_stmt_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("DELETE"))
+            })
+            .count();
+        assert_eq!(delete_stmt_count, deleted_row_count as usize);
+
+        // Verification query at the end.
+        let verify = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("SELECT COUNT(*)"))
+            })
+            .count();
+        assert_eq!(verify, 1);
+    }
+
+    #[test]
+    fn test_preset_btree_stress_seed_stability() {
+        let a = preset_btree_stress_sequential("fix", 99, 100);
+        let b = preset_btree_stress_sequential("fix", 99, 100);
+        assert_eq!(
+            a.to_jsonl().unwrap(),
+            b.to_jsonl().unwrap(),
+            "same seed must produce same JSONL"
+        );
+    }
+
+    #[test]
+    fn test_preset_btree_stress_different_seeds() {
+        let a = preset_btree_stress_sequential("fix", 1, 100);
+        let b = preset_btree_stress_sequential("fix", 2, 100);
+        assert_ne!(a.to_jsonl().unwrap(), b.to_jsonl().unwrap());
+    }
+
+    // ── Wide-Row Overflow preset tests ────────────────────────────────
+
+    #[test]
+    fn test_preset_wide_row_overflow_structure() {
+        let rows = 30_u32;
+        let payload = 2000_u32;
+        let log = preset_wide_row_overflow("fix-wro", 42, rows, payload);
+
+        assert_eq!(log.header.preset.as_deref(), Some("wide_row_overflow"));
+        assert_eq!(log.header.concurrency.worker_count, 1);
+
+        // Inserts.
+        let insert_count = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "wro"))
+            .count();
+        assert_eq!(insert_count, rows as usize);
+
+        // Each insert payload should be exactly `payload` bytes.
+        for rec in &log.records {
+            if let OpKind::Insert { values, .. } = &rec.kind {
+                if let Some((_, p)) = values.iter().find(|(k, _)| k == "payload") {
+                    assert_eq!(
+                        p.len(),
+                        payload as usize,
+                        "payload must be exactly {payload} bytes"
+                    );
+                }
+            }
+        }
+
+        // Deletes: every 3rd row.
+        let delete_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("DELETE"))
+            })
+            .count();
+        let expected_deletes = (0..rows).filter(|i| i % 3 == 0).count();
+        assert_eq!(delete_count, expected_deletes);
+    }
+
+    #[test]
+    fn test_preset_wide_row_overflow_seed_stability() {
+        let a = preset_wide_row_overflow("fix", 42, 10, 500);
+        let b = preset_wide_row_overflow("fix", 42, 10, 500);
+        assert_eq!(
+            a.to_jsonl().unwrap(),
+            b.to_jsonl().unwrap(),
+            "same seed must produce same JSONL"
+        );
+    }
+
+    #[test]
+    fn test_preset_wide_row_overflow_jsonl_roundtrip() {
+        let log = preset_wide_row_overflow("rt", 42, 10, 500);
+        let jsonl = log.to_jsonl().unwrap();
+        let parsed = OpLog::from_jsonl(&jsonl).unwrap();
+        assert_eq!(parsed.records.len(), log.records.len());
+        assert_eq!(parsed.header.preset.as_deref(), Some("wide_row_overflow"));
+    }
+
+    // ── Bulk Delete + Reinsert preset tests ───────────────────────────
+
+    #[test]
+    fn test_preset_bulk_delete_reinsert_structure() {
+        let initial = 100_u32;
+        let log = preset_bulk_delete_reinsert("fix-bdr", 42, initial);
+
+        assert_eq!(log.header.preset.as_deref(), Some("bulk_delete_reinsert"));
+        assert_eq!(log.header.concurrency.worker_count, 1);
+
+        // Phase 1: initial_rows inserts.
+        let bdr_inserts = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "bdr"))
+            .count();
+
+        // Deleted = rows where i%5 != 0.
+        let deleted = (0..initial).filter(|i| i % 5 != 0).count();
+        // Total inserts = initial + reinserted (== deleted count).
+        assert_eq!(bdr_inserts, initial as usize + deleted);
+
+        // Delete count.
+        let delete_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("DELETE"))
+            })
+            .count();
+        assert_eq!(delete_count, deleted);
+
+        // DDL: CREATE TABLE + CREATE INDEX.
+        let ddl_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("CREATE"))
+            })
+            .count();
+        assert_eq!(ddl_count, 2);
+    }
+
+    #[test]
+    fn test_preset_bulk_delete_reinsert_seed_stability() {
+        let a = preset_bulk_delete_reinsert("fix", 99, 50);
+        let b = preset_bulk_delete_reinsert("fix", 99, 50);
+        assert_eq!(
+            a.to_jsonl().unwrap(),
+            b.to_jsonl().unwrap(),
+            "same seed must produce same JSONL"
+        );
+    }
+
+    #[test]
+    fn test_preset_bulk_delete_reinsert_jsonl_roundtrip() {
+        let log = preset_bulk_delete_reinsert("rt", 42, 50);
+        let jsonl = log.to_jsonl().unwrap();
+        let parsed = OpLog::from_jsonl(&jsonl).unwrap();
+        assert_eq!(parsed.records.len(), log.records.len());
+    }
+
+    // ── Scatter Write preset tests ────────────────────────────────────
+
+    #[test]
+    fn test_preset_scatter_write_structure() {
+        let log = preset_scatter_write("fix-scw", 42, 3, 40);
+
+        assert_eq!(log.header.preset.as_deref(), Some("scatter_write"));
+        assert_eq!(log.header.concurrency.worker_count, 3);
+
+        // DDL: CREATE TABLE + CREATE INDEX.
+        let ddl_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("CREATE"))
+            })
+            .count();
+        assert_eq!(ddl_count, 2);
+
+        // Each worker should have ops.
+        for w in 0..3_u16 {
+            let ops: usize = log
+                .records
+                .iter()
+                .filter(|r| {
+                    r.worker == w
+                        && matches!(&r.kind, OpKind::Sql { statement }
+                            if statement.starts_with("INSERT OR REPLACE"))
+                })
+                .count();
+            assert_eq!(ops, 40, "worker {w} should have 40 scatter ops");
+        }
+
+        // Verification query.
+        let verify = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("SELECT COUNT(*)"))
+            })
+            .count();
+        assert_eq!(verify, 1);
+    }
+
+    #[test]
+    fn test_preset_scatter_write_seed_stability() {
+        let a = preset_scatter_write("fix", 99, 2, 20);
+        let b = preset_scatter_write("fix", 99, 2, 20);
+        assert_eq!(
+            a.to_jsonl().unwrap(),
+            b.to_jsonl().unwrap(),
+            "same seed must produce same JSONL"
+        );
+    }
+
+    #[test]
+    fn test_preset_scatter_write_different_seeds() {
+        let a = preset_scatter_write("fix", 1, 2, 20);
+        let b = preset_scatter_write("fix", 2, 2, 20);
+        assert_ne!(a.to_jsonl().unwrap(), b.to_jsonl().unwrap());
+    }
+
+    // ── Multi-Table Foreign Keys preset tests ─────────────────────────
+
+    #[test]
+    fn test_preset_multi_table_fk_structure() {
+        let custs = 20_u32;
+        let log = preset_multi_table_foreign_keys("fix-fk", 42, custs);
+
+        assert_eq!(
+            log.header.preset.as_deref(),
+            Some("multi_table_foreign_keys")
+        );
+        assert_eq!(log.header.concurrency.worker_count, 1);
+
+        // DDL: 3 CREATE TABLE + 2 CREATE INDEX.
+        let ddl_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("CREATE"))
+            })
+            .count();
+        assert_eq!(ddl_count, 5, "3 tables + 2 indexes");
+
+        // Customer inserts.
+        let cust_inserts = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "customers"))
+            .count();
+        assert_eq!(cust_inserts, custs as usize);
+
+        // Every customer should have 1-3 orders.
+        let order_inserts = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "orders"))
+            .count();
+        assert!(
+            order_inserts >= custs as usize,
+            "at least 1 order per customer"
+        );
+        assert!(
+            order_inserts <= (custs * 3) as usize,
+            "at most 3 orders per customer"
+        );
+
+        // Every order should have 1-5 line items.
+        let li_inserts = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "line_items"))
+            .count();
+        assert!(
+            li_inserts >= order_inserts,
+            "at least 1 line item per order"
+        );
+        assert!(
+            li_inserts <= order_inserts * 5,
+            "at most 5 line items per order"
+        );
+
+        // 3 verification queries.
+        let verify = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("SELECT COUNT(*)"))
+            })
+            .count();
+        assert_eq!(verify, 3);
+    }
+
+    #[test]
+    fn test_preset_multi_table_fk_seed_stability() {
+        let a = preset_multi_table_foreign_keys("fix", 99, 15);
+        let b = preset_multi_table_foreign_keys("fix", 99, 15);
+        assert_eq!(
+            a.to_jsonl().unwrap(),
+            b.to_jsonl().unwrap(),
+            "same seed must produce same JSONL"
+        );
+    }
+
+    #[test]
+    fn test_preset_multi_table_fk_jsonl_roundtrip() {
+        let log = preset_multi_table_foreign_keys("rt", 42, 10);
+        let jsonl = log.to_jsonl().unwrap();
+        let parsed = OpLog::from_jsonl(&jsonl).unwrap();
+        assert_eq!(parsed.records.len(), log.records.len());
+        assert_eq!(
+            parsed.header.preset.as_deref(),
+            Some("multi_table_foreign_keys")
+        );
+    }
+
+    #[test]
+    fn test_preset_multi_table_fk_different_seeds() {
+        let a = preset_multi_table_foreign_keys("fix", 1, 10);
+        let b = preset_multi_table_foreign_keys("fix", 2, 10);
+        assert_ne!(a.to_jsonl().unwrap(), b.to_jsonl().unwrap());
     }
 }

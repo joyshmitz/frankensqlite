@@ -84,13 +84,6 @@ impl MemTable {
         }
     }
 
-    /// Delete the row at the given index.
-    fn delete_at(&mut self, index: usize) {
-        if index < self.rows.len() {
-            self.rows.remove(index);
-        }
-    }
-
     /// Delete a row by rowid. Returns true if a row was found and deleted.
     #[allow(dead_code)]
     fn delete_by_rowid(&mut self, rowid: i64) -> bool {
@@ -234,14 +227,14 @@ impl SharedTxnPageIo {
     }
 
     /// Unwrap back to the owned transaction handle.
-    /// Panics if other Rc clones still exist.
-    fn into_inner(self) -> Box<dyn TransactionHandle> {
+    /// Returns an error if other Rc clones still exist.
+    fn into_inner(self) -> Result<Box<dyn TransactionHandle>> {
         match Rc::try_unwrap(self.txn) {
-            Ok(cell) => cell.into_inner(),
-            Err(rc) => panic!(
+            Ok(cell) => Ok(cell.into_inner()),
+            Err(rc) => Err(FrankenError::Internal(format!(
                 "SharedTxnPageIo: {} outstanding Rc references",
-                Rc::strong_count(&rc)
-            ),
+                Rc::strong_count(&rc),
+            ))),
         }
     }
 }
@@ -383,22 +376,116 @@ struct StorageCursor {
 /// Returned by [`MemDatabase::undo_version`] and consumed by
 /// [`MemDatabase::rollback_to`] to identify undo save-points.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MemDbVersionToken(u64);
+pub struct MemDbVersionToken(usize);
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Variants constructed by MemDatabase methods not yet wired to VDBE opcodes.
+enum MemDbUndoOp {
+    CreateTable {
+        root_page: i32,
+        prev_next_root_page: i32,
+    },
+    DestroyTable {
+        root_page: i32,
+        table: MemTable,
+    },
+    ClearTable {
+        root_page: i32,
+        table: MemTable,
+    },
+    BumpRowid {
+        root_page: i32,
+        prev_next_rowid: i64,
+    },
+    UpsertRow {
+        root_page: i32,
+        rowid: i64,
+        prev_next_rowid: i64,
+        old_values: Option<Vec<SqliteValue>>,
+    },
+    DeleteRow {
+        root_page: i32,
+        index: usize,
+        row: MemRow,
+        prev_next_rowid: i64,
+    },
+}
+
+impl MemDbUndoOp {
+    fn undo(self, db: &mut MemDatabase) {
+        match self {
+            Self::CreateTable {
+                root_page,
+                prev_next_root_page,
+            } => {
+                db.tables.remove(&root_page);
+                db.next_root_page = prev_next_root_page;
+            }
+            Self::DestroyTable { root_page, table } | Self::ClearTable { root_page, table } => {
+                db.tables.insert(root_page, table);
+            }
+            Self::BumpRowid {
+                root_page,
+                prev_next_rowid,
+            } => {
+                if let Some(table) = db.tables.get_mut(&root_page) {
+                    table.next_rowid = prev_next_rowid;
+                }
+            }
+            Self::UpsertRow {
+                root_page,
+                rowid,
+                prev_next_rowid,
+                old_values,
+            } => {
+                if let Some(table) = db.tables.get_mut(&root_page) {
+                    match old_values {
+                        Some(values) => {
+                            if let Some(row) = table.rows.iter_mut().find(|r| r.rowid == rowid) {
+                                row.values = values;
+                            } else {
+                                table.rows.push(MemRow { rowid, values });
+                            }
+                        }
+                        None => {
+                            if let Some(idx) = table.rows.iter().position(|r| r.rowid == rowid) {
+                                table.rows.remove(idx);
+                            }
+                        }
+                    }
+                    table.next_rowid = prev_next_rowid;
+                }
+            }
+            Self::DeleteRow {
+                root_page,
+                index,
+                row,
+                prev_next_rowid,
+            } => {
+                if let Some(table) = db.tables.get_mut(&root_page) {
+                    let insert_at = index.min(table.rows.len());
+                    table.rows.insert(insert_at, row);
+                    table.next_rowid = prev_next_rowid;
+                }
+            }
+        }
+    }
+}
 
 /// Shared in-memory database backing the VDBE engine's cursor operations.
 ///
 /// Maps root page numbers to in-memory tables. The Connection layer
 /// populates this when processing CREATE TABLE and passes it to the engine.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct MemDatabase {
     /// Tables indexed by root page number.
     pub tables: HashMap<i32, MemTable>,
     /// Next available root page number.
     next_root_page: i32,
-    /// Monotonically increasing version counter.
-    version: u64,
-    /// Snapshots keyed by version token, for savepoint rollback.
-    snapshots: HashMap<u64, (HashMap<i32, MemTable>, i32)>,
+    /// Whether undo logging is enabled for transaction/savepoint rollback.
+    undo_enabled: bool,
+    /// Undo log. A version token is the log length at the snapshot point.
+    undo_log: Vec<MemDbUndoOp>,
 }
 
 impl MemDatabase {
@@ -407,16 +494,21 @@ impl MemDatabase {
         Self {
             tables: HashMap::new(),
             next_root_page: 2, // Page 1 is reserved for sqlite_master.
-            version: 0,
-            snapshots: HashMap::new(),
+            undo_enabled: false,
+            undo_log: Vec::new(),
         }
     }
 
     /// Create a table and return its root page number.
     pub fn create_table(&mut self, num_columns: usize) -> i32 {
-        let root_page = self.next_root_page;
+        let prev_next_root_page = self.next_root_page;
+        let root_page = prev_next_root_page;
         self.next_root_page += 1;
         self.tables.insert(root_page, MemTable::new(num_columns));
+        self.push_undo(MemDbUndoOp::CreateTable {
+            root_page,
+            prev_next_root_page,
+        });
         root_page
     }
 
@@ -430,37 +522,133 @@ impl MemDatabase {
         self.tables.get_mut(&root_page)
     }
 
-    /// Capture a snapshot of the current state and return a version token.
-    ///
-    /// The snapshot is retained so that [`rollback_to`](Self::rollback_to)
-    /// can restore it later. Called at each SAVEPOINT and at transaction
-    /// start.
-    pub fn undo_version(&mut self) -> MemDbVersionToken {
-        let token = self.version;
-        self.snapshots
-            .insert(token, (self.tables.clone(), self.next_root_page));
-        self.version += 1;
-        MemDbVersionToken(token)
+    fn push_undo(&mut self, op: MemDbUndoOp) {
+        if self.undo_enabled {
+            self.undo_log.push(op);
+        }
     }
 
-    /// Mark the start of a new undo region (transaction begin).
+    /// Return the current undo-version token.
     ///
-    /// Currently a no-op — snapshot is taken by [`undo_version`](Self::undo_version).
-    pub fn begin_undo(&mut self) {}
+    /// This is the identity captured in snapshots for savepoints/transactions.
+    pub fn undo_version(&self) -> MemDbVersionToken {
+        MemDbVersionToken(self.undo_log.len())
+    }
 
-    /// Discard all saved snapshots (transaction committed/finished).
+    /// Begin a new undo region (transaction start).
+    pub fn begin_undo(&mut self) {
+        self.undo_enabled = true;
+        self.undo_log.clear();
+    }
+
+    /// End the undo region (transaction committed/finished).
     pub fn commit_undo(&mut self) {
-        self.snapshots.clear();
+        self.undo_enabled = false;
+        self.undo_log.clear();
     }
 
-    /// Restore the database to a previously captured snapshot.
-    ///
-    /// The snapshot is **not** removed, matching SQLite ROLLBACK TO semantics
-    /// where the savepoint remains active after rollback.
+    /// Restore the database to a previously captured undo-version token.
     pub fn rollback_to(&mut self, token: MemDbVersionToken) {
-        if let Some((tables_snap, next_root)) = self.snapshots.get(&token.0) {
-            self.tables = tables_snap.clone();
-            self.next_root_page = *next_root;
+        while self.undo_log.len() > token.0 {
+            if let Some(op) = self.undo_log.pop() {
+                op.undo(self);
+            }
+        }
+    }
+
+    fn destroy_table(&mut self, root_page: i32) {
+        if let Some(table) = self.tables.remove(&root_page) {
+            self.push_undo(MemDbUndoOp::DestroyTable { root_page, table });
+        }
+    }
+
+    fn clear_table(&mut self, root_page: i32) {
+        let prev = self.tables.get(&root_page).cloned();
+        if let Some(table) = prev {
+            self.push_undo(MemDbUndoOp::ClearTable { root_page, table });
+        }
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            table.rows.clear();
+        }
+    }
+
+    fn alloc_rowid(&mut self, root_page: i32) -> i64 {
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            let prev_next_rowid = table.next_rowid;
+            let rowid = table.alloc_rowid();
+            self.push_undo(MemDbUndoOp::BumpRowid {
+                root_page,
+                prev_next_rowid,
+            });
+            rowid
+        } else {
+            1
+        }
+    }
+
+    fn upsert_row(&mut self, root_page: i32, rowid: i64, values: Vec<SqliteValue>) {
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            let prev_next_rowid = table.next_rowid;
+            let old_values = table
+                .rows
+                .iter()
+                .find(|r| r.rowid == rowid)
+                .map(|r| r.values.clone());
+            table.insert(rowid, values);
+            self.push_undo(MemDbUndoOp::UpsertRow {
+                root_page,
+                rowid,
+                prev_next_rowid,
+                old_values,
+            });
+        }
+    }
+
+    fn delete_by_rowid(&mut self, root_page: i32, rowid: i64) {
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            if let Some(index) = table.rows.iter().position(|r| r.rowid == rowid) {
+                let prev_next_rowid = table.next_rowid;
+                let row = table.rows.remove(index);
+                self.push_undo(MemDbUndoOp::DeleteRow {
+                    root_page,
+                    index,
+                    row,
+                    prev_next_rowid,
+                });
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn delete_at(&mut self, root_page: i32, index: usize) {
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            if index < table.rows.len() {
+                let prev_next_rowid = table.next_rowid;
+                let row = table.rows.remove(index);
+                self.push_undo(MemDbUndoOp::DeleteRow {
+                    root_page,
+                    index,
+                    row,
+                    prev_next_rowid,
+                });
+            }
+        }
+    }
+}
+
+impl Default for MemDatabase {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for MemDatabase {
+    fn clone(&self) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            next_root_page: self.next_root_page,
+            undo_enabled: false,
+            undo_log: Vec::new(),
         }
     }
 }
@@ -590,11 +778,14 @@ impl VdbeEngine {
     /// Take back the pager transaction after execution.
     ///
     /// All storage cursors must be dropped first (cleared during execution
-    /// cleanup). Panics if Rc references remain.
-    pub fn take_transaction(&mut self) -> Option<Box<dyn TransactionHandle>> {
+    /// cleanup).
+    pub fn take_transaction(&mut self) -> Result<Option<Box<dyn TransactionHandle>>> {
         // Drop all storage cursors first to release Rc references.
         self.storage_cursors.clear();
-        self.txn_page_io.take().map(SharedTxnPageIo::into_inner)
+        match self.txn_page_io.take() {
+            Some(txn_page_io) => Ok(Some(txn_page_io.into_inner()?)),
+            None => Ok(None),
+        }
     }
 
     /// Attach a function registry for `Function`/`PureFunc` opcode dispatch.
@@ -1540,11 +1731,7 @@ impl VdbeEngine {
                         .or_else(|| self.cursors.get(&cursor_id).map(|c| c.root_page));
                     let rowid = if let Some(root) = root {
                         if let Some(db) = self.db.as_mut() {
-                            if let Some(table) = db.get_table_mut(root) {
-                                table.alloc_rowid()
-                            } else {
-                                1
-                            }
+                            db.alloc_rowid(root)
                         } else {
                             1
                         }
@@ -1585,9 +1772,7 @@ impl VdbeEngine {
                         storage_root.or_else(|| self.cursors.get(&cursor_id).map(|c| c.root_page));
                     if let Some(root) = root {
                         if let Some(db) = self.db.as_mut() {
-                            if let Some(table) = db.get_table_mut(root) {
-                                table.insert(rowid, values);
-                            }
+                            db.upsert_row(root, rowid, values);
                         }
                     }
                     pc += 1;
@@ -1614,9 +1799,7 @@ impl VdbeEngine {
                         // Sync deletion to MemDatabase (dual-write).
                         if rowid != 0 {
                             if let Some(db) = self.db.as_mut() {
-                                if let Some(table) = db.get_table_mut(root) {
-                                    table.delete_by_rowid(rowid);
-                                }
+                                db.delete_by_rowid(root, rowid);
                             }
                         }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
@@ -1624,9 +1807,7 @@ impl VdbeEngine {
                         if let Some(pos) = cursor.position {
                             let root = cursor.root_page;
                             if let Some(db) = self.db.as_mut() {
-                                if let Some(table) = db.get_table_mut(root) {
-                                    table.delete_at(pos);
-                                }
+                                db.delete_at(root, pos);
                             }
                         }
                     }
@@ -1880,9 +2061,7 @@ impl VdbeEngine {
                 Opcode::Clear => {
                     // Clear all rows from a table. p1 = root page.
                     if let Some(db) = self.db.as_mut() {
-                        if let Some(table) = db.get_table_mut(op.p1) {
-                            table.rows.clear();
-                        }
+                        db.clear_table(op.p1);
                     }
                     pc += 1;
                 }
@@ -1890,7 +2069,7 @@ impl VdbeEngine {
                 Opcode::Destroy => {
                     // Remove a table. p1 = root page.
                     if let Some(db) = self.db.as_mut() {
-                        db.tables.remove(&op.p1);
+                        db.destroy_table(op.p1);
                     }
                     pc += 1;
                 }
@@ -5610,7 +5789,9 @@ mod tests {
         engine.set_transaction(Box::new(txn));
 
         // take_transaction should return the handle and clear cursors.
-        let recovered = engine.take_transaction();
+        let recovered = engine
+            .take_transaction()
+            .expect("take_transaction should succeed");
         assert!(recovered.is_some());
         assert!(engine.txn_page_io.is_none());
         assert!(engine.storage_cursors.is_empty());
@@ -5640,7 +5821,9 @@ mod tests {
 
         // Clean up: drop cursors before taking transaction.
         engine.storage_cursors.clear();
-        let _txn = engine.take_transaction();
+        let _txn = engine
+            .take_transaction()
+            .expect("take_transaction should succeed");
     }
 
     #[test]
@@ -5696,6 +5879,11 @@ mod tests {
 
         // Verify transaction recovery after cursor lifecycle.
         engine.storage_cursors.clear();
-        assert!(engine.take_transaction().is_some());
+        assert!(
+            engine
+                .take_transaction()
+                .expect("take_transaction should succeed")
+                .is_some()
+        );
     }
 }
