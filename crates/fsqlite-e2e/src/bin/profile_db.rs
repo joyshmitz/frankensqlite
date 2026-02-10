@@ -555,7 +555,7 @@ fn has_foreign_keys(conn: &Connection, tables: &[TableProfileV1]) -> Result<bool
     Ok(false)
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 fn profile_database(
     db_path: &Path,
     db_id: &str,
