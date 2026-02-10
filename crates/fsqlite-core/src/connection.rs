@@ -110,24 +110,30 @@ impl std::fmt::Debug for PreparedStatement {
 impl PreparedStatement {
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
-        execute_program_with_postprocess(
+        let mut rows = execute_program_with_postprocess(
             &self.program,
             None,
             self.func_registry.as_ref(),
             self.expression_postprocess.as_ref(),
-            self.distinct,
-        )
+        )?;
+        if self.distinct {
+            dedup_rows(&mut rows);
+        }
+        Ok(rows)
     }
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        execute_program_with_postprocess(
+        let mut rows = execute_program_with_postprocess(
             &self.program,
             Some(params),
             self.func_registry.as_ref(),
             self.expression_postprocess.as_ref(),
-            self.distinct,
-        )
+        )?;
+        if self.distinct {
+            dedup_rows(&mut rows);
+        }
+        Ok(rows)
     }
 
     /// Execute as a query and return exactly one row.
@@ -195,6 +201,8 @@ pub struct Connection {
     persist_path: Option<String>,
     /// Internal guard to suppress persistence while restoring from disk.
     persist_suspended: RefCell<bool>,
+    /// Number of rows affected by the most recent DML statement.
+    last_changes: RefCell<usize>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -229,6 +237,7 @@ impl Connection {
             savepoints: RefCell::new(Vec::new()),
             persist_path,
             persist_suspended: RefCell::new(false),
+            last_changes: RefCell::new(0),
         };
         conn.load_persisted_state_if_present()?;
         Ok(conn)
@@ -272,13 +281,41 @@ impl Connection {
     }
 
     /// Prepare and execute SQL, returning output/affected row count.
+    ///
+    /// For DML (INSERT/UPDATE/DELETE) this returns the number of affected
+    /// rows.  For SELECT and other statement types it returns the number of
+    /// result rows.
     pub fn execute(&self, sql: &str) -> Result<usize> {
-        Ok(self.query(sql)?.len())
+        let statements = parse_statements(sql)?;
+        let mut last_count = 0;
+        for statement in statements {
+            let is_dml = matches!(
+                &statement,
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            );
+            let rows = self.execute_statement(statement, None)?;
+            last_count = if is_dml {
+                *self.last_changes.borrow()
+            } else {
+                rows.len()
+            };
+        }
+        Ok(last_count)
     }
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
-        Ok(self.query_with_params(sql, params)?.len())
+        let statement = parse_single_statement(sql)?;
+        let is_dml = matches!(
+            &statement,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        );
+        let rows = self.execute_statement(statement, Some(params))?;
+        Ok(if is_dml {
+            *self.last_changes.borrow()
+        } else {
+            rows.len()
+        })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -300,13 +337,16 @@ impl Connection {
                 let distinct = is_distinct_select(select);
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
-                    execute_program_with_postprocess(
+                    let mut rows = execute_program_with_postprocess(
                         &compile_expression_select(select)?,
                         params,
                         Some(&self.func_registry),
                         Some(&build_expression_postprocess(select)),
-                        distinct,
-                    )
+                    )?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    Ok(rows)
                 } else if has_group_by(select) {
                     let mut rows = self.execute_group_by_select(select, params)?;
                     if distinct {
@@ -327,29 +367,45 @@ impl Connection {
                     if distinct {
                         dedup_rows(&mut rows);
                         if let Some(limit_clause) = limit_clause.as_ref() {
-                            apply_limit_clause(&mut rows, limit_clause)?;
+                            apply_limit_clause(&mut rows, limit_clause);
                         }
                     }
                     Ok(rows)
                 }
             }
             Statement::Insert(ref insert) => {
+                let affected = match &insert.source {
+                    fsqlite_ast::InsertSource::Values(v) => v.len(),
+                    fsqlite_ast::InsertSource::DefaultValues => 1,
+                    fsqlite_ast::InsertSource::Select(sel) => {
+                        // Run the inner SELECT to determine row count.
+                        self.execute_statement(Statement::Select(*sel.clone()), None)?
+                            .len()
+                    }
+                };
                 let program = self.compile_table_insert(insert)?;
-                let rows = self.execute_table_program(&program, params)?;
+                self.execute_table_program(&program, params)?;
                 self.persist_if_needed()?;
-                Ok(rows)
+                *self.last_changes.borrow_mut() = affected;
+                Ok(Vec::new())
             }
             Statement::Update(ref update) => {
+                let affected =
+                    self.count_matching_rows(&update.table.name, update.where_clause.as_ref())?;
                 let program = self.compile_table_update(update)?;
-                let rows = self.execute_table_program(&program, params)?;
+                self.execute_table_program(&program, params)?;
                 self.persist_if_needed()?;
-                Ok(rows)
+                *self.last_changes.borrow_mut() = affected;
+                Ok(Vec::new())
             }
             Statement::Delete(ref delete) => {
+                let affected =
+                    self.count_matching_rows(&delete.table.name, delete.where_clause.as_ref())?;
                 let program = self.compile_table_delete(delete)?;
-                let rows = self.execute_table_program(&program, params)?;
+                self.execute_table_program(&program, params)?;
                 self.persist_if_needed()?;
-                Ok(rows)
+                *self.last_changes.borrow_mut() = affected;
+                Ok(Vec::new())
             }
             Statement::Begin(begin) => {
                 self.execute_begin(begin)?;
@@ -406,6 +462,22 @@ impl Connection {
                 "prepare() currently supports SELECT statements only".to_owned(),
             )),
         }
+    }
+
+    /// Count the number of rows in `table_name` matching an optional WHERE
+    /// clause.  Used by UPDATE/DELETE to compute the affected-row count
+    /// without modifying the VDBE engine.
+    fn count_matching_rows(
+        &self,
+        table_name: &fsqlite_ast::QualifiedName,
+        where_clause: Option<&Expr>,
+    ) -> Result<usize> {
+        let sql = if let Some(cond) = where_clause {
+            format!("SELECT * FROM {table_name} WHERE {cond}")
+        } else {
+            format!("SELECT * FROM {table_name}")
+        };
+        Ok(self.query(&sql)?.len())
     }
 
     /// Process a CREATE TABLE statement: register the schema and create the
@@ -784,6 +856,7 @@ impl Connection {
                     }
                     GroupByColumn::Agg { name, arg_col } => {
                         if name == "count" && arg_col.is_none() {
+                            #[allow(clippy::cast_possible_wrap)]
                             values.push(SqliteValue::Integer(group_rows.len() as i64));
                         } else {
                             let Some(idx) = *arg_col else {
@@ -969,6 +1042,46 @@ fn dedup_rows(rows: &mut Vec<Row>) {
             true
         }
     });
+}
+
+/// Apply a LIMIT/OFFSET clause to a post-processed row vector.
+///
+/// Used when DISTINCT + LIMIT interact: DISTINCT must run on all rows first,
+/// then LIMIT/OFFSET truncate the deduplicated result.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn apply_limit_clause(rows: &mut Vec<Row>, clause: &LimitClause) {
+    let limit_val = eval_limit_expr(&clause.limit);
+    let offset_val = clause
+        .offset
+        .as_ref()
+        .map_or(0_usize, |off| eval_limit_expr(off) as usize);
+
+    if offset_val > 0 && offset_val < rows.len() {
+        rows.drain(..offset_val);
+    } else if offset_val >= rows.len() {
+        rows.clear();
+        return;
+    }
+
+    if limit_val >= 0 {
+        let limit = limit_val as usize;
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+    }
+}
+
+/// Evaluate a constant integer expression for LIMIT/OFFSET.
+fn eval_limit_expr(expr: &Expr) -> i64 {
+    match expr {
+        Expr::Literal(Literal::Integer(n), _) => *n,
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate,
+            expr: inner,
+            ..
+        } => -eval_limit_expr(inner),
+        _ => -1, // Negative means "no limit"
+    }
 }
 
 /// Check whether a table-backed SELECT has a GROUP BY clause.

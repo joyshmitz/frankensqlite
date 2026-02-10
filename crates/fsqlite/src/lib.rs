@@ -1219,6 +1219,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn aggregate_group_by_sum() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE gs (dept TEXT, salary INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO gs VALUES ('eng', 100);").unwrap();
+        conn.execute("INSERT INTO gs VALUES ('eng', 200);").unwrap();
+        conn.execute("INSERT INTO gs VALUES ('sales', 50);")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT dept, SUM(salary) FROM gs GROUP BY dept;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<(SqliteValue, SqliteValue)> = rows
+            .iter()
+            .map(|r| {
+                let v = row_values(r);
+                (v[0].clone(), v[1].clone())
+            })
+            .collect();
+        assert!(vals.contains(&(
+            SqliteValue::Text("eng".to_owned()),
+            SqliteValue::Integer(300)
+        )));
+        assert!(vals.contains(&(
+            SqliteValue::Text("sales".to_owned()),
+            SqliteValue::Integer(50)
+        )));
+    }
+
+    #[test]
+    fn aggregate_group_by_multiple_aggs() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE gm (cat TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO gm VALUES ('a', 10);").unwrap();
+        conn.execute("INSERT INTO gm VALUES ('a', 20);").unwrap();
+        conn.execute("INSERT INTO gm VALUES ('a', 30);").unwrap();
+        conn.execute("INSERT INTO gm VALUES ('b', 5);").unwrap();
+
+        let rows = conn
+            .query("SELECT cat, COUNT(*), MIN(val), MAX(val) FROM gm GROUP BY cat;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let a_row = rows
+            .iter()
+            .find(|r| row_values(r)[0] == SqliteValue::Text("a".to_owned()))
+            .unwrap();
+        assert_eq!(
+            row_values(a_row),
+            vec![
+                SqliteValue::Text("a".to_owned()),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(30),
+            ]
+        );
+        let b_row = rows
+            .iter()
+            .find(|r| row_values(r)[0] == SqliteValue::Text("b".to_owned()))
+            .unwrap();
+        assert_eq!(
+            row_values(b_row),
+            vec![
+                SqliteValue::Text("b".to_owned()),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(5),
+                SqliteValue::Integer(5),
+            ]
+        );
+    }
+
     // ── Aggregate: count(col) excludes NULL ──────────────────────────────
 
     #[test]
