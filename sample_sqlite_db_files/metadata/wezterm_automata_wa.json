@@ -1,0 +1,1323 @@
+{
+  "schema_version": 1,
+  "db_id": "wezterm_automata_wa",
+  "source_path": "/dp/wezterm_automata/.wa/wa.db",
+  "golden_filename": "wezterm_automata_wa.db",
+  "sha256_golden": "a4848ea276e28237b0f76629669b2a2c52e18c6224089ae32b58a3e8185fa80c",
+  "size_bytes": 278528,
+  "sidecars_present": [],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 68,
+    "freelist_count": 0,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 7,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": false,
+    "has_fts": true,
+    "has_rtree": false,
+    "has_triggers": true,
+    "has_views": true,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "fts",
+    "many-indexes",
+    "many-tables",
+    "medium",
+    "misc",
+    "page-size-4096",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
+  "tables": [
+    {
+      "name": "accounts",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "account_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "service",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "percent_remaining",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "reset_at",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "tokens_used",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "tokens_remaining",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "tokens_limit",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "last_refreshed_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "last_used_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "action_undo",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "audit_action_id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "undoable",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        },
+        {
+          "name": "undo_strategy",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "undo_hint",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "undo_payload",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "undone_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "undone_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "agent_sessions",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "pane_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "agent_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "session_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "external_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "started_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "ended_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "end_reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "total_tokens",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "input_tokens",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "output_tokens",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "cached_tokens",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "reasoning_tokens",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "model_name",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "estimated_cost_usd",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "approval_tokens",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "code_hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "expires_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "used_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "workspace_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "action_kind",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pane_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "action_fingerprint",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "audit_actions",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ts",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "actor_kind",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "actor_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "pane_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "domain",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "action_kind",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "policy_decision",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "decision_reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "rule_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "input_summary",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "verification_summary",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "result",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "decision_context",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "config",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "key",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "value",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "events",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "pane_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "rule_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "agent_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "event_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "severity",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "confidence",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "extracted",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "matched_text",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "segment_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "detected_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "handled_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "handled_by_workflow_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "handled_status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "dedupe_key",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "maintenance_log",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "event_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "message",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "metadata",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "timestamp",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "output_gaps",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "pane_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "seq_before",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "seq_after",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "detected_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "output_segments",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "pane_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "seq",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "content",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "content_len",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "content_hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "captured_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "output_segments_fts",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "content",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "output_segments_fts_config",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "k",
+          "type": "",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "v",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "output_segments_fts_data",
+      "row_count": 2,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "block",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "output_segments_fts_docsize",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "sz",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "output_segments_fts_idx",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "segid",
+          "type": "",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "term",
+          "type": "",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pgno",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "panes",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "pane_id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "domain",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'local'"
+        },
+        {
+          "name": "window_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "tab_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "title",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "cwd",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "tty_name",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "first_seen_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "last_seen_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "observed",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "1"
+        },
+        {
+          "name": "ignore_reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "last_decision_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "pane_uuid",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "schema_version",
+      "row_count": 7,
+      "columns": [
+        {
+          "name": "version",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "applied_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "wa_meta",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "schema_version",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "min_compatible_wa",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_by_wa",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "workflow_action_plans",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "workflow_id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "plan_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "plan_hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "plan_json",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "workflow_executions",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "workflow_name",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pane_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "trigger_event_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "current_step",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'running'"
+        },
+        {
+          "name": "wait_condition",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "context",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "result",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "error",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "started_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "completed_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "workflow_step_logs",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "workflow_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "step_index",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "step_name",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "result_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "result_data",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "started_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "completed_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "duration_ms",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "audit_action_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "step_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "step_kind",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "policy_summary",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "verification_refs",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "error_code",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    }
+  ],
+  "indices": [
+    "idx_accounts_last_used",
+    "idx_accounts_percent",
+    "idx_accounts_service",
+    "idx_accounts_service_account",
+    "idx_action_plans_hash",
+    "idx_action_undo_undoable",
+    "idx_approval_tokens_expires",
+    "idx_approval_tokens_fingerprint",
+    "idx_approval_tokens_hash",
+    "idx_approval_tokens_pane",
+    "idx_approval_tokens_unused",
+    "idx_approval_tokens_workspace",
+    "idx_audit_actions_action",
+    "idx_audit_actions_actor",
+    "idx_audit_actions_decision",
+    "idx_audit_actions_pane",
+    "idx_audit_actions_ts",
+    "idx_events_detected",
+    "idx_events_pane",
+    "idx_events_rule",
+    "idx_events_severity",
+    "idx_events_unhandled",
+    "idx_gaps_detected",
+    "idx_gaps_pane",
+    "idx_maintenance_timestamp",
+    "idx_panes_last_seen",
+    "idx_panes_observed",
+    "idx_segments_captured",
+    "idx_segments_pane_seq",
+    "idx_sessions_active",
+    "idx_sessions_external",
+    "idx_sessions_pane",
+    "idx_step_logs_audit_action",
+    "idx_step_logs_workflow",
+    "idx_workflows_pane",
+    "idx_workflows_started",
+    "idx_workflows_status"
+  ],
+  "triggers": [
+    "output_segments_ad",
+    "output_segments_ai",
+    "output_segments_au"
+  ],
+  "views": [
+    "action_history"
+  ]
+}

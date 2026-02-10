@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "db_id": "codexbar_build",
+  "source_path": "/dp/CodexBar/.build/build.db",
+  "golden_filename": "codexbar_build.db",
+  "sha256_golden": "cdfc085305b2c8172d071b31979483a6fe37015f3863d021938e67c4ec26d763",
+  "size_bytes": 380928,
+  "sidecars_present": [],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 93,
+    "freelist_count": 0,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "delete",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": false,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": false,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "medium",
+    "misc",
+    "page-size-4096"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
+  "tables": [
+    {
+      "name": "info",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "version",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "client_version",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "iteration",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "key_names",
+      "row_count": 765,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "key",
+          "type": "STRING",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "rule_results",
+      "row_count": 765,
+      "columns": [
+        {
+          "name": "key_id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "value",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "signature",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "built_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "computed_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "start",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "end",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "dependencies",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    }
+  ],
+  "indices": [
+    "rule_results_idx"
+  ],
+  "triggers": [],
+  "views": []
+}

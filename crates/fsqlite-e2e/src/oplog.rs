@@ -771,6 +771,561 @@ pub fn preset_deterministic_transform(fixture_id: &str, seed: u64, rows_per_tabl
     OpLog { header, records }
 }
 
+/// Generate the **large transaction** preset.
+///
+/// A small number of very large transactions stress-test checkpoint behaviour,
+/// GC, and WAL frame accumulation.  Each worker commits one big transaction
+/// containing `rows_per_txn` inserts into separate tables (indexed) so the
+/// B-tree splits frequently.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn preset_large_txn(
+    fixture_id: &str,
+    seed: u64,
+    worker_count: u16,
+    rows_per_txn: u32,
+) -> OpLog {
+    let header = OpLogHeader {
+        fixture_id: fixture_id.to_owned(),
+        seed,
+        rng: RngSpec::default(),
+        concurrency: ConcurrencyModel {
+            worker_count,
+            transaction_size: rows_per_txn,
+            commit_order_policy: "deterministic".to_owned(),
+        },
+        preset: Some("large_txn".to_owned()),
+    };
+
+    let mut records = Vec::new();
+    let mut op_id: u64 = 0;
+
+    // Schema: two indexed tables.
+    let schema_stmts = [
+        "CREATE TABLE IF NOT EXISTS lt_main (\
+            id INTEGER PRIMARY KEY, \
+            category TEXT NOT NULL, \
+            val TEXT, \
+            num REAL, \
+            created_at INTEGER DEFAULT 0)",
+        "CREATE INDEX IF NOT EXISTS idx_lt_main_category ON lt_main (category)",
+        "CREATE INDEX IF NOT EXISTS idx_lt_main_num ON lt_main (num)",
+        "CREATE TABLE IF NOT EXISTS lt_aux (\
+            id INTEGER PRIMARY KEY, \
+            ref_id INTEGER, \
+            payload TEXT)",
+        "CREATE INDEX IF NOT EXISTS idx_lt_aux_ref ON lt_aux (ref_id)",
+    ];
+
+    for stmt in &schema_stmts {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: (*stmt).to_owned(),
+            },
+            expected: None,
+        });
+        op_id += 1;
+    }
+
+    // Deterministic helpers (same pattern as deterministic_transform).
+    let det_str = |prefix: &str, s: u64, w: u16, i: u32| -> String {
+        let mixed = s
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .wrapping_add(u64::from(w))
+            .wrapping_add(u64::from(i));
+        format!("{prefix}_{mixed:016x}")
+    };
+
+    let categories = ["alpha", "beta", "gamma", "delta"];
+
+    // Each worker executes one large transaction.
+    for w in 0..worker_count {
+        let base_key = i64::from(w) * i64::from(rows_per_txn);
+
+        records.push(OpRecord {
+            op_id,
+            worker: w,
+            kind: OpKind::Begin,
+            expected: None,
+        });
+        op_id += 1;
+
+        for r in 0..rows_per_txn {
+            let key = base_key + i64::from(r);
+            let cat = categories[r as usize % categories.len()];
+            let num_val = f64::from(r) * 3.14;
+
+            // Main table insert.
+            records.push(OpRecord {
+                op_id,
+                worker: w,
+                kind: OpKind::Insert {
+                    table: "lt_main".to_owned(),
+                    key,
+                    values: vec![
+                        ("category".to_owned(), cat.to_owned()),
+                        ("val".to_owned(), det_str("lt", seed, w, r)),
+                        ("num".to_owned(), format!("{num_val:.6}")),
+                        ("created_at".to_owned(), format!("{}", r.saturating_mul(100))),
+                    ],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            });
+            op_id += 1;
+
+            // Aux table insert (every other row).
+            if r % 2 == 0 {
+                records.push(OpRecord {
+                    op_id,
+                    worker: w,
+                    kind: OpKind::Insert {
+                        table: "lt_aux".to_owned(),
+                        key,
+                        values: vec![
+                            ("ref_id".to_owned(), format!("{key}")),
+                            ("payload".to_owned(), det_str("aux", seed, w, r)),
+                        ],
+                    },
+                    expected: Some(ExpectedResult::AffectedRows(1)),
+                });
+                op_id += 1;
+            }
+        }
+
+        records.push(OpRecord {
+            op_id,
+            worker: w,
+            kind: OpKind::Commit,
+            expected: None,
+        });
+        op_id += 1;
+    }
+
+    // Verification.
+    for table in &["lt_main", "lt_aux"] {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: format!("SELECT COUNT(*) FROM {table}"),
+            },
+            expected: Some(ExpectedResult::RowCount(1)),
+        });
+        op_id += 1;
+    }
+
+    OpLog { header, records }
+}
+
+/// Generate the **schema migration** preset.
+///
+/// Simulates a typical application upgrade sequence: create tables, populate,
+/// then run DDL migrations (ADD COLUMN, CREATE INDEX, backfill, RENAME TABLE).
+/// Serial execution only (`worker_count=1`) because DDL is inherently
+/// serialized in SQLite.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn preset_schema_migration(fixture_id: &str, seed: u64, rows: u32) -> OpLog {
+    let header = OpLogHeader {
+        fixture_id: fixture_id.to_owned(),
+        seed,
+        rng: RngSpec::default(),
+        concurrency: ConcurrencyModel {
+            worker_count: 1,
+            transaction_size: rows.clamp(1, 50),
+            commit_order_policy: "deterministic".to_owned(),
+        },
+        preset: Some("schema_migration".to_owned()),
+    };
+
+    let mut records = Vec::new();
+    let mut op_id: u64 = 0;
+
+    let det_str = |prefix: &str, s: u64, i: u32| -> String {
+        let mixed = s
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .wrapping_add(u64::from(i));
+        format!("{prefix}_{mixed:016x}")
+    };
+
+    // ── V1: initial schema ───────────────────────────────────────────
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "CREATE TABLE IF NOT EXISTS users (\
+                id INTEGER PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                email TEXT NOT NULL)"
+                .to_owned(),
+        },
+        expected: None,
+    });
+    op_id += 1;
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Sql {
+            statement: "CREATE TABLE IF NOT EXISTS posts (\
+                id INTEGER PRIMARY KEY, \
+                user_id INTEGER NOT NULL, \
+                title TEXT NOT NULL, \
+                body TEXT)"
+                .to_owned(),
+        },
+        expected: None,
+    });
+    op_id += 1;
+
+    // ── V1: populate ─────────────────────────────────────────────────
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    for i in 0..rows {
+        let key = i64::from(i);
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "users".to_owned(),
+                key,
+                values: vec![
+                    ("name".to_owned(), det_str("user", seed, i)),
+                    ("email".to_owned(), format!("u{i}@test.local")),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+
+        // Two posts per user.
+        for p in 0..2_u32 {
+            let post_key = i64::from(i) * 2 + i64::from(p);
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Insert {
+                    table: "posts".to_owned(),
+                    key: post_key,
+                    values: vec![
+                        ("user_id".to_owned(), format!("{key}")),
+                        ("title".to_owned(), det_str("title", seed, i * 2 + p)),
+                        ("body".to_owned(), det_str("body", seed, i * 2 + p)),
+                    ],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            });
+            op_id += 1;
+        }
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // ── V2: migration — ADD COLUMN + index + backfill ────────────────
+    let migration_ddl = [
+        "ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'",
+        "ALTER TABLE users ADD COLUMN created_at INTEGER DEFAULT 0",
+        "CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)",
+        "CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts (user_id)",
+    ];
+
+    for stmt in &migration_ddl {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: (*stmt).to_owned(),
+            },
+            expected: None,
+        });
+        op_id += 1;
+    }
+
+    // Backfill the new columns.
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    for i in 0..rows {
+        let key = i64::from(i);
+        let status = if i % 5 == 0 { "inactive" } else { "active" };
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: format!(
+                    "UPDATE users SET status = '{status}', created_at = {ts} WHERE id = {key}",
+                    ts = i.saturating_mul(3600),
+                ),
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // ── V3: migration — rename table + new join table ────────────────
+    let v3_ddl = [
+        "ALTER TABLE posts RENAME TO articles",
+        "CREATE TABLE IF NOT EXISTS tags (\
+            id INTEGER PRIMARY KEY, \
+            name TEXT NOT NULL UNIQUE)",
+        "CREATE TABLE IF NOT EXISTS article_tags (\
+            article_id INTEGER NOT NULL, \
+            tag_id INTEGER NOT NULL, \
+            PRIMARY KEY (article_id, tag_id))",
+    ];
+
+    for stmt in &v3_ddl {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: (*stmt).to_owned(),
+            },
+            expected: None,
+        });
+        op_id += 1;
+    }
+
+    // Insert some tags and link them.
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    let tag_names = ["rust", "sqlite", "mvcc", "testing", "perf"];
+    for (idx, tag) in tag_names.iter().enumerate() {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "tags".to_owned(),
+                key: idx as i64,
+                values: vec![("name".to_owned(), (*tag).to_owned())],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+    }
+
+    // Tag each article with 1-2 tags deterministically.
+    let article_count = rows.saturating_mul(2);
+    for a in 0..article_count {
+        let tag1 = a as usize % tag_names.len();
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: format!(
+                    "INSERT OR IGNORE INTO article_tags (article_id, tag_id) VALUES ({a}, {tag1})"
+                ),
+            },
+            expected: None,
+        });
+        op_id += 1;
+
+        if a % 3 == 0 {
+            let tag2 = (a as usize + 1) % tag_names.len();
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: format!(
+                        "INSERT OR IGNORE INTO article_tags (article_id, tag_id) VALUES ({a}, {tag2})"
+                    ),
+                },
+                expected: None,
+            });
+            op_id += 1;
+        }
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // Verification queries.
+    for table in &["users", "articles", "tags", "article_tags"] {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: format!("SELECT COUNT(*) FROM {table}"),
+            },
+            expected: Some(ExpectedResult::RowCount(1)),
+        });
+        op_id += 1;
+    }
+
+    OpLog { header, records }
+}
+
+// ── Preset Catalog ──────────────────────────────────────────────────────
+
+/// Expected equivalence tier when comparing sqlite3 vs fsqlite results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EquivalenceTier {
+    /// Tier 1: raw byte-for-byte SHA-256 match of the database file.
+    Tier1Raw,
+    /// Tier 2: canonical match (VACUUM INTO + stable PRAGMAs → SHA-256).
+    Tier2Canonical,
+    /// Tier 3: logical match (deterministic SQL dump comparison).
+    Tier3Logical,
+}
+
+impl EquivalenceTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tier1Raw => "tier1_raw",
+            Self::Tier2Canonical => "tier2_canonical",
+            Self::Tier3Logical => "tier3_logical",
+        }
+    }
+}
+
+impl std::fmt::Display for EquivalenceTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Concurrency sweep defaults for benchmark runs of a preset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConcurrencySweep {
+    /// Worker counts to test (e.g. `[1, 2, 4, 8]`).
+    pub worker_counts: Vec<u16>,
+    /// Whether concurrency sweep is meaningful for this preset.
+    pub applicable: bool,
+}
+
+/// Metadata describing a workload preset for the catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresetMeta {
+    /// Machine-readable name (matches `OpLogHeader::preset`).
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Expected equivalence tier when comparing sqlite3 vs fsqlite.
+    pub expected_tier: EquivalenceTier,
+    /// Whether this preset is serial-only or supports concurrent workers.
+    pub serial_only: bool,
+    /// Default concurrency sweep parameters for benchmarking.
+    pub concurrency_sweep: ConcurrencySweep,
+}
+
+/// Return the full catalog of built-in workload presets with documented expectations.
+#[must_use]
+pub fn preset_catalog() -> Vec<PresetMeta> {
+    vec![
+        PresetMeta {
+            name: "commutative_inserts_disjoint_keys".to_owned(),
+            description: "Disjoint-key inserts across workers; zero write conflicts expected. \
+                Tests MVCC scaling with embarrassingly parallel writes."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier2Canonical,
+            serial_only: false,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1, 2, 4, 8, 16, 32],
+                applicable: true,
+            },
+        },
+        PresetMeta {
+            name: "hot_page_contention".to_owned(),
+            description: "All workers compete for the same 10 rows, forcing lock contention \
+                and retry logic. Stress-tests MVCC conflict detection and SSI retry."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier3Logical,
+            serial_only: false,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1, 2, 4, 8],
+                applicable: true,
+            },
+        },
+        PresetMeta {
+            name: "mixed_read_write".to_owned(),
+            description: "OLTP-ish mix of reads and writes. Workers alternate SELECT and INSERT \
+                under barrier synchronization. Tests snapshot isolation under mixed workloads."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier2Canonical,
+            serial_only: false,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1, 2, 4, 8, 16],
+                applicable: true,
+            },
+        },
+        PresetMeta {
+            name: "deterministic_transform".to_owned(),
+            description: "Serial CREATE/INSERT/UPDATE/DELETE across 3 tables with indexes. \
+                Produces identical output for both engines at Tier-1 (same seed → same SHA-256)."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier1Raw,
+            serial_only: true,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1],
+                applicable: false,
+            },
+        },
+        PresetMeta {
+            name: "large_txn".to_owned(),
+            description: "Few very large transactions with indexed tables. Stress-tests \
+                checkpoint behaviour, GC, WAL frame accumulation, and B-tree splits."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier2Canonical,
+            serial_only: false,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1, 2, 4],
+                applicable: true,
+            },
+        },
+        PresetMeta {
+            name: "schema_migration".to_owned(),
+            description: "DDL migration sequence: CREATE TABLE → populate → ALTER TABLE ADD COLUMN → \
+                CREATE INDEX → backfill → RENAME TABLE → new join table. \
+                Tests DDL correctness across engines."
+                .to_owned(),
+            expected_tier: EquivalenceTier::Tier2Canonical,
+            serial_only: true,
+            concurrency_sweep: ConcurrencySweep {
+                worker_counts: vec![1],
+                applicable: false,
+            },
+        },
+    ]
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]

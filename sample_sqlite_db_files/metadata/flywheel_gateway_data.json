@@ -1,0 +1,1697 @@
+{
+  "schema_version": 1,
+  "db_id": "flywheel_gateway_data",
+  "source_path": "/dp/flywheel_gateway/data/gateway.db",
+  "golden_filename": "flywheel_gateway_data.db",
+  "sha256_golden": "37739fabf85c1df36abcc2cd586da76589521bddfe8999d7dd72063222bc6aec",
+  "size_bytes": 6008832,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 1467,
+    "freelist_count": 200,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": false,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "flywheel",
+    "large",
+    "many-indexes",
+    "page-size-4096",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
+  "tables": [
+    {
+      "name": "__drizzle_migrations",
+      "row_count": 3,
+      "columns": [
+        {
+          "name": "id",
+          "type": "SERIAL",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "numeric",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "account_pool_members",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pool_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "profile_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "priority",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "account_pools",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "workspace_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "provider",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "rotation_strategy",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'smart'"
+        },
+        {
+          "name": "cooldown_minutes_default",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "15"
+        },
+        {
+          "name": "max_retries",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "3"
+        },
+        {
+          "name": "active_profile_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "last_rotated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "account_profiles",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "workspace_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "provider",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "auth_mode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'unlinked'"
+        },
+        {
+          "name": "status_message",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "health_score",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "last_verified_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "expires_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "cooldown_until",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "last_used_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "auth_files_present",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "false"
+        },
+        {
+          "name": "auth_file_hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "storage_mode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "labels",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "health_status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "token_expires_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "last_error_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "error_count_1h",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "penalty_score",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "penalty_updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "plan_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "accounts",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "email",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "api_key_hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "role",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "agent_sweeps",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "query",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "action",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "affected_count",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "agents",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "repo_url",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "task",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'idle'"
+        },
+        {
+          "name": "model",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'sonnet-4'"
+        },
+        {
+          "name": "account_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "alerts",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "severity",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "message",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "acknowledged",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "false"
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "approval_requests",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "workspace_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "agent_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "session_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "rule_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "rule_name",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "operation_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "operation_command",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "operation_path",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "operation_description",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "operation_details",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "task_description",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "recent_actions",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'pending'"
+        },
+        {
+          "name": "priority",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'normal'"
+        },
+        {
+          "name": "requested_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "expires_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "decided_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "decided_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "decision_reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "correlation_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "audit_logs",
+      "row_count": 13058,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "account_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "action",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "resource",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "resource_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "outcome",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "correlation_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "metadata",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "checkpoints",
+      "row_count": 889,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "agent_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "state",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "dcg_allowlist",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "rule_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pattern",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "approved_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "expires_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "dcg_blocks",
+      "row_count": 3028,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pattern",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "false_positive",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "false"
+        },
+        {
+          "name": "command",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "pack",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "severity",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "rule_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "context_classification",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "dcg_config",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "enabled_packs",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "disabled_packs",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "critical_mode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'deny'"
+        },
+        {
+          "name": "high_mode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'deny'"
+        },
+        {
+          "name": "medium_mode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'warn'"
+        },
+        {
+          "name": "low_mode",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'log'"
+        },
+        {
+          "name": "updated_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "dcg_config_history",
+      "row_count": 421,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "config_snapshot",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "previous_snapshot",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "changed_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "changed_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "change_reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "change_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "dcg_pending_exceptions",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "short_code",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "command",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "command_hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pack",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "rule_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "severity",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "agent_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "block_event_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'pending'"
+        },
+        {
+          "name": "approved_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "approved_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "denied_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "denied_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "deny_reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "executed_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "execution_result",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "expires_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "fleet_repos",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "url",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "branch",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "path",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "last_sync_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "history",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "agent_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "command",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "input",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "output",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "duration_ms",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "job_logs",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "job_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "level",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "message",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "data",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "timestamp",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "duration_ms",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "jobs",
+      "row_count": 5,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "name",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'pending'"
+        },
+        {
+          "name": "priority",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "1"
+        },
+        {
+          "name": "session_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "agent_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "user_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "input",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "output",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "progress_current",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        },
+        {
+          "name": "progress_total",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "100"
+        },
+        {
+          "name": "progress_message",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "progress_stage",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "started_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "completed_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "estimated_duration_ms",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "actual_duration_ms",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "error_code",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "error_message",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "error_stack",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "error_retryable",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "retry_attempts",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        },
+        {
+          "name": "retry_max_attempts",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "3"
+        },
+        {
+          "name": "retry_backoff_ms",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "1000"
+        },
+        {
+          "name": "retry_next_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "cancel_requested_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "cancel_requested_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "cancel_reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "checkpoint_state",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "checkpoint_at",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "metadata",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "correlation_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    }
+  ],
+  "indices": [
+    "account_pool_members_pool_idx",
+    "account_pool_members_profile_idx",
+    "account_pool_members_unique_idx",
+    "account_pools_workspace_idx",
+    "account_pools_workspace_provider_idx",
+    "account_profiles_provider_idx",
+    "account_profiles_status_idx",
+    "account_profiles_workspace_idx",
+    "account_profiles_workspace_provider_idx",
+    "accounts_api_key_hash_idx",
+    "accounts_email_idx",
+    "agent_sweeps_status_idx",
+    "agents_account_idx",
+    "agents_created_at_idx",
+    "agents_status_idx",
+    "alerts_severity_idx",
+    "audit_logs_account_idx",
+    "audit_logs_action_idx",
+    "audit_logs_created_at_idx",
+    "checkpoints_agent_idx",
+    "checkpoints_created_at_idx",
+    "dcg_allowlist_rule_id_idx",
+    "dcg_blocks_created_at_idx",
+    "dcg_config_history_changed_at_idx",
+    "dcg_config_history_changed_by_idx",
+    "dcg_pending_agent_idx",
+    "dcg_pending_command_hash_idx",
+    "dcg_pending_expires_idx",
+    "dcg_pending_short_code_idx",
+    "dcg_pending_status_idx",
+    "fleet_repos_path_idx",
+    "history_agent_idx",
+    "history_command_idx",
+    "history_created_at_idx",
+    "job_logs_job_idx",
+    "job_logs_level_idx",
+    "job_logs_timestamp_idx",
+    "jobs_agent_idx",
+    "jobs_correlation_idx",
+    "jobs_created_at_idx",
+    "jobs_priority_idx",
+    "jobs_session_idx",
+    "jobs_status_idx",
+    "jobs_type_idx"
+  ],
+  "triggers": [],
+  "views": []
+}

@@ -1,0 +1,859 @@
+{
+  "schema_version": 1,
+  "db_id": "smartedgar_risk_ops",
+  "source_path": "/dp/smartedgar_mcp/risk_ops.db",
+  "golden_filename": "smartedgar_risk_ops.db",
+  "sha256_golden": "099800221ad57323bb4d6cc43dd20b0826bc839552e0b7951c50a6ef55b6607e",
+  "size_bytes": 303104,
+  "sidecars_present": [],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 74,
+    "freelist_count": 0,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "delete",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": false,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": false,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "many-indexes",
+    "medium",
+    "misc",
+    "page-size-4096"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
+  "tables": [
+    {
+      "name": "capital_simulation_audit",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pod_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "org_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "user_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "as_of",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "request_payload",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "response_payload",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "warnings",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "hedge_suggestion_audit",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "scenario_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pod_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "org_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "user_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "hedge_strategy",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "parameters",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "result_summary",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "accepted",
+          "type": "BOOLEAN",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "accepted_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "pod_performance_metrics",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pod_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "period",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "as_of",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "specific_ir",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "factor_ir",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "realized_vol",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "max_drawdown",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "percentile",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "capital_allocated",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "capital_recommended_min",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "capital_recommended_max",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "trend_values",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "warnings",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "metadata_json",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "risk_breach_acknowledgements",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "breach_id",
+          "type": "CHAR(32)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "snapshot_id",
+          "type": "CHAR(32)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pod_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "org_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "user_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "note",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "risk_constraint_limits",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "constraint_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "version",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "family",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "operator",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "threshold",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "pod_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "metadata_json",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "effective_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_by_user_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "risk_pod_breaches",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "snapshot_id",
+          "type": "CHAR(32)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "constraint_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "family",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "severity",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "message",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "metric_value",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "limit_value",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "units",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "tags",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "acknowledge_required",
+          "type": "BOOLEAN",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "acknowledged_by",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "acknowledged_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "risk_pod_memberships",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pod_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "ticker",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "weight",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "added_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "risk_pod_snapshots",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pod_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "as_of",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "generated_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "latency_ms",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "hedge_strategy",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "recommended_hedge",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "summary_metrics",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "errors",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "risk_pods",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "id",
+          "type": "VARCHAR",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "timezone",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "description",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "hedge_strategy_default",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "risk_role_assignment_pods",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "assignment_id",
+          "type": "CHAR(32)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pod_id",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "risk_role_assignments",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "id",
+          "type": "CHAR(32)",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "org_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "user_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "role",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "is_active",
+          "type": "BOOLEAN",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "updated_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    }
+  ],
+  "indices": [
+    "ix_capital_simulation_audit_created_at",
+    "ix_capital_simulation_audit_id",
+    "ix_capital_simulation_audit_org_id",
+    "ix_capital_simulation_audit_pod_id",
+    "ix_capital_simulation_audit_user_id",
+    "ix_hedge_suggestion_audit_id",
+    "ix_hedge_suggestion_audit_org_id",
+    "ix_hedge_suggestion_audit_pod_id",
+    "ix_hedge_suggestion_audit_scenario_id",
+    "ix_hedge_suggestion_audit_user_id",
+    "ix_pod_performance_metrics_as_of",
+    "ix_pod_performance_metrics_id",
+    "ix_pod_performance_metrics_period",
+    "ix_pod_performance_metrics_pod_id",
+    "ix_risk_breach_acknowledgements_breach_id",
+    "ix_risk_breach_acknowledgements_id",
+    "ix_risk_breach_acknowledgements_org_id",
+    "ix_risk_breach_acknowledgements_pod_id",
+    "ix_risk_breach_acknowledgements_snapshot_id",
+    "ix_risk_breach_acknowledgements_user_id",
+    "ix_risk_constraint_limits_constraint_id",
+    "ix_risk_constraint_limits_family",
+    "ix_risk_constraint_limits_id",
+    "ix_risk_constraint_limits_pod_id",
+    "ix_risk_constraint_limits_version",
+    "ix_risk_pod_breaches_constraint_id",
+    "ix_risk_pod_breaches_family",
+    "ix_risk_pod_breaches_id",
+    "ix_risk_pod_breaches_snapshot_id",
+    "ix_risk_pod_memberships_id",
+    "ix_risk_pod_memberships_pod_id",
+    "ix_risk_pod_memberships_ticker",
+    "ix_risk_pod_snapshots_id",
+    "ix_risk_pod_snapshots_pod_id",
+    "ix_risk_pods_name",
+    "ix_risk_role_assignment_pods_assignment_id",
+    "ix_risk_role_assignment_pods_id",
+    "ix_risk_role_assignment_pods_pod_id",
+    "ix_risk_role_assignments_id",
+    "ix_risk_role_assignments_org_id",
+    "ix_risk_role_assignments_user_id"
+  ],
+  "triggers": [],
+  "views": []
+}

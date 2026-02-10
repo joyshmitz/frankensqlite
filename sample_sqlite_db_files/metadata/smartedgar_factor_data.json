@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "db_id": "smartedgar_factor_data",
+  "source_path": "/dp/smartedgar_mcp/data/test_tz/factor_data.db",
+  "golden_filename": "smartedgar_factor_data.db",
+  "sha256_golden": "12840d3571862f87f864153fb6b4779e2a72e65d6f1360e874eb367ac39af240",
+  "size_bytes": 6098944,
+  "sidecars_present": [
+    "-wal",
+    "-shm"
+  ],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 1489,
+    "freelist_count": 0,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": true,
+    "has_fts": false,
+    "has_rtree": false,
+    "has_triggers": false,
+    "has_views": false,
+    "has_foreign_keys": false
+  },
+  "tags": [
+    "large",
+    "misc",
+    "page-size-4096",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
+  "tables": [
+    {
+      "name": "eodhd_fundamentals_raw",
+      "row_count": 733,
+      "columns": [
+        {
+          "name": "ticker",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "period_end",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "period_type",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "payload_json",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "ingested_at",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "payload_hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "polygon_corp_actions",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "ticker",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "event_date",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "event_type",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "payload_json",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "fetched_at",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "polygon_price_bars",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "ticker",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "date",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "adjusted_close",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "volume",
+          "type": "REAL",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "source",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "fetched_at",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "polygon_price_coverage",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "ticker",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "first_available",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "latest_available",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "last_refreshed_at",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "last_source",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "fetch_attempts",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        }
+      ]
+    }
+  ],
+  "indices": [],
+  "triggers": [],
+  "views": []
+}

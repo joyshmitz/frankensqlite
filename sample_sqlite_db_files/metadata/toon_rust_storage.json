@@ -1,0 +1,750 @@
+{
+  "schema_version": 1,
+  "db_id": "toon_rust_storage",
+  "source_path": "/dp/toon_rust/storage.sqlite3",
+  "golden_filename": "toon_rust_storage.db",
+  "sha256_golden": "14289be01e0795bb82f9219e65cc30a0ca3816bf86cf8be4453e51918b3772c2",
+  "size_bytes": 245760,
+  "sidecars_present": [],
+  "sqlite_meta": {
+    "page_size": 4096,
+    "page_count": 60,
+    "freelist_count": 0,
+    "schema_version": 1,
+    "encoding": "UTF-8",
+    "user_version": 0,
+    "application_id": 0,
+    "journal_mode": "wal",
+    "auto_vacuum": 0
+  },
+  "features": {
+    "has_wal_sidecars_observed": false,
+    "has_fts": true,
+    "has_rtree": false,
+    "has_triggers": true,
+    "has_views": false,
+    "has_foreign_keys": true
+  },
+  "tags": [
+    "fts",
+    "many-indexes",
+    "medium",
+    "misc",
+    "page-size-4096",
+    "wal"
+  ],
+  "safety": {
+    "pii_risk": "unknown",
+    "secrets_risk": "unknown",
+    "allowed_for_ci": false
+  },
+  "tables": [
+    {
+      "name": "agent_links",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "a_project_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "a_agent_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "b_project_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "b_agent_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "VARCHAR(16)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "reason",
+          "type": "VARCHAR(512)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "updated_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "expires_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "agents",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "project_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR(128)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "program",
+          "type": "VARCHAR(128)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "model",
+          "type": "VARCHAR(128)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "task_description",
+          "type": "VARCHAR(2048)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "inception_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "last_active_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "attachments_policy",
+          "type": "VARCHAR(16)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "contact_policy",
+          "type": "VARCHAR(16)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "file_reservations",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "project_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "agent_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "path_pattern",
+          "type": "VARCHAR(512)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "exclusive",
+          "type": "BOOLEAN",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "reason",
+          "type": "VARCHAR(512)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "expires_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "released_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "fts_messages",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "message_id",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "subject",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "body",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "fts_messages_config",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "k",
+          "type": "",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "v",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "fts_messages_content",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "c0",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "c1",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "c2",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "fts_messages_data",
+      "row_count": 2,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "block",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "fts_messages_docsize",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "sz",
+          "type": "BLOB",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "fts_messages_idx",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "segid",
+          "type": "",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "term",
+          "type": "",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "pgno",
+          "type": "",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "message_recipients",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "message_id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "agent_id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "kind",
+          "type": "VARCHAR(8)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "read_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "ack_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "messages",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "project_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "sender_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "thread_id",
+          "type": "VARCHAR(128)",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "subject",
+          "type": "VARCHAR(512)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "body_md",
+          "type": "VARCHAR",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "importance",
+          "type": "VARCHAR(16)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "ack_required",
+          "type": "BOOLEAN",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "attachments",
+          "type": "JSON",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'[]'"
+        }
+      ]
+    },
+    {
+      "name": "product_project_links",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "product_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "project_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "products",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "product_uid",
+          "type": "VARCHAR(64)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR(255)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "project_sibling_suggestions",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "project_a_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "project_b_id",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "score",
+          "type": "FLOAT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "status",
+          "type": "VARCHAR(16)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "rationale",
+          "type": "VARCHAR(4096)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "evaluated_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "confirmed_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "dismissed_ts",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "projects",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "slug",
+          "type": "VARCHAR(255)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "human_key",
+          "type": "VARCHAR(255)",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    }
+  ],
+  "indices": [
+    "idx_agent_links_a_project",
+    "idx_agent_links_b_project",
+    "idx_agent_links_b_project_agent",
+    "idx_agent_links_status",
+    "idx_file_reservations_expires_ts",
+    "idx_file_reservations_project_agent_released",
+    "idx_file_reservations_project_released_expires",
+    "idx_message_recipients_agent",
+    "idx_message_recipients_agent_message",
+    "idx_messages_created_ts",
+    "idx_messages_importance",
+    "idx_messages_project_created",
+    "idx_messages_project_sender_created",
+    "idx_messages_sender_created",
+    "idx_messages_thread_id",
+    "idx_product_project",
+    "ix_agent_links_a_agent_id",
+    "ix_agent_links_a_project_id",
+    "ix_agent_links_b_agent_id",
+    "ix_agent_links_b_project_id",
+    "ix_agents_name",
+    "ix_agents_project_id",
+    "ix_file_reservations_agent_id",
+    "ix_file_reservations_project_id",
+    "ix_messages_project_id",
+    "ix_messages_sender_id",
+    "ix_messages_thread_id",
+    "ix_product_project_links_product_id",
+    "ix_product_project_links_project_id",
+    "ix_products_name",
+    "ix_products_product_uid",
+    "ix_project_sibling_suggestions_project_a_id",
+    "ix_project_sibling_suggestions_project_b_id",
+    "ix_projects_human_key",
+    "ix_projects_slug"
+  ],
+  "triggers": [
+    "fts_messages_ad",
+    "fts_messages_ai",
+    "fts_messages_au"
+  ],
+  "views": []
+}
