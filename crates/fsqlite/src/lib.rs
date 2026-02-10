@@ -283,7 +283,7 @@ mod tests {
         if let SqliteValue::Float(v) = &row_values(&row)[0] {
             assert!((*v - 3.14).abs() < f64::EPSILON);
         } else {
-            panic!("expected Real value");
+            unreachable!("expected Float value");
         }
     }
 
@@ -708,6 +708,142 @@ mod tests {
         assert_eq!(rows.len(), 0);
     }
 
+    // ── Non-column result expressions (bd-19g7) ────────────────────────
+
+    #[test]
+    fn select_expression_column_arithmetic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE te (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO te VALUES (10);").unwrap();
+        conn.execute("INSERT INTO te VALUES (20);").unwrap();
+        let rows = conn.query("SELECT a + 1 FROM te;").unwrap();
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert!(vals.contains(&SqliteValue::Integer(11)));
+        assert!(vals.contains(&SqliteValue::Integer(21)));
+    }
+
+    #[test]
+    fn select_expression_column_with_literal() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE te2 (a INTEGER, b TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO te2 VALUES (5, 'hello');")
+            .unwrap();
+        let rows = conn.query("SELECT a * 2, b FROM te2;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(10),
+                SqliteValue::Text("hello".to_owned())
+            ]
+        );
+    }
+
+    // ── Multi-row INSERT (bd-2of2) ────────────────────────────────────
+
+    #[test]
+    fn insert_multi_row_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE tm (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO tm VALUES (1), (2), (3);")
+            .unwrap();
+        let rows = conn.query("SELECT v FROM tm;").unwrap();
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert_eq!(vals.len(), 3);
+        assert!(vals.contains(&SqliteValue::Integer(1)));
+        assert!(vals.contains(&SqliteValue::Integer(2)));
+        assert!(vals.contains(&SqliteValue::Integer(3)));
+    }
+
+    // ── IN / BETWEEN / LIKE (bd-3vpo) ─────────────────────────────────
+
+    #[test]
+    fn in_expression_only() {
+        // Test IN without any table - pure expression evaluation
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT 2 IN (1, 2, 3);").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn between_expression_only() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT 2 BETWEEN 1 AND 3;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn where_in_operator() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_three_rows(&conn);
+        let rows = conn.query("SELECT a FROM t3 WHERE a IN (1, 3);").unwrap();
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert_eq!(vals.len(), 2);
+        assert!(vals.contains(&SqliteValue::Integer(1)));
+        assert!(vals.contains(&SqliteValue::Integer(3)));
+    }
+
+    #[test]
+    fn where_between_operator() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_three_rows(&conn);
+        let rows = conn
+            .query("SELECT a FROM t3 WHERE a BETWEEN 1 AND 2;")
+            .unwrap();
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert_eq!(vals.len(), 2);
+        assert!(vals.contains(&SqliteValue::Integer(1)));
+        assert!(vals.contains(&SqliteValue::Integer(2)));
+    }
+
+    #[test]
+    fn where_like_operator() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_three_rows(&conn);
+        let rows = conn.query("SELECT b FROM t3 WHERE b LIKE 't%';").unwrap();
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert_eq!(vals.len(), 2);
+        assert!(vals.contains(&SqliteValue::Text("two".to_owned())));
+        assert!(vals.contains(&SqliteValue::Text("three".to_owned())));
+    }
+
+    // ── Aggregates (bd-xldj) ────────────────────────────────────────────
+
+    #[test]
+    fn aggregate_count_star() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_three_rows(&conn);
+        let row = conn.query_row("SELECT COUNT(*) FROM t3;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(3)]);
+    }
+
+    #[test]
+    fn aggregate_sum_min_max() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_three_rows(&conn);
+        let row = conn
+            .query_row("SELECT SUM(a), MIN(a), MAX(a) FROM t3;")
+            .unwrap();
+        assert_eq!(
+            row_values(&row),
+            vec![
+                SqliteValue::Integer(6),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_avg() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_three_rows(&conn);
+        let row = conn.query_row("SELECT AVG(a) FROM t3;").unwrap();
+        // AVG(1,2,3) = 2.0
+        assert_eq!(row_values(&row), vec![SqliteValue::Float(2.0)]);
+    }
+
     // ── UPDATE all rows (no WHERE) ─────────────────────────────────────
 
     #[test]
@@ -722,5 +858,335 @@ mod tests {
             rows.iter()
                 .all(|r| row_values(r) == vec![SqliteValue::Integer(0)])
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // bd-2832: Expanded SQL pattern coverage (IvoryWaterfall)
+    // ═══════════════════════════════════════════════════════════════════
+
+    fn setup_bd2832(conn: &Connection) {
+        conn.execute("CREATE TABLE tp (a INTEGER, b TEXT, c REAL);")
+            .unwrap();
+        conn.execute("INSERT INTO tp VALUES (1, 'alpha', 1.5);")
+            .unwrap();
+        conn.execute("INSERT INTO tp VALUES (2, 'beta', 2.5);")
+            .unwrap();
+        conn.execute("INSERT INTO tp VALUES (3, 'gamma', 3.5);")
+            .unwrap();
+        conn.execute("INSERT INTO tp VALUES (4, NULL, 4.5);")
+            .unwrap();
+        conn.execute("INSERT INTO tp VALUES (5, 'delta', 5.5);")
+            .unwrap();
+    }
+
+    // ── WHERE NOT ───────────────────────────────────────────────────────
+
+    #[test]
+    fn where_not_predicate() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn.query("SELECT a FROM tp WHERE NOT (a > 3);").unwrap();
+        assert_eq!(rows.len(), 3);
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert!(vals.contains(&SqliteValue::Integer(1)));
+        assert!(vals.contains(&SqliteValue::Integer(2)));
+        assert!(vals.contains(&SqliteValue::Integer(3)));
+    }
+
+    // ── Comparison operators (>=, <) ────────────────────────────────────
+
+    #[test]
+    fn where_greater_equal() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn.query("SELECT a FROM tp WHERE a >= 4;").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn where_less_than() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn.query("SELECT a FROM tp WHERE a < 3;").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    // ── Table-backed ORDER BY ASC / DESC ────────────────────────────────
+
+    #[test]
+    fn table_order_by_asc() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE tord (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO tord VALUES (3);").unwrap();
+        conn.execute("INSERT INTO tord VALUES (1);").unwrap();
+        conn.execute("INSERT INTO tord VALUES (2);").unwrap();
+        let rows = conn.query("SELECT v FROM tord ORDER BY v;").unwrap();
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn table_order_by_desc() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE tord2 (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO tord2 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO tord2 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO tord2 VALUES (2);").unwrap();
+        let rows = conn.query("SELECT v FROM tord2 ORDER BY v DESC;").unwrap();
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert_eq!(
+            vals,
+            vec![
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(1),
+            ]
+        );
+    }
+
+    // ── Table-backed LIMIT / OFFSET ─────────────────────────────────────
+
+    #[test]
+    fn table_limit() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn.query("SELECT a FROM tp LIMIT 3;").unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn table_limit_offset() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn.query("SELECT a FROM tp LIMIT 2 OFFSET 2;").unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert_eq!(vals, vec![SqliteValue::Integer(3), SqliteValue::Integer(4)]);
+    }
+
+    // ── WHERE + LIMIT ───────────────────────────────────────────────────
+
+    #[test]
+    fn where_with_limit() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn.query("SELECT a FROM tp WHERE a > 1 LIMIT 2;").unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert_eq!(vals, vec![SqliteValue::Integer(2), SqliteValue::Integer(3)]);
+    }
+
+    // ── CASE WHEN on table-backed SELECT ────────────────────────────────
+
+    #[test]
+    fn case_when_table_backed() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn
+            .query("SELECT CASE WHEN a > 3 THEN 'big' ELSE 'small' END FROM tp;")
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("small".to_owned()));
+        assert_eq!(rows[3].values()[0], SqliteValue::Text("big".to_owned()));
+    }
+
+    // ── CAST on table column ────────────────────────────────────────────
+
+    #[test]
+    fn cast_table_backed() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE tcast (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO tcast VALUES (42);").unwrap();
+        let row = conn
+            .query_row("SELECT CAST(v AS TEXT) FROM tcast;")
+            .unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("42".to_owned())]);
+    }
+
+    // ── IS NULL / IS NOT NULL on table ──────────────────────────────────
+
+    #[test]
+    fn where_column_is_null_correct() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn.query("SELECT a FROM tp WHERE b IS NULL;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(4)]);
+    }
+
+    #[test]
+    fn where_column_is_not_null_correct() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn.query("SELECT a FROM tp WHERE b IS NOT NULL;").unwrap();
+        assert_eq!(rows.len(), 4);
+    }
+
+    // ── Unary minus on table column ─────────────────────────────────────
+
+    #[test]
+    fn unary_minus_table_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE tneg (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO tneg VALUES (42);").unwrap();
+        let row = conn.query_row("SELECT -x FROM tneg;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(-42)]);
+    }
+
+    // ── Built-in functions: additional coverage ─────────────────────────
+
+    #[test]
+    fn builtin_typeof_all_types() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert_eq!(
+            row_values(&conn.query_row("SELECT typeof(3.14);").unwrap()),
+            vec![SqliteValue::Text("real".to_owned())]
+        );
+        assert_eq!(
+            row_values(&conn.query_row("SELECT typeof('abc');").unwrap()),
+            vec![SqliteValue::Text("text".to_owned())]
+        );
+        assert_eq!(
+            row_values(&conn.query_row("SELECT typeof(NULL);").unwrap()),
+            vec![SqliteValue::Text("null".to_owned())]
+        );
+        assert_eq!(
+            row_values(&conn.query_row("SELECT typeof(X'FF');").unwrap()),
+            vec![SqliteValue::Text("blob".to_owned())]
+        );
+    }
+
+    #[test]
+    fn builtin_substr() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT substr('hello world', 7, 5);")
+            .unwrap();
+        assert_eq!(
+            row_values(&row),
+            vec![SqliteValue::Text("world".to_owned())]
+        );
+    }
+
+    #[test]
+    fn builtin_replace() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT replace('hello world', 'world', 'rust');")
+            .unwrap();
+        assert_eq!(
+            row_values(&row),
+            vec![SqliteValue::Text("hello rust".to_owned())]
+        );
+    }
+
+    #[test]
+    fn builtin_trim() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT trim('  hello  ');").unwrap();
+        assert_eq!(
+            row_values(&row),
+            vec![SqliteValue::Text("hello".to_owned())]
+        );
+    }
+
+    #[test]
+    fn builtin_instr() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT instr('hello world', 'world');")
+            .unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(7)]);
+    }
+
+    #[test]
+    fn builtin_hex() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT hex(X'CAFE');").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("CAFE".to_owned())]);
+    }
+
+    // ── IS NULL expression context ──────────────────────────────────────
+
+    #[test]
+    fn is_null_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT NULL IS NULL;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(1)]);
+        let row = conn.query_row("SELECT 42 IS NULL;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(0)]);
+    }
+
+    // ── SOUNDEX NULL ────────────────────────────────────────────────────
+
+    #[test]
+    fn soundex_null_returns_question_marks() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT soundex(NULL);").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("?000".to_owned())]);
+    }
+
+    // ── LIKE underscore wildcard ─────────────────────────────────────────
+
+    #[test]
+    fn like_underscore_wildcard() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn.query("SELECT b FROM tp WHERE b LIKE 'b_ta';").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("beta".to_owned())]
+        );
+    }
+
+    // ── NOT IN / NOT BETWEEN ────────────────────────────────────────────
+
+    #[test]
+    fn where_not_in() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn
+            .query("SELECT a FROM tp WHERE a NOT IN (1, 3, 5);")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert!(vals.contains(&SqliteValue::Integer(2)));
+        assert!(vals.contains(&SqliteValue::Integer(4)));
+    }
+
+    #[test]
+    fn where_not_between() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let rows = conn
+            .query("SELECT a FROM tp WHERE a NOT BETWEEN 2 AND 4;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert!(vals.contains(&SqliteValue::Integer(1)));
+        assert!(vals.contains(&SqliteValue::Integer(5)));
+    }
+
+    // ── DISTINCT ──────────────────────────────────────────────────────
+    // NOTE: SELECT DISTINCT is parsed but not yet enforced in codegen.
+    // The DISTINCT keyword is silently ignored and all rows are returned.
+    // A separate bead should be created to implement DISTINCT elimination.
+
+    // ── Aggregate: count(col) excludes NULL ──────────────────────────────
+
+    #[test]
+    fn aggregate_count_column_excludes_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_bd2832(&conn);
+        let row = conn.query_row("SELECT count(b) FROM tp;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(4)]);
     }
 }

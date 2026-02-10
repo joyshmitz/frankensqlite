@@ -3,13 +3,8 @@
 //! Each test exercises a specific SQL feature through `Connection::query`/`execute`.
 //! Features that return `NotImplemented` are documented as skipped.
 //!
-//! NOTE: This file is currently disabled because it asserts many SQL features
-//! that are not yet implemented correctly in the engine. Keeping it enabled
-//! breaks workspace-wide `cargo clippy --all-targets -- -D warnings` and can
-//! also break `cargo test --workspace`. Re-enable once the underlying feature
-//! beads land.
-
-#![cfg(any())]
+//! Now that ScanCtx is threaded through emit_expr (commit c664162) and
+//! aggregate support is landed, most features work correctly.
 
 use fsqlite::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -311,6 +306,7 @@ fn test_aggregate_avg() {
 }
 
 #[test]
+#[ignore = "GROUP BY not yet implemented — needs dedicated bead"]
 fn test_aggregate_count_with_group_by() {
     let conn = seeded_conn();
     let rows = conn
@@ -331,6 +327,7 @@ fn test_aggregate_count_with_group_by() {
 // ── DISTINCT ────────────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "DISTINCT not yet implemented — needs dedicated bead"]
 fn test_distinct() {
     let conn = seeded_conn();
     let rows = conn.query("SELECT DISTINCT flag FROM t;").unwrap();
@@ -393,6 +390,7 @@ fn test_in_list() {
 // ── Multi-row INSERT ────────────────────────────────────────────────────────
 
 #[test]
+#[ignore = "multi-row INSERT not yet implemented — see bd-2of2"]
 fn test_multi_row_insert() {
     let conn = Connection::open(":memory:").unwrap();
     conn.execute("CREATE TABLE m (x INTEGER);").unwrap();

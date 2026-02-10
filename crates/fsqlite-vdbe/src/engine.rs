@@ -9,13 +9,14 @@
 //! Cursor-based opcodes (OpenRead, Rewind, Next, Column, etc.) are stubbed
 //! and will be wired to the B-tree layer in Phase 5.
 
+use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use fsqlite_btree::{BtreeCursorOps, MockBtreeCursor};
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_func::FunctionRegistry;
+use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{parse_record, serialize_record};
@@ -146,16 +147,30 @@ impl MemCursor {
 struct SorterCursor {
     /// Number of leading columns used as sort key.
     key_columns: usize,
+    /// Per-key sort direction (length == key_columns).
+    sort_key_orders: Vec<SortKeyOrder>,
     /// Inserted records decoded from `MakeRecord` blobs.
     rows: Vec<Vec<SqliteValue>>,
     /// Current position after `SorterSort`/`SorterNext`.
     position: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortKeyOrder {
+    Asc,
+    Desc,
+}
+
 impl SorterCursor {
-    fn new(key_columns: usize) -> Self {
+    fn new(key_columns: usize, mut sort_key_orders: Vec<SortKeyOrder>) -> Self {
+        let key_columns = key_columns.max(1);
+        if sort_key_orders.len() < key_columns {
+            sort_key_orders.resize(key_columns, SortKeyOrder::Asc);
+        }
+        sort_key_orders.truncate(key_columns);
         Self {
-            key_columns: key_columns.max(1),
+            key_columns,
+            sort_key_orders,
             rows: Vec::new(),
             position: None,
         }
@@ -163,8 +178,9 @@ impl SorterCursor {
 
     fn sort(&mut self) {
         let key_columns = self.key_columns;
+        let orders = self.sort_key_orders.clone();
         self.rows
-            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns));
+            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders));
     }
 }
 
@@ -280,6 +296,13 @@ pub struct VdbeEngine {
     db: Option<MemDatabase>,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
     func_registry: Option<Arc<FunctionRegistry>>,
+    /// Aggregate accumulators keyed by accumulator register.
+    aggregates: HashMap<i32, AggregateContext>,
+}
+
+struct AggregateContext {
+    func: Arc<ErasedAggregateFunction>,
+    state: Box<dyn Any + Send>,
 }
 
 impl VdbeEngine {
@@ -300,6 +323,7 @@ impl VdbeEngine {
             storage_read_cursors_enabled: false,
             db: None,
             func_registry: None,
+            aggregates: HashMap::new(),
         }
     }
 
@@ -346,6 +370,8 @@ impl VdbeEngine {
         if ops.is_empty() {
             return Ok(ExecOutcome::Done);
         }
+
+        self.aggregates.clear();
 
         let mut pc: usize = 0;
         // "once" flags: one bit per instruction address.
@@ -867,8 +893,22 @@ impl VdbeEngine {
                 Opcode::SorterOpen => {
                     let cursor_id = op.p1;
                     let key_columns = usize::try_from(op.p2.max(1)).unwrap_or(1);
+                    let sort_key_orders = match &op.p4 {
+                        P4::Str(order) => order
+                            .chars()
+                            .take(key_columns)
+                            .map(|ch| {
+                                if ch == '-' {
+                                    SortKeyOrder::Desc
+                                } else {
+                                    SortKeyOrder::Asc
+                                }
+                            })
+                            .collect(),
+                        _ => vec![SortKeyOrder::Asc; key_columns],
+                    };
                     self.sorters
-                        .insert(cursor_id, SorterCursor::new(key_columns));
+                        .insert(cursor_id, SorterCursor::new(key_columns, sort_key_orders));
                     // A cursor id cannot be both table and sorter cursor.
                     self.cursors.remove(&cursor_id);
                     self.storage_cursors.remove(&cursor_id);
@@ -1601,8 +1641,106 @@ impl VdbeEngine {
                     pc = saved as usize;
                 }
 
-                // ── Aggregation (stub) ──────────────────────────────────
-                Opcode::AggStep | Opcode::AggInverse | Opcode::AggFinal | Opcode::AggValue => {
+                // ── Aggregation ─────────────────────────────────────────
+                //
+                // Phase 4 supports single-group aggregation (no GROUP BY) using
+                // AggStep/AggFinal. Aggregate state is stored out-of-band and keyed
+                // by the accumulator register.
+                Opcode::AggStep => {
+                    let func_name = match &op.p4 {
+                        P4::FuncName(name) => name.as_str(),
+                        _ => {
+                            return Err(FrankenError::Internal(
+                                "AggStep opcode missing P4::FuncName".to_owned(),
+                            ));
+                        }
+                    };
+
+                    let registry = self.func_registry.as_ref().ok_or_else(|| {
+                        FrankenError::Internal(
+                            "AggStep opcode executed without function registry".to_owned(),
+                        )
+                    })?;
+
+                    let arg_count = i32::from(op.p5);
+                    let func = registry
+                        .find_aggregate(func_name, arg_count)
+                        .ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "no such aggregate function: {func_name}/{arg_count}",
+                            ))
+                        })?;
+
+                    let mut args = Vec::with_capacity(op.p5 as usize);
+                    for i in 0..op.p5 {
+                        let reg_idx = op.p2 + i32::from(i);
+                        args.push(self.get_reg(reg_idx).clone());
+                    }
+
+                    let accum_reg = op.p3;
+                    let ctx = self.aggregates.entry(accum_reg).or_insert_with(|| {
+                        let state = func.initial_state();
+                        AggregateContext {
+                            func: func.clone(),
+                            state,
+                        }
+                    });
+
+                    if !Arc::ptr_eq(&ctx.func, &func) {
+                        return Err(FrankenError::Internal(
+                            "AggStep accumulator reused for a different aggregate".to_owned(),
+                        ));
+                    }
+
+                    ctx.func.step(&mut ctx.state, &args)?;
+                    pc += 1;
+                }
+
+                Opcode::AggFinal => {
+                    let func_name = match &op.p4 {
+                        P4::FuncName(name) => name.as_str(),
+                        _ => {
+                            return Err(FrankenError::Internal(
+                                "AggFinal opcode missing P4::FuncName".to_owned(),
+                            ));
+                        }
+                    };
+
+                    let registry = self.func_registry.as_ref().ok_or_else(|| {
+                        FrankenError::Internal(
+                            "AggFinal opcode executed without function registry".to_owned(),
+                        )
+                    })?;
+
+                    let arg_count = op.p2;
+                    let func = registry
+                        .find_aggregate(func_name, arg_count)
+                        .ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "no such aggregate function: {func_name}/{arg_count}",
+                            ))
+                        })?;
+
+                    let accum_reg = op.p1;
+                    let result = match self.aggregates.remove(&accum_reg) {
+                        Some(ctx) => {
+                            if !Arc::ptr_eq(&ctx.func, &func) {
+                                return Err(FrankenError::Internal(
+                                    "AggFinal accumulator used for a different aggregate"
+                                        .to_owned(),
+                                ));
+                            }
+                            ctx.func.finalize(ctx.state)?
+                        }
+                        None => func.finalize(func.initial_state())?,
+                    };
+
+                    self.set_reg(accum_reg, result);
+                    pc += 1;
+                }
+
+                Opcode::AggInverse | Opcode::AggValue => {
+                    // Not needed yet (GROUP BY / window aggregates / inverse ops).
                     pc += 1;
                 }
 
@@ -1852,10 +1990,10 @@ fn decode_record(val: &SqliteValue) -> Result<Vec<SqliteValue>> {
 }
 
 fn sorter_keys_equal(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: usize) -> bool {
-    compare_sorter_rows(lhs, rhs, key_columns) == Ordering::Equal
+    compare_sorter_keys(lhs, rhs, key_columns) == Ordering::Equal
 }
 
-fn compare_sorter_rows(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: usize) -> Ordering {
+fn compare_sorter_keys(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: usize) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
         let Some(lhs_value) = lhs.get(idx) else {
@@ -1873,6 +2011,38 @@ fn compare_sorter_rows(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: us
             Ordering::Equal => {}
             non_equal => return non_equal,
         }
+    }
+    Ordering::Equal
+}
+
+fn compare_sorter_rows(
+    lhs: &[SqliteValue],
+    rhs: &[SqliteValue],
+    key_columns: usize,
+    sort_key_orders: &[SortKeyOrder],
+) -> Ordering {
+    let key_count = key_columns.max(1);
+    for idx in 0..key_count {
+        let Some(lhs_value) = lhs.get(idx) else {
+            return if rhs.get(idx).is_some() {
+                Ordering::Less
+            } else {
+                break;
+            };
+        };
+        let Some(rhs_value) = rhs.get(idx) else {
+            return Ordering::Greater;
+        };
+
+        let mut ord = lhs_value.partial_cmp(rhs_value).unwrap_or(Ordering::Equal);
+        if ord == Ordering::Equal {
+            continue;
+        }
+
+        if sort_key_orders.get(idx) == Some(&SortKeyOrder::Desc) {
+            ord = ord.reverse();
+        }
+        return ord;
     }
 
     // Deterministic tie-breaker: compare full rows so sort order is stable.

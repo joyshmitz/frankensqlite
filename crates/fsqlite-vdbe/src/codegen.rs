@@ -465,11 +465,10 @@ fn codegen_select_ordered_scan(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Resolve data column indices (the result columns).
-    let data_col_indices = resolve_result_column_indices(columns, table)?;
-
     let num_sort_keys = sort_col_indices.len();
-    let num_data_cols = data_col_indices.len();
+    let num_data_cols = usize::try_from(out_col_count).map_err(|_| {
+        CodegenError::Unsupported("negative output column count in ordered SELECT".to_owned())
+    })?;
     let total_sorter_cols = num_sort_keys + num_data_cols;
 
     // Sorter cursor is separate from the table cursor.
@@ -527,11 +526,17 @@ fn codegen_select_ordered_scan(
             b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
             reg += 1;
         }
-        for &col_idx in &data_col_indices {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
-            reg += 1;
-        }
+
+        // Evaluate result columns (including expressions) and store the final
+        // output values in the sorter record.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        emit_column_reads(
+            b,
+            cursor,
+            columns,
+            table,
+            sorter_base + num_sort_keys as i32,
+        )?;
     }
 
     // MakeRecord from all sorter columns, then SorterInsert.
@@ -942,26 +947,13 @@ pub fn codegen_insert(
         0,
     );
 
-    // NewRowid: generate a new rowid.
-    // In concurrent mode, p3 != 0 signals the snapshot-independent allocator.
-    let rowid_reg = b.alloc_reg();
-    let concurrent_flag = i32::from(ctx.concurrent_mode);
-    b.emit_op(
-        Opcode::NewRowid,
-        cursor,
-        rowid_reg,
-        concurrent_flag,
-        P4::None,
-        0,
-    );
-
-    // Emit value expressions (bind parameters from VALUES).
-    let values = match &stmt.source {
+    // Extract all rows from VALUES clause.
+    let all_rows = match &stmt.source {
         InsertSource::Values(rows) => {
             if rows.is_empty() {
                 return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
             }
-            &rows[0] // First row for now (multi-row insert would loop).
+            rows
         }
         InsertSource::DefaultValues => {
             return Err(CodegenError::Unsupported("DEFAULT VALUES".to_owned()));
@@ -971,42 +963,59 @@ pub fn codegen_insert(
         }
     };
 
-    let n_cols = values.len();
+    // Allocate registers once using the first row's column count.
+    let n_cols = all_rows[0].len();
+    let rowid_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let val_regs = b.alloc_regs(n_cols as i32);
-
-    for (i, val_expr) in values.iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let reg = val_regs + i as i32;
-        emit_expr(b, val_expr, reg, None);
-    }
-
-    // MakeRecord: pack columns into a record.
     let rec_reg = b.alloc_reg();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let n_cols_i32 = n_cols as i32;
-    b.emit_op(
-        Opcode::MakeRecord,
-        val_regs,
-        n_cols_i32,
-        rec_reg,
-        P4::Affinity(table.affinity_string()),
-        0,
-    );
+    let concurrent_flag = i32::from(ctx.concurrent_mode);
 
-    // Insert.
-    b.emit_op(
-        Opcode::Insert,
-        cursor,
-        rec_reg,
-        rowid_reg,
-        P4::Table(table.name.clone()),
-        0,
-    );
+    // Emit insert sequence for each VALUES row.
+    for row_values in all_rows {
+        // NewRowid: generate a new rowid for this row.
+        b.emit_op(
+            Opcode::NewRowid,
+            cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
 
-    // RETURNING clause: emit ResultRow with rowid if present.
-    if !stmt.returning.is_empty() {
-        b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
+        // Emit value expressions into registers.
+        for (i, val_expr) in row_values.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let reg = val_regs + i as i32;
+            emit_expr(b, val_expr, reg, None);
+        }
+
+        // MakeRecord: pack columns into a record.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let n_cols_i32 = n_cols as i32;
+        b.emit_op(
+            Opcode::MakeRecord,
+            val_regs,
+            n_cols_i32,
+            rec_reg,
+            P4::Affinity(table.affinity_string()),
+            0,
+        );
+
+        // Insert.
+        b.emit_op(
+            Opcode::Insert,
+            cursor,
+            rec_reg,
+            rowid_reg,
+            P4::Table(table.name.clone()),
+            0,
+        );
+
+        // RETURNING clause: emit ResultRow with rowid if present.
+        if !stmt.returning.is_empty() {
+            b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
+        }
     }
 
     // Close + Halt.
@@ -1388,7 +1397,14 @@ fn resolve_column_ref(expr: &Expr, table: &TableSchema) -> Option<usize> {
 ///
 /// Returns a Vec of column indices for each output column.
 /// `Star` and `TableStar` expand to all table columns.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+///
+/// NOTE: Currently unused — `emit_column_reads` handles non-column result
+/// expressions directly. Kept for potential future index-only scan codegen.
+#[allow(
+    dead_code,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn resolve_result_column_indices(
     columns: &[ResultColumn],
     table: &TableSchema,
@@ -1630,6 +1646,128 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             b.resolve_label(lbl_null);
             b.emit_op(Opcode::Integer, val_null, reg, 0, P4::None, 0);
             b.resolve_label(lbl_done);
+        }
+        Expr::Like {
+            expr: operand,
+            pattern,
+            escape,
+            op: like_op,
+            not,
+            ..
+        } => {
+            let func_name = match like_op {
+                fsqlite_ast::LikeOp::Like => "like",
+                fsqlite_ast::LikeOp::Glob => "glob",
+                fsqlite_ast::LikeOp::Match => "match",
+                fsqlite_ast::LikeOp::Regexp => "regexp",
+            };
+            let nargs: u16 = if escape.is_some() { 3 } else { 2 };
+            let arg_base = b.alloc_regs(i32::from(nargs));
+            // like(pattern, string [, escape])
+            emit_expr(b, pattern, arg_base, ctx);
+            emit_expr(b, operand, arg_base + 1, ctx);
+            if let Some(esc) = escape {
+                emit_expr(b, esc, arg_base + 2, ctx);
+            }
+            b.emit_op(
+                Opcode::PureFunc,
+                0,
+                arg_base,
+                reg,
+                P4::FuncName(func_name.to_owned()),
+                nargs,
+            );
+            if *not {
+                b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
+            }
+        }
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not,
+            ..
+        } => {
+            // BETWEEN low AND high → (operand >= low) AND (operand <= high)
+            let r_operand = b.alloc_temp();
+            let r_low = b.alloc_temp();
+            let r_high = b.alloc_temp();
+            emit_expr(b, operand, r_operand, ctx);
+            emit_expr(b, low, r_low, ctx);
+            emit_expr(b, high, r_high, ctx);
+            let false_label = b.emit_label();
+            let done_label = b.emit_label();
+            // Jump to false if operand < low.
+            b.emit_jump_to_label(Opcode::Lt, r_low, r_operand, false_label, P4::None, 0);
+            // Jump to false if operand > high.
+            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, P4::None, 0);
+            // In range.
+            b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            b.resolve_label(false_label);
+            b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+            b.resolve_label(done_label);
+            b.free_temp(r_high);
+            b.free_temp(r_low);
+            b.free_temp(r_operand);
+        }
+        Expr::In {
+            expr: operand,
+            set,
+            not,
+            ..
+        } => {
+            if let fsqlite_ast::InSet::List(values) = set {
+                // IN (v1, v2, ...) → chain of equality checks.
+                let r_operand = b.alloc_temp();
+                emit_expr(b, operand, r_operand, ctx);
+                let true_label = b.emit_label();
+                let done_label = b.emit_label();
+                let r_val = b.alloc_temp();
+                for val_expr in values {
+                    emit_expr(b, val_expr, r_val, ctx);
+                    b.emit_jump_to_label(Opcode::Eq, r_val, r_operand, true_label, P4::None, 0);
+                }
+                b.free_temp(r_val);
+                // No match.
+                b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                b.resolve_label(true_label);
+                b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
+                b.resolve_label(done_label);
+                b.free_temp(r_operand);
+            } else {
+                // IN (SELECT ...) or IN table — not yet supported, emit Null.
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            }
+        }
+        Expr::FunctionCall { name, args, .. } if !is_aggregate_function(name) => {
+            // Scalar function call: emit args, then PureFunc.
+            match args {
+                fsqlite_ast::FunctionArgs::Star => {
+                    // func(*) for non-aggregate → 0 args.
+                    b.emit_op(Opcode::PureFunc, 0, 0, reg, P4::FuncName(name.clone()), 0);
+                }
+                fsqlite_ast::FunctionArgs::List(arg_list) => {
+                    let Ok(nargs) = u16::try_from(arg_list.len()) else {
+                        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                        return;
+                    };
+                    let arg_base = b.alloc_regs(i32::from(nargs));
+                    for (i, arg_expr) in arg_list.iter().enumerate() {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        emit_expr(b, arg_expr, arg_base + i as i32, ctx);
+                    }
+                    b.emit_op(
+                        Opcode::PureFunc,
+                        0,
+                        arg_base,
+                        reg,
+                        P4::FuncName(name.clone()),
+                        nargs,
+                    );
+                }
+            }
         }
         Expr::Column(col_ref, _) if ctx.is_some() => {
             let sc = ctx.unwrap();
@@ -2401,7 +2539,9 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_non_column_expr_with_from_rejected() {
+    fn test_codegen_select_non_column_expr_with_from_accepted() {
+        // Non-column expressions in SELECT list with FROM are now supported
+        // via ScanCtx-aware emit_expr in emit_column_reads.
         let stmt = SelectStatement {
             with: None,
             body: SelectBody {
@@ -2430,13 +2570,17 @@ mod tests {
         let schema = test_schema();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
-            .expect_err("non-column table projection must be rejected");
-        assert_eq!(
-            err,
-            CodegenError::Unsupported(
-                "non-column result expression in table-backed SELECT".to_owned()
-            )
+        codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect("non-column expression in SELECT list should succeed");
+        let prog = b.finish().unwrap();
+
+        // Should contain Add opcode for the 1 + 2 expression.
+        assert!(
+            has_opcodes(
+                &prog,
+                &[Opcode::Init, Opcode::OpenRead, Opcode::Rewind, Opcode::Add]
+            ),
+            "expected Add opcode for expression evaluation"
         );
     }
 
