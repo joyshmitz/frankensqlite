@@ -783,17 +783,21 @@ impl Connection {
                         );
                     }
                     GroupByColumn::Agg { name, arg_col } => {
-                        let agg_values: Vec<&SqliteValue> = match arg_col {
-                            Some(idx) => group_rows.iter().filter_map(|r| r.get(*idx)).collect(),
-                            None => {
-                                // count(*): one entry per row
-                                group_rows
-                                    .iter()
-                                    .map(|r| r.first().unwrap_or(&SqliteValue::Null))
-                                    .collect()
-                            }
-                        };
-                        values.push(compute_aggregate(name, &agg_values));
+                        if name == "count" && arg_col.is_none() {
+                            values.push(SqliteValue::Integer(group_rows.len() as i64));
+                        } else {
+                            let Some(idx) = *arg_col else {
+                                return Err(FrankenError::NotImplemented(format!(
+                                    "aggregate {name} requires a column argument in this GROUP BY connection path"
+                                )));
+                            };
+                            let agg_values: Vec<&SqliteValue> = group_rows
+                                .iter()
+                                .filter_map(|r| r.get(idx))
+                                .filter(|v| !matches!(v, SqliteValue::Null))
+                                .collect();
+                            values.push(compute_aggregate(name, &agg_values));
+                        }
                     }
                 }
             }
