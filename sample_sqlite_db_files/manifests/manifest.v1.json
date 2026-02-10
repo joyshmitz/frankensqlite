@@ -2,6 +2,18 @@
   "manifest_version": 1,
   "entries": [
     {
+      "db_id": "agent_flywheel_mail",
+      "golden_filename": "agent_flywheel_mail.db",
+      "sha256_golden": "243a503079ca5380717bdadeff2c3db6014dbdfe52cc35b6438dcfe5eed4ea4c",
+      "size_bytes": 1531904,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
       "db_id": "agentic_coding_flywheel_setup",
       "golden_filename": "agentic_coding_flywheel_setup.db",
       "sha256_golden": "6bef9ced8217337f7bf7196d1f3d8035752c67ec32c4952abc09ad6a0235c037",
@@ -18,6 +30,18 @@
       "golden_filename": "asupersync.db",
       "sha256_golden": "8e91ff61cbbf4c63c68009e6dee7de0ac63f8e601d9555db3a4afbcb7f85acd0",
       "size_bytes": 12427264,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "beads_rust_beads",
+      "golden_filename": "beads_rust_beads.db",
+      "sha256_golden": "650d2a7c44665c35dbd64c6afe6b15581b2065169aff5a0fd2fcb7fb60c3a28c",
+      "size_bytes": 4120576,
       "sqlite_meta": {
         "page_size": 4096,
         "journal_mode": "wal",
@@ -50,10 +74,34 @@
       }
     },
     {
+      "db_id": "codexbar_build",
+      "golden_filename": "codexbar_build.db",
+      "sha256_golden": "cdfc085305b2c8172d071b31979483a6fe37015f3863d021938e67c4ec26d763",
+      "size_bytes": 380928,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "delete",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
       "db_id": "coding_agent_session_search",
       "golden_filename": "coding_agent_session_search.db",
       "sha256_golden": "418628dd11d06b0d11fc1597e84a1bdcc4165a0f668640ad118321dce095e974",
       "size_bytes": 8044544,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "communitai_storage",
+      "golden_filename": "communitai_storage.db",
+      "sha256_golden": "8cd3929fe0aa64fbde09f7dffb8a27456e289227b3449b25217ecc01485e1fda",
+      "size_bytes": 159744,
       "sqlite_meta": {
         "page_size": 4096,
         "journal_mode": "wal",
@@ -86,6 +134,30 @@
       }
     },
     {
+      "db_id": "eidetic_memory",
+      "golden_filename": "eidetic_memory.db",
+      "sha256_golden": "4f50e7195e739fe28e12918c3423bc71436fa2b0003f6a6bb96be9c9ac1e5e8e",
+      "size_bytes": 15175680,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "fix_my_documents_backend",
+      "golden_filename": "fix_my_documents_backend.db",
+      "sha256_golden": "a359647625689e867fcd395642b0a4e220f1a1dfad7499192f2a2d962ab788a7",
+      "size_bytes": 16453632,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
       "db_id": "flywheel_connectors",
       "golden_filename": "flywheel_connectors.db",
       "sha256_golden": "931a8e00ee2c38352041112d099ed422bba944c10949e5445b22558a1149d974",
@@ -102,6 +174,18 @@
       "golden_filename": "flywheel_gateway.db",
       "sha256_golden": "89a42207ef62e498a535cf6e5a7ed412f32696f08b6d7912be6377f7530f4de7",
       "size_bytes": 13295616,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "flywheel_gateway_data",
+      "golden_filename": "flywheel_gateway_data.db",
+      "sha256_golden": "37739fabf85c1df36abcc2cd586da76589521bddfe8999d7dd72063222bc6aec",
+      "size_bytes": 6008832,
       "sqlite_meta": {
         "page_size": 4096,
         "journal_mode": "wal",
@@ -206,6 +290,30 @@
       }
     },
     {
+      "db_id": "markdown_web_browser_runs",
+      "golden_filename": "markdown_web_browser_runs.db",
+      "sha256_golden": "e470e020252bd527f714c69a595f4fca8858c33456291eb37b354d0263a436cd",
+      "size_bytes": 118784,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "mcp_agent_mail_storage",
+      "golden_filename": "mcp_agent_mail_storage.db",
+      "sha256_golden": "b866ac7f405fdb1bcb6a7675820f140654a0771fbcee26ff2f30374a71ec24af",
+      "size_bytes": 7020544,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
       "db_id": "meta_skill",
       "golden_filename": "meta_skill.db",
       "sha256_golden": "faf3170e17574e7f9e57bb19120aab4dd0c8eb727acffdf2dbf38d1f7f1a9b64",
@@ -213,6 +321,18 @@
       "sqlite_meta": {
         "page_size": 4096,
         "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "northwind",
+      "golden_filename": "northwind.db",
+      "sha256_golden": "ffddd65dbd69c0b6ebfd282dce94150cdd6ba4e0dd5dc42983e5cca2adad9f45",
+      "size_bytes": 24702976,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "delete",
         "user_version": 0,
         "application_id": 0
       }
@@ -238,6 +358,54 @@
         "page_size": 4096,
         "journal_mode": "wal",
         "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "smartedgar_factor_data",
+      "golden_filename": "smartedgar_factor_data.db",
+      "sha256_golden": "12840d3571862f87f864153fb6b4779e2a72e65d6f1360e874eb367ac39af240",
+      "size_bytes": 6098944,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "smartedgar_risk_ops",
+      "golden_filename": "smartedgar_risk_ops.db",
+      "sha256_golden": "099800221ad57323bb4d6cc43dd20b0826bc839552e0b7951c50a6ef55b6607e",
+      "size_bytes": 303104,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "delete",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "toon_rust_storage",
+      "golden_filename": "toon_rust_storage.db",
+      "sha256_golden": "14289be01e0795bb82f9219e65cc30a0ca3816bf86cf8be4453e51918b3772c2",
+      "size_bytes": 245760,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "wezterm_automata_wa",
+      "golden_filename": "wezterm_automata_wa.db",
+      "sha256_golden": "a4848ea276e28237b0f76629669b2a2c52e18c6224089ae32b58a3e8185fa80c",
+      "size_bytes": 278528,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 7,
         "application_id": 0
       }
     }
