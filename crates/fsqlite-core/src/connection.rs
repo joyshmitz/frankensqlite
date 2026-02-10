@@ -708,7 +708,7 @@ impl Connection {
 
     /// Take a snapshot of the current database + schema state.
     fn snapshot(&self) -> DbSnapshot {
-        let db_version = self.db.borrow().undo_version();
+        let db_version = self.db.borrow_mut().undo_version();
         DbSnapshot {
             db_version,
             schema: self.schema.borrow().clone(),
@@ -1776,10 +1776,7 @@ fn execute_table_program_with_db(
     if let Some(db_value) = engine.take_database() {
         *db.borrow_mut() = db_value;
     }
-    let txn_back = match engine.take_transaction() {
-        Ok(txn) => txn,
-        Err(e) => return (Err(e), None),
-    };
+    let txn_back = engine.take_transaction();
 
     let result = match exec_res {
         Ok(ExecOutcome::Done) => Ok(engine
