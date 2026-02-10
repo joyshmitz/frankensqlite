@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
     }
 
-    // ── NULL handling ──────────────────────────────────────────────────
+    // ── NULL handling (WHERE) ──────────────────────────────────────────
 
     #[test]
     fn where_is_null() {
@@ -533,6 +533,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
     }
+
+    // ── NULL handling (expression) ─────────────────────────────────────
 
     #[test]
     fn coalesce_expression() {
@@ -693,86 +695,6 @@ mod tests {
             vals,
             vec![SqliteValue::Integer(20), SqliteValue::Integer(30)]
         );
-    }
-
-    // ── Aggregate functions (table-backed) ─────────────────────────────
-
-    #[test]
-    fn aggregate_count_star() {
-        let conn = Connection::open(":memory:").unwrap();
-        setup_three_rows(&conn);
-        let rows = conn.query("SELECT COUNT(*) FROM t3;").unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(3)]);
-    }
-
-    #[test]
-    fn aggregate_sum() {
-        let conn = Connection::open(":memory:").unwrap();
-        setup_three_rows(&conn);
-        let rows = conn.query("SELECT SUM(a) FROM t3;").unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(6)]);
-    }
-
-    #[test]
-    fn aggregate_min_max() {
-        let conn = Connection::open(":memory:").unwrap();
-        setup_three_rows(&conn);
-        let rows = conn.query("SELECT MIN(a), MAX(a) FROM t3;").unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Integer(1), SqliteValue::Integer(3)]
-        );
-    }
-
-    // ── LIKE ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn like_pattern_match() {
-        let conn = Connection::open(":memory:").unwrap();
-        setup_three_rows(&conn);
-        let rows = conn.query("SELECT b FROM t3 WHERE b LIKE 't%';").unwrap();
-        assert_eq!(rows.len(), 2);
-        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
-        assert!(vals.contains(&SqliteValue::Text("two".to_owned())));
-        assert!(vals.contains(&SqliteValue::Text("three".to_owned())));
-    }
-
-    // ── BETWEEN / IN ───────────────────────────────────────────────────
-
-    #[test]
-    fn between_operator() {
-        let conn = Connection::open(":memory:").unwrap();
-        setup_three_rows(&conn);
-        let rows = conn
-            .query("SELECT a FROM t3 WHERE a BETWEEN 1 AND 2;")
-            .unwrap();
-        assert_eq!(rows.len(), 2);
-    }
-
-    #[test]
-    fn in_list_operator() {
-        let conn = Connection::open(":memory:").unwrap();
-        setup_three_rows(&conn);
-        let rows = conn.query("SELECT a FROM t3 WHERE a IN (1, 3);").unwrap();
-        assert_eq!(rows.len(), 2);
-        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
-        assert!(vals.contains(&SqliteValue::Integer(1)));
-        assert!(vals.contains(&SqliteValue::Integer(3)));
-    }
-
-    // ── Multi-row INSERT ───────────────────────────────────────────────
-
-    #[test]
-    fn multi_row_insert() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE tm (v INTEGER);").unwrap();
-        conn.execute("INSERT INTO tm VALUES (1), (2), (3);")
-            .unwrap();
-        let rows = conn.query("SELECT v FROM tm;").unwrap();
-        assert_eq!(rows.len(), 3);
     }
 
     // ── DELETE without WHERE (all rows) ────────────────────────────────

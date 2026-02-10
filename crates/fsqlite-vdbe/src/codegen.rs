@@ -978,7 +978,7 @@ pub fn codegen_insert(
     for (i, val_expr) in values.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let reg = val_regs + i as i32;
-        emit_expr(b, val_expr, reg);
+        emit_expr(b, val_expr, reg, None);
     }
 
     // MakeRecord: pack columns into a record.
@@ -1110,7 +1110,7 @@ pub fn codegen_update(
     for (assign_idx, col_idx) in assignment_cols.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let target = col_regs + *col_idx as i32;
-        emit_expr(b, &stmt.assignments[assign_idx].value, target);
+        emit_expr(b, &stmt.assignments[assign_idx].value, target, None);
     }
 
     // Get the current rowid for re-insertion.
@@ -1300,9 +1300,10 @@ fn emit_column_reads(
                     })?;
                     b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
                 } else {
-                    return Err(CodegenError::Unsupported(
-                        "non-column result expression in table-backed SELECT".to_owned(),
-                    ));
+                    // Evaluate non-column expressions (literals, arithmetic, CASE, CAST, etc.)
+                    // against the current scan row.
+                    let scan = ScanCtx { cursor, table };
+                    emit_expr(b, expr, reg, Some(&scan));
                 }
                 reg += 1;
             }
@@ -1338,7 +1339,7 @@ fn emit_where_filter(
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
                 b.emit_op(Opcode::Column, cursor, col_idx as i32, col_reg, P4::None, 0);
-                emit_expr(b, right, val_reg);
+                emit_expr(b, right, val_reg, None);
                 b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
@@ -1346,7 +1347,7 @@ fn emit_where_filter(
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
                 b.emit_op(Opcode::Column, cursor, col_idx as i32, col_reg, P4::None, 0);
-                emit_expr(b, left, val_reg);
+                emit_expr(b, left, val_reg, None);
                 b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
@@ -1364,9 +1365,10 @@ fn emit_where_filter(
             emit_where_filter(b, right, cursor, table, skip_label);
         }
         _ => {
-            // Unsupported WHERE form — evaluate as expression and test truthiness.
+            // Generic WHERE: evaluate expression with cursor context and test truthiness.
+            let scan = ScanCtx { cursor, table };
             let cond_reg = b.alloc_temp();
-            emit_expr(b, where_expr, cond_reg);
+            emit_expr(b, where_expr, cond_reg, Some(&scan));
             b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
             b.free_temp(cond_reg);
         }
@@ -1512,15 +1514,23 @@ fn bind_param_index(expr: &Expr) -> Option<i32> {
 /// For bind parameters, emits a Variable instruction.
 /// Emit bytecode for an expression, placing the result in `reg`.
 ///
-/// Handles literals, bind parameters, binary/unary operators, CASE, and CAST.
-/// Column references and other cursor-dependent expressions fall back to Null
-/// until Phase 5 cursor integration.
+/// Cursor context for expression emission inside table scans.
+///
+/// When present, allows `emit_expr` to resolve `Expr::Column` references
+/// by emitting `Opcode::Column` against the given cursor.
+struct ScanCtx<'a> {
+    cursor: i32,
+    table: &'a TableSchema,
+}
+
+/// Handles literals, bind parameters, binary/unary operators, CASE, CAST,
+/// and (when `ctx` is provided) column references from a table scan cursor.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::too_many_lines
 )]
-fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
+fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx<'_>>) {
     match expr {
         Expr::Placeholder(pt, _) => {
             let idx = match pt {
@@ -1563,12 +1573,12 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
         Expr::BinaryOp {
             left, op, right, ..
         } => {
-            emit_binary_op(b, left, *op, right, reg);
+            emit_binary_op(b, left, *op, right, reg, ctx);
         }
         Expr::UnaryOp {
             op, expr: operand, ..
         } => {
-            emit_expr(b, operand, reg);
+            emit_expr(b, operand, reg, ctx);
             match op {
                 fsqlite_ast::UnaryOp::Negate => {
                     // Multiply by -1: Integer(-1) into temp, then Multiply.
@@ -1591,7 +1601,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
             type_name,
             ..
         } => {
-            emit_expr(b, inner, reg);
+            emit_expr(b, inner, reg, ctx);
             let affinity = type_name_to_affinity(type_name);
             b.emit_op(Opcode::Cast, reg, i32::from(affinity), 0, P4::None, 0);
         }
@@ -1601,14 +1611,14 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
             else_expr,
             ..
         } => {
-            emit_case_expr(b, operand.as_deref(), whens, else_expr.as_deref(), reg);
+            emit_case_expr(b, operand.as_deref(), whens, else_expr.as_deref(), reg, ctx);
         }
         Expr::IsNull {
             expr: inner, not, ..
         } => {
             // IS NULL → result 1 if null, 0 otherwise.
             // IS NOT NULL → result 0 if null, 1 otherwise.
-            emit_expr(b, inner, reg);
+            emit_expr(b, inner, reg, ctx);
             let lbl_null = b.emit_label();
             let lbl_done = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, lbl_null, P4::None, 0);
@@ -1621,8 +1631,18 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) {
             b.emit_op(Opcode::Integer, val_null, reg, 0, P4::None, 0);
             b.resolve_label(lbl_done);
         }
+        Expr::Column(col_ref, _) if ctx.is_some() => {
+            let sc = ctx.unwrap();
+            if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
+            } else {
+                // Unknown column — emit Null.
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            }
+        }
         _ => {
-            // Column refs and other cursor-dependent expressions: emit Null placeholder.
+            // Column refs without scan context and other unhandled expressions: Null.
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         }
     }
@@ -1663,6 +1683,7 @@ fn emit_binary_op(
     op: fsqlite_ast::BinaryOp,
     right: &Expr,
     reg: i32,
+    ctx: Option<&ScanCtx<'_>>,
 ) {
     // For comparison operators, emit a conditional jump pattern that
     // produces 1 (true) or 0 (false) as an integer result.
@@ -1675,20 +1696,20 @@ fn emit_binary_op(
             | fsqlite_ast::BinaryOp::Gt
             | fsqlite_ast::BinaryOp::Ge
     ) {
-        emit_comparison(b, left, op, right, reg);
+        emit_comparison(b, left, op, right, reg, ctx);
         return;
     }
 
     if matches!(op, fsqlite_ast::BinaryOp::Is | fsqlite_ast::BinaryOp::IsNot) {
-        emit_is_comparison(b, left, op, right, reg);
+        emit_is_comparison(b, left, op, right, reg, ctx);
         return;
     }
 
     // Arithmetic / logical / bitwise: evaluate left into reg, right into tmp,
     // then apply the opcode.
     let tmp = b.alloc_temp();
-    emit_expr(b, left, reg);
-    emit_expr(b, right, tmp);
+    emit_expr(b, left, reg, ctx);
+    emit_expr(b, right, tmp, ctx);
     let opcode = binary_op_to_opcode(op);
     // VDBE arithmetic: OP p1=rhs, p2=lhs, p3=dest
     b.emit_op(opcode, tmp, reg, reg, P4::None, 0);
@@ -1703,11 +1724,12 @@ fn emit_comparison(
     op: fsqlite_ast::BinaryOp,
     right: &Expr,
     reg: i32,
+    ctx: Option<&ScanCtx<'_>>,
 ) {
     let r_left = b.alloc_temp();
     let r_right = b.alloc_temp();
-    emit_expr(b, left, r_left);
-    emit_expr(b, right, r_right);
+    emit_expr(b, left, r_left, ctx);
+    emit_expr(b, right, r_right, ctx);
 
     let cmp_opcode = match op {
         fsqlite_ast::BinaryOp::Eq => Opcode::Eq,
@@ -1743,11 +1765,12 @@ fn emit_is_comparison(
     op: fsqlite_ast::BinaryOp,
     right: &Expr,
     reg: i32,
+    ctx: Option<&ScanCtx<'_>>,
 ) {
     let r_left = b.alloc_temp();
     let r_right = b.alloc_temp();
-    emit_expr(b, left, r_left);
-    emit_expr(b, right, r_right);
+    emit_expr(b, left, r_left, ctx);
+    emit_expr(b, right, r_right, ctx);
 
     let true_label = b.emit_label();
     let done_label = b.emit_label();
@@ -1784,11 +1807,12 @@ fn emit_case_expr(
     whens: &[(Expr, Expr)],
     else_expr: Option<&Expr>,
     reg: i32,
+    ctx: Option<&ScanCtx<'_>>,
 ) {
     let done_label = b.emit_label();
     let r_operand = operand.map(|op_expr| {
         let r = b.alloc_temp();
-        emit_expr(b, op_expr, r);
+        emit_expr(b, op_expr, r, ctx);
         r
     });
 
@@ -1798,19 +1822,19 @@ fn emit_case_expr(
         if let Some(r_op) = r_operand {
             // Simple CASE: compare operand to each WHEN value.
             let r_when = b.alloc_temp();
-            emit_expr(b, when_expr, r_when);
+            emit_expr(b, when_expr, r_when, ctx);
             // If operand != when_value, skip to next WHEN.
             b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, 0);
             b.free_temp(r_when);
         } else {
             // Searched CASE: each WHEN is a boolean condition.
-            emit_expr(b, when_expr, reg);
+            emit_expr(b, when_expr, reg, ctx);
             // If condition is false/null, skip to next WHEN.
             b.emit_jump_to_label(Opcode::IfNot, reg, 1, next_when, P4::None, 0);
         }
 
         // Emit THEN expression.
-        emit_expr(b, then_expr, reg);
+        emit_expr(b, then_expr, reg, ctx);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
         b.resolve_label(next_when);
@@ -1818,7 +1842,7 @@ fn emit_case_expr(
 
     // ELSE clause (or NULL if no ELSE).
     if let Some(el) = else_expr {
-        emit_expr(b, el, reg);
+        emit_expr(b, el, reg, ctx);
     } else {
         b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
     }
