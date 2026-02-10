@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use fsqlite_types::LockLevel;
 
 use crate::traits::{Vfs, VfsFile};
 
@@ -769,18 +769,20 @@ mod tests {
         file.write(&cx, b"test", 0).unwrap();
 
         // MemoryVfs always returns true for access if file exists.
-        assert!(vfs
-            .access(&cx, Path::new("acc.db"), AccessFlags::READWRITE)
-            .unwrap());
+        assert!(
+            vfs.access(&cx, Path::new("acc.db"), AccessFlags::READWRITE)
+                .unwrap()
+        );
     }
 
     #[test]
     fn access_nonexistent() {
         let cx = Cx::new();
         let vfs = make_vfs();
-        assert!(!vfs
-            .access(&cx, Path::new("nope.db"), AccessFlags::EXISTS)
-            .unwrap());
+        assert!(
+            !vfs.access(&cx, Path::new("nope.db"), AccessFlags::EXISTS)
+                .unwrap()
+        );
     }
 
     #[test]
