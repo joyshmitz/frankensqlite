@@ -158,6 +158,32 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 Traditional SQLite uses a single WAL_WRITE_LOCK that serializes all writers. FrankenSQLite replaces this with **page-level MVCC versioning**, where each page carries a version chain. Writers only conflict when they touch the same page in the same transaction window, dramatically improving write concurrency for real-world workloads.
 
+### CRITICAL: Concurrent-Writer Mode is the ENTIRE POINT — DO NOT TOUCH
+
+> **This is the single most important rule in this project. Violating it destroys the project's reason for existing.**
+
+FrankenSQLite exists for ONE reason: to eliminate SQLite's single-writer serialization bottleneck via MVCC page-level versioning. **Concurrent-writer mode is ON by default and MUST stay ON by default.** Every `BEGIN` is promoted to `BEGIN CONCURRENT` unless the user explicitly opts out.
+
+**YOU MUST NEVER:**
+
+1. **Set `concurrent_mode_default` to `false`** — This is the field in `Connection` (connection.rs) that controls whether `BEGIN` promotes to `BEGIN CONCURRENT`. It MUST be `true`. Setting it to `false` reverts the entire system to behaving like stock SQLite with a single-writer bottleneck.
+
+2. **Implement SQLite-style serialized file locking** — FrankenSQLite does NOT use SQLite's Shared/Reserved/Pending/Exclusive lock escalation protocol for write serialization. That is the exact bottleneck we exist to replace. The `MemoryVfs` locking stubs are intentionally minimal because MVCC handles concurrency at the page level, not the file-lock level.
+
+3. **Default any concurrency setting to OFF/false/disabled** — Every harness, executor, config struct, and benchmark setting that has a `concurrent_mode` field MUST default to `true`. Check: `HarnessSettings`, `FsqliteExecConfig`, `benchmark_settings()`, and `Connection` internals.
+
+4. **Add lock contention that blocks concurrent writers** — If you find yourself writing code where one writer blocks another at the file/connection level, you are reimplementing the bottleneck. Writers in FrankenSQLite only conflict at the PAGE level within the same transaction window — that's MVCC.
+
+**The key locations you must never regress:**
+- `crates/fsqlite-core/src/connection.rs` — `concurrent_mode_default: RefCell::new(true)`
+- `crates/fsqlite-e2e/src/lib.rs` — `HarnessSettings::default()` → `concurrent_mode: true`
+- `crates/fsqlite-e2e/src/fsqlite_executor.rs` — `FsqliteExecConfig::default()` → `concurrent_mode: true`
+- `crates/fsqlite-e2e/src/fairness.rs` — `benchmark_settings()` → `concurrent_mode: true`
+
+**Why this rule exists:** On Feb 10 2026, an agent set `concurrent_mode_default` to `false` and implemented serialized file locking in `MemoryVfs`, completely defeating the project's core innovation. It took an emergency session to identify and revert the damage. This must never happen again. If you are unsure whether a change affects concurrency behavior, ASK before making it.
+
+---
+
 ### Architecture
 
 ```
