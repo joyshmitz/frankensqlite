@@ -1142,7 +1142,8 @@ fn sqlite_page_size_or_default(db_bytes: &[u8]) -> u32 {
     if db_bytes.len() < DATABASE_HEADER_SIZE {
         return 4096;
     }
-    let Ok(header_bytes) = <[u8; DATABASE_HEADER_SIZE]>::try_from(&db_bytes[..DATABASE_HEADER_SIZE])
+    let Ok(header_bytes) =
+        <[u8; DATABASE_HEADER_SIZE]>::try_from(&db_bytes[..DATABASE_HEADER_SIZE])
     else {
         return 4096;
     };

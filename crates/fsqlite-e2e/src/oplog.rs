@@ -868,7 +868,10 @@ pub fn preset_large_txn(
                         ("category".to_owned(), cat.to_owned()),
                         ("val".to_owned(), det_str("lt", seed, w, r)),
                         ("num".to_owned(), format!("{num_val:.6}")),
-                        ("created_at".to_owned(), format!("{}", r.saturating_mul(100))),
+                        (
+                            "created_at".to_owned(),
+                            format!("{}", r.saturating_mul(100)),
+                        ),
                     ],
                 },
                 expected: Some(ExpectedResult::AffectedRows(1)),
@@ -1314,10 +1317,7 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
                 worker_counts: vec![1],
                 applicable: false,
             },
-            determinism_inputs: vec![
-                "seed".to_owned(),
-                "rows_per_table".to_owned(),
-            ],
+            determinism_inputs: vec!["seed".to_owned(), "rows_per_table".to_owned()],
         },
         PresetMeta {
             name: "large_txn".to_owned(),
@@ -1338,20 +1338,18 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
         },
         PresetMeta {
             name: "schema_migration".to_owned(),
-            description: "DDL migration sequence: CREATE TABLE → populate → ALTER TABLE ADD COLUMN → \
+            description:
+                "DDL migration sequence: CREATE TABLE → populate → ALTER TABLE ADD COLUMN → \
                 CREATE INDEX → backfill → RENAME TABLE → new join table. \
                 Tests DDL correctness across engines."
-                .to_owned(),
+                    .to_owned(),
             expected_tier: EquivalenceTier::Tier2Canonical,
             serial_only: true,
             concurrency_sweep: ConcurrencySweep {
                 worker_counts: vec![1],
                 applicable: false,
             },
-            determinism_inputs: vec![
-                "seed".to_owned(),
-                "rows".to_owned(),
-            ],
+            determinism_inputs: vec!["seed".to_owned(), "rows".to_owned()],
         },
     ]
 }
@@ -1716,7 +1714,10 @@ mod tests {
                     if statement.starts_with("CREATE"))
             })
             .count();
-        assert!(ddl_count >= 4, "expected at least 4 DDL statements (2 tables + indexes)");
+        assert!(
+            ddl_count >= 4,
+            "expected at least 4 DDL statements (2 tables + indexes)"
+        );
 
         // Each worker should have inserts into lt_main.
         let main_inserts: usize = log
@@ -1725,8 +1726,7 @@ mod tests {
             .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "lt_main"))
             .count();
         assert_eq!(
-            main_inserts,
-            100,
+            main_inserts, 100,
             "2 workers × 50 rows = 100 lt_main inserts"
         );
 
@@ -1786,7 +1786,10 @@ mod tests {
                     if statement.starts_with("CREATE TABLE"))
             })
             .count();
-        assert!(create_count >= 4, "expected CREATE TABLE for users, posts, tags, article_tags");
+        assert!(
+            create_count >= 4,
+            "expected CREATE TABLE for users, posts, tags, article_tags"
+        );
 
         // V2: ALTER TABLE statements.
         let alter_count = log
@@ -1797,7 +1800,10 @@ mod tests {
                     if statement.starts_with("ALTER TABLE"))
             })
             .count();
-        assert!(alter_count >= 3, "expected ALTER TABLE ADD COLUMN (×2) + RENAME");
+        assert!(
+            alter_count >= 3,
+            "expected ALTER TABLE ADD COLUMN (×2) + RENAME"
+        );
 
         // V2: CREATE INDEX.
         let idx_count = log
@@ -1927,7 +1933,10 @@ mod tests {
     #[test]
     fn test_equivalence_tier_display() {
         assert_eq!(EquivalenceTier::Tier1Raw.to_string(), "tier1_raw");
-        assert_eq!(EquivalenceTier::Tier2Canonical.to_string(), "tier2_canonical");
+        assert_eq!(
+            EquivalenceTier::Tier2Canonical.to_string(),
+            "tier2_canonical"
+        );
         assert_eq!(EquivalenceTier::Tier3Logical.to_string(), "tier3_logical");
     }
 
