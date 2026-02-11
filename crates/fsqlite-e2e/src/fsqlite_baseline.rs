@@ -115,12 +115,15 @@ const BASELINE_PAGE_SIZE: u32 = 4096;
 
 /// Create a WAL-mode database with known data and a WAL-FEC sidecar.
 ///
-/// Returns `(db_path, wal_info, original_page_payloads)`.
+/// Returns `(db_path, wal_info, original_page_payloads, expected_dump_hash)`.
 ///
 /// The database has `BASELINE_ROW_COUNT` rows inserted, then a passive
 /// checkpoint, then 20 more rows (so WAL frames exist for WAL-targeting
 /// strategies).
-fn setup_baseline_with_fec(dir: &Path) -> E2eResult<(PathBuf, Option<WalInfo>, Vec<Vec<u8>>)> {
+#[allow(clippy::type_complexity)]
+fn setup_baseline_with_fec(
+    dir: &Path,
+) -> E2eResult<(PathBuf, Option<WalInfo>, Vec<Vec<u8>>, String)> {
     let live_db = dir.join("live.db");
     let crash_db = dir.join("baseline.db");
 
@@ -159,6 +162,12 @@ fn setup_baseline_with_fec(dir: &Path) -> E2eResult<(PathBuf, Option<WalInfo>, V
         )?;
     }
 
+    // Compute the "expected" dump hash while the writer connection is still open.
+    // Opening and closing an extra connection here can checkpoint and remove the
+    // WAL file, which would break WAL-targeting corruption strategies later.
+    let expected_dump = logical_dump(&conn)?;
+    let expected_hash = hash_dump(&expected_dump);
+
     // Snapshot while writer is still open (WAL exists).
     let live_wal = live_db.with_extension("db-wal");
     std::fs::copy(&live_db, &crash_db)?;
@@ -186,7 +195,7 @@ fn setup_baseline_with_fec(dir: &Path) -> E2eResult<(PathBuf, Option<WalInfo>, V
         (None, Vec::new())
     };
 
-    Ok((crash_db, wal_info, original_pages))
+    Ok((crash_db, wal_info, original_pages, expected_hash))
 }
 
 /// Create a dummy WAL-FEC sidecar file for sidecar corruption strategies.
@@ -318,23 +327,14 @@ pub fn measure_fsqlite_baseline(
     let total_rows = BASELINE_ROW_COUNT + 20;
 
     // 1. Set up baseline DB with WAL-FEC sidecar.
-    let (db_path, wal_info, original_pages) = setup_baseline_with_fec(work_dir)?;
+    let (db_path, wal_info, original_pages, expected_hash) = setup_baseline_with_fec(work_dir)?;
 
     // Ensure sidecar exists for sidecar strategies.
     if entry.category == CorruptionCategory::Sidecar {
         ensure_sidecar_file(&db_path)?;
     }
 
-    // 2. Take the expected dump before corruption.
-    let expected_dump = {
-        let conn = Connection::open(&db_path)?;
-        let dump = logical_dump(&conn)?;
-        drop(conn);
-        dump
-    };
-    let expected_hash = hash_dump(&expected_dump);
-
-    // 3. Apply corruption.
+    // 2. Apply corruption.
     let target = target_path_for_category(&db_path, entry.category);
     let corruption_report = if target.exists() {
         Some(entry.inject(&target, BASELINE_PAGE_SIZE)?)
@@ -360,7 +360,7 @@ pub fn measure_fsqlite_baseline(
         });
     };
 
-    // 4. Attempt WAL-FEC recovery for WAL strategies.
+    // 3. Attempt WAL-FEC recovery for WAL strategies.
     let (recovery_attempted, recovery_succeeded, pages_recovered, recovery_log_summary) =
         if entry.category == CorruptionCategory::Wal {
             if let Some(ref info) = wal_info {
@@ -403,7 +403,7 @@ pub fn measure_fsqlite_baseline(
             (false, false, 0, None)
         };
 
-    // 5. Try to open and inspect the (possibly recovered) database.
+    // 4. Try to open and inspect the (possibly recovered) database.
     let open_result = Connection::open(&db_path);
     let conn = match open_result {
         Err(e) => {
@@ -429,12 +429,12 @@ pub fn measure_fsqlite_baseline(
         Ok(c) => c,
     };
 
-    // 6. Run integrity check.
+    // 5. Run integrity check.
     let integrity = conn
         .query_row("PRAGMA integrity_check;", [], |row| row.get::<_, String>(0))
         .unwrap_or_else(|e| format!("error: {e}"));
 
-    // 7. Count surviving rows.
+    // 6. Count surviving rows.
     let rows_after = conn
         .query_row("SELECT COUNT(*) FROM items;", [], |row| {
             row.get::<_, i64>(0)
@@ -442,12 +442,12 @@ pub fn measure_fsqlite_baseline(
         .ok()
         .and_then(|n| usize::try_from(n).ok());
 
-    // 8. Attempt logical dump for divergence detection.
+    // 7. Attempt logical dump for divergence detection.
     let actual_dump = logical_dump(&conn).ok();
     let actual_hash = actual_dump.as_deref().map(hash_dump);
     drop(conn);
 
-    // 9. Classify recovery tier.
+    // 8. Classify recovery tier.
     let recovery_tier = if actual_hash.as_deref() == Some(expected_hash.as_str()) {
         FsqliteRecoveryTier::Recovered
     } else if rows_after.is_some() {
@@ -631,7 +631,8 @@ mod tests {
     #[test]
     fn test_setup_baseline_with_fec_creates_files() {
         let dir = tempfile::tempdir().unwrap();
-        let (db_path, wal_info, original_pages) = setup_baseline_with_fec(dir.path()).unwrap();
+        let (db_path, wal_info, original_pages, _expected_hash) =
+            setup_baseline_with_fec(dir.path()).unwrap();
         assert!(db_path.exists(), "database file should exist");
 
         let wal_path = db_path.with_extension("db-wal");
@@ -647,7 +648,7 @@ mod tests {
     #[test]
     fn test_logical_dump_deterministic() {
         let dir = tempfile::tempdir().unwrap();
-        let (db_path, _, _) = setup_baseline_with_fec(dir.path()).unwrap();
+        let (db_path, _, _, _expected_hash) = setup_baseline_with_fec(dir.path()).unwrap();
 
         let conn = Connection::open(&db_path).unwrap();
         let dump1 = logical_dump(&conn).unwrap();

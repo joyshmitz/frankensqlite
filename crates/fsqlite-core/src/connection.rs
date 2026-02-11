@@ -2892,7 +2892,7 @@ mod tests {
     use fsqlite_error::FrankenError;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
-    use fsqlite_vdbe::engine::{ExecOutcome, VdbeEngine};
+    use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, VdbeEngine};
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values().to_vec()
@@ -4231,21 +4231,28 @@ mod tests {
         let program = conn.compile_table_select(&select).unwrap();
 
         // Execute once with mem cursors (storage cursors disabled).
-        let db_mem = conn.db.borrow().clone();
+        let db_mem = conn.db.replace(MemDatabase::new());
         let mut engine = VdbeEngine::new(program.register_count());
+        engine.enable_storage_read_cursors(false);
         engine.set_database(db_mem);
         let outcome = engine.execute(&program).unwrap();
         assert_eq!(outcome, ExecOutcome::Done);
         let mem_rows = engine.take_results();
+        if let Some(db_after) = engine.take_database() {
+            *conn.db.borrow_mut() = db_after;
+        }
 
         // Execute once with storage-backed read cursors enabled.
-        let db_storage = conn.db.borrow().clone();
+        let db_storage = conn.db.replace(MemDatabase::new());
         let mut engine = VdbeEngine::new(program.register_count());
         engine.enable_storage_read_cursors(true);
         engine.set_database(db_storage);
         let outcome = engine.execute(&program).unwrap();
         assert_eq!(outcome, ExecOutcome::Done);
         let storage_rows = engine.take_results();
+        if let Some(db_after) = engine.take_database() {
+            *conn.db.borrow_mut() = db_after;
+        }
 
         let expected = vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])];
         assert_eq!(mem_rows, vec![expected.clone()]);

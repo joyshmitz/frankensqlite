@@ -371,11 +371,14 @@ struct StorageCursor {
     root_page: i32,
 }
 
-/// Lightweight version token for `MemDatabase` undo/rollback.
+/// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
 ///
+/// This is the MVCC-style snapshot identity for the in-memory store.
 /// Returned by [`MemDatabase::undo_version`] and consumed by
 /// [`MemDatabase::rollback_to`] to identify undo save-points.
+/// The token is just the undo-log length — O(1) to capture, no cloning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use]
 pub struct MemDbVersionToken(usize);
 
 #[derive(Debug, Clone)]
@@ -642,16 +645,9 @@ impl Default for MemDatabase {
     }
 }
 
-impl Clone for MemDatabase {
-    fn clone(&self) -> Self {
-        Self {
-            tables: self.tables.clone(),
-            next_root_page: self.next_root_page,
-            undo_enabled: false,
-            undo_log: Vec::new(),
-        }
-    }
-}
+// NOTE: MemDatabase intentionally does NOT implement Clone.
+// Snapshot reads use the lightweight `MemDbVersionToken` (undo-log index)
+// rather than cloning the entire table state.  See bd-g6eo.
 
 const VDBE_TRACE_ENV: &str = "FSQLITE_VDBE_TRACE_OPCODES";
 const VDBE_TRACE_LOGGING_STANDARD: &str = "bd-1fpm";

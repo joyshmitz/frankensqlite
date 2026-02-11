@@ -11,7 +11,15 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "flywheel",
+        "fts",
+        "many-indexes",
+        "medium",
+        "page-size-4096",
+        "wal"
+      ]
     },
     {
       "db_id": "agentic_coding_flywheel_setup",
@@ -23,7 +31,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "flywheel",
+        "large",
+        "many-indexes",
+        "wal"
+      ]
     },
     {
       "db_id": "asupersync",
@@ -35,7 +49,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "asupersync",
+        "large",
+        "many-indexes",
+        "wal"
+      ]
     },
     {
       "db_id": "beads_rust_beads",
@@ -47,7 +67,14 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "beads",
+        "many-indexes",
+        "medium",
+        "page-size-4096",
+        "wal"
+      ]
     },
     {
       "db_id": "beads_viewer",
@@ -59,7 +86,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "beads",
+        "large",
+        "many-indexes",
+        "wal"
+      ]
     },
     {
       "db_id": "brenner_bot",
@@ -71,7 +104,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "codexbar_build",
@@ -83,7 +122,12 @@
         "journal_mode": "delete",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "medium",
+        "misc",
+        "page-size-4096"
+      ]
     },
     {
       "db_id": "coding_agent_session_search",
@@ -95,7 +139,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "communitai_storage",
@@ -107,7 +157,15 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "fts",
+        "many-indexes",
+        "medium",
+        "misc",
+        "page-size-4096",
+        "wal"
+      ]
     },
     {
       "db_id": "destructive_command_guard",
@@ -119,7 +177,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "dp_level",
@@ -131,7 +195,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "many-indexes",
+        "medium",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "eidetic_memory",
@@ -143,7 +213,15 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "fts",
+        "large",
+        "many-indexes",
+        "misc",
+        "page-size-4096",
+        "wal"
+      ]
     },
     {
       "db_id": "fix_my_documents_backend",
@@ -155,7 +233,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "misc",
+        "page-size-4096",
+        "wal"
+      ]
     },
     {
       "db_id": "flywheel_connectors",
@@ -167,7 +251,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "flywheel",
+        "large",
+        "many-indexes",
+        "wal"
+      ]
     },
     {
       "db_id": "flywheel_gateway",
@@ -179,7 +269,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "flywheel",
+        "large",
+        "many-indexes",
+        "wal"
+      ]
     },
     {
       "db_id": "flywheel_gateway_data",
@@ -191,7 +287,14 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "flywheel",
+        "large",
+        "many-indexes",
+        "page-size-4096",
+        "wal"
+      ]
     },
     {
       "db_id": "flywheel_private",
@@ -203,7 +306,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "flywheel",
+        "large",
+        "many-indexes",
+        "wal"
+      ]
     },
     {
       "db_id": "frankensqlite",
@@ -215,7 +324,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "frankensqlite",
+        "large",
+        "many-indexes",
+        "wal"
+      ]
     },
     {
       "db_id": "frankentui",
@@ -227,7 +342,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "frankentui",
+        "large",
+        "many-indexes",
+        "wal"
+      ]
     },
     {
       "db_id": "historical_soldiers",
@@ -239,7 +360,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "jain_idea_analyzer_agent",
@@ -251,7 +378,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "jeffreys_skills_md",
@@ -263,7 +396,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "jeffreysprompts_premium",
@@ -275,7 +414,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "jsm",
@@ -287,7 +432,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "markdown_web_browser_runs",
@@ -299,7 +450,14 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "medium",
+        "misc",
+        "page-size-4096",
+        "vec0",
+        "wal"
+      ]
     },
     {
       "db_id": "mcp_agent_mail_storage",
@@ -311,7 +469,15 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "agent-mail",
+        "fts",
+        "large",
+        "many-indexes",
+        "page-size-4096",
+        "wal"
+      ]
     },
     {
       "db_id": "meta_skill",
@@ -323,7 +489,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "northwind",
@@ -335,7 +507,12 @@
         "journal_mode": "delete",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "misc",
+        "page-size-4096"
+      ]
     },
     {
       "db_id": "ntm",
@@ -347,7 +524,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "remote_compilation_helper",
@@ -359,7 +542,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "many-indexes",
+        "misc",
+        "wal"
+      ]
     },
     {
       "db_id": "smartedgar_factor_data",
@@ -371,7 +560,13 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "large",
+        "misc",
+        "page-size-4096",
+        "wal"
+      ]
     },
     {
       "db_id": "smartedgar_risk_ops",
@@ -383,7 +578,13 @@
         "journal_mode": "delete",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "many-indexes",
+        "medium",
+        "misc",
+        "page-size-4096"
+      ]
     },
     {
       "db_id": "toon_rust_storage",
@@ -395,7 +596,15 @@
         "journal_mode": "wal",
         "user_version": 0,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "fts",
+        "many-indexes",
+        "medium",
+        "misc",
+        "page-size-4096",
+        "wal"
+      ]
     },
     {
       "db_id": "wezterm_automata_wa",
@@ -407,7 +616,16 @@
         "journal_mode": "wal",
         "user_version": 7,
         "application_id": 0
-      }
+      },
+      "tags": [
+        "fts",
+        "many-indexes",
+        "many-tables",
+        "medium",
+        "misc",
+        "page-size-4096",
+        "wal"
+      ]
     }
   ]
 }

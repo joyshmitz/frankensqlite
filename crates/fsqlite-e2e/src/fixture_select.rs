@@ -934,4 +934,62 @@ mod tests {
             panic!("expected NoMatch");
         }
     }
+
+    #[test]
+    fn test_find_duplicate_db_ids_none() {
+        let m = sample_manifest();
+        let dups = find_duplicate_db_ids(&m);
+        assert!(dups.is_empty(), "sample manifest should have unique IDs");
+    }
+
+    #[test]
+    fn test_find_duplicate_db_ids_detects() {
+        let mut m = sample_manifest();
+        m.entries.push(ManifestEntry {
+            db_id: "beads_rust_beads".to_owned(),
+            golden_filename: "duplicate.db".to_owned(),
+            sha256_golden: "eee".to_owned(),
+            size_bytes: 100,
+            tags: vec![],
+            sqlite_meta: None,
+        });
+        let dups = find_duplicate_db_ids(&m);
+        assert_eq!(dups, vec!["beads_rust_beads"]);
+    }
+
+    #[test]
+    fn test_real_manifest_db_ids_unique() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        if let Ok(manifest) = load_manifest(workspace_root) {
+            let dups = find_duplicate_db_ids(&manifest);
+            assert!(dups.is_empty(), "manifest has duplicate db_ids: {dups:?}");
+        }
+    }
+
+    #[test]
+    fn test_sync_tags_from_metadata() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        if let Ok(mut manifest) = load_manifest(workspace_root) {
+            let meta_dir = workspace_root.join(METADATA_DIR_RELATIVE);
+            if meta_dir.is_dir() {
+                let count = sync_tags_from_metadata(&mut manifest, workspace_root).unwrap();
+                // After sync, entries with metadata files should have tags.
+                let entries_with_tags = manifest
+                    .entries
+                    .iter()
+                    .filter(|e| !e.tags.is_empty())
+                    .count();
+                assert!(
+                    entries_with_tags > 0 || count == 0,
+                    "sync should populate tags from metadata"
+                );
+            }
+        }
+    }
 }
