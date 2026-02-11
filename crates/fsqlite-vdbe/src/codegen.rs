@@ -916,7 +916,7 @@ fn parse_aggregate_columns(
                         } else {
                             // Single-arg aggregate: resolve column reference.
                             let col_idx =
-                                resolve_column_ref(&exprs[0], table).ok_or_else(|| {
+                                resolve_column_index(&exprs[0], table).ok_or_else(|| {
                                     CodegenError::Unsupported(
                                         "non-column argument in aggregate function".to_owned(),
                                     )
@@ -973,7 +973,7 @@ fn parse_group_by_output(
     let group_key_table_cols: Vec<usize> = group_by
         .iter()
         .map(|expr| {
-            resolve_column_ref(expr, table).ok_or_else(|| {
+            resolve_column_index(expr, table).ok_or_else(|| {
                 CodegenError::Unsupported("non-column GROUP BY expression".to_owned())
             })
         })
@@ -1007,7 +1007,7 @@ fn parse_group_by_output(
                             });
                         } else {
                             let col_idx =
-                                resolve_column_ref(&exprs[0], table).ok_or_else(|| {
+                                resolve_column_index(&exprs[0], table).ok_or_else(|| {
                                     CodegenError::Unsupported(
                                         "non-column argument in aggregate function".to_owned(),
                                     )
@@ -1025,7 +1025,7 @@ fn parse_group_by_output(
             }
             ResultColumn::Expr { expr, .. } => {
                 // Must be a GROUP BY column reference.
-                let col_idx = resolve_column_ref(expr, table).ok_or_else(|| {
+                let col_idx = resolve_column_index(expr, table).ok_or_else(|| {
                     CodegenError::Unsupported(
                         "non-aggregate, non-column expression in GROUP BY query".to_owned(),
                     )
