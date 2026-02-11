@@ -663,6 +663,19 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
+                // Route INSERT OR REPLACE / INSERT OR IGNORE through a
+                // fallback that correctly handles conflict resolution on
+                // the INTEGER PRIMARY KEY (rowid).
+                if insert.or_conflict.is_some() {
+                    if let fsqlite_ast::InsertSource::Values(rows) = &insert.source {
+                        let affected =
+                            self.execute_insert_or_conflict(insert, rows, params)?;
+                        self.persist_if_needed()?;
+                        *self.last_changes.borrow_mut() = affected;
+                        return Ok(Vec::new());
+                    }
+                }
+
                 let affected = match &insert.source {
                     fsqlite_ast::InsertSource::Values(v) => v.len(),
                     fsqlite_ast::InsertSource::DefaultValues => 1,
@@ -840,6 +853,143 @@ impl Connection {
         }
 
         Ok(source_rows.len())
+    }
+
+    /// Handle INSERT OR REPLACE / INSERT OR IGNORE for VALUES source by
+    /// evaluating each row, resolving the INTEGER PRIMARY KEY rowid, and
+    /// applying conflict resolution directly on the in-memory database.
+    #[allow(clippy::too_many_lines)]
+    fn execute_insert_or_conflict(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        rows: &[Vec<Expr>],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<usize> {
+        use fsqlite_ast::ConflictAction;
+
+        let conflict = insert
+            .or_conflict
+            .as_ref()
+            .ok_or_else(|| FrankenError::Internal("expected or_conflict".to_owned()))?;
+
+        let table_name = &insert.table.name;
+        let schema = self.schema.borrow();
+        let table_schema = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::Internal(format!("no such table: {table_name}")))?;
+        let root_page = table_schema.root_page;
+        let num_cols = table_schema.columns.len();
+
+        // Determine which VALUES position maps to the INTEGER PRIMARY KEY
+        // column so we can extract the user-supplied rowid.
+        let ipk_col_idx = self
+            .rowid_alias_columns
+            .borrow()
+            .get(&table_name.to_ascii_lowercase())
+            .copied();
+        // Map from VALUES position to table column position.
+        let target_map: Vec<usize> = if insert.columns.is_empty() {
+            (0..num_cols).collect()
+        } else {
+            insert
+                .columns
+                .iter()
+                .map(|col| {
+                    table_schema.column_index(col).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "column '{col}' not found in table '{table_name}'"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        // Which VALUES position (if any) maps to the IPK column.
+        let ipk_values_pos = ipk_col_idx.and_then(|ipk| target_map.iter().position(|&t| t == ipk));
+
+        drop(schema);
+
+        let mut affected = 0usize;
+
+        for row_exprs in rows {
+            // Evaluate the row expressions by wrapping them in a SELECT.
+            let expr_strs: Vec<String> = row_exprs.iter().map(|e| format!("{e}")).collect();
+            let select_sql = format!("SELECT {}", expr_strs.join(", "));
+            let eval_rows = if let Some(p) = params {
+                self.query_with_params(&select_sql, p)?
+            } else {
+                self.query(&select_sql)?
+            };
+            let values: Vec<SqliteValue> = eval_rows
+                .first()
+                .map(|r| r.values().to_vec())
+                .unwrap_or_default();
+
+            // Extract the user-supplied rowid from the IPK column (if any).
+            let explicit_rowid = ipk_values_pos.and_then(|pos| {
+                values.get(pos).and_then(|v| match v {
+                    SqliteValue::Integer(n) => Some(*n),
+                    _ => None,
+                })
+            });
+
+            // Build the full column value vector in table order.
+            let mut col_values = vec![SqliteValue::Null; num_cols];
+            for (val_pos, &tgt) in target_map.iter().enumerate() {
+                if let Some(v) = values.get(val_pos) {
+                    col_values[tgt] = v.clone();
+                }
+            }
+
+            let mut db = self.db.borrow_mut();
+            if let Some(rowid) = explicit_rowid {
+                let exists = db
+                    .get_table(root_page)
+                    .and_then(|t| t.find_by_rowid(rowid))
+                    .is_some();
+
+                match conflict {
+                    ConflictAction::Replace => {
+                        // insert_row delegates to insert() which has upsert
+                        // semantics: replaces if rowid already exists.
+                        if let Some(table) = db.get_table_mut(root_page) {
+                            table.insert_row(rowid, col_values);
+                        }
+                        affected += 1;
+                    }
+                    ConflictAction::Ignore => {
+                        if !exists {
+                            if let Some(table) = db.get_table_mut(root_page) {
+                                table.insert_row(rowid, col_values);
+                            }
+                            affected += 1;
+                        }
+                        // else: silently skip this row
+                    }
+                    ConflictAction::Abort | ConflictAction::Fail | ConflictAction::Rollback => {
+                        if exists {
+                            return Err(FrankenError::UniqueViolation {
+                                columns: format!("{table_name}.rowid"),
+                            });
+                        }
+                        if let Some(table) = db.get_table_mut(root_page) {
+                            table.insert_row(rowid, col_values);
+                        }
+                        affected += 1;
+                    }
+                }
+            } else {
+                // No explicit rowid; auto-allocate.  Conflict on auto-generated
+                // rowid is practically impossible.
+                if let Some(table) = db.get_table_mut(root_page) {
+                    let new_rowid = table.alloc_rowid();
+                    table.insert_row(new_rowid, col_values);
+                }
+                affected += 1;
+            }
+        }
+
+        Ok(affected)
     }
 
     fn resolve_insert_select_target_layout(
@@ -10203,5 +10353,76 @@ mod transaction_lifecycle_tests {
                 &fsqlite_types::value::SqliteValue::Integer(2)
             );
         }
+    }
+
+    #[test]
+    fn test_insert_or_replace() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+        // Replace row with id=1
+        conn.execute("INSERT OR REPLACE INTO t VALUES (1, 'carol')")
+            .unwrap();
+        let rows = conn.query("SELECT id, name FROM t ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("carol".into()));
+        assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(2));
+        assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Text("bob".into()));
+    }
+
+    #[test]
+    fn test_replace_into() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        // REPLACE INTO is syntactic sugar for INSERT OR REPLACE
+        conn.execute("REPLACE INTO t VALUES (1, 'zara')").unwrap();
+        let rows = conn.query("SELECT name FROM t WHERE id = 1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("zara".into()));
+    }
+
+    #[test]
+    fn test_insert_or_ignore() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        // INSERT OR IGNORE should silently skip the conflicting row
+        conn.execute("INSERT OR IGNORE INTO t VALUES (1, 'bob')")
+            .unwrap();
+        let rows = conn.query("SELECT name FROM t WHERE id = 1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("alice".into()));
+    }
+
+    #[test]
+    fn test_insert_or_replace_new_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        // INSERT OR REPLACE with a new id should just insert
+        conn.execute("INSERT OR REPLACE INTO t VALUES (2, 'b')")
+            .unwrap();
+        let rows = conn.query("SELECT id, val FROM t ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_or_ignore_no_conflict() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        // INSERT OR IGNORE with no conflict should insert normally
+        conn.execute("INSERT OR IGNORE INTO t VALUES (2, 'b')")
+            .unwrap();
+        let rows = conn.query("SELECT id FROM t ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
     }
 }

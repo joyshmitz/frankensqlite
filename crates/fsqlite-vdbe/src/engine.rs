@@ -64,7 +64,7 @@ impl MemTable {
     }
 
     /// Allocate a new unique rowid.
-    fn alloc_rowid(&mut self) -> i64 {
+    pub fn alloc_rowid(&mut self) -> i64 {
         let id = self.next_rowid;
         self.next_rowid += 1;
         id
@@ -96,7 +96,7 @@ impl MemTable {
     }
 
     /// Find a row by rowid. Returns the index.
-    fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
+    pub fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
         self.rows.iter().position(|r| r.rowid == rowid)
     }
 
