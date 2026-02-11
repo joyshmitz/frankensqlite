@@ -5656,6 +5656,12 @@ fn sqlite_value_to_text(v: &SqliteValue) -> String {
 }
 
 /// Evaluate a scalar function call (for JOIN expression evaluation).
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
     let lower = name.to_ascii_lowercase();
     match lower.as_str() {
@@ -5709,6 +5715,227 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 args.first().cloned().unwrap_or(SqliteValue::Null)
             }
         }
+        "typeof" => {
+            let type_name = match args.first() {
+                Some(SqliteValue::Integer(_)) => "integer",
+                Some(SqliteValue::Float(_)) => "real",
+                Some(SqliteValue::Text(_)) => "text",
+                Some(SqliteValue::Blob(_)) => "blob",
+                _ => "null",
+            };
+            SqliteValue::Text(type_name.to_owned())
+        }
+        "iif" => {
+            if args.len() >= 3 {
+                if is_sqlite_truthy(&args[0]) {
+                    args[1].clone()
+                } else {
+                    args[2].clone()
+                }
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "max" => args
+            .iter()
+            .filter(|v| !matches!(v, SqliteValue::Null))
+            .max_by(|a, b| cmp_sqlite_values(a, b))
+            .cloned()
+            .unwrap_or(SqliteValue::Null),
+        "min" => args
+            .iter()
+            .filter(|v| !matches!(v, SqliteValue::Null))
+            .min_by(|a, b| cmp_sqlite_values(a, b))
+            .cloned()
+            .unwrap_or(SqliteValue::Null),
+        "replace" => {
+            if args.len() >= 3 {
+                let s = sqlite_value_to_text(&args[0]);
+                let from = sqlite_value_to_text(&args[1]);
+                let to = sqlite_value_to_text(&args[2]);
+                SqliteValue::Text(s.replace(&from, &to))
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "substr" | "substring" => {
+            if let Some(SqliteValue::Text(s)) = args.first() {
+                let start = args
+                    .get(1)
+                    .map_or(1, fsqlite_types::SqliteValue::to_integer)
+                    .max(1) as usize
+                    - 1;
+                let chars: Vec<char> = s.chars().collect();
+                if let Some(len_val) = args.get(2) {
+                    let len = len_val.to_integer().max(0) as usize;
+                    let end = (start + len).min(chars.len());
+                    SqliteValue::Text(chars[start..end].iter().collect())
+                } else {
+                    SqliteValue::Text(chars[start..].iter().collect())
+                }
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "instr" => {
+            if args.len() >= 2 {
+                let haystack = sqlite_value_to_text(&args[0]);
+                let needle = sqlite_value_to_text(&args[1]);
+                #[allow(clippy::cast_possible_wrap)]
+                let pos = haystack.find(&needle).map_or(0i64, |i| (i + 1) as i64);
+                SqliteValue::Integer(pos)
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "trim" => {
+            if let Some(v) = args.first() {
+                SqliteValue::Text(sqlite_value_to_text(v).trim().to_owned())
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "ltrim" => {
+            if let Some(v) = args.first() {
+                SqliteValue::Text(sqlite_value_to_text(v).trim_start().to_owned())
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "rtrim" => {
+            if let Some(v) = args.first() {
+                SqliteValue::Text(sqlite_value_to_text(v).trim_end().to_owned())
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "hex" => match args.first() {
+            Some(SqliteValue::Blob(b)) => {
+                use std::fmt::Write;
+                let mut hex = String::with_capacity(b.len() * 2);
+                for byte in b {
+                    let _ = write!(hex, "{byte:02X}");
+                }
+                SqliteValue::Text(hex)
+            }
+            Some(v) => {
+                use std::fmt::Write;
+                let s = sqlite_value_to_text(v);
+                let mut hex = String::with_capacity(s.len() * 2);
+                for b in s.bytes() {
+                    let _ = write!(hex, "{b:02X}");
+                }
+                SqliteValue::Text(hex)
+            }
+            None => SqliteValue::Null,
+        },
+        "quote" => match args.first() {
+            Some(SqliteValue::Null) => SqliteValue::Text("NULL".to_owned()),
+            Some(SqliteValue::Integer(n)) => SqliteValue::Text(n.to_string()),
+            Some(SqliteValue::Float(f)) => SqliteValue::Text(f.to_string()),
+            Some(SqliteValue::Text(s)) => SqliteValue::Text(format!("'{}'", s.replace('\'', "''"))),
+            Some(SqliteValue::Blob(b)) => {
+                use std::fmt::Write;
+                let mut hex = String::with_capacity(b.len() * 2);
+                for byte in b {
+                    let _ = write!(hex, "{byte:02X}");
+                }
+                SqliteValue::Text(format!("X'{hex}'"))
+            }
+            None => SqliteValue::Null,
+        },
+        "unicode" => {
+            if let Some(SqliteValue::Text(s)) = args.first() {
+                s.chars().next().map_or(SqliteValue::Null, |c| {
+                    SqliteValue::Integer(i64::from(c as u32))
+                })
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "char" => {
+            let s: String = args
+                .iter()
+                .filter_map(|v| {
+                    if let SqliteValue::Integer(n) = v {
+                        #[allow(clippy::cast_sign_loss)]
+                        char::from_u32(*n as u32)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            SqliteValue::Text(s)
+        }
+        "random" => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::time::SystemTime::now().hash(&mut hasher);
+            #[allow(clippy::cast_possible_wrap)]
+            SqliteValue::Integer(hasher.finish() as i64)
+        }
+        "zeroblob" => {
+            let n = args.first().map_or(0, |v| v.to_integer().max(0)) as usize;
+            SqliteValue::Blob(vec![0u8; n])
+        }
+        "round" => match args.first() {
+            Some(SqliteValue::Float(f)) => {
+                let digits = args
+                    .get(1)
+                    .map_or(0, fsqlite_types::SqliteValue::to_integer);
+                let factor = 10f64.powi(digits as i32);
+                SqliteValue::Float((f * factor).round() / factor)
+            }
+            Some(SqliteValue::Integer(n)) => SqliteValue::Float(*n as f64),
+            _ => SqliteValue::Null,
+        },
+        "sign" => match args.first() {
+            Some(SqliteValue::Integer(n)) => SqliteValue::Integer(n.signum()),
+            Some(SqliteValue::Float(f)) => {
+                if f.is_nan() {
+                    SqliteValue::Null
+                } else {
+                    SqliteValue::Integer(if *f > 0.0 {
+                        1
+                    } else if *f < 0.0 {
+                        -1
+                    } else {
+                        0
+                    })
+                }
+            }
+            _ => SqliteValue::Null,
+        },
+        "concat" => {
+            let parts: Vec<String> = args
+                .iter()
+                .filter(|v| !matches!(v, SqliteValue::Null))
+                .map(sqlite_value_to_text)
+                .collect();
+            SqliteValue::Text(parts.concat())
+        }
+        "concat_ws" => {
+            if let Some(sep) = args.first() {
+                if matches!(sep, SqliteValue::Null) {
+                    return SqliteValue::Null;
+                }
+                let sep_str = sqlite_value_to_text(sep);
+                let parts: Vec<String> = args[1..]
+                    .iter()
+                    .filter(|v| !matches!(v, SqliteValue::Null))
+                    .map(sqlite_value_to_text)
+                    .collect();
+                SqliteValue::Text(parts.join(&sep_str))
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "sqlite_version" => SqliteValue::Text("3.45.0".to_owned()),
+        "total_changes" | "changes" | "last_insert_rowid" => {
+            // Stub: return 0 since we don't have full state tracking here.
+            SqliteValue::Integer(0)
+        }
+        "likely" | "unlikely" => args.first().cloned().unwrap_or(SqliteValue::Null),
         _ => SqliteValue::Null,
     }
 }
@@ -10556,5 +10783,129 @@ mod transaction_lifecycle_tests {
         assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Integer(10));
         assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(10));
         assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Integer(20));
+    }
+
+    #[test]
+    fn test_scalar_fn_typeof() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val REAL)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'hello', 3.14)")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT typeof(t.id), typeof(t.name), typeof(t.val) \
+                 FROM t JOIN t AS t2 ON t.id = t2.id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Text("integer".into())
+        );
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("text".into()));
+    }
+
+    #[test]
+    fn test_scalar_fn_iif() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        let rows = conn
+            .query(
+                "SELECT t.id, iif(t.val > 15, 'big', 'small') \
+                 FROM t JOIN t AS t2 ON t.id = t2.id ORDER BY t.id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("small".into()));
+        assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Text("big".into()));
+    }
+
+    #[test]
+    fn test_scalar_fn_replace_substr_instr() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'hello world')")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT replace(t.s, 'world', 'earth'), \
+                        substr(t.s, 7), \
+                        instr(t.s, 'world') \
+                 FROM t JOIN t AS t2 ON t.id = t2.id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Text("hello earth".into())
+        );
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("world".into()));
+        assert_eq!(rows[0].get(2).unwrap(), &SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn test_scalar_fn_trim_variants() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '  hello  ')")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT trim(t.s), ltrim(t.s), rtrim(t.s) \
+                 FROM t JOIN t AS t2 ON t.id = t2.id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("hello".into()));
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &SqliteValue::Text("hello  ".into())
+        );
+        assert_eq!(
+            rows[0].get(2).unwrap(),
+            &SqliteValue::Text("  hello".into())
+        );
+    }
+
+    #[test]
+    fn test_scalar_fn_concat_hex_quote() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'foo', 'bar')")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT concat(t.a, t.b), hex(t.a), quote(t.a) \
+                 FROM t JOIN t AS t2 ON t.id = t2.id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("foobar".into()));
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("666F6F".into()));
+        assert_eq!(rows[0].get(2).unwrap(), &SqliteValue::Text("'foo'".into()));
+    }
+
+    #[test]
+    fn test_scalar_fn_round_sign() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 2.71828)").unwrap();
+        let rows = conn
+            .query(
+                "SELECT round(t.val, 2), sign(t.val) \
+                 FROM t JOIN t AS t2 ON t.id = t2.id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Float(2.72));
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Integer(1));
     }
 }

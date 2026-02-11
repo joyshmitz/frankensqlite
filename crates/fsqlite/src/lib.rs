@@ -1616,4 +1616,438 @@ mod tests {
         conn.execute("COMMIT;").unwrap();
         assert!(!conn.in_transaction());
     }
+
+    // ── Probe tests for SQL feature coverage ─────────────────────
+
+    #[test]
+    fn probe_update_self_ref_expr() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20);").unwrap();
+        conn.execute("UPDATE t SET val = val + 5;").unwrap();
+        let rows = conn.query("SELECT id, val FROM t ORDER BY id;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(15)]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Integer(25)]
+        );
+    }
+
+    #[test]
+    fn probe_delete_compound_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'c');").unwrap();
+        conn.execute("DELETE FROM t WHERE id > 1 AND val = 'b';")
+            .unwrap();
+        let rows = conn.query("SELECT id FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn probe_coalesce_nulls() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, NULL, 'fallback');")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'present', 'fallback');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, COALESCE(a, b) FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("fallback".to_owned())
+        );
+        assert_eq!(
+            row_values(&rows[1])[1],
+            SqliteValue::Text("present".to_owned())
+        );
+    }
+
+    #[test]
+    fn probe_case_when_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, NULL);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 5);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 15);").unwrap();
+        let rows = conn
+            .query(
+                "SELECT id, CASE WHEN val IS NULL THEN 'null' WHEN val < 10 THEN 'small' ELSE 'big' END FROM t ORDER BY id;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("null".to_owned())
+        );
+        assert_eq!(
+            row_values(&rows[1])[1],
+            SqliteValue::Text("small".to_owned())
+        );
+        assert_eq!(row_values(&rows[2])[1], SqliteValue::Text("big".to_owned()));
+    }
+
+    #[test]
+    fn probe_union_all() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2, 'b');").unwrap();
+        let rows = conn
+            .query("SELECT val FROM t1 UNION ALL SELECT val FROM t2;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn probe_union_dedup() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'b');").unwrap();
+        let rows = conn
+            .query("SELECT val FROM t UNION SELECT val FROM t;")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "UNION should deduplicate: got {:?}",
+            rows.iter().map(row_values).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn probe_except() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'c');").unwrap();
+        let rows = conn
+            .query("SELECT val FROM t EXCEPT SELECT val FROM t WHERE id = 2;")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "EXCEPT should remove 'b': got {:?}",
+            rows.iter().map(row_values).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn probe_intersect() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'c');").unwrap();
+        let rows = conn
+            .query("SELECT val FROM t INTERSECT SELECT val FROM t WHERE id <= 2;")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "INTERSECT should keep 'a' and 'b': got {:?}",
+            rows.iter().map(row_values).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn probe_insert_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO dst SELECT * FROM src;").unwrap();
+        let rows = conn.query("SELECT id, val FROM dst ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("a".to_owned()));
+    }
+
+    #[test]
+    fn probe_limit_offset() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        for i in 1..=10 {
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'v{i}');"))
+                .unwrap();
+        }
+        let rows = conn
+            .query("SELECT id FROM t ORDER BY id LIMIT 3 OFFSET 2;")
+            .unwrap();
+        assert_eq!(rows.len(), 3, "LIMIT 3 OFFSET 2 should return 3 rows");
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(3));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(4));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Integer(5));
+    }
+
+    #[test]
+    fn probe_group_by_multi_col() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, sub TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'A', 'x', 10);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'A', 'x', 20);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'A', 'y', 30);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 'B', 'x', 40);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT cat, sub, SUM(val) FROM t GROUP BY cat, sub ORDER BY cat, sub;")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "Should have 3 groups: got {:?}",
+            rows.iter().map(row_values).collect::<Vec<_>>()
+        );
+        assert_eq!(row_values(&rows[0])[2], SqliteValue::Integer(30));
+        assert_eq!(row_values(&rows[1])[2], SqliteValue::Integer(30));
+        assert_eq!(row_values(&rows[2])[2], SqliteValue::Integer(40));
+    }
+
+    #[test]
+    fn probe_having_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'A', 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'A', 20);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'B', 30);").unwrap();
+        let rows = conn
+            .query("SELECT cat, COUNT(*) as cnt FROM t GROUP BY cat HAVING cnt > 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "Only group A has count > 1");
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("A".to_owned()));
+    }
+
+    #[test]
+    fn probe_nested_functions() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '  hello  ');")
+            .unwrap();
+        let rows = conn.query("SELECT UPPER(TRIM(val)) FROM t;").unwrap();
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("HELLO".to_owned())
+        );
+    }
+
+    #[test]
+    fn probe_update_where_column_cmp() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5, 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 15, 10);").unwrap();
+        conn.execute("UPDATE t SET a = a * 2 WHERE a < b;").unwrap();
+        let rows = conn.query("SELECT id, a FROM t ORDER BY id;").unwrap();
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(10));
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Integer(15));
+    }
+
+    #[test]
+    fn probe_nullif() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'skip');").unwrap();
+        let rows = conn
+            .query("SELECT id, NULLIF(val, 'skip') FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Null);
+    }
+
+    #[test]
+    fn probe_iif() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 15);").unwrap();
+        let rows = conn
+            .query("SELECT id, IIF(val > 10, 'big', 'small') FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("small".to_owned())
+        );
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Text("big".to_owned()));
+    }
+
+    #[test]
+    fn probe_select_distinct() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 'b');").unwrap();
+        conn.execute("INSERT INTO t VALUES (5, 'c');").unwrap();
+        let rows = conn
+            .query("SELECT DISTINCT val FROM t ORDER BY val;")
+            .unwrap();
+        assert_eq!(rows.len(), 3, "DISTINCT should return 3 unique values");
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Text("c".to_owned()));
+    }
+
+    #[test]
+    fn probe_order_by_desc() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 30);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 20);").unwrap();
+        let rows = conn
+            .query("SELECT id, val FROM t ORDER BY val DESC;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(3));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn probe_insert_or_replace() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'old');").unwrap();
+        conn.execute("INSERT OR REPLACE INTO t VALUES (1, 'new');")
+            .unwrap();
+        let rows = conn.query("SELECT id, val FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("new".to_owned()));
+    }
+
+    #[test]
+    fn probe_insert_or_ignore() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'first');").unwrap();
+        conn.execute("INSERT OR IGNORE INTO t VALUES (1, 'second');")
+            .unwrap();
+        let rows = conn.query("SELECT id, val FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("first".to_owned())
+        );
+    }
+
+    #[test]
+    fn probe_between() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        for i in 1..=10 {
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, {i});"))
+                .unwrap();
+        }
+        let rows = conn
+            .query("SELECT val FROM t WHERE val BETWEEN 3 AND 7 ORDER BY val;")
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(3));
+        assert_eq!(row_values(&rows[4])[0], SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn probe_in_list() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'c');").unwrap();
+        let rows = conn
+            .query("SELECT id FROM t WHERE val IN ('a', 'c') ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn probe_like_pattern() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'Alice');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'Bob');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'Charlie');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT name FROM t WHERE name LIKE '%li%' ORDER BY name;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("Alice".to_owned())
+        );
+        assert_eq!(
+            row_values(&rows[1])[0],
+            SqliteValue::Text("Charlie".to_owned())
+        );
+    }
+
+    #[test]
+    fn probe_subquery_in_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, t1_id INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'c');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2, 3);").unwrap();
+        // This may not be supported - check if it errors gracefully
+        let result =
+            conn.query("SELECT val FROM t1 WHERE id IN (SELECT t1_id FROM t2) ORDER BY val;");
+        if let Ok(rows) = result {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("a".to_owned()));
+            assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("c".to_owned()));
+        } else {
+            // IN subquery not yet supported — that's fine for now
+        }
+    }
 }
