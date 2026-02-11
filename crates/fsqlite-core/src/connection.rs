@@ -2642,7 +2642,13 @@ impl Connection {
         let mut temp_names: Vec<String> = Vec::with_capacity(ctes.len());
         for cte in ctes {
             let cte_name = &cte.name;
-            let has_self_ref = is_recursive && !cte.query.body.compounds.is_empty();
+            let has_self_ref = is_recursive
+                && cte
+                    .query
+                    .body
+                    .compounds
+                    .iter()
+                    .any(|(_, core)| select_core_references_table(core, cte_name));
 
             if has_self_ref {
                 self.materialize_recursive_cte(cte, params, &mut temp_names)?;
@@ -2710,13 +2716,14 @@ impl Connection {
     }
 
     /// Materialize a recursive CTE by iterating until no new rows are produced.
-    #[allow(clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_wrap, clippy::too_many_lines)]
     fn materialize_recursive_cte(
         &self,
         cte: &fsqlite_ast::Cte,
         params: Option<&[SqliteValue]>,
         temp_names: &mut Vec<String>,
     ) -> Result<()> {
+        const MAX_RECURSION: usize = 1000;
         let cte_name = &cte.name;
         let col_names: Vec<String> = if cte.columns.is_empty() {
             let inferred = infer_select_column_names(&cte.query);
@@ -2759,10 +2766,18 @@ impl Connection {
         let base_rows = self.execute_statement(Statement::Select(base_select), params)?;
         let mut all_rows: Vec<Vec<SqliteValue>> =
             base_rows.iter().map(|r| r.values().to_vec()).collect();
+        if cte
+            .query
+            .body
+            .compounds
+            .iter()
+            .any(|(op, _)| matches!(op, CompoundOp::Union))
+        {
+            dedup_value_rows(&mut all_rows);
+        }
         let mut working_set: Vec<Vec<SqliteValue>> = all_rows.clone();
 
         // Iterate: feed working set to recursive arm, collect new rows.
-        const MAX_RECURSION: usize = 1000;
         for _ in 0..MAX_RECURSION {
             if working_set.is_empty() {
                 break;
@@ -2779,7 +2794,12 @@ impl Connection {
             }
             // Execute each recursive arm.
             let mut new_rows: Vec<Vec<SqliteValue>> = Vec::new();
-            for (_op, recursive_core) in &cte.query.body.compounds {
+            for (op, recursive_core) in &cte.query.body.compounds {
+                if matches!(op, CompoundOp::Intersect | CompoundOp::Except) {
+                    return Err(FrankenError::NotImplemented(
+                        "recursive CTE supports only UNION and UNION ALL".to_owned(),
+                    ));
+                }
                 let arm_select = SelectStatement {
                     with: None,
                     body: SelectBody {
@@ -2789,10 +2809,20 @@ impl Connection {
                     order_by: vec![],
                     limit: None,
                 };
-                let arm_rows =
-                    self.execute_statement(Statement::Select(arm_select), params)?;
+                let arm_rows = self.execute_statement(Statement::Select(arm_select), params)?;
                 for row in &arm_rows {
-                    new_rows.push(row.values().to_vec());
+                    let vals = row.values().to_vec();
+                    match op {
+                        CompoundOp::UnionAll => new_rows.push(vals),
+                        CompoundOp::Union => {
+                            if !contains_value_row(&all_rows, &vals)
+                                && !contains_value_row(&new_rows, &vals)
+                            {
+                                new_rows.push(vals);
+                            }
+                        }
+                        CompoundOp::Intersect | CompoundOp::Except => unreachable!(),
+                    }
                 }
             }
             if new_rows.is_empty() {
@@ -3214,6 +3244,24 @@ fn dedup_rows(rows: &mut Vec<Row>) {
     });
 }
 
+/// Check whether a candidate row already exists in a set of value rows.
+fn contains_value_row(rows: &[Vec<SqliteValue>], candidate: &[SqliteValue]) -> bool {
+    rows.iter().any(|row| row == candidate)
+}
+
+/// Remove duplicate value rows while preserving first-seen order.
+fn dedup_value_rows(rows: &mut Vec<Vec<SqliteValue>>) {
+    let mut seen: Vec<Vec<SqliteValue>> = Vec::with_capacity(rows.len());
+    rows.retain(|row| {
+        if contains_value_row(&seen, row) {
+            false
+        } else {
+            seen.push(row.clone());
+            true
+        }
+    });
+}
+
 /// Apply a LIMIT/OFFSET clause to a post-processed row vector.
 ///
 /// Used when DISTINCT + LIMIT interact: DISTINCT must run on all rows first,
@@ -3287,6 +3335,42 @@ fn has_subquery_source(select: &SelectStatement) -> bool {
         }
     }
     false
+}
+
+/// Check whether a `SelectCore` references a named table/CTE in any FROM source.
+fn select_core_references_table(core: &SelectCore, table_name: &str) -> bool {
+    match core {
+        SelectCore::Select {
+            from: Some(from), ..
+        } => from_clause_references_table(from, table_name),
+        SelectCore::Select { from: None, .. } | SelectCore::Values(_) => false,
+    }
+}
+
+fn from_clause_references_table(from: &fsqlite_ast::FromClause, table_name: &str) -> bool {
+    table_or_subquery_references_table(&from.source, table_name)
+        || from
+            .joins
+            .iter()
+            .any(|join| table_or_subquery_references_table(&join.table, table_name))
+}
+
+fn table_or_subquery_references_table(table: &TableOrSubquery, table_name: &str) -> bool {
+    match table {
+        TableOrSubquery::Table { name, .. } => name.name.eq_ignore_ascii_case(table_name),
+        TableOrSubquery::Subquery { query, .. } => select_references_table(query, table_name),
+        TableOrSubquery::ParenJoin(from) => from_clause_references_table(from, table_name),
+        TableOrSubquery::TableFunction { .. } => false,
+    }
+}
+
+fn select_references_table(select: &SelectStatement, table_name: &str) -> bool {
+    select_core_references_table(&select.body.select, table_name)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| select_core_references_table(core, table_name))
 }
 
 /// Infer column names from a SELECT statement's result columns.
@@ -11541,11 +11625,8 @@ mod transaction_lifecycle_tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 5);
-        for (i, row) in rows.iter().enumerate() {
-            assert_eq!(
-                row.get(0).unwrap(),
-                &SqliteValue::Integer(i as i64 + 1)
-            );
+        for (row, expected) in rows.iter().zip(1_i64..=5_i64) {
+            assert_eq!(row.get(0).unwrap(), &SqliteValue::Integer(expected));
         }
     }
 
@@ -11566,5 +11647,38 @@ mod transaction_lifecycle_tests {
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
         assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(1));
         assert_eq!(rows[11].get(0).unwrap(), &SqliteValue::Integer(89));
+    }
+
+    #[test]
+    fn test_recursive_cte_union_deduplicates_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(
+                "WITH RECURSIVE t(x) AS (\
+                   SELECT 1 \
+                   UNION \
+                   SELECT x FROM t WHERE x < 3\
+                 ) SELECT x FROM t",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_recursive_keyword_without_self_reference_is_not_iterative() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(
+                "WITH RECURSIVE t(x) AS (\
+                   SELECT 1 \
+                   UNION ALL \
+                   SELECT 2\
+                 ) SELECT x FROM t ORDER BY x",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
+        assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(2));
     }
 }

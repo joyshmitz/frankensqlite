@@ -4120,6 +4120,26 @@ mod tests {
         true
     }
 
+    fn schema_with_ipk_alias() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "a".to_owned(),
+                    affinity: 'd',
+                    is_ipk: true,
+                },
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'C',
+                    is_ipk: false,
+                },
+            ],
+            indexes: vec![],
+        }]
+    }
+
     // === Test 1: SELECT by rowid ===
     #[test]
     fn test_codegen_select_by_rowid() {
@@ -4151,6 +4171,46 @@ mod tests {
             .find(|op| op.opcode == Opcode::Transaction)
             .unwrap();
         assert_eq!(txn.p2, 0);
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_column_uses_rowid_opcode() {
+        let stmt = simple_select(&["a"], "t", None);
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(
+            ops.contains(&Opcode::Rowid),
+            "IPK column projection should read rowid"
+        );
+        assert!(
+            !ops.contains(&Opcode::Column),
+            "single IPK projection should not read record columns"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_star_uses_rowid_for_ipk_column() {
+        let stmt = star_select("t");
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Rewind,
+                Opcode::Rowid,
+                Opcode::Column,
+                Opcode::ResultRow
+            ]
+        ));
     }
 
     // === Test 2: INSERT VALUES ===
