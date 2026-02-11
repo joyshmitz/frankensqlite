@@ -3684,6 +3684,107 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_select_projection_rowid_aliases() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t3 (x TEXT);").unwrap();
+        conn.execute("INSERT INTO t3 VALUES ('c');").unwrap();
+        conn.execute("INSERT INTO t3 VALUES ('a');").unwrap();
+        conn.execute("INSERT INTO t3 VALUES ('b');").unwrap();
+
+        let rows = conn
+            .query("SELECT rowid, _rowid_, oid, x FROM t3 ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("c".to_owned()),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(2),
+                SqliteValue::Text("a".to_owned()),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(3),
+                SqliteValue::Text("b".to_owned()),
+            ]
+        );
+
+        let rows = conn
+            .query("SELECT rowid + 10, _rowid_ + 10, oid + 10 FROM t3 ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(11),
+                SqliteValue::Integer(11),
+                SqliteValue::Integer(11),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(12),
+                SqliteValue::Integer(12),
+                SqliteValue::Integer(12),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![
+                SqliteValue::Integer(13),
+                SqliteValue::Integer(13),
+                SqliteValue::Integer(13),
+            ]
+        );
+
+        // Qualified references via table alias should resolve rowid aliases.
+        let rows = conn
+            .query("SELECT tt.rowid, tt._rowid_, tt.oid FROM t3 AS tt ORDER BY tt.rowid;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(2),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(3),
+                SqliteValue::Integer(3),
+            ]
+        );
+    }
+
     // ── Function registry wiring tests ──────────────────────────────────
 
     #[test]

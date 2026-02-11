@@ -161,8 +161,8 @@ pub fn codegen_select(
         .as_ref()
         .ok_or_else(|| CodegenError::Unsupported("SELECT without FROM".to_owned()))?;
 
-    let table_name = match &from_clause.source {
-        fsqlite_ast::TableOrSubquery::Table { name, .. } => &name.name,
+    let (table_name, table_alias) = match &from_clause.source {
+        fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
         _ => {
             return Err(CodegenError::Unsupported(
                 "non-table FROM source".to_owned(),
@@ -218,7 +218,7 @@ pub fn codegen_select(
         );
 
         // Read columns.
-        emit_column_reads(b, cursor, columns, table, out_regs)?;
+        emit_column_reads(b, cursor, columns, table, table_alias, out_regs)?;
 
         // ResultRow.
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -251,7 +251,7 @@ pub fn codegen_select(
             b.emit_op(Opcode::SeekRowid, cursor, 0, rowid_reg, P4::None, 0);
 
             // Read columns.
-            emit_column_reads(b, cursor, columns, table, out_regs)?;
+            emit_column_reads(b, cursor, columns, table, table_alias, out_regs)?;
 
             // ResultRow.
             b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -261,6 +261,7 @@ pub fn codegen_select(
                 b,
                 cursor,
                 table,
+                table_alias,
                 columns,
                 where_clause.as_deref(),
                 stmt.limit.as_ref(),
@@ -276,6 +277,7 @@ pub fn codegen_select(
             b,
             cursor,
             table,
+            table_alias,
             columns,
             where_clause.as_deref(),
             group_by,
@@ -290,6 +292,7 @@ pub fn codegen_select(
             b,
             cursor,
             table,
+            table_alias,
             columns,
             where_clause.as_deref(),
             out_regs,
@@ -303,6 +306,7 @@ pub fn codegen_select(
             b,
             cursor,
             table,
+            table_alias,
             columns,
             where_clause.as_deref(),
             &stmt.order_by,
@@ -318,6 +322,7 @@ pub fn codegen_select(
             b,
             cursor,
             table,
+            table_alias,
             columns,
             where_clause.as_deref(),
             stmt.limit.as_ref(),
@@ -345,6 +350,7 @@ fn codegen_select_full_scan(
     b: &mut ProgramBuilder,
     cursor: i32,
     table: &TableSchema,
+    table_alias: Option<&str>,
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     limit_clause: Option<&LimitClause>,
@@ -383,7 +389,7 @@ fn codegen_select_full_scan(
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
     }
 
     // OFFSET: if offset counter > 0, decrement by 1 and skip this row.
@@ -392,7 +398,7 @@ fn codegen_select_full_scan(
     }
 
     // Read columns.
-    emit_column_reads(b, cursor, columns, table, out_regs)?;
+    emit_column_reads(b, cursor, columns, table, table_alias, out_regs)?;
 
     // ResultRow.
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -461,6 +467,7 @@ fn codegen_select_ordered_scan(
     b: &mut ProgramBuilder,
     cursor: i32,
     table: &TableSchema,
+    table_alias: Option<&str>,
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     order_by: &[OrderingTerm],
@@ -474,7 +481,7 @@ fn codegen_select_ordered_scan(
     let sort_keys: Vec<SortKeySource> = order_by
         .iter()
         .map(|term| {
-            resolve_sort_key(&term.expr, table).ok_or_else(|| {
+            resolve_sort_key(&term.expr, table, table_alias).ok_or_else(|| {
                 CodegenError::Unsupported("non-column ORDER BY expression".to_owned())
             })
         })
@@ -528,7 +535,7 @@ fn codegen_select_ordered_scan(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
     }
 
     // Read sort-key columns + data columns into consecutive registers.
@@ -557,6 +564,7 @@ fn codegen_select_ordered_scan(
             cursor,
             columns,
             table,
+            table_alias,
             sorter_base + num_sort_keys as i32,
         )?;
     }
@@ -756,6 +764,7 @@ fn codegen_select_aggregate(
     b: &mut ProgramBuilder,
     cursor: i32,
     table: &TableSchema,
+    table_alias: Option<&str>,
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     out_regs: i32,
@@ -792,7 +801,7 @@ fn codegen_select_aggregate(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
     }
 
     // AggStep for each aggregate column.
@@ -1054,6 +1063,7 @@ fn codegen_select_group_by_aggregate(
     b: &mut ProgramBuilder,
     cursor: i32,
     table: &TableSchema,
+    table_alias: Option<&str>,
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     group_by: &[Expr],
@@ -1128,7 +1138,7 @@ fn codegen_select_group_by_aggregate(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
     }
 
     // Read group-key columns + agg-arg columns into consecutive registers.
@@ -1612,7 +1622,7 @@ pub fn codegen_update(
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
     if let Some(where_expr) = &stmt.where_clause {
-        emit_where_filter(b, where_expr, cursor, table, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, None, skip_label);
     }
 
     // Read ALL existing columns into registers.
@@ -1731,7 +1741,7 @@ pub fn codegen_delete(
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
     if let Some(where_expr) = &stmt.where_clause {
-        emit_where_filter(b, where_expr, cursor, table, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, None, skip_label);
     }
 
     // Delete at cursor position.
@@ -1789,6 +1799,7 @@ fn emit_column_reads(
     cursor: i32,
     columns: &[ResultColumn],
     table: &TableSchema,
+    table_alias: Option<&str>,
     base_reg: i32,
 ) -> Result<(), CodegenError> {
     let mut reg = base_reg;
@@ -1801,7 +1812,7 @@ fn emit_column_reads(
                 }
             }
             ResultColumn::TableStar(qualifier) => {
-                if !qualifier.eq_ignore_ascii_case(&table.name) {
+                if !matches_table_or_alias(qualifier, table, table_alias) {
                     return Err(CodegenError::TableNotFound(qualifier.clone()));
                 }
                 for i in 0..table.columns.len() {
@@ -1812,21 +1823,29 @@ fn emit_column_reads(
             ResultColumn::Expr { expr, .. } => {
                 if let Expr::Column(col_ref, _) = expr {
                     if let Some(qualifier) = &col_ref.table {
-                        if !qualifier.eq_ignore_ascii_case(&table.name) {
+                        if !matches_table_or_alias(qualifier, table, table_alias) {
                             return Err(CodegenError::TableNotFound(qualifier.clone()));
                         }
                     }
-                    let col_idx = table.column_index(&col_ref.column).ok_or_else(|| {
-                        CodegenError::ColumnNotFound {
-                            table: table.name.clone(),
-                            column: col_ref.column.clone(),
-                        }
-                    })?;
-                    b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+                    if is_rowid_alias(&col_ref.column) {
+                        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                    } else {
+                        let col_idx = table.column_index(&col_ref.column).ok_or_else(|| {
+                            CodegenError::ColumnNotFound {
+                                table: table.name.clone(),
+                                column: col_ref.column.clone(),
+                            }
+                        })?;
+                        b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+                    }
                 } else {
                     // Evaluate non-column expressions (literals, arithmetic, CASE, CAST, etc.)
                     // against the current scan row.
-                    let scan = ScanCtx { cursor, table };
+                    let scan = ScanCtx {
+                        cursor,
+                        table,
+                        table_alias,
+                    };
                     emit_expr(b, expr, reg, Some(&scan));
                 }
                 reg += 1;
@@ -1849,6 +1868,7 @@ fn emit_where_filter(
     where_expr: &Expr,
     cursor: i32,
     table: &TableSchema,
+    table_alias: Option<&str>,
     skip_label: crate::Label,
 ) {
     match where_expr {
@@ -1885,12 +1905,16 @@ fn emit_where_filter(
             ..
         } => {
             // AND: both conditions must pass.
-            emit_where_filter(b, left, cursor, table, skip_label);
-            emit_where_filter(b, right, cursor, table, skip_label);
+            emit_where_filter(b, left, cursor, table, table_alias, skip_label);
+            emit_where_filter(b, right, cursor, table, table_alias, skip_label);
         }
         _ => {
             // Generic WHERE: evaluate expression with cursor context and test truthiness.
-            let scan = ScanCtx { cursor, table };
+            let scan = ScanCtx {
+                cursor,
+                table,
+                table_alias,
+            };
             let cond_reg = b.alloc_temp();
             emit_expr(b, where_expr, cond_reg, Some(&scan));
             b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
@@ -1905,6 +1929,11 @@ fn is_rowid_alias(name: &str) -> bool {
     lower == "rowid" || lower == "_rowid_" || lower == "oid"
 }
 
+fn matches_table_or_alias(qualifier: &str, table: &TableSchema, table_alias: Option<&str>) -> bool {
+    qualifier.eq_ignore_ascii_case(&table.name)
+        || table_alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+}
+
 /// Source for a sort key: either a table column or the implicit rowid.
 enum SortKeySource {
     Column(usize),
@@ -1912,12 +1941,21 @@ enum SortKeySource {
 }
 
 /// Resolve a column reference to a `SortKeySource` (column index or rowid).
-fn resolve_sort_key(expr: &Expr, table: &TableSchema) -> Option<SortKeySource> {
+fn resolve_sort_key(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<SortKeySource> {
     if let Expr::Column(col_ref, _) = expr {
+        if let Some(qualifier) = &col_ref.table
+            && !matches_table_or_alias(qualifier, table, table_alias)
+        {
+            return None;
+        }
         if let Some(idx) = table.column_index(&col_ref.column) {
             return Some(SortKeySource::Column(idx));
         }
-        if col_ref.table.is_none() && is_rowid_alias(&col_ref.column) {
+        if is_rowid_alias(&col_ref.column) {
             return Some(SortKeySource::Rowid);
         }
     }
@@ -2077,6 +2115,7 @@ fn bind_param_index(expr: &Expr) -> Option<i32> {
 struct ScanCtx<'a> {
     cursor: i32,
     table: &'a TableSchema,
+    table_alias: Option<&'a str>,
 }
 
 /// Handles literals, bind parameters, binary/unary operators, CASE, CAST,
@@ -2311,7 +2350,15 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
         }
         Expr::Column(col_ref, _) if ctx.is_some() => {
             let sc = ctx.unwrap();
-            if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
+            if let Some(qualifier) = &col_ref.table {
+                if !matches_table_or_alias(qualifier, sc.table, sc.table_alias) {
+                    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                    return;
+                }
+            }
+            if is_rowid_alias(&col_ref.column) {
+                b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
+            } else if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
             } else {
