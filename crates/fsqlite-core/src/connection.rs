@@ -2630,57 +2630,62 @@ impl Connection {
 
     /// Materialize CTEs as temporary in-memory tables, execute the main query
     /// with `with` stripped, then clean up the temporary tables.
+    #[allow(clippy::too_many_lines)]
     fn execute_with_ctes(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let ctes = select.with.as_ref().map_or(&[][..], |w| w.ctes.as_slice());
+        let with_clause = select.with.as_ref().unwrap();
+        let is_recursive = with_clause.recursive;
+        let ctes = &with_clause.ctes;
         let mut temp_names: Vec<String> = Vec::with_capacity(ctes.len());
         for cte in ctes {
             let cte_name = &cte.name;
-            // Execute the CTE body query to get its result rows.
-            let cte_rows = self.execute_statement(Statement::Select(cte.query.clone()), params)?;
-            // Determine column definitions from the CTE.
-            let col_names: Vec<String> = if cte.columns.is_empty() {
-                // Infer column names from the CTE query's SELECT columns.
-                let inferred = infer_select_column_names(&cte.query);
-                if inferred.is_empty() {
-                    // Fallback: generate numbered names from result width.
-                    let width = cte_rows.first().map_or(1, |r| r.values().len());
-                    (0..width).map(|i| format!("_c{i}")).collect()
-                } else {
-                    inferred
-                }
+            let has_self_ref = is_recursive && !cte.query.body.compounds.is_empty();
+
+            if has_self_ref {
+                self.materialize_recursive_cte(cte, params, &mut temp_names)?;
             } else {
-                cte.columns.clone()
-            };
-            // Create the temporary table via direct schema manipulation.
-            let col_infos: Vec<ColumnInfo> = col_names
-                .iter()
-                .map(|name| ColumnInfo {
-                    name: name.clone(),
-                    affinity: 'B', // BLOB affinity (no type coercion)
-                    is_ipk: false,
-                })
-                .collect();
-            let num_columns = col_infos.len();
-            let root_page = self.db.borrow_mut().create_table(num_columns);
-            self.schema.borrow_mut().push(TableSchema {
-                name: cte_name.clone(),
-                root_page,
-                columns: col_infos,
-                indexes: Vec::new(),
-            });
-            temp_names.push(cte_name.clone());
-            // Insert the CTE result rows into the temporary table.
-            for (i, row) in cte_rows.iter().enumerate() {
-                let vals: Vec<SqliteValue> = row.values().to_vec();
-                #[allow(clippy::cast_possible_wrap)]
-                let rowid = (i + 1) as i64;
-                let mut db = self.db.borrow_mut();
-                if let Some(table) = db.get_table_mut(root_page) {
-                    table.insert_row(rowid, vals);
+                // Non-recursive CTE: execute body, then create table.
+                let cte_rows =
+                    self.execute_statement(Statement::Select(cte.query.clone()), params)?;
+                let col_names: Vec<String> = if cte.columns.is_empty() {
+                    let inferred = infer_select_column_names(&cte.query);
+                    if inferred.is_empty() {
+                        let width = cte_rows.first().map_or(1, |r| r.values().len());
+                        (0..width).map(|i| format!("_c{i}")).collect()
+                    } else {
+                        inferred
+                    }
+                } else {
+                    cte.columns.clone()
+                };
+                let col_infos: Vec<ColumnInfo> = col_names
+                    .iter()
+                    .map(|name| ColumnInfo {
+                        name: name.clone(),
+                        affinity: 'B',
+                        is_ipk: false,
+                    })
+                    .collect();
+                let num_columns = col_infos.len();
+                let root_page = self.db.borrow_mut().create_table(num_columns);
+                self.schema.borrow_mut().push(TableSchema {
+                    name: cte_name.clone(),
+                    root_page,
+                    columns: col_infos,
+                    indexes: Vec::new(),
+                });
+                temp_names.push(cte_name.clone());
+                for (i, row) in cte_rows.iter().enumerate() {
+                    let vals: Vec<SqliteValue> = row.values().to_vec();
+                    #[allow(clippy::cast_possible_wrap)]
+                    let rowid = (i + 1) as i64;
+                    let mut db = self.db.borrow_mut();
+                    if let Some(table) = db.get_table_mut(root_page) {
+                        table.insert_row(rowid, vals);
+                    }
                 }
             }
         }
@@ -2702,6 +2707,112 @@ impl Connection {
             }
         }
         result
+    }
+
+    /// Materialize a recursive CTE by iterating until no new rows are produced.
+    #[allow(clippy::cast_possible_wrap)]
+    fn materialize_recursive_cte(
+        &self,
+        cte: &fsqlite_ast::Cte,
+        params: Option<&[SqliteValue]>,
+        temp_names: &mut Vec<String>,
+    ) -> Result<()> {
+        let cte_name = &cte.name;
+        let col_names: Vec<String> = if cte.columns.is_empty() {
+            let inferred = infer_select_column_names(&cte.query);
+            if inferred.is_empty() {
+                vec!["_c0".to_owned()]
+            } else {
+                inferred
+            }
+        } else {
+            cte.columns.clone()
+        };
+        let col_infos: Vec<ColumnInfo> = col_names
+            .iter()
+            .map(|name| ColumnInfo {
+                name: name.clone(),
+                affinity: 'B',
+                is_ipk: false,
+            })
+            .collect();
+        let num_columns = col_infos.len();
+        let root_page = self.db.borrow_mut().create_table(num_columns);
+        self.schema.borrow_mut().push(TableSchema {
+            name: cte_name.clone(),
+            root_page,
+            columns: col_infos,
+            indexes: Vec::new(),
+        });
+        temp_names.push(cte_name.clone());
+
+        // Execute the base case (first SELECT core only).
+        let base_select = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: cte.query.body.select.clone(),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let base_rows = self.execute_statement(Statement::Select(base_select), params)?;
+        let mut all_rows: Vec<Vec<SqliteValue>> =
+            base_rows.iter().map(|r| r.values().to_vec()).collect();
+        let mut working_set: Vec<Vec<SqliteValue>> = all_rows.clone();
+
+        // Iterate: feed working set to recursive arm, collect new rows.
+        const MAX_RECURSION: usize = 1000;
+        for _ in 0..MAX_RECURSION {
+            if working_set.is_empty() {
+                break;
+            }
+            // Put only the working set in the temp table.
+            {
+                let mut db = self.db.borrow_mut();
+                if let Some(table) = db.get_table_mut(root_page) {
+                    table.clear();
+                    for (i, vals) in working_set.iter().enumerate() {
+                        table.insert_row(i as i64 + 1, vals.clone());
+                    }
+                }
+            }
+            // Execute each recursive arm.
+            let mut new_rows: Vec<Vec<SqliteValue>> = Vec::new();
+            for (_op, recursive_core) in &cte.query.body.compounds {
+                let arm_select = SelectStatement {
+                    with: None,
+                    body: SelectBody {
+                        select: recursive_core.clone(),
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                };
+                let arm_rows =
+                    self.execute_statement(Statement::Select(arm_select), params)?;
+                for row in &arm_rows {
+                    new_rows.push(row.values().to_vec());
+                }
+            }
+            if new_rows.is_empty() {
+                break;
+            }
+            all_rows.extend(new_rows.iter().cloned());
+            working_set = new_rows;
+        }
+
+        // Final: populate temp table with ALL accumulated rows.
+        {
+            let mut db = self.db.borrow_mut();
+            if let Some(table) = db.get_table_mut(root_page) {
+                table.clear();
+                for (i, vals) in all_rows.iter().enumerate() {
+                    table.insert_row(i as i64 + 1, vals.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Pre-process a SELECT statement, eagerly evaluating EXISTS and scalar
@@ -11415,5 +11526,45 @@ mod transaction_lifecycle_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_recursive_cte_sequence() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(
+                "WITH RECURSIVE cnt(x) AS (\
+                   SELECT 1 \
+                   UNION ALL \
+                   SELECT x+1 FROM cnt WHERE x<5\
+                 ) SELECT x FROM cnt",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.get(0).unwrap(),
+                &SqliteValue::Integer(i as i64 + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn test_recursive_cte_fibonacci() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(
+                "WITH RECURSIVE fib(a, b) AS (\
+                   SELECT 0, 1 \
+                   UNION ALL \
+                   SELECT b, a+b FROM fib WHERE b < 100\
+                 ) SELECT a FROM fib",
+            )
+            .unwrap();
+        // Fibonacci: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89
+        assert_eq!(rows.len(), 12);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+        assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(1));
+        assert_eq!(rows[11].get(0).unwrap(), &SqliteValue::Integer(89));
     }
 }

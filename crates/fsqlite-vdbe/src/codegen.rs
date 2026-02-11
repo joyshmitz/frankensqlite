@@ -3625,7 +3625,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
             } else if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
+                if sc.table.columns[col_idx].is_ipk {
+                    b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
+                }
             } else {
                 // Unknown column — emit Null.
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
@@ -3903,10 +3907,12 @@ mod tests {
                 ColumnInfo {
                     name: "a".to_owned(),
                     affinity: 'd',
+                    is_ipk: false,
                 },
                 ColumnInfo {
                     name: "b".to_owned(),
                     affinity: 'C',
+                    is_ipk: false,
                 },
             ],
             indexes: vec![],
@@ -3921,10 +3927,12 @@ mod tests {
                 ColumnInfo {
                     name: "a".to_owned(),
                     affinity: 'd',
+                    is_ipk: false,
                 },
                 ColumnInfo {
                     name: "b".to_owned(),
                     affinity: 'C',
+                    is_ipk: false,
                 },
             ],
             indexes: vec![IndexSchema {
@@ -3944,10 +3952,12 @@ mod tests {
                     ColumnInfo {
                         name: "a".to_owned(),
                         affinity: 'd',
+                        is_ipk: false,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
                         affinity: 'C',
+                        is_ipk: false,
                     },
                 ],
                 indexes: vec![],
@@ -3958,6 +3968,7 @@ mod tests {
                 columns: vec![ColumnInfo {
                     name: "b".to_owned(),
                     affinity: 'd',
+                    is_ipk: false,
                 }],
                 indexes: vec![],
             },
@@ -4259,10 +4270,12 @@ mod tests {
                     ColumnInfo {
                         name: "a".to_owned(),
                         affinity: 'd',
+                        is_ipk: false,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
                         affinity: 'C',
+                        is_ipk: false,
                     },
                 ],
                 indexes: vec![],
@@ -4274,10 +4287,12 @@ mod tests {
                     ColumnInfo {
                         name: "x".to_owned(),
                         affinity: 'd',
+                        is_ipk: false,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
                         affinity: 'C',
+                        is_ipk: false,
                     },
                 ],
                 indexes: vec![],
@@ -4386,10 +4401,12 @@ mod tests {
                     ColumnInfo {
                         name: "a".to_owned(),
                         affinity: 'd',
+                        is_ipk: false,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
                         affinity: 'C',
+                        is_ipk: false,
                     },
                 ],
                 indexes: vec![],
@@ -4401,14 +4418,17 @@ mod tests {
                     ColumnInfo {
                         name: "x".to_owned(),
                         affinity: 'd',
+                        is_ipk: false,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
                         affinity: 'C',
+                        is_ipk: false,
                     },
                     ColumnInfo {
                         name: "z".to_owned(),
                         affinity: 'e',
+                        is_ipk: false,
                     },
                 ],
                 indexes: vec![],

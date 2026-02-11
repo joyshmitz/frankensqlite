@@ -2241,14 +2241,16 @@ mod tests {
         assert_eq!(row_values(&rows[0])[2], SqliteValue::Null);
     }
 
-    // Test: INSERT DEFAULT VALUES with RETURNING
+    // Test: INSERT DEFAULT VALUES with RETURNING (IPK column)
     #[test]
     fn probe_insert_default_values_returning() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
             .unwrap();
+        // Use RETURNING id (IPK column) — tests that IPK columns emit Rowid
+        // instead of Column (which would return Null for DEFAULT VALUES).
         let rows = conn
-            .query("INSERT INTO t DEFAULT VALUES RETURNING rowid;")
+            .query("INSERT INTO t DEFAULT VALUES RETURNING id;")
             .unwrap();
         assert_eq!(
             rows.len(),

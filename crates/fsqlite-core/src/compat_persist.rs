@@ -368,8 +368,14 @@ fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
         let name = tokens[0].trim_matches('"').to_owned();
         let type_str = tokens.get(1).copied().unwrap_or("TEXT");
         let affinity = type_to_affinity(type_str);
+        let upper = trimmed.to_ascii_uppercase();
+        let is_ipk = upper.contains("PRIMARY KEY") && type_str.to_ascii_uppercase().contains("INT");
 
-        columns.push(ColumnInfo { name, affinity });
+        columns.push(ColumnInfo {
+            name,
+            affinity,
+            is_ipk,
+        });
     }
 
     columns
@@ -423,10 +429,12 @@ mod tests {
                 ColumnInfo {
                     name: "id".to_owned(),
                     affinity: 'd',
+                    is_ipk: false,
                 },
                 ColumnInfo {
                     name: "name".to_owned(),
                     affinity: 'C',
+                    is_ipk: false,
                 },
             ],
             indexes: Vec::new(),
@@ -571,6 +579,7 @@ mod tests {
                 columns: vec![ColumnInfo {
                     name: "val".to_owned(),
                     affinity: 'C',
+                    is_ipk: false,
                 }],
                 indexes: Vec::new(),
             },
@@ -580,6 +589,7 @@ mod tests {
                 columns: vec![ColumnInfo {
                     name: "num".to_owned(),
                     affinity: 'd',
+                    is_ipk: false,
                 }],
                 indexes: Vec::new(),
             },

@@ -85,14 +85,18 @@ impl MemTable {
     }
 
     /// Delete a row by rowid. Returns true if a row was found and deleted.
-    #[allow(dead_code)]
-    fn delete_by_rowid(&mut self, rowid: i64) -> bool {
+    pub fn delete_by_rowid(&mut self, rowid: i64) -> bool {
         if let Some(idx) = self.rows.iter().position(|r| r.rowid == rowid) {
             self.rows.remove(idx);
             true
         } else {
             false
         }
+    }
+
+    /// Remove all rows from the table.
+    pub fn clear(&mut self) {
+        self.rows.clear();
     }
 
     /// Find a row by rowid. Returns the index.
@@ -3648,10 +3652,12 @@ mod tests {
                     ColumnInfo {
                         name: "a".to_owned(),
                         affinity: 'd',
+                        is_ipk: false,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
                         affinity: 'C',
+                        is_ipk: false,
                     },
                 ],
                 indexes: vec![],
