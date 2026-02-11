@@ -4278,6 +4278,85 @@ mod tests {
     }
 
     #[test]
+    fn test_begin_concurrent_newrowid_runtime_observes_flag() {
+        fn seed_table_with_empty_visible_set_but_advanced_counter(conn: &Connection) {
+            conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10), (11);",
+            )
+            .unwrap();
+            conn.execute("DELETE FROM t;").unwrap();
+            assert_eq!(
+                conn.query("SELECT x FROM t;").unwrap().len(),
+                0,
+                "seed must leave table empty while preserving advanced rowid counter state"
+            );
+        }
+
+        // Non-concurrent transaction: runtime uses serialized NewRowid path.
+        let conn_serialized = Connection::open(":memory:").unwrap();
+        seed_table_with_empty_visible_set_but_advanced_counter(&conn_serialized);
+        conn_serialized.execute("BEGIN IMMEDIATE;").unwrap();
+        conn_serialized
+            .execute("INSERT INTO t VALUES (999);")
+            .unwrap();
+        conn_serialized.execute("COMMIT;").unwrap();
+
+        let serialized_rowid = conn_serialized
+            .query_with_params(
+                "SELECT x FROM t WHERE rowid = ?1;",
+                &[SqliteValue::Integer(12)],
+            )
+            .unwrap();
+        assert_eq!(
+            serialized_rowid.len(),
+            1,
+            "serialized mode should follow local next_rowid counter (advanced by prior inserts)"
+        );
+        assert_eq!(
+            row_values(&serialized_rowid[0]),
+            vec![SqliteValue::Integer(999)]
+        );
+
+        // Concurrent transaction: runtime observes `NewRowid.p3 != 0` and
+        // uses the snapshot-independent path.
+        let conn_concurrent = Connection::open(":memory:").unwrap();
+        seed_table_with_empty_visible_set_but_advanced_counter(&conn_concurrent);
+        conn_concurrent.execute("BEGIN CONCURRENT;").unwrap();
+        conn_concurrent
+            .execute("INSERT INTO t VALUES (999);")
+            .unwrap();
+        conn_concurrent.execute("COMMIT;").unwrap();
+
+        let concurrent_rowid = conn_concurrent
+            .query_with_params(
+                "SELECT x FROM t WHERE rowid = ?1;",
+                &[SqliteValue::Integer(1)],
+            )
+            .unwrap();
+        assert_eq!(
+            concurrent_rowid.len(),
+            1,
+            "concurrent mode should allocate from max-visible-rowid + 1"
+        );
+        assert_eq!(
+            row_values(&concurrent_rowid[0]),
+            vec![SqliteValue::Integer(999)]
+        );
+        assert_eq!(
+            conn_concurrent
+                .query_with_params(
+                    "SELECT x FROM t WHERE rowid = ?1;",
+                    &[SqliteValue::Integer(12)],
+                )
+                .unwrap()
+                .len(),
+            0,
+            "concurrent path should not follow the serialized counter-only allocation"
+        );
+    }
+
+    #[test]
     fn test_blob_literal_roundtrips_through_mem_and_storage_cursors() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (bl BLOB);").unwrap();

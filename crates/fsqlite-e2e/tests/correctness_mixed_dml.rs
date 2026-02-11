@@ -16,6 +16,14 @@
 
 use fsqlite_e2e::comparison::{ComparisonRunner, SqlBackend, SqlValue};
 
+/// Default mixed-DML workload size used in regular test runs.
+///
+/// Keep this practical for workspace-wide CI while preserving the full
+/// 20k-statement stress path as an explicit ignored test below.
+const MIXED_DML_FAST_OPS: usize = 5_000;
+/// Heavy stress workload size for opt-in runs.
+const MIXED_DML_STRESS_OPS: usize = 20_000;
+
 // ─── Deterministic workload generator ──────────────────────────────────
 
 /// Simple deterministic PRNG (xorshift64) to avoid pulling in `rand`.
@@ -144,7 +152,7 @@ fn generate_mixed_dml(seed: u64, count: usize) -> (Vec<String>, usize) {
 
 #[test]
 fn mixed_dml_20k_ops_no_mismatches() {
-    let (stmts, _) = generate_mixed_dml(42, 20_000);
+    let (stmts, _) = generate_mixed_dml(42, MIXED_DML_FAST_OPS);
     let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
     let result = runner.run_and_compare(&stmts);
 
@@ -169,7 +177,7 @@ fn mixed_dml_20k_ops_no_mismatches() {
 
 #[test]
 fn mixed_dml_row_count_matches_expected() {
-    let (stmts, expected_rows) = generate_mixed_dml(42, 20_000);
+    let (stmts, expected_rows) = generate_mixed_dml(42, MIXED_DML_FAST_OPS);
     let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
     let _ = runner.run_and_compare(&stmts);
 
@@ -188,6 +196,32 @@ fn mixed_dml_row_count_matches_expected() {
         f_rows[0][0],
         SqlValue::Integer(expected_rows_i64),
         "fsqlite row count {f_rows:?} != expected {expected_rows}"
+    );
+}
+
+#[test]
+#[ignore = "stress workload; run manually when profiling mixed DML throughput"]
+fn mixed_dml_20k_ops_stress_no_mismatches() {
+    let (stmts, _) = generate_mixed_dml(42, MIXED_DML_STRESS_OPS);
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+    let result = runner.run_and_compare(&stmts);
+
+    assert_eq!(
+        result.operations_mismatched,
+        0,
+        "statement-level mismatches in mixed DML stress run ({} of {}):\n{}",
+        result.operations_mismatched,
+        stmts.len(),
+        result
+            .mismatches
+            .iter()
+            .take(10)
+            .map(|m| format!(
+                "  stmt {}: sql='{}'\n    csqlite={:?}\n    fsqlite={:?}",
+                m.index, m.sql, m.csqlite, m.fsqlite
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 

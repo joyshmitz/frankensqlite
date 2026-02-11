@@ -589,6 +589,27 @@ impl MemDatabase {
         }
     }
 
+    /// Allocate a rowid for concurrent mode (`OP_NewRowid` with `p3 != 0`).
+    ///
+    /// Unlike the serialized path (counter only), this path derives the next
+    /// candidate strictly from the visible table contents (`max(rowid) + 1`).
+    /// This avoids relying on potentially stale local counter state.
+    fn alloc_rowid_concurrent(&mut self, root_page: i32) -> i64 {
+        if let Some(table) = self.tables.get_mut(&root_page) {
+            let prev_next_rowid = table.next_rowid;
+            let max_visible = table.rows.iter().map(|r| r.rowid).max().unwrap_or(0);
+            let rowid = max_visible + 1;
+            table.next_rowid = rowid + 1;
+            self.push_undo(MemDbUndoOp::BumpRowid {
+                root_page,
+                prev_next_rowid,
+            });
+            rowid
+        } else {
+            1
+        }
+    }
+
     fn upsert_row(&mut self, root_page: i32, rowid: i64, values: Vec<SqliteValue>) {
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;
@@ -1715,8 +1736,12 @@ impl VdbeEngine {
                 // ── Insert / Delete / NewRowid ──────────────────────────
                 Opcode::NewRowid => {
                     // Allocate a new rowid for cursor p1, store in register p2.
+                    //
+                    // `p3 != 0` selects the concurrent path (snapshot-independent
+                    // allocator behavior). `p3 == 0` keeps legacy serialized mode.
                     let cursor_id = op.p1;
                     let target = op.p2;
+                    let concurrent_mode = op.p3 != 0;
                     // Check storage cursor first, falling back to MemCursor.
                     // Rowid is always allocated from MemTable's counter so
                     // both the B-tree and MemDatabase stay in sync.
@@ -1727,7 +1752,11 @@ impl VdbeEngine {
                         .or_else(|| self.cursors.get(&cursor_id).map(|c| c.root_page));
                     let rowid = if let Some(root) = root {
                         if let Some(db) = self.db.as_mut() {
-                            db.alloc_rowid(root)
+                            if concurrent_mode {
+                                db.alloc_rowid_concurrent(root)
+                            } else {
+                                db.alloc_rowid(root)
+                            }
                         } else {
                             1
                         }
@@ -5752,6 +5781,47 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], SqliteValue::Integer(6));
         assert_eq!(rows[1][0], SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn test_newrowid_concurrent_flag_uses_snapshot_independent_path() {
+        fn setup_db_with_stale_counter() -> (MemDatabase, i32) {
+            let mut db = MemDatabase::new();
+            let root = db.create_table(1);
+            let table = db.get_table_mut(root).expect("table should exist");
+            table.insert(10, vec![SqliteValue::Integer(10)]);
+            table.insert(11, vec![SqliteValue::Integer(11)]);
+            // Simulate stale local counter state from an old snapshot.
+            table.next_rowid = 1;
+            (db, root)
+        }
+
+        let (db_serialized, root) = setup_db_with_stale_counter();
+        let (rows_serialized, _) = run_write_with_storage_cursors(db_serialized, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            // Serialized path (`p3 = 0`) uses local counter directly.
+            b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        let (db_concurrent, root) = setup_db_with_stale_counter();
+        let (rows_concurrent, _) = run_write_with_storage_cursors(db_concurrent, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            // Concurrent path (`p3 != 0`) uses max-visible-rowid + 1.
+            b.emit_op(Opcode::NewRowid, 0, 1, 1, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows_serialized, vec![vec![SqliteValue::Integer(1)]]);
+        assert_eq!(rows_concurrent, vec![vec![SqliteValue::Integer(12)]]);
     }
 
     // ── bd-2a3y: TransactionPageIo / SharedTxnPageIo integration tests ──
