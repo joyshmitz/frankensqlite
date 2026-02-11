@@ -4226,7 +4226,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_context_propagates_concurrent_txn_to_newrowid() {
+    fn test_codegen_newrowid_sets_concurrent_flag_in_begin_concurrent() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
         conn.execute("BEGIN CONCURRENT;").unwrap();
@@ -4246,6 +4246,32 @@ mod tests {
         assert_ne!(
             nr.p3, 0,
             "NewRowid p3 should be non-zero in a concurrent transaction"
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_codegen_newrowid_cleared_in_begin_immediate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
+
+        let stmt = super::parse_single_statement("INSERT INTO t VALUES (1);").unwrap();
+        let insert = match stmt {
+            Statement::Insert(insert) => insert,
+            other => unreachable!("expected INSERT statement, got {other:?}"),
+        };
+
+        let program = conn.compile_table_insert(&insert).unwrap();
+        let nr = program
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::NewRowid)
+            .unwrap();
+        assert_eq!(
+            nr.p3, 0,
+            "NewRowid p3 should be 0 in a non-concurrent transaction"
         );
 
         conn.execute("ROLLBACK;").unwrap();
