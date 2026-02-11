@@ -987,7 +987,9 @@ impl Connection {
     fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
-        let ctx = CodegenContext::default();
+        let ctx = CodegenContext {
+            concurrent_mode: self.is_concurrent_transaction(),
+        };
         codegen_select(&mut builder, select, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
     }
@@ -1227,7 +1229,9 @@ impl Connection {
     fn compile_table_insert(&self, insert: &fsqlite_ast::InsertStatement) -> Result<VdbeProgram> {
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
-        let ctx = CodegenContext::default();
+        let ctx = CodegenContext {
+            concurrent_mode: self.is_concurrent_transaction(),
+        };
         codegen_insert(&mut builder, insert, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
     }
@@ -1236,7 +1240,9 @@ impl Connection {
     fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
-        let ctx = CodegenContext::default();
+        let ctx = CodegenContext {
+            concurrent_mode: self.is_concurrent_transaction(),
+        };
         codegen_update(&mut builder, update, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
     }
@@ -1245,7 +1251,9 @@ impl Connection {
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
-        let ctx = CodegenContext::default();
+        let ctx = CodegenContext {
+            concurrent_mode: self.is_concurrent_transaction(),
+        };
         codegen_delete(&mut builder, delete, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
     }
@@ -4215,6 +4223,32 @@ mod tests {
             }
             other => unreachable!("expected P4::Blob, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_codegen_context_propagates_concurrent_txn_to_newrowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+
+        let stmt = super::parse_single_statement("INSERT INTO t VALUES (1);").unwrap();
+        let insert = match stmt {
+            Statement::Insert(insert) => insert,
+            other => unreachable!("expected INSERT statement, got {other:?}"),
+        };
+
+        let program = conn.compile_table_insert(&insert).unwrap();
+        let nr = program
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::NewRowid)
+            .unwrap();
+        assert_ne!(
+            nr.p3, 0,
+            "NewRowid p3 should be non-zero in a concurrent transaction"
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
     }
 
     #[test]
