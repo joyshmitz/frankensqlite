@@ -14,10 +14,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fsqlite_ast::{
-    AlterTableAction, BinaryOp, CompoundOp, CreateTableBody, Distinctness, DropObjectType, Expr,
-    FunctionArgs, InSet, JoinConstraint, JoinKind, LikeOp, LimitClause, Literal, NullsOrder,
-    OrderingTerm, PlaceholderType, ResultColumn, SelectBody, SelectCore, SelectStatement,
-    SortDirection, Statement, TableOrSubquery, UnaryOp,
+    AlterTableAction, BinaryOp, ColumnRef, CompoundOp, CreateTableBody, Distinctness,
+    DropObjectType, Expr, FunctionArgs, InSet, JoinConstraint, JoinKind, LikeOp, LimitClause,
+    Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody, SelectCore,
+    SelectStatement, SortDirection, Span, Statement, TableOrSubquery, UnaryOp,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
@@ -1756,8 +1756,41 @@ impl Connection {
             .map(|c| (table_name.clone(), c.name.clone()))
             .collect();
 
+        // Check if any result column is Star/TableStar — if so, we relax the
+        // "must appear in GROUP BY" validation (SQLite allows this).
+        let has_star = columns
+            .iter()
+            .any(|c| matches!(c, ResultColumn::Star | ResultColumn::TableStar(_)));
+
+        // Expand Star/TableStar into explicit column references so GROUP BY
+        // can process them individually.
+        let expanded_columns: Vec<ResultColumn> = columns
+            .iter()
+            .flat_map(|col| match col {
+                ResultColumn::Star => table_schema
+                    .columns
+                    .iter()
+                    .map(|c| ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare(c.name.clone()), Span::new(0, 0)),
+                        alias: None,
+                    })
+                    .collect::<Vec<_>>(),
+                ResultColumn::TableStar(tbl) if tbl.eq_ignore_ascii_case(&table_name) => {
+                    table_schema
+                        .columns
+                        .iter()
+                        .map(|c| ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare(c.name.clone()), Span::new(0, 0)),
+                            alias: None,
+                        })
+                        .collect::<Vec<_>>()
+                }
+                other => vec![other.clone()],
+            })
+            .collect();
+
         // Parse result columns into GroupByColumn descriptors.
-        let result_descriptors: Vec<GroupByColumn> = columns
+        let result_descriptors: Vec<GroupByColumn> = expanded_columns
             .iter()
             .map(|col| match col {
                 ResultColumn::Expr {
@@ -1811,7 +1844,7 @@ impl Connection {
                     // The expression must match one of the GROUP BY expressions
                     // (either structurally or as a column reference to a GROUP BY column).
                     let in_group_by = group_by_exprs.iter().any(|gb| exprs_match(gb, expr));
-                    if !in_group_by {
+                    if !in_group_by && !has_star {
                         let label = expr_col_name(expr).unwrap_or("<expression>");
                         return Err(FrankenError::NotImplemented(format!(
                             "non-aggregate result column '{label}' must appear in GROUP BY"
@@ -1894,7 +1927,7 @@ impl Connection {
                     having,
                     &values,
                     &result_descriptors,
-                    columns,
+                    &expanded_columns,
                     group_rows,
                     &col_names,
                 ) {
@@ -1906,7 +1939,7 @@ impl Connection {
 
         // Post-process: ORDER BY.
         if !select.order_by.is_empty() {
-            sort_rows_by_order_terms(&mut result, &select.order_by, columns)?;
+            sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
         }
 
         // Post-process: LIMIT / OFFSET.
@@ -5813,6 +5846,51 @@ mod tests {
     }
 
     #[test]
+    fn test_select_star_group_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (category TEXT, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES ('fruit', 'apple');")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES ('fruit', 'banana');")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES ('veggie', 'carrot');")
+            .unwrap();
+        // SELECT * ... GROUP BY category should expand * to all columns.
+        let rows = conn
+            .query("SELECT * FROM items GROUP BY category;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_select_star_group_by_with_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (grp TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('a', 1);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('a', 2);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('b', 3);").unwrap();
+        let rows = conn
+            .query("SELECT grp, COUNT(*) FROM t GROUP BY grp;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // 'a' group has count 2, 'b' group has count 1.
+        let counts: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| {
+                if let SqliteValue::Integer(n) = &r.values()[1] {
+                    Some(*n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(counts.contains(&2));
+        assert!(counts.contains(&1));
+    }
+
+    #[test]
     fn test_order_by_position_join() {
         // Uses a JOIN to exercise the fallback sort_rows_by_order_terms path.
         let conn = Connection::open(":memory:").unwrap();
@@ -6592,6 +6670,50 @@ mod tests {
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(60)); // 20+40
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(40)); // 10+30
+    }
+
+    #[test]
+    fn test_group_by_select_star_when_grouping_all_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'y');").unwrap();
+
+        let rows = conn
+            .query("SELECT * FROM t GROUP BY a, b ORDER BY a, b;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Text("x".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Text("y".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_group_by_select_table_star_when_grouping_all_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'z');").unwrap();
+
+        let rows = conn
+            .query("SELECT t.* FROM t GROUP BY a, b ORDER BY a, b;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Text("x".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(3), SqliteValue::Text("z".to_owned())]
+        );
     }
 
     // ── LIKE/CASE/CAST expression evaluation tests (bd-3pss) ──────
