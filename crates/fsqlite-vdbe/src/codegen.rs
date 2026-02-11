@@ -125,6 +125,82 @@ fn table_name_from_qualified(qtr: &QualifiedTableRef) -> &str {
     &qtr.name.name
 }
 
+fn contains_unsupported_in_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            contains_unsupported_in_expr(inner)
+                || match set {
+                    fsqlite_ast::InSet::List(items) => {
+                        items.iter().any(contains_unsupported_in_expr)
+                    }
+                    // `IN (SELECT ...)` / `IN table` are handled by runtime probe
+                    // codegen in `emit_expr`.
+                    fsqlite_ast::InSet::Subquery(_) | fsqlite_ast::InSet::Table(_) => false,
+                }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            contains_unsupported_in_expr(left) || contains_unsupported_in_expr(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => contains_unsupported_in_expr(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            contains_unsupported_in_expr(inner)
+                || contains_unsupported_in_expr(low)
+                || contains_unsupported_in_expr(high)
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            contains_unsupported_in_expr(inner)
+                || contains_unsupported_in_expr(pattern)
+                || escape.as_deref().is_some_and(contains_unsupported_in_expr)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(contains_unsupported_in_expr)
+                || whens.iter().any(|(cond, then_expr)| {
+                    contains_unsupported_in_expr(cond) || contains_unsupported_in_expr(then_expr)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(contains_unsupported_in_expr)
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::List(args),
+            ..
+        } => args.iter().any(contains_unsupported_in_expr),
+        Expr::RowValue(items, _) => items.iter().any(contains_unsupported_in_expr),
+        _ => false,
+    }
+}
+
+fn contains_unsupported_in_result_column(col: &ResultColumn) -> bool {
+    match col {
+        ResultColumn::Expr { expr, .. } => contains_unsupported_in_expr(expr),
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    }
+}
+
+fn unsupported_in_message() -> String {
+    "IN (SELECT ...) / IN table requires rewrite before VDBE codegen".to_owned()
+}
+
 // ---------------------------------------------------------------------------
 // SELECT codegen
 // ---------------------------------------------------------------------------
@@ -157,6 +233,22 @@ pub fn codegen_select(
             return Err(CodegenError::Unsupported("VALUES in SELECT".to_owned()));
         }
     };
+
+    if columns.iter().any(contains_unsupported_in_result_column)
+        || where_clause
+            .as_ref()
+            .is_some_and(|expr| contains_unsupported_in_expr(expr))
+        || group_by.iter().any(contains_unsupported_in_expr)
+        || having
+            .as_ref()
+            .is_some_and(|expr| contains_unsupported_in_expr(expr))
+        || stmt
+            .order_by
+            .iter()
+            .any(|term| contains_unsupported_in_expr(&term.expr))
+    {
+        return Err(CodegenError::Unsupported(unsupported_in_message()));
+    }
 
     // Determine the table from the FROM clause.
     let from_clause = from
@@ -264,6 +356,7 @@ pub fn codegen_select(
                 cursor,
                 table,
                 table_alias,
+                schema,
                 columns,
                 where_clause.as_deref(),
                 stmt.limit.as_ref(),
@@ -280,6 +373,7 @@ pub fn codegen_select(
             cursor,
             table,
             table_alias,
+            schema,
             columns,
             where_clause.as_deref(),
             group_by,
@@ -296,6 +390,7 @@ pub fn codegen_select(
             cursor,
             table,
             table_alias,
+            schema,
             columns,
             where_clause.as_deref(),
             out_regs,
@@ -310,6 +405,7 @@ pub fn codegen_select(
             cursor,
             table,
             table_alias,
+            schema,
             columns,
             where_clause.as_deref(),
             &stmt.order_by,
@@ -327,6 +423,7 @@ pub fn codegen_select(
             cursor,
             table,
             table_alias,
+            schema,
             columns,
             where_clause.as_deref(),
             stmt.limit.as_ref(),
@@ -342,6 +439,7 @@ pub fn codegen_select(
             cursor,
             table,
             table_alias,
+            schema,
             columns,
             where_clause.as_deref(),
             stmt.limit.as_ref(),
@@ -370,6 +468,7 @@ fn codegen_select_full_scan(
     cursor: i32,
     table: &TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     limit_clause: Option<&LimitClause>,
@@ -408,7 +507,7 @@ fn codegen_select_full_scan(
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
     }
 
     // OFFSET: if offset counter > 0, decrement by 1 and skip this row.
@@ -417,7 +516,7 @@ fn codegen_select_full_scan(
     }
 
     // Read columns.
-    emit_column_reads(b, cursor, columns, table, table_alias, out_regs)?;
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
 
     // ResultRow.
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -462,6 +561,7 @@ fn codegen_select_distinct_scan(
     cursor: i32,
     table: &TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     limit_clause: Option<&LimitClause>,
@@ -506,12 +606,12 @@ fn codegen_select_distinct_scan(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
     }
 
     // Read output columns into consecutive registers.
     let sorter_base = b.alloc_regs(out_col_count);
-    emit_column_reads(b, cursor, columns, table, table_alias, sorter_base)?;
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, sorter_base)?;
 
     // MakeRecord from all output columns, then SorterInsert.
     let record_reg = b.alloc_reg();
@@ -698,6 +798,7 @@ fn codegen_select_ordered_scan(
     cursor: i32,
     table: &TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     order_by: &[OrderingTerm],
@@ -762,7 +863,7 @@ fn codegen_select_ordered_scan(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
     }
 
     // Read sort-key columns + data columns into consecutive registers.
@@ -774,6 +875,7 @@ fn codegen_select_ordered_scan(
             cursor,
             table,
             table_alias,
+            schema: Some(schema),
         };
         for key in &sort_keys {
             match key {
@@ -800,6 +902,7 @@ fn codegen_select_ordered_scan(
             columns,
             table,
             table_alias,
+            schema,
             sorter_base + num_sort_keys as i32,
         )?;
     }
@@ -1885,6 +1988,7 @@ fn codegen_insert_values(
 /// each row into the target table.
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap
 )]
@@ -1915,6 +2019,14 @@ fn codegen_insert_select(
     let from_clause = from
         .as_ref()
         .ok_or_else(|| CodegenError::Unsupported("INSERT ... SELECT without FROM".to_owned()))?;
+
+    if columns.iter().any(contains_unsupported_in_result_column)
+        || where_clause
+            .as_ref()
+            .is_some_and(|expr| contains_unsupported_in_expr(expr))
+    {
+        return Err(CodegenError::Unsupported(unsupported_in_message()));
+    }
 
     let (src_table_name, src_table_alias) = match &from_clause.source {
         fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
@@ -2049,6 +2161,18 @@ pub fn codegen_update(
 
     let end_label = b.emit_label();
     let done_label = b.emit_label();
+
+    if stmt
+        .where_clause
+        .as_ref()
+        .is_some_and(contains_unsupported_in_expr)
+        || stmt
+            .assignments
+            .iter()
+            .any(|assign| contains_unsupported_in_expr(&assign.value))
+    {
+        return Err(CodegenError::Unsupported(unsupported_in_message()));
+    }
 
     // Init.
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -2195,6 +2319,14 @@ pub fn codegen_delete(
     let end_label = b.emit_label();
     let done_label = b.emit_label();
 
+    if stmt
+        .where_clause
+        .as_ref()
+        .is_some_and(contains_unsupported_in_expr)
+    {
+        return Err(CodegenError::Unsupported(unsupported_in_message()));
+    }
+
     // Init.
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
 
@@ -2330,6 +2462,7 @@ fn emit_column_reads(
                         cursor,
                         table,
                         table_alias,
+                        schema: None,
                     };
                     emit_expr(b, expr, reg, Some(&scan));
                 }
@@ -2591,6 +2724,7 @@ fn emit_where_filter(
     cursor: i32,
     table: &TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     skip_label: crate::Label,
 ) {
     match where_expr {
@@ -2616,6 +2750,7 @@ fn emit_where_filter(
                             cursor,
                             table,
                             table_alias,
+                            schema: Some(schema),
                         };
                         emit_expr(b, &expr, col_reg, Some(&scan));
                     }
@@ -2639,6 +2774,7 @@ fn emit_where_filter(
                             cursor,
                             table,
                             table_alias,
+                            schema: Some(schema),
                         };
                         emit_expr(b, &expr, col_reg, Some(&scan));
                     }
@@ -2666,6 +2802,7 @@ fn emit_where_filter(
                 cursor,
                 table,
                 table_alias,
+                schema: Some(schema),
             };
             let cond_reg = b.alloc_temp();
             emit_expr(b, where_expr, cond_reg, Some(&scan));
@@ -2896,6 +3033,189 @@ struct ScanCtx<'a> {
     cursor: i32,
     table: &'a TableSchema,
     table_alias: Option<&'a str>,
+    schema: Option<&'a [TableSchema]>,
+}
+
+enum InProbeValue<'a> {
+    Expr(&'a Expr),
+    FirstColumn,
+}
+
+struct InProbeSource<'a> {
+    table: &'a TableSchema,
+    table_alias: Option<&'a str>,
+    where_clause: Option<&'a Expr>,
+    value: InProbeValue<'a>,
+}
+
+fn resolve_in_probe_source<'a>(
+    set: &'a fsqlite_ast::InSet,
+    schema: &'a [TableSchema],
+) -> Option<InProbeSource<'a>> {
+    match set {
+        fsqlite_ast::InSet::List(_) => None,
+        fsqlite_ast::InSet::Table(name) => {
+            let table = find_table(schema, &name.name).ok()?;
+            if table.columns.is_empty() {
+                return None;
+            }
+            Some(InProbeSource {
+                table,
+                table_alias: None,
+                where_clause: None,
+                value: InProbeValue::FirstColumn,
+            })
+        }
+        fsqlite_ast::InSet::Subquery(subquery) => {
+            if subquery.with.is_some()
+                || !subquery.body.compounds.is_empty()
+                || !subquery.order_by.is_empty()
+                || subquery.limit.is_some()
+            {
+                return None;
+            }
+
+            let fsqlite_ast::SelectCore::Select {
+                columns,
+                from,
+                where_clause,
+                group_by,
+                having,
+                windows,
+                ..
+            } = &subquery.body.select
+            else {
+                return None;
+            };
+
+            if !group_by.is_empty() || having.is_some() || !windows.is_empty() {
+                return None;
+            }
+
+            let from_clause = from.as_ref()?;
+            if !from_clause.joins.is_empty() {
+                return None;
+            }
+
+            let (table_name, table_alias) = match &from_clause.source {
+                fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => {
+                    (&name.name, alias.as_deref())
+                }
+                _ => return None,
+            };
+            let table = find_table(schema, table_name).ok()?;
+
+            let value = match columns.as_slice() {
+                [fsqlite_ast::ResultColumn::Expr { expr, .. }] => InProbeValue::Expr(expr),
+                [fsqlite_ast::ResultColumn::Star] | [fsqlite_ast::ResultColumn::TableStar(_)] => {
+                    if table.columns.is_empty() {
+                        return None;
+                    }
+                    InProbeValue::FirstColumn
+                }
+                _ => return None,
+            };
+
+            Some(InProbeSource {
+                table,
+                table_alias,
+                where_clause: where_clause.as_deref(),
+                value,
+            })
+        }
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_in_probe_expr(
+    b: &mut ProgramBuilder,
+    operand: &Expr,
+    set: &fsqlite_ast::InSet,
+    not: bool,
+    reg: i32,
+    ctx: Option<&ScanCtx<'_>>,
+) {
+    let Some(scan_ctx) = ctx else {
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        return;
+    };
+    let Some(schema) = scan_ctx.schema else {
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        return;
+    };
+    let Some(probe_source) = resolve_in_probe_source(set, schema) else {
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        return;
+    };
+
+    // Keep probe cursors far from primary scan/sorter cursors used by main paths.
+    let probe_cursor = scan_ctx.cursor + 64;
+    let r_operand = b.alloc_temp();
+    let r_probe = b.alloc_temp();
+
+    emit_expr(b, operand, r_operand, Some(scan_ctx));
+
+    b.emit_op(
+        Opcode::OpenRead,
+        probe_cursor,
+        probe_source.table.root_page,
+        0,
+        P4::Table(probe_source.table.name.clone()),
+        0,
+    );
+
+    let no_match_label = b.emit_label();
+    let matched_label = b.emit_label();
+    let done_label = b.emit_label();
+
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, no_match_label, P4::None, 0);
+
+    let skip_label = probe_source.where_clause.map(|_| b.emit_label());
+    if let (Some(where_expr), Some(skip)) = (probe_source.where_clause, skip_label) {
+        emit_where_filter(
+            b,
+            where_expr,
+            probe_cursor,
+            probe_source.table,
+            probe_source.table_alias,
+            schema,
+            skip,
+        );
+    }
+
+    let probe_scan = ScanCtx {
+        cursor: probe_cursor,
+        table: probe_source.table,
+        table_alias: probe_source.table_alias,
+        schema: Some(schema),
+    };
+    match probe_source.value {
+        InProbeValue::Expr(expr) => emit_expr(b, expr, r_probe, Some(&probe_scan)),
+        InProbeValue::FirstColumn => {
+            b.emit_op(Opcode::Column, probe_cursor, 0, r_probe, P4::None, 0);
+        }
+    }
+    b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
+
+    if let Some(skip) = skip_label {
+        b.resolve_label(skip);
+    }
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, probe_cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(no_match_label);
+    b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(matched_label);
+    b.emit_op(Opcode::Integer, i32::from(!not), reg, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
+
+    b.free_temp(r_probe);
+    b.free_temp(r_operand);
 }
 
 /// Handles literals, bind parameters, binary/unary operators, CASE, CAST,
@@ -3096,8 +3416,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 b.resolve_label(done_label);
                 b.free_temp(r_operand);
             } else {
-                // IN (SELECT ...) or IN table — not yet supported, emit Null.
-                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                emit_in_probe_expr(b, operand, set, *not, reg, ctx);
             }
         }
         Expr::FunctionCall { name, args, .. } if !is_aggregate_function(name) => {
@@ -4555,7 +4874,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_where_in_subquery_emits_scan_probe() {
+    fn test_codegen_select_where_in_subquery_rejected_without_rewrite() {
         let subquery = SelectStatement {
             with: None,
             body: SelectBody {
@@ -4587,59 +4906,15 @@ mod tests {
         let schema = test_schema_with_subquery_source();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
-        let prog = b.finish().unwrap();
-
-        let open_reads: Vec<_> = prog
-            .ops()
-            .iter()
-            .filter(|op| op.opcode == Opcode::OpenRead)
-            .collect();
-        assert_eq!(
-            open_reads.len(),
-            2,
-            "outer + subquery OpenRead expected; ops={:?}",
-            prog.ops()
-        );
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx).unwrap_err();
         assert!(
-            open_reads.iter().any(|op| op.p2 == 3),
-            "expected subquery root-page OpenRead"
-        );
-        assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
-            "expected Eq comparison in IN probe scan"
+            matches!(err, CodegenError::Unsupported(ref msg) if msg.contains("IN (SELECT ...)")),
+            "unexpected error: {err:?}"
         );
     }
 
     #[test]
-    fn test_resolve_in_probe_source_subquery_supported() {
-        let subquery = SelectStatement {
-            with: None,
-            body: SelectBody {
-                select: SelectCore::Select {
-                    distinct: Distinctness::All,
-                    columns: vec![ResultColumn::Expr {
-                        expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
-                        alias: None,
-                    }],
-                    from: Some(from_table("s")),
-                    where_clause: None,
-                    group_by: vec![],
-                    having: None,
-                    windows: vec![],
-                },
-                compounds: vec![],
-            },
-            order_by: vec![],
-            limit: None,
-        };
-        let set = InSet::Subquery(Box::new(subquery));
-        let schema = test_schema_with_subquery_source();
-        assert!(super::resolve_in_probe_source(&set, &schema).is_some());
-    }
-
-    #[test]
-    fn test_codegen_select_where_in_table_emits_scan_probe() {
+    fn test_codegen_select_where_in_table_rejected_without_rewrite() {
         let where_expr = Expr::In {
             expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
             set: InSet::Table(QualifiedName::bare("s")),
@@ -4651,22 +4926,10 @@ mod tests {
         let schema = test_schema_with_subquery_source();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
-        let prog = b.finish().unwrap();
-
-        let open_reads: Vec<_> = prog
-            .ops()
-            .iter()
-            .filter(|op| op.opcode == Opcode::OpenRead)
-            .collect();
-        assert_eq!(open_reads.len(), 2, "outer + IN table OpenRead expected");
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx).unwrap_err();
         assert!(
-            open_reads.iter().any(|op| op.p2 == 3),
-            "expected IN table root-page OpenRead"
-        );
-        assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
-            "expected Eq comparison in IN probe scan"
+            matches!(err, CodegenError::Unsupported(ref msg) if msg.contains("IN (SELECT ...)")),
+            "unexpected error: {err:?}"
         );
     }
 

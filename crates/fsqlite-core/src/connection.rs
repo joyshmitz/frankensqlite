@@ -564,6 +564,10 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Select(ref select) => {
+                // CTE (WITH clause): materialize as temporary tables.
+                if select.with.is_some() {
+                    return self.execute_with_ctes(select, params);
+                }
                 let distinct = is_distinct_select(select);
                 // Compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
                 if !select.body.compounds.is_empty() {
@@ -1318,11 +1322,6 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        if select.with.is_some() {
-            return Err(FrankenError::NotImplemented(
-                "WITH is not supported with GROUP BY in this connection path".to_owned(),
-            ));
-        }
         if !select.body.compounds.is_empty() {
             return Err(FrankenError::NotImplemented(
                 "compound SELECT is not supported with GROUP BY in this connection path".to_owned(),
@@ -1621,6 +1620,82 @@ impl Connection {
         }
 
         Ok(result)
+    }
+
+    /// Materialize CTEs as temporary in-memory tables, execute the main query
+    /// with `with` stripped, then clean up the temporary tables.
+    fn execute_with_ctes(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let ctes = select
+            .with
+            .as_ref()
+            .map_or(&[][..], |w| w.ctes.as_slice());
+        let mut temp_names: Vec<String> = Vec::with_capacity(ctes.len());
+        for cte in ctes {
+            let cte_name = &cte.name;
+            // Execute the CTE body query to get its result rows.
+            let cte_rows = self.execute_statement(
+                Statement::Select(cte.query.clone()),
+                params,
+            )?;
+            // Determine column definitions from the CTE.
+            let col_names: Vec<String> = if !cte.columns.is_empty() {
+                cte.columns.clone()
+            } else if let Some(first_row) = cte_rows.first() {
+                first_row
+                    .column_names
+                    .iter()
+                    .map(|c| c.clone())
+                    .collect()
+            } else {
+                vec!["_c0".to_owned()]
+            };
+            // Create the temporary table via direct schema manipulation.
+            let col_infos: Vec<ColumnInfo> = col_names
+                .iter()
+                .map(|name| ColumnInfo {
+                    name: name.clone(),
+                    affinity: 'B', // BLOB affinity (no type coercion)
+                })
+                .collect();
+            let num_columns = col_infos.len();
+            let root_page = self.db.borrow_mut().create_table(num_columns);
+            self.schema.borrow_mut().push(TableSchema {
+                name: cte_name.clone(),
+                root_page,
+                columns: col_infos,
+                indexes: Vec::new(),
+            });
+            temp_names.push(cte_name.clone());
+            // Insert the CTE result rows into the temporary table.
+            for row in &cte_rows {
+                let vals: Vec<SqliteValue> = row.values.iter().cloned().collect();
+                self.db
+                    .borrow_mut()
+                    .insert_row(root_page, &vals);
+            }
+        }
+        // Execute the main query with the WITH clause stripped.
+        let mut stripped = select.clone();
+        stripped.with = None;
+        let result = self.execute_statement(Statement::Select(stripped), params);
+        // Clean up temporary CTE tables.
+        for name in &temp_names {
+            let mut schema = self.schema.borrow_mut();
+            if let Some(idx) = schema
+                .iter()
+                .position(|t| t.name.eq_ignore_ascii_case(name))
+            {
+                let rp = schema[idx].root_page;
+                schema.remove(idx);
+                drop(schema);
+                self.db.borrow_mut().destroy_table(rp);
+            }
+        }
+        result
     }
 
     /// Pre-process a SELECT statement, eagerly evaluating subquery expressions:
@@ -2011,6 +2086,7 @@ fn rewrite_in_select_core(core: &mut SelectCore, conn: &Connection) -> Result<()
 /// Recursively walk an expression tree and eagerly evaluate subquery
 /// expressions: `IN (SELECT ...)`, `EXISTS (SELECT ...)`, and scalar
 /// subqueries `(SELECT ...)`.
+#[allow(clippy::too_many_lines)]
 fn rewrite_in_expr(expr: &mut Expr, conn: &Connection) -> Result<()> {
     match expr {
         Expr::In {
@@ -3154,11 +3230,6 @@ fn parse_pragma_bool(value: &fsqlite_ast::PragmaValue) -> Result<bool> {
 
 #[allow(clippy::too_many_lines)]
 fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
-    if select.with.is_some() {
-        return Err(FrankenError::NotImplemented(
-            "WITH is not supported in this connection path".to_owned(),
-        ));
-    }
     if !select.body.compounds.is_empty() {
         return Err(FrankenError::NotImplemented(
             "compound SELECT is not supported in this connection path".to_owned(),
