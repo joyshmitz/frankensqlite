@@ -1764,11 +1764,14 @@ impl Connection {
             .find(|t| t.name.eq_ignore_ascii_case(&table_name))
             .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
 
-        // Build a column map for expression evaluation: (table_name, col_name).
+        // Build a column map for expression evaluation: (table_label, col_name).
+        // Use the alias as the table label when present so that alias-qualified
+        // column references (e.g. `t.dept` when FROM table AS t) resolve correctly.
+        let effective_label = table_alias.as_deref().unwrap_or(&table_name);
         let col_map: Vec<(String, String)> = table_schema
             .columns
             .iter()
-            .map(|c| (table_name.clone(), c.name.clone()))
+            .map(|c| (effective_label.to_owned(), c.name.clone()))
             .collect();
 
         // Check if any result column is Star/TableStar — if so, we relax the
@@ -4609,7 +4612,7 @@ fn resolve_table_name(source: &TableOrSubquery) -> Result<(String, Option<String
 }
 
 /// Perform a single join step: combine left-side rows with right-side rows.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
 fn execute_single_join(
     left: &[Vec<SqliteValue>],
     right: &[Vec<SqliteValue>],
@@ -5953,6 +5956,48 @@ mod tests {
             .collect();
         assert!(counts.contains(&2));
         assert!(counts.contains(&1));
+    }
+
+    #[test]
+    fn test_group_by_table_alias_star() {
+        // SELECT t.* FROM ... AS t GROUP BY ... should resolve t.* correctly.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE employees (dept TEXT, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES ('eng', 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES ('eng', 'Bob');")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES ('sales', 'Carol');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT t.* FROM employees AS t GROUP BY t.dept;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_group_by_alias_qualified_column() {
+        // t.dept in GROUP BY should resolve when FROM uses alias.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales (region TEXT, amount INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('north', 10);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('north', 20);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('south', 30);")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT s.region, SUM(s.amount) FROM sales AS s GROUP BY s.region ORDER BY s.region;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("north".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(30));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("south".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(30));
     }
 
     #[test]
@@ -9162,6 +9207,136 @@ mod tests {
         assert_eq!(rows[0].values()[0], SqliteValue::Text("x".to_owned()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(42));
         assert_eq!(rows[0].values()[2], SqliteValue::Text("alpha".to_owned()));
+    }
+
+    #[test]
+    fn test_right_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE r (l_id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO l VALUES (1, 'alice');").unwrap();
+        conn.execute("INSERT INTO r VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO r VALUES (2, 'b');").unwrap();
+
+        let rows = conn
+            .query("SELECT l.name, r.tag FROM l RIGHT JOIN r ON l.id = r.l_id ORDER BY r.tag;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Matched row: alice, a
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("alice".to_owned()),
+                SqliteValue::Text("a".to_owned())
+            ]
+        );
+        // Unmatched right row: NULL, b
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Null, SqliteValue::Text("b".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_right_join_all_matched() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE r (l_id INTEGER);").unwrap();
+        conn.execute("INSERT INTO l VALUES (1);").unwrap();
+        conn.execute("INSERT INTO l VALUES (2);").unwrap();
+        conn.execute("INSERT INTO r VALUES (1);").unwrap();
+
+        let rows = conn
+            .query("SELECT l.id, r.l_id FROM l RIGHT JOIN r ON l.id = r.l_id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(1)]
+        );
+    }
+
+    #[test]
+    fn test_full_outer_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE r (l_id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO l VALUES (1, 'alice');").unwrap();
+        conn.execute("INSERT INTO l VALUES (3, 'charlie');")
+            .unwrap();
+        conn.execute("INSERT INTO r VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO r VALUES (2, 'b');").unwrap();
+
+        let rows = conn
+            .query("SELECT l.name, r.tag FROM l FULL OUTER JOIN r ON l.id = r.l_id;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let vals: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert!(vals.contains(&vec![
+            SqliteValue::Text("alice".to_owned()),
+            SqliteValue::Text("a".to_owned())
+        ]));
+        assert!(vals.contains(&vec![SqliteValue::Null, SqliteValue::Text("b".to_owned())]));
+        assert!(vals.contains(&vec![
+            SqliteValue::Text("charlie".to_owned()),
+            SqliteValue::Null
+        ]));
+    }
+
+    #[test]
+    fn test_full_join_no_matches() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE r (l_id INTEGER);").unwrap();
+        conn.execute("INSERT INTO l VALUES (1);").unwrap();
+        conn.execute("INSERT INTO r VALUES (2);").unwrap();
+
+        let rows = conn
+            .query("SELECT l.id, r.l_id FROM l FULL JOIN r ON l.id = r.l_id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Unmatched left: 1, NULL
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Null]
+        );
+        // Unmatched right: NULL, 2
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Null, SqliteValue::Integer(2)]
+        );
+    }
+
+    #[test]
+    fn test_right_join_using() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE r (id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO l VALUES (1, 'alice');").unwrap();
+        conn.execute("INSERT INTO r VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO r VALUES (2, 'b');").unwrap();
+
+        let rows = conn
+            .query("SELECT l.name, r.tag FROM l RIGHT JOIN r USING (id) ORDER BY r.tag;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("alice".to_owned()),
+                SqliteValue::Text("a".to_owned())
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Null, SqliteValue::Text("b".to_owned())]
+        );
     }
 }
 

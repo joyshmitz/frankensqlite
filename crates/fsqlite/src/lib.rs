@@ -1409,6 +1409,66 @@ mod tests {
     }
 
     #[test]
+    fn right_join_null_extension() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE r (l_id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO l VALUES (1, 'left-a'), (2, 'left-b');")
+            .unwrap();
+        conn.execute("INSERT INTO r VALUES (2, 'right-b'), (3, 'right-c');")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT l.name, r.tag FROM l RIGHT JOIN r ON l.id = r.l_id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let projected: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert!(projected.contains(&vec![
+            SqliteValue::Text("left-b".to_owned()),
+            SqliteValue::Text("right-b".to_owned())
+        ]));
+        assert!(projected.contains(&vec![
+            SqliteValue::Null,
+            SqliteValue::Text("right-c".to_owned())
+        ]));
+    }
+
+    #[test]
+    fn full_outer_join_null_extension() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE r (l_id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO l VALUES (1, 'left-a'), (2, 'left-b');")
+            .unwrap();
+        conn.execute("INSERT INTO r VALUES (2, 'right-b'), (3, 'right-c');")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT l.name, r.tag FROM l FULL OUTER JOIN r ON l.id = r.l_id;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        let projected: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert!(projected.contains(&vec![
+            SqliteValue::Text("left-a".to_owned()),
+            SqliteValue::Null
+        ]));
+        assert!(projected.contains(&vec![
+            SqliteValue::Text("left-b".to_owned()),
+            SqliteValue::Text("right-b".to_owned())
+        ]));
+        assert!(projected.contains(&vec![
+            SqliteValue::Null,
+            SqliteValue::Text("right-c".to_owned())
+        ]));
+    }
+
+    #[test]
     fn aggregate_group_by_sum() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE gs (dept TEXT, salary INTEGER);")
