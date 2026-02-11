@@ -1622,7 +1622,14 @@ pub fn codegen_update(
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
     if let Some(where_expr) = &stmt.where_clause {
-        emit_where_filter(b, where_expr, cursor, table, None, skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            stmt.table.alias.as_deref(),
+            skip_label,
+        );
     }
 
     // Read ALL existing columns into registers.
@@ -1741,7 +1748,14 @@ pub fn codegen_delete(
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
     if let Some(where_expr) = &stmt.where_clause {
-        emit_where_filter(b, where_expr, cursor, table, None, skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            stmt.table.alias.as_deref(),
+            skip_label,
+        );
     }
 
     // Delete at cursor position.

@@ -3568,6 +3568,55 @@ mod tests {
     }
 
     #[test]
+    fn test_update_where_qualified_table_alias_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t_alias_upd (a INTEGER, b TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t_alias_upd VALUES (1, 'one');")
+            .unwrap();
+        conn.execute("INSERT INTO t_alias_upd VALUES (2, 'two');")
+            .unwrap();
+        conn.execute("INSERT INTO t_alias_upd VALUES (3, 'three');")
+            .unwrap();
+
+        conn.execute("UPDATE t_alias_upd AS tt SET b = 'updated' WHERE tt.a > 1;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT b FROM t_alias_upd ORDER BY a;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("one".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Text("updated".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![SqliteValue::Text("updated".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_delete_where_qualified_table_alias_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t_alias_del (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO t_alias_del VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t_alias_del VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t_alias_del VALUES (3);").unwrap();
+
+        conn.execute("DELETE FROM t_alias_del AS tt WHERE tt.a > 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT a FROM t_alias_del ORDER BY a;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
     fn test_select_by_rowid_with_parameter() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
