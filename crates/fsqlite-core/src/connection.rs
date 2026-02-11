@@ -5813,19 +5813,28 @@ mod tests {
     }
 
     #[test]
-    fn test_order_by_position_reference() {
+    fn test_order_by_position_join() {
+        // Uses a JOIN to exercise the fallback sort_rows_by_order_terms path.
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE items (name TEXT, price INTEGER);")
+        conn.execute("CREATE TABLE items (id INTEGER, name TEXT, price INTEGER);")
             .unwrap();
-        conn.execute("INSERT INTO items VALUES ('banana', 2);")
+        conn.execute("CREATE TABLE tags (item_id INTEGER, tag TEXT);")
             .unwrap();
-        conn.execute("INSERT INTO items VALUES ('apple', 3);")
+        conn.execute("INSERT INTO items VALUES (1, 'banana', 2);")
             .unwrap();
-        conn.execute("INSERT INTO items VALUES ('cherry', 1);")
+        conn.execute("INSERT INTO items VALUES (2, 'apple', 3);")
             .unwrap();
-        // ORDER BY 2 means order by second column (price).
+        conn.execute("INSERT INTO items VALUES (3, 'cherry', 1);")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES (1, 'fruit');")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES (2, 'fruit');")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES (3, 'fruit');")
+            .unwrap();
+        // ORDER BY 3 means order by the third result column (price).
         let rows = conn
-            .query("SELECT name, price FROM items ORDER BY 2;")
+            .query("SELECT items.name, tags.tag, items.price FROM items JOIN tags ON items.id = tags.item_id ORDER BY 3;")
             .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("cherry".into()));
@@ -5834,7 +5843,8 @@ mod tests {
     }
 
     #[test]
-    fn test_order_by_position_desc() {
+    fn test_order_by_position_desc_group_by() {
+        // Uses GROUP BY to exercise sort_rows_by_order_terms with position refs.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE scores (player TEXT, points INTEGER);")
             .unwrap();
@@ -5844,9 +5854,11 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO scores VALUES ('C', 20);")
             .unwrap();
-        // ORDER BY 2 DESC, 1 ASC
+        // ORDER BY 2 DESC on a GROUP BY query.
         let rows = conn
-            .query("SELECT player, points FROM scores ORDER BY 2 DESC, 1;")
+            .query(
+                "SELECT player, SUM(points) AS total FROM scores GROUP BY player ORDER BY 2 DESC;",
+            )
             .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(30));
@@ -5855,21 +5867,23 @@ mod tests {
     }
 
     #[test]
-    fn test_order_by_expression() {
+    fn test_order_by_expression_group_by() {
+        // Uses GROUP BY with expression ORDER BY (compound SELECT path).
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE nums (a INTEGER, b INTEGER);")
+        conn.execute("CREATE TABLE data (cat TEXT, val INTEGER);")
             .unwrap();
-        conn.execute("INSERT INTO nums VALUES (1, 10);").unwrap();
-        conn.execute("INSERT INTO nums VALUES (5, 2);").unwrap();
-        conn.execute("INSERT INTO nums VALUES (3, 5);").unwrap();
-        // ORDER BY a + b (expression matching against result columns).
+        conn.execute("INSERT INTO data VALUES ('x', 5);").unwrap();
+        conn.execute("INSERT INTO data VALUES ('x', 3);").unwrap();
+        conn.execute("INSERT INTO data VALUES ('y', 10);").unwrap();
+        conn.execute("INSERT INTO data VALUES ('z', 1);").unwrap();
+        // ORDER BY expression referencing aggregate result column by name.
         let rows = conn
-            .query("SELECT a, b, a + b AS total FROM nums ORDER BY a + b;")
+            .query("SELECT cat, SUM(val) AS total FROM data GROUP BY cat ORDER BY total;")
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(row_values(&rows[0])[2], SqliteValue::Integer(7));
-        assert_eq!(row_values(&rows[1])[2], SqliteValue::Integer(11));
-        assert_eq!(row_values(&rows[2])[2], SqliteValue::Integer(15));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("z".into()));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("x".into()));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Text("y".into()));
     }
 
     #[test]
