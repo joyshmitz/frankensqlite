@@ -895,38 +895,70 @@ impl Connection {
         }
         drop(schema);
 
-        let columns = match &create.body {
-            CreateTableBody::Columns { columns, .. } => columns,
-            CreateTableBody::AsSelect(_) => {
-                return Err(FrankenError::NotImplemented(
-                    "CREATE TABLE AS SELECT is not supported yet".to_owned(),
-                ));
+        match &create.body {
+            CreateTableBody::Columns { columns, .. } => {
+                let col_infos: Vec<ColumnInfo> = columns
+                    .iter()
+                    .map(|col| {
+                        let affinity = col
+                            .type_name
+                            .as_ref()
+                            .map_or('B', |tn| type_name_to_affinity_char(&tn.name));
+                        ColumnInfo {
+                            name: col.name.clone(),
+                            affinity,
+                        }
+                    })
+                    .collect();
+                let num_columns = col_infos.len();
+                let root_page = self.db.borrow_mut().create_table(num_columns);
+                self.schema.borrow_mut().push(TableSchema {
+                    name: table_name,
+                    root_page,
+                    columns: col_infos,
+                    indexes: Vec::new(),
+                });
             }
-        };
-
-        let col_infos: Vec<ColumnInfo> = columns
-            .iter()
-            .map(|col| {
-                let affinity = col
-                    .type_name
-                    .as_ref()
-                    .map_or('B', |tn| type_name_to_affinity_char(&tn.name));
-                ColumnInfo {
-                    name: col.name.clone(),
-                    affinity,
+            CreateTableBody::AsSelect(select_stmt) => {
+                // Execute the SELECT to get result rows.
+                let rows = self.execute_statement(
+                    Statement::Select(*select_stmt.clone()),
+                    None,
+                )?;
+                // Infer column names from the SELECT columns.
+                let col_names = infer_select_column_names(select_stmt);
+                let width = rows.first().map_or(
+                    if col_names.is_empty() { 1 } else { col_names.len() },
+                    |r| r.values().len(),
+                );
+                let col_infos: Vec<ColumnInfo> = (0..width)
+                    .map(|i| ColumnInfo {
+                        name: col_names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("_c{i}")),
+                        affinity: 'B',
+                    })
+                    .collect();
+                let root_page = self.db.borrow_mut().create_table(width);
+                self.schema.borrow_mut().push(TableSchema {
+                    name: table_name,
+                    root_page,
+                    columns: col_infos,
+                    indexes: Vec::new(),
+                });
+                // Insert result rows into the new table.
+                for (i, row) in rows.iter().enumerate() {
+                    let vals: Vec<SqliteValue> = row.values().to_vec();
+                    #[allow(clippy::cast_possible_wrap)]
+                    let rowid = (i + 1) as i64;
+                    let mut db = self.db.borrow_mut();
+                    if let Some(table) = db.get_table_mut(root_page) {
+                        table.insert_row(rowid, vals);
+                    }
                 }
-            })
-            .collect();
-
-        let num_columns = col_infos.len();
-        let root_page = self.db.borrow_mut().create_table(num_columns);
-
-        self.schema.borrow_mut().push(TableSchema {
-            name: table_name,
-            root_page,
-            columns: col_infos,
-            indexes: Vec::new(),
-        });
+            }
+        }
 
         Ok(())
     }
@@ -1435,13 +1467,7 @@ impl Connection {
                 ResultColumn::Expr { expr, .. } => {
                     // The expression must match one of the GROUP BY expressions
                     // (either structurally or as a column reference to a GROUP BY column).
-                    let in_group_by = group_by_exprs.iter().any(|gb| gb == expr)
-                        || expr_col_name(expr).is_some_and(|col_name| {
-                            group_by_exprs.iter().any(|gb| {
-                                expr_col_name(gb)
-                                    .is_some_and(|gc| gc.eq_ignore_ascii_case(col_name))
-                            })
-                        });
+                    let in_group_by = group_by_exprs.iter().any(|gb| exprs_match(gb, expr));
                     if !in_group_by {
                         let label = expr_col_name(expr).unwrap_or("<expression>");
                         return Err(FrankenError::NotImplemented(format!(
@@ -2252,6 +2278,74 @@ enum GroupByColumn {
     },
 }
 
+/// Compare two expressions for structural equality, ignoring source spans.
+fn exprs_match(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Column(ca, _), Expr::Column(cb, _)) => {
+            ca.column.eq_ignore_ascii_case(&cb.column)
+                && ca.table.as_deref().map(str::to_ascii_lowercase)
+                    == cb.table.as_deref().map(str::to_ascii_lowercase)
+        }
+        (Expr::Literal(la, _), Expr::Literal(lb, _)) => la == lb,
+        (
+            Expr::BinaryOp {
+                left: la,
+                op: oa,
+                right: ra,
+                ..
+            },
+            Expr::BinaryOp {
+                left: lb,
+                op: ob,
+                right: rb,
+                ..
+            },
+        ) => oa == ob && exprs_match(la, lb) && exprs_match(ra, rb),
+        (
+            Expr::UnaryOp {
+                op: oa, expr: ea, ..
+            },
+            Expr::UnaryOp {
+                op: ob, expr: eb, ..
+            },
+        ) => oa == ob && exprs_match(ea, eb),
+        (
+            Expr::FunctionCall {
+                name: na,
+                args: aa,
+                distinct: da,
+                ..
+            },
+            Expr::FunctionCall {
+                name: nb,
+                args: ab,
+                distinct: db,
+                ..
+            },
+        ) => {
+            na.eq_ignore_ascii_case(nb)
+                && da == db
+                && match (aa, ab) {
+                    (FunctionArgs::Star, FunctionArgs::Star) => true,
+                    (FunctionArgs::List(la), FunctionArgs::List(lb)) => {
+                        la.len() == lb.len()
+                            && la.iter().zip(lb.iter()).all(|(x, y)| exprs_match(x, y))
+                    }
+                    _ => false,
+                }
+        }
+        (
+            Expr::IsNull {
+                expr: ea, not: na, ..
+            },
+            Expr::IsNull {
+                expr: eb, not: nb, ..
+            },
+        ) => na == nb && exprs_match(ea, eb),
+        _ => false,
+    }
+}
+
 /// Resolve a column name from an expression (simple Expr::Column case).
 fn expr_col_name(expr: &Expr) -> Option<&str> {
     match expr {
@@ -2579,6 +2673,32 @@ fn numeric_mul(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     }
 }
 
+fn numeric_div(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+    match (a, b) {
+        (SqliteValue::Integer(_), SqliteValue::Integer(0)) => SqliteValue::Null,
+        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
+            SqliteValue::Integer(ai.wrapping_div(*bi))
+        }
+        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af / bf),
+        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 / bf),
+        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af / *bi as f64),
+        _ => SqliteValue::Null,
+    }
+}
+
+fn numeric_mod(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+    match (a, b) {
+        (SqliteValue::Integer(_), SqliteValue::Integer(0)) => SqliteValue::Null,
+        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
+            SqliteValue::Integer(ai.wrapping_rem(*bi))
+        }
+        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af % bf),
+        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 % bf),
+        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af % *bi as f64),
+        _ => SqliteValue::Null,
+    }
+}
+
 /// Compare two `SqliteValue`s for ordering (used by HAVING comparisons).
 fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
     match (a, b) {
@@ -2751,14 +2871,9 @@ fn sort_rows_by_order_terms(
     let resolved: Vec<(usize, bool)> = order_by
         .iter()
         .map(|term| {
-            let col_name = expr_col_name(&term.expr).ok_or_else(|| {
-                FrankenError::NotImplemented(
-                    "only column references are supported in GROUP BY ORDER BY".to_owned(),
-                )
-            })?;
-            let idx = columns
-                .iter()
-                .position(|c| match c {
+            // Try column reference first (alias or column name match).
+            let idx = if let Some(col_name) = expr_col_name(&term.expr) {
+                columns.iter().position(|c| match c {
                     ResultColumn::Expr {
                         expr: Expr::Column(r, _),
                         ..
@@ -2768,11 +2883,18 @@ fn sort_rows_by_order_terms(
                     } => alias.eq_ignore_ascii_case(col_name),
                     _ => false,
                 })
-                .ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "ORDER BY column '{col_name}' not found in SELECT list"
-                    ))
-                })?;
+            } else {
+                // Expression ORDER BY: match structurally against result columns.
+                columns.iter().position(|c| match c {
+                    ResultColumn::Expr { expr, .. } => exprs_match(&term.expr, expr),
+                    _ => false,
+                })
+            };
+            let idx = idx.ok_or_else(|| {
+                FrankenError::Internal(
+                    "ORDER BY expression not found in SELECT list".to_owned(),
+                )
+            })?;
             let desc = matches!(term.direction, Some(SortDirection::Desc));
             Ok((idx, desc))
         })
@@ -4328,6 +4450,8 @@ fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) ->
         BinaryOp::Add => numeric_add(left, right),
         BinaryOp::Subtract => numeric_sub(left, right),
         BinaryOp::Multiply => numeric_mul(left, right),
+        BinaryOp::Divide => numeric_div(left, right),
+        BinaryOp::Modulo => numeric_mod(left, right),
         BinaryOp::Concat => {
             let l = sqlite_value_to_text(left);
             let r = sqlite_value_to_text(right);
@@ -5593,7 +5717,8 @@ mod tests {
     #[test]
     fn test_group_by_arithmetic_expression() {
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10);").unwrap();
         conn.execute("INSERT INTO t VALUES (2, 20);").unwrap();
         conn.execute("INSERT INTO t VALUES (3, 10);").unwrap();
@@ -5635,7 +5760,8 @@ mod tests {
     #[test]
     fn test_group_by_function_expression() {
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (name TEXT, score INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t (name TEXT, score INTEGER);")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES ('Alice', 90);").unwrap();
         conn.execute("INSERT INTO t VALUES ('Bob', 80);").unwrap();
         conn.execute("INSERT INTO t VALUES ('Ann', 70);").unwrap();
@@ -5676,7 +5802,8 @@ mod tests {
     #[test]
     fn test_group_by_expression_with_aggregate_sum() {
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 10);").unwrap();
         conn.execute("INSERT INTO t VALUES (2, 20);").unwrap();
         conn.execute("INSERT INTO t VALUES (3, 30);").unwrap();
