@@ -14,10 +14,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fsqlite_ast::{
-    AlterTableAction, BinaryOp, ColumnRef, CompoundOp, CreateTableBody, Distinctness,
-    DropObjectType, Expr, FunctionArgs, InSet, JoinConstraint, JoinKind, LikeOp, LimitClause,
-    Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody, SelectCore,
-    SelectStatement, SortDirection, Span, Statement, TableOrSubquery, UnaryOp,
+    AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
+    Distinctness, DropObjectType, Expr, FunctionArgs, InSet, JoinConstraint, JoinKind, LikeOp,
+    LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody,
+    SelectCore, SelectStatement, SortDirection, Span, Statement, TableOrSubquery, UnaryOp,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
@@ -428,6 +428,10 @@ pub struct Connection {
     /// Connection-scoped PRAGMA state used by the E2E harness for fairness knobs
     /// (journal_mode, synchronous, cache_size, page_size).
     pragma_state: RefCell<fsqlite_vdbe::pragma::ConnectionPragmaState>,
+    /// Maps table name (lowercased) to the 0-based column index of the
+    /// `INTEGER PRIMARY KEY` column, which is an alias for `rowid`.
+    /// Used by fallback paths (GROUP BY, JOIN) to resolve rowid/\_rowid\_/oid.
+    rowid_alias_columns: RefCell<HashMap<String, usize>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -476,6 +480,7 @@ impl Connection {
             concurrent_txn: RefCell::new(false),
             concurrent_mode_default: RefCell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
+            rowid_alias_columns: RefCell::new(HashMap::new()),
         };
         conn.apply_current_journal_mode_to_pager()?;
         conn.load_persisted_state_if_present()?;
@@ -599,6 +604,16 @@ impl Connection {
                         Some(&self.func_registry),
                         Some(&build_expression_postprocess(&rewritten)),
                     )?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    Ok(rows)
+                } else if has_group_by(select) && has_joins(select) {
+                    // GROUP BY + JOIN: materialize the join as a temp table,
+                    // then GROUP BY on that temp table.
+                    let rewritten = self.rewrite_in_subqueries_select(select)?;
+                    let mut rows =
+                        self.execute_group_by_join_select(&rewritten, params)?;
                     if distinct {
                         dedup_rows(&mut rows);
                     }
@@ -958,6 +973,23 @@ impl Connection {
                         }
                     })
                     .collect();
+                // Detect INTEGER PRIMARY KEY column (rowid alias).
+                let rowid_col_idx = columns.iter().enumerate().find_map(|(i, col)| {
+                    let is_integer = col
+                        .type_name
+                        .as_ref()
+                        .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+                    let is_pk = col
+                        .constraints
+                        .iter()
+                        .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
+                    (is_integer && is_pk).then_some(i)
+                });
+                if let Some(idx) = rowid_col_idx {
+                    self.rowid_alias_columns
+                        .borrow_mut()
+                        .insert(table_name.to_ascii_lowercase(), idx);
+                }
                 let num_columns = col_infos.len();
                 let root_page = self.db.borrow_mut().create_table(num_columns);
                 self.schema.borrow_mut().push(TableSchema {
@@ -1027,6 +1059,9 @@ impl Connection {
                         schema.remove(idx);
                         drop(schema);
                         self.db.borrow_mut().destroy_table(root_page);
+                        self.rowid_alias_columns
+                            .borrow_mut()
+                            .remove(&obj_name.to_ascii_lowercase());
                         Ok(())
                     }
                     None => {
@@ -1704,11 +1739,221 @@ impl Connection {
         builder.finish()
     }
 
-    /// Execute a GROUP BY aggregate SELECT via post-execution processing.
-    ///
-    /// 1. Compile and execute a `SELECT *` scan (no aggregates)
-    /// 2. Group rows by GROUP BY key columns
-    /// 3. Compute aggregates per group
+    /// Handle GROUP BY + JOIN by materializing the join first, then applying
+    /// GROUP BY aggregation directly on the joined rows.
+    #[allow(clippy::too_many_lines)]
+    fn execute_group_by_join_select(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        // Step 1: Execute the JOIN (SELECT * without GROUP BY/HAVING).
+        let mut join_select = select.clone();
+        if let SelectCore::Select {
+            ref mut group_by,
+            ref mut having,
+            ref mut columns,
+            ..
+        } = join_select.body.select
+        {
+            *group_by = Vec::new();
+            *having = None;
+            *columns = vec![ResultColumn::Star];
+        }
+        join_select.limit = None;
+        join_select.order_by = Vec::new();
+
+        let join_rows = self.execute_join_select(&join_select, params)?;
+
+        // Step 2: Build a col_map with original table labels.
+        let col_map = self.build_join_col_map(select);
+
+        // Step 3: Extract GROUP BY expressions and result columns.
+        let SelectCore::Select {
+            columns,
+            group_by: group_by_exprs,
+            having,
+            ..
+        } = &select.body.select
+        else {
+            return Err(FrankenError::NotImplemented(
+                "GROUP BY JOIN on non-SELECT core".to_owned(),
+            ));
+        };
+        let having_expr = having.as_deref();
+
+        // Step 4: Parse result descriptors.
+        let result_descriptors: Vec<GroupByColumn> = columns
+            .iter()
+            .map(|col| match col {
+                ResultColumn::Expr {
+                    expr: Expr::FunctionCall { name, args, .. },
+                    ..
+                } if is_agg_fn(name) => {
+                    let func = name.to_ascii_lowercase();
+                    let arg_col = match args {
+                        FunctionArgs::Star => {
+                            if func == "count" {
+                                None
+                            } else {
+                                return Err(FrankenError::NotImplemented(format!(
+                                    "{func}(*) is not supported in GROUP BY+JOIN path"
+                                )));
+                            }
+                        }
+                        FunctionArgs::List(exprs) if exprs.is_empty() => {
+                            if func == "count" {
+                                None
+                            } else {
+                                return Err(FrankenError::NotImplemented(format!(
+                                    "{func}() with no args is not supported in GROUP BY+JOIN path"
+                                )));
+                            }
+                        }
+                        FunctionArgs::List(exprs) if exprs.len() == 1 => {
+                            let col_name = expr_col_name(&exprs[0]).ok_or_else(|| {
+                                FrankenError::NotImplemented(format!(
+                                    "non-column argument to aggregate {func}() in GROUP BY+JOIN"
+                                ))
+                            })?;
+                            let table_prefix = match &exprs[0] {
+                                Expr::Column(cr, _) => cr.table.as_deref(),
+                                _ => None,
+                            };
+                            let idx = find_col_in_map(&col_map, table_prefix, col_name)?;
+                            Some(idx)
+                        }
+                        FunctionArgs::List(_) => {
+                            return Err(FrankenError::NotImplemented(format!(
+                                "{func}() with multiple args is not supported in GROUP BY+JOIN path"
+                            )));
+                        }
+                    };
+                    Ok(GroupByColumn::Agg {
+                        name: func,
+                        arg_col,
+                    })
+                }
+                ResultColumn::Expr { expr, .. } => Ok(GroupByColumn::Plain(Box::new(expr.clone()))),
+                ResultColumn::Star | ResultColumn::TableStar(_) => Err(
+                    FrankenError::NotImplemented("SELECT * with GROUP BY+JOIN".to_owned()),
+                ),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Step 5: Group the joined rows by evaluating GROUP BY expressions.
+        let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
+        for row in &join_rows {
+            let key: Vec<SqliteValue> = group_by_exprs
+                .iter()
+                .map(|expr| {
+                    eval_join_expr(expr, row.values(), &col_map).unwrap_or(SqliteValue::Null)
+                })
+                .collect();
+            if let Some(group) = groups.iter_mut().find(|(k, _)| k == &key) {
+                group.1.push(row.values().to_vec());
+            } else {
+                groups.push((key, vec![row.values().to_vec()]));
+            }
+        }
+
+        // Step 6: Build result rows from groups.
+        let col_names: Vec<String> = col_map.iter().map(|(_, c)| c.clone()).collect();
+        let mut result = Vec::with_capacity(groups.len());
+        for (_key, group_rows) in &groups {
+            let mut values = Vec::with_capacity(result_descriptors.len());
+            for desc in &result_descriptors {
+                match desc {
+                    GroupByColumn::Plain(expr) => {
+                        let val = group_rows.first().map_or(SqliteValue::Null, |r| {
+                            eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
+                        });
+                        values.push(val);
+                    }
+                    GroupByColumn::Agg { name, arg_col } => {
+                        if name == "count" && arg_col.is_none() {
+                            #[allow(clippy::cast_possible_wrap)]
+                            values.push(SqliteValue::Integer(group_rows.len() as i64));
+                        } else {
+                            let Some(idx) = *arg_col else {
+                                return Err(FrankenError::NotImplemented(format!(
+                                    "aggregate {name} requires a column argument"
+                                )));
+                            };
+                            let agg_values: Vec<&SqliteValue> = group_rows
+                                .iter()
+                                .filter_map(|r| r.get(idx))
+                                .filter(|v| !matches!(v, SqliteValue::Null))
+                                .collect();
+                            values.push(compute_aggregate(name, &agg_values));
+                        }
+                    }
+                }
+            }
+            if let Some(having) = having_expr {
+                if !evaluate_having_predicate(
+                    having,
+                    &values,
+                    &result_descriptors,
+                    columns,
+                    group_rows,
+                    &col_names,
+                ) {
+                    continue;
+                }
+            }
+            result.push(Row { values });
+        }
+
+        // Step 7: ORDER BY and LIMIT.
+        if !select.order_by.is_empty() {
+            sort_rows_by_order_terms(&mut result, &select.order_by, columns)?;
+        }
+        if let Some(ref limit_clause) = select.limit {
+            apply_limit_offset_postprocess(&mut result, limit_clause);
+        }
+
+        Ok(result)
+    }
+
+    /// Build a col_map with original table labels for a SELECT with JOINs.
+    fn build_join_col_map(&self, select: &SelectStatement) -> Vec<(String, String)> {
+        let mut col_map = Vec::new();
+        let schema = self.schema.borrow();
+        if let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        {
+            if let TableOrSubquery::Table { name, alias, .. } = &from.source {
+                let label = alias.as_deref().unwrap_or(&name.name);
+                if let Some(ts) = schema
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&name.name))
+                {
+                    for c in &ts.columns {
+                        col_map.push((label.to_owned(), c.name.clone()));
+                    }
+                }
+            }
+            for join in &from.joins {
+                if let TableOrSubquery::Table { name, alias, .. } = &join.table {
+                    let label = alias.as_deref().unwrap_or(&name.name);
+                    if let Some(ts) = schema
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(&name.name))
+                    {
+                        for c in &ts.columns {
+                            col_map.push((label.to_owned(), c.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        col_map
+    }
+
+    /// Execute a GROUP BY aggregate SELECT via post-execution processing:
+    /// scan all rows, group by key columns, compute aggregates per group.
     #[allow(clippy::too_many_lines)]
     fn execute_group_by_select(
         &self,
@@ -1778,6 +2023,14 @@ impl Connection {
             .iter()
             .map(|c| (effective_label.to_owned(), c.name.clone()))
             .collect();
+
+        // Resolve the INTEGER PRIMARY KEY column index so that rowid/_rowid_/oid
+        // aliases can be resolved by the expression evaluator.
+        let rowid_col_idx = self
+            .rowid_alias_columns
+            .borrow()
+            .get(&table_name.to_ascii_lowercase())
+            .copied();
 
         // Check if any result column is Star/TableStar — if so, we relax the
         // "must appear in GROUP BY" validation (SQLite allows this).
@@ -6922,6 +7175,112 @@ mod tests {
             row_values(&rows[1]),
             vec![SqliteValue::Integer(2), SqliteValue::Text("y".to_owned())]
         );
+    }
+
+    // ── GROUP BY + JOIN tests (bd-29mz) ──────
+
+    #[test]
+    fn test_group_by_with_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE customers (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO customers VALUES (1, 'alice');")
+            .unwrap();
+        conn.execute("INSERT INTO customers VALUES (2, 'bob');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 1, 100);")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (2, 1, 200);")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (3, 2, 50);")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT customers.name, SUM(orders.amount) FROM customers INNER JOIN orders ON customers.id = orders.customer_id GROUP BY customers.name ORDER BY customers.name;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("alice".to_owned()),
+                SqliteValue::Integer(300)
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Text("bob".to_owned()),
+                SqliteValue::Integer(50)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_group_by_with_join_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dept (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE emp (id INTEGER, dept_id INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO dept VALUES (1, 'eng');").unwrap();
+        conn.execute("INSERT INTO dept VALUES (2, 'sales');")
+            .unwrap();
+        conn.execute("INSERT INTO emp VALUES (1, 1);").unwrap();
+        conn.execute("INSERT INTO emp VALUES (2, 1);").unwrap();
+        conn.execute("INSERT INTO emp VALUES (3, 1);").unwrap();
+        conn.execute("INSERT INTO emp VALUES (4, 2);").unwrap();
+
+        let rows = conn
+            .query("SELECT dept.name, COUNT(*) FROM dept INNER JOIN emp ON dept.id = emp.dept_id GROUP BY dept.name ORDER BY dept.name;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("eng".to_owned()), SqliteValue::Integer(3)]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Text("sales".to_owned()),
+                SqliteValue::Integer(1)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_group_by_with_left_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE categories (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE products (id INTEGER, cat_id INTEGER, price INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO categories VALUES (1, 'food');")
+            .unwrap();
+        conn.execute("INSERT INTO categories VALUES (2, 'toys');")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES (1, 1, 10);")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES (2, 1, 20);")
+            .unwrap();
+        // Category 'toys' has no products.
+
+        let rows = conn
+            .query("SELECT categories.name, COUNT(products.id) FROM categories LEFT JOIN products ON categories.id = products.cat_id GROUP BY categories.name ORDER BY categories.name;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("food".to_owned()),
+                SqliteValue::Integer(2)
+            ]
+        );
+        // LEFT JOIN: toys appears but with COUNT = 0 (all NULLs from products).
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("toys".to_owned()));
+        // COUNT of NULL product IDs should be 0.
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(0));
     }
 
     // ── LIKE/CASE/CAST expression evaluation tests (bd-3pss) ──────
