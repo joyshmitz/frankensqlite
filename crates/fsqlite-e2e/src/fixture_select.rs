@@ -927,12 +927,12 @@ mod tests {
             ..Default::default()
         };
         let result = select(&m, &filter);
-        if let SelectionResult::NoMatch { reason } = result {
-            assert!(reason.contains("nonexistent"));
-            assert!(reason.contains("tag=rare"));
-        } else {
-            panic!("expected NoMatch");
-        }
+        let SelectionResult::NoMatch { reason } = result else {
+            assert!(false, "expected NoMatch, got {result:?}");
+            return;
+        };
+        assert!(reason.contains("nonexistent"));
+        assert!(reason.contains("tag=rare"));
     }
 
     #[test]
