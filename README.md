@@ -136,7 +136,8 @@ This README describes the target end-state architecture. The runnable code today
 
 - Public entry point: `fsqlite::Connection` (`crates/fsqlite/src/lib.rs`), implemented by `fsqlite-core::Connection` (`crates/fsqlite-core/src/connection.rs`).
 - Execution backend: table storage is backed by `fsqlite-vdbe::engine::MemDatabase` and executed via `fsqlite-vdbe::VdbeEngine` (`crates/fsqlite-vdbe/src/engine.rs`).
-- Persistence: for non-`:memory:` paths, `Connection` persists by writing/loading a SQL dump of schema + data (not WAL/file-format persistence yet).
+- Persistence: for non-`:memory:` paths, `Connection` snapshots `MemDatabase` to a SQLite-format file via `compat_persist` and reloads from that snapshot on open. This is full-file snapshot persistence, not WAL/incremental pager-backed persistence yet.
+- Extensions: extension crates are present and feature-gated in the workspace/public API crate, but the runtime connection path is still centered on `fsqlite-func` registrations; extension virtual table/function wiring is still in progress.
 - Storage stack status: `fsqlite-vfs`, `fsqlite-pager`, `fsqlite-wal`, `fsqlite-mvcc`, and `fsqlite-btree` exist and have extensive tests, and `fsqlite-vdbe` has early "storage cursor" support behind a flag, but `Connection` is not yet wired to use the pager/WAL/B-tree stack as its default backend (see Phase 5+ below).
 
 ---
@@ -2450,7 +2451,7 @@ FrankenSQLite deliberately omits several components of the C SQLite ecosystem. E
 
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
 - **No C API.** The initial release targets Rust consumers. A C-compatible FFI wrapper is a future goal.
-- **No loadable extensions.** All extensions are compiled in. Dynamic `dlopen`-based loading is not planned.
+- **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
 - **No WASM target yet.** The VFS trait abstracts all OS operations, and a `WasmVfs` implementation is planned but not yet built. Browser/edge deployment via WebAssembly is a future goal.
 - **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. ARC eviction and GC mitigate this but introduce background work.
 - **No row-level locking.** Two transactions modifying different rows on the same page can still conflict at the page level. The safe write-merge ladder can resolve commuting conflicts, but non-commuting conflicts still abort/retry. This is a deliberate tradeoff for file format compatibility.
