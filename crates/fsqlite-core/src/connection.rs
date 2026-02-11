@@ -1723,12 +1723,14 @@ impl Connection {
             ));
         }
 
-        // Find the table name from the FROM clause.
-        let table_name = match &select.body.select {
+        // Find the table name/alias from the FROM clause.
+        let (table_name, table_alias) = match &select.body.select {
             SelectCore::Select {
                 from: Some(from), ..
             } => match &from.source {
-                fsqlite_ast::TableOrSubquery::Table { name, .. } => name.name.clone(),
+                fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => {
+                    (name.name.clone(), alias.clone())
+                }
                 _ => {
                     return Err(FrankenError::NotImplemented(
                         "GROUP BY with non-table source".to_owned(),
@@ -1775,7 +1777,12 @@ impl Connection {
                         alias: None,
                     })
                     .collect::<Vec<_>>(),
-                ResultColumn::TableStar(tbl) if tbl.eq_ignore_ascii_case(&table_name) => {
+                ResultColumn::TableStar(tbl)
+                    if tbl.eq_ignore_ascii_case(&table_name)
+                        || table_alias
+                            .as_ref()
+                            .is_some_and(|alias| tbl.eq_ignore_ascii_case(alias)) =>
+                {
                     table_schema
                         .columns
                         .iter()
@@ -2504,26 +2511,38 @@ fn rewrite_in_select_core(core: &mut SelectCore, conn: &Connection) -> Result<()
 }
 
 /// Recursively walk an expression tree and eagerly evaluate subquery
-/// expressions: `IN (SELECT ...)`, `EXISTS (SELECT ...)`, and scalar
-/// subqueries `(SELECT ...)`.
+/// expressions: `EXISTS (SELECT ...)` and scalar `(SELECT ...)`.
+///
+/// When `rewrite_in_subqueries` is true, also eagerly evaluate
+/// `IN (SELECT ...)` and `IN table` into literal lists.  When false,
+/// leave those forms intact so the VDBE codegen can handle them via
+/// runtime probe scans.
 #[allow(clippy::too_many_lines)]
-fn rewrite_in_expr(expr: &mut Expr, conn: &Connection) -> Result<()> {
+fn rewrite_in_expr(
+    expr: &mut Expr,
+    conn: &Connection,
+    rewrite_in_subqueries: bool,
+) -> Result<()> {
     match expr {
         Expr::In {
             set, expr: inner, ..
         } => {
-            rewrite_in_expr(inner, conn)?;
-            if let InSet::Subquery(sub) = set {
-                let rows = conn.execute_statement(Statement::Select(*sub.clone()), Some(&[]))?;
-                let literals: Vec<Expr> = rows
-                    .into_iter()
-                    .filter_map(|row| row.values.into_iter().next())
-                    .map(value_to_literal_expr)
-                    .collect();
-                *set = InSet::List(literals);
-            } else if let InSet::List(exprs) = set {
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries)?;
+            if rewrite_in_subqueries {
+                if let InSet::Subquery(sub) = set {
+                    let rows =
+                        conn.execute_statement(Statement::Select(*sub.clone()), Some(&[]))?;
+                    let literals: Vec<Expr> = rows
+                        .into_iter()
+                        .filter_map(|row| row.values.into_iter().next())
+                        .map(value_to_literal_expr)
+                        .collect();
+                    *set = InSet::List(literals);
+                }
+            }
+            if let InSet::List(exprs) = set {
                 for e in exprs.iter_mut() {
-                    rewrite_in_expr(e, conn)?;
+                    rewrite_in_expr(e, conn, rewrite_in_subqueries)?;
                 }
             }
         }
@@ -6713,6 +6732,28 @@ mod tests {
         assert_eq!(
             row_values(&rows[1]),
             vec![SqliteValue::Integer(3), SqliteValue::Text("z".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_group_by_select_table_star_with_from_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'y');").unwrap();
+
+        let rows = conn
+            .query("SELECT tt.* FROM t AS tt GROUP BY a, b ORDER BY a, b;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Text("x".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Text("y".to_owned())]
         );
     }
 
