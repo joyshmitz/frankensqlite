@@ -14,10 +14,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fsqlite_ast::{
-    BinaryOp, CompoundOp, CreateTableBody, Distinctness, DropObjectType, Expr, FunctionArgs, InSet,
-    JoinConstraint, JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm,
-    PlaceholderType, ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection,
-    Statement, TableOrSubquery, UnaryOp,
+    AlterTableAction, BinaryOp, CompoundOp, CreateTableBody, Distinctness, DropObjectType, Expr,
+    FunctionArgs, InSet, JoinConstraint, JoinKind, LikeOp, LimitClause, Literal, NullsOrder,
+    OrderingTerm, PlaceholderType, ResultColumn, SelectBody, SelectCore, SelectStatement,
+    SortDirection, Statement, TableOrSubquery, UnaryOp,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
@@ -687,8 +687,13 @@ impl Connection {
                 self.persist_if_needed()?;
                 Ok(Vec::new())
             }
+            Statement::AlterTable(ref alter) => {
+                self.execute_alter_table(alter)?;
+                self.persist_if_needed()?;
+                Ok(Vec::new())
+            }
             _ => Err(FrankenError::NotImplemented(
-                "only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, transaction control, and PRAGMA are supported".to_owned(),
+                "only SELECT, INSERT, UPDATE, DELETE, CREATE/DROP/ALTER TABLE, transaction control, and PRAGMA are supported".to_owned(),
             )),
         }
     }
@@ -996,6 +1001,74 @@ impl Connection {
                         name: table_name.clone(),
                     })
                 }
+            }
+        }
+    }
+
+    /// Execute an ALTER TABLE statement.
+    fn execute_alter_table(&self, alter: &fsqlite_ast::AlterTableStatement) -> Result<()> {
+        let table_name = &alter.table.name;
+        match &alter.action {
+            AlterTableAction::RenameTo(new_name) => {
+                let mut schema = self.schema.borrow_mut();
+                let table = schema
+                    .iter_mut()
+                    .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                    .ok_or_else(|| FrankenError::NoSuchTable {
+                        name: table_name.clone(),
+                    })?;
+                table.name.clone_from(new_name);
+                Ok(())
+            }
+            AlterTableAction::RenameColumn { old, new } => {
+                let mut schema = self.schema.borrow_mut();
+                let table = schema
+                    .iter_mut()
+                    .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                    .ok_or_else(|| FrankenError::NoSuchTable {
+                        name: table_name.clone(),
+                    })?;
+                let col = table
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name.eq_ignore_ascii_case(old))
+                    .ok_or_else(|| FrankenError::Internal(format!("no such column: {old}")))?;
+                col.name.clone_from(new);
+                Ok(())
+            }
+            AlterTableAction::AddColumn(col_def) => {
+                let affinity = col_def
+                    .type_name
+                    .as_ref()
+                    .map_or('B', |tn| type_name_to_affinity_char(&tn.name));
+                let mut schema = self.schema.borrow_mut();
+                let table = schema
+                    .iter_mut()
+                    .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                    .ok_or_else(|| FrankenError::NoSuchTable {
+                        name: table_name.clone(),
+                    })?;
+                table.columns.push(ColumnInfo {
+                    name: col_def.name.clone(),
+                    affinity,
+                });
+                Ok(())
+            }
+            AlterTableAction::DropColumn(col_name) => {
+                let mut schema = self.schema.borrow_mut();
+                let table = schema
+                    .iter_mut()
+                    .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                    .ok_or_else(|| FrankenError::NoSuchTable {
+                        name: table_name.clone(),
+                    })?;
+                let col_idx = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                    .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
+                table.columns.remove(col_idx);
+                Ok(())
             }
         }
     }
@@ -5109,6 +5182,88 @@ mod tests {
         let rows = conn.query("SELECT x FROM t_tx_drop;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(7)]);
+    }
+
+    // ── ALTER TABLE tests (bd-2yrj) ───────────────────────────────
+
+    #[test]
+    fn test_alter_table_add_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+
+        conn.execute("ALTER TABLE t ADD COLUMN b TEXT;").unwrap();
+
+        // Existing rows should have NULL for the new column.
+        let rows = conn.query("SELECT a, b FROM t ORDER BY a;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Null);
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Null);
+
+        // New inserts should include both columns.
+        conn.execute("INSERT INTO t VALUES (3, 'hello');").unwrap();
+        let rows = conn.query("SELECT a, b FROM t WHERE a = 3;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+    }
+
+    #[test]
+    fn test_alter_table_rename_to() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE old_name (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO old_name VALUES (42);").unwrap();
+
+        conn.execute("ALTER TABLE old_name RENAME TO new_name;")
+            .unwrap();
+
+        // Old name should fail.
+        let err = conn.query("SELECT x FROM old_name;");
+        assert!(err.is_err());
+
+        // New name should work.
+        let rows = conn.query("SELECT x FROM new_name;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (10);").unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn.query("SELECT new_col FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+    }
+
+    #[test]
+    fn test_alter_table_drop_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT, c REAL);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x', 3.14);")
+            .unwrap();
+
+        conn.execute("ALTER TABLE t DROP COLUMN b;").unwrap();
+
+        // Should only have a and c now.
+        let rows = conn.query("SELECT a, c FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_alter_table_nonexistent_table_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn.execute("ALTER TABLE nosuch ADD COLUMN x INTEGER;");
+        assert!(err.is_err());
     }
 
     #[test]
