@@ -14,9 +14,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fsqlite_ast::{
-    BinaryOp, CompoundOp, CreateTableBody, Distinctness, Expr, FunctionArgs, InSet, LikeOp,
-    LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody,
-    SelectCore, SelectStatement, SortDirection, Statement, UnaryOp,
+    BinaryOp, CompoundOp, CreateTableBody, Distinctness, Expr, FunctionArgs, InSet, JoinConstraint,
+    JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType,
+    ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection, Statement,
+    TableOrSubquery, UnaryOp,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
@@ -580,6 +581,12 @@ impl Connection {
                     Ok(rows)
                 } else if has_group_by(select) {
                     let mut rows = self.execute_group_by_select(select, params)?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    Ok(rows)
+                } else if has_joins(select) {
+                    let mut rows = self.execute_join_select(select, params)?;
                     if distinct {
                         dedup_rows(&mut rows);
                     }
@@ -1546,6 +1553,163 @@ impl Connection {
         Ok(result)
     }
 
+    /// Execute a SELECT with JOINs using in-memory nested-loop evaluation.
+    ///
+    /// Loads each table's rows independently, then combines them according to
+    /// the join type and constraint. WHERE, ORDER BY, LIMIT/OFFSET, and column
+    /// projection are applied to the combined result.
+    #[allow(clippy::too_many_lines)]
+    fn execute_join_select(
+        &self,
+        select: &SelectStatement,
+        _params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause,
+            ..
+        } = &select.body.select
+        else {
+            return Err(FrankenError::NotImplemented(
+                "JOIN on non-SELECT core".to_owned(),
+            ));
+        };
+
+        // ── 1. Resolve all table sources (primary + joined tables) ──
+        let schema = self.schema.borrow();
+        let mut table_sources: Vec<JoinTableSource> = Vec::with_capacity(1 + from.joins.len());
+
+        // Primary table.
+        let (primary_name, primary_alias) = resolve_table_name(&from.source)?;
+        let primary_schema = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&primary_name))
+            .ok_or_else(|| FrankenError::Internal(format!("table not found: {primary_name}")))?;
+        let primary_col_names: Vec<String> = primary_schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        table_sources.push(JoinTableSource {
+            table_name: primary_name.clone(),
+            alias: primary_alias,
+            col_names: primary_col_names,
+        });
+
+        // Joined tables.
+        for join in &from.joins {
+            let (name, alias) = resolve_table_name(&join.table)?;
+            let join_schema = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {name}")))?;
+            let col_names: Vec<String> =
+                join_schema.columns.iter().map(|c| c.name.clone()).collect();
+            table_sources.push(JoinTableSource {
+                table_name: name,
+                alias,
+                col_names,
+            });
+        }
+        drop(schema);
+
+        // ── 2. Build the combined column map ──
+        // col_map entries: (table_label, col_name, combined_index)
+        let mut col_map: Vec<(String, String)> = Vec::new();
+        for src in &table_sources {
+            let label = src.alias.as_deref().unwrap_or(&src.table_name);
+            for col_name in &src.col_names {
+                col_map.push((label.to_owned(), col_name.clone()));
+            }
+        }
+
+        // ── 3. Load each table's raw rows ──
+        let mut table_rows: Vec<Vec<Vec<SqliteValue>>> = Vec::with_capacity(table_sources.len());
+        for src in &table_sources {
+            let scan_sql = format!("SELECT * FROM {}", src.table_name);
+            let rows = self.query(&scan_sql)?;
+            table_rows.push(rows.iter().map(|r| r.values().to_vec()).collect());
+        }
+
+        // ── 4. Perform joins ──
+        // Start with primary table rows as "left" side.
+        let primary_width = table_sources[0].col_names.len();
+        let mut combined: Vec<Vec<SqliteValue>> = table_rows[0]
+            .iter()
+            .map(|row| row[..primary_width].to_vec())
+            .collect();
+
+        for (join_idx, join) in from.joins.iter().enumerate() {
+            let right_rows = &table_rows[join_idx + 1];
+            let right_width = table_sources[join_idx + 1].col_names.len();
+            let current_width: usize = table_sources[..=join_idx]
+                .iter()
+                .map(|s| s.col_names.len())
+                .sum();
+
+            combined = execute_single_join(
+                &combined,
+                right_rows,
+                right_width,
+                current_width,
+                join.join_type.kind,
+                join.constraint.as_ref(),
+                &col_map,
+            )?;
+        }
+
+        // ── 5. Apply WHERE filter ──
+        if let Some(where_expr) = where_clause {
+            combined.retain(|row| eval_join_predicate(where_expr, row, &col_map).unwrap_or(false));
+        }
+
+        // ── 6. Project result columns ──
+        let mut result: Vec<Row> = combined
+            .iter()
+            .map(|row| {
+                let mut values = Vec::new();
+                for col in columns {
+                    match col {
+                        ResultColumn::Star => {
+                            // All columns from all tables.
+                            values.extend(row.iter().cloned());
+                        }
+                        ResultColumn::TableStar(table_name) => {
+                            // All columns from a specific table.
+                            let mut offset = 0;
+                            for src in &table_sources {
+                                let label = src.alias.as_deref().unwrap_or(&src.table_name);
+                                if label.eq_ignore_ascii_case(table_name) {
+                                    let width = src.col_names.len();
+                                    values.extend(row[offset..offset + width].iter().cloned());
+                                    break;
+                                }
+                                offset += src.col_names.len();
+                            }
+                        }
+                        ResultColumn::Expr { .. } => {
+                            values.push(project_join_column(col, row, &col_map));
+                        }
+                    }
+                }
+                Row { values }
+            })
+            .collect();
+
+        // ── 7. Post-process: ORDER BY ──
+        if !select.order_by.is_empty() {
+            sort_rows_by_order_terms(&mut result, &select.order_by, columns)?;
+        }
+
+        // ── 8. Post-process: LIMIT / OFFSET ──
+        if let Some(ref limit_clause) = select.limit {
+            apply_limit_offset_postprocess(&mut result, limit_clause);
+        }
+
+        Ok(result)
+    }
+
     /// Compile an INSERT through the VDBE codegen.
     fn compile_table_insert(&self, insert: &fsqlite_ast::InsertStatement) -> Result<VdbeProgram> {
         let schema = self.schema.borrow();
@@ -1722,6 +1886,14 @@ fn has_group_by(select: &SelectStatement) -> bool {
     matches!(
         &select.body.select,
         SelectCore::Select { group_by, .. } if !group_by.is_empty()
+    )
+}
+
+/// Check whether a table-backed SELECT has JOINs in the FROM clause.
+fn has_joins(select: &SelectStatement) -> bool {
+    matches!(
+        &select.body.select,
+        SelectCore::Select { from: Some(from), .. } if !from.joins.is_empty()
     )
 }
 
@@ -3543,6 +3715,397 @@ fn emit_like_expr(
     Ok(())
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+//  JOIN helpers
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Metadata for a table participating in a JOIN.
+struct JoinTableSource {
+    table_name: String,
+    alias: Option<String>,
+    col_names: Vec<String>,
+}
+
+/// Extract the table name and optional alias from a `TableOrSubquery`.
+fn resolve_table_name(source: &TableOrSubquery) -> Result<(String, Option<String>)> {
+    match source {
+        TableOrSubquery::Table { name, alias, .. } => Ok((name.name.clone(), alias.clone())),
+        _ => Err(FrankenError::NotImplemented(
+            "only named tables are supported in JOIN".to_owned(),
+        )),
+    }
+}
+
+/// Perform a single join step: combine left-side rows with right-side rows.
+#[allow(clippy::too_many_lines)]
+fn execute_single_join(
+    left: &[Vec<SqliteValue>],
+    right: &[Vec<SqliteValue>],
+    right_width: usize,
+    left_width: usize,
+    kind: JoinKind,
+    constraint: Option<&JoinConstraint>,
+    col_map: &[(String, String)],
+) -> Result<Vec<Vec<SqliteValue>>> {
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        return Err(FrankenError::NotImplemented(format!(
+            "{kind:?} JOIN is not supported in this connection path"
+        )));
+    }
+
+    let mut result = Vec::new();
+    let combined_width = left_width + right_width;
+
+    for left_row in left {
+        let mut matched = false;
+
+        for right_row in right {
+            // Build combined row.
+            let mut combined = Vec::with_capacity(combined_width);
+            combined.extend_from_slice(left_row);
+            combined.extend(right_row[..right_width].iter().cloned());
+
+            // Evaluate join constraint.
+            let passes = match constraint {
+                None => true,
+                Some(JoinConstraint::On(expr)) => {
+                    eval_join_predicate(expr, &combined, col_map).unwrap_or(false)
+                }
+                Some(JoinConstraint::Using(cols)) => {
+                    eval_using_constraint(cols, &combined, col_map, left_width)
+                }
+            };
+
+            if passes {
+                matched = true;
+                result.push(combined);
+            }
+        }
+
+        // LEFT JOIN: if no right row matched, emit left + NULLs.
+        if !matched && matches!(kind, JoinKind::Left) {
+            let mut combined = Vec::with_capacity(combined_width);
+            combined.extend_from_slice(left_row);
+            combined.extend(std::iter::repeat_n(SqliteValue::Null, right_width));
+            result.push(combined);
+        }
+
+        // CROSS JOIN without constraint: handled by `passes = true` above.
+    }
+
+    Ok(result)
+}
+
+/// Evaluate a USING constraint: check that named columns match in both sides.
+fn eval_using_constraint(
+    cols: &[String],
+    combined_row: &[SqliteValue],
+    col_map: &[(String, String)],
+    left_width: usize,
+) -> bool {
+    for col_name in cols {
+        // Find the column in the left side.
+        let left_val = col_map[..left_width]
+            .iter()
+            .enumerate()
+            .find(|(_, (_, name))| name.eq_ignore_ascii_case(col_name))
+            .and_then(|(i, _)| combined_row.get(i));
+        // Find the column in the right side.
+        let right_val = col_map[left_width..]
+            .iter()
+            .enumerate()
+            .find(|(_, (_, name))| name.eq_ignore_ascii_case(col_name))
+            .and_then(|(i, _)| combined_row.get(left_width + i));
+
+        match (left_val, right_val) {
+            (Some(l), Some(r)) => {
+                if cmp_sqlite_values(l, r) != std::cmp::Ordering::Equal {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Evaluate a boolean predicate expression against a combined join row.
+fn eval_join_predicate(
+    expr: &Expr,
+    row: &[SqliteValue],
+    col_map: &[(String, String)],
+) -> Result<bool> {
+    let val = eval_join_expr(expr, row, col_map)?;
+    Ok(is_sqlite_truthy(&val))
+}
+
+/// Evaluate an expression against a combined join row, producing a value.
+#[allow(clippy::too_many_lines)]
+fn eval_join_expr(
+    expr: &Expr,
+    row: &[SqliteValue],
+    col_map: &[(String, String)],
+) -> Result<SqliteValue> {
+    match expr {
+        Expr::Column(col_ref, _) => {
+            let col_name = &col_ref.column;
+            let table_prefix = col_ref.table.as_deref();
+            let idx = find_col_in_map(col_map, table_prefix, col_name)?;
+            Ok(row.get(idx).cloned().unwrap_or(SqliteValue::Null))
+        }
+        Expr::Literal(lit, _) => Ok(literal_to_join_value(lit)),
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            let lv = eval_join_expr(left, row, col_map)?;
+            let rv = eval_join_expr(right, row, col_map)?;
+            Ok(eval_join_binary_op(&lv, *op, &rv))
+        }
+        Expr::UnaryOp {
+            op, expr: inner, ..
+        } => {
+            let val = eval_join_expr(inner, row, col_map)?;
+            Ok(match op {
+                UnaryOp::Negate => match val {
+                    SqliteValue::Integer(n) => SqliteValue::Integer(-n),
+                    SqliteValue::Float(f) => SqliteValue::Float(-f),
+                    _ => SqliteValue::Null,
+                },
+                UnaryOp::Not => SqliteValue::Integer(i64::from(!is_sqlite_truthy(&val))),
+                _ => SqliteValue::Null,
+            })
+        }
+        Expr::IsNull {
+            expr: inner, not, ..
+        } => {
+            let val = eval_join_expr(inner, row, col_map)?;
+            let is_null = matches!(val, SqliteValue::Null);
+            Ok(SqliteValue::Integer(i64::from(if *not {
+                !is_null
+            } else {
+                is_null
+            })))
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            not,
+            ..
+        } => {
+            let val = eval_join_expr(inner, row, col_map)?;
+            let low_val = eval_join_expr(low, row, col_map)?;
+            let high_val = eval_join_expr(high, row, col_map)?;
+            let in_range = cmp_values(&val, &low_val) != std::cmp::Ordering::Less
+                && cmp_values(&val, &high_val) != std::cmp::Ordering::Greater;
+            Ok(SqliteValue::Integer(i64::from(if *not {
+                !in_range
+            } else {
+                in_range
+            })))
+        }
+        Expr::In {
+            expr: inner,
+            set,
+            not,
+            ..
+        } => {
+            let val = eval_join_expr(inner, row, col_map)?;
+            let found = match set {
+                InSet::List(exprs) => exprs.iter().any(|e| {
+                    eval_join_expr(e, row, col_map)
+                        .is_ok_and(|v| cmp_values(&val, &v) == std::cmp::Ordering::Equal)
+                }),
+                _ => {
+                    return Err(FrankenError::NotImplemented(
+                        "IN subquery in JOIN not supported".to_owned(),
+                    ));
+                }
+            };
+            Ok(SqliteValue::Integer(i64::from(if *not {
+                !found
+            } else {
+                found
+            })))
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            let arg_vals: Vec<SqliteValue> = match args {
+                FunctionArgs::List(exprs) => exprs
+                    .iter()
+                    .map(|e| eval_join_expr(e, row, col_map))
+                    .collect::<Result<Vec<_>>>()?,
+                FunctionArgs::Star => vec![],
+            };
+            Ok(eval_scalar_fn(name, &arg_vals))
+        }
+        _ => Ok(SqliteValue::Null),
+    }
+}
+
+/// Find a column's index in the combined column map.
+fn find_col_in_map(
+    col_map: &[(String, String)],
+    table_prefix: Option<&str>,
+    col_name: &str,
+) -> Result<usize> {
+    if let Some(prefix) = table_prefix {
+        // Qualified: match table label + column name.
+        col_map
+            .iter()
+            .position(|(tbl, col)| {
+                tbl.eq_ignore_ascii_case(prefix) && col.eq_ignore_ascii_case(col_name)
+            })
+            .ok_or_else(|| FrankenError::Internal(format!("column not found: {prefix}.{col_name}")))
+    } else {
+        // Unqualified: first match wins (left-to-right).
+        col_map
+            .iter()
+            .position(|(_, col)| col.eq_ignore_ascii_case(col_name))
+            .ok_or_else(|| FrankenError::Internal(format!("column not found: {col_name}")))
+    }
+}
+
+/// Convert an AST literal to a `SqliteValue` (for JOIN expression evaluation).
+fn literal_to_join_value(lit: &Literal) -> SqliteValue {
+    match lit {
+        Literal::Integer(n) => SqliteValue::Integer(*n),
+        Literal::Float(f) => SqliteValue::Float(*f),
+        Literal::String(s) => SqliteValue::Text(s.clone()),
+        Literal::True => SqliteValue::Integer(1),
+        Literal::False => SqliteValue::Integer(0),
+        _ => SqliteValue::Null,
+    }
+}
+
+/// Evaluate a binary operator on two `SqliteValue`s (for JOIN expression evaluation).
+fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) -> SqliteValue {
+    match op {
+        BinaryOp::Eq => SqliteValue::Integer(i64::from(
+            cmp_values(left, right) == std::cmp::Ordering::Equal,
+        )),
+        BinaryOp::Ne => SqliteValue::Integer(i64::from(
+            cmp_values(left, right) != std::cmp::Ordering::Equal,
+        )),
+        BinaryOp::Gt => SqliteValue::Integer(i64::from(
+            cmp_values(left, right) == std::cmp::Ordering::Greater,
+        )),
+        BinaryOp::Lt => SqliteValue::Integer(i64::from(
+            cmp_values(left, right) == std::cmp::Ordering::Less,
+        )),
+        BinaryOp::Ge => SqliteValue::Integer(i64::from(
+            cmp_values(left, right) != std::cmp::Ordering::Less,
+        )),
+        BinaryOp::Le => SqliteValue::Integer(i64::from(
+            cmp_values(left, right) != std::cmp::Ordering::Greater,
+        )),
+        BinaryOp::And => {
+            SqliteValue::Integer(i64::from(is_sqlite_truthy(left) && is_sqlite_truthy(right)))
+        }
+        BinaryOp::Or => {
+            SqliteValue::Integer(i64::from(is_sqlite_truthy(left) || is_sqlite_truthy(right)))
+        }
+        BinaryOp::Add => numeric_add(left, right),
+        BinaryOp::Subtract => numeric_sub(left, right),
+        BinaryOp::Multiply => numeric_mul(left, right),
+        BinaryOp::Concat => {
+            let l = sqlite_value_to_text(left);
+            let r = sqlite_value_to_text(right);
+            SqliteValue::Text(format!("{l}{r}"))
+        }
+        _ => SqliteValue::Null,
+    }
+}
+
+/// Convert a `SqliteValue` to its text representation.
+fn sqlite_value_to_text(v: &SqliteValue) -> String {
+    match v {
+        SqliteValue::Text(s) => s.clone(),
+        SqliteValue::Integer(n) => n.to_string(),
+        SqliteValue::Float(f) => f.to_string(),
+        SqliteValue::Null | SqliteValue::Blob(_) => String::new(),
+    }
+}
+
+/// Evaluate a scalar function call (for JOIN expression evaluation).
+fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "length" | "len" => {
+            if let Some(SqliteValue::Text(s)) = args.first() {
+                #[allow(clippy::cast_possible_wrap)]
+                SqliteValue::Integer(s.len() as i64)
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "upper" => {
+            if let Some(SqliteValue::Text(s)) = args.first() {
+                SqliteValue::Text(s.to_uppercase())
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "lower" => {
+            if let Some(SqliteValue::Text(s)) = args.first() {
+                SqliteValue::Text(s.to_lowercase())
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "abs" => match args.first() {
+            Some(SqliteValue::Integer(n)) => SqliteValue::Integer(n.abs()),
+            Some(SqliteValue::Float(f)) => SqliteValue::Float(f.abs()),
+            _ => SqliteValue::Null,
+        },
+        "coalesce" => args
+            .iter()
+            .find(|v| !matches!(v, SqliteValue::Null))
+            .cloned()
+            .unwrap_or(SqliteValue::Null),
+        "ifnull" => {
+            if args.len() >= 2 {
+                if matches!(&args[0], SqliteValue::Null) {
+                    args[1].clone()
+                } else {
+                    args[0].clone()
+                }
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "nullif" => {
+            if args.len() >= 2 && cmp_values(&args[0], &args[1]) == std::cmp::Ordering::Equal {
+                SqliteValue::Null
+            } else {
+                args.first().cloned().unwrap_or(SqliteValue::Null)
+            }
+        }
+        _ => SqliteValue::Null,
+    }
+}
+
+/// Project a single result column from a combined join row.
+fn project_join_column(
+    col: &ResultColumn,
+    row: &[SqliteValue],
+    col_map: &[(String, String)],
+) -> SqliteValue {
+    match col {
+        ResultColumn::Expr { expr, .. } => {
+            eval_join_expr(expr, row, col_map).unwrap_or(SqliteValue::Null)
+        }
+        ResultColumn::Star => {
+            // Star should have been expanded earlier; this is a fallback.
+            SqliteValue::Null
+        }
+        ResultColumn::TableStar(table_name) => {
+            // TableStar should have been expanded; fallback.
+            let _ = table_name;
+            SqliteValue::Null
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Connection, Row};
@@ -4753,6 +5316,142 @@ mod tests {
             .collect();
         vals.sort_unstable();
         assert_eq!(vals, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_join_inner() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'Bob');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 'Widget');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 'Gadget');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (3, 'Gizmo');")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT users.name, orders.product FROM users JOIN orders ON users.id = orders.user_id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("Gadget".to_owned()));
+    }
+
+    #[test]
+    fn test_join_left() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE orders (user_id INTEGER, product TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'Bob');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 'Widget');")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT users.name, orders.product FROM users LEFT JOIN orders ON users.id = orders.user_id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Alice has a match.
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".to_owned()));
+        // Bob has no match: product is NULL.
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_join_cross() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a (x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE b (y INTEGER);").unwrap();
+        conn.execute("INSERT INTO a VALUES (1);").unwrap();
+        conn.execute("INSERT INTO a VALUES (2);").unwrap();
+        conn.execute("INSERT INTO b VALUES (10);").unwrap();
+        conn.execute("INSERT INTO b VALUES (20);").unwrap();
+
+        let rows = conn.query("SELECT a.x, b.y FROM a CROSS JOIN b;").unwrap();
+        assert_eq!(rows.len(), 4); // Cartesian product: 2 x 2.
+    }
+
+    #[test]
+    fn test_join_with_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE orders (user_id INTEGER, amount INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'Bob');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 50);").unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 150);").unwrap();
+        conn.execute("INSERT INTO orders VALUES (2, 75);").unwrap();
+
+        let rows = conn
+            .query("SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 100;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(150));
+    }
+
+    #[test]
+    fn test_join_star_projection() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (c INTEGER, d TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 'y');").unwrap();
+
+        let rows = conn
+            .query("SELECT * FROM t1 JOIN t2 ON t1.a = t2.c;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values().len(), 4); // a, b, c, d
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("y".to_owned()));
+    }
+
+    #[test]
+    fn test_join_multi_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, product_id INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE products (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (100, 1, 10);")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES (10, 'Widget');")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT users.name, products.name FROM users JOIN orders ON users.id = orders.user_id JOIN products ON orders.product_id = products.id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".to_owned()));
     }
 
     #[test]
