@@ -6832,6 +6832,206 @@ mod tests {
         let rows = conn.query("PRAGMA concurrent_mode=OFF;").unwrap();
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
     }
+
+    // ─── JOIN tests ─────────────────────────────────────────────
+
+    fn setup_join_tables(conn: &Connection) {
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, amount INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'Bob');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (3, 'Carol');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (10, 1, 100);")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (11, 1, 200);")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (12, 2, 50);")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_inner_join_on() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&conn);
+        let rows = conn
+            .query("SELECT users.name, orders.amount FROM users INNER JOIN orders ON users.id = orders.user_id ORDER BY orders.amount;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(50));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(100));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Integer(200));
+    }
+
+    #[test]
+    fn test_left_join_includes_unmatched() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&conn);
+        // Carol has no orders, so her row should appear with NULLs.
+        let rows = conn
+            .query("SELECT users.name, orders.amount FROM users LEFT JOIN orders ON users.id = orders.user_id ORDER BY users.name;")
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        // Alice (2 orders), Bob (1 order), Carol (NULL).
+        let names: Vec<String> = rows
+            .iter()
+            .map(|r| match &r.values()[0] {
+                SqliteValue::Text(s) => s.clone(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(names, vec!["Alice", "Alice", "Bob", "Carol"]);
+        // Carol's amount should be NULL.
+        assert_eq!(rows[3].values()[1], SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_cross_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a (x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE b (y INTEGER);").unwrap();
+        conn.execute("INSERT INTO a VALUES (1);").unwrap();
+        conn.execute("INSERT INTO a VALUES (2);").unwrap();
+        conn.execute("INSERT INTO b VALUES (10);").unwrap();
+        conn.execute("INSERT INTO b VALUES (20);").unwrap();
+        conn.execute("INSERT INTO b VALUES (30);").unwrap();
+        // CROSS JOIN produces 2×3 = 6 rows.
+        let rows = conn.query("SELECT a.x, b.y FROM a CROSS JOIN b;").unwrap();
+        assert_eq!(rows.len(), 6);
+    }
+
+    #[test]
+    fn test_join_with_where_clause() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&conn);
+        let rows = conn
+            .query("SELECT users.name, orders.amount FROM users INNER JOIN orders ON users.id = orders.user_id WHERE orders.amount > 75;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Only Alice's orders (100, 200) pass the filter.
+        for r in &rows {
+            assert_eq!(r.values()[0], SqliteValue::Text("Alice".to_owned()));
+        }
+    }
+
+    #[test]
+    fn test_join_select_star() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (c INTEGER, d TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 'y');").unwrap();
+        let rows = conn
+            .query("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.c;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        // SELECT * should include all columns from both tables.
+        assert_eq!(rows[0].values().len(), 4);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("y".to_owned()));
+    }
+
+    #[test]
+    fn test_join_using_clause() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER, val1 TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (id INTEGER, val2 TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2, 'x');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3, 'y');").unwrap();
+        let rows = conn
+            .query("SELECT t1.val1, t2.val2 FROM t1 INNER JOIN t2 USING (id);")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+    }
+
+    #[test]
+    fn test_join_with_table_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&conn);
+        let rows = conn
+            .query("SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id ORDER BY o.amount;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(50));
+    }
+
+    #[test]
+    fn test_join_with_limit() {
+        let conn = Connection::open(":memory:").unwrap();
+        setup_join_tables(&conn);
+        let rows = conn
+            .query("SELECT users.name, orders.amount FROM users INNER JOIN orders ON users.id = orders.user_id ORDER BY orders.amount LIMIT 2;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(50));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(100));
+    }
+
+    #[test]
+    fn test_join_no_matching_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+        // Inner join with no match produces no rows.
+        let rows = conn
+            .query("SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b;")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_implicit_join_comma() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (10);").unwrap();
+        // Implicit join via comma syntax (treated as CROSS JOIN).
+        let rows = conn.query("SELECT t1.a, t2.b FROM t1, t2;").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_multi_table_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE b (a_id INTEGER, val INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE c (a_id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO a VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO b VALUES (1, 42);").unwrap();
+        conn.execute("INSERT INTO c VALUES (1, 'alpha');").unwrap();
+        let rows = conn
+            .query("SELECT a.name, b.val, c.tag FROM a INNER JOIN b ON a.id = b.a_id INNER JOIN c ON a.id = c.a_id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(42));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("alpha".to_owned()));
+    }
 }
 
 #[cfg(test)]
