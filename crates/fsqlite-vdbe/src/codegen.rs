@@ -2868,7 +2868,8 @@ fn emit_index_inserts(
 /// Emit `IdxDelete` opcodes for all indexes on the table (bd-34se: Phase 5I.4).
 ///
 /// For each index, this reads the indexed column values from the cursor,
-/// reads the rowid, builds an index key record, and deletes it.
+/// reads the rowid, and emits `IdxDelete` with `(p2, p3)` pointing at the key
+/// register span. The VDBE engine seeks to that key before deleting.
 /// MUST be called BEFORE the table row is deleted, while data is still accessible.
 ///
 /// # Arguments
@@ -2908,23 +2909,12 @@ fn emit_index_deletes(b: &mut ProgramBuilder, table: &TableSchema, table_cursor:
         let rowid_key_reg = idx_key_regs + n_idx_cols as i32;
         b.emit_op(Opcode::Rowid, table_cursor, rowid_key_reg, 0, P4::None, 0);
 
-        // Build the index key record.
-        let idx_rec_reg = b.alloc_reg();
-        b.emit_op(
-            Opcode::MakeRecord,
-            idx_key_regs,
-            (n_idx_cols + 1) as i32,
-            idx_rec_reg,
-            P4::None,
-            0,
-        );
-
         // Delete from the index.
         b.emit_op(
             Opcode::IdxDelete,
             idx_cursor,
-            idx_rec_reg,
-            0,
+            idx_key_regs,
+            (n_idx_cols + 1) as i32,
             P4::Table(index.name.clone()),
             0,
         );
@@ -5349,6 +5339,84 @@ mod tests {
                 Opcode::Halt,
             ]
         ));
+    }
+
+    #[test]
+    fn test_codegen_update_with_index_emits_keyed_idxdelete() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let idx_delete = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::IdxDelete)
+            .expect("expected IdxDelete for indexed UPDATE");
+        assert!(
+            idx_delete.p3 > 0,
+            "IdxDelete must carry key register count (p3 > 0) so engine seeks by key"
+        );
+    }
+
+    #[test]
+    fn test_codegen_delete_with_index_emits_keyed_idxdelete() {
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(1)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let idx_delete = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::IdxDelete)
+            .expect("expected IdxDelete for indexed DELETE");
+        assert!(
+            idx_delete.p3 > 0,
+            "IdxDelete must carry key register count (p3 > 0) so engine seeks by key"
+        );
     }
 
     // === Test 5: Label resolution ===

@@ -4916,9 +4916,9 @@ fn affinity_decl_type(affinity: char) -> &'static str {
     match affinity.to_ascii_uppercase() {
         'A' => "BLOB",
         'B' => "TEXT",
-        'C' => "NUMERIC",
         'D' => "INTEGER",
         'E' => "REAL",
+        // 'C' and any unknown affinity map to NUMERIC
         _ => "NUMERIC",
     }
 }

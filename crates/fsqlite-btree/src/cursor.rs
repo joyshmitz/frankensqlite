@@ -1430,9 +1430,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 mod tests {
     use super::*;
     use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+    use fsqlite_types::SqliteValue;
     use fsqlite_types::record::serialize_record;
     use fsqlite_types::serial_type::write_varint;
-    use fsqlite_types::SqliteValue;
     use proptest::strategy::Strategy as _;
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
