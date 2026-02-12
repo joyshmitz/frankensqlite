@@ -18,6 +18,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::Path;
 
+use serde::de::DeserializeOwned;
+
 use crate::HarnessSettings;
 use crate::benchmark::BenchmarkSummary;
 use crate::perf_runner::{CellOutcome, PerfResult};
@@ -28,40 +30,84 @@ type PerfByFixture<'a> = BTreeMap<&'a str, Vec<(&'a str, u16, Vec<&'a CellOutcom
 
 // ── Parsing ────────────────────────────────────────────────────────────
 
+/// Parse diagnostic for a malformed JSONL line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonlParseError {
+    pub line: usize,
+    pub error: String,
+}
+
+/// Parsed JSONL records plus malformed-line diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonlParseReport<T> {
+    pub records: Vec<T>,
+    pub invalid_lines: Vec<JsonlParseError>,
+}
+
+fn parse_jsonl_with_report<T: DeserializeOwned>(jsonl: &str) -> JsonlParseReport<T> {
+    let mut records = Vec::new();
+    let mut invalid_lines = Vec::new();
+
+    for (idx, line) in jsonl.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<T>(trimmed) {
+            Ok(record) => records.push(record),
+            Err(err) => invalid_lines.push(JsonlParseError {
+                line: idx + 1,
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    JsonlParseReport {
+        records,
+        invalid_lines,
+    }
+}
+
 /// Parse a JSONL string into a list of [`RunRecordV1`] records.
 ///
-/// Blank lines and lines that fail to parse are silently skipped.
+/// Blank lines are skipped; malformed lines are ignored.
 #[must_use]
 pub fn parse_run_records_jsonl(jsonl: &str) -> Vec<RunRecordV1> {
-    jsonl
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    parse_run_records_jsonl_report(jsonl).records
+}
+
+/// Parse JSONL into [`RunRecordV1`] records with malformed-line diagnostics.
+#[must_use]
+pub fn parse_run_records_jsonl_report(jsonl: &str) -> JsonlParseReport<RunRecordV1> {
+    parse_jsonl_with_report(jsonl)
 }
 
 /// Parse a JSONL string into a list of [`BenchmarkSummary`] records.
 ///
-/// Blank lines and lines that fail to parse are silently skipped.
+/// Blank lines are skipped; malformed lines are ignored.
 #[must_use]
 pub fn parse_benchmark_summaries_jsonl(jsonl: &str) -> Vec<BenchmarkSummary> {
-    jsonl
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    parse_benchmark_summaries_jsonl_report(jsonl).records
+}
+
+/// Parse JSONL into [`BenchmarkSummary`] records with malformed-line diagnostics.
+#[must_use]
+pub fn parse_benchmark_summaries_jsonl_report(jsonl: &str) -> JsonlParseReport<BenchmarkSummary> {
+    parse_jsonl_with_report(jsonl)
 }
 
 /// Parse a JSONL string of [`CellOutcome`] records.
 ///
-/// Blank lines and lines that fail to parse are silently skipped.
+/// Blank lines are skipped; malformed lines are ignored.
 #[must_use]
 pub fn parse_perf_result_jsonl(jsonl: &str) -> Vec<CellOutcome> {
-    jsonl
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    parse_perf_result_jsonl_report(jsonl).records
+}
+
+/// Parse JSONL into [`CellOutcome`] records with malformed-line diagnostics.
+#[must_use]
+pub fn parse_perf_result_jsonl_report(jsonl: &str) -> JsonlParseReport<CellOutcome> {
+    parse_jsonl_with_report(jsonl)
 }
 
 // ── Markdown rendering from RunRecordV1 ────────────────────────────────
@@ -794,6 +840,18 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].engine.name, "sqlite3");
         assert_eq!(parsed[1].engine.name, "fsqlite");
+    }
+
+    #[test]
+    fn parse_run_records_report_surfaces_invalid_lines() {
+        let r1 = make_run_record("sqlite3", "db-a", "inserts", 1);
+        let line1 = serde_json::to_string(&r1).unwrap();
+        let jsonl = format!("{line1}\n{{bad json}}\n");
+
+        let parsed = parse_run_records_jsonl_report(&jsonl);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.invalid_lines.len(), 1);
+        assert_eq!(parsed.invalid_lines[0].line, 2);
     }
 
     #[test]

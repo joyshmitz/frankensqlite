@@ -12,7 +12,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -817,6 +817,9 @@ pub struct VdbeEngine {
     sorters: HashMap<i32, SorterCursor>,
     /// Open storage-backed cursors keyed by cursor number (read and write).
     storage_cursors: HashMap<i32, StorageCursor>,
+    /// Cursors that deleted the current row and should treat the next `Next`
+    /// as a no-advance "consume successor" step.
+    pending_next_after_delete: HashSet<i32>,
     /// Whether `OpenRead`/`OpenWrite` should route through storage-backed cursors.
     storage_cursors_enabled: bool,
     /// Shared pager transaction for storage cursors (Phase 5, bd-2a3y).
@@ -855,6 +858,7 @@ impl VdbeEngine {
             cursors: HashMap::new(),
             sorters: HashMap::new(),
             storage_cursors: HashMap::new(),
+            pending_next_after_delete: HashSet::new(),
             storage_cursors_enabled: true,
             txn_page_io: None,
             db: None,
@@ -1479,6 +1483,7 @@ impl VdbeEngine {
                     // No MemCursor fallback - open_storage_cursor must succeed.
                     let cursor_id = op.p1;
                     let root_page = op.p2;
+                    self.pending_next_after_delete.remove(&cursor_id);
                     if !self.open_storage_cursor(cursor_id, root_page, false) {
                         return Err(FrankenError::Internal(format!(
                             "OpenRead failed: could not open storage cursor on root page {root_page}"
@@ -1492,6 +1497,7 @@ impl VdbeEngine {
                     // No MemCursor fallback - open_storage_cursor must succeed.
                     let cursor_id = op.p1;
                     let root_page = op.p2;
+                    self.pending_next_after_delete.remove(&cursor_id);
                     if !self.open_storage_cursor(cursor_id, root_page, true) {
                         return Err(FrankenError::Internal(format!(
                             "OpenWrite failed: could not open storage cursor on root page {root_page}"
@@ -1504,6 +1510,7 @@ impl VdbeEngine {
                 Opcode::OpenEphemeral | Opcode::OpenAutoindex => {
                     // Ephemeral table: create an in-memory table on-the-fly.
                     let cursor_id = op.p1;
+                    self.pending_next_after_delete.remove(&cursor_id);
                     let num_cols = op.p2.max(1);
                     if let Some(db) = self.db.as_mut() {
                         let root_page = db.create_table(num_cols as usize);
@@ -1516,6 +1523,7 @@ impl VdbeEngine {
 
                 Opcode::OpenPseudo => {
                     let cursor_id = op.p1;
+                    self.pending_next_after_delete.remove(&cursor_id);
                     self.storage_cursors.remove(&cursor_id);
                     self.cursors.insert(cursor_id, MemCursor::new_pseudo());
                     pc += 1;
@@ -1528,6 +1536,7 @@ impl VdbeEngine {
 
                 Opcode::SorterOpen => {
                     let cursor_id = op.p1;
+                    self.pending_next_after_delete.remove(&cursor_id);
                     let key_columns = usize::try_from(op.p2.max(1)).unwrap_or(1);
                     let sort_key_orders = match &op.p4 {
                         P4::Str(order) => order
@@ -1555,6 +1564,7 @@ impl VdbeEngine {
                     self.cursors.remove(&op.p1);
                     self.storage_cursors.remove(&op.p1);
                     self.sorters.remove(&op.p1);
+                    self.pending_next_after_delete.remove(&op.p1);
                     pc += 1;
                 }
 
@@ -1640,7 +1650,34 @@ impl VdbeEngine {
                 Opcode::Next | Opcode::SorterNext => {
                     // Advance cursor to the next row. Jump to p2 if more rows.
                     let cursor_id = op.p1;
-                    let has_next = if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
+                    let has_next = if self.pending_next_after_delete.remove(&cursor_id) {
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            !cursor.cursor.eof()
+                        } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                            if cursor.is_pseudo {
+                                false
+                            } else if let Some(pos) = cursor.position {
+                                if let Some(table) = self
+                                    .db
+                                    .as_ref()
+                                    .and_then(|db| db.get_table(cursor.root_page))
+                                {
+                                    if pos < table.rows.len() {
+                                        true
+                                    } else {
+                                        cursor.position = None;
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             let next = pos + 1;
                             if next < sorter.rows.len() {
@@ -2124,21 +2161,32 @@ impl VdbeEngine {
                 Opcode::Delete => {
                     // Delete the row at the current cursor position.
                     let cursor_id = op.p1;
+                    let mut deleted = false;
                     // Phase 5B.3 (bd-1r0d): write-through — route ONLY through
                     // storage cursor when one exists; fall back to MemDatabase
                     // only for legacy Phase 4 cursors.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable && !sc.cursor.eof() {
                             sc.cursor.delete(&sc.cx)?;
+                            deleted = true;
                         }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         // Pure in-memory path (Phase 4).
                         if let Some(pos) = cursor.position {
                             let root = cursor.root_page;
-                            if let Some(db) = self.db.as_mut() {
+                            let can_delete = self
+                                .db
+                                .as_ref()
+                                .and_then(|db| db.get_table(root))
+                                .is_some_and(|table| pos < table.rows.len());
+                            if can_delete && let Some(db) = self.db.as_mut() {
                                 db.delete_at(root, pos);
+                                deleted = true;
                             }
                         }
+                    }
+                    if deleted {
+                        self.pending_next_after_delete.insert(cursor_id);
                     }
                     pc += 1;
                 }

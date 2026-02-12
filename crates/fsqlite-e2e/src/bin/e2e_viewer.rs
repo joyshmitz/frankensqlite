@@ -15,6 +15,7 @@
 //! - **Tab** — switch between Runs and Benchmarks tabs
 //! - **q/Esc** — quit
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -27,7 +28,9 @@ use ftui::{App, Cmd, Event, KeyCode, KeyEventKind, Model, PackedRgba, ScreenMode
 
 use fsqlite_e2e::benchmark::BenchmarkSummary;
 use fsqlite_e2e::report::RunRecordV1;
-use fsqlite_e2e::report_render::{parse_benchmark_summaries_jsonl, parse_run_records_jsonl};
+use fsqlite_e2e::report_render::{
+    JsonlParseReport, parse_benchmark_summaries_jsonl_report, parse_run_records_jsonl_report,
+};
 
 // ── Active tab ───────────────────────────────────────────────────────────
 
@@ -949,6 +952,26 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+fn count_malformed_jsonl_lines(
+    runs_report: &JsonlParseReport<RunRecordV1>,
+    benchmarks_report: &JsonlParseReport<BenchmarkSummary>,
+) -> usize {
+    let run_invalid_lines: HashSet<usize> = runs_report
+        .invalid_lines
+        .iter()
+        .map(|entry| entry.line)
+        .collect();
+    let benchmark_invalid_lines: HashSet<usize> = benchmarks_report
+        .invalid_lines
+        .iter()
+        .map(|entry| entry.line)
+        .collect();
+
+    run_invalid_lines
+        .intersection(&benchmark_invalid_lines)
+        .count()
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────
 
 fn main() -> std::io::Result<()> {
@@ -984,14 +1007,32 @@ fn main() -> std::io::Result<()> {
             }
         };
 
-        let runs = parse_run_records_jsonl(&content);
-        let benchmarks = parse_benchmark_summaries_jsonl(&content);
+        let runs_report = parse_run_records_jsonl_report(&content);
+        let benchmarks_report = parse_benchmark_summaries_jsonl_report(&content);
+        let invalid_count = count_malformed_jsonl_lines(&runs_report, &benchmarks_report);
+        let runs = runs_report.records;
+        let benchmarks = benchmarks_report.records;
 
-        if runs.is_empty() && benchmarks.is_empty() {
+        if invalid_count > 0 {
             eprintln!(
-                "warning: no RunRecordV1 or BenchmarkSummary records in {}",
+                "warning: {} malformed JSONL line(s) in {}",
+                invalid_count,
                 path.display()
             );
+        }
+
+        if runs.is_empty() && benchmarks.is_empty() {
+            if invalid_count == 0 {
+                eprintln!(
+                    "warning: no RunRecordV1 or BenchmarkSummary records in {}",
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "warning: no valid RunRecordV1 or BenchmarkSummary records in {}",
+                    path.display()
+                );
+            }
         }
 
         all_runs.extend(runs);
@@ -1213,5 +1254,29 @@ mod tests {
             modifiers: ftui::Modifiers::empty(),
         }));
         assert!(matches!(tab, Msg::SwitchTab));
+    }
+
+    #[test]
+    fn malformed_count_ignores_run_only_lines() {
+        let run_line = serde_json::to_string(&sample_run()).expect("sample run must serialize");
+        let jsonl = format!("{run_line}\n");
+        let runs_report = parse_run_records_jsonl_report(&jsonl);
+        let benchmarks_report = parse_benchmark_summaries_jsonl_report(&jsonl);
+        assert_eq!(
+            count_malformed_jsonl_lines(&runs_report, &benchmarks_report),
+            0
+        );
+    }
+
+    #[test]
+    fn malformed_count_only_includes_lines_invalid_for_both_schemas() {
+        let run_line = serde_json::to_string(&sample_run()).expect("sample run must serialize");
+        let jsonl = format!("{run_line}\n{{not valid json}}\n");
+        let runs_report = parse_run_records_jsonl_report(&jsonl);
+        let benchmarks_report = parse_benchmark_summaries_jsonl_report(&jsonl);
+        assert_eq!(
+            count_malformed_jsonl_lines(&runs_report, &benchmarks_report),
+            1
+        );
     }
 }

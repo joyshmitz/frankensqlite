@@ -8,7 +8,7 @@ use crate::ProgramBuilder;
 use fsqlite_ast::{
     ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FunctionArgs, InsertSource,
     InsertStatement, LimitClause, Literal, OrderingTerm, QualifiedTableRef, ResultColumn,
-    SelectCore, SelectStatement, SortDirection, UpdateStatement,
+    SelectCore, SelectStatement, SortDirection, TableOrSubquery, UpdateStatement,
 };
 use fsqlite_types::opcode::{Opcode, P4};
 
@@ -159,6 +159,213 @@ fn find_table<'a>(schema: &'a [TableSchema], name: &str) -> Result<&'a TableSche
 
 fn table_name_from_qualified(qtr: &QualifiedTableRef) -> &str {
     &qtr.name.name
+}
+
+/// Count anonymous placeholders in an expression tree.
+///
+/// Used by `codegen_update` to correctly number placeholders when bytecode
+/// emission order differs from SQL textual order (WHERE is emitted before SET,
+/// but SET placeholders appear first in the SQL text).
+fn count_anon_placeholders(expr: &Expr) -> u32 {
+    match expr {
+        Expr::Placeholder(fsqlite_ast::PlaceholderType::Anonymous, _) => 1,
+        Expr::Placeholder(_, _) | Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } => {
+            0
+        }
+        Expr::Subquery(subquery, _) | Expr::Exists { subquery, .. } => {
+            count_anon_placeholders_in_select(subquery)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            count_anon_placeholders(left) + count_anon_placeholders(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => count_anon_placeholders(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            count_anon_placeholders(inner)
+                + count_anon_placeholders(low)
+                + count_anon_placeholders(high)
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            count_anon_placeholders(inner)
+                + match set {
+                    fsqlite_ast::InSet::List(items) => {
+                        items.iter().map(count_anon_placeholders).sum()
+                    }
+                    fsqlite_ast::InSet::Subquery(subquery) => {
+                        count_anon_placeholders_in_select(subquery)
+                    }
+                    fsqlite_ast::InSet::Table(_) => 0,
+                }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            count_anon_placeholders(inner)
+                + count_anon_placeholders(pattern)
+                + escape.as_deref().map_or(0, count_anon_placeholders)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().map_or(0, count_anon_placeholders)
+                + whens
+                    .iter()
+                    .map(|(cond, then_expr)| {
+                        count_anon_placeholders(cond) + count_anon_placeholders(then_expr)
+                    })
+                    .sum::<u32>()
+                + else_expr.as_deref().map_or(0, count_anon_placeholders)
+        }
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            let args_count = match args {
+                FunctionArgs::List(exprs) => exprs.iter().map(count_anon_placeholders).sum(),
+                FunctionArgs::Star => 0,
+            };
+            args_count
+                + filter.as_deref().map_or(0, count_anon_placeholders)
+                + over
+                    .as_ref()
+                    .map_or(0, count_anon_placeholders_in_window_spec)
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            count_anon_placeholders(expr) + count_anon_placeholders(path)
+        }
+        Expr::RowValue(items, _) => items.iter().map(count_anon_placeholders).sum(),
+    }
+}
+
+fn count_anon_placeholders_in_select(select: &SelectStatement) -> u32 {
+    let mut count = 0;
+    if let Some(with_clause) = &select.with {
+        for cte in &with_clause.ctes {
+            count += count_anon_placeholders_in_select(&cte.query);
+        }
+    }
+    count += count_anon_placeholders_in_select_core(&select.body.select);
+    for (_, core) in &select.body.compounds {
+        count += count_anon_placeholders_in_select_core(core);
+    }
+    for order_term in &select.order_by {
+        count += count_anon_placeholders(&order_term.expr);
+    }
+    if let Some(limit_clause) = &select.limit {
+        count += count_anon_placeholders(&limit_clause.limit);
+        if let Some(offset) = &limit_clause.offset {
+            count += count_anon_placeholders(offset);
+        }
+    }
+    count
+}
+
+fn count_anon_placeholders_in_select_core(core: &SelectCore) -> u32 {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            let mut count = columns
+                .iter()
+                .filter_map(|col| match col {
+                    ResultColumn::Expr { expr, .. } => Some(count_anon_placeholders(expr)),
+                    ResultColumn::Star | ResultColumn::TableStar(_) => None,
+                })
+                .sum::<u32>();
+
+            if let Some(from_clause) = from {
+                count += count_anon_placeholders_in_from_clause(from_clause);
+            }
+            if let Some(predicate) = where_clause {
+                count += count_anon_placeholders(predicate);
+            }
+            for expr in group_by {
+                count += count_anon_placeholders(expr);
+            }
+            if let Some(predicate) = having {
+                count += count_anon_placeholders(predicate);
+            }
+            for window in windows {
+                count += count_anon_placeholders_in_window_spec(&window.spec);
+            }
+            count
+        }
+        SelectCore::Values(rows) => rows
+            .iter()
+            .map(|row| row.iter().map(count_anon_placeholders).sum::<u32>())
+            .sum(),
+    }
+}
+
+fn count_anon_placeholders_in_from_clause(from: &fsqlite_ast::FromClause) -> u32 {
+    let mut count = count_anon_placeholders_in_table_or_subquery(&from.source);
+    for join in &from.joins {
+        count += count_anon_placeholders_in_table_or_subquery(&join.table);
+        if let Some(fsqlite_ast::JoinConstraint::On(expr)) = &join.constraint {
+            count += count_anon_placeholders(expr);
+        }
+    }
+    count
+}
+
+fn count_anon_placeholders_in_table_or_subquery(source: &TableOrSubquery) -> u32 {
+    match source {
+        TableOrSubquery::Table { .. } => 0,
+        TableOrSubquery::Subquery { query, .. } => count_anon_placeholders_in_select(query),
+        TableOrSubquery::TableFunction { args, .. } => {
+            args.iter().map(count_anon_placeholders).sum()
+        }
+        TableOrSubquery::ParenJoin(from_clause) => {
+            count_anon_placeholders_in_from_clause(from_clause)
+        }
+    }
+}
+
+fn count_anon_placeholders_in_window_spec(spec: &fsqlite_ast::WindowSpec) -> u32 {
+    let mut count: u32 = spec.partition_by.iter().map(count_anon_placeholders).sum();
+    count += spec
+        .order_by
+        .iter()
+        .map(|term| count_anon_placeholders(&term.expr))
+        .sum::<u32>();
+    if let Some(frame) = &spec.frame {
+        count += count_anon_placeholders_in_frame_bound(&frame.start);
+        if let Some(end) = &frame.end {
+            count += count_anon_placeholders_in_frame_bound(end);
+        }
+    }
+    count
+}
+
+fn count_anon_placeholders_in_frame_bound(bound: &fsqlite_ast::FrameBound) -> u32 {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            count_anon_placeholders(expr)
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => 0,
+    }
 }
 
 fn contains_unsupported_in_expr(expr: &Expr) -> bool {
@@ -822,7 +1029,8 @@ fn emit_limit_expr(b: &mut ProgramBuilder, expr: &Expr, target_reg: i32) {
         Expr::Placeholder(pt, _) => {
             let param_idx = match pt {
                 fsqlite_ast::PlaceholderType::Numbered(n) => *n as i32,
-                _ => 1,
+                // Anonymous and named placeholders use sequential numbering.
+                _ => b.next_anon_placeholder_idx() as i32,
             };
             b.emit_op(Opcode::Variable, param_idx, target_reg, 0, P4::None, 0);
         }
@@ -2518,9 +2726,21 @@ pub fn codegen_update(
     let loop_start = b.current_addr();
     b.emit_jump_to_label(Opcode::Rewind, table_cursor, 0, done_label, P4::None, 0);
 
+    // Count anonymous placeholders in SET assignments.
+    // Parameters are numbered in SQL textual order (SET first, then WHERE), but
+    // bytecode emits WHERE before SET. We must set the placeholder counter
+    // so WHERE placeholders get indices *after* the SET placeholders.
+    let set_placeholder_count: u32 = stmt
+        .assignments
+        .iter()
+        .map(|a| count_anon_placeholders(&a.value))
+        .sum();
+
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
     if let Some(where_expr) = &stmt.where_clause {
+        // Set placeholder counter to start after SET placeholders.
+        b.set_next_anon_placeholder(set_placeholder_count + 1);
         emit_where_filter(
             b,
             where_expr,
@@ -2560,6 +2780,8 @@ pub fn codegen_update(
         table_alias: stmt.table.alias.as_deref(),
         schema: Some(schema),
     };
+    // Reset placeholder counter to 1 for SET expressions (they appear first in SQL text).
+    b.set_next_anon_placeholder(1);
     for (assign_idx, col_idx) in assignment_cols.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let target = col_regs + *col_idx as i32;
@@ -7038,6 +7260,86 @@ mod tests {
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::Insert),
             "expected update writeback Insert"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_set_subquery_anonymous_placeholder_offsets_where() {
+        // UPDATE t SET b = a IN (SELECT b FROM s WHERE b = ?) WHERE a = ?
+        //
+        // SQL placeholder order: SET-subquery first, WHERE second.
+        // Bytecode emission order is WHERE first, then SET; codegen must offset
+        // WHERE placeholder numbering so WHERE uses parameter 2.
+        let set_subquery = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(from_table("s")),
+                    where_clause: Some(Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                        op: AstBinaryOp::Eq,
+                        right: Box::new(Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)),
+                        span: Span::ZERO,
+                    })),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: Expr::In {
+                    expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    set: InSet::Subquery(Box::new(set_subquery)),
+                    not: false,
+                    span: Span::ZERO,
+                },
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let variable_params: Vec<i32> = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .map(|op| op.p1)
+            .collect();
+        assert_eq!(
+            variable_params,
+            vec![2, 1],
+            "WHERE placeholder must be shifted past SET placeholders, including placeholders nested in SET subqueries"
         );
     }
 

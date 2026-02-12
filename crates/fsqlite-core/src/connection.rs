@@ -7137,6 +7137,7 @@ fn sqlite_value_to_literal(value: &SqliteValue) -> Literal {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn bind_placeholders_in_expr(
     expr: &mut Expr,
     bind_state: &mut BindParamState,
@@ -14294,7 +14295,22 @@ mod transaction_lifecycle_tests {
     #[test]
     fn test_group_by_join_having_named_placeholder() {
         let conn = Connection::open(":memory:").unwrap();
-        setup_join_tables(&conn);
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, amount INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'Bob');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (3, 'Carol');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (10, 1, 100);")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (11, 1, 200);")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (12, 2, 50);")
+            .unwrap();
         let rows = conn
             .query_with_params(
                 "SELECT users.name, COUNT(*) \

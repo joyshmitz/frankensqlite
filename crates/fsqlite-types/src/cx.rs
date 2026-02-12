@@ -26,9 +26,8 @@
 //! ```
 
 use std::marker::PhantomData;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 /// SQLite error code for `SQLITE_INTERRUPT`.
@@ -291,7 +290,7 @@ struct CxInner {
     cancel_state: Mutex<CancelState>,
     cancel_reason: Mutex<Option<CancelReason>>,
     mask_depth: AtomicU32,
-    children: Mutex<Vec<Arc<Self>>>,
+    children: Mutex<Vec<Weak<Self>>>,
     last_checkpoint_msg: Mutex<Option<String>>,
     // Deterministic clock: milliseconds since epoch for tests.
     unix_millis: AtomicU64,
@@ -344,11 +343,12 @@ fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
 
     // Collect children (release lock before recursing).
     let children: Vec<Arc<CxInner>> = {
-        let guard = inner
+        let mut guard = inner
             .children
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.clone()
+        guard.retain(|child| child.strong_count() > 0);
+        guard.iter().filter_map(Weak::upgrade).collect()
     };
     for child in &children {
         propagate_cancel(child, reason);
@@ -658,7 +658,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 .children
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            children.push(Arc::clone(&child.inner));
+            children.push(Arc::downgrade(&child.inner));
         }
         child
     }
@@ -743,6 +743,7 @@ impl CommitCtx {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+    use std::sync::Weak;
 
     #[test]
     fn test_cx_checkpoint_observes_cancellation() {
@@ -1234,6 +1235,29 @@ mod tests {
 
         // Reason must propagate.
         assert_eq!(child1.cancel_reason(), Some(CancelReason::RegionClose));
+    }
+
+    #[test]
+    fn test_dropped_children_are_pruned_from_parent_links() {
+        let parent = Cx::<FullCaps>::new();
+
+        let live_child = parent.create_child();
+        let dropped_child = parent.create_child();
+        drop(dropped_child);
+
+        // Trigger propagation pass, which prunes dead weak child links.
+        parent.cancel_with_reason(CancelReason::RegionClose);
+
+        let live_count = {
+            let children = parent
+                .inner
+                .children
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            children.iter().filter_map(Weak::upgrade).count()
+        };
+        assert_eq!(live_count, 1, "only the live child should remain linked");
+        assert!(live_child.is_cancel_requested());
     }
 
     #[test]
