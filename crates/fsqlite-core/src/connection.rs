@@ -576,6 +576,23 @@ fn trigger_event_matches(
     }
 }
 
+/// Evaluate a trigger WHEN clause in a constant-expression context.
+///
+/// If evaluation fails (for example due to unresolved OLD/NEW references),
+/// return `true` to preserve current trigger behavior until pseudo-table
+/// bindings are fully implemented.
+fn trigger_when_matches(when_clause: Option<&Expr>) -> bool {
+    let Some(expr) = when_clause else {
+        return true;
+    };
+    let row: [SqliteValue; 0] = [];
+    let col_map: [(String, String); 0] = [];
+    match eval_join_expr(expr, &row, &col_map) {
+        Ok(value) => is_sqlite_truthy(&value),
+        Err(_) => true,
+    }
+}
+
 /// Snapshot of the database + schema state at a point in time.
 /// Used for transaction rollback and savepoint restore.
 #[derive(Debug, Clone)]
@@ -1210,9 +1227,46 @@ impl Connection {
                 self.execute_create_trigger(create_trigger)?;
                 Ok(Vec::new())
             }
-            // Maintenance stubs: these are no-ops for in-memory databases but
-            // accepted for SQL compatibility (applications often call them).
-            Statement::Vacuum(_) | Statement::Analyze(_) | Statement::Reindex(_) => {
+            // VACUUM INTO copies the database to a new file.
+            // Plain VACUUM is a no-op for now (defragmentation not implemented).
+            Statement::Vacuum(ref vacuum_stmt) => {
+                if let Some(ref into_expr) = vacuum_stmt.into {
+                    // Extract target path from the INTO expression
+                    let target_path = match into_expr {
+                        Expr::Literal(Literal::String(s), _) => s.clone(),
+                        _ => {
+                            return Err(FrankenError::internal(
+                                "VACUUM INTO requires a string literal path".to_string(),
+                            ))
+                        }
+                    };
+
+                    if self.path == ":memory:" {
+                        // For in-memory databases, we need to serialize to a file
+                        return Err(FrankenError::NotImplemented(
+                            "VACUUM INTO from :memory: database not yet implemented".to_string(),
+                        ));
+                    }
+
+                    // Ensure any pending changes are flushed
+                    if *self.in_transaction.borrow() {
+                        return Err(FrankenError::internal(
+                            "cannot VACUUM INTO while a transaction is active".to_string(),
+                        ));
+                    }
+
+                    // Copy the database file to the target path
+                    std::fs::copy(&self.path, &target_path).map_err(|e| {
+                        FrankenError::internal(format!(
+                            "VACUUM INTO failed to copy database to '{}': {}",
+                            target_path, e
+                        ))
+                    })?;
+                }
+                Ok(Vec::new())
+            }
+            // ANALYZE and REINDEX are no-ops for now
+            Statement::Analyze(_) | Statement::Reindex(_) => {
                 Ok(Vec::new())
             }
             _ => Err(FrankenError::NotImplemented(
@@ -2224,8 +2278,11 @@ impl Connection {
         }
 
         for trigger in matching {
-            // TODO: Evaluate WHEN clause when OLD/NEW pseudo-tables are implemented.
-            // For now, always fire if event matches.
+            // Evaluate constant WHEN expressions now; unresolved OLD/NEW-based
+            // clauses still fall back to firing until pseudo-tables are wired.
+            if !trigger_when_matches(trigger.when_clause.as_ref()) {
+                continue;
+            }
 
             // Execute each statement in the trigger body.
             for stmt in &trigger.body {
@@ -2263,7 +2320,9 @@ impl Connection {
         }
 
         for trigger in matching {
-            // TODO: Evaluate WHEN clause when OLD/NEW pseudo-tables are implemented.
+            if !trigger_when_matches(trigger.when_clause.as_ref()) {
+                continue;
+            }
 
             // Execute each statement in the trigger body.
             for stmt in &trigger.body {
@@ -9180,6 +9239,40 @@ mod tests {
             fsqlite_ast::TriggerEvent::Update(cols) => assert_eq!(cols, &vec!["id".to_owned()]),
             other => panic!("expected UPDATE trigger event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_trigger_when_false_constant_does_not_fire() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_when_false AFTER INSERT ON t WHEN 0 BEGIN INSERT INTO log VALUES ('fired'); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert!(rows.is_empty(), "WHEN 0 trigger should not fire");
+    }
+
+    #[test]
+    fn test_trigger_when_true_constant_fires() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_when_true AFTER INSERT ON t WHEN 1 BEGIN INSERT INTO log VALUES ('fired'); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("fired".to_owned())
+        );
     }
 
     #[test]
