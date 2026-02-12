@@ -1114,7 +1114,7 @@ impl Connection {
                 }
 
                 let affected =
-                    self.count_matching_rows(&update.table, update.where_clause.as_ref())?;
+                    self.count_matching_rows(&update.table, update.where_clause.as_ref(), params)?;
                 let program = self.compile_table_update(update)?;
                 let rows = self.execute_table_program(&program, params)?;
 
@@ -1150,7 +1150,7 @@ impl Connection {
                 }
 
                 let affected =
-                    self.count_matching_rows(&delete.table, delete.where_clause.as_ref())?;
+                    self.count_matching_rows(&delete.table, delete.where_clause.as_ref(), params)?;
                 let program = self.compile_table_delete(delete)?;
                 let rows = self.execute_table_program(&program, params)?;
 
@@ -1544,6 +1544,7 @@ impl Connection {
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
+        params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
         let alias_clause = table_ref
             .alias
@@ -1557,7 +1558,13 @@ impl Connection {
         } else {
             format!("SELECT * FROM {}", table_ref.name)
         };
-        Ok(self.query(&sql)?.len())
+        // br-22iss: Pass params through so numbered placeholders work correctly.
+        let rows = if let Some(params) = params {
+            self.query_with_params(&sql, params)?
+        } else {
+            self.query(&sql)?
+        };
+        Ok(rows.len())
     }
 
     // ── autocommit pager transaction wrapping (bd-14dj / 5B.5) ──────────
@@ -15615,5 +15622,52 @@ mod schema_loading_tests {
         let rows = conn.query("PRAGMA busy_timeout;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(10000));
+    }
+
+    /// br-22iss: Test UPDATE with numbered placeholders
+    #[test]
+    fn test_update_with_four_numbered_placeholders() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                policy TEXT
+            )",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO agents VALUES (1, 'BlueLake', 'auto')")
+            .unwrap();
+        conn.execute("INSERT INTO agents VALUES (2, 'RedFox', 'auto')")
+            .unwrap();
+
+        // Verify data exists
+        let rows = conn.query("SELECT * FROM agents").unwrap();
+        assert_eq!(rows.len(), 2, "Should have 2 rows");
+
+        // Test: UPDATE with literal WHERE (should work - baseline)
+        let affected = conn
+            .execute("UPDATE agents SET policy = 'literal_test' WHERE name = 'RedFox'")
+            .unwrap();
+        assert_eq!(affected, 1, "UPDATE with literal WHERE should work");
+
+        // Verify it worked
+        let rows = conn
+            .query("SELECT policy FROM agents WHERE name = 'RedFox'")
+            .unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("literal_test".to_string())
+        );
+
+        // Test: UPDATE with numbered placeholder in WHERE
+        let affected = conn
+            .execute_with_params(
+                "UPDATE agents SET policy = 'param_test' WHERE name = ?1",
+                &[SqliteValue::Text("RedFox".to_string())],
+            )
+            .unwrap();
+        assert_eq!(affected, 1, "UPDATE WHERE name = ?1 should affect 1 row");
     }
 }
