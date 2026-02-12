@@ -2260,4 +2260,148 @@ mod tests {
         // rowid should be auto-assigned (1)
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
     }
+
+    // =================================================================
+    // IPK integration tests (bd-3l6e / PARITY-B5)
+    // =================================================================
+
+    /// NULL IPK should auto-generate an incrementing rowid.
+    #[test]
+    fn ipk_null_auto_generates_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let r1 = conn
+            .query("INSERT INTO t VALUES (NULL, 'a') RETURNING id;")
+            .unwrap();
+        let r2 = conn
+            .query("INSERT INTO t VALUES (NULL, 'b') RETURNING id;")
+            .unwrap();
+        let id1 = &row_values(&r1[0])[0];
+        let id2 = &row_values(&r2[0])[0];
+        // Both should be positive integers.
+        assert!(
+            matches!(id1, SqliteValue::Integer(n) if *n > 0),
+            "NULL IPK should auto-generate positive id, got {id1:?}"
+        );
+        // Second should be greater than first.
+        if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (id1, id2) {
+            assert!(
+                b > a,
+                "successive NULL IPK inserts should increment: {a} < {b}"
+            );
+        }
+    }
+
+    /// Explicit IPK value of 0 should be stored as rowid 0.
+    #[test]
+    fn ipk_zero_is_valid_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t VALUES (0, 'zero') RETURNING id;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(0));
+    }
+
+    /// Negative IPK values should be stored as negative rowids.
+    #[test]
+    fn ipk_negative_is_valid_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t VALUES (-5, 'neg') RETURNING id;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(-5));
+    }
+
+    /// Multi-row INSERT with explicit IPK values.
+    #[test]
+    fn ipk_multi_row_explicit_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t VALUES (10,'a'),(20,'b'),(30,'c') RETURNING id;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(10));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(20));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Integer(30));
+    }
+
+    /// Mixed NULL and explicit IPK in multi-row INSERT.
+    #[test]
+    fn ipk_mixed_null_and_explicit() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (10, 'explicit');")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t VALUES (NULL, 'auto') RETURNING id;")
+            .unwrap();
+        // Auto-generated id should be > 10 (the max existing rowid).
+        if let SqliteValue::Integer(id) = &row_values(&rows[0])[0] {
+            assert!(
+                *id > 10,
+                "auto-generated id after max=10 should be > 10, got {id}"
+            );
+        } else {
+            panic!("expected Integer, got {:?}", row_values(&rows[0])[0]);
+        }
+    }
+
+    /// RETURNING * should include the correct IPK value.
+    #[test]
+    fn ipk_returning_star_includes_correct_id() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t VALUES (42, 'x') RETURNING *;")
+            .unwrap();
+        let vals = row_values(&rows[0]);
+        assert_eq!(vals[0], SqliteValue::Integer(42));
+        assert_eq!(vals[1], SqliteValue::Text("x".to_owned()));
+    }
+
+    /// SELECT after INSERT should see the correct IPK values.
+    #[test]
+    fn ipk_roundtrip_select_after_insert() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (42, 'Alice');").unwrap();
+        conn.execute("INSERT INTO t VALUES (100, 'Bob');").unwrap();
+        let rows = conn.query("SELECT * FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(42));
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("Alice".to_owned())
+        );
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(100));
+    }
+
+    /// DELETE then reinsert with same IPK should work.
+    #[test]
+    fn ipk_delete_reinsert_same_id() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'original');")
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE id = 1;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'reinserted');")
+            .unwrap();
+        let rows = conn.query("SELECT val FROM t WHERE id = 1;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("reinserted".to_owned())
+        );
+    }
 }

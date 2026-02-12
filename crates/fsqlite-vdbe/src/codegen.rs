@@ -1905,8 +1905,8 @@ fn codegen_select_group_by_aggregate(
 ///
 /// Pattern: `INSERT INTO t VALUES (?, ?, ...)`
 ///
-/// Init → Transaction(write) → OpenWrite → NewRowid → Variable* →
-/// MakeRecord → Insert → Close → Halt
+/// Init → Transaction(write) → OpenWrite → Variable* → (IPK routing |
+/// NewRowid) → MakeRecord → Insert → Close → Halt
 pub fn codegen_insert(
     b: &mut ProgramBuilder,
     stmt: &InsertStatement,
@@ -1934,15 +1934,42 @@ pub fn codegen_insert(
         0,
     );
 
+    // When an explicit column list is provided, remap the IPK index from
+    // table-schema position to VALUES position.  If the IPK column is absent
+    // from the column list, treat it as NULL (auto-generate rowid).
+    let effective_ctx = if stmt.columns.is_empty() {
+        ctx.clone()
+    } else if let Some(ipk_schema_idx) = ctx.rowid_alias_col_idx {
+        let ipk_col_name = &table.columns[ipk_schema_idx].name;
+        let values_pos = stmt
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(ipk_col_name));
+        CodegenContext {
+            concurrent_mode: ctx.concurrent_mode,
+            rowid_alias_col_idx: values_pos,
+        }
+    } else {
+        ctx.clone()
+    };
+
     match &stmt.source {
         InsertSource::Values(rows) => {
             if rows.is_empty() {
                 return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
             }
-            codegen_insert_values(b, rows, cursor, table, &stmt.returning, ctx)?;
+            codegen_insert_values(b, rows, cursor, table, &stmt.returning, &effective_ctx)?;
         }
         InsertSource::Select(select_stmt) => {
-            codegen_insert_select(b, select_stmt, cursor, table, schema, &stmt.returning, ctx)?;
+            codegen_insert_select(
+                b,
+                select_stmt,
+                cursor,
+                table,
+                schema,
+                &stmt.returning,
+                &effective_ctx,
+            )?;
         }
         InsertSource::DefaultValues => {
             // Insert one row with all columns set to NULL.
@@ -2026,20 +2053,52 @@ fn codegen_insert_values(
             ));
         }
 
-        // NewRowid: generate a new rowid for this row.
-        b.emit_op(
-            Opcode::NewRowid,
-            cursor,
-            rowid_reg,
-            concurrent_flag,
-            P4::None,
-            0,
-        );
-
         // Emit value expressions into registers.
         for (i, val_expr) in row_values.iter().enumerate() {
             let reg = val_regs + i as i32;
             emit_expr(b, val_expr, reg, None);
+        }
+
+        // Rowid determination: if an INTEGER PRIMARY KEY column exists, use
+        // the user-supplied value as the rowid (falling back to NewRowid when
+        // the supplied value is NULL).  Otherwise always auto-generate.
+        if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            let ipk_reg = val_regs + ipk_idx as i32;
+            let auto_label = b.emit_label();
+            let done_label = b.emit_label();
+
+            // If the user-supplied IPK value is NULL, jump to auto-generate.
+            b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
+
+            // Non-NULL path: copy user value into rowid register.
+            b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+            // NULL path: auto-generate rowid, then sync it back into the
+            // IPK column register so MakeRecord includes the real rowid.
+            b.resolve_label(auto_label);
+            b.emit_op(
+                Opcode::NewRowid,
+                cursor,
+                rowid_reg,
+                concurrent_flag,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+
+            b.resolve_label(done_label);
+        } else {
+            // No IPK column — always auto-generate.
+            b.emit_op(
+                Opcode::NewRowid,
+                cursor,
+                rowid_reg,
+                concurrent_flag,
+                P4::None,
+                0,
+            );
         }
 
         // MakeRecord: pack columns into a record.
@@ -2181,15 +2240,42 @@ fn codegen_insert_select(
         val_regs,
     )?;
 
-    // NewRowid for target table.
-    b.emit_op(
-        Opcode::NewRowid,
-        write_cursor,
-        rowid_reg,
-        concurrent_flag,
-        P4::None,
-        0,
-    );
+    // Rowid determination: use IPK column value if present, else auto-generate.
+    if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let ipk_reg = val_regs + ipk_idx as i32;
+        let auto_label = b.emit_label();
+        let done_rowid = b.emit_label();
+
+        b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
+
+        // Non-NULL: use the selected value as rowid.
+        b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_rowid, P4::None, 0);
+
+        // NULL: auto-generate and sync back.
+        b.resolve_label(auto_label);
+        b.emit_op(
+            Opcode::NewRowid,
+            write_cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+
+        b.resolve_label(done_rowid);
+    } else {
+        b.emit_op(
+            Opcode::NewRowid,
+            write_cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
+    }
 
     // MakeRecord from the read column values.
     b.emit_op(
@@ -4238,9 +4324,9 @@ mod tests {
                 Opcode::Init,
                 Opcode::Transaction,
                 Opcode::OpenWrite,
+                Opcode::Variable,
+                Opcode::Variable,
                 Opcode::NewRowid,
-                Opcode::Variable,
-                Opcode::Variable,
                 Opcode::MakeRecord,
                 Opcode::Insert,
                 Opcode::Close,
@@ -6638,6 +6724,197 @@ mod tests {
         assert_eq!(
             null_count, 0,
             "expected 0 Null opcodes (column refs should resolve), got {null_count}"
+        );
+    }
+
+    // =================================================================
+    // IPK codegen tests (bd-3l6e / PARITY-B5)
+    // =================================================================
+
+    /// INSERT VALUES with IPK column should emit IsNull+Copy routing, NOT
+    /// unconditional NewRowid.
+    #[test]
+    fn test_codegen_insert_values_ipk_uses_copy_not_new_rowid() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        // Must contain IsNull (conditional branch) and Copy (value→rowid).
+        assert!(
+            ops.contains(&Opcode::IsNull),
+            "IPK INSERT should emit IsNull to check for NULL IPK value"
+        );
+        assert!(
+            ops.contains(&Opcode::Copy),
+            "IPK INSERT should emit Copy to move IPK value to rowid register"
+        );
+        // The sequence must be: Variable (values) → IsNull → Copy → Goto
+        //                       (or the NULL path: NewRowid → Copy)
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::OpenWrite,
+                Opcode::Variable,
+                Opcode::Variable,
+                Opcode::IsNull,
+                Opcode::Copy,
+                Opcode::MakeRecord,
+                Opcode::Insert,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+    }
+
+    /// INSERT VALUES without IPK should still use unconditional NewRowid.
+    #[test]
+    fn test_codegen_insert_values_no_ipk_uses_new_rowid() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema(); // no IPK
+        let ctx = CodegenContext::default(); // rowid_alias_col_idx = None
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(
+            ops.contains(&Opcode::NewRowid),
+            "non-IPK INSERT should use NewRowid"
+        );
+        assert!(
+            !ops.contains(&Opcode::IsNull),
+            "non-IPK INSERT should NOT emit IsNull routing"
+        );
+    }
+
+    /// INSERT with explicit column list where IPK is in non-first position.
+    #[test]
+    fn test_codegen_insert_values_ipk_column_list_reorder() {
+        // Table: (a INTEGER PRIMARY KEY, b TEXT)
+        // INSERT INTO t(b, a) VALUES (?, ?)  →  IPK is at VALUES position 1
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["b".to_owned(), "a".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0), // IPK is column 0 in schema
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        // Should still emit IPK routing (IsNull + Copy) because 'a' is in
+        // the column list at position 1.
+        assert!(
+            ops.contains(&Opcode::IsNull),
+            "reordered column list with IPK should emit IsNull"
+        );
+    }
+
+    /// INSERT with explicit column list that OMITS the IPK column.
+    #[test]
+    fn test_codegen_insert_values_ipk_column_list_omitted() {
+        // Table: (a INTEGER PRIMARY KEY, b TEXT)
+        // INSERT INTO t(b) VALUES (?)  →  IPK omitted, should auto-generate
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["b".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        // IPK omitted from column list → should auto-generate (NewRowid only).
+        assert!(
+            ops.contains(&Opcode::NewRowid),
+            "omitted IPK should use NewRowid"
+        );
+        assert!(
+            !ops.contains(&Opcode::IsNull),
+            "omitted IPK should NOT emit IsNull routing"
+        );
+    }
+
+    /// Multi-row VALUES with IPK should emit IPK routing for each row.
+    #[test]
+    fn test_codegen_insert_values_ipk_multi_row() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![
+                vec![placeholder(1), placeholder(2)],
+                vec![placeholder(3), placeholder(4)],
+                vec![placeholder(5), placeholder(6)],
+            ]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        // Three rows → three IsNull opcodes (one per row).
+        let is_null_count = ops.iter().filter(|&&op| op == Opcode::IsNull).count();
+        assert_eq!(
+            is_null_count, 3,
+            "3-row INSERT with IPK should emit 3 IsNull opcodes, got {is_null_count}"
         );
     }
 }
