@@ -611,8 +611,11 @@ impl Connection {
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let statement = self.rewrite_subquery_statement(statement)?;
-        // 5B.5: autocommit wrapping — ensure a pager transaction is active
-        // for write operations outside an explicit BEGIN.
+        // 5B.5 + 5B.2 (bd-1yi8): autocommit wrapping — ensure a pager
+        // transaction is active for ALL operations outside an explicit
+        // BEGIN.  Writes use Immediate mode; reads use Deferred (read-only).
+        // This is necessary because write-through INSERTs no longer sync
+        // to MemDatabase, so subsequent SELECTs must read from the pager.
         let is_write = matches!(
             &statement,
             Statement::Insert(_)
@@ -626,7 +629,7 @@ impl Connection {
         let was_auto = if is_write {
             self.ensure_autocommit_txn()?
         } else {
-            false
+            self.ensure_autocommit_txn_mode(TransactionMode::Deferred)?
         };
         let result = self.execute_statement_dispatch(statement, params);
         let ok = result.is_ok();
@@ -1190,11 +1193,18 @@ impl Connection {
     /// created.  Returns `true` when an implicit transaction was started
     /// (the caller must later call [`resolve_autocommit_txn`]).
     fn ensure_autocommit_txn(&self) -> Result<bool> {
+        self.ensure_autocommit_txn_mode(TransactionMode::Immediate)
+    }
+
+    /// Ensure a pager transaction is active, using the specified mode.
+    /// Phase 5B.2 (bd-1yi8): reads also need pager transactions so
+    /// they can see data written by prior write-through INSERTs.
+    fn ensure_autocommit_txn_mode(&self, mode: TransactionMode) -> Result<bool> {
         if *self.in_transaction.borrow() || self.active_txn.borrow().is_some() {
             return Ok(false);
         }
         let cx = Cx::new();
-        let txn = self.pager.begin(&cx, TransactionMode::Immediate)?;
+        let txn = self.pager.begin(&cx, mode)?;
         *self.active_txn.borrow_mut() = Some(txn);
         Ok(true)
     }

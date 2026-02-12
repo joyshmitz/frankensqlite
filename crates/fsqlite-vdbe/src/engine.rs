@@ -1383,17 +1383,34 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
-                // ── Cursor operations (in-memory backend) ──────────────
-                Opcode::OpenRead | Opcode::OpenWrite => {
+                // ── Cursor operations ─────────────────────────────────
+                Opcode::OpenRead => {
+                    // Phase 5C.1 (bd-35my): ALWAYS route reads through
+                    // StorageCursor (pager-backed B-tree). The read path
+                    // opens a cursor on existing page data without
+                    // reinitializing the root page.
                     let cursor_id = op.p1;
                     let root_page = op.p2;
-                    let writable = op.opcode == Opcode::OpenWrite;
-                    if self.open_storage_cursor(cursor_id, root_page, writable) {
+                    if self.open_storage_cursor(cursor_id, root_page, false) {
+                        self.cursors.remove(&cursor_id);
+                    } else {
+                        // Fallback to MemCursor when storage cursors are
+                        // disabled (e.g. older tests without txn_page_io).
+                        self.storage_cursors.remove(&cursor_id);
+                        self.cursors
+                            .insert(cursor_id, MemCursor::new(root_page, false));
+                    }
+                    pc += 1;
+                }
+                Opcode::OpenWrite => {
+                    let cursor_id = op.p1;
+                    let root_page = op.p2;
+                    if self.open_storage_cursor(cursor_id, root_page, true) {
                         self.cursors.remove(&cursor_id);
                     } else {
                         self.storage_cursors.remove(&cursor_id);
                         self.cursors
-                            .insert(cursor_id, MemCursor::new(root_page, writable));
+                            .insert(cursor_id, MemCursor::new(root_page, true));
                     }
                     pc += 1;
                 }
@@ -1867,9 +1884,7 @@ impl VdbeEngine {
                             }
                             sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
                         }
-                    } else if let Some(root) =
-                        self.cursors.get(&cursor_id).map(|c| c.root_page)
-                    {
+                    } else if let Some(root) = self.cursors.get(&cursor_id).map(|c| c.root_page) {
                         // MemDatabase fallback (Phase 4 in-memory cursors).
                         let values = decode_record(&record_val)?;
                         if let Some(db) = self.db.as_mut() {
@@ -1882,26 +1897,12 @@ impl VdbeEngine {
                 Opcode::Delete => {
                     // Delete the row at the current cursor position.
                     let cursor_id = op.p1;
-                    // Phase 5: route through B-tree if a writable storage
-                    // cursor is active.
-                    let storage_delete = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id)
-                    {
+                    // Phase 5B.3 (bd-1r0d): write-through — route ONLY through
+                    // storage cursor when one exists; fall back to MemDatabase
+                    // only for legacy Phase 4 cursors.
+                    if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable && !sc.cursor.eof() {
-                            let rowid = sc.cursor.rowid(&sc.cx)?;
                             sc.cursor.delete(&sc.cx)?;
-                            Some((sc.root_page, rowid))
-                        } else {
-                            Some((sc.root_page, 0)) // has cursor but no-op
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some((root, rowid)) = storage_delete {
-                        // Sync deletion to MemDatabase (dual-write).
-                        if rowid != 0 {
-                            if let Some(db) = self.db.as_mut() {
-                                db.delete_by_rowid(root, rowid);
-                            }
                         }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         // Pure in-memory path (Phase 4).
@@ -2521,51 +2522,71 @@ impl VdbeEngine {
         };
 
         // Phase 5 (bd-2a3y): prefer real pager transaction when available.
-        // We hydrate the B-tree from MemTable rows through the pager's
-        // transaction, so the cursor exercises the real page I/O path.
         if let Some(ref page_io) = self.txn_page_io {
             let cx = Cx::new();
 
-            // Initialize the root page as an empty leaf table B-tree page
-            // (type 0x0D) in the pager's write-set.
-            let mut root_data = vec![0u8; PAGE_SIZE as usize];
-            root_data[0] = 0x0D; // leaf table
-            // bytes 3-4: cell count = 0
-            // bytes 5-6: content area offset = page_size
-            #[allow(clippy::cast_possible_truncation)]
-            let content_offset = PAGE_SIZE as u16;
-            root_data[5..7].copy_from_slice(&content_offset.to_be_bytes());
-            {
-                let mut io = page_io.clone();
-                if io.write_page(&cx, root_pgno, &root_data).is_err() {
-                    return false;
+            if writable {
+                // Write path: initialize the root page as an empty leaf table
+                // B-tree page (type 0x0D) in the pager's write-set, then
+                // hydrate from MemTable rows (dual-source during Phase 5
+                // transition).
+                let mut root_data = vec![0u8; PAGE_SIZE as usize];
+                root_data[0] = 0x0D; // leaf table
+                // bytes 3-4: cell count = 0
+                // bytes 5-6: content area offset = page_size
+                #[allow(clippy::cast_possible_truncation)]
+                let content_offset = PAGE_SIZE as u16;
+                root_data[5..7].copy_from_slice(&content_offset.to_be_bytes());
+                {
+                    let mut io = page_io.clone();
+                    if io.write_page(&cx, root_pgno, &root_data).is_err() {
+                        return false;
+                    }
                 }
-            }
 
-            let mut cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
+                let mut cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
 
-            // Hydrate from MemTable rows (dual-source during Phase 5 transition).
-            if let Some(db) = self.db.as_ref() {
-                if let Some(table) = db.get_table(root_page) {
-                    for row in &table.rows {
-                        let payload = encode_record(&row.values);
-                        if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
-                            return false;
+                // Hydrate from MemTable rows (dual-source during Phase 5
+                // transition).
+                if let Some(db) = self.db.as_ref() {
+                    if let Some(table) = db.get_table(root_page) {
+                        for row in &table.rows {
+                            let payload = encode_record(&row.values);
+                            if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
+                                return false;
+                            }
                         }
                     }
                 }
-            }
 
-            self.storage_cursors.insert(
-                cursor_id,
-                StorageCursor {
-                    cursor: CursorBackend::Txn(cursor),
-                    cx,
-                    writable,
-                    root_page,
-                    last_alloc_rowid: 0,
-                },
-            );
+                self.storage_cursors.insert(
+                    cursor_id,
+                    StorageCursor {
+                        cursor: CursorBackend::Txn(cursor),
+                        cx,
+                        writable,
+                        root_page,
+                        last_alloc_rowid: 0,
+                    },
+                );
+            } else {
+                // Read path (bd-35my): open a cursor on the EXISTING B-tree
+                // page data. Do NOT reinitialize the root page or hydrate
+                // from MemTable — the data should already be in the pager's
+                // write-set (from prior writes) or on disk.
+                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
+
+                self.storage_cursors.insert(
+                    cursor_id,
+                    StorageCursor {
+                        cursor: CursorBackend::Txn(cursor),
+                        cx,
+                        writable,
+                        root_page,
+                        last_alloc_rowid: 0,
+                    },
+                );
+            }
             return true;
         }
 
@@ -5753,8 +5774,10 @@ mod tests {
 
     #[test]
     fn test_insert_via_storage_cursor_write_path() {
-        // Insert a row through the B-tree write path and verify it's readable
-        // via the storage cursor AND synced to MemDatabase.
+        // Phase 5B.2 (bd-1yi8): INSERT goes ONLY through StorageCursor
+        // (B-tree write path), NOT synced to MemDatabase.
+        // Read-back uses the SAME cursor (Rewind) since the MemPageStore
+        // is per-cursor and not shared across Close/OpenRead.
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
 
@@ -5776,9 +5799,7 @@ mod tests {
             // Insert(cursor=0, record=r4, rowid=r1).
             b.emit_op(Opcode::Insert, 0, 4, 1, P4::None, 0);
 
-            // Now read it back: close write cursor, open read cursor.
-            b.emit_op(Opcode::Close, 0, 0, 0, P4::None, 0);
-            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(2), 0);
+            // Read back via same cursor: Rewind then Column/ResultRow.
             b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
 
             let body = b.current_addr();
@@ -5793,14 +5814,20 @@ mod tests {
             b.resolve_label(end);
         });
 
-        // Phase 5B.2 (bd-1yi8): write-through — INSERT goes ONLY through
-        // StorageCursor, MemDatabase is NOT synced.
+        // Write-through: MemDatabase should NOT have the row.
         let table = final_db.get_table(root).expect("table should exist");
-        assert_eq!(table.rows.len(), 0, "MemDatabase should NOT have the row after write-through");
+        assert_eq!(
+            table.rows.len(),
+            0,
+            "MemDatabase must not be synced in write-through mode"
+        );
 
-        // The row is readable via B-tree read-back (verified by the
-        // ResultRow output from the OpenRead/Column/Next sequence above).
-        assert_eq!(rows.len(), 1, "should read back exactly one row from B-tree");
+        // Data readable from B-tree via same cursor.
+        assert_eq!(
+            rows.len(),
+            1,
+            "should read back exactly one row from B-tree"
+        );
         assert_eq!(rows[0][0], SqliteValue::Integer(42));
         assert_eq!(rows[0][1], SqliteValue::Text("hello".to_owned()));
     }
@@ -5808,7 +5835,8 @@ mod tests {
     #[test]
     fn test_delete_via_storage_cursor_write_path() {
         // Insert a row into MemDatabase, open a writable StorageCursor,
-        // position on it, delete it, verify MemDatabase is synced.
+        // position on it, delete it, and verify data is removed from the
+        // B-tree while MemDatabase remains unchanged (write-through mode).
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
         let table = db.get_table_mut(root).unwrap();
@@ -5816,7 +5844,7 @@ mod tests {
         table.insert(2, vec![SqliteValue::Integer(20)]);
         table.insert(3, vec![SqliteValue::Integer(30)]);
 
-        let (_, final_db) = run_write_with_storage_cursors(db, |b| {
+        let (rows, final_db) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
 
@@ -5830,17 +5858,32 @@ mod tests {
             // Delete the current row.
             b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
 
+            // Read back rowids from B-tree to verify rowid=2 was deleted.
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Rowid, 0, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
 
-        // MemDatabase should have only rows 1 and 3 remaining.
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(3)],],
+            "B-tree cursor should observe rowid=2 deleted"
+        );
+
+        // MemDatabase should remain unchanged in write-through mode.
         let table = final_db.get_table(root).expect("table should exist");
-        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows.len(), 3);
         let rowids: Vec<i64> = table.rows.iter().map(|r| r.rowid).collect();
         assert!(rowids.contains(&1));
+        assert!(rowids.contains(&2));
         assert!(rowids.contains(&3));
-        assert!(!rowids.contains(&2));
     }
 
     #[test]
@@ -5875,6 +5918,9 @@ mod tests {
 
     #[test]
     fn test_newrowid_concurrent_flag_uses_snapshot_independent_path() {
+        // Phase 5B.2 (bd-1yi8): with storage cursors, NewRowid reads max
+        // rowid from B-tree regardless of p3 (concurrent flag). The p3
+        // flag only affects the MemDatabase fallback (Phase 4 cursors).
         fn setup_db_with_stale_counter() -> (MemDatabase, i32) {
             let mut db = MemDatabase::new();
             let root = db.create_table(1);
@@ -5891,7 +5937,8 @@ mod tests {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
-            // Serialized path (`p3 = 0`) uses local counter directly.
+            // Serialized path (`p3 = 0`) — with storage cursors, reads
+            // max rowid from B-tree (11), returns 12.
             b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
@@ -5903,15 +5950,236 @@ mod tests {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
-            // Concurrent path (`p3 != 0`) uses max-visible-rowid + 1.
+            // Concurrent path (`p3 != 0`) — same B-tree path, same result.
             b.emit_op(Opcode::NewRowid, 0, 1, 1, P4::None, 0);
             b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
 
-        assert_eq!(rows_serialized, vec![vec![SqliteValue::Integer(1)]]);
+        // Both paths read max rowid (11) from B-tree → return 12.
+        assert_eq!(rows_serialized, vec![vec![SqliteValue::Integer(12)]]);
         assert_eq!(rows_concurrent, vec![vec![SqliteValue::Integer(12)]]);
+    }
+
+    // ── bd-1yi8: INSERT write-through tests ────────────────────────────
+
+    #[test]
+    fn test_insert_write_through_no_memdb_sync() {
+        // Verify INSERT with storage cursor does NOT write to MemDatabase.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let (_, final_db) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 99, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        let table = final_db.get_table(root).expect("table should exist");
+        assert_eq!(table.rows.len(), 0, "write-through must skip MemDatabase");
+    }
+
+    #[test]
+    fn test_insert_new_rowid_from_btree() {
+        // Verify NewRowid reads max from B-tree, not MemDatabase counter.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        // Insert rows 1..=3 into MemTable (these get copied to B-tree at
+        // cursor open time via MemPageStore fallback).
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+        // Reset counter to simulate stale state.
+        table.next_rowid = 1;
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+            b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // B-tree max rowid is 3 → should return 4, NOT 1.
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(4)]]);
+    }
+
+    #[test]
+    fn test_insert_multiple_rows_write_through() {
+        // Insert multiple rows via B-tree and read them all back.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let (rows, final_db) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+            // Insert row 1: value=100
+            b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 100, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+
+            // Insert row 2: value=200
+            b.emit_op(Opcode::NewRowid, 0, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 200, 5, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 5, 1, 6, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 6, 4, P4::None, 0);
+
+            // Insert row 3: value=300
+            b.emit_op(Opcode::NewRowid, 0, 7, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 300, 8, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 8, 1, 9, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 9, 7, P4::None, 0);
+
+            // Read back via Rewind/Column/Next loop.
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Column, 0, 0, 10, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 10, 1, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // MemDatabase should be empty (write-through).
+        let table = final_db.get_table(root).expect("table should exist");
+        assert_eq!(table.rows.len(), 0);
+
+        // All 3 rows readable from B-tree.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0], SqliteValue::Integer(100));
+        assert_eq!(rows[1][0], SqliteValue::Integer(200));
+        assert_eq!(rows[2][0], SqliteValue::Integer(300));
+    }
+
+    #[test]
+    fn test_insert_upsert_via_btree() {
+        // Insert same rowid twice — second insert should overwrite.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+            // Insert rowid=1 with value=10.
+            b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+
+            // Insert rowid=1 again with value=99 (upsert).
+            b.emit_op(Opcode::Integer, 99, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, 4, 1, 5, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 0);
+
+            // Read back.
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            let body = b.current_addr();
+            b.emit_op(Opcode::Column, 0, 0, 6, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 6, 1, 0, P4::None, 0);
+            let next_target =
+                i32::try_from(body).expect("program counter should fit into i32 for tests");
+            b.emit_op(Opcode::Next, 0, next_target, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // Only one row with the updated value.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], SqliteValue::Integer(99));
+    }
+
+    #[test]
+    fn test_insert_memdb_fallback_without_storage_cursor() {
+        // Verify that INSERT still works via MemDatabase when no
+        // storage cursor is active (Phase 4 legacy path).
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+        // Open a regular MemCursor (not a storage cursor).
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::NewRowid, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        // Disable storage cursors to force MemDatabase path.
+        engine.enable_storage_cursors(false);
+        engine.set_database(db);
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+
+        let final_db = engine.take_database().expect("database should exist");
+        let table = final_db.get_table(root).expect("table should exist");
+        assert_eq!(
+            table.rows.len(),
+            1,
+            "MemDatabase fallback must insert the row"
+        );
+        assert_eq!(table.rows[0].values[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn test_delete_memdb_fallback_without_storage_cursor() {
+        // Verify DELETE still works via MemDatabase when storage cursors are disabled.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+        b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(false);
+        engine.set_database(db);
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+
+        let final_db = engine.take_database().expect("database should exist");
+        let table = final_db.get_table(root).expect("table should exist");
+        let rowids: Vec<i64> = table.rows.iter().map(|r| r.rowid).collect();
+        assert_eq!(
+            rowids,
+            vec![1, 3],
+            "MemDatabase fallback should delete rowid=2"
+        );
     }
 
     // ── bd-2a3y: TransactionPageIo / SharedTxnPageIo integration tests ──
