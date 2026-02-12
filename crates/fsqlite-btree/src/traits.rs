@@ -129,7 +129,10 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// B-trees, this is the key bytes.
     fn payload(&self, cx: &Cx) -> Result<Vec<u8>>;
 
-    /// Read the rowid at the current cursor position (table B-trees only).
+    /// Read the rowid at the current cursor position.
+    ///
+    /// For table B-trees this is the integer key. For index B-trees this is
+    /// extracted from the trailing field of the serialized key record.
     fn rowid(&self, cx: &Cx) -> Result<i64>;
 
     /// Whether the cursor is at EOF (past the last entry).
@@ -167,7 +170,9 @@ impl sealed::Sealed for MockBtreeCursor {}
 #[allow(clippy::missing_errors_doc)]
 impl BtreeCursorOps for MockBtreeCursor {
     fn index_move_to(&mut self, _cx: &Cx, key: &[u8]) -> Result<SeekResult> {
-        // Simple linear scan for testing.
+        // Linear scan for exact match, then find successor position if not found.
+        // Per SeekResult::NotFound contract: cursor must point to the entry that
+        // would follow the key in sort order (or be at EOF if no such entry exists).
         for (i, (_, data)) in self.entries.iter().enumerate() {
             if data.as_slice() == key {
                 self.pos = i;
@@ -176,11 +181,28 @@ impl BtreeCursorOps for MockBtreeCursor {
                 return Ok(SeekResult::Found);
             }
         }
-        self.at_eof = true;
+        // Not found: find successor position (first entry with key > target).
+        // Entries assumed to be sorted by key for proper seek semantics.
+        let successor_pos = self
+            .entries
+            .iter()
+            .position(|(_, data)| data.as_slice() > key);
+        if let Some(pos) = successor_pos {
+            self.pos = pos;
+            self.at_eof = false;
+            self.current_rowid = self.entries[pos].0;
+        } else {
+            // No successor exists - position at EOF.
+            self.pos = self.entries.len();
+            self.at_eof = true;
+        }
         Ok(SeekResult::NotFound)
     }
 
     fn table_move_to(&mut self, _cx: &Cx, rowid: i64) -> Result<SeekResult> {
+        // Linear scan for exact match, then find successor position if not found.
+        // Per SeekResult::NotFound contract: cursor must point to the entry that
+        // would follow the rowid in sort order (or be at EOF if no such entry exists).
         for (i, (rid, _)) in self.entries.iter().enumerate() {
             if *rid == rowid {
                 self.pos = i;
@@ -189,7 +211,18 @@ impl BtreeCursorOps for MockBtreeCursor {
                 return Ok(SeekResult::Found);
             }
         }
-        self.at_eof = true;
+        // Not found: find successor position (first entry with rowid > target).
+        // Entries assumed to be sorted by rowid for proper seek semantics.
+        let successor_pos = self.entries.iter().position(|(rid, _)| *rid > rowid);
+        if let Some(pos) = successor_pos {
+            self.pos = pos;
+            self.at_eof = false;
+            self.current_rowid = self.entries[pos].0;
+        } else {
+            // No successor exists - position at EOF.
+            self.pos = self.entries.len();
+            self.at_eof = true;
+        }
         Ok(SeekResult::NotFound)
     }
 
