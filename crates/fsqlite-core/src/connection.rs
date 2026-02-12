@@ -4646,7 +4646,11 @@ impl Connection {
             let num_columns = columns.len();
 
             // Track rowid alias columns (INTEGER PRIMARY KEY).
-            if let Some(idx) = columns.iter().position(|c| c.is_ipk) {
+            // When a column is INTEGER PRIMARY KEY, its value is NOT stored in the
+            // record payload - it IS the rowid. We need to insert the rowid at this
+            // position when loading data.
+            let ipk_col_idx = columns.iter().position(|c| c.is_ipk);
+            if let Some(idx) = ipk_col_idx {
                 new_alias_map.insert(name.to_ascii_lowercase(), idx);
             }
 
@@ -4677,7 +4681,13 @@ impl Connection {
                     loop {
                         let rowid = cursor.rowid(cx)?;
                         let payload = cursor.payload(cx)?;
-                        if let Some(values) = parse_record(&payload) {
+                        if let Some(mut values) = parse_record(&payload) {
+                            // If this table has an INTEGER PRIMARY KEY column, insert
+                            // the rowid at that position since it's not stored in the
+                            // record payload.
+                            if let Some(ipk_idx) = ipk_col_idx {
+                                values.insert(ipk_idx, SqliteValue::Integer(rowid));
+                            }
                             mem_table.insert_row(rowid, values);
                         }
                         if !cursor.next(cx)? {
