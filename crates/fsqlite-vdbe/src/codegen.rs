@@ -3932,7 +3932,11 @@ fn resolve_in_probe_source<'a>(
 ///
 /// Returns `true` if the subquery was handled, `false` if it cannot be handled
 /// (caller should fall back to emitting Null or other behavior).
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines
+)]
 fn try_emit_complex_in_subquery(
     b: &mut ProgramBuilder,
     operand: &Expr,
@@ -3941,9 +3945,8 @@ fn try_emit_complex_in_subquery(
     reg: i32,
     scan_ctx: &ScanCtx<'_>,
 ) -> bool {
-    let schema = match scan_ctx.schema {
-        Some(s) => s,
-        None => return false,
+    let Some(schema) = scan_ctx.schema else {
+        return false;
     };
 
     // Reject WITH and compound queries.

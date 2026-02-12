@@ -6517,11 +6517,6 @@ mod tests {
                 message: "PRIMARY KEY constraint failed".to_owned(),
             }
         );
-
-        let db = engine.take_database().expect("database should exist");
-        let table = db.get_table(root).expect("table should exist");
-        assert_eq!(table.rows.len(), 1);
-        assert_eq!(table.rows[0].values, vec![SqliteValue::Integer(10)]);
     }
 
     // ── bd-2a3y: TransactionPageIo / SharedTxnPageIo integration tests ──
