@@ -1,80 +1,67 @@
 #[cfg(test)]
 mod tests {
-    use crate::engine::{MemDatabase, VdbeEngine, ExecOutcome};
-    use crate::VdbeProgram;
+    use crate::engine::{ExecOutcome, MemDatabase, VdbeEngine};
+    use crate::ProgramBuilder;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
 
     #[test]
-    fn test_repro_delete_skips_next_row() {
-        // Create table with 3 rows: 1, 2, 3.
+    fn test_delete_then_next_does_not_skip_successor_row() {
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
-        db.insert_row(1, vec![SqliteValue::Integer(1)]);
-        db.insert_row(2, vec![SqliteValue::Integer(2)]);
-        db.insert_row(3, vec![SqliteValue::Integer(3)]);
+        {
+            let table = db.get_table_mut(root).expect("table exists");
+            table.insert_row(1, vec![SqliteValue::Integer(1)]);
+            table.insert_row(2, vec![SqliteValue::Integer(2)]);
+            table.insert_row(3, vec![SqliteValue::Integer(3)]);
+        }
 
         // Program:
-        // 0. OpenRead cursor 0 on root
-        // 1. Rewind 0 to End (label 6)
-        // 2. Rowid 0 -> r1
-        // 3. Eq r1, target(2) -> Delete
-        // 4. Next 0 -> 2
-        // 5. Halt
-        // 6. Halt
-        //
-        // Delete step:
-        // Delete rowid 2.
-        // Then Next.
-        // Expectation: Should visit row 3.
-        // Bug: If Delete doesn't adjust cursor, Next skips row 3.
+        //   OpenWrite cursor on t
+        //   Rewind loop
+        //     rowid -> r1
+        //     ResultRow r1
+        //     if r1 == 2: Delete
+        //   Next loop
+        let mut b = ProgramBuilder::new();
+        let done = b.emit_label();
+        let skip_delete = b.emit_label();
 
-        let mut engine = VdbeEngine::new(5);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, done, P4::None, 0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let loop_start = b.current_addr() as i32;
+        b.emit_op(Opcode::Rowid, 0, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 2, 2, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Ne, 2, 1, skip_delete, P4::None, 0);
+        b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+        b.resolve_label(skip_delete);
+        b.emit_op(Opcode::Next, 0, loop_start, 0, P4::None, 0);
+        b.resolve_label(done);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let program = b.finish().expect("program builds");
+        let mut engine = VdbeEngine::new(program.register_count());
         engine.set_database(db);
 
-        // Manually build program to iterate and delete 2.
-        use fsqlite_types::opcode::VdbeOp;
-        let ops = vec![
-            VdbeOp { opcode: Opcode::OpenRead, p1: 0, p2: root, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Rewind, p1: 0, p2: 7, p3: 0, p4: P4::None, p5: 0 },
-            // Loop start (addr 2)
-            VdbeOp { opcode: Opcode::Rowid, p1: 0, p2: 1, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Integer, p1: 2, p2: 2, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Ne, p1: 2, p2: 6, p3: 1, p4: P4::None, p5: 0 }, // if r1 != 2, skip delete
-            // Delete row 2
-            VdbeOp { opcode: Opcode::Delete, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
-            // Loop end (addr 6)
-            VdbeOp { opcode: Opcode::Next, p1: 0, p2: 2, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Halt, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
-        ];
+        let outcome = engine.execute(&program).expect("program executes");
+        assert!(matches!(outcome, ExecOutcome::Done));
 
-        // We can't easily assert visited rows without ResultRow or tracing.
-        // Instead, we check the DB content after.
-        // But the bug is about *skipping* the next row during iteration.
-        // If we skip row 3, we won't see it.
-        // Let's modify the program to Count visited rows.
-        // Or better, ResultRow.
-        
-        let ops_result = vec![
-            VdbeOp { opcode: Opcode::OpenRead, p1: 0, p2: root, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Rewind, p1: 0, p2: 8, p3: 0, p4: P4::None, p5: 0 },
-            // Loop start (addr 2)
-            VdbeOp { opcode: Opcode::Rowid, p1: 0, p2: 1, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::ResultRow, p1: 1, p2: 1, p3: 0, p4: P4::None, p5: 0 }, // Emit rowid
-            VdbeOp { opcode: Opcode::Integer, p1: 2, p2: 2, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Ne, p1: 2, p2: 7, p3: 1, p4: P4::None, p5: 0 }, // if r1 != 2, skip delete
-            // Delete row 2
-            VdbeOp { opcode: Opcode::Delete, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
-            // Loop end (addr 7)
-            VdbeOp { opcode: Opcode::Next, p1: 0, p2: 2, p3: 0, p4: P4::None, p5: 0 },
-            VdbeOp { opcode: Opcode::Halt, p1: 0, p2: 0, p3: 0, p4: P4::None, p5: 0 },
-        ];
-        
-        // Use a wrapper or hack to run this since VdbeProgram fields are crate-private?
-        // No, ops is pub(crate). But `VdbeProgram` struct fields are private.
-        // I need to use `ProgramBuilder` or similar.
-        // But `ProgramBuilder` is in `lib.rs`, `VdbeEngine` in `engine.rs`.
-        // I can construct `VdbeProgram` if I can access fields? No.
-        // I should use `ProgramBuilder` to build it.
+        let visited: Vec<i64> = engine
+            .take_results()
+            .into_iter()
+            .filter_map(|row| row.first().and_then(SqliteValue::as_integer))
+            .collect();
+        assert_eq!(visited, vec![1, 2, 3], "row 3 must not be skipped");
+
+        let db_after = engine.take_database().expect("engine returns db");
+        let remaining: Vec<i64> = db_after
+            .get_table(root)
+            .expect("table exists")
+            .iter_rows()
+            .map(|(rowid, _)| rowid)
+            .collect();
+        assert_eq!(remaining, vec![1, 3], "only rowid 2 should be deleted");
     }
 }

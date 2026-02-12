@@ -10,6 +10,8 @@ use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 pub mod codegen;
 pub mod engine;
 pub mod frame;
+#[cfg(test)]
+mod repro_delete_skip;
 
 // ── Label System ────────────────────────────────────────────────────────────
 

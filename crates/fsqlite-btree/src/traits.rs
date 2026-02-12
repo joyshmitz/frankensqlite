@@ -441,4 +441,65 @@ mod tests {
         assert!(!cursor.prev(&cx).unwrap());
         assert!(cursor.eof());
     }
+
+    /// bd-hpa5: Verify MockBtreeCursor seek positions at successor on NotFound.
+    /// This mirrors real cursor semantics per SeekResult::NotFound contract.
+    #[test]
+    fn test_mock_cursor_seek_positions_at_successor() {
+        // Entries sorted by rowid.
+        let entries = vec![
+            (10, b"ten".to_vec()),
+            (20, b"twenty".to_vec()),
+            (30, b"thirty".to_vec()),
+        ];
+        let mut cursor = MockBtreeCursor::new(entries);
+        let cx = Cx::new();
+
+        // Seek for rowid 15 (not found) should position at successor (rowid 20).
+        let result = cursor.table_move_to(&cx, 15).unwrap();
+        assert!(!result.is_found());
+        assert!(!cursor.eof(), "cursor should not be at EOF when successor exists");
+        assert_eq!(cursor.rowid(&cx).unwrap(), 20, "cursor should be at successor");
+
+        // Seek for rowid 5 (not found) should position at successor (rowid 10).
+        let result = cursor.table_move_to(&cx, 5).unwrap();
+        assert!(!result.is_found());
+        assert!(!cursor.eof());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
+
+        // Seek for rowid 35 (not found, no successor) should position at EOF.
+        let result = cursor.table_move_to(&cx, 35).unwrap();
+        assert!(!result.is_found());
+        assert!(cursor.eof(), "cursor should be at EOF when no successor exists");
+    }
+
+    /// bd-hpa5: Verify index_move_to positions at successor on NotFound.
+    #[test]
+    fn test_mock_cursor_index_seek_positions_at_successor() {
+        // Entries sorted by key.
+        let entries = vec![
+            (1, b"alpha".to_vec()),
+            (2, b"beta".to_vec()),
+            (3, b"gamma".to_vec()),
+        ];
+        let mut cursor = MockBtreeCursor::new(entries);
+        let cx = Cx::new();
+
+        // Seek for "aaa" (before "alpha") should position at "alpha".
+        let result = cursor.index_move_to(&cx, b"aaa").unwrap();
+        assert!(!result.is_found());
+        assert!(!cursor.eof());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+
+        // Seek for "cat" (between "beta" and "gamma") should position at "gamma".
+        let result = cursor.index_move_to(&cx, b"cat").unwrap();
+        assert!(!result.is_found());
+        assert!(!cursor.eof());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+
+        // Seek for "zzz" (after all) should position at EOF.
+        let result = cursor.index_move_to(&cx, b"zzz").unwrap();
+        assert!(!result.is_found());
+        assert!(cursor.eof());
+    }
 }
