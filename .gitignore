@@ -84,3 +84,10 @@ dist/
 
 # Wrangler config (downloaded, not source of truth)
 wrangler.toml
+
+# Agent/compiler ephemeral files
+.plan.md
+screenshots_for_diagnostics/
+rustc-ice-*.txt
+reports/
+.agent-mail.yaml
