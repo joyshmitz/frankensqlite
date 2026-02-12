@@ -3478,9 +3478,14 @@ impl Connection {
     fn compile_table_update(&self, update: &fsqlite_ast::UpdateStatement) -> Result<VdbeProgram> {
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
+        let rowid_alias_col_idx = self
+            .rowid_alias_columns
+            .borrow()
+            .get(&update.table.name.name.to_ascii_lowercase())
+            .copied();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
-            rowid_alias_col_idx: None,
+            rowid_alias_col_idx,
         };
         codegen_update(&mut builder, update, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
@@ -7951,6 +7956,59 @@ mod tests {
             row_values(&rows[1]),
             vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())]
         );
+    }
+
+    #[test]
+    fn test_update_integer_primary_key_moves_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob');").unwrap();
+
+        let changed = conn.execute("UPDATE t SET id = 5 WHERE id = 1;").unwrap();
+        assert_eq!(changed, 1);
+
+        let rows = conn.query("SELECT id, name FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(5),
+                SqliteValue::Text("alice".to_owned())
+            ]
+        );
+
+        let old_rows = conn.query("SELECT id FROM t WHERE id = 1;").unwrap();
+        assert!(
+            old_rows.is_empty(),
+            "old rowid should be removed after PK update"
+        );
+    }
+
+    #[test]
+    fn test_update_large_record_payload() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
+
+        let large_payload = "y".repeat(5000);
+        let changed = conn
+            .execute_with_params(
+                "UPDATE t SET payload = ?1 WHERE id = 1;",
+                &[SqliteValue::Text(large_payload.clone())],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        let rows = conn.query("SELECT payload FROM t WHERE id = 1;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text(large_payload)]);
     }
 
     #[test]

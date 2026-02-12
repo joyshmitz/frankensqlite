@@ -2371,7 +2371,7 @@ pub fn codegen_update(
     b: &mut ProgramBuilder,
     stmt: &UpdateStatement,
     schema: &[TableSchema],
-    _ctx: &CodegenContext,
+    ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
     let table_name = table_name_from_qualified(&stmt.table);
     let table = find_table(schema, table_name)?;
@@ -2482,9 +2482,46 @@ pub fn codegen_update(
         );
     }
 
-    // Get the current rowid for re-insertion.
-    let rowid_reg = b.alloc_reg();
-    b.emit_op(Opcode::Rowid, cursor, rowid_reg, 0, P4::None, 0);
+    // Get the current rowid before deleting the old row.
+    let old_rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::Rowid, cursor, old_rowid_reg, 0, P4::None, 0);
+
+    // UPDATE is delete+insert: remove the current row first, then insert the
+    // rewritten record (possibly at a new rowid).
+    b.emit_op(Opcode::Delete, cursor, 0, 0, P4::None, 0);
+
+    // Determine destination rowid for re-insertion.
+    let mut rowid_reg = old_rowid_reg;
+    let rowid_alias_col_idx = ctx
+        .rowid_alias_col_idx
+        .or_else(|| table.columns.iter().position(|col| col.is_ipk));
+    if let Some(ipk_idx) = rowid_alias_col_idx {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let ipk_reg = col_regs + ipk_idx as i32;
+        let auto_label = b.emit_label();
+        let done_label = b.emit_label();
+        let concurrent_flag = i32::from(ctx.concurrent_mode);
+
+        rowid_reg = b.alloc_reg();
+
+        // If the rewritten IPK is NULL, allocate a new rowid.
+        b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
+        b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+        b.resolve_label(auto_label);
+        b.emit_op(
+            Opcode::NewRowid,
+            cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
+        // Keep the IPK payload column consistent with the chosen rowid.
+        b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+        b.resolve_label(done_label);
+    }
 
     // MakeRecord with ALL columns.
     let rec_reg = b.alloc_reg();
@@ -4923,7 +4960,8 @@ mod tests {
         let prog = b.finish().unwrap();
 
         // Verify scan-based update: Rewind loop, read all columns,
-        // overwrite changed column (Variable for bind param), re-insert.
+        // overwrite changed column (Variable for bind param), delete old row,
+        // then insert rewritten record.
         assert!(has_opcodes(
             &prog,
             &[
@@ -4935,6 +4973,7 @@ mod tests {
                 Opcode::Column,     // read existing col b
                 Opcode::Variable,   // new value for b
                 Opcode::Rowid,      // get current rowid
+                Opcode::Delete,     // delete old row
                 Opcode::MakeRecord, // pack ALL columns
                 Opcode::Insert,     // write back
                 Opcode::Next,       // loop
@@ -4950,6 +4989,67 @@ mod tests {
             .find(|op| op.opcode == Opcode::MakeRecord)
             .unwrap();
         assert_eq!(mr.p2, 2); // ALL columns, not just the changed one.
+    }
+
+    #[test]
+    fn test_codegen_update_ipk_assignment_updates_rowid() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("a".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let mut schema = test_schema();
+        schema[0].columns[0].is_ipk = true;
+
+        let ctx = CodegenContext {
+            concurrent_mode: true,
+            rowid_alias_col_idx: Some(0),
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let ops: Vec<Opcode> = prog.ops().iter().map(|op| op.opcode).collect();
+        assert!(
+            ops.contains(&Opcode::Delete),
+            "UPDATE must delete old row before reinsert"
+        );
+        assert!(
+            ops.contains(&Opcode::IsNull) && ops.contains(&Opcode::NewRowid),
+            "IPK update should handle NULL rowid by generating NewRowid"
+        );
+
+        let delete_pos = ops
+            .iter()
+            .position(|&op| op == Opcode::Delete)
+            .expect("Delete opcode should exist");
+        let insert_pos = ops
+            .iter()
+            .position(|&op| op == Opcode::Insert)
+            .expect("Insert opcode should exist");
+        assert!(
+            delete_pos < insert_pos,
+            "Delete must execute before Insert in UPDATE rewrite"
+        );
     }
 
     // === Test 4: DELETE by rowid ===
