@@ -3928,6 +3928,391 @@ fn resolve_in_probe_source<'a>(
     }
 }
 
+/// Attempt to emit bytecode for a complex IN subquery with ORDER BY and/or LIMIT.
+///
+/// Returns `true` if the subquery was handled, `false` if it cannot be handled
+/// (caller should fall back to emitting Null or other behavior).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn try_emit_complex_in_subquery(
+    b: &mut ProgramBuilder,
+    operand: &Expr,
+    subquery: &SelectStatement,
+    not: bool,
+    reg: i32,
+    scan_ctx: &ScanCtx<'_>,
+) -> bool {
+    let schema = match scan_ctx.schema {
+        Some(s) => s,
+        None => return false,
+    };
+
+    // Reject WITH and compound queries.
+    if subquery.with.is_some() || !subquery.body.compounds.is_empty() {
+        return false;
+    }
+
+    let fsqlite_ast::SelectCore::Select {
+        columns,
+        from,
+        where_clause,
+        group_by,
+        having,
+        windows,
+        ..
+    } = &subquery.body.select
+    else {
+        return false;
+    };
+
+    // Reject GROUP BY, HAVING, windows.
+    if !group_by.is_empty() || having.is_some() || !windows.is_empty() {
+        return false;
+    }
+
+    let from_clause = match from.as_ref() {
+        Some(f) => f,
+        None => return false,
+    };
+
+    // Reject JOINs.
+    if !from_clause.joins.is_empty() {
+        return false;
+    }
+
+    let (table_name, table_alias) = match &from_clause.source {
+        fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
+        _ => return false,
+    };
+
+    let table = match find_table(schema, table_name) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    // Determine the value expression to compare.
+    let value_expr: Option<&Expr> = match columns.as_slice() {
+        [fsqlite_ast::ResultColumn::Expr { expr, .. }] => Some(expr),
+        [fsqlite_ast::ResultColumn::Star | fsqlite_ast::ResultColumn::TableStar(_)] => {
+            if table.columns.is_empty() {
+                return false;
+            }
+            None // Use first column
+        }
+        _ => return false,
+    };
+
+    // --- Begin bytecode emission ---
+
+    // Use cursors well above the main scan cursor to avoid collisions.
+    let subq_cursor = scan_ctx.cursor + 128;
+    let sorter_cursor = scan_ctx.cursor + 129;
+
+    // Evaluate the operand (value we're checking for membership).
+    let r_operand = b.alloc_temp();
+    emit_expr(b, operand, r_operand, Some(scan_ctx));
+
+    // Labels for control flow.
+    let no_match_label = b.emit_label();
+    let matched_label = b.emit_label();
+    let done_label = b.emit_label();
+
+    // Check if we have ORDER BY and/or LIMIT.
+    let has_order_by = !subquery.order_by.is_empty();
+    let has_limit = subquery.limit.is_some();
+
+    if has_order_by || has_limit {
+        // Materialize subquery results into a sorter, then probe.
+
+        // Build sort order string.
+        let sort_order: String = subquery
+            .order_by
+            .iter()
+            .map(|term| {
+                if term.direction == Some(SortDirection::Desc) {
+                    '-'
+                } else {
+                    '+'
+                }
+            })
+            .collect();
+
+        // Number of sort key columns. If no ORDER BY, still need 1 column for the value.
+        let num_sort_keys = if has_order_by {
+            subquery.order_by.len()
+        } else {
+            0
+        };
+        // Sorter holds: sort keys + value column.
+        let num_sorter_cols = num_sort_keys + 1;
+
+        // Open sorter.
+        b.emit_op(
+            Opcode::SorterOpen,
+            sorter_cursor,
+            num_sort_keys.max(1) as i32,
+            0,
+            P4::Str(if sort_order.is_empty() {
+                "+".to_owned()
+            } else {
+                sort_order
+            }),
+            0,
+        );
+
+        // Open subquery table for reading.
+        b.emit_op(
+            Opcode::OpenRead,
+            subq_cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+
+        // === Pass 1: Scan subquery rows into sorter ===
+        let scan_start = b.current_addr();
+        let scan_done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Rewind, subq_cursor, 0, scan_done, P4::None, 0);
+
+        // WHERE filter.
+        let skip_row = b.emit_label();
+        if let Some(where_expr) = where_clause.as_deref() {
+            emit_where_filter(
+                b,
+                where_expr,
+                subq_cursor,
+                table,
+                table_alias,
+                schema,
+                skip_row,
+            );
+        }
+
+        // Allocate registers for sorter record.
+        let sorter_base = b.alloc_regs(num_sorter_cols as i32);
+        let subq_scan = ScanCtx {
+            cursor: subq_cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+        };
+
+        // Emit sort key columns.
+        for (i, term) in subquery.order_by.iter().enumerate() {
+            let key_source = resolve_sort_key(&term.expr, table, table_alias);
+            match key_source {
+                SortKeySource::Column(col_idx) => {
+                    b.emit_op(
+                        Opcode::Column,
+                        subq_cursor,
+                        col_idx as i32,
+                        sorter_base + i as i32,
+                        P4::None,
+                        0,
+                    );
+                }
+                SortKeySource::Rowid => {
+                    b.emit_op(
+                        Opcode::Rowid,
+                        subq_cursor,
+                        sorter_base + i as i32,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                }
+                SortKeySource::Expression(expr) => {
+                    emit_expr(b, &expr, sorter_base + i as i32, Some(&subq_scan));
+                }
+            }
+        }
+
+        // Emit value column (last column in sorter record).
+        let value_reg = sorter_base + num_sort_keys as i32;
+        match value_expr {
+            Some(expr) => emit_expr(b, &expr, value_reg, Some(&subq_scan)),
+            None => {
+                // First column.
+                b.emit_op(Opcode::Column, subq_cursor, 0, value_reg, P4::None, 0);
+            }
+        }
+
+        // MakeRecord + SorterInsert.
+        let record_reg = b.alloc_temp();
+        b.emit_op(
+            Opcode::MakeRecord,
+            sorter_base,
+            num_sorter_cols as i32,
+            record_reg,
+            P4::None,
+            0,
+        );
+        b.emit_op(
+            Opcode::SorterInsert,
+            sorter_cursor,
+            record_reg,
+            0,
+            P4::None,
+            0,
+        );
+        b.free_temp(record_reg);
+
+        // Skip label (for WHERE-filtered rows).
+        b.resolve_label(skip_row);
+
+        // Next row.
+        let scan_body = (scan_start + 1) as i32;
+        b.emit_op(Opcode::Next, subq_cursor, scan_body, 0, P4::None, 0);
+
+        // End of pass 1.
+        b.resolve_label(scan_done);
+        b.emit_op(Opcode::Close, subq_cursor, 0, 0, P4::None, 0);
+
+        // === Pass 2: Sort and probe ===
+
+        // Initialize LIMIT counter if needed.
+        let limit_reg = subquery.limit.as_ref().map(|lc| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, &lc.limit, r);
+            r
+        });
+
+        // SorterSort: sort and position at first row; jump to no_match if empty.
+        b.emit_jump_to_label(
+            Opcode::SorterSort,
+            sorter_cursor,
+            0,
+            no_match_label,
+            P4::None,
+            0,
+        );
+
+        // Probe loop.
+        let probe_loop = b.current_addr();
+
+        // SorterData to extract current row.
+        let sorted_reg = b.alloc_temp();
+        b.emit_op(
+            Opcode::SorterData,
+            sorter_cursor,
+            sorted_reg,
+            0,
+            P4::None,
+            0,
+        );
+
+        // Extract the value column (last column).
+        let r_probe = b.alloc_temp();
+        b.emit_op(
+            Opcode::Column,
+            sorter_cursor,
+            num_sort_keys as i32,
+            r_probe,
+            P4::None,
+            0,
+        );
+
+        // Compare with operand.
+        b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
+
+        b.free_temp(r_probe);
+        b.free_temp(sorted_reg);
+
+        // LIMIT: decrement counter and stop when zero.
+        let continue_label = b.emit_label();
+        if let Some(lim_r) = limit_reg {
+            // DecrJumpZero: if limit counter reaches zero, jump to no_match.
+            b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, no_match_label, P4::None, 0);
+        }
+        b.resolve_label(continue_label);
+
+        // SorterNext.
+        b.emit_op(
+            Opcode::SorterNext,
+            sorter_cursor,
+            probe_loop as i32,
+            0,
+            P4::None,
+            0,
+        );
+
+        // Fall through to no_match.
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, no_match_label, P4::None, 0);
+    } else {
+        // No ORDER BY, no LIMIT: simple scan probe (should have been handled
+        // by resolve_in_probe_source, but handle here as fallback).
+        b.emit_op(
+            Opcode::OpenRead,
+            subq_cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+
+        let loop_start = b.current_addr();
+        b.emit_jump_to_label(Opcode::Rewind, subq_cursor, 0, no_match_label, P4::None, 0);
+
+        // WHERE filter.
+        let skip_label = b.emit_label();
+        if let Some(where_expr) = where_clause.as_deref() {
+            emit_where_filter(
+                b,
+                where_expr,
+                subq_cursor,
+                table,
+                table_alias,
+                schema,
+                skip_label,
+            );
+        }
+
+        let subq_scan = ScanCtx {
+            cursor: subq_cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+        };
+
+        let r_probe = b.alloc_temp();
+        match value_expr {
+            Some(expr) => emit_expr(b, expr, r_probe, Some(&subq_scan)),
+            None => {
+                b.emit_op(Opcode::Column, subq_cursor, 0, r_probe, P4::None, 0);
+            }
+        }
+        b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
+
+        b.resolve_label(skip_label);
+        let loop_body = (loop_start + 1) as i32;
+        b.emit_op(Opcode::Next, subq_cursor, loop_body, 0, P4::None, 0);
+
+        b.free_temp(r_probe);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, no_match_label, P4::None, 0);
+    }
+
+    // --- Result emission (shared by both paths) ---
+
+    b.resolve_label(no_match_label);
+    b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(matched_label);
+    b.emit_op(Opcode::Integer, i32::from(!not), reg, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    // Close cursors.
+    if has_order_by || has_limit {
+        b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
+    } else {
+        b.emit_op(Opcode::Close, subq_cursor, 0, 0, P4::None, 0);
+    }
+
+    b.free_temp(r_operand);
+
+    true
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_in_probe_expr(
     b: &mut ProgramBuilder,
@@ -3946,6 +4331,12 @@ fn emit_in_probe_expr(
         return;
     };
     let Some(probe_source) = resolve_in_probe_source(set, schema) else {
+        // Try to handle complex subqueries with ORDER BY/LIMIT.
+        if let fsqlite_ast::InSet::Subquery(subquery) = set {
+            if try_emit_complex_in_subquery(b, operand, subquery, not, reg, scan_ctx) {
+                return;
+            }
+        }
         b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         return;
     };
