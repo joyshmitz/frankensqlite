@@ -102,6 +102,13 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
 
+fn u64_to_usize(value: u64, what: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| FrankenError::OutOfRange {
+        what: what.to_string(),
+        value: value.to_string(),
+    })
+}
+
 impl Vfs for MemoryVfs {
     type File = MemoryFile;
 
@@ -119,6 +126,7 @@ impl Vfs for MemoryVfs {
         checkpoint_or_abort(cx)?;
         let mut inner = self.inner.lock().map_err(|_| lock_err())?;
 
+        let is_anonymous_temp = path.is_none();
         let resolved_path = if let Some(p) = path {
             p.to_path_buf()
         } else {
@@ -152,7 +160,8 @@ impl Vfs for MemoryVfs {
             path: resolved_path,
             storage,
             lock_level: LockLevel::None,
-            delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
+            // SQLite temp opens pass a null path and expect delete-on-close semantics.
+            delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE) || is_anonymous_temp,
             vfs: Arc::clone(&self.inner),
             shm_owner_id,
             shm_path,
@@ -413,12 +422,11 @@ impl VfsFile for MemoryFile {
         Ok(())
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
         let storage = self.storage.lock().map_err(|_| lock_err())?;
 
-        let offset = offset as usize;
+        let offset = u64_to_usize(offset, "read offset")?;
         let file_len = storage.data.len();
 
         if offset >= file_len {
@@ -440,13 +448,18 @@ impl VfsFile for MemoryFile {
         Ok(to_read)
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening)]
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
 
-        let offset = offset as usize;
-        let end = offset + buf.len();
+        let offset = u64_to_usize(offset, "write offset")?;
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "write end offset".to_string(),
+                value: format!("offset={offset}, len={}", buf.len()),
+            })?;
 
         if end > storage.data.len() {
             storage.data.resize(end, 0);
@@ -456,13 +469,13 @@ impl VfsFile for MemoryFile {
         Ok(())
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
+        let size = u64_to_usize(size, "truncate size")?;
         self.storage
             .lock()
             .map_err(|_| lock_err())?
             .data
-            .truncate(size as usize);
+            .truncate(size);
         Ok(())
     }
 
@@ -513,8 +526,35 @@ impl VfsFile for MemoryFile {
         let shm_info = self.ensure_shm_info()?;
         let mut info = shm_info.lock().map_err(|_| lock_err())?;
         if let Some(existing) = info.regions.get(&region).cloned() {
+            let requested_size = usize::try_from(size).map_err(|_| FrankenError::LockFailed {
+                detail: format!("shm_map size too large: {size}"),
+            })?;
+            if existing.len() >= requested_size {
+                drop(info);
+                return Ok(existing);
+            }
+            if !extend {
+                drop(info);
+                return Err(FrankenError::LockFailed {
+                    detail: format!(
+                        "shm region {region} is {} bytes, requested {requested_size} bytes without extend",
+                        existing.len()
+                    ),
+                });
+            }
+
+            // Grow the region while preserving existing bytes to match WAL-index
+            // expectations when a caller remaps with a larger size.
+            let replacement = ShmRegion::new(requested_size);
+            {
+                let existing_guard = existing.lock();
+                let mut replacement_guard = replacement.lock();
+                let copy_len = existing_guard.len().min(replacement_guard.len());
+                replacement_guard[..copy_len].copy_from_slice(&existing_guard[..copy_len]);
+            }
+            info.regions.insert(region, replacement.clone());
             drop(info);
-            return Ok(existing);
+            return Ok(replacement);
         }
         if !extend {
             drop(info);
@@ -798,6 +838,15 @@ mod tests {
 
         file2.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(&buf, b"file2");
+
+        assert_eq!(vfs.inner.lock().unwrap().files.len(), 2);
+        file1.close(&cx).unwrap();
+        file2.close(&cx).unwrap();
+        assert_eq!(
+            vfs.inner.lock().unwrap().files.len(),
+            0,
+            "anonymous temp files must be deleted on close"
+        );
     }
 
     #[test]
@@ -964,6 +1013,19 @@ mod tests {
     }
 
     #[test]
+    fn write_offset_overflow_returns_error() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("overflow_offset.db")), flags)
+            .unwrap();
+
+        let err = file.write(&cx, b"ab", u64::MAX).unwrap_err();
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
     fn read_zero_bytes() {
         let cx = Cx::new();
         let vfs = make_vfs();
@@ -1064,6 +1126,33 @@ mod tests {
 
         let err = file.shm_map(&cx, 2, 64, false).unwrap_err();
         assert!(matches!(err, FrankenError::CannotOpen { .. }));
+    }
+
+    #[test]
+    fn shm_map_existing_region_grows_on_larger_extend_request() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("shm_grow.db")), flags)
+            .unwrap();
+
+        let region_small = file.shm_map(&cx, 0, 64, true).unwrap();
+        {
+            let mut guard = region_small.lock();
+            guard[0] = 0x11;
+            guard[63] = 0x22;
+        }
+
+        let region_big = file.shm_map(&cx, 0, 128, true).unwrap();
+        assert_eq!(region_big.len(), 128);
+        {
+            let guard = region_big.lock();
+            assert_eq!(guard[0], 0x11);
+            assert_eq!(guard[63], 0x22);
+            assert_eq!(guard[127], 0x00);
+            drop(guard);
+        }
     }
 
     #[test]

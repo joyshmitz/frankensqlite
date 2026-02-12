@@ -883,7 +883,14 @@ impl<P: PageWriter> BtCursor<P> {
             let mut page_buf = vec![0u8; page_size];
             page_buf[0..4].copy_from_slice(&next.to_be_bytes());
             page_buf[4..4 + chunk.len()].copy_from_slice(chunk);
-            self.pager.write_page(cx, pgno, &page_buf)?;
+            if let Err(err) = self.pager.write_page(cx, pgno, &page_buf) {
+                // Best-effort cleanup: any overflow pages allocated for this
+                // cell must be released if chain materialization fails midway.
+                for leaked in pages.iter().copied() {
+                    let _ = self.pager.free_page(cx, leaked);
+                }
+                return Err(err);
+            }
         }
 
         Ok(pages[0])
@@ -930,9 +937,8 @@ impl<P: PageWriter> BtCursor<P> {
         rowid: i64,
         payload: &[u8],
     ) -> Result<(Vec<u8>, Option<PageNumber>)> {
-        let payload_size_u64 = u64::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
-        #[allow(clippy::cast_possible_truncation)]
-        let payload_size = payload_size_u64 as u32;
+        let payload_size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
+        let payload_size_u64 = u64::from(payload_size);
         let local_size = cell::local_payload_size(
             payload_size,
             self.usable_size,
@@ -965,9 +971,8 @@ impl<P: PageWriter> BtCursor<P> {
         cx: &Cx,
         key: &[u8],
     ) -> Result<(Vec<u8>, Option<PageNumber>)> {
-        let payload_size_u64 = u64::try_from(key.len()).map_err(|_| FrankenError::TooBig)?;
-        #[allow(clippy::cast_possible_truncation)]
-        let payload_size = payload_size_u64 as u32;
+        let payload_size = u32::try_from(key.len()).map_err(|_| FrankenError::TooBig)?;
+        let payload_size_u64 = u64::from(payload_size);
         let local_size = cell::local_payload_size(
             payload_size,
             self.usable_size,
@@ -1486,6 +1491,47 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingOverflowStore {
+        inner: Rc<RefCell<MemPageStore>>,
+        fail_on_write: usize,
+        write_count: usize,
+    }
+
+    impl FailingOverflowStore {
+        fn new(inner: Rc<RefCell<MemPageStore>>, fail_on_write: usize) -> Self {
+            Self {
+                inner,
+                fail_on_write,
+                write_count: 0,
+            }
+        }
+    }
+
+    impl PageReader for FailingOverflowStore {
+        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            self.inner.borrow().read_page(cx, page_no)
+        }
+    }
+
+    impl PageWriter for FailingOverflowStore {
+        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+            self.write_count = self.write_count.saturating_add(1);
+            if self.write_count == self.fail_on_write {
+                return Err(FrankenError::internal("injected write failure"));
+            }
+            self.inner.borrow_mut().write_page(cx, page_no, data)
+        }
+
+        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+            self.inner.borrow_mut().allocate_page(cx)
+        }
+
+        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+            self.inner.borrow_mut().free_page(cx, page_no)
+        }
+    }
+
     const USABLE: u32 = 4096;
 
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.
@@ -1980,6 +2026,28 @@ mod tests {
 
         assert!(cursor.table_move_to(&cx, 42).unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), payload);
+    }
+
+    #[test]
+    fn test_cursor_table_insert_overflow_write_failure_frees_allocations() {
+        let cx = Cx::new();
+        let root_page = pn(2);
+        let mut base = MemPageStore::new(USABLE);
+        base.init_leaf_table_root(root_page);
+        let shared = Rc::new(RefCell::new(base));
+
+        // Force a mid-chain overflow write failure.
+        let failing = FailingOverflowStore::new(Rc::clone(&shared), 2);
+        let mut cursor = BtCursor::new(failing, root_page, USABLE, true);
+        let payload = vec![0xCC; 9_000];
+
+        let err = cursor.table_insert(&cx, 1, &payload).unwrap_err();
+        assert!(matches!(err, FrankenError::Internal(_)));
+        assert_eq!(
+            shared.borrow().pages.len(),
+            1,
+            "only the root page should remain after failed overflow write"
+        );
     }
 
     #[test]

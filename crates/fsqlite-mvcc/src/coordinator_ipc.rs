@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use fsqlite_types::ObjectId;
 use fsqlite_types::encoding::{
@@ -30,6 +30,10 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Default maximum outstanding permits per coordinator.
 pub const MAX_OUTSTANDING_PERMITS: usize = 16;
+
+/// When consumed permits exceed this multiple of `max_permits`, compact the
+/// permit map by dropping consumed entries.
+const CONSUMED_PERMIT_GC_MULTIPLIER: usize = 8;
 
 /// Maximum wire `write_set_summary` length in bytes.
 pub const WIRE_WRITE_SET_MAX_BYTES: usize = 1024 * 1024;
@@ -427,17 +431,18 @@ impl RowidReserveResponse {
 
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(16);
+        let mut buf = Vec::with_capacity(24);
         match self {
             Self::Ok { start_rowid, count } => {
                 buf.push(Self::TAG_OK);
                 buf.extend_from_slice(&[0u8; 7]); // pad to 8-byte alignment
                 append_u64_le(&mut buf, *start_rowid);
                 append_u32_le(&mut buf, *count);
+                append_u32_le(&mut buf, 0); // pad1
             }
             Self::Err { code } => {
                 buf.push(Self::TAG_ERR);
-                buf.extend_from_slice(&[0u8; 3]); // pad
+                buf.extend_from_slice(&[0u8; 7]); // pad to offset 8
                 append_u32_le(&mut buf, *code);
             }
         }
@@ -451,10 +456,11 @@ impl RowidReserveResponse {
             Self::TAG_OK => {
                 let start_rowid = read_u64_le(src.get(8..16)?)?;
                 let count = read_u32_le(src.get(16..20)?)?;
+                read_u32_le(src.get(20..24)?)?; // pad1
                 Some(Self::Ok { start_rowid, count })
             }
             Self::TAG_ERR => {
-                let code = read_u32_le(src.get(4..8)?)?;
+                let code = read_u32_le(src.get(8..12)?)?;
                 Some(Self::Err { code })
             }
             _ => None,
@@ -1165,6 +1171,7 @@ enum PermitState {
 pub struct PermitManager {
     max_permits: usize,
     next_id: AtomicU64,
+    reserved_count: AtomicUsize,
     active: Mutex<HashMap<u64, PermitState>>,
 }
 
@@ -1175,6 +1182,7 @@ impl PermitManager {
         Self {
             max_permits,
             next_id: AtomicU64::new(1),
+            reserved_count: AtomicUsize::new(0),
             active: Mutex::new(HashMap::new()),
         }
     }
@@ -1182,16 +1190,13 @@ impl PermitManager {
     /// Reserve a new permit. Returns `Err(Busy)` if at capacity.
     pub fn reserve(&self) -> Result<u64, PermitError> {
         let mut active = self.active.lock();
-        let outstanding = active
-            .values()
-            .filter(|s| **s == PermitState::Reserved)
-            .count();
-        if outstanding >= self.max_permits {
+        if self.reserved_count.load(Ordering::Relaxed) >= self.max_permits {
             drop(active);
             return Err(PermitError::Busy);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         active.insert(id, PermitState::Reserved);
+        self.reserved_count.fetch_add(1, Ordering::Relaxed);
         drop(active);
         Ok(id)
     }
@@ -1199,38 +1204,50 @@ impl PermitManager {
     /// Consume a permit (SUBMIT). Returns `Err` if not found or already consumed.
     pub fn consume(&self, permit_id: u64) -> Result<(), PermitError> {
         let mut active = self.active.lock();
-        let res = match active.get(&permit_id) {
+        let result = match active.get_mut(&permit_id) {
             None => Err(PermitError::NotFound(permit_id)),
             Some(PermitState::Consumed) => Err(PermitError::AlreadyConsumed(permit_id)),
-            Some(PermitState::Reserved) => {
-                active.insert(permit_id, PermitState::Consumed);
+            Some(state @ PermitState::Reserved) => {
+                *state = PermitState::Consumed;
+                self.reserved_count.fetch_sub(1, Ordering::Relaxed);
+
+                let reserved = self.reserved_count.load(Ordering::Relaxed);
+                let consumed = active.len().saturating_sub(reserved);
+                let max_consumed_before_gc = self
+                    .max_permits
+                    .saturating_mul(CONSUMED_PERMIT_GC_MULTIPLIER)
+                    .max(self.max_permits);
+                if consumed > max_consumed_before_gc {
+                    active.retain(|_, permit_state| *permit_state == PermitState::Reserved);
+                }
                 Ok(())
             }
         };
         drop(active);
-        res
+        result
     }
 
     /// Release a permit (connection drop without SUBMIT).
     pub fn release(&self, permit_id: u64) {
         let mut active = self.active.lock();
-        active.remove(&permit_id);
+        if let Some(permit_state) = active.remove(&permit_id) {
+            if permit_state == PermitState::Reserved {
+                self.reserved_count.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Number of currently outstanding (reserved, not yet consumed) permits.
     #[must_use]
     pub fn outstanding(&self) -> usize {
-        let active = self.active.lock();
-        active
-            .values()
-            .filter(|s| **s == PermitState::Reserved)
-            .count()
+        self.reserved_count.load(Ordering::Relaxed)
     }
 
     /// Garbage-collect consumed permits.
     pub fn gc_consumed(&self) {
         let mut active = self.active.lock();
         active.retain(|_, s| *s == PermitState::Reserved);
+        self.reserved_count.store(active.len(), Ordering::Relaxed);
     }
 }
 
@@ -2368,5 +2385,64 @@ mod tests {
             original.count,
             "count at offset 28"
         );
+    }
+
+    #[test]
+    fn test_rowid_reserve_response_ok_layout_and_roundtrip() {
+        let original = RowidReserveResponse::Ok {
+            start_rowid: 0x0123_4567_89AB_CDEF,
+            count: 64,
+        };
+
+        let bytes = original.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            24,
+            "ROWID_RESERVE ok response must be 24 bytes"
+        );
+        assert_eq!(bytes[0], RowidReserveResponse::TAG_OK, "tag at offset 0");
+        assert!(
+            bytes[1..8].iter().all(|b| *b == 0),
+            "bytes 1..8 are reserved padding"
+        );
+        assert_eq!(
+            read_u64_le(&bytes[8..16]).unwrap(),
+            0x0123_4567_89AB_CDEF,
+            "start_rowid at offset 8"
+        );
+        assert_eq!(
+            read_u32_le(&bytes[16..20]).unwrap(),
+            64,
+            "count at offset 16"
+        );
+        assert_eq!(read_u32_le(&bytes[20..24]).unwrap(), 0, "pad1 at offset 20");
+
+        let decoded = RowidReserveResponse::from_bytes(&bytes).expect("decode ok response");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_rowid_reserve_response_err_layout_and_roundtrip() {
+        let original = RowidReserveResponse::Err { code: 0xDEAD_BEEF };
+
+        let bytes = original.to_bytes();
+        assert_eq!(
+            bytes.len(),
+            12,
+            "ROWID_RESERVE err response must be 12 bytes"
+        );
+        assert_eq!(bytes[0], RowidReserveResponse::TAG_ERR, "tag at offset 0");
+        assert!(
+            bytes[1..8].iter().all(|b| *b == 0),
+            "bytes 1..8 are reserved padding"
+        );
+        assert_eq!(
+            read_u32_le(&bytes[8..12]).unwrap(),
+            0xDEAD_BEEF,
+            "error code at offset 8"
+        );
+
+        let decoded = RowidReserveResponse::from_bytes(&bytes).expect("decode err response");
+        assert_eq!(decoded, original);
     }
 }

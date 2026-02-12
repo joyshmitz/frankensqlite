@@ -416,33 +416,198 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
     }
 
     let body = &sql[open + 1..close];
-    let mut columns = Vec::new();
+    split_top_level_csv_items(body)
+        .into_iter()
+        .filter_map(|col_def| {
+            if starts_with_unquoted_table_constraint(col_def) {
+                return None;
+            }
 
-    for col_def in body.split(',') {
-        let trimmed = col_def.trim();
-        if trimmed.is_empty() {
+            let (name, remainder) = parse_column_name_and_remainder(col_def)?;
+            let tokens: Vec<&str> = remainder.split_whitespace().collect();
+            let type_decl = extract_type_declaration(&tokens);
+            let affinity = type_to_affinity(&type_decl);
+            let upper = col_def.to_ascii_uppercase();
+            let is_ipk = upper.contains("PRIMARY KEY") && type_decl.eq_ignore_ascii_case("INTEGER");
+
+            Some(ColumnInfo {
+                name,
+                affinity,
+                is_ipk,
+            })
+        })
+        .collect()
+}
+
+fn parse_column_name_and_remainder(def: &str) -> Option<(String, &str)> {
+    let trimmed = def.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let (name_raw, remainder) = match bytes[0] {
+        b'"' => parse_quoted_identifier(trimmed, b'"', b'"')?,
+        b'`' => parse_quoted_identifier(trimmed, b'`', b'`')?,
+        b'[' => parse_bracket_identifier(trimmed)?,
+        _ => {
+            let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+            (&trimmed[..end], &trimmed[end..])
+        }
+    };
+    Some((strip_identifier_quotes(name_raw), remainder.trim_start()))
+}
+
+fn parse_quoted_identifier(input: &str, quote: u8, escape: u8) -> Option<(&str, &str)> {
+    let bytes = input.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == quote {
+            if i + 1 < bytes.len() && bytes[i + 1] == escape {
+                i += 2;
+                continue;
+            }
+            return Some((&input[..=i], &input[i + 1..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_bracket_identifier(input: &str) -> Option<(&str, &str)> {
+    let bytes = input.as_bytes();
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b']' {
+            return Some((&input[..=i], &input[i + 1..]));
+        }
+        i += 1;
+    }
+    None
+}
+
+const COLUMN_CONSTRAINT_KEYWORDS: &[&str] = &[
+    "CONSTRAINT",
+    "PRIMARY",
+    "NOT",
+    "NULL",
+    "UNIQUE",
+    "CHECK",
+    "DEFAULT",
+    "COLLATE",
+    "REFERENCES",
+    "GENERATED",
+    "AS",
+];
+
+/// Split a comma-separated SQL list while respecting parentheses and quotes.
+fn split_top_level_csv_items(input: &str) -> Vec<&str> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut in_brackets = false;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(q) = quote {
+            if byte == q {
+                let escaped = i + 1 < bytes.len() && bytes[i + 1] == q;
+                if escaped {
+                    i += 1;
+                } else {
+                    quote = None;
+                }
+            }
+            i += 1;
             continue;
         }
-        // Split into tokens; first token is column name (possibly quoted).
-        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-        if tokens.is_empty() {
+
+        if in_brackets {
+            if byte == b']' {
+                in_brackets = false;
+            }
+            i += 1;
             continue;
         }
 
-        let name = tokens[0].trim_matches('"').to_owned();
-        let type_str = tokens.get(1).copied().unwrap_or("TEXT");
-        let affinity = type_to_affinity(type_str);
-        let upper = trimmed.to_ascii_uppercase();
-        let is_ipk = upper.contains("PRIMARY KEY") && type_str.to_ascii_uppercase().contains("INT");
-
-        columns.push(ColumnInfo {
-            name,
-            affinity,
-            is_ipk,
-        });
+        match byte {
+            b'\'' | b'"' | b'`' => quote = Some(byte),
+            b'[' => in_brackets = true,
+            b'(' => paren_depth = paren_depth.saturating_add(1),
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b',' if paren_depth == 0 => {
+                let part = input[start..i].trim();
+                if !part.is_empty() {
+                    out.push(part);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
     }
 
-    columns
+    let tail = input[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
+}
+
+fn starts_with_unquoted_table_constraint(def: &str) -> bool {
+    let trimmed = def.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    match trimmed.as_bytes()[0] {
+        b'"' | b'`' | b'[' => return false,
+        _ => {}
+    }
+    let first = trimmed.split_whitespace().next().unwrap_or_default();
+    matches!(
+        first.to_ascii_uppercase().as_str(),
+        "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
+    )
+}
+
+fn strip_identifier_quotes(token: &str) -> String {
+    let trimmed = token.trim();
+    if trimmed.len() >= 2 {
+        if trimmed.starts_with('"') && trimmed.ends_with('"') {
+            return trimmed[1..trimmed.len() - 1].replace("\"\"", "\"");
+        }
+        if trimmed.starts_with('`') && trimmed.ends_with('`') {
+            return trimmed[1..trimmed.len() - 1].replace("``", "`");
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            return trimmed[1..trimmed.len() - 1].to_owned();
+        }
+    }
+    trimmed.to_owned()
+}
+
+fn extract_type_declaration(tokens: &[&str]) -> String {
+    let mut parts = Vec::new();
+    let mut paren_depth = 0isize;
+    for token in tokens {
+        let token_upper = token
+            .trim_matches(|c: char| c == ',' || c == ';')
+            .to_ascii_uppercase();
+        if paren_depth == 0 && COLUMN_CONSTRAINT_KEYWORDS.contains(&token_upper.as_str()) {
+            break;
+        }
+        parts.push(*token);
+        for ch in token.chars() {
+            if ch == '(' {
+                paren_depth += 1;
+            } else if ch == ')' && paren_depth > 0 {
+                paren_depth -= 1;
+            }
+        }
+    }
+    parts.join(" ")
 }
 
 /// Map a SQL type keyword to an affinity character.
@@ -686,6 +851,49 @@ mod tests {
         assert_eq!(cols[1].affinity, 'C');
         assert_eq!(cols[2].name, "data");
         assert_eq!(cols[2].affinity, 'B');
+    }
+
+    #[test]
+    fn test_parse_columns_from_create_sql_handles_nested_commas_and_constraints() {
+        let sql = r"CREATE TABLE metrics (
+            id INTEGER PRIMARY KEY,
+            amount DECIMAL(10,2) NOT NULL,
+            status TEXT CHECK (status IN ('a,b', 'c')),
+            CONSTRAINT metrics_pk PRIMARY KEY (id)
+        )";
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "id");
+        assert_eq!(cols[0].affinity, 'd');
+        assert!(cols[0].is_ipk);
+        assert_eq!(cols[1].name, "amount");
+        assert_eq!(cols[1].affinity, 'A');
+        assert_eq!(cols[2].name, "status");
+        assert_eq!(cols[2].affinity, 'C');
+    }
+
+    #[test]
+    fn test_parse_columns_from_create_sql_keeps_quoted_keyword_column_name() {
+        let sql = r#"CREATE TABLE t ("primary" TEXT, value INTEGER)"#;
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "primary");
+        assert_eq!(cols[0].affinity, 'C');
+        assert_eq!(cols[1].name, "value");
+        assert_eq!(cols[1].affinity, 'd');
+    }
+
+    #[test]
+    fn test_parse_columns_from_create_sql_handles_quoted_names_with_spaces() {
+        let sql = r#"CREATE TABLE t ("first name" TEXT, [last name] INTEGER, `role name` NUMERIC)"#;
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0].name, "first name");
+        assert_eq!(cols[0].affinity, 'C');
+        assert_eq!(cols[1].name, "last name");
+        assert_eq!(cols[1].affinity, 'd');
+        assert_eq!(cols[2].name, "role name");
+        assert_eq!(cols[2].affinity, 'A');
     }
 
     #[test]

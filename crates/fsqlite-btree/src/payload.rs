@@ -7,7 +7,7 @@
 
 use crate::cell::{self, BtreePageType, CellRef};
 use crate::overflow;
-use fsqlite_error::Result;
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 use tracing::debug;
 
@@ -80,8 +80,7 @@ where
     A: FnMut() -> Result<PageNumber>,
     W: FnMut(PageNumber, &[u8]) -> Result<()>,
 {
-    #[allow(clippy::cast_possible_truncation)]
-    let payload_size = payload.len() as u32;
+    let payload_size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
     let local_size = cell::local_payload_size(payload_size, usable_size, page_type) as usize;
 
     if local_size >= payload.len() {

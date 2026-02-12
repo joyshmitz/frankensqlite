@@ -1852,6 +1852,9 @@ fn parse_u16_list(raw: &str) -> Result<Vec<u16>, String> {
         let Ok(n) = part.parse::<u16>() else {
             return Err(format!("invalid integer in --concurrency list: `{part}`"));
         };
+        if n == 0 {
+            return Err("concurrency values must be >= 1".to_owned());
+        }
         out.push(n);
     }
     if out.is_empty() {
@@ -3341,6 +3344,8 @@ mod tests {
     fn parse_u16_list_single_and_list() {
         assert_eq!(parse_u16_list("1").unwrap(), vec![1]);
         assert_eq!(parse_u16_list("1,2,4,8,16").unwrap(), vec![1, 2, 4, 8, 16]);
+        assert!(parse_u16_list("0").is_err());
+        assert!(parse_u16_list("1,0,2").is_err());
         assert!(parse_u16_list("").is_err());
         assert!(parse_u16_list("1,").is_err());
         assert!(parse_u16_list("nope").is_err());

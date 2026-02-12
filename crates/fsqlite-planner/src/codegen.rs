@@ -5,8 +5,8 @@
 //! UPDATE, and DELETE with correct opcode patterns matching C SQLite behavior.
 
 use fsqlite_ast::{
-    ColumnRef, DeleteStatement, Expr, InsertSource, InsertStatement, Literal, QualifiedTableRef,
-    ResultColumn, SelectCore, SelectStatement, UpdateStatement,
+    ColumnRef, DeleteStatement, Expr, InsertSource, InsertStatement, Literal, PlaceholderType,
+    QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, UpdateStatement,
 };
 use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
 
@@ -123,6 +123,12 @@ fn table_name_from_qualified(qtr: &QualifiedTableRef) -> &str {
     &qtr.name.name
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindParamRef {
+    Anonymous,
+    Numbered(i32),
+}
+
 // ---------------------------------------------------------------------------
 // SELECT codegen
 // ---------------------------------------------------------------------------
@@ -197,6 +203,13 @@ pub fn codegen_select(
     } else {
         None
     };
+    if where_clause.is_some() && rowid_param.is_none() && index_eq.is_none() {
+        return Err(CodegenError::Unsupported(
+            "SELECT WHERE currently supports only `rowid = ?` or `indexed_col = ?`".to_owned(),
+        ));
+    }
+
+    let mut index_cursor_to_close: Option<i32> = None;
 
     if let Some(param_idx) = rowid_param {
         // --- Rowid-seek SELECT ---
@@ -210,7 +223,14 @@ pub fn codegen_select(
             P4::Table(table.name.clone()),
             0,
         );
-        b.emit_jump_to_label(Opcode::SeekRowid, cursor, 0, done_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            done_label,
+            P4::None,
+            0,
+        );
 
         // Read columns.
         emit_column_reads(b, cursor, columns, table, out_regs)?;
@@ -219,50 +239,75 @@ pub fn codegen_select(
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     } else if let Some((col_name, param_idx)) = &index_eq {
         // --- Index-seek SELECT ---
-        if let Some(idx_schema) = table.index_for_column(col_name) {
-            let idx_cursor = 1_i32;
-            let param_reg = b.alloc_reg();
-            b.emit_op(Opcode::Variable, *param_idx, param_reg, 0, P4::None, 0);
-            b.emit_op(
-                Opcode::OpenRead,
-                cursor,
-                table.root_page,
-                0,
-                P4::Table(table.name.clone()),
-                0,
-            );
-            b.emit_op(
-                Opcode::OpenRead,
-                idx_cursor,
-                idx_schema.root_page,
-                0,
-                P4::Table(idx_schema.name.clone()),
-                0,
-            );
-            // SeekGE on index, then check equality with Found.
-            b.emit_jump_to_label(Opcode::SeekGE, idx_cursor, 0, done_label, P4::None, 0);
-            let rowid_reg = b.alloc_reg();
-            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-            b.emit_op(Opcode::SeekRowid, cursor, 0, rowid_reg, P4::None, 0);
+        let idx_schema = table.index_for_column(col_name).ok_or_else(|| {
+            CodegenError::Unsupported(format!(
+                "SELECT WHERE `{col_name} = ?` requires an index on `{col_name}`"
+            ))
+        })?;
+        let idx_cursor = 1_i32;
+        index_cursor_to_close = Some(idx_cursor);
+        let param_reg = b.alloc_reg();
+        b.emit_op(Opcode::Variable, *param_idx, param_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IsNull, param_reg, 0, done_label, P4::None, 0);
 
-            // Read columns.
-            emit_column_reads(b, cursor, columns, table, out_regs)?;
+        // Build probe key `[value, i64::MIN]` so SeekGE lands at first duplicate.
+        let min_rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+        let probe_key_reg = b.alloc_reg();
+        b.emit_op(Opcode::MakeRecord, param_reg, 2, probe_key_reg, P4::None, 0);
 
-            // ResultRow.
-            b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
-        } else {
-            // Fallback to full scan.
-            return codegen_select_full_scan(
-                b,
-                cursor,
-                table,
-                columns,
-                out_regs,
-                out_col_count,
-                done_label,
-                end_label,
-            );
-        }
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            idx_schema.root_page,
+            0,
+            P4::Index(idx_schema.name.clone()),
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            probe_key_reg,
+            done_label,
+            P4::None,
+            0,
+        );
+
+        let loop_start = b.current_addr();
+        let idx_key_reg = b.alloc_reg();
+        b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Ne, param_reg, idx_key_reg, done_label, P4::None, 0);
+
+        let rowid_reg = b.alloc_reg();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        let skip_row_label = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            skip_row_label,
+            P4::None,
+            0,
+        );
+
+        // Read columns.
+        emit_column_reads(b, cursor, columns, table, out_regs)?;
+
+        // ResultRow.
+        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+        b.resolve_label(skip_row_label);
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let loop_target = loop_start as i32;
+        b.emit_op(Opcode::Next, idx_cursor, loop_target, 0, P4::None, 0);
     } else {
         // --- Full table scan ---
         return codegen_select_full_scan(
@@ -279,6 +324,9 @@ pub fn codegen_select(
 
     // Done: Close + Halt.
     b.resolve_label(done_label);
+    if let Some(idx_cursor) = index_cursor_to_close {
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
@@ -640,12 +688,16 @@ pub fn codegen_update(
         param_idx += 1;
     }
 
-    // Rowid bind parameter.
+    // Rowid bind parameter (required).
+    let rowid_bind = extract_rowid_bind(stmt.where_clause.as_ref()).ok_or_else(|| {
+        CodegenError::Unsupported("UPDATE currently supports only `WHERE rowid = ?`".to_owned())
+    })?;
     let rowid_reg = b.alloc_reg();
-    let rowid_param = extract_rowid_bind_param(stmt.where_clause.as_ref());
-    if rowid_param.is_some() {
-        b.emit_op(Opcode::Variable, param_idx, rowid_reg, 0, P4::None, 0);
-    }
+    let rowid_param = match rowid_bind {
+        BindParamRef::Anonymous => param_idx,
+        BindParamRef::Numbered(idx) => idx,
+    };
+    b.emit_op(Opcode::Variable, rowid_param, rowid_reg, 0, P4::None, 0);
 
     // OpenWrite.
     b.emit_op(
@@ -859,6 +911,14 @@ fn emit_column_reads(
 ///
 /// Returns the 1-based bind parameter index if so.
 fn extract_rowid_bind_param(where_clause: Option<&Expr>) -> Option<i32> {
+    extract_rowid_bind(where_clause).map(|bind| match bind {
+        BindParamRef::Anonymous => 1,
+        BindParamRef::Numbered(idx) => idx,
+    })
+}
+
+/// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
+fn extract_rowid_bind(where_clause: Option<&Expr>) -> Option<BindParamRef> {
     let expr = where_clause?;
     if let Expr::BinaryOp {
         left,
@@ -869,10 +929,10 @@ fn extract_rowid_bind_param(where_clause: Option<&Expr>) -> Option<i32> {
     {
         // Check left = rowid column, right = bind param.
         if is_rowid_expr(left) {
-            return bind_param_index(right);
+            return bind_param_ref(right);
         }
         if is_rowid_expr(right) {
-            return bind_param_index(left);
+            return bind_param_ref(left);
         }
     }
     None
@@ -924,13 +984,21 @@ fn is_rowid_ref(col_ref: &ColumnRef) -> bool {
 
 /// Extract a bind parameter index from a `?` or `?NNN` placeholder.
 fn bind_param_index(expr: &Expr) -> Option<i32> {
+    bind_param_ref(expr).map(|bind| match bind {
+        BindParamRef::Anonymous => 1,
+        BindParamRef::Numbered(idx) => idx,
+    })
+}
+
+/// Extract a bind parameter while preserving anonymous vs numbered form.
+fn bind_param_ref(expr: &Expr) -> Option<BindParamRef> {
     if let Expr::Placeholder(pt, _) = expr {
         match pt {
-            fsqlite_ast::PlaceholderType::Anonymous => Some(1),
-            fsqlite_ast::PlaceholderType::Numbered(n) =>
+            PlaceholderType::Anonymous => Some(BindParamRef::Anonymous),
+            PlaceholderType::Numbered(n) =>
             {
                 #[allow(clippy::cast_possible_wrap)]
-                Some(*n as i32)
+                Some(BindParamRef::Numbered(*n as i32))
             }
             _ => None,
         }
@@ -1714,15 +1782,83 @@ mod tests {
         assert!(has_opcodes(
             &prog,
             &[
+                Opcode::MakeRecord,
                 Opcode::OpenRead,
                 Opcode::OpenRead,
                 Opcode::SeekGE,
+                Opcode::Column,
+                Opcode::Ne,
                 Opcode::IdxRowid,
                 Opcode::SeekRowid,
                 Opcode::Column,
                 Opcode::ResultRow,
             ]
         ));
+
+        let variable = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Variable)
+            .expect("Variable should load index probe parameter");
+        let make_record = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::MakeRecord)
+            .expect("MakeRecord should encode index probe key");
+        assert_eq!(
+            make_record.p1, variable.p2,
+            "MakeRecord source should be Variable destination register"
+        );
+        assert_eq!(
+            make_record.p2, 2,
+            "probe key should include indexed value and synthetic low rowid"
+        );
+        let int64 = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Int64)
+            .expect("Int64 should load i64::MIN for duplicate-range seek lower bound");
+        assert_eq!(int64.p4, P4::Int64(i64::MIN));
+        assert_eq!(
+            make_record.p1 + 1,
+            int64.p2,
+            "MakeRecord should consume [param_reg, min_rowid_reg]"
+        );
+        let seek_ge = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::SeekGE)
+            .expect("SeekGE should be emitted for index probe");
+        assert_eq!(
+            seek_ge.p3, make_record.p3,
+            "SeekGE must read probe key from MakeRecord destination register"
+        );
+
+        let is_null_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::IsNull)
+            .count();
+        assert!(
+            is_null_count >= 1,
+            "indexed equality should guard NULL probe"
+        );
+
+        let seek_rowid = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::SeekRowid)
+            .expect("SeekRowid should follow IdxRowid");
+        assert_ne!(
+            seek_rowid.p2, 0,
+            "SeekRowid miss target must not jump to pc=0"
+        );
+        let next = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Next)
+            .expect("index equality path must iterate duplicates");
+        assert_eq!(next.p1, 1, "Next should advance the index cursor");
     }
 
     // === Test 10: INSERT RETURNING ===
@@ -1922,6 +2058,83 @@ mod tests {
         let mut b = ProgramBuilder::new();
         let err = codegen_update(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
         assert!(matches!(err, CodegenError::TableNotFound(_)));
+    }
+
+    #[test]
+    fn test_codegen_update_requires_rowid_predicate() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: None,
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
+        assert!(matches!(err, CodegenError::Unsupported(_)));
+    }
+
+    #[test]
+    fn test_codegen_update_rowid_anonymous_bind_is_offset_after_assignments() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let vars: Vec<_> = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .collect();
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars[0].p1, 1, "first bind should be SET assignment");
+        assert_eq!(vars[1].p1, 2, "rowid bind should follow SET binds");
+    }
+
+    #[test]
+    fn test_codegen_select_where_without_supported_pattern_is_error() {
+        let stmt = simple_select(&["a"], "t", Some(col_eq_param("a", 1)));
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
+        assert!(matches!(err, CodegenError::Unsupported(_)));
     }
 
     #[test]

@@ -162,23 +162,43 @@ fn elapsed_ms(start: Instant) -> u64 {
 /// Default scale values per preset.  Each returns a reasonable small-test
 /// value suitable for CI smoke; multiply by `BatchConfig::scale` for
 /// longer runs.
-fn generate_oplog(preset: &str, fixture_id: &str, seed: u64, concurrency: u16) -> Option<OpLog> {
+fn generate_oplog(
+    preset: &str,
+    fixture_id: &str,
+    seed: u64,
+    concurrency: u16,
+    scale: u32,
+) -> Option<OpLog> {
+    let scale_multiplier = scale.max(1);
+    let scaled = |base: u32| base.saturating_mul(scale_multiplier).max(1);
+
     Some(match preset {
-        "commutative_inserts_disjoint_keys" => {
-            oplog::preset_commutative_inserts_disjoint_keys(fixture_id, seed, concurrency, 50)
-        }
+        "commutative_inserts_disjoint_keys" => oplog::preset_commutative_inserts_disjoint_keys(
+            fixture_id,
+            seed,
+            concurrency,
+            scaled(50),
+        ),
         "hot_page_contention" => {
-            oplog::preset_hot_page_contention(fixture_id, seed, concurrency, 20)
+            oplog::preset_hot_page_contention(fixture_id, seed, concurrency, scaled(20))
         }
-        "mixed_read_write" => oplog::preset_mixed_read_write(fixture_id, seed, concurrency, 30),
-        "deterministic_transform" => oplog::preset_deterministic_transform(fixture_id, seed, 100),
-        "large_txn" => oplog::preset_large_txn(fixture_id, seed, concurrency, 50),
-        "schema_migration" => oplog::preset_schema_migration(fixture_id, seed, 100),
-        "btree_stress_sequential" => oplog::preset_btree_stress_sequential(fixture_id, seed, 500),
-        "wide_row_overflow" => oplog::preset_wide_row_overflow(fixture_id, seed, 20, 8000),
-        "bulk_delete_reinsert" => oplog::preset_bulk_delete_reinsert(fixture_id, seed, 200),
-        "scatter_write" => oplog::preset_scatter_write(fixture_id, seed, concurrency, 40),
-        "multi_table_foreign_keys" => oplog::preset_multi_table_foreign_keys(fixture_id, seed, 50),
+        "mixed_read_write" => {
+            oplog::preset_mixed_read_write(fixture_id, seed, concurrency, scaled(30))
+        }
+        "deterministic_transform" => {
+            oplog::preset_deterministic_transform(fixture_id, seed, scaled(100))
+        }
+        "large_txn" => oplog::preset_large_txn(fixture_id, seed, concurrency, scaled(50)),
+        "schema_migration" => oplog::preset_schema_migration(fixture_id, seed, scaled(100)),
+        "btree_stress_sequential" => {
+            oplog::preset_btree_stress_sequential(fixture_id, seed, scaled(500))
+        }
+        "wide_row_overflow" => oplog::preset_wide_row_overflow(fixture_id, seed, scaled(20), 8000),
+        "bulk_delete_reinsert" => oplog::preset_bulk_delete_reinsert(fixture_id, seed, scaled(200)),
+        "scatter_write" => oplog::preset_scatter_write(fixture_id, seed, concurrency, scaled(40)),
+        "multi_table_foreign_keys" => {
+            oplog::preset_multi_table_foreign_keys(fixture_id, seed, scaled(50))
+        }
         _ => return None,
     })
 }
@@ -225,6 +245,7 @@ fn run_cell(
     preset: &PresetMeta,
     concurrency: u16,
     seed: u64,
+    scale: u32,
     settings: &HarnessSettings,
     bundle_config: &mismatch_artifacts::BundleConfig,
     sqlite_config: &SqliteExecConfig,
@@ -233,7 +254,7 @@ fn run_cell(
     let cell_start = Instant::now();
 
     // 1. Generate OpLog.
-    let Some(oplog) = generate_oplog(&preset.name, fixture_id, seed, concurrency) else {
+    let Some(oplog) = generate_oplog(&preset.name, fixture_id, seed, concurrency, scale) else {
         return CellResult {
             fixture_id: fixture_id.to_owned(),
             preset_name: preset.name.clone(),
@@ -402,6 +423,7 @@ fn run_cell(
     };
 
     if matches!(cell.verdict, CellVerdict::Mismatch { .. }) {
+        cell.artifact_dir = Some(workspace.run_dir.display().to_string());
         match mismatch_artifacts::write_mismatch_bundle(
             &cell,
             &sqlite_db,
@@ -529,6 +551,7 @@ pub fn run_matrix(config: &BatchConfig) -> E2eResult<BatchResult> {
                         preset,
                         concurrency,
                         seed,
+                        config.scale,
                         &config.settings,
                         &config.bundle_config,
                         &sqlite_config,
@@ -693,7 +716,7 @@ mod tests {
     fn test_generate_oplog_all_presets() {
         let catalog = oplog::preset_catalog();
         for meta in &catalog {
-            let log = generate_oplog(&meta.name, "test_fixture", 42, 2);
+            let log = generate_oplog(&meta.name, "test_fixture", 42, 2, 1);
             assert!(
                 log.is_some(),
                 "preset {} not handled by generate_oplog dispatch",
@@ -710,7 +733,20 @@ mod tests {
 
     #[test]
     fn test_generate_oplog_unknown_returns_none() {
-        assert!(generate_oplog("nonexistent_preset", "fix", 1, 1).is_none());
+        assert!(generate_oplog("nonexistent_preset", "fix", 1, 1, 1).is_none());
+    }
+
+    #[test]
+    fn test_generate_oplog_scale_multiplier_applies() {
+        let small =
+            generate_oplog("deterministic_transform", "fix", 1, 1, 1).expect("preset should exist");
+        let large =
+            generate_oplog("deterministic_transform", "fix", 1, 1, 3).expect("preset should exist");
+
+        assert!(
+            large.records.len() > small.records.len(),
+            "higher scale should generate larger workloads"
+        );
     }
 
     #[test]

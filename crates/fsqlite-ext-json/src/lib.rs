@@ -13,7 +13,9 @@
 //! Path support in this slice:
 //! - `$` root
 //! - `$.key` object member
+//! - `$."key.with.dots"` quoted object member
 //! - `$[N]` array index
+//! - `$[#]` append pseudo-index
 //! - `$[#-N]` reverse array index
 
 use fsqlite_error::{FrankenError, Result};
@@ -42,6 +44,7 @@ const JSONB_OBJECT_TYPE: u8 = 0xC;
 enum PathSegment {
     Key(String),
     Index(usize),
+    Append,
     FromEnd(usize),
 }
 
@@ -990,6 +993,7 @@ fn is_superficially_valid_jsonb(input: &[u8]) -> bool {
     1 + len_size + payload_len <= input.len()
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
     let bytes = path.as_bytes();
     if bytes.first().copied() != Some(b'$') {
@@ -1004,16 +1008,58 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
         match bytes[idx] {
             b'.' => {
                 idx += 1;
-                let start = idx;
-                while idx < bytes.len() && bytes[idx] != b'.' && bytes[idx] != b'[' {
-                    idx += 1;
-                }
-                if start == idx {
+                if idx >= bytes.len() {
                     return Err(FrankenError::function_error(format!(
                         "invalid json path `{path}`: empty key segment"
                     )));
                 }
-                segments.push(PathSegment::Key(path[start..idx].to_owned()));
+
+                if bytes[idx] == b'"' {
+                    let quoted_start = idx;
+                    idx += 1;
+                    let mut escaped = false;
+                    while idx < bytes.len() {
+                        let byte = bytes[idx];
+                        if escaped {
+                            escaped = false;
+                            idx += 1;
+                            continue;
+                        }
+                        if byte == b'\\' {
+                            escaped = true;
+                            idx += 1;
+                            continue;
+                        }
+                        if byte == b'"' {
+                            break;
+                        }
+                        idx += 1;
+                    }
+                    if idx >= bytes.len() {
+                        return Err(FrankenError::function_error(format!(
+                            "invalid json path `{path}`: missing closing quote in key segment"
+                        )));
+                    }
+                    let quoted_key = &path[quoted_start..=idx];
+                    let key = serde_json::from_str::<String>(quoted_key).map_err(|error| {
+                        FrankenError::function_error(format!(
+                            "invalid json path `{path}` quoted key `{quoted_key}`: {error}"
+                        ))
+                    })?;
+                    idx += 1; // closing quote
+                    segments.push(PathSegment::Key(key));
+                } else {
+                    let start = idx;
+                    while idx < bytes.len() && bytes[idx] != b'.' && bytes[idx] != b'[' {
+                        idx += 1;
+                    }
+                    if start == idx {
+                        return Err(FrankenError::function_error(format!(
+                            "invalid json path `{path}`: empty key segment"
+                        )));
+                    }
+                    segments.push(PathSegment::Key(path[start..idx].to_owned()));
+                }
             }
             b'[' => {
                 idx += 1;
@@ -1029,7 +1075,9 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
                 let segment_text = &path[start..idx];
                 idx += 1;
 
-                if let Some(rest) = segment_text.strip_prefix("#-") {
+                if segment_text == "#" {
+                    segments.push(PathSegment::Append);
+                } else if let Some(rest) = segment_text.strip_prefix("#-") {
                     let from_end = rest.parse::<usize>().map_err(|error| {
                         FrankenError::function_error(format!(
                             "invalid json path `{path}` from-end index `{segment_text}`: {error}"
@@ -1092,6 +1140,7 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
                 let index = array.len() - from_end;
                 cursor = &array[index];
             }
+            PathSegment::Append => return Ok(None),
         }
     }
 
@@ -1380,56 +1429,100 @@ fn apply_edit(root: &mut Value, segments: &[PathSegment], new_value: Value, mode
         }
         return;
     }
+    if !matches!(root, Value::Object(_) | Value::Array(_)) {
+        // Match SQLite JSON1 semantics: non-root path edits are no-ops when
+        // the document root is a scalar value.
+        return;
+    }
 
+    let original = root.clone();
     let (parent_segments, last) = segments.split_at(segments.len() - 1);
     let Some(last_segment) = last.first() else {
         return;
     };
-    let Some(parent) = resolve_path_mut(root, parent_segments) else {
+    let Some(parent) = resolve_parent_for_edit(root, parent_segments, Some(last_segment), mode)
+    else {
+        *root = original;
         return;
     };
 
-    match (parent, last_segment) {
+    let applied = match (parent, last_segment) {
         (Value::Object(object), PathSegment::Key(key)) => {
             let exists = object.contains_key(key);
             match mode {
                 EditMode::Set => {
                     object.insert(key.clone(), new_value);
+                    true
                 }
                 EditMode::Insert => {
-                    if !exists {
+                    if exists {
+                        false
+                    } else {
                         object.insert(key.clone(), new_value);
+                        true
                     }
                 }
                 EditMode::Replace => {
                     if exists {
                         object.insert(key.clone(), new_value);
+                        true
+                    } else {
+                        false
                     }
                 }
             }
         }
         (Value::Array(array), PathSegment::Index(index)) => {
-            apply_array_edit(array, *index, new_value, mode);
+            apply_array_edit(array, *index, new_value, mode)
+        }
+        (Value::Array(array), PathSegment::Append) => {
+            if matches!(mode, EditMode::Set | EditMode::Insert) {
+                array.push(new_value);
+                true
+            } else {
+                false
+            }
         }
         (Value::Array(array), PathSegment::FromEnd(from_end)) => {
             if *from_end == 0 || *from_end > array.len() {
-                return;
+                false
+            } else {
+                let index = array.len() - *from_end;
+                apply_array_edit(array, index, new_value, mode)
             }
-            let index = array.len() - *from_end;
-            apply_array_edit(array, index, new_value, mode);
         }
-        _ => {}
+        _ => false,
+    };
+
+    if !applied {
+        *root = original;
     }
 }
 
-fn apply_array_edit(array: &mut [Value], index: usize, new_value: Value, mode: EditMode) {
-    if index >= array.len() {
-        return;
+fn apply_array_edit(
+    array: &mut Vec<Value>,
+    index: usize,
+    new_value: Value,
+    mode: EditMode,
+) -> bool {
+    if index > array.len() {
+        return false;
+    }
+
+    if index == array.len() {
+        if matches!(mode, EditMode::Set | EditMode::Insert) {
+            array.push(new_value);
+            return true;
+        }
+        return false;
     }
 
     match mode {
-        EditMode::Set | EditMode::Replace => array[index] = new_value,
-        EditMode::Insert => {}
+        EditMode::Set | EditMode::Replace => {
+            array[index] = new_value;
+            true
+        }
+        EditMode::Insert => false,
     }
 }
 
@@ -1479,6 +1572,91 @@ fn resolve_path_mut<'a>(root: &'a mut Value, segments: &[PathSegment]) -> Option
             PathSegment::Index(index) => {
                 let next = cursor.as_array_mut()?.get_mut(*index)?;
                 cursor = next;
+            }
+            PathSegment::FromEnd(from_end) => {
+                let array = cursor.as_array_mut()?;
+                if *from_end == 0 || *from_end > array.len() {
+                    return None;
+                }
+                let index = array.len() - *from_end;
+                let next = array.get_mut(index)?;
+                cursor = next;
+            }
+            PathSegment::Append => return None,
+        }
+    }
+
+    Some(cursor)
+}
+
+fn resolve_parent_for_edit<'a>(
+    root: &'a mut Value,
+    segments: &[PathSegment],
+    tail_hint: Option<&PathSegment>,
+    mode: EditMode,
+) -> Option<&'a mut Value> {
+    fn scaffold_for_next_segment(next: Option<&PathSegment>) -> Value {
+        match next {
+            Some(PathSegment::Index(_) | PathSegment::Append | PathSegment::FromEnd(_)) => {
+                Value::Array(Vec::new())
+            }
+            _ => Value::Object(Map::new()),
+        }
+    }
+
+    let mut cursor = root;
+
+    for (idx, segment) in segments.iter().enumerate() {
+        let next_segment = segments.get(idx + 1).or_else(|| {
+            if idx + 1 == segments.len() {
+                tail_hint
+            } else {
+                None
+            }
+        });
+        match segment {
+            PathSegment::Key(key) => {
+                if cursor.is_null() && matches!(mode, EditMode::Set | EditMode::Insert) {
+                    *cursor = Value::Object(Map::new());
+                }
+
+                let object = cursor.as_object_mut()?;
+                if !object.contains_key(key) {
+                    if !matches!(mode, EditMode::Set | EditMode::Insert) {
+                        return None;
+                    }
+                    object.insert(key.clone(), scaffold_for_next_segment(next_segment));
+                }
+                let next = object.get_mut(key)?;
+                cursor = next;
+            }
+            PathSegment::Index(index) => {
+                if cursor.is_null() && matches!(mode, EditMode::Set | EditMode::Insert) {
+                    *cursor = Value::Array(Vec::new());
+                }
+                let array = cursor.as_array_mut()?;
+                if *index > array.len() {
+                    return None;
+                }
+                if *index == array.len() {
+                    if !matches!(mode, EditMode::Set | EditMode::Insert) {
+                        return None;
+                    }
+                    array.push(scaffold_for_next_segment(next_segment));
+                }
+                let next = array.get_mut(*index)?;
+                cursor = next;
+            }
+            PathSegment::Append => {
+                if cursor.is_null() && matches!(mode, EditMode::Set | EditMode::Insert) {
+                    *cursor = Value::Array(Vec::new());
+                }
+                let array = cursor.as_array_mut()?;
+                if !matches!(mode, EditMode::Set | EditMode::Insert) {
+                    return None;
+                }
+                array.push(scaffold_for_next_segment(next_segment));
+                cursor = array.last_mut()?;
             }
             PathSegment::FromEnd(from_end) => {
                 let array = cursor.as_array_mut()?;
@@ -1629,6 +1807,12 @@ mod tests {
     }
 
     #[test]
+    fn test_json_extract_quoted_key_segment() {
+        let result = json_extract(r#"{"a.b":1}"#, &["$.\"a.b\""]).unwrap();
+        assert_eq!(result, SqliteValue::Integer(1));
+    }
+
+    #[test]
     fn test_json_extract_from_end() {
         let result = json_extract("[10,20,30]", &["$[#-1]"]).unwrap();
         assert_eq!(result, SqliteValue::Integer(30));
@@ -1758,6 +1942,54 @@ mod tests {
     }
 
     #[test]
+    fn test_json_set_nested_path_create() {
+        let out = json_set("{}", &[("$.a.b", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, r#"{"a":{"b":1}}"#);
+    }
+
+    #[test]
+    fn test_json_set_nested_array_path_create() {
+        let out = json_set("{}", &[("$.a[0]", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, r#"{"a":[1]}"#);
+    }
+
+    #[test]
+    fn test_json_set_nested_append_path_create() {
+        let out = json_set("{}", &[("$.a[#]", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, r#"{"a":[1]}"#);
+    }
+
+    #[test]
+    fn test_json_set_nested_array_object_create() {
+        let out = json_set("{}", &[("$.a[0].b", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, r#"{"a":[{"b":1}]}"#);
+    }
+
+    #[test]
+    fn test_json_set_nested_array_index_out_of_range_does_not_scaffold() {
+        let out = json_set("{}", &[("$.a[1]", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, "{}");
+    }
+
+    #[test]
+    fn test_json_set_nested_from_end_does_not_scaffold() {
+        let out = json_set("{}", &[("$.a[#-1]", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, "{}");
+    }
+
+    #[test]
+    fn test_json_set_scalar_root_with_array_path_is_noop() {
+        let out = json_set("null", &[("$.a[0]", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, "null");
+    }
+
+    #[test]
+    fn test_json_set_existing_null_value_with_array_path_is_noop() {
+        let out = json_set(r#"{"a":null}"#, &[("$.a[1]", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, r#"{"a":null}"#);
+    }
+
+    #[test]
     fn test_json_set_overwrite() {
         let out = json_set(r#"{"a":1}"#, &[("$.a", SqliteValue::Integer(2))]).unwrap();
         assert_eq!(out, r#"{"a":2}"#);
@@ -1773,6 +2005,18 @@ mod tests {
     fn test_json_insert_create() {
         let out = json_insert(r#"{"a":1}"#, &[("$.b", SqliteValue::Integer(2))]).unwrap();
         assert_eq!(out, r#"{"a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn test_json_insert_nested_path_create() {
+        let out = json_insert("{}", &[("$.a.b", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, r#"{"a":{"b":1}}"#);
+    }
+
+    #[test]
+    fn test_json_insert_nested_array_path_create() {
+        let out = json_insert("{}", &[("$.a[0]", SqliteValue::Integer(1))]).unwrap();
+        assert_eq!(out, r#"{"a":[1]}"#);
     }
 
     #[test]
@@ -2380,6 +2624,30 @@ mod tests {
     fn test_json_set_array_element() {
         let out = json_set("[1,2,3]", &[("$[1]", SqliteValue::Integer(99))]).unwrap();
         assert_eq!(out, "[1,99,3]");
+    }
+
+    #[test]
+    fn test_json_set_array_append_at_len() {
+        let out = json_set("[1,2]", &[("$[2]", SqliteValue::Integer(3))]).unwrap();
+        assert_eq!(out, "[1,2,3]");
+    }
+
+    #[test]
+    fn test_json_insert_array_append_at_len() {
+        let out = json_insert("[1,2]", &[("$[2]", SqliteValue::Integer(3))]).unwrap();
+        assert_eq!(out, "[1,2,3]");
+    }
+
+    #[test]
+    fn test_json_set_append_pseudo_index() {
+        let out = json_set("[1,2]", &[("$[#]", SqliteValue::Integer(3))]).unwrap();
+        assert_eq!(out, "[1,2,3]");
+    }
+
+    #[test]
+    fn test_json_replace_append_pseudo_index_noop() {
+        let out = json_replace("[1,2]", &[("$[#]", SqliteValue::Integer(3))]).unwrap();
+        assert_eq!(out, "[1,2]");
     }
 
     #[test]

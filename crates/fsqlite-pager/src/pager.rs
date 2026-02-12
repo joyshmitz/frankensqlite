@@ -36,6 +36,10 @@ pub(crate) struct PagerInner<F: VfsFile> {
     next_page: u32,
     /// Whether a writer transaction is currently active.
     writer_active: bool,
+    /// Number of active transactions (readers + writers).
+    active_transactions: u32,
+    /// Whether a checkpoint is currently running.
+    checkpoint_active: bool,
     /// Deallocated pages available for reuse.
     ///
     /// TODO: This is currently an in-memory freelist. Pages freed here are
@@ -68,10 +72,25 @@ impl<F: VfsFile> PagerInner<F> {
             return Ok(data.to_vec());
         }
 
+        // Reads of yet-unallocated pages should observe zero-filled content.
+        // This is relied upon by savepoint rollback semantics for pages that
+        // were allocated and then rolled back before commit.
+        if page_no.get() > self.db_size {
+            return Ok(vec![0_u8; self.page_size.as_usize()]);
+        }
+
         let mut buf = self.cache.pool().clone().acquire()?;
         let page_size = self.page_size.as_usize();
         let offset = u64::from(page_no.get() - 1) * page_size as u64;
-        let _ = self.db_file.read(cx, buf.as_mut_slice(), offset)?;
+        let bytes_read = self.db_file.read(cx, buf.as_mut_slice(), offset)?;
+        if bytes_read < page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short read fetching page {page}: got {bytes_read} of {page_size}",
+                    page = page_no.get()
+                ),
+            });
+        }
         let out = buf.as_slice()[..page_size].to_vec();
 
         let fresh = self.cache.insert_fresh(page_no)?;
@@ -131,6 +150,10 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
+        if inner.checkpoint_active {
+            return Err(FrankenError::Busy);
+        }
+
         let eager_writer = matches!(
             mode,
             TransactionMode::Immediate | TransactionMode::Exclusive
@@ -141,6 +164,7 @@ where
         if eager_writer {
             inner.writer_active = true;
         }
+        inner.active_transactions = inner.active_transactions.saturating_add(1);
         let original_db_size = inner.db_size;
         let journal_mode = inner.journal_mode;
         let pool = inner.cache.pool().clone();
@@ -155,6 +179,7 @@ where
             mode,
             is_writer: eager_writer,
             committed: false,
+            finished: false,
             original_db_size,
             savepoint_stack: Vec::new(),
             journal_mode,
@@ -175,6 +200,9 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
+        if inner.checkpoint_active {
+            return Err(FrankenError::Busy);
+        }
         if inner.writer_active {
             // Cannot switch journal mode while a writer is active.
             return Err(FrankenError::Busy);
@@ -194,6 +222,9 @@ where
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        if inner.checkpoint_active {
+            return Err(FrankenError::Busy);
+        }
         inner.wal_backend = Some(backend);
         drop(inner);
         Ok(())
@@ -259,9 +290,49 @@ where
             db_file.write(&cx, &page1, 0)?;
             db_file.sync(&cx, SyncFlags::NORMAL)?;
             file_size = db_file.file_size(&cx)?;
+        } else {
+            if file_size < DATABASE_HEADER_SIZE as u64 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database file too small for header: {file_size} bytes (< {DATABASE_HEADER_SIZE})"
+                    ),
+                });
+            }
+
+            let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
+            let header_read = db_file.read(&cx, &mut header_bytes, 0)?;
+            if header_read < DATABASE_HEADER_SIZE {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "short read fetching database header: got {header_read} of {DATABASE_HEADER_SIZE}"
+                    ),
+                });
+            }
+            let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("invalid database header: {error}"),
+                }
+            })?;
+            if header.page_size != page_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "database page size mismatch: header={} requested={}",
+                        header.page_size.get(),
+                        page_size.get()
+                    ),
+                });
+            }
         }
 
         let page_size_u64 = page_size.as_usize() as u64;
+        if file_size % page_size_u64 != 0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "database file size {file_size} is not aligned to page size {}",
+                    page_size.get()
+                ),
+            });
+        }
         let db_pages = file_size
             .checked_div(page_size_u64)
             .ok_or_else(|| FrankenError::internal("page size must be non-zero"))?;
@@ -281,6 +352,8 @@ where
                 db_size,
                 next_page,
                 writer_active: false,
+                active_transactions: 0,
+                checkpoint_active: false,
                 freelist: Vec::new(),
                 journal_mode: JournalMode::Delete,
                 wal_backend: None,
@@ -313,6 +386,15 @@ where
         let Ok(header) = JournalHeader::decode(&hdr_buf) else {
             return Ok(()); // Corrupt header — nothing to replay.
         };
+        if header.page_size != page_size.get() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "hot journal page size mismatch: header={} expected={}",
+                    header.page_size,
+                    page_size.get()
+                ),
+            });
+        }
 
         let page_count = if header.page_count < 0 {
             header.compute_page_count_from_file_size(jrnl_size)
@@ -347,7 +429,15 @@ where
             }
 
             // Write the pre-image back to the database file.
-            let page_offset = u64::from(record.page_number.saturating_sub(1)) * ps as u64;
+            let Some(page_no) = PageNumber::new(record.page_number) else {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "hot journal contains invalid page number {}",
+                        record.page_number
+                    ),
+                });
+            };
+            let page_offset = u64::from(page_no.get() - 1) * ps as u64;
             db_file.write(cx, &record.content, page_offset)?;
 
             offset += record_size as u64;
@@ -390,6 +480,7 @@ pub struct SimpleTransaction<V: Vfs> {
     mode: TransactionMode,
     is_writer: bool,
     committed: bool,
+    finished: bool,
     original_db_size: u32,
     /// Stack of savepoints, pushed on SAVEPOINT and popped on RELEASE.
     savepoint_stack: Vec<SavepointEntry>,
@@ -444,7 +535,15 @@ where
                 let mut pre_image = vec![0u8; ps];
                 if page_no.get() <= inner.db_size {
                     let disk_offset = u64::from(page_no.get() - 1) * ps as u64;
-                    let _ = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
+                    let bytes_read = inner.db_file.read(cx, &mut pre_image, disk_offset)?;
+                    if bytes_read < ps {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short read while journaling pre-image for page {}: got {bytes_read} of {ps}",
+                                page_no.get()
+                            ),
+                        });
+                    }
                 }
 
                 let record = JournalPageRecord::new(page_no.get(), pre_image, nonce);
@@ -532,6 +631,9 @@ where
                     .inner
                     .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                if inner.checkpoint_active {
+                    return Err(FrankenError::Busy);
+                }
                 if inner.writer_active {
                     return Err(FrankenError::Busy);
                 }
@@ -622,11 +724,18 @@ where
 
     #[allow(clippy::too_many_lines)]
     fn commit(&mut self, cx: &Cx) -> Result<()> {
-        if self.committed {
+        if self.finished {
             return Ok(());
         }
         if !self.is_writer {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            inner.active_transactions = inner.active_transactions.saturating_sub(1);
+            drop(inner);
             self.committed = true;
+            self.finished = true;
             return Ok(());
         }
 
@@ -651,25 +760,32 @@ where
 
         if commit_result.is_ok() {
             inner.commit_seq = inner.commit_seq.next();
-        }
-        inner.writer_active = false;
-        drop(inner);
-        if commit_result.is_ok() {
+            inner.active_transactions = inner.active_transactions.saturating_sub(1);
+            inner.writer_active = false;
+            drop(inner);
             self.write_set.clear();
             self.committed = true;
+            self.finished = true;
+        } else {
+            // Keep the writer lock held on commit failure so no other writer
+            // can interleave while the caller decides to retry or roll back.
+            drop(inner);
         }
         commit_result
     }
 
     fn rollback(&mut self, cx: &Cx) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
         self.write_set.clear();
         self.freed_pages.clear();
         self.savepoint_stack.clear();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         if self.is_writer {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             inner.db_size = self.original_db_size;
 
             // Reset next_page to avoid holes if we allocated pages that are now discarded.
@@ -678,11 +794,15 @@ where
             inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
 
             inner.writer_active = false;
-            drop(inner);
+        }
+        inner.active_transactions = inner.active_transactions.saturating_sub(1);
+        drop(inner);
+        if self.is_writer {
             // Delete any partial journal file.
             let _ = self.vfs.delete(cx, &self.journal_path, true);
         }
         self.committed = false;
+        self.finished = true;
         Ok(())
     }
 
@@ -743,12 +863,16 @@ where
 
 impl<V: Vfs> Drop for SimpleTransaction<V> {
     fn drop(&mut self) {
-        if self.committed || !self.is_writer {
+        if self.finished {
             return;
         }
         if let Ok(mut inner) = self.inner.lock() {
-            inner.writer_active = false;
+            if self.is_writer {
+                inner.writer_active = false;
+            }
+            inner.active_transactions = inner.active_transactions.saturating_sub(1);
         }
+        self.finished = true;
     }
 }
 
@@ -878,17 +1002,18 @@ where
     ///
     /// # Notes
     ///
-    /// This implementation assumes no active readers (oldest_reader_frame = None)
-    /// and starts from the beginning (backfilled_frames = 0). For incremental
-    /// checkpoints with reader tracking, use the lower-level WAL backend API.
+    /// This implementation refuses to checkpoint while any transaction is active.
+    /// It starts from the beginning (backfilled_frames = 0) and passes
+    /// `oldest_reader_frame = None`. For incremental, reader-aware checkpointing,
+    /// use the lower-level WAL backend API.
     pub fn checkpoint(
         &self,
         cx: &Cx,
         mode: traits::CheckpointMode,
     ) -> Result<traits::CheckpointResult> {
-        // Take the WAL backend out of the pager so we can run the checkpoint
-        // without holding the pager lock. The checkpoint writer needs to
-        // acquire the lock for each page write, so we can't hold it here.
+        // Take the WAL backend out of the pager while marking checkpoint active.
+        // `begin()` and deferred writer upgrades are blocked while this flag is
+        // set so commits cannot observe "WAL mode but no backend".
         let mut wal = {
             let mut inner = self
                 .inner
@@ -899,29 +1024,43 @@ where
             if inner.journal_mode != JournalMode::Wal {
                 return Err(FrankenError::Unsupported);
             }
+            if inner.checkpoint_active {
+                return Err(FrankenError::Busy);
+            }
+            // Without reader tracking in pager, the safe policy is to refuse
+            // checkpoint while any transaction is active.
+            if inner.active_transactions > 0 {
+                return Err(FrankenError::Busy);
+            }
 
+            inner.checkpoint_active = true;
             // Take the WAL backend out temporarily.
-            inner.wal_backend.take().ok_or_else(|| {
-                FrankenError::internal("WAL mode active but no WAL backend installed")
-            })?
+            let Some(wal) = inner.wal_backend.take() else {
+                inner.checkpoint_active = false;
+                return Err(FrankenError::internal(
+                    "WAL mode active but no WAL backend installed",
+                ));
+            };
+            drop(inner);
+            wal
         };
         // Lock is released here.
 
         // Create a checkpoint writer that writes directly to the database file.
         let mut writer = self.checkpoint_writer();
 
-        // Run the checkpoint. For now, assume:
-        // - No frames already backfilled (start from beginning)
-        // - No active readers blocking (oldest_reader_frame = None)
+        // Run the checkpoint from the beginning. Reader-aware incremental
+        // checkpointing requires exposing oldest-reader tracking from pager.
         let result = wal.checkpoint(cx, mode, &mut writer, 0, None);
 
-        // Put the WAL backend back.
+        // Put the WAL backend back and clear checkpoint state.
         {
             let mut inner = self
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
             inner.wal_backend = Some(wal);
+            inner.checkpoint_active = false;
         }
 
         result
@@ -982,6 +1121,43 @@ mod tests {
         assert_eq!(
             btree_hdr.cell_count, 0,
             "bead_id={BEAD_ID} case=sqlite_master_initially_empty"
+        );
+    }
+
+    #[test]
+    fn test_open_existing_database_rejects_page_size_mismatch() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/page_size_mismatch.db");
+
+        let _pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let wrong_page_size = PageSize::new(8192).unwrap();
+        let Err(err) = SimplePager::open(vfs, &path, wrong_page_size) else {
+            panic!("expected page size mismatch error");
+        };
+        assert!(
+            matches!(err, FrankenError::DatabaseCorrupt { .. }),
+            "bead_id={BEAD_ID} case=reject_page_size_mismatch"
+        );
+    }
+
+    #[test]
+    fn test_open_existing_database_rejects_non_page_aligned_size() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/misaligned.db");
+        let cx = Cx::new();
+        let _pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        let file_size = db_file.file_size(&cx).unwrap();
+        db_file.write(&cx, &[0xAB], file_size).unwrap();
+
+        let Err(err) = SimplePager::open(vfs, &path, PageSize::DEFAULT) else {
+            panic!("expected non-page-aligned file size error");
+        };
+        assert!(
+            matches!(err, FrankenError::DatabaseCorrupt { .. }),
+            "bead_id={BEAD_ID} case=reject_non_page_aligned_file_size"
         );
     }
 
@@ -1313,6 +1489,52 @@ mod tests {
     // ── Journal crash recovery tests ────────────────────────────────────
 
     #[test]
+    fn test_commit_journal_short_preimage_read_errors() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/short_preimage.db");
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+
+        // Establish page 2 so the next commit must read a pre-image for it.
+        let page_two = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            p
+        };
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.write_page(&cx, page_two, &vec![0x22; ps]).unwrap();
+
+        // Simulate external truncation: pre-image read for page 2 becomes short.
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+        let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+        db_file
+            .truncate(&cx, PageSize::DEFAULT.as_usize() as u64)
+            .unwrap();
+
+        let err = txn.commit(&cx).unwrap_err();
+        assert!(
+            matches!(err, FrankenError::DatabaseCorrupt { .. }),
+            "bead_id={BEAD_ID} case=short_preimage_read_is_corruption"
+        );
+
+        // Commit failure should keep the writer lock until explicit rollback.
+        let Err(busy) = pager.begin(&cx, TransactionMode::Immediate) else {
+            panic!("expected begin to fail while writer lock is still held");
+        };
+        assert!(
+            matches!(busy, FrankenError::Busy),
+            "bead_id={BEAD_ID} case=commit_error_keeps_writer_lock"
+        );
+
+        txn.rollback(&cx).unwrap();
+        let _next_writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+    }
+
+    #[test]
     fn test_commit_creates_and_deletes_journal() {
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/jrnl_test.db");
@@ -1549,6 +1771,45 @@ mod tests {
                 "bead_id={BEAD_ID} case=bad_checksum_stops_replay"
             );
         }
+    }
+
+    #[test]
+    fn test_hot_journal_invalid_page_number_errors() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/bad_pgno_jrnl.db");
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        {
+            let _pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+            let journal_path = SimplePager::<MemoryVfs>::journal_path(&path);
+            let jrnl_flags =
+                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut jrnl, _) = vfs.open(&cx, Some(&journal_path), jrnl_flags).unwrap();
+
+            let nonce = 321;
+            let header = JournalHeader {
+                page_count: 1,
+                nonce,
+                initial_db_size: 1,
+                sector_size: 512,
+                page_size: 4096,
+            };
+            let hdr_bytes = header.encode_padded();
+            jrnl.write(&cx, &hdr_bytes, 0).unwrap();
+
+            let record = JournalPageRecord::new(0, vec![0xAA; ps], nonce);
+            let rec_bytes = record.encode();
+            jrnl.write(&cx, &rec_bytes, hdr_bytes.len() as u64).unwrap();
+        }
+
+        let Err(err) = SimplePager::open(vfs, &path, PageSize::DEFAULT) else {
+            panic!("expected invalid journal page number error");
+        };
+        assert!(
+            matches!(err, FrankenError::DatabaseCorrupt { .. }),
+            "bead_id={BEAD_ID} case=invalid_journal_page_number_rejected"
+        );
     }
 
     #[test]
@@ -2085,6 +2346,37 @@ mod tests {
             result.is_err(),
             "bead_id={BEAD_ID} case=mode_switch_blocked_during_write"
         );
+    }
+
+    #[test]
+    fn test_checkpoint_busy_with_active_reader() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let err = pager
+            .checkpoint(&cx, crate::traits::CheckpointMode::Passive)
+            .expect_err("checkpoint should be blocked by active reader");
+        assert!(matches!(err, FrankenError::Busy));
+        drop(reader);
+
+        // After reader ends, checkpoint should proceed.
+        let result = pager
+            .checkpoint(&cx, crate::traits::CheckpointMode::Passive)
+            .expect("checkpoint should succeed after reader closes");
+        assert_eq!(result.total_frames, 0);
+    }
+
+    #[test]
+    fn test_checkpoint_busy_with_active_writer() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+
+        let _writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let err = pager
+            .checkpoint(&cx, crate::traits::CheckpointMode::Passive)
+            .expect_err("checkpoint should be blocked by active writer");
+        assert!(matches!(err, FrankenError::Busy));
     }
 
     #[test]

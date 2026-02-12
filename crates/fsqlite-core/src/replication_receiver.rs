@@ -20,6 +20,8 @@ use crate::replication_sender::{
 use crate::source_block_partition::K_MAX;
 
 const BEAD_ID: &str = "bd-1hi.14";
+const DEFAULT_MAX_INFLIGHT_DECODERS: usize = 128;
+const DEFAULT_MAX_BUFFERED_SYMBOL_BYTES: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Receiver State Machine
@@ -115,6 +117,16 @@ impl DecoderState {
         true
     }
 
+    #[must_use]
+    fn has_symbol(&self, isi: u32) -> bool {
+        self.received_isis.contains(&isi)
+    }
+
+    #[must_use]
+    fn buffered_bytes(&self) -> usize {
+        self.symbols.values().map(Vec::len).sum()
+    }
+
     /// Attempt to decode the collected symbols into changeset bytes.
     ///
     /// For source symbols (ISI < k_source), this reconstructs the padded
@@ -204,6 +216,8 @@ pub struct ReplicationReceiver {
     decoders: HashMap<ChangesetId, DecoderState>,
     /// Received symbol counts per changeset.
     received_counts: HashMap<ChangesetId, u32>,
+    /// Total bytes currently buffered across all decoder symbol sets.
+    buffered_symbol_bytes: usize,
     /// Decoded results waiting for application.
     pending_results: Vec<DecodeResult>,
     /// Applied results (for metrics/ACK).
@@ -250,12 +264,16 @@ impl Default for DecodeProofEmissionPolicy {
 }
 
 /// Receiver policy knobs for packet integrity/auth enforcement.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ReceiverConfig {
     /// Optional auth key for validating packet auth tags.
     pub auth_key: Option<[u8; 32]>,
     /// Decode proof emission hooks.
     pub decode_proof_policy: DecodeProofEmissionPolicy,
+    /// Maximum number of concurrent in-flight changeset decoders.
+    pub max_inflight_decoders: usize,
+    /// Maximum total bytes buffered across all decoder symbol maps.
+    pub max_buffered_symbol_bytes: usize,
 }
 
 impl ReceiverConfig {
@@ -265,11 +283,33 @@ impl ReceiverConfig {
         Self {
             auth_key: Some(auth_key),
             decode_proof_policy: DecodeProofEmissionPolicy::disabled(),
+            max_inflight_decoders: DEFAULT_MAX_INFLIGHT_DECODERS,
+            max_buffered_symbol_bytes: DEFAULT_MAX_BUFFERED_SYMBOL_BYTES,
+        }
+    }
+}
+
+impl Default for ReceiverConfig {
+    fn default() -> Self {
+        Self {
+            auth_key: None,
+            decode_proof_policy: DecodeProofEmissionPolicy::disabled(),
+            max_inflight_decoders: DEFAULT_MAX_INFLIGHT_DECODERS,
+            max_buffered_symbol_bytes: DEFAULT_MAX_BUFFERED_SYMBOL_BYTES,
         }
     }
 }
 
 impl ReplicationReceiver {
+    fn remove_decoder(&mut self, changeset_id: ChangesetId) {
+        if let Some(decoder) = self.decoders.remove(&changeset_id) {
+            self.buffered_symbol_bytes = self
+                .buffered_symbol_bytes
+                .saturating_sub(decoder.buffered_bytes());
+        }
+        self.received_counts.remove(&changeset_id);
+    }
+
     /// Create a new receiver with explicit configuration.
     #[must_use]
     pub fn with_config(config: ReceiverConfig) -> Self {
@@ -278,6 +318,7 @@ impl ReplicationReceiver {
             state: ReceiverState::Listening,
             decoders: HashMap::new(),
             received_counts: HashMap::new(),
+            buffered_symbol_bytes: 0,
             pending_results: Vec::new(),
             applied_count: 0,
             decode_audit: Vec::new(),
@@ -405,6 +446,7 @@ impl ReplicationReceiver {
         }
 
         let changeset_id = packet.changeset_id;
+        let mut created_decoder = false;
 
         // Get or create decoder state.
         if let Some(decoder) = self.decoders.get(&changeset_id) {
@@ -448,6 +490,15 @@ impl ReplicationReceiver {
                 });
             }
         } else {
+            if self.decoders.len() >= self.config.max_inflight_decoders {
+                warn!(
+                    bead_id = BEAD_ID,
+                    active_decoders = self.decoders.len(),
+                    max_inflight_decoders = self.config.max_inflight_decoders,
+                    "decoder cap reached; rejecting new changeset"
+                );
+                return Err(FrankenError::Busy);
+            }
             // Create new decoder state.
             let expected_seed =
                 crate::replication_sender::derive_seed_from_changeset_id(&changeset_id);
@@ -474,6 +525,34 @@ impl ReplicationReceiver {
                 DecoderState::new(packet.k_source, symbol_size, seed),
             );
             self.received_counts.insert(changeset_id, 0);
+            created_decoder = true;
+        }
+
+        // Enforce global buffered-symbol bound before accepting a new symbol.
+        if let Some(decoder) = self.decoders.get(&changeset_id) {
+            if !decoder.has_symbol(packet.esi) {
+                let next_total = self
+                    .buffered_symbol_bytes
+                    .saturating_add(packet.symbol_data.len());
+                if next_total > self.config.max_buffered_symbol_bytes {
+                    warn!(
+                        bead_id = BEAD_ID,
+                        buffered_symbol_bytes = self.buffered_symbol_bytes,
+                        incoming_symbol_bytes = packet.symbol_data.len(),
+                        max_buffered_symbol_bytes = self.config.max_buffered_symbol_bytes,
+                        "buffered symbol budget exceeded"
+                    );
+                    if created_decoder {
+                        self.remove_decoder(changeset_id);
+                        self.state = if self.decoders.is_empty() {
+                            ReceiverState::Listening
+                        } else {
+                            ReceiverState::Collecting
+                        };
+                    }
+                    return Err(FrankenError::TooBig);
+                }
+            }
         }
 
         // Add symbol to decoder (with ISI deduplication) and capture decode context.
@@ -500,6 +579,9 @@ impl ReplicationReceiver {
                 return Ok(PacketResult::Duplicate);
             }
 
+            self.buffered_symbol_bytes = self
+                .buffered_symbol_bytes
+                .saturating_add(packet.symbol_data.len());
             let count = self.received_counts.entry(changeset_id).or_insert(0);
             *count += 1;
             debug!(
@@ -566,8 +648,7 @@ impl ReplicationReceiver {
                             n_pages, "decode succeeded, ready to apply"
                         );
                         // Clean up decoder for this changeset.
-                        self.decoders.remove(&changeset_id);
-                        self.received_counts.remove(&changeset_id);
+                        self.remove_decoder(changeset_id);
                         return Ok(PacketResult::DecodeReady);
                     }
                     Err(e) => {
@@ -577,8 +658,7 @@ impl ReplicationReceiver {
                             "changeset validation failed after decode"
                         );
                         // Clean up failed decoder.
-                        self.decoders.remove(&changeset_id);
-                        self.received_counts.remove(&changeset_id);
+                        self.remove_decoder(changeset_id);
                         self.state = if self.decoders.is_empty() {
                             ReceiverState::Listening
                         } else {
@@ -618,6 +698,7 @@ impl ReplicationReceiver {
     }
 
     /// Parse and validate decoded changeset bytes.
+    #[allow(clippy::too_many_lines)]
     fn parse_and_validate_changeset(
         &self,
         changeset_id: ChangesetId,
@@ -644,6 +725,13 @@ impl ReplicationReceiver {
                 what: "total_len".to_owned(),
                 value: header.total_len.to_string(),
             })?;
+        if total_len < CHANGESET_HEADER_SIZE {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "total_len ({total_len}) smaller than changeset header size ({CHANGESET_HEADER_SIZE})"
+                ),
+            });
+        }
         if total_len > padded_bytes.len() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -655,29 +743,56 @@ impl ReplicationReceiver {
         let changeset_bytes = &padded_bytes[..total_len];
 
         // Parse page entries.
-        let entry_size = 4_usize + 8 + header.page_size as usize; // page_number + xxh3 + data
+        let page_size =
+            usize::try_from(header.page_size).map_err(|_| FrankenError::OutOfRange {
+                what: "page_size".to_owned(),
+                value: header.page_size.to_string(),
+            })?;
+        let entry_size = 4_usize
+            .checked_add(8)
+            .and_then(|value| value.checked_add(page_size))
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "entry_size".to_owned(),
+                value: format!("page_size={}", header.page_size),
+            })?; // page_number + xxh3 + data
+        let n_pages = usize::try_from(header.n_pages).map_err(|_| FrankenError::OutOfRange {
+            what: "n_pages".to_owned(),
+            value: header.n_pages.to_string(),
+        })?;
         let data_start = CHANGESET_HEADER_SIZE;
         let data_bytes = &changeset_bytes[data_start..];
+        let required_bytes =
+            entry_size
+                .checked_mul(n_pages)
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: "changeset payload size".to_owned(),
+                    value: format!("entry_size={entry_size}, n_pages={}", header.n_pages),
+                })?;
 
-        if data_bytes.len() < entry_size * header.n_pages as usize {
+        if data_bytes.len() < required_bytes {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "insufficient data for {} pages: {} < {}",
                     header.n_pages,
                     data_bytes.len(),
-                    entry_size * header.n_pages as usize,
+                    required_bytes,
                 ),
             });
         }
 
-        let mut pages = Vec::with_capacity(header.n_pages as usize);
+        let mut pages = Vec::with_capacity(n_pages);
         let decoder_state_symbols = self
             .decoders
             .get(&changeset_id)
             .map_or(0, DecoderState::received_count);
 
-        for i in 0..header.n_pages as usize {
-            let offset = i * entry_size;
+        for i in 0..n_pages {
+            let offset = i
+                .checked_mul(entry_size)
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: "page entry offset".to_owned(),
+                    value: format!("index={i}, entry_size={entry_size}"),
+                })?;
             let page_number =
                 u32::from_le_bytes(data_bytes[offset..offset + 4].try_into().expect("4 bytes"));
             let page_xxh3 = u64::from_le_bytes(
@@ -685,8 +800,7 @@ impl ReplicationReceiver {
                     .try_into()
                     .expect("8 bytes"),
             );
-            let page_data =
-                data_bytes[offset + 12..offset + 12 + header.page_size as usize].to_vec();
+            let page_data = data_bytes[offset + 12..offset + 12 + page_size].to_vec();
 
             // Validate page xxh3.
             let computed_xxh3 = xxhash_rust::xxh3::xxh3_64(&page_data);
@@ -804,6 +918,7 @@ impl ReplicationReceiver {
     pub fn force_reset(&mut self) {
         self.decoders.clear();
         self.received_counts.clear();
+        self.buffered_symbol_bytes = 0;
         self.pending_results.clear();
         self.state = ReceiverState::Listening;
         warn!(bead_id = BEAD_ID, "receiver force-reset to LISTENING");
@@ -863,13 +978,70 @@ pub fn parse_changeset_pages(changeset_bytes: &[u8]) -> Result<(ChangesetHeader,
         .expect("checked length");
     let header = ChangesetHeader::from_bytes(&header_bytes)?;
 
-    let entry_size = 4_usize + 8 + header.page_size as usize;
+    let total_len = usize::try_from(header.total_len).map_err(|_| FrankenError::OutOfRange {
+        what: "total_len".to_owned(),
+        value: header.total_len.to_string(),
+    })?;
+    if total_len < CHANGESET_HEADER_SIZE {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "total_len ({total_len}) smaller than changeset header size ({CHANGESET_HEADER_SIZE})"
+            ),
+        });
+    }
+    if total_len > changeset_bytes.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "total_len ({total_len}) exceeds available bytes ({})",
+                changeset_bytes.len()
+            ),
+        });
+    }
+    let changeset_bytes = &changeset_bytes[..total_len];
+
+    let page_size = usize::try_from(header.page_size).map_err(|_| FrankenError::OutOfRange {
+        what: "page_size".to_owned(),
+        value: header.page_size.to_string(),
+    })?;
+    let entry_size = 4_usize
+        .checked_add(8)
+        .and_then(|value| value.checked_add(page_size))
+        .ok_or_else(|| FrankenError::OutOfRange {
+            what: "entry_size".to_owned(),
+            value: format!("page_size={}", header.page_size),
+        })?;
+    let n_pages = usize::try_from(header.n_pages).map_err(|_| FrankenError::OutOfRange {
+        what: "n_pages".to_owned(),
+        value: header.n_pages.to_string(),
+    })?;
     let data_start = CHANGESET_HEADER_SIZE;
     let data_bytes = &changeset_bytes[data_start..];
+    let required_bytes =
+        entry_size
+            .checked_mul(n_pages)
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "changeset payload size".to_owned(),
+                value: format!("entry_size={entry_size}, n_pages={}", header.n_pages),
+            })?;
+    if data_bytes.len() < required_bytes {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "insufficient data for {} pages: {} < {}",
+                header.n_pages,
+                data_bytes.len(),
+                required_bytes
+            ),
+        });
+    }
 
-    let mut pages = Vec::with_capacity(header.n_pages as usize);
-    for i in 0..header.n_pages as usize {
-        let offset = i * entry_size;
+    let mut pages = Vec::with_capacity(n_pages);
+    for i in 0..n_pages {
+        let offset = i
+            .checked_mul(entry_size)
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "page entry offset".to_owned(),
+                value: format!("index={i}, entry_size={entry_size}"),
+            })?;
         let page_number =
             u32::from_le_bytes(data_bytes[offset..offset + 4].try_into().expect("4 bytes"));
         let page_xxh3 = u64::from_le_bytes(
@@ -877,7 +1049,7 @@ pub fn parse_changeset_pages(changeset_bytes: &[u8]) -> Result<(ChangesetHeader,
                 .try_into()
                 .expect("8 bytes"),
         );
-        let page_bytes = data_bytes[offset + 12..offset + 12 + header.page_size as usize].to_vec();
+        let page_bytes = data_bytes[offset + 12..offset + 12 + page_size].to_vec();
 
         pages.push(PageEntry {
             page_number,
@@ -1087,6 +1259,7 @@ mod tests {
         ReplicationReceiver::with_config(ReceiverConfig {
             auth_key: None,
             decode_proof_policy: DecodeProofEmissionPolicy::durability_critical(),
+            ..ReceiverConfig::default()
         })
     }
 
@@ -1129,6 +1302,69 @@ mod tests {
             ReceiverState::Listening,
             "bead_id={TEST_BEAD_ID} case=decoder_created"
         );
+    }
+
+    #[test]
+    fn test_receiver_rejects_new_changeset_when_decoder_limit_hit() {
+        let mut receiver = ReplicationReceiver::with_config(ReceiverConfig {
+            max_inflight_decoders: 1,
+            ..ReceiverConfig::default()
+        });
+
+        let first = make_packet(
+            ChangesetId::from_bytes([0x31; 16]),
+            0,
+            0,
+            100,
+            vec![0x11; 256],
+        );
+        receiver
+            .process_parsed_packet(&first)
+            .expect("first decoder");
+        assert_eq!(receiver.active_decoders(), 1);
+
+        let second = make_packet(
+            ChangesetId::from_bytes([0x32; 16]),
+            0,
+            0,
+            100,
+            vec![0x22; 256],
+        );
+        let err = receiver.process_parsed_packet(&second).unwrap_err();
+        assert!(matches!(err, FrankenError::Busy));
+        assert_eq!(receiver.active_decoders(), 1);
+    }
+
+    #[test]
+    fn test_receiver_enforces_buffered_symbol_budget() {
+        let mut receiver = ReplicationReceiver::with_config(ReceiverConfig {
+            max_buffered_symbol_bytes: 512,
+            ..ReceiverConfig::default()
+        });
+
+        let first = make_packet(
+            ChangesetId::from_bytes([0x41; 16]),
+            0,
+            0,
+            100,
+            vec![0x55; 400],
+        );
+        receiver
+            .process_parsed_packet(&first)
+            .expect("first packet");
+        assert_eq!(receiver.active_decoders(), 1);
+
+        // New changeset would exceed budget and should be rejected/cleaned up.
+        let second = make_packet(
+            ChangesetId::from_bytes([0x42; 16]),
+            0,
+            0,
+            100,
+            vec![0x77; 200],
+        );
+        let err = receiver.process_parsed_packet(&second).unwrap_err();
+        assert!(matches!(err, FrankenError::TooBig));
+        assert_eq!(receiver.active_decoders(), 1);
     }
 
     #[test]
@@ -1435,6 +1671,7 @@ mod tests {
                 emit_on_decode_failure: false,
                 emit_on_repair_success: true,
             },
+            ..ReceiverConfig::default()
         });
         let page_size = 64_u32;
         let mut pages = make_pages(page_size, &[7]);
@@ -1536,6 +1773,40 @@ mod tests {
             result.is_err(),
             "bead_id={TEST_BEAD_ID} case=xxh3_validation_catches_corruption"
         );
+    }
+
+    #[test]
+    fn test_parse_and_validate_rejects_total_len_smaller_than_header() {
+        let receiver = ReplicationReceiver::new();
+        let changeset_id = ChangesetId::from_bytes([0xA5; 16]);
+
+        let mut malformed = vec![0_u8; CHANGESET_HEADER_SIZE];
+        malformed[0..4].copy_from_slice(b"FSRP");
+        malformed[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        malformed[6..10].copy_from_slice(&4096_u32.to_le_bytes());
+        malformed[10..14].copy_from_slice(&1_u32.to_le_bytes());
+        malformed[14..22].copy_from_slice(&1_u64.to_le_bytes());
+
+        let result = receiver.parse_and_validate_changeset(changeset_id, &malformed);
+        assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
+    }
+
+    #[test]
+    fn test_parse_changeset_pages_rejects_truncated_payload() {
+        let total_len = CHANGESET_HEADER_SIZE + 8;
+        let mut malformed = vec![0_u8; total_len];
+        malformed[0..4].copy_from_slice(b"FSRP");
+        malformed[4..6].copy_from_slice(&1_u16.to_le_bytes());
+        malformed[6..10].copy_from_slice(&4096_u32.to_le_bytes());
+        malformed[10..14].copy_from_slice(&1_u32.to_le_bytes());
+        malformed[14..22].copy_from_slice(
+            &u64::try_from(total_len)
+                .expect("test total_len fits into u64")
+                .to_le_bytes(),
+        );
+
+        let result = parse_changeset_pages(&malformed);
+        assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
     }
 
     #[test]

@@ -105,12 +105,14 @@ impl HarnessSettings {
     /// FrankenSQLite-specific settings (e.g. `fsqlite.concurrent_mode`).
     #[must_use]
     pub fn to_fsqlite_pragmas(&self) -> Vec<String> {
+        let concurrent_mode = if self.concurrent_mode { "ON" } else { "OFF" };
         vec![
             format!("PRAGMA busy_timeout={};", self.busy_timeout_ms),
             format!("PRAGMA journal_mode={};", self.journal_mode),
             format!("PRAGMA synchronous={};", self.synchronous),
             format!("PRAGMA cache_size={};", self.cache_size),
             format!("PRAGMA page_size={};", self.page_size),
+            format!("PRAGMA fsqlite.concurrent_mode={concurrent_mode};"),
         ]
     }
 
@@ -177,4 +179,34 @@ pub enum E2eError {
     /// A result divergence between the two engines.
     #[error("divergence: {0}")]
     Divergence(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HarnessSettings;
+
+    #[test]
+    fn to_fsqlite_pragmas_includes_concurrent_mode_on_by_default() {
+        let settings = HarnessSettings::default();
+        let pragmas = settings.to_fsqlite_pragmas();
+        assert!(
+            pragmas
+                .iter()
+                .any(|p| p == "PRAGMA fsqlite.concurrent_mode=ON;")
+        );
+    }
+
+    #[test]
+    fn to_fsqlite_pragmas_includes_concurrent_mode_off_when_disabled() {
+        let settings = HarnessSettings {
+            concurrent_mode: false,
+            ..HarnessSettings::default()
+        };
+        let pragmas = settings.to_fsqlite_pragmas();
+        assert!(
+            pragmas
+                .iter()
+                .any(|p| p == "PRAGMA fsqlite.concurrent_mode=OFF;")
+        );
+    }
 }

@@ -48,10 +48,10 @@ use fsqlite_wal::{WalFile, WalSalts};
 // MVCC concurrent-writer support (bd-14zc / 5E.1, bd-kivg / 5E.2, bd-3bql / 5E.5)
 use fsqlite_mvcc::{
     CommitIndex, ConcurrentHandle, ConcurrentRegistry, FcwResult, GcScheduler, GcTickResult,
-    GcTodo, InProcessPageLockTable, MvccError, VersionStore, concurrent_abort, concurrent_commit,
-    concurrent_read_page, concurrent_write_page,
+    GcTodo, InProcessPageLockTable, MvccError, VersionStore, concurrent_abort,
+    concurrent_read_page, concurrent_write_page, validate_first_committer_wins,
 };
-use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot};
+use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot, TxnId};
 
 use crate::wal_adapter::WalBackendAdapter;
 
@@ -599,7 +599,10 @@ fn trigger_when_matches(when_clause: Option<&Expr>) -> bool {
 struct DbSnapshot {
     db_version: MemDbVersionToken,
     schema: Vec<TableSchema>,
+    views: Vec<ViewDef>,
     triggers: Vec<TriggerDef>,
+    rowid_alias_columns: HashMap<String, usize>,
+    next_master_rowid: i64,
 }
 
 /// A named savepoint with its pre-state snapshot.
@@ -926,6 +929,9 @@ impl Connection {
                 | Statement::Rollback(_)
                 | Statement::Savepoint(_)
                 | Statement::Release(_)
+                // PRAGMA handlers that need pager access (for example
+                // `PRAGMA wal_checkpoint`) manage their own pager operations.
+                | Statement::Pragma(_)
         );
         let was_auto = if is_txn_control {
             false // transaction-control manages its own transactions
@@ -1606,7 +1612,12 @@ impl Connection {
     /// created.  Returns `true` when an implicit transaction was started
     /// (the caller must later call [`resolve_autocommit_txn`]).
     fn ensure_autocommit_txn(&self) -> Result<bool> {
-        self.ensure_autocommit_txn_mode(TransactionMode::Immediate)
+        let mode = if *self.concurrent_mode_default.borrow() {
+            TransactionMode::Concurrent
+        } else {
+            TransactionMode::Immediate
+        };
+        self.ensure_autocommit_txn_mode(mode)
     }
 
     /// Ensure a pager transaction is active, using the specified mode.
@@ -1617,8 +1628,35 @@ impl Connection {
             return Ok(false);
         }
         let cx = Cx::new();
-        let txn = self.pager.begin(&cx, mode)?;
+        let mut txn = self.pager.begin(&cx, mode)?;
+        let is_concurrent = mode == TransactionMode::Concurrent;
+        let concurrent_session = if is_concurrent {
+            let commit_seq = *self.next_commit_seq.borrow();
+            let snapshot = Snapshot::new(
+                CommitSeq::new(commit_seq.saturating_sub(1)),
+                SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+            );
+            match self
+                .concurrent_registry
+                .borrow_mut()
+                .begin_concurrent(snapshot)
+            {
+                Ok(session_id) => Some(session_id),
+                Err(error) => {
+                    let _ = txn.rollback(&cx);
+                    return Err(match error {
+                        MvccError::Busy => FrankenError::Busy,
+                        _ => FrankenError::Internal(format!("MVCC begin failed: {error}")),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         *self.active_txn.borrow_mut() = Some(txn);
+        *self.concurrent_session_id.borrow_mut() = concurrent_session;
+        *self.concurrent_txn.borrow_mut() = is_concurrent;
         Ok(true)
     }
 
@@ -1629,15 +1667,67 @@ impl Connection {
             return Ok(());
         }
         let cx = Cx::new();
-        let mut guard = self.active_txn.borrow_mut();
-        if let Some(txn) = guard.as_deref_mut() {
-            if ok {
-                txn.commit(&cx)?;
-            } else {
-                txn.rollback(&cx)?;
+        let mut txn = {
+            let mut guard = self.active_txn.borrow_mut();
+            let Some(txn) = guard.take() else {
+                *self.concurrent_txn.borrow_mut() = false;
+                *self.concurrent_session_id.borrow_mut() = None;
+                return Ok(());
+            };
+            txn
+        };
+
+        let concurrent_plan = if ok && *self.concurrent_txn.borrow() {
+            match self.plan_concurrent_commit() {
+                Ok(plan) => plan,
+                Err(err) => {
+                    let _ = txn.rollback(&cx);
+                    *self.concurrent_txn.borrow_mut() = false;
+                    *self.concurrent_session_id.borrow_mut() = None;
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+
+        if !ok && *self.concurrent_txn.borrow() {
+            if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
+                let mut registry = self.concurrent_registry.borrow_mut();
+                if let Some(handle) = registry.get_mut(session_id) {
+                    concurrent_abort(handle, &self.concurrent_lock_table, session_id);
+                }
+                registry.remove(session_id);
             }
         }
-        *guard = None;
+
+        let txn_result = if ok {
+            txn.commit(&cx)
+        } else {
+            txn.rollback(&cx)
+        };
+        if let Err(err) = txn_result {
+            let _ = txn.rollback(&cx);
+            if *self.concurrent_txn.borrow() {
+                if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
+                    let mut registry = self.concurrent_registry.borrow_mut();
+                    if let Some(handle) = registry.get_mut(session_id) {
+                        concurrent_abort(handle, &self.concurrent_lock_table, session_id);
+                    }
+                    registry.remove(session_id);
+                }
+            }
+            *self.concurrent_txn.borrow_mut() = false;
+            *self.concurrent_session_id.borrow_mut() = None;
+            return Err(err);
+        }
+
+        if let Some((session_id, committed_seq, write_pages)) = concurrent_plan {
+            self.finalize_concurrent_commit(session_id, committed_seq, write_pages);
+        }
+
+        *self.concurrent_txn.borrow_mut() = false;
+        *self.concurrent_session_id.borrow_mut() = None;
         Ok(())
     }
 
@@ -2617,7 +2707,10 @@ impl Connection {
         DbSnapshot {
             db_version,
             schema: self.schema.borrow().clone(),
+            views: self.views.borrow().clone(),
             triggers: self.triggers.borrow().clone(),
+            rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
+            next_master_rowid: *self.next_master_rowid.borrow(),
         }
     }
 
@@ -2625,7 +2718,10 @@ impl Connection {
     fn restore_snapshot(&self, snap: &DbSnapshot) {
         self.db.borrow_mut().rollback_to(snap.db_version);
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
+        (*self.views.borrow_mut()).clone_from(&snap.views);
         (*self.triggers.borrow_mut()).clone_from(&snap.triggers);
+        (*self.rowid_alias_columns.borrow_mut()).clone_from(&snap.rowid_alias_columns);
+        *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
@@ -2660,13 +2756,11 @@ impl Connection {
         };
 
         let cx = Cx::new();
-        let txn = self.pager.begin(&cx, pager_mode)?;
-        *self.active_txn.borrow_mut() = Some(txn);
-
+        let mut txn = self.pager.begin(&cx, pager_mode)?;
         // MVCC concurrent-writer session (bd-14zc / 5E.1):
         // When mode is Concurrent, register with ConcurrentRegistry for
         // page-level MVCC locking and first-committer-wins validation.
-        if is_concurrent {
+        let concurrent_session = if is_concurrent {
             let commit_seq = *self.next_commit_seq.borrow();
             let snapshot = Snapshot::new(
                 CommitSeq::new(commit_seq.saturating_sub(1)),
@@ -2679,15 +2773,128 @@ impl Connection {
                 .map_err(|e| match e {
                     MvccError::Busy => FrankenError::Busy,
                     _ => FrankenError::Internal(format!("MVCC begin failed: {e}")),
-                })?;
-            *self.concurrent_session_id.borrow_mut() = Some(session_id);
-        }
+                });
+            let session_id = match session_id {
+                Ok(id) => id,
+                Err(err) => {
+                    let _ = txn.rollback(&cx);
+                    return Err(err);
+                }
+            };
+            Some(session_id)
+        } else {
+            None
+        };
 
+        *self.active_txn.borrow_mut() = Some(txn);
+        *self.concurrent_session_id.borrow_mut() = concurrent_session;
         self.db.borrow_mut().begin_undo();
         *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
         *self.in_transaction.borrow_mut() = true;
         *self.concurrent_txn.borrow_mut() = is_concurrent;
         Ok(())
+    }
+
+    fn map_mvcc_commit_error(err: MvccError, fcw_result: FcwResult) -> FrankenError {
+        match err {
+            MvccError::BusySnapshot => {
+                let pages = match fcw_result {
+                    FcwResult::Conflict {
+                        conflicting_pages, ..
+                    } => conflicting_pages
+                        .iter()
+                        .map(|p| p.get().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    FcwResult::Clean => String::new(),
+                };
+                FrankenError::BusySnapshot {
+                    conflicting_pages: pages,
+                }
+            }
+            MvccError::Busy => FrankenError::Busy,
+            _ => FrankenError::Internal(format!("MVCC commit failed: {err}")),
+        }
+    }
+
+    fn plan_concurrent_commit(&self) -> Result<Option<(u64, CommitSeq, Vec<PageNumber>)>> {
+        // MVCC concurrent-writer commit path (bd-14zc / 5E.1):
+        // Validate FCW/SSI preconditions first, but delay commit-index
+        // publication and lock release until pager commit succeeds. This
+        // prevents publishing a committed sequence if physical commit fails.
+        let Some(session_id) = *self.concurrent_session_id.borrow() else {
+            return Ok(None);
+        };
+        let assign_seq = CommitSeq::new(*self.next_commit_seq.borrow());
+
+        let validate_result: std::result::Result<Vec<PageNumber>, (MvccError, FcwResult)> = {
+            let mut registry = self.concurrent_registry.borrow_mut();
+            match registry.get_mut(session_id) {
+                Some(handle) => {
+                    if handle.is_active() {
+                        let fcw_result =
+                            validate_first_committer_wins(handle, &self.concurrent_commit_index);
+                        match &fcw_result {
+                            FcwResult::Conflict { .. } => {
+                                if let Some(txn_id) = TxnId::new(session_id) {
+                                    self.concurrent_lock_table.release_all(txn_id);
+                                }
+                                handle.mark_aborted();
+                                Err((MvccError::BusySnapshot, fcw_result))
+                            }
+                            FcwResult::Clean => {
+                                if handle.is_marked_for_abort()
+                                    || (handle.has_in_rw() && handle.has_out_rw())
+                                {
+                                    if let Some(txn_id) = TxnId::new(session_id) {
+                                        self.concurrent_lock_table.release_all(txn_id);
+                                    }
+                                    handle.mark_aborted();
+                                    Err((MvccError::BusySnapshot, FcwResult::Clean))
+                                } else {
+                                    Ok(handle.write_set_pages())
+                                }
+                            }
+                        }
+                    } else {
+                        Err((MvccError::InvalidState, FcwResult::Clean))
+                    }
+                }
+                None => Err((MvccError::InvalidState, FcwResult::Clean)),
+            }
+        };
+
+        match validate_result {
+            Ok(write_pages) => Ok(Some((session_id, assign_seq, write_pages))),
+            Err((err, fcw_result)) => {
+                self.concurrent_registry.borrow_mut().remove(session_id);
+                *self.concurrent_session_id.borrow_mut() = None;
+                Err(Self::map_mvcc_commit_error(err, fcw_result))
+            }
+        }
+    }
+
+    fn finalize_concurrent_commit(
+        &self,
+        session_id: u64,
+        committed_seq: CommitSeq,
+        write_pages: Vec<PageNumber>,
+    ) {
+        for page in write_pages {
+            self.concurrent_commit_index.update(page, committed_seq);
+        }
+        if let Some(txn_id) = TxnId::new(session_id) {
+            self.concurrent_lock_table.release_all(txn_id);
+        }
+        {
+            let mut registry = self.concurrent_registry.borrow_mut();
+            if let Some(handle) = registry.get_mut(session_id) {
+                handle.mark_committed();
+            }
+            registry.remove(session_id);
+        }
+        *self.next_commit_seq.borrow_mut() = committed_seq.get() + 1;
+        *self.concurrent_session_id.borrow_mut() = None;
     }
 
     /// Handle COMMIT.
@@ -2698,66 +2905,12 @@ impl Connection {
             ));
         }
 
-        let is_concurrent = *self.concurrent_txn.borrow();
+        let concurrent_commit_plan = if *self.concurrent_txn.borrow() {
+            self.plan_concurrent_commit()?
+        } else {
+            None
+        };
         let cx = Cx::new();
-
-        // MVCC concurrent-writer commit path (bd-14zc / 5E.1):
-        // When in concurrent mode, use first-committer-wins validation.
-        if is_concurrent {
-            if let Some(session_id) = *self.concurrent_session_id.borrow() {
-                let assign_seq = CommitSeq::new(*self.next_commit_seq.borrow());
-
-                // Get the handle and perform FCW validation + commit.
-                let commit_result = {
-                    let mut registry = self.concurrent_registry.borrow_mut();
-                    if let Some(handle) = registry.get_mut(session_id) {
-                        concurrent_commit(
-                            handle,
-                            &self.concurrent_commit_index,
-                            &self.concurrent_lock_table,
-                            session_id,
-                            assign_seq,
-                        )
-                    } else {
-                        Err((MvccError::InvalidState, FcwResult::Clean))
-                    }
-                };
-
-                match commit_result {
-                    Ok(committed_seq) => {
-                        // Update next_commit_seq for subsequent transactions.
-                        *self.next_commit_seq.borrow_mut() = committed_seq.get() + 1;
-                        // Remove session from registry.
-                        self.concurrent_registry.borrow_mut().remove(session_id);
-                    }
-                    Err((err, fcw_result)) => {
-                        // Clean up on failure.
-                        self.concurrent_registry.borrow_mut().remove(session_id);
-                        *self.concurrent_session_id.borrow_mut() = None;
-                        return Err(match err {
-                            MvccError::BusySnapshot => {
-                                let pages = match fcw_result {
-                                    FcwResult::Conflict {
-                                        conflicting_pages, ..
-                                    } => conflicting_pages
-                                        .iter()
-                                        .map(|p| p.get().to_string())
-                                        .collect::<Vec<_>>()
-                                        .join(", "),
-                                    FcwResult::Clean => String::new(),
-                                };
-                                FrankenError::BusySnapshot {
-                                    conflicting_pages: pages,
-                                }
-                            }
-                            MvccError::Busy => FrankenError::Busy,
-                            _ => FrankenError::Internal(format!("MVCC commit failed: {err}")),
-                        });
-                    }
-                }
-            }
-            *self.concurrent_session_id.borrow_mut() = None;
-        }
 
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
@@ -2770,6 +2923,10 @@ impl Connection {
 
         // Commit succeeded; now consume and drop the handle.
         *self.active_txn.borrow_mut() = None;
+
+        if let Some((session_id, committed_seq, write_pages)) = concurrent_commit_plan {
+            self.finalize_concurrent_commit(session_id, committed_seq, write_pages);
+        }
 
         // Discard rollback snapshot and savepoints — changes are committed.
         *self.txn_snapshot.borrow_mut() = None;
@@ -2790,20 +2947,29 @@ impl Connection {
     fn execute_rollback(&self, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
         let cx = Cx::new();
         if let Some(ref sp_name) = rb.to_savepoint {
+            let (idx, snap, canonical_name) = {
+                let savepoints = self.savepoints.borrow();
+                let idx = savepoints
+                    .iter()
+                    .rposition(|e| e.name.eq_ignore_ascii_case(sp_name))
+                    .ok_or_else(|| {
+                        FrankenError::Internal(format!("no such savepoint: {sp_name}"))
+                    })?;
+                let entry = &savepoints[idx];
+                (idx, entry.snapshot.clone(), entry.name.clone())
+            };
+
             // ROLLBACK TO SAVEPOINT: restore to the named savepoint's snapshot
             // but keep the savepoint (don't pop it).
             if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-                txn.rollback_to_savepoint(&cx, sp_name)?;
+                txn.rollback_to_savepoint(&cx, &canonical_name)?;
             }
 
-            let savepoints = self.savepoints.borrow();
-            let entry = savepoints
-                .iter()
-                .rev()
-                .find(|e| e.name.eq_ignore_ascii_case(sp_name))
-                .ok_or_else(|| FrankenError::Internal(format!("no such savepoint: {sp_name}")))?;
-            let snap = entry.snapshot.clone();
-            drop(savepoints);
+            {
+                let mut savepoints = self.savepoints.borrow_mut();
+                // Discard savepoints created after the rollback target.
+                savepoints.truncate(idx + 1);
+            }
             self.restore_snapshot(&snap);
         } else {
             // Full ROLLBACK: restore to transaction start.
@@ -2965,13 +3131,46 @@ impl Connection {
         let cx = Cx::new();
         // If no explicit transaction, implicitly begin one.
         if !*self.in_transaction.borrow() {
-            let txn = self.pager.begin(&cx, TransactionMode::Deferred)?;
-            *self.active_txn.borrow_mut() = Some(txn);
+            let is_concurrent = *self.concurrent_mode_default.borrow();
+            let pager_mode = if is_concurrent {
+                TransactionMode::Concurrent
+            } else {
+                TransactionMode::Deferred
+            };
+            let mut txn = self.pager.begin(&cx, pager_mode)?;
+            let concurrent_session = if is_concurrent {
+                let commit_seq = *self.next_commit_seq.borrow();
+                let snapshot = Snapshot::new(
+                    CommitSeq::new(commit_seq.saturating_sub(1)),
+                    SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+                );
+                let session_id = self
+                    .concurrent_registry
+                    .borrow_mut()
+                    .begin_concurrent(snapshot)
+                    .map_err(|error| match error {
+                        MvccError::Busy => FrankenError::Busy,
+                        _ => FrankenError::Internal(format!("MVCC begin failed: {error}")),
+                    });
+                let session_id = match session_id {
+                    Ok(id) => id,
+                    Err(err) => {
+                        let _ = txn.rollback(&cx);
+                        return Err(err);
+                    }
+                };
+                Some(session_id)
+            } else {
+                None
+            };
 
+            *self.active_txn.borrow_mut() = Some(txn);
+            *self.concurrent_session_id.borrow_mut() = concurrent_session;
             self.db.borrow_mut().begin_undo();
             *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
             *self.in_transaction.borrow_mut() = true;
             *self.implicit_txn.borrow_mut() = true;
+            *self.concurrent_txn.borrow_mut() = is_concurrent;
         }
 
         if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
@@ -2988,31 +3187,28 @@ impl Connection {
     /// Handle RELEASE \[SAVEPOINT\] name.
     fn execute_release(&self, name: &str) -> Result<()> {
         let cx = Cx::new();
+        let (idx, canonical_name) = {
+            let savepoints = self.savepoints.borrow();
+            let idx = savepoints
+                .iter()
+                .rposition(|e| e.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| FrankenError::Internal(format!("no such savepoint: {name}")))?;
+            (idx, savepoints[idx].name.clone())
+        };
+
         if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
-            txn.release_savepoint(&cx, name)?;
+            txn.release_savepoint(&cx, &canonical_name)?;
+        }
+
+        // If no savepoints remain and we started implicitly, `RELEASE` behaves
+        // like `COMMIT`, including MVCC commit finalization/cleanup.
+        if idx == 0 && *self.implicit_txn.borrow() {
+            return self.execute_commit();
         }
 
         let mut savepoints = self.savepoints.borrow_mut();
-        let idx = savepoints
-            .iter()
-            .rposition(|e| e.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| FrankenError::Internal(format!("no such savepoint: {name}")))?;
         // RELEASE removes the named savepoint and all savepoints created after it.
         savepoints.truncate(idx);
-        // If no savepoints remain and we started implicitly, end the transaction.
-        if savepoints.is_empty() && *self.implicit_txn.borrow() {
-            drop(savepoints);
-            // Implicit transaction via savepoint: commit on final release.
-            // (If the user did explicit BEGIN, they still need COMMIT.)
-            if let Some(mut txn) = self.active_txn.borrow_mut().take() {
-                txn.commit(&cx)?;
-            }
-
-            *self.txn_snapshot.borrow_mut() = None;
-            *self.in_transaction.borrow_mut() = false;
-            *self.implicit_txn.borrow_mut() = false;
-            self.db.borrow_mut().commit_undo();
-        }
         Ok(())
     }
 
@@ -8398,7 +8594,9 @@ fn project_join_column(
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitSeq, Connection, InProcessPageLockTable, MvccPageIo, Row, SchemaEpoch};
+    use super::{
+        CommitSeq, Connection, InProcessPageLockTable, MvccPageIo, Row, SchemaEpoch, Snapshot,
+    };
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
     use fsqlite_types::PageNumber;
@@ -11825,11 +12023,140 @@ mod tests {
     }
 
     #[test]
+    fn test_savepoint_release_implicit_txn_clears_concurrent_session() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        assert!(conn.in_transaction());
+        assert!(conn.is_concurrent_transaction());
+        assert!(conn.has_concurrent_session());
+
+        conn.execute("RELEASE sp1;").unwrap();
+        assert!(!conn.in_transaction());
+        assert!(!conn.is_concurrent_transaction());
+        assert!(!conn.has_concurrent_session());
+    }
+
+    #[test]
+    fn test_savepoint_rollback_to_discards_inner_savepoints() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT a;").unwrap();
+        conn.execute("SAVEPOINT b;").unwrap();
+        conn.execute("ROLLBACK TO a;").unwrap();
+
+        let err = conn.execute("RELEASE b;").unwrap_err();
+        assert_eq!(err.to_string(), "internal error: no such savepoint: b");
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_rollback_to_is_case_insensitive() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT MiXeD;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+        conn.execute("ROLLBACK TO mixed;").unwrap();
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert!(rows.is_empty());
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_release_is_case_insensitive() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT MiXeD;").unwrap();
+        conn.execute("RELEASE mixed;").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_rollback_restores_views_aliases_and_master_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE base (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT sp;").unwrap();
+        let before_views = conn.views.borrow().len();
+        let before_aliases = conn.rowid_alias_columns.borrow().clone();
+        let before_next_master_rowid = *conn.next_master_rowid.borrow();
+
+        conn.execute("CREATE TABLE temp_t (id INTEGER PRIMARY KEY, x TEXT);")
+            .unwrap();
+        conn.execute("CREATE VIEW temp_v AS SELECT id FROM temp_t;")
+            .unwrap();
+
+        assert!(conn.rowid_alias_columns.borrow().contains_key("temp_t"));
+        assert!(conn.views.borrow().iter().any(|v| v.name == "temp_v"));
+        assert!(*conn.next_master_rowid.borrow() > before_next_master_rowid);
+
+        conn.execute("ROLLBACK TO sp;").unwrap();
+
+        assert_eq!(conn.views.borrow().len(), before_views);
+        assert_eq!(*conn.rowid_alias_columns.borrow(), before_aliases);
+        assert_eq!(*conn.next_master_rowid.borrow(), before_next_master_rowid);
+        assert!(!conn.views.borrow().iter().any(|v| v.name == "temp_v"));
+        assert!(!conn.rowid_alias_columns.borrow().contains_key("temp_t"));
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
     fn test_savepoint_starts_implicit_transaction() {
         let conn = Connection::open(":memory:").unwrap();
         assert!(!conn.in_transaction());
         conn.execute("SAVEPOINT sp1;").unwrap();
         assert!(conn.in_transaction());
+    }
+
+    #[test]
+    fn test_savepoint_implicit_transaction_uses_concurrent_mode_default() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(conn.is_concurrent_mode_default());
+
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        assert!(conn.in_transaction());
+        assert!(conn.is_concurrent_transaction());
+        assert!(conn.has_concurrent_session());
+    }
+
+    #[test]
+    fn test_begin_concurrent_setup_failure_does_not_leak_transaction_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        {
+            let mut registry = conn.concurrent_registry.borrow_mut();
+            for _ in 0..fsqlite_mvcc::MAX_CONCURRENT_WRITERS {
+                registry.begin_concurrent(snapshot).unwrap();
+            }
+        }
+
+        let err = conn.execute("BEGIN;").unwrap_err();
+        assert!(matches!(err, FrankenError::Busy));
+        assert!(!conn.in_transaction());
+        assert!(!conn.has_concurrent_session());
+        assert!(conn.active_txn.borrow().is_none());
+    }
+
+    #[test]
+    fn test_savepoint_concurrent_setup_failure_does_not_leak_transaction_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        {
+            let mut registry = conn.concurrent_registry.borrow_mut();
+            for _ in 0..fsqlite_mvcc::MAX_CONCURRENT_WRITERS {
+                registry.begin_concurrent(snapshot).unwrap();
+            }
+        }
+
+        let err = conn.execute("SAVEPOINT sp1;").unwrap_err();
+        assert!(matches!(err, FrankenError::Busy));
+        assert!(!conn.in_transaction());
+        assert!(!conn.has_concurrent_session());
+        assert!(conn.active_txn.borrow().is_none());
     }
 
     #[test]
@@ -15143,6 +15470,36 @@ mod autocommit_txn_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(42));
         eprintln!("[5B5][test=autocommit_insert][step=verify] data_persisted=true ✓");
+    }
+
+    #[test]
+    fn test_autocommit_write_mode_uses_concurrent_session_by_default() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(conn.is_concurrent_mode_default());
+
+        let started = conn.ensure_autocommit_txn().unwrap();
+        assert!(started);
+        assert!(conn.is_concurrent_transaction());
+        assert!(conn.has_concurrent_session());
+
+        conn.resolve_autocommit_txn(true, true).unwrap();
+        assert!(!conn.is_concurrent_transaction());
+        assert!(!conn.has_concurrent_session());
+        assert!(conn.active_txn.borrow().is_none());
+    }
+
+    #[test]
+    fn test_autocommit_read_mode_does_not_open_concurrent_session() {
+        let conn = Connection::open(":memory:").unwrap();
+        let started = conn
+            .ensure_autocommit_txn_mode(TransactionMode::Deferred)
+            .unwrap();
+        assert!(started);
+        assert!(!conn.is_concurrent_transaction());
+        assert!(!conn.has_concurrent_session());
+
+        conn.resolve_autocommit_txn(true, true).unwrap();
+        assert!(conn.active_txn.borrow().is_none());
     }
 
     #[test]

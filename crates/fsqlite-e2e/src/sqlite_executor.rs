@@ -429,6 +429,11 @@ fn execute_sql_stmt(
     if is_query {
         match query_row_count(tx, trimmed) {
             Ok(rc) => {
+                if matches!(expected, Some(ExpectedResult::Error)) {
+                    return Err(OpError::Fatal(format!(
+                        "expected error, but query succeeded: `{trimmed}`"
+                    )));
+                }
                 if let Some(ExpectedResult::RowCount(n)) = expected {
                     if rc != *n {
                         return Err(OpError::Fatal(format!(
@@ -438,11 +443,22 @@ fn execute_sql_stmt(
                 }
                 Ok(())
             }
-            Err(e) => Err(classify_rusqlite_error_as_op(&e)),
+            Err(e) => {
+                if matches!(expected, Some(ExpectedResult::Error)) {
+                    Ok(())
+                } else {
+                    Err(classify_rusqlite_error_as_op(&e))
+                }
+            }
         }
     } else {
         match tx.execute(trimmed, []) {
             Ok(affected) => {
+                if matches!(expected, Some(ExpectedResult::Error)) {
+                    return Err(OpError::Fatal(format!(
+                        "expected error, but statement succeeded: `{trimmed}`"
+                    )));
+                }
                 if let Some(ExpectedResult::AffectedRows(n)) = expected {
                     if affected != *n {
                         return Err(OpError::Fatal(format!(
@@ -452,7 +468,13 @@ fn execute_sql_stmt(
                 }
                 Ok(())
             }
-            Err(e) => Err(classify_rusqlite_error_as_op(&e)),
+            Err(e) => {
+                if matches!(expected, Some(ExpectedResult::Error)) {
+                    Ok(())
+                } else {
+                    Err(classify_rusqlite_error_as_op(&e))
+                }
+            }
         }
     }
 }
@@ -485,6 +507,11 @@ fn execute_structured_insert(
 
     match tx.execute(&sql, params_from_iter(params)) {
         Ok(affected) => {
+            if matches!(expected, Some(ExpectedResult::Error)) {
+                return Err(OpError::Fatal(format!(
+                    "expected error, but statement succeeded: `{sql}`"
+                )));
+            }
             if let Some(ExpectedResult::AffectedRows(n)) = expected {
                 if affected != *n {
                     return Err(OpError::Fatal(format!(
@@ -494,7 +521,13 @@ fn execute_structured_insert(
             }
             Ok(())
         }
-        Err(e) => Err(classify_rusqlite_error_as_op(&e)),
+        Err(e) => {
+            if matches!(expected, Some(ExpectedResult::Error)) {
+                Ok(())
+            } else {
+                Err(classify_rusqlite_error_as_op(&e))
+            }
+        }
     }
 }
 
@@ -526,6 +559,11 @@ fn execute_structured_update(
 
     match tx.execute(&sql, params_from_iter(params)) {
         Ok(affected) => {
+            if matches!(expected, Some(ExpectedResult::Error)) {
+                return Err(OpError::Fatal(format!(
+                    "expected error, but statement succeeded: `{sql}`"
+                )));
+            }
             if let Some(ExpectedResult::AffectedRows(n)) = expected {
                 if affected != *n {
                     return Err(OpError::Fatal(format!(
@@ -535,7 +573,13 @@ fn execute_structured_update(
             }
             Ok(())
         }
-        Err(e) => Err(classify_rusqlite_error_as_op(&e)),
+        Err(e) => {
+            if matches!(expected, Some(ExpectedResult::Error)) {
+                Ok(())
+            } else {
+                Err(classify_rusqlite_error_as_op(&e))
+            }
+        }
     }
 }
 
@@ -610,7 +654,10 @@ fn duration_to_u64_ms(d: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oplog::preset_commutative_inserts_disjoint_keys;
+    use crate::oplog::{
+        ConcurrencyModel, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec,
+        preset_commutative_inserts_disjoint_keys,
+    };
 
     #[test]
     fn test_run_oplog_sqlite_basic_concurrent() {
@@ -698,5 +745,72 @@ mod tests {
             run_integrity_check_sqlite(&db_path),
             "healthy database should pass"
         );
+    }
+
+    #[test]
+    fn execute_sql_stmt_expected_error_behavior() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let tx = conn.transaction().unwrap();
+        let expected = ExpectedResult::Error;
+
+        assert!(execute_sql_stmt(&tx, "SELECT * FROM no_such_table;", Some(&expected)).is_ok());
+        assert!(execute_sql_stmt(&tx, "SELECT 1;", Some(&expected)).is_err());
+
+        drop(tx);
+    }
+
+    #[test]
+    fn run_oplog_sqlite_expected_error_is_counted_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("expected_error.db");
+        Connection::open(&db_path).unwrap();
+
+        let oplog = OpLog {
+            header: OpLogHeader {
+                fixture_id: "sqlite-expected-error".to_owned(),
+                seed: 2,
+                rng: RngSpec::default(),
+                concurrency: ConcurrencyModel {
+                    worker_count: 1,
+                    transaction_size: 1,
+                    commit_order_policy: "deterministic".to_owned(),
+                },
+                preset: None,
+            },
+            records: vec![
+                OpRecord {
+                    op_id: 0,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: "CREATE TABLE t0(id INTEGER PRIMARY KEY);".to_owned(),
+                    },
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 1,
+                    worker: 0,
+                    kind: OpKind::Begin,
+                    expected: None,
+                },
+                OpRecord {
+                    op_id: 2,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: "SELECT * FROM no_such_table;".to_owned(),
+                    },
+                    expected: Some(ExpectedResult::Error),
+                },
+                OpRecord {
+                    op_id: 3,
+                    worker: 0,
+                    kind: OpKind::Commit,
+                    expected: None,
+                },
+            ],
+        };
+
+        let report = run_oplog_sqlite(&db_path, &oplog, &SqliteExecConfig::default()).unwrap();
+        assert!(report.error.is_none(), "error={:?}", report.error);
+        assert_eq!(report.ops_total, 1);
     }
 }

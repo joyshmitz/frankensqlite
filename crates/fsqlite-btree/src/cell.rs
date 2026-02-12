@@ -348,7 +348,7 @@ impl CellRef {
     /// Parse a cell from the given page at the specified byte offset.
     ///
     /// `usable_size` is the usable page size (page_size - reserved_bytes).
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn parse(
         page: &[u8],
         cell_offset: usize,
@@ -404,7 +404,10 @@ impl CellRef {
             read_varint(&page[pos..]).ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "truncated varint in cell (payload size)".to_owned(),
             })?;
-        let payload_size = payload_size_raw as u32;
+        let payload_size =
+            u32::try_from(payload_size_raw).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "cell payload size exceeds 32-bit range".to_owned(),
+            })?;
         pos += ps_len;
 
         // Table cells (leaf table): rowid varint after payload size.
@@ -423,10 +426,20 @@ impl CellRef {
 
         let payload_offset = pos;
         let local_size = local_payload_size(payload_size, usable_size, page_type);
+        let local_end = payload_offset
+            .checked_add(local_size as usize)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "cell payload offset overflow".to_owned(),
+            })?;
+        if local_end > page.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "cell extends past page (payload bytes)".to_owned(),
+            });
+        }
 
         // Check for overflow page pointer.
         let overflow_page = if local_size < payload_size {
-            let overflow_ptr_offset = payload_offset + local_size as usize;
+            let overflow_ptr_offset = local_end;
             if overflow_ptr_offset + 4 > page.len() {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "cell extends past page (overflow pointer)".to_owned(),
@@ -766,6 +779,19 @@ mod tests {
 
         let payload = cell.local_payload(&page);
         assert_eq!(payload, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn test_parse_leaf_table_cell_rejects_truncated_local_payload() {
+        // Payload claims 10 bytes but only 2 header bytes fit on page.
+        let mut page = vec![0u8; 64];
+        let cell_offset = 60;
+        page[cell_offset] = 10; // payload_size
+        page[cell_offset + 1] = 1; // rowid
+
+        let err = CellRef::parse(&page, cell_offset, BtreePageType::LeafTable, 4096).unwrap_err();
+        assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
+        assert!(err.to_string().contains("payload bytes"));
     }
 
     #[test]

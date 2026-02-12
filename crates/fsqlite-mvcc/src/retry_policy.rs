@@ -6,6 +6,7 @@
 //! `p_succ(t | evidence)` for each candidate wait time, selecting the action
 //! that minimizes expected loss.
 
+use std::collections::HashMap;
 use std::fmt;
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,9 @@ pub const MAX_CONTENTION_BUCKETS: usize = 16;
 /// Default starvation threshold: after this many consecutive conflicts
 /// on a single transaction, escalate to serialized mode.
 pub const DEFAULT_STARVATION_THRESHOLD: u32 = 5;
+
+/// Hard cap on per-transaction conflict counters retained by the controller.
+const MAX_TRACKED_CONFLICT_TXNS: usize = 4_096;
 
 // ---------------------------------------------------------------------------
 // Retry action
@@ -295,7 +299,7 @@ pub struct RetryController {
     /// Evidence ledger.
     ledger: Vec<RetryEvidenceEntry>,
     /// Per-transaction conflict counter (txn_id → consecutive_conflicts).
-    conflict_counts: Vec<(u64, u32)>,
+    conflict_counts: HashMap<u64, u32>,
 }
 
 impl RetryController {
@@ -310,7 +314,7 @@ impl RetryController {
             posteriors,
             starvation_threshold: DEFAULT_STARVATION_THRESHOLD,
             ledger: Vec::new(),
-            conflict_counts: Vec::new(),
+            conflict_counts: HashMap::new(),
         }
     }
 
@@ -328,7 +332,7 @@ impl RetryController {
             posteriors,
             starvation_threshold,
             ledger: Vec::new(),
-            conflict_counts: Vec::new(),
+            conflict_counts: HashMap::new(),
         }
     }
 
@@ -360,6 +364,7 @@ impl RetryController {
                 starvation_escalation,
             );
             self.ledger.push(entry);
+            self.clear_conflict(txn_id);
             return RetryAction::FailNow;
         }
 
@@ -383,6 +388,7 @@ impl RetryController {
                 starvation_escalation,
             );
             self.ledger.push(entry);
+            self.clear_conflict(txn_id);
             return RetryAction::FailNow;
         }
 
@@ -423,6 +429,9 @@ impl RetryController {
             starvation_escalation,
         );
         self.ledger.push(entry);
+        if best_action == RetryAction::FailNow {
+            self.clear_conflict(txn_id);
+        }
 
         best_action
     }
@@ -455,7 +464,7 @@ impl RetryController {
 
     /// Clear conflict counter for a transaction (after successful commit).
     pub fn clear_conflict(&mut self, txn_id: u64) {
-        self.conflict_counts.retain(|(id, _)| *id != txn_id);
+        self.conflict_counts.remove(&txn_id);
     }
 
     /// Access the evidence ledger.
@@ -481,28 +490,51 @@ impl RetryController {
     #[must_use]
     pub fn is_starvation_escalated(&self, txn_id: u64) -> bool {
         self.conflict_counts
-            .iter()
-            .any(|(id, count)| *id == txn_id && *count >= self.starvation_threshold)
+            .get(&txn_id)
+            .is_some_and(|count| *count >= self.starvation_threshold)
     }
 
     // -- internal helpers --
 
     fn candidate_index(&self, wait_ms: u64) -> usize {
+        debug_assert!(
+            !self.candidates.is_empty(),
+            "retry candidate set must not be empty"
+        );
+        if let Some(exact) = self
+            .candidates
+            .iter()
+            .position(|&candidate| candidate == wait_ms)
+        {
+            return exact;
+        }
+
+        // Observe/posterior callers may report measured wait values that do not
+        // exactly match a canonical arm (e.g. scheduler jitter). Route to the
+        // nearest configured arm instead of silently biasing toward 0ms.
         self.candidates
             .iter()
-            .position(|&t| t == wait_ms)
-            .unwrap_or(0)
+            .enumerate()
+            .min_by_key(|(_, candidate)| candidate.abs_diff(wait_ms))
+            .map_or(0, |(idx, _)| idx)
     }
 
     fn increment_conflict(&mut self, txn_id: u64) -> u32 {
-        for (id, count) in &mut self.conflict_counts {
-            if *id == txn_id {
-                *count += 1;
-                return *count;
+        if self.conflict_counts.len() >= MAX_TRACKED_CONFLICT_TXNS
+            && !self.conflict_counts.contains_key(&txn_id)
+        {
+            let evict_txn = self
+                .conflict_counts
+                .iter()
+                .min_by_key(|(id, count)| (**count, **id))
+                .map(|(id, _)| *id);
+            if let Some(evict_txn) = evict_txn {
+                self.conflict_counts.remove(&evict_txn);
             }
         }
-        self.conflict_counts.push((txn_id, 1));
-        1
+        let count = self.conflict_counts.entry(txn_id).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -689,6 +721,23 @@ mod tests {
     }
 
     #[test]
+    fn test_observe_non_candidate_wait_uses_nearest_arm() {
+        let params = RetryCostParams::default();
+        let mut ctrl = RetryController::with_candidates(params, vec![0, 5, 10], 3);
+
+        let alpha_zero_before = ctrl.posterior(0).alpha;
+        let alpha_five_before = ctrl.posterior(5).alpha;
+        let alpha_ten_before = ctrl.posterior(10).alpha;
+
+        // 6ms is not a configured arm; nearest configured wait is 5ms.
+        ctrl.observe(6, true);
+
+        assert!((ctrl.posterior(0).alpha - alpha_zero_before).abs() < 1e-10);
+        assert!((ctrl.posterior(10).alpha - alpha_ten_before).abs() < 1e-10);
+        assert!((ctrl.posterior(5).alpha - (alpha_five_before + 1.0)).abs() < 1e-10);
+    }
+
+    #[test]
     fn test_evidence_ledger_complete() {
         let mut ctrl = RetryController::new(RetryCostParams::default());
         let _ = ctrl.decide(42, 50, 7, Some(ContentionBucketKey::from_raw(4, 0.1)));
@@ -717,6 +766,23 @@ mod tests {
         assert!(ctrl.is_starvation_escalated(99));
         // Last entry should have starvation flag.
         assert!(ctrl.ledger().last().unwrap().starvation_escalation);
+    }
+
+    #[test]
+    fn test_fail_now_clears_conflict_tracking() {
+        let mut ctrl = RetryController::new(RetryCostParams::default());
+        let action = ctrl.decide(77, 0, 0, None);
+        assert_eq!(action, RetryAction::FailNow);
+        assert_eq!(ctrl.tracked_conflicts(), 0);
+    }
+
+    #[test]
+    fn test_conflict_tracking_is_bounded() {
+        let mut ctrl = RetryController::new(RetryCostParams::default());
+        for txn_id in 1..=(MAX_TRACKED_CONFLICT_TXNS + 256) {
+            let _ = ctrl.decide(u64::try_from(txn_id).unwrap(), 100, 0, None);
+        }
+        assert!(ctrl.tracked_conflicts() <= MAX_TRACKED_CONFLICT_TXNS);
     }
 
     #[test]

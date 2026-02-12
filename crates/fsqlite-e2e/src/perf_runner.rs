@@ -152,10 +152,8 @@ impl PerfResult {
     pub fn to_jsonl(&self) -> Result<String, serde_json::Error> {
         let mut out = String::new();
         for cell in &self.cells {
-            if let Some(ref summary) = cell.summary {
-                out.push_str(&serde_json::to_string(summary)?);
-                out.push('\n');
-            }
+            out.push_str(&serde_json::to_string(cell)?);
+            out.push('\n');
         }
         Ok(out)
     }
@@ -377,9 +375,9 @@ pub fn run_perf_matrix(config: &PerfMatrixConfig) -> PerfResult {
     }
 }
 
-/// Write benchmark summaries to a JSONL file.
+/// Write all per-cell benchmark outcomes to a JSONL file.
 ///
-/// Each successful cell's `BenchmarkSummary` is written as one JSON line.
+/// Each line is a serialized [`CellOutcome`], including failed cells.
 ///
 /// # Errors
 ///
@@ -388,10 +386,8 @@ pub fn write_results_jsonl(result: &PerfResult, path: &Path) -> std::io::Result<
     use std::io::Write;
     let mut file = std::fs::File::create(path)?;
     for cell in &result.cells {
-        if let Some(ref summary) = cell.summary {
-            let line = serde_json::to_string(summary).map_err(std::io::Error::other)?;
-            writeln!(file, "{line}")?;
-        }
+        let line = serde_json::to_string(cell).map_err(std::io::Error::other)?;
+        writeln!(file, "{line}")?;
     }
     Ok(())
 }
@@ -512,5 +508,27 @@ mod tests {
         let parsed: CellOutcome = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.error.as_deref(), Some("test error"));
         assert!(parsed.summary.is_none());
+    }
+
+    #[test]
+    fn test_perf_jsonl_includes_error_cells() {
+        let result = PerfResult {
+            schema_version: PERF_RESULT_SCHEMA_V1.to_owned(),
+            total_cells: 1,
+            success_count: 0,
+            error_count: 1,
+            cells: vec![CellOutcome {
+                summary: None,
+                error: Some("boom".to_owned()),
+                engine: "fsqlite".to_owned(),
+                fixture_id: "fix1".to_owned(),
+                workload: "hot_page_contention".to_owned(),
+                concurrency: 4,
+            }],
+        };
+
+        let jsonl = result.to_jsonl().unwrap();
+        assert!(jsonl.contains("\"error\":\"boom\""));
+        assert!(jsonl.contains("\"engine\":\"fsqlite\""));
     }
 }
