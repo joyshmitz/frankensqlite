@@ -1,0 +1,170 @@
+name: Unit Test Shard Matrix
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/unit-test-shard-matrix.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+
+jobs:
+  unit-shards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - id: storage-foundation
+            risk_tier: high
+            crates: "fsqlite-types fsqlite-error fsqlite-observability fsqlite-vfs fsqlite-pager fsqlite-wal fsqlite-mvcc fsqlite-btree"
+          - id: sql-engine
+            risk_tier: high
+            crates: "fsqlite-ast fsqlite-parser fsqlite-planner fsqlite-vdbe fsqlite-func fsqlite-core fsqlite"
+          - id: extensions
+            risk_tier: medium
+            crates: "fsqlite-ext-fts3 fsqlite-ext-fts5 fsqlite-ext-json fsqlite-ext-rtree fsqlite-ext-session fsqlite-ext-icu fsqlite-ext-misc"
+          - id: harness-and-tools
+            risk_tier: medium
+            crates: "fsqlite-harness fsqlite-e2e fsqlite-cli"
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+      SHARD_ID: ${{ matrix.shard.id }}
+      RISK_TIER: ${{ matrix.shard.risk_tier }}
+      CRATE_LIST: ${{ matrix.shard.crates }}
+      SHARD_MANIFEST_VERSION: fsqlite-ci.unit-shards.v1
+      SHARD_SUMMARY_SCHEMA_VERSION: fsqlite-ci.unit-shard-summary.v1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Run deterministic unit-test shard
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_root="artifacts/unit-shards/${SHARD_ID}"
+          log_dir="${artifact_root}/logs"
+          summary_md="${artifact_root}/summary.md"
+          summary_json="${artifact_root}/summary.json"
+          passed_file="${artifact_root}/passed.txt"
+          failed_file="${artifact_root}/failed.txt"
+
+          mkdir -p "${log_dir}"
+          : > "${passed_file}"
+          : > "${failed_file}"
+
+          started_at="$(date +%s)"
+          crate_count=0
+          failed_count=0
+
+          {
+            echo "# Unit Shard Summary: ${SHARD_ID}"
+            echo
+            echo "- manifest_version: \`${SHARD_MANIFEST_VERSION}\`"
+            echo "- risk_tier: \`${RISK_TIER}\`"
+            echo "- crates: \`${CRATE_LIST}\`"
+            echo
+            echo "## Results"
+          } > "${summary_md}"
+
+          for crate in ${CRATE_LIST}; do
+            crate_count=$((crate_count + 1))
+            log_file="${log_dir}/${crate}.log"
+            test_target="--lib"
+
+            if [[ "${crate}" == "fsqlite-cli" ]]; then
+              test_target="--bins"
+            fi
+
+            echo "Running ${crate} (${test_target})..."
+            set +e
+            cargo test -p "${crate}" ${test_target} --locked -- --nocapture > "${log_file}" 2>&1
+            status=$?
+            set -e
+
+            if [[ ${status} -eq 0 ]]; then
+              echo "${crate}" >> "${passed_file}"
+              echo "- PASS \`${crate}\`" >> "${summary_md}"
+              continue
+            fi
+
+            failed_count=$((failed_count + 1))
+            echo "${crate}" >> "${failed_file}"
+            echo "- FAIL \`${crate}\` (exit ${status}) — see \`logs/${crate}.log\`" >> "${summary_md}"
+
+            {
+              echo "# Failure excerpt for ${crate}"
+              grep -En "test result:|failures:|error:|panicked at" "${log_file}" | head -n 40 || true
+            } > "${log_dir}/${crate}.failure_excerpt.txt"
+          done
+
+          duration_seconds="$(( $(date +%s) - started_at ))"
+          passed_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' "${passed_file}")"
+          failed_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' "${failed_file}")"
+
+          jq -n \
+            --arg schema_version "${SHARD_SUMMARY_SCHEMA_VERSION}" \
+            --arg manifest_version "${SHARD_MANIFEST_VERSION}" \
+            --arg shard_id "${SHARD_ID}" \
+            --arg risk_tier "${RISK_TIER}" \
+            --arg crate_list "${CRATE_LIST}" \
+            --argjson crate_count "${crate_count}" \
+            --argjson passed_crates "${passed_json}" \
+            --argjson failed_crates "${failed_json}" \
+            --argjson failed_count "${failed_count}" \
+            --argjson duration_seconds "${duration_seconds}" \
+            '{
+              schema_version: $schema_version,
+              manifest_version: $manifest_version,
+              shard_id: $shard_id,
+              risk_tier: $risk_tier,
+              crate_count: $crate_count,
+              crates: ($crate_list | split(" ")),
+              passed_crates: $passed_crates,
+              failed_crates: $failed_crates,
+              failed_count: $failed_count,
+              duration_seconds: $duration_seconds
+            }' > "${summary_json}"
+
+          {
+            echo
+            echo "## Totals"
+            echo "- crates_run: ${crate_count}"
+            echo "- failed_crates: ${failed_count}"
+            echo "- duration_seconds: ${duration_seconds}"
+          } >> "${summary_md}"
+
+          {
+            echo "### Unit shard ${SHARD_ID} (${RISK_TIER})"
+            echo "- crates_run: ${crate_count}"
+            echo "- failed_crates: ${failed_count}"
+            if [[ ${failed_count} -gt 0 ]]; then
+              failures="$(tr '\n' ' ' < "${failed_file}" | sed -e 's/  */ /g' -e 's/ $//')"
+              echo "- failures: \`${failures}\`"
+            else
+              echo "- failures: none"
+            fi
+            echo "- summary: \`${summary_json}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ ${failed_count} -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: Upload unit-shard artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-shard-${{ matrix.shard.id }}-artifacts
+          path: artifacts/unit-shards/${{ matrix.shard.id }}/
