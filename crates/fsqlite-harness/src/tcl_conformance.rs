@@ -7,7 +7,7 @@
 //! targets. The default execution mode is dry-run so CI can always produce
 //! reproducible manifests even when TCL toolchain prerequisites are absent.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -52,6 +52,25 @@ pub enum TclHarnessOutcome {
     Error,
 }
 
+/// Conformance category used to track pass-rate targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TclConformanceCategory {
+    CoreSql,
+    Transactions,
+    ErrorHandling,
+    Extensions,
+    Wal,
+}
+
+/// Classification used for deterministic failure triage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TclFailureClassification {
+    Bug,
+    DeliberateDivergence,
+}
+
 /// Parsed testrunner summary counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TclRunnerCounts {
@@ -69,6 +88,7 @@ pub struct TclHarnessScenario {
     pub id: String,
     pub description: String,
     pub args: Vec<String>,
+    pub category: TclConformanceCategory,
 }
 
 /// Declarative TCL harness suite.
@@ -107,6 +127,7 @@ impl Default for TclExecutionOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TclHarnessScenarioResult {
     pub scenario_id: String,
+    pub category: TclConformanceCategory,
     pub command: String,
     pub outcome: TclHarnessOutcome,
     pub reason: Option<String>,
@@ -116,10 +137,52 @@ pub struct TclHarnessScenarioResult {
     pub skipped_jobs: u64,
     pub elapsed_ms: u64,
     pub log_path: String,
+    pub failures: Vec<TclFailureRecord>,
+}
+
+/// Deterministic classification entry for a failed test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TclFailureRecord {
+    pub test_name: String,
+    pub classification: TclFailureClassification,
+    pub rationale: String,
+}
+
+/// Aggregated category metric in the conformance matrix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TclConformanceCategoryMetric {
+    pub category: TclConformanceCategory,
+    pub tests: u64,
+    pub errors: u64,
+    pub pass_rate_pct: f64,
+    pub target_pass_rate_pct: Option<f64>,
+    pub meets_target: Option<bool>,
+    pub notes: String,
+}
+
+/// Flattened failure row for the conformance matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TclConformanceFailure {
+    pub scenario_id: String,
+    pub category: TclConformanceCategory,
+    pub test_name: String,
+    pub classification: TclFailureClassification,
+    pub rationale: String,
+}
+
+/// Conformance matrix artifact required by `bd-3plop.7`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TclConformanceMatrix {
+    pub overall_tests: u64,
+    pub overall_errors: u64,
+    pub overall_pass_rate_pct: f64,
+    pub category_metrics: Vec<TclConformanceCategoryMetric>,
+    pub failures: Vec<TclConformanceFailure>,
+    pub roadmap: Vec<String>,
 }
 
 /// Aggregated execution summary.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TclHarnessExecutionSummary {
     pub bead_id: String,
     pub schema_version: u32,
@@ -135,6 +198,7 @@ pub struct TclHarnessExecutionSummary {
     pub timeout_scenarios: usize,
     pub error_scenarios: usize,
     pub results: Vec<TclHarnessScenarioResult>,
+    pub conformance_matrix: TclConformanceMatrix,
 }
 
 /// Build the canonical TCL suite definition for `bd-3plop.7`.
@@ -150,6 +214,7 @@ pub fn canonical_tcl_harness_suite() -> TclHarnessSuite {
                 id: "release_quick".to_owned(),
                 description: "Run release permutation on quick.test smoke script".to_owned(),
                 args: vec!["release".to_owned(), "quick.test".to_owned()],
+                category: TclConformanceCategory::CoreSql,
             },
             TclHarnessScenario {
                 id: "release_subset".to_owned(),
@@ -159,6 +224,32 @@ pub fn canonical_tcl_harness_suite() -> TclHarnessSuite {
                     "trans*.test".to_owned(),
                     "savepoint*.test".to_owned(),
                 ],
+                category: TclConformanceCategory::Transactions,
+            },
+            TclHarnessScenario {
+                id: "release_errors".to_owned(),
+                description: "Run release permutation on SQL error-handling tests".to_owned(),
+                args: vec!["release".to_owned(), "err*.test".to_owned()],
+                category: TclConformanceCategory::ErrorHandling,
+            },
+            TclHarnessScenario {
+                id: "release_extensions".to_owned(),
+                description: "Run extension-focused tests (expected unsupported today)".to_owned(),
+                args: vec![
+                    "release".to_owned(),
+                    "fts*.test".to_owned(),
+                    "rtree*.test".to_owned(),
+                    "json*.test".to_owned(),
+                ],
+                category: TclConformanceCategory::Extensions,
+            },
+            TclHarnessScenario {
+                id: "release_wal".to_owned(),
+                description:
+                    "Run WAL-focused tests (expected divergence from SQLite file-lock protocol)"
+                        .to_owned(),
+                args: vec!["release".to_owned(), "wal*.test".to_owned()],
+                category: TclConformanceCategory::Wal,
             },
         ],
     }
@@ -211,6 +302,7 @@ pub fn validate_tcl_harness_suite(suite: &TclHarnessSuite) -> Vec<String> {
     }
 
     let mut scenario_ids = BTreeSet::new();
+    let mut categories = BTreeSet::new();
     for scenario in &suite.scenarios {
         if scenario.id.trim().is_empty() {
             diagnostics.push("scenario_id_empty".to_owned());
@@ -223,6 +315,17 @@ pub fn validate_tcl_harness_suite(suite: &TclHarnessSuite) -> Vec<String> {
         }
         if !scenario_ids.insert(scenario.id.clone()) {
             diagnostics.push(format!("scenario_id_duplicate id={}", scenario.id));
+        }
+        categories.insert(scenario.category);
+    }
+
+    for required in [
+        TclConformanceCategory::CoreSql,
+        TclConformanceCategory::Transactions,
+        TclConformanceCategory::ErrorHandling,
+    ] {
+        if !categories.contains(&required) {
+            diagnostics.push(format!("category_missing required={required:?}"));
         }
     }
 
@@ -253,6 +356,136 @@ pub fn parse_testrunner_counts(output: &str) -> Option<TclRunnerCounts> {
             skipped_jobs,
         }),
         _ => None,
+    }
+}
+
+/// Parse unique failed test names from `testrunner.tcl` output.
+#[must_use]
+pub fn parse_failed_test_names(output: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut failed = Vec::new();
+    for line in output.lines() {
+        let Some(test_name) = line.trim().strip_prefix("FAILED:") else {
+            continue;
+        };
+        let test_name = test_name.trim();
+        if test_name.is_empty() {
+            continue;
+        }
+        let test_name = test_name.to_owned();
+        if seen.insert(test_name.clone()) {
+            failed.push(test_name);
+        }
+    }
+    failed
+}
+
+/// Deterministically classify a failed test as bug or deliberate divergence.
+#[must_use]
+pub fn classify_failed_test_name(test_name: &str) -> TclFailureRecord {
+    let lowered = test_name.to_ascii_lowercase();
+    let is_extension = ["fts", "rtree", "json", "icu", "session", "geopoly"]
+        .iter()
+        .any(|needle| lowered.contains(needle));
+    if is_extension {
+        return TclFailureRecord {
+            test_name: test_name.to_owned(),
+            classification: TclFailureClassification::DeliberateDivergence,
+            rationale: "unsupported_extension_feature".to_owned(),
+        };
+    }
+
+    let is_wal_or_locking = [
+        "wal",
+        "checkpoint",
+        "journal",
+        "locking",
+        "shm",
+        "sharedmem",
+        "busy",
+        "hotwal",
+        "recover",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle));
+    if is_wal_or_locking {
+        return TclFailureRecord {
+            test_name: test_name.to_owned(),
+            classification: TclFailureClassification::DeliberateDivergence,
+            rationale: "wal_locking_architecture_divergence".to_owned(),
+        };
+    }
+
+    TclFailureRecord {
+        test_name: test_name.to_owned(),
+        classification: TclFailureClassification::Bug,
+        rationale: "default_bug_bucket_requires_triage".to_owned(),
+    }
+}
+
+/// Build the conformance matrix artifact from scenario results.
+#[must_use]
+pub fn build_tcl_conformance_matrix(results: &[TclHarnessScenarioResult]) -> TclConformanceMatrix {
+    let mut tests_by_category: BTreeMap<TclConformanceCategory, (u64, u64)> = BTreeMap::new();
+    let mut overall_tests = 0_u64;
+    let mut overall_errors = 0_u64;
+    let mut failures = Vec::new();
+
+    for result in results {
+        let entry = tests_by_category.entry(result.category).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(result.tests);
+        entry.1 = entry.1.saturating_add(result.errors);
+        overall_tests = overall_tests.saturating_add(result.tests);
+        overall_errors = overall_errors.saturating_add(result.errors);
+        for failure in &result.failures {
+            failures.push(TclConformanceFailure {
+                scenario_id: result.scenario_id.clone(),
+                category: result.category,
+                test_name: failure.test_name.clone(),
+                classification: failure.classification,
+                rationale: failure.rationale.clone(),
+            });
+        }
+    }
+
+    let category_metrics = [
+        TclConformanceCategory::CoreSql,
+        TclConformanceCategory::Transactions,
+        TclConformanceCategory::ErrorHandling,
+        TclConformanceCategory::Extensions,
+        TclConformanceCategory::Wal,
+    ]
+    .into_iter()
+    .map(|category| {
+        let (tests, errors) = tests_by_category.get(&category).copied().unwrap_or((0, 0));
+        let pass_rate_pct = pass_rate_pct(tests, errors);
+        let target_pass_rate_pct = category_target_pass_rate(category);
+        let meets_target = match target_pass_rate_pct {
+            Some(target) if tests > 0 => Some(pass_rate_pct >= target),
+            _ => None,
+        };
+        let notes = category_notes(category, tests, meets_target);
+        TclConformanceCategoryMetric {
+            category,
+            tests,
+            errors,
+            pass_rate_pct,
+            target_pass_rate_pct,
+            meets_target,
+            notes,
+        }
+    })
+    .collect::<Vec<_>>();
+
+    let roadmap = conformance_roadmap(&category_metrics, &failures, overall_tests);
+
+    TclConformanceMatrix {
+        overall_tests,
+        overall_errors,
+        overall_pass_rate_pct: pass_rate_pct(overall_tests, overall_errors),
+        category_metrics,
+        failures,
+        roadmap,
     }
 }
 
@@ -297,6 +530,7 @@ pub fn execute_tcl_harness_suite(
         let result = match options.mode {
             TclExecutionMode::DryRun => TclHarnessScenarioResult {
                 scenario_id: scenario.id.clone(),
+                category: scenario.category,
                 command,
                 outcome: TclHarnessOutcome::Skipped,
                 reason: Some("dry_run_mode".to_owned()),
@@ -306,6 +540,7 @@ pub fn execute_tcl_harness_suite(
                 skipped_jobs: 0,
                 elapsed_ms: 0,
                 log_path: path_to_string(&log_path),
+                failures: Vec::new(),
             },
             TclExecutionMode::Execute => execute_scenario(
                 scenario,
@@ -333,6 +568,7 @@ pub fn execute_tcl_harness_suite(
             TclHarnessOutcome::Error => error_scenarios += 1,
         }
     }
+    let conformance_matrix = build_tcl_conformance_matrix(&results);
 
     Ok(TclHarnessExecutionSummary {
         bead_id: BEAD_ID.to_owned(),
@@ -349,6 +585,7 @@ pub fn execute_tcl_harness_suite(
         timeout_scenarios,
         error_scenarios,
         results,
+        conformance_matrix,
     })
 }
 
@@ -448,6 +685,115 @@ fn parse_skipped_jobs_line(line: &str) -> Option<u64> {
     line.split_whitespace().next()?.parse::<u64>().ok()
 }
 
+fn category_target_pass_rate(category: TclConformanceCategory) -> Option<f64> {
+    match category {
+        TclConformanceCategory::CoreSql => Some(95.0),
+        TclConformanceCategory::Transactions => Some(90.0),
+        TclConformanceCategory::ErrorHandling => Some(90.0),
+        TclConformanceCategory::Extensions | TclConformanceCategory::Wal => None,
+    }
+}
+
+fn category_notes(
+    category: TclConformanceCategory,
+    tests: u64,
+    meets_target: Option<bool>,
+) -> String {
+    if tests == 0 {
+        return "no_executed_tests_collected_for_category".to_owned();
+    }
+    match category {
+        TclConformanceCategory::Extensions => {
+            "extension_lanes_expected_to_skip_until_feature_support_lands".to_owned()
+        }
+        TclConformanceCategory::Wal => {
+            "wal_lane_expected_to_diverge_due_to_mvcc_file_locking_strategy".to_owned()
+        }
+        TclConformanceCategory::CoreSql
+        | TclConformanceCategory::Transactions
+        | TclConformanceCategory::ErrorHandling => {
+            if meets_target == Some(true) {
+                "target_met".to_owned()
+            } else {
+                "below_target".to_owned()
+            }
+        }
+    }
+}
+
+fn conformance_roadmap(
+    category_metrics: &[TclConformanceCategoryMetric],
+    failures: &[TclConformanceFailure],
+    overall_tests: u64,
+) -> Vec<String> {
+    let bug_failures = failures
+        .iter()
+        .filter(|failure| failure.classification == TclFailureClassification::Bug)
+        .count();
+    let deliberate_failures = failures
+        .iter()
+        .filter(|failure| failure.classification == TclFailureClassification::DeliberateDivergence)
+        .count();
+
+    let mut roadmap = Vec::new();
+    if overall_tests == 0 {
+        roadmap.push(
+            "build_and_wire_sqlite_c_api_surface (sqlite3_open/prepare/step/finalize) for real TCL execution"
+                .to_owned(),
+        );
+        roadmap.push(
+            "produce_frankensqlite_linked_testfixture_and_run_testrunner_in_execute_mode"
+                .to_owned(),
+        );
+    }
+
+    if bug_failures > 0 {
+        roadmap.push(format!(
+            "triage_and_fix_bug_bucket_failures count={bug_failures} with reproduction scripts"
+        ));
+    }
+    if deliberate_failures > 0 {
+        roadmap.push(format!(
+            "document_deliberate_divergences count={deliberate_failures} in compatibility matrix"
+        ));
+    }
+
+    for metric in category_metrics {
+        if metric.tests == 0 {
+            continue;
+        }
+        if metric.target_pass_rate_pct.is_some() && metric.meets_target == Some(false) {
+            roadmap.push(format!(
+                "raise_{:?}_pass_rate from {:.2}% to target {:.2}%",
+                metric.category,
+                metric.pass_rate_pct,
+                metric.target_pass_rate_pct.unwrap_or(0.0)
+            ));
+        }
+    }
+
+    if roadmap.is_empty() {
+        roadmap
+            .push("keep_weekly_ci_conformance_gate_and_alert_on_pass_count_regression".to_owned());
+    }
+    roadmap
+}
+
+fn pass_rate_pct(tests: u64, errors: u64) -> f64 {
+    if tests == 0 {
+        return 0.0;
+    }
+    let passed = tests.saturating_sub(errors);
+    (u64_to_f64_saturating(passed) * 100.0) / u64_to_f64_saturating(tests)
+}
+
+fn u64_to_f64_saturating(value: u64) -> f64 {
+    match u32::try_from(value) {
+        Ok(converted) => f64::from(converted),
+        Err(_) => f64::from(u32::MAX),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpawnScenarioError {
     TclshNotFound,
@@ -479,6 +825,7 @@ fn execute_scenario(
             None,
             0,
             log_path,
+            Vec::new(),
         ));
     }
     if !sqlite_root.is_dir() {
@@ -494,6 +841,7 @@ fn execute_scenario(
             None,
             0,
             log_path,
+            Vec::new(),
         ));
     }
 
@@ -509,6 +857,7 @@ fn execute_scenario(
                 None,
                 0,
                 log_path,
+                Vec::new(),
             ));
         }
         Err(SpawnScenarioError::Io) => {
@@ -521,6 +870,7 @@ fn execute_scenario(
                 None,
                 0,
                 log_path,
+                Vec::new(),
             ));
         }
     };
@@ -537,12 +887,17 @@ fn execute_scenario(
                 None,
                 0,
                 log_path,
+                Vec::new(),
             ));
         }
     };
 
     let log_text = fs::read_to_string(log_path).unwrap_or_default();
     let parsed_counts = parse_testrunner_counts(&log_text);
+    let failures = parse_failed_test_names(&log_text)
+        .into_iter()
+        .map(|test_name| classify_failed_test_name(&test_name))
+        .collect::<Vec<_>>();
     let (outcome, reason) = classify_process_result(
         process_status.timed_out,
         process_status.exit_code,
@@ -558,6 +913,7 @@ fn execute_scenario(
         parsed_counts,
         process_status.elapsed_ms,
         log_path,
+        failures,
     ))
 }
 
@@ -672,6 +1028,7 @@ fn build_scenario_result(
     parsed_counts: Option<TclRunnerCounts>,
     elapsed_ms: u64,
     log_path: &Path,
+    failures: Vec<TclFailureRecord>,
 ) -> TclHarnessScenarioResult {
     let counts = parsed_counts.unwrap_or(TclRunnerCounts {
         errors: 0,
@@ -680,6 +1037,7 @@ fn build_scenario_result(
     });
     TclHarnessScenarioResult {
         scenario_id: scenario.id.clone(),
+        category: scenario.category,
         command: command.to_owned(),
         outcome,
         reason,
@@ -689,6 +1047,7 @@ fn build_scenario_result(
         skipped_jobs: counts.skipped_jobs,
         elapsed_ms,
         log_path: path_to_string(log_path),
+        failures,
     }
 }
 

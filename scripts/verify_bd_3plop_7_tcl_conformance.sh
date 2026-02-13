@@ -76,6 +76,14 @@ SCENARIO_TOTAL="$(jq -r '.total_scenarios // 0' "$SUMMARY_PATH" 2>/dev/null || e
 SCENARIO_SKIPPED="$(jq -r '.skipped_scenarios // 0' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
 SCENARIO_FAILED="$(jq -r '.failed_scenarios // 0' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
 SCENARIO_ERRORS="$(jq -r '.error_scenarios // 0' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
+OVERALL_TESTS="$(jq -r '.conformance_matrix.overall_tests // 0' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
+OVERALL_ERRORS="$(jq -r '.conformance_matrix.overall_errors // 0' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
+OVERALL_PASS_RATE="$(jq -r '.conformance_matrix.overall_pass_rate_pct // 0' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
+CORE_PASS_RATE="$(jq -r '(.conformance_matrix.category_metrics[] | select(.category == "core_sql") | .pass_rate_pct) // 0' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
+TRANSACTION_PASS_RATE="$(jq -r '(.conformance_matrix.category_metrics[] | select(.category == "transactions") | .pass_rate_pct) // 0' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
+ERROR_PASS_RATE="$(jq -r '(.conformance_matrix.category_metrics[] | select(.category == "error_handling") | .pass_rate_pct) // 0' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
+BUG_FAILURES="$(jq -r '[.conformance_matrix.failures[]? | select(.classification == "bug")] | length' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
+DIVERGENCE_FAILURES="$(jq -r '[.conformance_matrix.failures[]? | select(.classification == "deliberate_divergence")] | length' "$SUMMARY_PATH" 2>/dev/null || echo 0)"
 
 if [[ -f "$SUITE_PATH" ]]; then
     SUITE_HASH="$(sha256sum "$SUITE_PATH" | awk '{print $1}')"
@@ -108,7 +116,15 @@ if [[ "$JSON_OUTPUT" == "true" ]]; then
   "scenario_total": $SCENARIO_TOTAL,
   "scenario_skipped": $SCENARIO_SKIPPED,
   "scenario_failed": $SCENARIO_FAILED,
-  "scenario_errors": $SCENARIO_ERRORS
+  "scenario_errors": $SCENARIO_ERRORS,
+  "overall_tests": $OVERALL_TESTS,
+  "overall_errors": $OVERALL_ERRORS,
+  "overall_pass_rate_pct": $OVERALL_PASS_RATE,
+  "core_sql_pass_rate_pct": $CORE_PASS_RATE,
+  "transaction_pass_rate_pct": $TRANSACTION_PASS_RATE,
+  "error_handling_pass_rate_pct": $ERROR_PASS_RATE,
+  "bug_failure_count": $BUG_FAILURES,
+  "deliberate_divergence_count": $DIVERGENCE_FAILURES
 }
 ENDJSON
 else
@@ -127,6 +143,14 @@ else
     echo "Scenarios skipped:$SCENARIO_SKIPPED"
     echo "Scenarios failed: $SCENARIO_FAILED"
     echo "Scenarios errors: $SCENARIO_ERRORS"
+    echo "Overall tests:    $OVERALL_TESTS"
+    echo "Overall errors:   $OVERALL_ERRORS"
+    echo "Overall pass %:   $OVERALL_PASS_RATE"
+    echo "Core SQL pass %:  $CORE_PASS_RATE"
+    echo "Txn pass %:       $TRANSACTION_PASS_RATE"
+    echo "Error pass %:     $ERROR_PASS_RATE"
+    echo "Bug failures:     $BUG_FAILURES"
+    echo "Divergences:      $DIVERGENCE_FAILURES"
 fi
 
 [[ "$RESULT" == "pass" ]]
