@@ -11,6 +11,10 @@
 //! `checkpoint_interval` symbols (§4.12.1).  If the context is cancelled
 //! the operation returns `FrankenError::Abort`.
 
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{ObjectId, cx::Cx};
 use tracing::{debug, error, info, warn};
@@ -19,6 +23,134 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::decode_proofs::EcsDecodeProof;
 
 const BEAD_ID: &str = "bd-1hi.5";
+
+// ---------------------------------------------------------------------------
+// RaptorQ Metrics (bd-3bw.1)
+// ---------------------------------------------------------------------------
+
+/// Global atomic counters for RaptorQ encode/decode operations.
+///
+/// These metrics track cumulative byte and symbol counts for observability
+/// and capacity planning.  All counters are monotonically increasing and
+/// use `Relaxed` ordering (sufficient for diagnostic counters).
+pub struct RaptorQMetrics {
+    /// Total bytes encoded via `encode_pages()`.
+    pub encoded_bytes_total: AtomicU64,
+    /// Total repair symbols generated across all encode calls.
+    pub repair_symbols_generated_total: AtomicU64,
+    /// Total bytes successfully decoded via `decode_pages()`.
+    pub decoded_bytes_total: AtomicU64,
+    /// Total encode operations.
+    pub encode_ops: AtomicU64,
+    /// Total decode operations (success + failure).
+    pub decode_ops: AtomicU64,
+    /// Total decode failures.
+    pub decode_failures: AtomicU64,
+}
+
+impl RaptorQMetrics {
+    /// Create a new zeroed metrics instance.  `const` so it can back a
+    /// `static`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            encoded_bytes_total: AtomicU64::new(0),
+            repair_symbols_generated_total: AtomicU64::new(0),
+            decoded_bytes_total: AtomicU64::new(0),
+            encode_ops: AtomicU64::new(0),
+            decode_ops: AtomicU64::new(0),
+            decode_failures: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a successful encode operation.
+    pub fn record_encode(&self, encoded_bytes: u64, repair_symbols: u64) {
+        self.encoded_bytes_total
+            .fetch_add(encoded_bytes, Ordering::Relaxed);
+        self.repair_symbols_generated_total
+            .fetch_add(repair_symbols, Ordering::Relaxed);
+        self.encode_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a successful decode operation.
+    pub fn record_decode_success(&self, decoded_bytes: u64) {
+        self.decoded_bytes_total
+            .fetch_add(decoded_bytes, Ordering::Relaxed);
+        self.decode_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a failed decode operation.
+    pub fn record_decode_failure(&self) {
+        self.decode_ops.fetch_add(1, Ordering::Relaxed);
+        self.decode_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take a point-in-time snapshot of all counters.
+    #[must_use]
+    pub fn snapshot(&self) -> RaptorQMetricsSnapshot {
+        RaptorQMetricsSnapshot {
+            encoded_bytes_total: self.encoded_bytes_total.load(Ordering::Relaxed),
+            repair_symbols_generated_total: self
+                .repair_symbols_generated_total
+                .load(Ordering::Relaxed),
+            decoded_bytes_total: self.decoded_bytes_total.load(Ordering::Relaxed),
+            encode_ops: self.encode_ops.load(Ordering::Relaxed),
+            decode_ops: self.decode_ops.load(Ordering::Relaxed),
+            decode_failures: self.decode_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero (useful for tests).
+    pub fn reset(&self) {
+        self.encoded_bytes_total.store(0, Ordering::Relaxed);
+        self.repair_symbols_generated_total
+            .store(0, Ordering::Relaxed);
+        self.decoded_bytes_total.store(0, Ordering::Relaxed);
+        self.encode_ops.store(0, Ordering::Relaxed);
+        self.decode_ops.store(0, Ordering::Relaxed);
+        self.decode_failures.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for RaptorQMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global RaptorQ metrics singleton.
+pub static GLOBAL_RAPTORQ_METRICS: RaptorQMetrics = RaptorQMetrics::new();
+
+/// Point-in-time snapshot of [`RaptorQMetrics`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaptorQMetricsSnapshot {
+    pub encoded_bytes_total: u64,
+    pub repair_symbols_generated_total: u64,
+    pub decoded_bytes_total: u64,
+    pub encode_ops: u64,
+    pub decode_ops: u64,
+    pub decode_failures: u64,
+}
+
+impl fmt::Display for RaptorQMetricsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "raptorq: encoded={} bytes ({} ops, {} repair syms), decoded={} bytes ({} ops, {} failures)",
+            self.encoded_bytes_total,
+            self.encode_ops,
+            self.repair_symbols_generated_total,
+            self.decoded_bytes_total,
+            self.decode_ops,
+            self.decode_failures,
+        )
+    }
+}
+
+/// Convert a `Duration` to microseconds, saturating at `u64::MAX`.
+fn duration_us_saturating(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
 
 // ---------------------------------------------------------------------------
 // Pipeline Configuration (§3.3)
@@ -346,6 +478,8 @@ impl<C: SymbolCodec> RaptorQPageEncoder<C> {
     /// Encode page data and write symbols through the sink.
     ///
     /// `cx.checkpoint()` is called every `checkpoint_interval` symbols.
+    /// Emits a `raptorq_encode` tracing span (bd-3bw.1) and updates
+    /// [`GLOBAL_RAPTORQ_METRICS`].
     #[allow(clippy::cast_possible_truncation)]
     pub fn encode_pages(
         &self,
@@ -356,6 +490,7 @@ impl<C: SymbolCodec> RaptorQPageEncoder<C> {
         cx.checkpoint().map_err(|_| FrankenError::Abort)?;
 
         let symbol_size = self.config.symbol_size;
+        let t0 = Instant::now();
         debug!(
             bead_id = BEAD_ID,
             data_len = page_data.len(),
@@ -392,13 +527,32 @@ impl<C: SymbolCodec> RaptorQPageEncoder<C> {
             symbol_size,
         };
 
+        let encode_time_us = duration_us_saturating(t0.elapsed());
+
+        // bd-3bw.1: structured tracing span with required fields.
+        let span = tracing::span!(
+            tracing::Level::DEBUG,
+            "raptorq_encode",
+            source_symbols = outcome.source_count,
+            repair_symbols = outcome.repair_count,
+            encode_time_us,
+            encoded_bytes = page_data.len(),
+            symbol_size = outcome.symbol_size,
+        );
+        let _guard = span.enter();
+
         info!(
             bead_id = BEAD_ID,
             source_count = outcome.source_count,
             repair_count = outcome.repair_count,
             symbol_size = outcome.symbol_size,
+            encode_time_us,
             "page encode complete"
         );
+
+        // bd-3bw.1: update global metric counters.
+        GLOBAL_RAPTORQ_METRICS
+            .record_encode(page_data.len() as u64, u64::from(outcome.repair_count));
 
         Ok(outcome)
     }
@@ -436,7 +590,9 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
     /// Decode pages from the source.
     ///
     /// Reads available symbols, delegates to the codec, and returns the
-    /// outcome.  Cx checkpoint is called at read boundaries.
+    /// outcome.  Cx checkpoint is called at read boundaries.  Emits a
+    /// `raptorq_decode` tracing span (bd-3bw.1) and updates
+    /// [`GLOBAL_RAPTORQ_METRICS`].
     #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn decode_pages(
         &self,
@@ -445,6 +601,7 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
         k_source: u32,
     ) -> Result<DecodeOutcome> {
         cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        let t0 = Instant::now();
 
         let available = source.available_count();
         debug!(
@@ -524,6 +681,23 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
                         "fragile recovery: decoded with minimum symbol count"
                     );
                 }
+                let decoded_len = data.len() as u64;
+                let decode_time_us = duration_us_saturating(t0.elapsed());
+
+                // bd-3bw.1: structured tracing span for successful decode.
+                let span = tracing::span!(
+                    tracing::Level::DEBUG,
+                    "raptorq_decode",
+                    k_source,
+                    symbols_used,
+                    decoded_bytes = decoded_len,
+                    decode_time_us,
+                    ok = true,
+                );
+                let _guard = span.enter();
+
+                GLOBAL_RAPTORQ_METRICS.record_decode_success(decoded_len);
+
                 Ok(DecodeOutcome::Success(DecodeSuccess {
                     data,
                     symbols_used,
@@ -560,6 +734,20 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
                 } else {
                     None
                 };
+                let decode_time_us = duration_us_saturating(t0.elapsed());
+
+                // bd-3bw.1: structured tracing span for failed decode.
+                let span = tracing::span!(
+                    tracing::Level::DEBUG,
+                    "raptorq_decode",
+                    k_source,
+                    symbols_received,
+                    k_required,
+                    decode_time_us,
+                    ok = false,
+                );
+                let _guard = span.enter();
+
                 error!(
                     bead_id = BEAD_ID,
                     k_source,
@@ -568,6 +756,9 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
                     reason = ?reason,
                     "page decode failed"
                 );
+
+                GLOBAL_RAPTORQ_METRICS.record_decode_failure();
+
                 Ok(DecodeOutcome::Failure(DecodeFailure {
                     reason,
                     symbols_received,
@@ -1732,5 +1923,109 @@ mod tests {
                 f.reason
             ),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // bd-3bw.1: RaptorQ Metrics Tests
+    //
+    // Unit tests use a local RaptorQMetrics instance to avoid
+    // interference from parallel tests sharing the global singleton.
+    // Integration test verifies the global is wired up.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn metrics_struct_encode_counters() {
+        let m = RaptorQMetrics::new();
+        m.record_encode(2048, 3);
+        m.record_encode(4096, 5);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.encode_ops, 2);
+        assert_eq!(snap.encoded_bytes_total, 6144);
+        assert_eq!(snap.repair_symbols_generated_total, 8);
+        assert_eq!(snap.decode_ops, 0);
+    }
+
+    #[test]
+    fn metrics_struct_decode_counters() {
+        let m = RaptorQMetrics::new();
+        m.record_decode_success(4096);
+        m.record_decode_success(2048);
+        m.record_decode_failure();
+
+        let snap = m.snapshot();
+        assert_eq!(snap.decode_ops, 3);
+        assert_eq!(snap.decoded_bytes_total, 6144);
+        assert_eq!(snap.decode_failures, 1);
+        assert_eq!(snap.encode_ops, 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_display() {
+        let m = RaptorQMetrics::new();
+        m.record_encode(4096, 2);
+        m.record_decode_success(4096);
+        let snap = m.snapshot();
+        let display = format!("{snap}");
+        assert!(display.contains("4096"), "encoded bytes in display");
+        assert!(display.contains("2 repair"), "repair syms in display");
+    }
+
+    #[test]
+    fn metrics_reset() {
+        let m = RaptorQMetrics::new();
+        m.record_encode(1000, 5);
+        m.record_decode_success(500);
+        m.record_decode_failure();
+        m.reset();
+        let snap = m.snapshot();
+        assert_eq!(snap.encoded_bytes_total, 0);
+        assert_eq!(snap.repair_symbols_generated_total, 0);
+        assert_eq!(snap.encode_ops, 0);
+        assert_eq!(snap.decode_ops, 0);
+        assert_eq!(snap.decode_failures, 0);
+        assert_eq!(snap.decoded_bytes_total, 0);
+    }
+
+    #[test]
+    fn metrics_global_wired_to_encode_decode() {
+        // Verify that encode_pages / decode_pages bump the global.
+        // We use >= on deltas because other parallel tests also touch
+        // the global singleton.
+        let before = GLOBAL_RAPTORQ_METRICS.snapshot();
+
+        let config = default_config();
+        let encoder =
+            RaptorQPageEncoder::new(config.clone(), default_codec()).expect("encoder build");
+        let decoder =
+            RaptorQPageDecoder::new(config.clone(), default_codec()).expect("decoder build");
+        let cx = test_cx();
+        let k = 4_usize;
+        let data = deterministic_page_data(k, config.symbol_size as usize, 0xF00D);
+
+        let mut sink = VecPageSink::new();
+        let outcome = encoder.encode_pages(&cx, &data, &mut sink).expect("encode");
+        let mut source = VecPageSource::from_sink(&sink);
+        let _decode = decoder
+            .decode_pages(&cx, &mut source, outcome.source_count)
+            .expect("decode");
+
+        let after = GLOBAL_RAPTORQ_METRICS.snapshot();
+        assert!(
+            after.encode_ops > before.encode_ops,
+            "global encode_ops should have increased"
+        );
+        assert!(
+            after.encoded_bytes_total > before.encoded_bytes_total,
+            "global encoded_bytes should have increased"
+        );
+        assert!(
+            after.decode_ops > before.decode_ops,
+            "global decode_ops should have increased"
+        );
+        assert!(
+            after.decoded_bytes_total > before.decoded_bytes_total,
+            "global decoded_bytes should have increased"
+        );
     }
 }
