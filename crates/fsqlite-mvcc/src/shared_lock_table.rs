@@ -65,16 +65,48 @@ impl PageLockEntry {
 /// One of the two physical hash tables in the `SharedPageLockTable`.
 struct LockTableInstance {
     entries: Vec<PageLockEntry>,
+    /// Atomic occupancy counter - tracks slots where `page_number != 0`.
+    ///
+    /// Maintained atomically on insert to avoid O(capacity) full-table scans
+    /// on every lock acquisition. This is a critical hot-path optimization:
+    /// reduces load-factor check from O(1M) to O(1).
+    ///
+    /// Invariant: `occupied_count_atomic ∈ [actual - ε, actual + ε]` where
+    /// ε is bounded by concurrent in-flight operations (typically < 100).
+    /// For the 70% load factor check, this slack is negligible.
+    occupied_count_atomic: AtomicU32,
 }
 
 impl LockTableInstance {
     fn new(capacity: u32) -> Self {
         let entries: Vec<PageLockEntry> = (0..capacity).map(|_| PageLockEntry::new()).collect();
-        Self { entries }
+        Self {
+            entries,
+            occupied_count_atomic: AtomicU32::new(0),
+        }
     }
 
-    /// Count entries where `page_number != 0` (occupied slots).
+    /// Get the approximate occupied count in O(1) time.
+    ///
+    /// Uses the atomic counter maintained during insert operations.
+    /// This avoids the O(capacity) full-table scan that was previously
+    /// performed on every lock acquisition.
+    #[inline]
     fn occupied_count(&self) -> u32 {
+        self.occupied_count_atomic.load(Ordering::Relaxed)
+    }
+
+    /// Increment occupied count when a new slot is claimed.
+    #[inline]
+    fn increment_occupied(&self) {
+        self.occupied_count_atomic.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Full-table scan for occupied count (expensive, use sparingly).
+    ///
+    /// Only needed for rebuild/diagnostic operations, not hot path.
+    #[allow(dead_code)]
+    fn occupied_count_full_scan(&self) -> u32 {
         let mut count = 0_u32;
         for entry in &self.entries {
             if entry.page_number.load(Ordering::Relaxed) != 0 {
@@ -102,7 +134,7 @@ impl LockTableInstance {
             .all(|e| e.owner_txn.load(Ordering::Acquire) == 0)
     }
 
-    /// Clear all entries (set page_number=0, owner_txn=0).
+    /// Clear all entries (set page_number=0, owner_txn=0) and reset counter.
     ///
     /// SAFETY: Must only be called when the table is lock-quiescent.
     fn clear_all(&self) {
@@ -110,6 +142,8 @@ impl LockTableInstance {
             entry.page_number.store(0, Ordering::Release);
             entry.owner_txn.store(0, Ordering::Release);
         }
+        // Reset the occupancy counter to match cleared state.
+        self.occupied_count_atomic.store(0, Ordering::Release);
     }
 
     /// Release all locks held by a specific txn (crash cleanup, §5.6.3).
@@ -357,6 +391,10 @@ impl SharedPageLockTable {
                     // have inserted our page_number here.
                     continue;
                 }
+
+                // Slot successfully claimed — increment occupied counter.
+                // This maintains the O(1) occupancy tracking invariant.
+                active.increment_occupied();
 
                 // Slot claimed. Now CAS owner_txn from 0 → txn_id.
                 // MUST NOT use store() here (§5.6.3).
