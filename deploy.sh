@@ -9,6 +9,49 @@ MIRROR_DOMAINS=("https://www.frankensqlite.com" "https://frankensqlite-spec-evol
 SQLITE_FILE="spec_evolution_v1.sqlite3"
 EXPECTED_DB_URL="$CANONICAL_DOMAIN/$SQLITE_FILE"
 PROJECT_NAME="frankensqlite-spec-evolution"
+DEPLOY_BRANCH="main"
+HEALTH_PATH="healthz"
+HEALTH_JSON_PATH="healthz.json"
+
+build_health_payload() {
+    local generated_at
+    local db_magic
+    local db_sha256
+    local schema_version
+    local dataset_hash
+    local db_hash
+
+    generated_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    db_magic=$(head -c 15 "$SQLITE_FILE")
+    db_sha256=$(sha256sum "$SQLITE_FILE" | awk '{print $1}')
+    schema_version=$(jq -r '.schema_version' "${SQLITE_FILE}.config.json")
+    dataset_hash=$(jq -r '.dataset_hash' "${SQLITE_FILE}.config.json")
+    db_hash=$(jq -r '.hash' "${SQLITE_FILE}.config.json")
+
+    jq -n \
+        --arg status "ok" \
+        --arg generated_at "$generated_at" \
+        --arg db_file "$SQLITE_FILE" \
+        --arg db_magic "$db_magic" \
+        --arg db_sha256 "$db_sha256" \
+        --arg db_hash "$db_hash" \
+        --arg dataset_hash "$dataset_hash" \
+        --arg expected_db_url "$EXPECTED_DB_URL" \
+        --argjson schema_version "$schema_version" \
+        '{
+            status: $status,
+            generated_at: $generated_at,
+            expected_db_url: $expected_db_url,
+            db: {
+                file: $db_file,
+                magic: $db_magic,
+                sha256: $db_sha256,
+                hash: $db_hash,
+                dataset_hash: $dataset_hash,
+                schema_version: $schema_version
+            }
+        }'
+}
 
 # Ensure dist exists and is populated
 mkdir -p dist
@@ -22,10 +65,13 @@ cp frankensqlite_illustration.webp dist/
 cp frankensqlite_diagram.webp dist/
 cp _headers dist/
 cp _routes.json dist/
+health_payload=$(build_health_payload)
+printf '%s\n' "$health_payload" > "dist/$HEALTH_JSON_PATH"
+printf '%s\n' "$health_payload" > "dist/$HEALTH_PATH"
 
 # Deploy to Cloudflare Pages
 echo "Deploying to Cloudflare Pages..."
-npx wrangler pages deploy dist --project-name "$PROJECT_NAME" --commit-dirty=true
+npx wrangler pages deploy dist --project-name "$PROJECT_NAME" --branch "$DEPLOY_BRANCH" --commit-dirty=true
 
 # Post-deployment verification
 echo ""
@@ -92,6 +138,50 @@ extract_db_url_from_html() {
 extract_const_string() {
     local key="$1"
     sed -n "s/^[[:space:]]*const $key = \"\\([^\"]*\\)\";.*/\\1/p" | head -n 1
+}
+
+check_healthz_once() {
+    local url="$1"
+    local body
+    local status
+    local magic
+    local schema_version
+    local expected_db_url
+
+    body=$(curl -fsSL "$url" || true)
+    if [[ -z "$body" ]]; then
+        echo "  WARN: $url -> empty response"
+        return 1
+    fi
+
+    status=$(printf '%s' "$body" | jq -r '.status // empty')
+    magic=$(printf '%s' "$body" | jq -r '.db.magic // empty')
+    schema_version=$(printf '%s' "$body" | jq -r '.db.schema_version // empty')
+    expected_db_url=$(printf '%s' "$body" | jq -r '.expected_db_url // empty')
+
+    if [[ "$status" == "ok" ]] && [[ "$magic" == "SQLite format 3" ]] && [[ "$schema_version" =~ ^[0-9]+$ ]] && [[ "$expected_db_url" == "$EXPECTED_DB_URL" ]]; then
+        return 0
+    fi
+
+    echo "  WARN: $url -> status=$status magic='$magic' schema_version='$schema_version' expected_db_url='$expected_db_url'"
+    return 1
+}
+
+verify_healthz() {
+    local url="$1"
+    local max_retries=5
+    local retry=0
+
+    while [ "$retry" -lt "$max_retries" ]; do
+        echo "  Checking $url (attempt $((retry + 1))/$max_retries)..."
+        if check_healthz_once "$url"; then
+            echo "  OK: healthz contract verified"
+            return 0
+        fi
+        retry=$((retry + 1))
+        sleep 3
+    done
+    return 1
 }
 
 resolve_db_url() {
@@ -178,12 +268,18 @@ for origin in "$CANONICAL_DOMAIN" "${MIRROR_DOMAINS[@]}"; do
     if ! verify_viewer_contract "$origin"; then
         verification_failed=1
     fi
+    if ! verify_healthz "$origin/$HEALTH_PATH"; then
+        verification_failed=1
+    fi
+    if ! verify_healthz "$origin/$HEALTH_JSON_PATH"; then
+        verification_failed=1
+    fi
 done
 
 if [ "$verification_failed" -ne 0 ]; then
     echo ""
     echo "DEPLOYMENT VERIFICATION FAILED!"
-    echo "At least one public host serves a viewer that does not resolve to a valid canonical SQLite URL."
+    echo "At least one public host failed viewer or healthz contract verification."
     exit 1
 fi
 

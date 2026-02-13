@@ -4,6 +4,14 @@
 /spec_evolution.html
   Cache-Control: no-cache
 
+/healthz
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store
+
+/healthz.json
+  Content-Type: application/json; charset=utf-8
+  Cache-Control: no-store
+
 /*.sqlite3
   Content-Type: application/octet-stream
   X-Content-Type-Options: nosniff
