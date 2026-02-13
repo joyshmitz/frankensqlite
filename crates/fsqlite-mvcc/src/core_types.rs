@@ -330,7 +330,10 @@ impl InProcessPageLockTable {
                         return Ok(()); // already held by this txn in draining table
                     }
                     crate::observability::emit_page_lock_contention(
-                        &self.observer, page, txn, holder,
+                        &self.observer,
+                        page,
+                        txn,
+                        holder,
                     );
                     return Err(holder);
                 }
@@ -344,9 +347,7 @@ impl InProcessPageLockTable {
             if holder == txn {
                 return Ok(()); // already held by this txn
             }
-            crate::observability::emit_page_lock_contention(
-                &self.observer, page, txn, holder,
-            );
+            crate::observability::emit_page_lock_contention(&self.observer, page, txn, holder);
             return Err(holder);
         }
         map.insert(page, txn);
@@ -3879,5 +3880,268 @@ mod tests {
         );
         assert_eq!(result.active_slots, 1);
         assert_eq!(result.sentinel_blockers, 0);
+    }
+
+    // ===================================================================
+    // bd-t6sv2.1: Conflict observer integration tests (§5.1)
+    // ===================================================================
+
+    const BEAD_T6SV2_1: &str = "bd-t6sv2.1";
+
+    #[test]
+    fn test_lock_table_observer_emits_on_contention() {
+        // bd-t6sv2.1: InProcessPageLockTable emits PageLockContention
+        // when a second transaction tries to acquire a page already held.
+        let obs = std::sync::Arc::new(fsqlite_observability::MetricsObserver::new(100));
+        let table = InProcessPageLockTable::with_observer(
+            obs.clone() as std::sync::Arc<dyn fsqlite_observability::ConflictObserver>
+        );
+        let page = PageNumber::new(42).unwrap();
+        let txn_a = TxnId::new(1).unwrap();
+        let txn_b = TxnId::new(2).unwrap();
+
+        // txn_a acquires — no event.
+        table.try_acquire(page, txn_a).unwrap();
+        assert_eq!(
+            obs.metrics()
+                .page_contentions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "bead_id={BEAD_T6SV2_1} case=no_event_on_clean_acquire"
+        );
+
+        // txn_b tries same page — contention event emitted.
+        let err = table.try_acquire(page, txn_b).unwrap_err();
+        assert_eq!(err, txn_a);
+        assert_eq!(
+            obs.metrics()
+                .page_contentions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "bead_id={BEAD_T6SV2_1} case=contention_event_emitted"
+        );
+        assert_eq!(
+            obs.metrics()
+                .conflicts_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "bead_id={BEAD_T6SV2_1} case=conflicts_total_incremented"
+        );
+
+        // Verify the ring buffer has the right event.
+        let events = obs.log().snapshot();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(
+                &events[0],
+                fsqlite_observability::ConflictEvent::PageLockContention {
+                    page: p,
+                    requester,
+                    holder,
+                    ..
+                } if p.get() == 42 && requester.get() == 2 && holder.get() == 1
+            ),
+            "bead_id={BEAD_T6SV2_1} case=event_fields_correct"
+        );
+    }
+
+    #[test]
+    fn test_lock_table_observer_no_event_on_reacquire() {
+        // bd-t6sv2.1: Re-acquiring a lock by the same txn should NOT emit.
+        let obs = std::sync::Arc::new(fsqlite_observability::MetricsObserver::new(100));
+        let table = InProcessPageLockTable::with_observer(
+            obs.clone() as std::sync::Arc<dyn fsqlite_observability::ConflictObserver>
+        );
+        let page = PageNumber::new(7).unwrap();
+        let txn = TxnId::new(1).unwrap();
+
+        table.try_acquire(page, txn).unwrap();
+        table.try_acquire(page, txn).unwrap(); // idempotent re-acquire
+
+        assert_eq!(
+            obs.metrics()
+                .page_contentions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "bead_id={BEAD_T6SV2_1} case=no_event_on_reacquire"
+        );
+        assert!(obs.log().is_empty());
+    }
+
+    #[test]
+    fn test_lock_table_observer_multiple_contentions() {
+        // bd-t6sv2.1: Multiple contention events from different txns on
+        // different pages accumulate correctly.
+        let obs = std::sync::Arc::new(fsqlite_observability::MetricsObserver::new(100));
+        let table = InProcessPageLockTable::with_observer(
+            obs.clone() as std::sync::Arc<dyn fsqlite_observability::ConflictObserver>
+        );
+
+        let txn_a = TxnId::new(1).unwrap();
+        let txn_b = TxnId::new(2).unwrap();
+        let txn_c = TxnId::new(3).unwrap();
+
+        // txn_a holds pages 10 and 20.
+        table
+            .try_acquire(PageNumber::new(10).unwrap(), txn_a)
+            .unwrap();
+        table
+            .try_acquire(PageNumber::new(20).unwrap(), txn_a)
+            .unwrap();
+
+        // txn_b contends on page 10.
+        assert!(
+            table
+                .try_acquire(PageNumber::new(10).unwrap(), txn_b)
+                .is_err()
+        );
+        // txn_c contends on page 10.
+        assert!(
+            table
+                .try_acquire(PageNumber::new(10).unwrap(), txn_c)
+                .is_err()
+        );
+        // txn_b contends on page 20.
+        assert!(
+            table
+                .try_acquire(PageNumber::new(20).unwrap(), txn_b)
+                .is_err()
+        );
+
+        assert_eq!(
+            obs.metrics()
+                .page_contentions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "bead_id={BEAD_T6SV2_1} case=multiple_contentions_counted"
+        );
+
+        // Hotspot tracking: page 10 has 2 contentions, page 20 has 1.
+        let snap = obs.metrics().snapshot();
+        let hotspots = &snap.top_hotspots;
+        assert!(hotspots.len() >= 2);
+        // Page 10 should be the hottest.
+        assert_eq!(hotspots[0].0, PageNumber::new(10).unwrap());
+        assert_eq!(hotspots[0].1, 2);
+    }
+
+    #[test]
+    fn test_lock_table_no_observer_zero_overhead() {
+        // bd-t6sv2.1: When no observer is set, contention still works
+        // correctly but no events are recorded anywhere.
+        let table = InProcessPageLockTable::new();
+        let page = PageNumber::new(1).unwrap();
+        let txn_a = TxnId::new(1).unwrap();
+        let txn_b = TxnId::new(2).unwrap();
+
+        table.try_acquire(page, txn_a).unwrap();
+        let err = table.try_acquire(page, txn_b).unwrap_err();
+        assert_eq!(
+            err, txn_a,
+            "bead_id={BEAD_T6SV2_1} case=contention_works_without_observer"
+        );
+        // No panic, no observer — just normal Err return.
+        assert!(table.observer().is_none());
+    }
+
+    #[test]
+    fn test_lock_table_observer_during_rebuild() {
+        // bd-t6sv2.1: Contention in the draining table during rebuild
+        // also emits events.
+        let obs = std::sync::Arc::new(fsqlite_observability::MetricsObserver::new(100));
+        let mut table = InProcessPageLockTable::with_observer(
+            obs.clone() as std::sync::Arc<dyn fsqlite_observability::ConflictObserver>
+        );
+        let page = PageNumber::new(50).unwrap();
+        let txn_a = TxnId::new(1).unwrap();
+        let txn_b = TxnId::new(2).unwrap();
+
+        // txn_a acquires page before rebuild.
+        table.try_acquire(page, txn_a).unwrap();
+        assert_eq!(obs.log().len(), 0);
+
+        // Begin rebuild — page is now in draining table.
+        table.begin_rebuild().unwrap();
+
+        // txn_b tries to acquire — contention from draining table.
+        let err = table.try_acquire(page, txn_b).unwrap_err();
+        assert_eq!(err, txn_a);
+        assert_eq!(
+            obs.metrics()
+                .page_contentions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "bead_id={BEAD_T6SV2_1} case=contention_emits_during_rebuild"
+        );
+
+        let events = obs.log().snapshot();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            fsqlite_observability::ConflictEvent::PageLockContention {
+                page: p,
+                requester,
+                holder,
+                ..
+            } if p.get() == 50 && requester.get() == 2 && holder.get() == 1
+        ));
+    }
+
+    #[test]
+    fn test_lock_table_set_observer_after_creation() {
+        // bd-t6sv2.1: set_observer() can attach observer to an existing table.
+        let obs = std::sync::Arc::new(fsqlite_observability::MetricsObserver::new(100));
+        let mut table = InProcessPageLockTable::new();
+        assert!(table.observer().is_none());
+
+        // Attach observer.
+        table.set_observer(Some(
+            obs.clone() as std::sync::Arc<dyn fsqlite_observability::ConflictObserver>
+        ));
+        assert!(table.observer().is_some());
+
+        let page = PageNumber::new(1).unwrap();
+        let txn_a = TxnId::new(1).unwrap();
+        let txn_b = TxnId::new(2).unwrap();
+
+        table.try_acquire(page, txn_a).unwrap();
+        assert!(table.try_acquire(page, txn_b).is_err());
+
+        assert_eq!(
+            obs.metrics()
+                .page_contentions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "bead_id={BEAD_T6SV2_1} case=observer_works_after_set"
+        );
+    }
+
+    #[test]
+    fn test_lock_table_observer_reset_clears_metrics() {
+        // bd-t6sv2.1: MetricsObserver.reset() clears both counters and log.
+        let obs = std::sync::Arc::new(fsqlite_observability::MetricsObserver::new(100));
+        let table = InProcessPageLockTable::with_observer(
+            obs.clone() as std::sync::Arc<dyn fsqlite_observability::ConflictObserver>
+        );
+        let page = PageNumber::new(1).unwrap();
+        let txn_a = TxnId::new(1).unwrap();
+        let txn_b = TxnId::new(2).unwrap();
+
+        table.try_acquire(page, txn_a).unwrap();
+        assert!(table.try_acquire(page, txn_b).is_err());
+        assert_eq!(obs.log().len(), 1);
+
+        obs.reset();
+        assert_eq!(
+            obs.metrics()
+                .page_contentions
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "bead_id={BEAD_T6SV2_1} case=reset_clears_counters"
+        );
+        assert!(
+            obs.log().is_empty(),
+            "bead_id={BEAD_T6SV2_1} case=reset_clears_log"
+        );
     }
 }

@@ -656,4 +656,303 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"conflicts_total\":1"));
     }
+
+    // ===================================================================
+    // bd-t6sv2.1: Additional observability tests
+    // ===================================================================
+
+    #[test]
+    fn ring_buffer_stress_many_pushes() {
+        // Push far more events than capacity; verify only the last N survive.
+        let cap = 10;
+        let rb = ConflictRingBuffer::new(cap);
+        for i in 1..=200_u32 {
+            rb.push(make_contention_event(i, u64::from(i), u64::from(i) + 1));
+        }
+        assert_eq!(rb.len(), cap);
+        let snap = rb.snapshot();
+        assert_eq!(snap.len(), cap);
+        // Oldest surviving event should be page 191.
+        assert!(matches!(
+            &snap[0],
+            ConflictEvent::PageLockContention { page, .. } if page.get() == 191
+        ),);
+        // Newest should be page 200.
+        assert!(matches!(
+            &snap[cap - 1],
+            ConflictEvent::PageLockContention { page, .. } if page.get() == 200
+        ),);
+    }
+
+    #[test]
+    fn ring_buffer_capacity_one() {
+        // Edge case: capacity of 1 always holds the latest event.
+        let rb = ConflictRingBuffer::new(1);
+        rb.push(make_contention_event(1, 10, 20));
+        rb.push(make_contention_event(2, 11, 21));
+        rb.push(make_contention_event(3, 12, 22));
+        assert_eq!(rb.len(), 1);
+        let snap = rb.snapshot();
+        assert!(
+            matches!(&snap[0], ConflictEvent::PageLockContention { page, .. } if page.get() == 3)
+        );
+    }
+
+    #[test]
+    fn ring_buffer_clear_after_wrap() {
+        // Ensure clear works correctly after the buffer has wrapped.
+        let rb = ConflictRingBuffer::new(2);
+        rb.push(make_contention_event(1, 10, 20));
+        rb.push(make_contention_event(2, 11, 21));
+        rb.push(make_contention_event(3, 12, 22)); // wrap
+        assert_eq!(rb.len(), 2);
+
+        rb.clear();
+        assert!(rb.is_empty());
+        assert_eq!(rb.capacity(), 2);
+
+        // Re-use after clear.
+        rb.push(make_contention_event(4, 13, 23));
+        assert_eq!(rb.len(), 1);
+        let snap = rb.snapshot();
+        assert!(
+            matches!(&snap[0], ConflictEvent::PageLockContention { page, .. } if page.get() == 4)
+        );
+    }
+
+    #[test]
+    fn metrics_all_fcw_merge_combinations() {
+        // Test all four combinations of merge_attempted x merge_succeeded.
+        let m = ConflictMetrics::new();
+
+        let cases = [
+            (false, false),
+            (true, false),
+            (true, true),
+            (false, false), // duplicate no-merge
+        ];
+        for (attempted, succeeded) in cases {
+            m.record(&ConflictEvent::FcwBaseDrift {
+                page: page(1),
+                loser: txn(1),
+                winner_commit_seq: CommitSeq::new(1),
+                merge_attempted: attempted,
+                merge_succeeded: succeeded,
+                timestamp_ns: 0,
+            });
+        }
+
+        assert_eq!(m.fcw_drifts.load(Ordering::Relaxed), 4);
+        assert_eq!(m.fcw_merge_attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(m.fcw_merge_successes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn metrics_all_ssi_abort_categories() {
+        let m = ConflictMetrics::new();
+
+        for reason in [
+            SsiAbortCategory::Pivot,
+            SsiAbortCategory::CommittedPivot,
+            SsiAbortCategory::MarkedForAbort,
+        ] {
+            m.record(&ConflictEvent::SsiAbort {
+                txn: TxnToken::new(txn(1), fsqlite_types::TxnEpoch::new(1)),
+                reason,
+                in_edge_count: 1,
+                out_edge_count: 1,
+                timestamp_ns: 0,
+            });
+        }
+
+        assert_eq!(m.ssi_aborts.load(Ordering::Relaxed), 3);
+        assert_eq!(m.conflicts_total.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn metrics_conflict_resolved_not_counted_as_conflict() {
+        // ConflictResolved increments resolved counter but NOT conflicts_total.
+        let m = ConflictMetrics::new();
+        for i in 1..=5_u64 {
+            m.record(&ConflictEvent::ConflictResolved {
+                txn: txn(i),
+                pages_merged: 2,
+                commit_seq: CommitSeq::new(i * 10),
+                timestamp_ns: 0,
+            });
+        }
+
+        assert_eq!(m.conflicts_resolved.load(Ordering::Relaxed), 5);
+        assert_eq!(m.conflicts_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn metrics_hotspot_ordering() {
+        // Verify top_hotspots returns pages sorted by descending frequency.
+        let m = ConflictMetrics::new();
+        // Page 5: 3 contentions, page 10: 1, page 15: 2.
+        for _ in 0..3 {
+            m.record(&make_contention_event(5, 1, 2));
+        }
+        m.record(&make_contention_event(10, 1, 2));
+        for _ in 0..2 {
+            m.record(&make_contention_event(15, 1, 2));
+        }
+
+        let hotspots = m.top_hotspots(3);
+        assert_eq!(hotspots.len(), 3);
+        assert_eq!(hotspots[0], (page(5), 3));
+        assert_eq!(hotspots[1], (page(15), 2));
+        assert_eq!(hotspots[2], (page(10), 1));
+    }
+
+    #[test]
+    fn metrics_hotspot_truncation() {
+        // top_hotspots(N) should return at most N entries.
+        let m = ConflictMetrics::new();
+        for i in 1..=20_u32 {
+            m.record(&make_contention_event(i, 1, 2));
+        }
+        assert_eq!(m.top_hotspots(5).len(), 5);
+        assert_eq!(m.top_hotspots(0).len(), 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_all_fields() {
+        // Verify snapshot captures all counter types accurately.
+        let m = ConflictMetrics::new();
+        m.record(&make_contention_event(1, 10, 20));
+        m.record(&ConflictEvent::FcwBaseDrift {
+            page: page(2),
+            loser: txn(3),
+            winner_commit_seq: CommitSeq::new(100),
+            merge_attempted: true,
+            merge_succeeded: false,
+            timestamp_ns: 0,
+        });
+        m.record(&ConflictEvent::SsiAbort {
+            txn: TxnToken::new(txn(4), fsqlite_types::TxnEpoch::new(1)),
+            reason: SsiAbortCategory::Pivot,
+            in_edge_count: 2,
+            out_edge_count: 3,
+            timestamp_ns: 0,
+        });
+        m.record(&ConflictEvent::ConflictResolved {
+            txn: txn(5),
+            pages_merged: 1,
+            commit_seq: CommitSeq::new(200),
+            timestamp_ns: 0,
+        });
+
+        let snap = m.snapshot();
+        assert_eq!(snap.conflicts_total, 3); // contention + drift + abort
+        assert_eq!(snap.page_contentions, 1);
+        assert_eq!(snap.fcw_drifts, 1);
+        assert_eq!(snap.fcw_merge_attempts, 1);
+        assert_eq!(snap.fcw_merge_successes, 0);
+        assert_eq!(snap.ssi_aborts, 1);
+        assert_eq!(snap.conflicts_resolved, 1);
+        assert!(snap.elapsed_secs >= 0.0);
+    }
+
+    #[test]
+    fn metrics_observer_log_preserves_order() {
+        // Events in the ring buffer are in chronological order.
+        let obs = MetricsObserver::new(100);
+        for i in 1..=5_u32 {
+            obs.on_event(&make_contention_event(i, u64::from(i), u64::from(i) + 10));
+        }
+
+        let events = obs.log().snapshot();
+        assert_eq!(events.len(), 5);
+        for (idx, event) in events.iter().enumerate() {
+            let expected_page = u32::try_from(idx + 1).unwrap();
+            assert!(matches!(
+                event,
+                ConflictEvent::PageLockContention { page, .. } if page.get() == expected_page
+            ),);
+        }
+    }
+
+    #[test]
+    fn metrics_observer_elapsed_ns_monotonic() {
+        let obs = MetricsObserver::new(10);
+        let t1 = obs.elapsed_ns();
+        // Busy-wait briefly to ensure some time passes.
+        std::thread::yield_now();
+        let t2 = obs.elapsed_ns();
+        assert!(t2 >= t1, "elapsed_ns must be monotonically non-decreasing");
+    }
+
+    #[test]
+    fn conflict_event_serde_roundtrip() {
+        // All event variants should serialize to JSON and back.
+        let events = vec![
+            make_contention_event(1, 2, 3),
+            ConflictEvent::FcwBaseDrift {
+                page: page(4),
+                loser: txn(5),
+                winner_commit_seq: CommitSeq::new(100),
+                merge_attempted: true,
+                merge_succeeded: true,
+                timestamp_ns: 42,
+            },
+            ConflictEvent::SsiAbort {
+                txn: TxnToken::new(txn(6), fsqlite_types::TxnEpoch::new(2)),
+                reason: SsiAbortCategory::CommittedPivot,
+                in_edge_count: 3,
+                out_edge_count: 4,
+                timestamp_ns: 99,
+            },
+            ConflictEvent::ConflictResolved {
+                txn: txn(7),
+                pages_merged: 5,
+                commit_seq: CommitSeq::new(200),
+                timestamp_ns: 123,
+            },
+        ];
+
+        for event in &events {
+            let json = serde_json::to_string(event).unwrap();
+            assert!(!json.is_empty(), "serialization should produce output");
+        }
+    }
+
+    #[test]
+    fn conflict_event_is_conflict_all_variants() {
+        assert!(make_contention_event(1, 2, 3).is_conflict());
+
+        assert!(
+            ConflictEvent::FcwBaseDrift {
+                page: page(1),
+                loser: txn(1),
+                winner_commit_seq: CommitSeq::new(1),
+                merge_attempted: false,
+                merge_succeeded: false,
+                timestamp_ns: 0,
+            }
+            .is_conflict()
+        );
+
+        assert!(
+            ConflictEvent::SsiAbort {
+                txn: TxnToken::new(txn(1), fsqlite_types::TxnEpoch::new(1)),
+                reason: SsiAbortCategory::Pivot,
+                in_edge_count: 0,
+                out_edge_count: 0,
+                timestamp_ns: 0,
+            }
+            .is_conflict()
+        );
+
+        assert!(
+            !ConflictEvent::ConflictResolved {
+                txn: txn(1),
+                pages_merged: 0,
+                commit_seq: CommitSeq::new(1),
+                timestamp_ns: 0,
+            }
+            .is_conflict()
+        );
+    }
 }
