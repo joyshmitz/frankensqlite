@@ -92,6 +92,8 @@ jobs:
           log_file="${artifact_root}/logs/e2e_runner.log"
           manifest_json="${artifact_root}/orchestrator_manifest.json"
           orchestrator_summary_json="${artifact_root}/orchestrator_summary.json"
+          drift_report_json="${artifact_root}/scenario_drift_report.json"
+          drift_report_md="${artifact_root}/scenario_drift_summary.md"
 
           mkdir -p "${run_dir}"
 
@@ -119,6 +121,18 @@ jobs:
           orchestrator_status=$?
           set -e
 
+          # Enforce scenario-to-script drift gate for required lanes.
+          set +e
+          cargo run -p fsqlite-harness --bin scenario_coverage_drift_gate_runner -- \
+            --workspace-root "${GITHUB_WORKSPACE}" \
+            --run-dir "${artifact_root}/scenario-drift-run" \
+            --root-seed "${LANE_SEED}" \
+            --output-json "${drift_report_json}" \
+            --output-human "${drift_report_md}" \
+            > "${artifact_root}/logs/scenario_coverage_drift_gate_runner.log" 2>&1
+          drift_gate_status=$?
+          set -e
+
           results_file="${run_dir}/results.json"
           if [[ -f "${results_file}" ]]; then
             total_tests="$(jq -r '.summary.total_tests // 0' "${results_file}")"
@@ -141,9 +155,11 @@ jobs:
             --argjson seed "${LANE_SEED}" \
             --argjson lane_exit_code "${lane_status}" \
             --argjson orchestrator_exit_code "${orchestrator_status}" \
+            --argjson drift_gate_exit_code "${drift_gate_status}" \
             --arg results_file "${results_file}" \
             --arg orchestrator_manifest "${manifest_json}" \
             --arg orchestrator_summary "${orchestrator_summary_json}" \
+            --arg drift_report "${drift_report_json}" \
             --arg log_file "${log_file}" \
             --argjson duration_seconds "${duration_seconds}" \
             --argjson total_tests "${total_tests}" \
@@ -159,6 +175,7 @@ jobs:
               seed: $seed,
               lane_exit_code: $lane_exit_code,
               orchestrator_exit_code: $orchestrator_exit_code,
+              drift_gate_exit_code: $drift_gate_exit_code,
               duration_seconds: $duration_seconds,
               summary: {
                 total_tests: $total_tests,
@@ -170,7 +187,8 @@ jobs:
                 results_file: $results_file,
                 log_file: $log_file,
                 orchestrator_manifest: $orchestrator_manifest,
-                orchestrator_summary: $orchestrator_summary
+                orchestrator_summary: $orchestrator_summary,
+                scenario_drift_report: $drift_report
               }
             }' > "${summary_json}"
 
@@ -184,6 +202,7 @@ jobs:
             echo "- duration_seconds: ${duration_seconds}"
             echo "- lane_exit_code: ${lane_status}"
             echo "- orchestrator_exit_code: ${orchestrator_status} (evidence-only)"
+            echo "- drift_gate_exit_code: ${drift_gate_status} (enforced)"
             echo
             echo "## Test Summary"
             echo "- total: ${total_tests}"
@@ -196,6 +215,7 @@ jobs:
             echo "- lane log: \`${log_file}\`"
             echo "- orchestrator manifest: \`${manifest_json}\`"
             echo "- orchestrator summary: \`${orchestrator_summary_json}\`"
+            echo "- scenario drift report: \`${drift_report_json}\`"
           } > "${summary_md}"
 
           {
@@ -204,11 +224,17 @@ jobs:
             echo "- seed: \`${LANE_SEED}\`"
             echo "- lane_exit_code: ${lane_status}"
             echo "- orchestrator_exit_code: ${orchestrator_status} (non-blocking evidence)"
+            echo "- drift_gate_exit_code: ${drift_gate_status} (blocking gate)"
             echo "- summary: \`${summary_json}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-          if [[ ${lane_status} -ne 0 ]]; then
-            exit "${lane_status}"
+          final_status="${lane_status}"
+          if [[ ${drift_gate_status} -ne 0 && ${final_status} -eq 0 ]]; then
+            final_status="${drift_gate_status}"
+          fi
+
+          if [[ ${final_status} -ne 0 ]]; then
+            exit "${final_status}"
           fi
 
       - name: Upload E2E matrix lane artifacts
