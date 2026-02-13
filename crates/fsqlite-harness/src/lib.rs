@@ -25,6 +25,7 @@ pub mod mismatch_minimizer;
 pub mod oracle;
 pub mod parity_taxonomy;
 pub mod perf_loop;
+pub mod planner_vdbe_closure;
 pub mod ratchet_policy;
 pub mod replay_harness;
 pub mod scheduler;
