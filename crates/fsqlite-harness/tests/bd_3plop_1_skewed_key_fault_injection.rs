@@ -689,7 +689,7 @@ fn test_e2e_bd_3plop_1_skewed_key_fault_injection() {
         "version-chain pressure proxy captured per case/distribution".to_owned(),
     ];
 
-    let run_id = format!("{BEAD_ID}-{}", suite_seed);
+    let run_id = format!("{BEAD_ID}-{}-ops{ops}", suite_seed);
     let suite = SuiteArtifact {
         schema_version: 1,
         bead_id: BEAD_ID.to_owned(),
