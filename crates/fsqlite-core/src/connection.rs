@@ -59,7 +59,11 @@ use fsqlite_mvcc::{
     concurrent_abort, concurrent_read_page, concurrent_write_page, validate_first_committer_wins,
 };
 // MVCC conflict observability (bd-t6sv2.1)
-use fsqlite_observability::MetricsObserver;
+use fsqlite_observability::{
+    MetricsObserver, next_decision_id, next_trace_id, record_compat_trace_callback,
+    record_trace_export, record_trace_export_error, record_trace_span_created, reset_trace_metrics,
+    trace_metrics_snapshot,
+};
 use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot, TxnId, TxnToken};
 
 use crate::wal_adapter::WalBackendAdapter;
@@ -108,6 +112,16 @@ impl<'a, 'b> MvccPageIo<'a, 'b> {
 
 impl fsqlite_btree::cursor::PageReader for MvccPageIo<'_, '_> {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        let storage_span = tracing::span!(
+            target: "fsqlite.storage",
+            tracing::Level::TRACE,
+            "storage",
+            op = "read_page",
+            page_no = page_no.get(),
+            session_id = self.session_id
+        );
+        record_trace_span_created();
+        let _storage_guard = storage_span.enter();
         // Check the local write set first (read-your-own-writes).
         if let Some(page_data) = concurrent_read_page(self.handle, page_no) {
             return Ok(page_data.as_bytes().to_vec());
@@ -119,6 +133,17 @@ impl fsqlite_btree::cursor::PageReader for MvccPageIo<'_, '_> {
 
 impl fsqlite_btree::cursor::PageWriter for MvccPageIo<'_, '_> {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        let storage_span = tracing::span!(
+            target: "fsqlite.storage",
+            tracing::Level::TRACE,
+            "storage",
+            op = "write_page",
+            page_no = page_no.get(),
+            session_id = self.session_id,
+            bytes = data.len()
+        );
+        record_trace_span_created();
+        let _storage_guard = storage_span.enter();
         // Acquire page lock and record in write set.
         concurrent_write_page(
             self.handle,
@@ -388,6 +413,97 @@ struct ResolvedOrderTerm {
     column_index: usize,
     descending: bool,
     nulls_order: NullsOrder,
+}
+
+/// Compatibility mask for sqlite3_trace_v2-style callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceMask(u32);
+
+impl TraceMask {
+    pub const STMT: Self = Self(0x01);
+    pub const PROFILE: Self = Self(0x02);
+    pub const ROW: Self = Self(0x04);
+    pub const CLOSE: Self = Self(0x08);
+    pub const ALL: Self = Self(Self::STMT.0 | Self::PROFILE.0 | Self::ROW.0 | Self::CLOSE.0);
+
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+}
+
+impl std::ops::BitOr for TraceMask {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// sqlite3_trace_v2-style callback event payload.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TraceEvent {
+    /// Statement text about to execute.
+    Statement { sql: String },
+    /// Statement execution profile (nanoseconds).
+    Profile { sql: String, elapsed_ns: u64 },
+    /// Row delivered to the client.
+    Row { values: Vec<SqliteValue> },
+    /// Connection close lifecycle event.
+    Close,
+}
+
+impl TraceEvent {
+    #[must_use]
+    fn callback_type(&self) -> &'static str {
+        match self {
+            Self::Statement { .. } => "stmt",
+            Self::Profile { .. } => "profile",
+            Self::Row { .. } => "row",
+            Self::Close => "close",
+        }
+    }
+
+    #[must_use]
+    fn required_mask(&self) -> TraceMask {
+        match self {
+            Self::Statement { .. } => TraceMask::STMT,
+            Self::Profile { .. } => TraceMask::PROFILE,
+            Self::Row { .. } => TraceMask::ROW,
+            Self::Close => TraceMask::CLOSE,
+        }
+    }
+}
+
+/// Callback signature for sqlite3_trace_v2 compatibility.
+pub type TraceCallback = Arc<dyn Fn(TraceEvent) + Send + Sync + 'static>;
+
+#[derive(Clone)]
+struct TraceRegistration {
+    mask: TraceMask,
+    callback: TraceCallback,
+}
+
+fn emit_compat_trace_event(trace: Option<&TraceRegistration>, event: TraceEvent) {
+    let Some(trace) = trace else {
+        return;
+    };
+    if !trace.mask.contains(event.required_mask()) {
+        return;
+    }
+
+    let callback_type = event.callback_type();
+    let span = tracing::span!(
+        target: "fsqlite.compat_trace",
+        tracing::Level::DEBUG,
+        "compat_trace",
+        callback_type
+    );
+    record_trace_span_created();
+    record_compat_trace_callback();
+    let _guard = span.enter();
+    (trace.callback)(event);
+    tracing::debug!(callback_type, "sqlite3_trace_v2 callback emitted");
 }
 
 impl std::fmt::Debug for PreparedStatement {
@@ -711,6 +827,8 @@ pub struct Connection {
     /// FCW drift, SSI aborts) and a ring-buffer of recent conflict events.
     /// Exposed via PRAGMA fsqlite.conflict_stats / conflict_log / conflict_reset.
     conflict_observer: Rc<MetricsObserver>,
+    /// sqlite3_trace_v2 compatibility callback registration.
+    trace_registration: RefCell<Option<TraceRegistration>>,
     /// Bounded append-only SSI decision cards with tamper-evident chain hashes.
     /// Queried via `PRAGMA fsqlite.ssi_decisions`.
     ssi_evidence_ledger: SsiEvidenceLedger,
@@ -794,6 +912,7 @@ impl Connection {
             change_counter: RefCell::new(0),
             // MVCC conflict observability (bd-t6sv2.1)
             conflict_observer: Rc::new(MetricsObserver::new(1024)),
+            trace_registration: RefCell::new(None),
             // SSI evidence ledger (bd-1lsfu.3)
             ssi_evidence_ledger: SsiEvidenceLedger::new(4096),
             // MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2)
@@ -821,6 +940,15 @@ impl Connection {
         &self.path
     }
 
+    /// Register or clear sqlite3_trace_v2-compatible callbacks.
+    ///
+    /// Passing `Some(callback)` enables callback delivery for the requested
+    /// `mask`. Passing `None` clears any existing registration.
+    pub fn trace_v2(&self, mask: TraceMask, callback: Option<TraceCallback>) {
+        *self.trace_registration.borrow_mut() =
+            callback.map(|callback| TraceRegistration { mask, callback });
+    }
+
     /// Close the connection and perform pager/WAL shutdown steps.
     ///
     /// On close:
@@ -835,6 +963,7 @@ impl Connection {
         if *self.closed.get_mut() {
             return Ok(());
         }
+        let trace_registration = self.trace_registration.get_mut().clone();
 
         let cx = Cx::new();
         let active_txn = self.active_txn.get_mut();
@@ -864,19 +993,60 @@ impl Connection {
         }
 
         *self.closed.get_mut() = true;
+        emit_compat_trace_event(trace_registration.as_ref(), TraceEvent::Close);
         Ok(())
     }
 
     /// Prepare SQL into a statement.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
-        let statement = parse_single_statement(sql)?;
-        let statement = self.rewrite_subquery_statement(statement)?;
+        let statement = {
+            let parse_span = tracing::span!(
+                target: "fsqlite.parse",
+                tracing::Level::TRACE,
+                "parse",
+                parse_mode = "prepare_single",
+                sql_len = sql.len()
+            );
+            record_trace_span_created();
+            let _parse_guard = parse_span.enter();
+            parse_single_statement(sql)?
+        };
+        let statement = {
+            let parse_span = tracing::span!(
+                target: "fsqlite.parse",
+                tracing::Level::TRACE,
+                "parse",
+                parse_mode = "prepare_rewrite"
+            );
+            record_trace_span_created();
+            let _parse_guard = parse_span.enter();
+            self.rewrite_subquery_statement(statement)?
+        };
+        let plan_span = tracing::span!(
+            target: "fsqlite.plan",
+            tracing::Level::TRACE,
+            "plan",
+            stage = "compile_prepared_statement"
+        );
+        record_trace_span_created();
+        let _plan_guard = plan_span.enter();
         self.compile_and_wrap(&statement)
     }
 
     /// Prepare and execute SQL as a query.
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
-        let statements = parse_statements(sql)?;
+        let statements = {
+            let parse_span = tracing::span!(
+                target: "fsqlite.parse",
+                tracing::Level::TRACE,
+                "parse",
+                parse_mode = "query_multi",
+                sql_len = sql.len()
+            );
+            record_trace_span_created();
+            let _parse_guard = parse_span.enter();
+            parse_statements(sql)?
+        };
         let mut rows = Vec::new();
         for statement in statements {
             rows = self.execute_statement(statement, None)?;
@@ -886,7 +1056,18 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
     pub fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        let statement = parse_single_statement(sql)?;
+        let statement = {
+            let parse_span = tracing::span!(
+                target: "fsqlite.parse",
+                tracing::Level::TRACE,
+                "parse",
+                parse_mode = "query_single",
+                sql_len = sql.len()
+            );
+            record_trace_span_created();
+            let _parse_guard = parse_span.enter();
+            parse_single_statement(sql)?
+        };
         self.execute_statement(statement, Some(params))
     }
 
@@ -906,7 +1087,18 @@ impl Connection {
     /// rows.  For SELECT and other statement types it returns the number of
     /// result rows.
     pub fn execute(&self, sql: &str) -> Result<usize> {
-        let statements = parse_statements(sql)?;
+        let statements = {
+            let parse_span = tracing::span!(
+                target: "fsqlite.parse",
+                tracing::Level::TRACE,
+                "parse",
+                parse_mode = "execute_multi",
+                sql_len = sql.len()
+            );
+            record_trace_span_created();
+            let _parse_guard = parse_span.enter();
+            parse_statements(sql)?
+        };
         let mut last_count = 0;
         for statement in statements {
             let is_dml = matches!(
@@ -925,7 +1117,18 @@ impl Connection {
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
-        let statement = parse_single_statement(sql)?;
+        let statement = {
+            let parse_span = tracing::span!(
+                target: "fsqlite.parse",
+                tracing::Level::TRACE,
+                "parse",
+                parse_mode = "execute_single",
+                sql_len = sql.len()
+            );
+            record_trace_span_created();
+            let _parse_guard = parse_span.enter();
+            parse_single_statement(sql)?
+        };
         let is_dml = matches!(
             &statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -942,12 +1145,65 @@ impl Connection {
 
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
     /// DML (SELECT/INSERT/UPDATE/DELETE).
+    #[allow(clippy::too_many_lines)]
     fn execute_statement(
         &self,
         statement: Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let statement = self.rewrite_subquery_statement(statement)?;
+        let statement_kind = match &statement {
+            Statement::Select(_) => "select",
+            Statement::Insert(_) => "insert",
+            Statement::Update(_) => "update",
+            Statement::Delete(_) => "delete",
+            Statement::CreateTable(_) => "create_table",
+            Statement::Drop(_) => "drop",
+            Statement::AlterTable(_) => "alter_table",
+            Statement::CreateIndex(_) => "create_index",
+            Statement::Pragma(_) => "pragma",
+            Statement::Begin(_) => "begin",
+            Statement::Commit => "commit",
+            Statement::Rollback(_) => "rollback",
+            Statement::Savepoint(_) => "savepoint",
+            Statement::Release(_) => "release",
+            Statement::CreateView(_) => "create_view",
+            Statement::CreateTrigger(_) => "create_trigger",
+            _ => "other",
+        };
+        let trace_id = next_trace_id();
+        let decision_id = next_decision_id();
+        let statement_sql = statement.to_string();
+        let trace_registration = self.trace_registration.borrow().clone();
+        let statement_span = tracing::span!(
+            target: "fsqlite.statement",
+            tracing::Level::DEBUG,
+            "statement",
+            trace_id,
+            decision_id,
+            statement_kind
+        );
+        record_trace_span_created();
+        let _statement_guard = statement_span.enter();
+        emit_compat_trace_event(
+            trace_registration.as_ref(),
+            TraceEvent::Statement {
+                sql: statement_sql.clone(),
+            },
+        );
+        let execution_started = std::time::Instant::now();
+        let statement = {
+            let parse_span = tracing::span!(
+                target: "fsqlite.parse",
+                tracing::Level::TRACE,
+                "parse",
+                trace_id,
+                statement_kind,
+                phase = "rewrite_subquery"
+            );
+            record_trace_span_created();
+            let _parse_guard = parse_span.enter();
+            self.rewrite_subquery_statement(statement)?
+        };
         // 5B.5 + 5B.2 (bd-1yi8): autocommit wrapping — ensure a pager
         // transaction is active for data/DDL operations outside an
         // explicit BEGIN.  Writes use Immediate mode; reads use Deferred.
@@ -983,6 +1239,24 @@ impl Connection {
         let result = self.execute_statement_dispatch(statement, params);
         let ok = result.is_ok();
         self.resolve_autocommit_txn(was_auto, ok)?;
+        let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        emit_compat_trace_event(
+            trace_registration.as_ref(),
+            TraceEvent::Profile {
+                sql: statement_sql,
+                elapsed_ns,
+            },
+        );
+        if let Ok(rows) = result.as_ref() {
+            for row in rows {
+                emit_compat_trace_event(
+                    trace_registration.as_ref(),
+                    TraceEvent::Row {
+                        values: row.values().to_vec(),
+                    },
+                );
+            }
+        }
         result
     }
 
@@ -1022,8 +1296,17 @@ impl Connection {
                 if is_expression_only_select(select) {
                     // Fallback codegen: eagerly rewrite IN subqueries.
                     let rewritten = self.rewrite_in_subqueries_select(select)?;
+                    let plan_span = tracing::span!(
+                        target: "fsqlite.plan",
+                        tracing::Level::TRACE,
+                        "plan",
+                        stage = "compile_expression_select"
+                    );
+                    record_trace_span_created();
+                    let _plan_guard = plan_span.enter();
+                    let program = compile_expression_select(&rewritten)?;
                     let mut rows = execute_program_with_postprocess(
-                        &compile_expression_select(&rewritten)?,
+                        &program,
                         params,
                         Some(&self.func_registry),
                         Some(&build_expression_postprocess(&rewritten)),
@@ -1064,12 +1347,22 @@ impl Connection {
                     Ok(rows)
                 } else {
                     let limit_clause = select.limit.clone();
-                    let program = if distinct && limit_clause.is_some() {
-                        let mut unbounded = select.clone();
-                        unbounded.limit = None;
-                        self.compile_table_select(&unbounded)?
-                    } else {
-                        self.compile_table_select(select)?
+                    let program = {
+                        let plan_span = tracing::span!(
+                            target: "fsqlite.plan",
+                            tracing::Level::TRACE,
+                            "plan",
+                            stage = "compile_table_select"
+                        );
+                        record_trace_span_created();
+                        let _plan_guard = plan_span.enter();
+                        if distinct && limit_clause.is_some() {
+                            let mut unbounded = select.clone();
+                            unbounded.limit = None;
+                            self.compile_table_select(&unbounded)?
+                        } else {
+                            self.compile_table_select(select)?
+                        }
                     };
 
                     let mut rows = self.execute_table_program(&program, params)?;
@@ -1136,7 +1429,17 @@ impl Connection {
                             .len()
                     }
                 };
-                let program = self.compile_table_insert(insert)?;
+                let program = {
+                    let plan_span = tracing::span!(
+                        target: "fsqlite.plan",
+                        tracing::Level::TRACE,
+                        "plan",
+                        stage = "compile_table_insert"
+                    );
+                    record_trace_span_created();
+                    let _plan_guard = plan_span.enter();
+                    self.compile_table_insert(insert)?
+                };
                 let rows = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER INSERT triggers.
@@ -1183,7 +1486,17 @@ impl Connection {
 
                 let affected =
                     self.count_matching_rows(&update.table, update.where_clause.as_ref(), params)?;
-                let program = self.compile_table_update(update)?;
+                let program = {
+                    let plan_span = tracing::span!(
+                        target: "fsqlite.plan",
+                        tracing::Level::TRACE,
+                        "plan",
+                        stage = "compile_table_update"
+                    );
+                    record_trace_span_created();
+                    let _plan_guard = plan_span.enter();
+                    self.compile_table_update(update)?
+                };
                 let rows = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
@@ -1219,7 +1532,17 @@ impl Connection {
 
                 let affected =
                     self.count_matching_rows(&delete.table, delete.where_clause.as_ref(), params)?;
-                let program = self.compile_table_delete(delete)?;
+                let program = {
+                    let plan_span = tracing::span!(
+                        target: "fsqlite.plan",
+                        tracing::Level::TRACE,
+                        "plan",
+                        stage = "compile_table_delete"
+                    );
+                    record_trace_span_created();
+                    let _plan_guard = plan_span.enter();
+                    self.compile_table_delete(delete)?
+                };
                 let rows = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
@@ -3615,6 +3938,50 @@ impl Connection {
                     values: vec![SqliteValue::Text("ok".into())],
                 }])
             }
+            "fsqlite.trace_stats" | "trace_stats" => {
+                let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                let snapshot = trace_metrics_snapshot();
+                Ok(vec![
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fsqlite_trace_spans_total".into()),
+                            SqliteValue::Integer(to_i64(snapshot.fsqlite_trace_spans_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fsqlite_trace_export_errors_total".into()),
+                            SqliteValue::Integer(to_i64(
+                                snapshot.fsqlite_trace_export_errors_total,
+                            )),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fsqlite_compat_trace_callbacks_total".into()),
+                            SqliteValue::Integer(to_i64(
+                                snapshot.fsqlite_compat_trace_callbacks_total,
+                            )),
+                        ],
+                    },
+                ])
+            }
+            "fsqlite.trace_reset" | "trace_reset" => {
+                reset_trace_metrics();
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Text("ok".into())],
+                }])
+            }
+            // ── Simple join lineage/provenance PRAGMA (bd-2j365) ─────────
+            "fsqlite.lineage" | "lineage" => {
+                let value = pragma.value.as_ref().ok_or_else(|| {
+                    FrankenError::Internal(
+                        "PRAGMA lineage requires `left_table,right_table,left_col,right_col[,left_id_col,right_id_col]`".to_owned(),
+                    )
+                })?;
+                let spec = parse_lineage_query(value)?;
+                execute_simple_join_lineage_query(self, &spec)
+            }
             // ── SSI decision evidence ledger PRAGMAs (bd-1lsfu.3) ─────────
             "fsqlite.ssi_decisions" | "ssi_decisions" => {
                 let query = if let Some(value) = pragma.value.as_ref() {
@@ -5164,6 +5531,14 @@ impl Connection {
         program: &VdbeProgram,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        let execution_span = tracing::span!(
+            target: "fsqlite.execution",
+            tracing::Level::DEBUG,
+            "execution",
+            mode = "table"
+        );
+        record_trace_span_created();
+        let _execution_guard = execution_span.enter();
         // Lend the active transaction to the VDBE engine so that storage
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
         let txn = self.active_txn.borrow_mut().take();
@@ -6683,6 +7058,14 @@ fn execute_table_program_with_db(
     schema_cookie: u32,
     concurrent_ctx: Option<ConcurrentExecContext>,
 ) -> (Result<Vec<Row>>, Option<Box<dyn TransactionHandle>>) {
+    let execution_span = tracing::span!(
+        target: "fsqlite.execution",
+        tracing::Level::DEBUG,
+        "execution",
+        mode = "vdbe"
+    );
+    record_trace_span_created();
+    let _execution_guard = execution_span.enter();
     let mut engine = VdbeEngine::new(program.register_count());
     if let Some(params) = params {
         if let Err(e) = validate_bound_parameters(program, params) {
@@ -6713,7 +7096,13 @@ fn execute_table_program_with_db(
     engine.set_database(db_value);
 
     // Always take the DB and txn back, even if execution returns Err.
+    let export_started = std::time::Instant::now();
     let exec_res = engine.execute(program);
+    let export_latency_us = u64::try_from(export_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    record_trace_export(1, export_latency_us);
+    if exec_res.is_err() || matches!(exec_res, Ok(ExecOutcome::Error { .. })) {
+        record_trace_export_error();
+    }
     if let Some(db_value) = engine.take_database() {
         *db.borrow_mut() = db_value;
     }
@@ -7111,6 +7500,95 @@ fn raptorq_repair_evidence_cards_to_rows(cards: &[WalFecRepairEvidenceCard]) -> 
             ],
         })
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct LineageJoinSpec {
+    left_table: String,
+    right_table: String,
+    left_column: String,
+    right_column: String,
+    left_contributor_column: String,
+    right_contributor_column: String,
+}
+
+fn parse_lineage_identifier(raw: &str, label: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(FrankenError::Internal(format!(
+            "PRAGMA lineage {label} must be non-empty"
+        )));
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(FrankenError::Internal(format!(
+            "PRAGMA lineage {label} must use [A-Za-z0-9_], got `{trimmed}`"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn parse_lineage_query_spec(spec: &str) -> Result<LineageJoinSpec> {
+    let parts = spec.split(',').map(str::trim).collect::<Vec<_>>();
+    if !(parts.len() == 4 || parts.len() == 6) {
+        return Err(FrankenError::Internal(
+            "PRAGMA lineage must be `left_table,right_table,left_col,right_col[,left_id_col,right_id_col]`"
+                .to_owned(),
+        ));
+    }
+    let (left_contributor_column, right_contributor_column) = if parts.len() == 6 {
+        (
+            parse_lineage_identifier(parts[4], "left contributor column")?,
+            parse_lineage_identifier(parts[5], "right contributor column")?,
+        )
+    } else {
+        ("rowid".to_owned(), "rowid".to_owned())
+    };
+    Ok(LineageJoinSpec {
+        left_table: parse_lineage_identifier(parts[0], "left table")?,
+        right_table: parse_lineage_identifier(parts[1], "right table")?,
+        left_column: parse_lineage_identifier(parts[2], "left join column")?,
+        right_column: parse_lineage_identifier(parts[3], "right join column")?,
+        left_contributor_column,
+        right_contributor_column,
+    })
+}
+
+fn parse_lineage_query(value: &fsqlite_ast::PragmaValue) -> Result<LineageJoinSpec> {
+    let expr = match value {
+        fsqlite_ast::PragmaValue::Assign(e) | fsqlite_ast::PragmaValue::Call(e) => e,
+    };
+    match expr {
+        Expr::Literal(Literal::String(spec), _) => parse_lineage_query_spec(spec),
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+            parse_lineage_query_spec(&col_ref.column)
+        }
+        _ => Err(FrankenError::Internal(
+            "PRAGMA lineage value must be a string like `left,right,left_col,right_col[,left_id_col,right_id_col]`".to_owned(),
+        )),
+    }
+}
+
+fn execute_simple_join_lineage_query(
+    conn: &Connection,
+    spec: &LineageJoinSpec,
+) -> Result<Vec<Row>> {
+    let sql = format!(
+        "SELECT l.{left_id_col}, r.{right_id_col}, l.{left_col}, r.{right_col} \
+         FROM {left_tbl} AS l \
+         JOIN {right_tbl} AS r \
+         ON l.{left_col} = r.{right_col} \
+         ORDER BY 1, 2;",
+        left_id_col = spec.left_contributor_column,
+        right_id_col = spec.right_contributor_column,
+        left_col = spec.left_column,
+        right_col = spec.right_column,
+        left_tbl = spec.left_table,
+        right_tbl = spec.right_table
+    );
+    conn.query(&sql)
 }
 
 fn parse_u64_component(raw: &str, label: &str) -> Result<u64> {
@@ -14418,6 +14896,48 @@ mod tests {
             decision_types.contains(&"ABORT_WRITE_SKEW".to_owned()),
             "write-skew abort decision card missing"
         );
+
+        let abort_rows = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.get(4),
+                    Some(SqliteValue::Text(decision)) if decision == "ABORT_WRITE_SKEW"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !abort_rows.is_empty(),
+            "expected at least one ABORT_WRITE_SKEW evidence row"
+        );
+        for row in abort_rows {
+            let has_conflicting_txns =
+                matches!(row.get(5), Some(SqliteValue::Text(txns)) if !txns.is_empty());
+            let has_conflict_pages =
+                matches!(row.get(6), Some(SqliteValue::Text(pages)) if !pages.is_empty());
+            let has_read_set_count =
+                matches!(row.get(7), Some(SqliteValue::Integer(page_count)) if *page_count > 0);
+            let has_read_set_top_k =
+                matches!(row.get(8), Some(SqliteValue::Text(top_k)) if !top_k.is_empty());
+            let has_write_set =
+                matches!(row.get(10), Some(SqliteValue::Text(write_set)) if !write_set.is_empty());
+            assert!(
+                has_conflicting_txns
+                    || has_conflict_pages
+                    || has_read_set_count
+                    || has_read_set_top_k
+                    || has_write_set,
+                "abort row must include at least one non-empty evidence payload field"
+            );
+            assert!(
+                matches!(row.get(11), Some(SqliteValue::Text(rationale)) if !rationale.is_empty()),
+                "abort row must include rationale text in column 11"
+            );
+            assert!(
+                matches!(row.get(14), Some(SqliteValue::Text(chain_hash)) if chain_hash.len() == 64),
+                "abort row must include 64-char chain hash in column 14"
+            );
+        }
     }
 
     #[test]
@@ -14494,6 +15014,67 @@ mod tests {
             .query(&format!("PRAGMA ssi_decisions='time:{min_ts}-{max_ts}';"))
             .unwrap();
         assert!(!time_rows.is_empty(), "time range filter should match rows");
+    }
+
+    #[test]
+    fn test_pragma_lineage_returns_simple_join_contributors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER, total INTEGER);",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO users VALUES (1, 'alice');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'bob');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (10, 1, 50);")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (11, 1, 75);")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (12, 2, 20);")
+            .unwrap();
+
+        let rows = conn
+            .query("PRAGMA lineage='users,orders,id,user_id,id,id';")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "expected one lineage row per join result row"
+        );
+
+        let mut tuples = rows
+            .iter()
+            .map(|row| {
+                let left_rowid = match row.get(0) {
+                    Some(SqliteValue::Integer(v)) => *v,
+                    other => panic!("expected integer left rowid, got {other:?}"),
+                };
+                let right_rowid = match row.get(1) {
+                    Some(SqliteValue::Integer(v)) => *v,
+                    other => panic!("expected integer right rowid, got {other:?}"),
+                };
+                let left_key = match row.get(2) {
+                    Some(SqliteValue::Integer(v)) => *v,
+                    other => panic!("expected integer left key, got {other:?}"),
+                };
+                let right_key = match row.get(3) {
+                    Some(SqliteValue::Integer(v)) => *v,
+                    other => panic!("expected integer right key, got {other:?}"),
+                };
+                (left_rowid, right_rowid, left_key, right_key)
+            })
+            .collect::<Vec<_>>();
+        tuples.sort_unstable();
+
+        assert_eq!(
+            tuples,
+            vec![(1, 10, 1, 1), (1, 11, 1, 1), (2, 12, 2, 2)],
+            "lineage rows should identify contributing tuple rowids/keys for each join output"
+        );
     }
 
     // ── Connection PRAGMA state tests (bd-1w6k.2.3) ────────────────────
@@ -17582,5 +18163,190 @@ mod schema_loading_tests {
             )
             .unwrap();
         assert_eq!(affected, 1, "UPDATE WHERE name = ?1 should affect 1 row");
+    }
+
+    #[test]
+    fn test_pragma_trace_stats_exposes_trace_metrics() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.query("SELECT 1;").unwrap();
+
+        let rows = conn.query("PRAGMA trace_stats;").unwrap();
+        let mut metric_names = rows
+            .iter()
+            .map(|row| match &row.values()[0] {
+                SqliteValue::Text(name) => name.clone(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>();
+        metric_names.sort();
+
+        assert!(
+            metric_names
+                .iter()
+                .any(|name| name == "fsqlite_trace_spans_total"),
+            "trace_stats should expose fsqlite_trace_spans_total"
+        );
+        assert!(
+            metric_names
+                .iter()
+                .any(|name| name == "fsqlite_trace_export_errors_total"),
+            "trace_stats should expose fsqlite_trace_export_errors_total"
+        );
+        assert!(
+            metric_names
+                .iter()
+                .any(|name| name == "fsqlite_compat_trace_callbacks_total"),
+            "trace_stats should expose fsqlite_compat_trace_callbacks_total"
+        );
+    }
+
+    #[test]
+    fn test_pragma_trace_reset_returns_ok() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.query("PRAGMA trace_reset;").unwrap();
+        let snapshot = trace_metrics_snapshot();
+        assert_eq!(
+            snapshot.fsqlite_trace_export_errors_total, 0,
+            "trace_reset should clear export error counter"
+        );
+    }
+
+    #[test]
+    fn test_trace_v2_emits_stmt_profile_row_and_close() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::<TraceEvent>::new()));
+        let sink = Arc::clone(&events);
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.trace_v2(
+            TraceMask::ALL,
+            Some(Arc::new(move |event| {
+                sink.lock().expect("trace sink mutex poisoned").push(event);
+            })),
+        );
+        conn.query("SELECT id FROM t;").unwrap();
+        conn.close().unwrap();
+
+        let captured = events.lock().expect("trace sink mutex poisoned").clone();
+        assert!(
+            captured.iter().any(|event| matches!(
+                event,
+                TraceEvent::Statement { sql } if sql.contains("SELECT id FROM t")
+            )),
+            "expected statement callback for SELECT"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|event| matches!(event, TraceEvent::Profile { .. })),
+            "expected profile callback"
+        );
+        assert!(
+            captured.iter().any(|event| matches!(
+                event,
+                TraceEvent::Row { values }
+                    if matches!(values.first(), Some(SqliteValue::Integer(1)))
+            )),
+            "expected row callback with selected value"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|event| matches!(event, TraceEvent::Close)),
+            "expected close callback"
+        );
+    }
+
+    #[test]
+    fn test_trace_v2_mask_filters_callback_types() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::<TraceEvent>::new()));
+        let sink = Arc::clone(&events);
+
+        let conn = Connection::open(":memory:").unwrap();
+        conn.trace_v2(
+            TraceMask::STMT,
+            Some(Arc::new(move |event| {
+                sink.lock().expect("trace sink mutex poisoned").push(event);
+            })),
+        );
+        conn.query("SELECT 1;").unwrap();
+
+        let captured = events.lock().expect("trace sink mutex poisoned");
+        assert!(
+            captured
+                .iter()
+                .any(|event| matches!(event, TraceEvent::Statement { .. })),
+            "expected at least one statement callback"
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|event| matches!(event, TraceEvent::Statement { .. })),
+            "TraceMask::STMT should filter out profile/row/close callbacks"
+        );
+        drop(captured);
+    }
+
+    #[test]
+    fn test_trace_v2_lifecycle_and_trace_metrics_for_multi_statement_workload() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.query("PRAGMA trace_reset;").unwrap();
+        let baseline = trace_metrics_snapshot();
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::<TraceEvent>::new()));
+        let sink = Arc::clone(&events);
+        conn.trace_v2(
+            TraceMask::ALL,
+            Some(Arc::new(move |event| {
+                sink.lock().expect("trace sink mutex poisoned").push(event);
+            })),
+        );
+
+        conn.execute("CREATE TABLE trace_cov (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO trace_cov VALUES (1, 10);")
+            .unwrap();
+        conn.execute("UPDATE trace_cov SET v = v + 1 WHERE id = 1;")
+            .unwrap();
+        conn.query("SELECT v FROM trace_cov WHERE id = 1;").unwrap();
+        conn.execute("DELETE FROM trace_cov WHERE id = 1;").unwrap();
+        conn.trace_v2(TraceMask::ALL, None);
+
+        let captured = events.lock().expect("trace sink mutex poisoned").clone();
+        let statement_count = captured
+            .iter()
+            .filter(|event| matches!(event, TraceEvent::Statement { .. }))
+            .count();
+        let profile_count = captured
+            .iter()
+            .filter(|event| matches!(event, TraceEvent::Profile { .. }))
+            .count();
+        assert!(
+            statement_count >= 5,
+            "expected at least one stmt callback per executed statement"
+        );
+        assert!(
+            profile_count >= statement_count,
+            "expected profile callbacks to cover every observed statement callback"
+        );
+        assert!(
+            captured.iter().any(|event| matches!(
+                event,
+                TraceEvent::Row { values }
+                    if matches!(values.first(), Some(SqliteValue::Integer(11)))
+            )),
+            "expected row callback to include updated SELECT value"
+        );
+
+        let snapshot = trace_metrics_snapshot();
+        assert!(
+            snapshot.fsqlite_trace_spans_total > baseline.fsqlite_trace_spans_total,
+            "trace span counter should increase for a multi-statement workload"
+        );
+        assert!(
+            snapshot.fsqlite_compat_trace_callbacks_total >= captured.len() as u64,
+            "compat callback counter should include emitted callbacks"
+        );
     }
 }

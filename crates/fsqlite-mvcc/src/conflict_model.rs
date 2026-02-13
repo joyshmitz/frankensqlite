@@ -131,6 +131,14 @@ pub const MIN_AMS_R: usize = 8;
 pub const MAX_AMS_R: usize = 32;
 /// Sketch version marker recorded in evidence logs.
 pub const AMS_SKETCH_VERSION: &str = "fsqlite:m2:ams:v1";
+/// NitroSketch cardinality sketch version marker.
+pub const NITRO_SKETCH_VERSION: &str = "fsqlite:cardinality:nitro:v1";
+/// Default NitroSketch precision (register count `m = 2^p`).
+pub const DEFAULT_NITRO_PRECISION: u8 = 12;
+/// Minimum NitroSketch precision.
+pub const MIN_NITRO_PRECISION: u8 = 4;
+/// Maximum NitroSketch precision.
+pub const MAX_NITRO_PRECISION: u8 = 18;
 
 /// Default heavy-hitter table capacity (SpaceSaving K).
 pub const DEFAULT_HEAVY_HITTER_K: usize = 64;
@@ -152,10 +160,162 @@ pub fn validate_ams_r(r: usize) -> bool {
     (MIN_AMS_R..=MAX_AMS_R).contains(&r)
 }
 
+/// Validate whether NitroSketch precision `p` is within bounds.
+#[must_use]
+pub fn validate_nitro_precision(precision: u8) -> bool {
+    (MIN_NITRO_PRECISION..=MAX_NITRO_PRECISION).contains(&precision)
+}
+
 /// Validate whether SpaceSaving `K` is within normative bounds.
 #[must_use]
 pub fn validate_heavy_hitter_k(k: usize) -> bool {
     (MIN_HEAVY_HITTER_K..=MAX_HEAVY_HITTER_K).contains(&k)
+}
+
+/// NitroSketch cardinality estimator configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NitroSketchConfig {
+    /// Precision `p` (register count `m = 2^p`).
+    pub precision: u8,
+    /// User-provided deterministic seed.
+    pub seed: u64,
+}
+
+impl Default for NitroSketchConfig {
+    fn default() -> Self {
+        Self {
+            precision: DEFAULT_NITRO_PRECISION,
+            seed: 0,
+        }
+    }
+}
+
+/// NitroSketch cardinality estimator (HyperLogLog-style).
+///
+/// Tracks approximate distinct cardinality with bounded memory and fixed update
+/// cost. The relative standard error is approximately `1.04 / sqrt(m)` where
+/// `m = 2^precision`.
+#[derive(Clone)]
+pub struct NitroSketch {
+    precision: u8,
+    seed: u64,
+    registers: Vec<u8>,
+}
+
+impl fmt::Debug for NitroSketch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NitroSketch")
+            .field("precision", &self.precision)
+            .field("register_count", &self.registers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NitroSketch {
+    /// Create a NitroSketch from configuration.
+    #[must_use]
+    pub fn new(config: &NitroSketchConfig) -> Self {
+        assert!(
+            validate_nitro_precision(config.precision),
+            "NitroSketch precision must be in [{MIN_NITRO_PRECISION}, {MAX_NITRO_PRECISION}], got {}",
+            config.precision
+        );
+        let register_count = 1_usize << usize::from(config.precision);
+        Self {
+            precision: config.precision,
+            seed: config.seed,
+            registers: vec![0; register_count],
+        }
+    }
+
+    /// Observe one element value.
+    pub fn observe_u64(&mut self, value: u64) {
+        let salted = value ^ self.seed ^ 0x4E49_5452_4F53_4B45;
+        let hash = mix64(salted);
+
+        let precision_u32 = u32::from(self.precision);
+        let index_shift = 64_u32.saturating_sub(precision_u32);
+        let index_u64 = hash >> index_shift;
+        let index = usize::try_from(index_u64).expect("register index should fit usize");
+
+        let remaining = hash << precision_u32;
+        let rank_u32 = remaining.leading_zeros().saturating_add(1);
+        let max_rank_u32 = 64_u32.saturating_sub(precision_u32).saturating_add(1);
+        let rank_u8 =
+            u8::try_from(rank_u32.min(max_rank_u32)).expect("rank should fit in u8 register");
+        self.registers[index] = self.registers[index].max(rank_u8);
+    }
+
+    /// Estimate distinct cardinality.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::naive_bytecount)]
+    pub fn estimate_cardinality(&self) -> f64 {
+        let register_count = self.registers.len();
+        let m = register_count as f64;
+        let alpha = nitro_alpha(register_count);
+        let denominator = self
+            .registers
+            .iter()
+            .map(|&register| 2_f64.powi(-i32::from(register)))
+            .sum::<f64>();
+        let raw_estimate = alpha * m * m / denominator;
+
+        let zero_registers = self
+            .registers
+            .iter()
+            .filter(|&&register| register == 0)
+            .count();
+        if raw_estimate <= 2.5 * m && zero_registers > 0 {
+            let zero_count = zero_registers as f64;
+            return m * (m / zero_count).ln();
+        }
+
+        let two_pow_32 = 4_294_967_296_f64;
+        if raw_estimate > two_pow_32 / 30.0 {
+            return -two_pow_32 * (1.0 - raw_estimate / two_pow_32).ln();
+        }
+
+        raw_estimate
+    }
+
+    /// Theoretical relative standard error (`1.04 / sqrt(m)`).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn relative_standard_error(&self) -> f64 {
+        1.04 / (self.registers.len() as f64).sqrt()
+    }
+
+    /// Configured precision `p`.
+    #[must_use]
+    pub fn precision(&self) -> u8 {
+        self.precision
+    }
+
+    /// Number of registers `m = 2^p`.
+    #[must_use]
+    pub fn register_count(&self) -> usize {
+        self.registers.len()
+    }
+
+    /// Memory footprint in bytes.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        self.registers.len()
+    }
+}
+
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+fn nitro_alpha(register_count: usize) -> f64 {
+    match register_count {
+        16 => 0.673,
+        32 => 0.697,
+        64 => 0.709,
+        _ => {
+            let m = register_count as f64;
+            0.7213 / (1.0 + 1.079 / m)
+        }
+    }
 }
 
 /// AMS F2 sketch configuration.
@@ -1271,6 +1431,62 @@ mod tests {
         (1..=k)
             .map(|rank| (((rank as f64).powf(-s) * scale).round() as u64).max(1))
             .collect()
+    }
+
+    #[test]
+    fn test_nitro_sketch_precision_validation() {
+        assert!(validate_nitro_precision(DEFAULT_NITRO_PRECISION));
+        assert!(validate_nitro_precision(MIN_NITRO_PRECISION));
+        assert!(validate_nitro_precision(MAX_NITRO_PRECISION));
+        assert!(!validate_nitro_precision(
+            MIN_NITRO_PRECISION.saturating_sub(1)
+        ));
+        assert!(!validate_nitro_precision(
+            MAX_NITRO_PRECISION.saturating_add(1)
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_nitro_sketch_cardinality_accuracy_one_million_distinct() {
+        let mut sketch = NitroSketch::new(&NitroSketchConfig {
+            precision: DEFAULT_NITRO_PRECISION,
+            seed: 0x00C0_FFEE_u64,
+        });
+        for value in 0_u64..1_000_000_u64 {
+            sketch.observe_u64(value);
+        }
+
+        let estimate = sketch.estimate_cardinality();
+        let exact = 1_000_000_f64;
+        let relative_error = ((estimate - exact) / exact).abs();
+        assert!(
+            relative_error <= 0.05,
+            "bead_id={BEAD_ID_3U2V} case=nitro_accuracy_1m estimate={estimate} exact={exact} rel_error={relative_error}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_nitro_sketch_deterministic_replay() {
+        let config = NitroSketchConfig {
+            precision: DEFAULT_NITRO_PRECISION,
+            seed: 0xFACE_u64,
+        };
+        let mut a = NitroSketch::new(&config);
+        let mut b = NitroSketch::new(&config);
+        for value in 0_u64..200_000_u64 {
+            let mixed = mix64(value.wrapping_mul(31).wrapping_add(7));
+            a.observe_u64(mixed);
+            b.observe_u64(mixed);
+        }
+
+        let estimate_a = a.estimate_cardinality();
+        let estimate_b = b.estimate_cardinality();
+        assert!(
+            (estimate_a - estimate_b).abs() <= f64::EPSILON,
+            "bead_id={BEAD_ID_3U2V} case=nitro_determinism estimate_a={estimate_a} estimate_b={estimate_b}"
+        );
     }
 
     #[test]

@@ -22,6 +22,83 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
+// Structured trace metrics (bd-19u.1)
+// ---------------------------------------------------------------------------
+
+static FSQLITE_TRACE_SPANS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_TRACE_EXPORT_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_COMPAT_TRACE_CALLBACKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TRACE_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static DECISION_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Snapshot of structured tracing counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TraceMetricsSnapshot {
+    pub fsqlite_trace_spans_total: u64,
+    pub fsqlite_trace_export_errors_total: u64,
+    pub fsqlite_compat_trace_callbacks_total: u64,
+}
+
+/// Allocate the next trace identifier.
+#[must_use]
+pub fn next_trace_id() -> u64 {
+    TRACE_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Allocate the next decision identifier.
+#[must_use]
+pub fn next_decision_id() -> u64 {
+    DECISION_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Record creation of a tracing span in the SQL pipeline.
+pub fn record_trace_span_created() {
+    FSQLITE_TRACE_SPANS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record an export batch for tracing spans.
+pub fn record_trace_export(spans_exported: u64, export_latency_us: u64) {
+    let span = tracing::span!(
+        target: "fsqlite.trace_export",
+        tracing::Level::DEBUG,
+        "trace_export",
+        spans_exported,
+        export_latency_us
+    );
+    let _guard = span.enter();
+    tracing::debug!("trace export observed");
+}
+
+/// Record a failed span-export attempt.
+pub fn record_trace_export_error() {
+    FSQLITE_TRACE_EXPORT_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a sqlite3_trace_v2 compatibility callback invocation.
+pub fn record_compat_trace_callback() {
+    FSQLITE_COMPAT_TRACE_CALLBACKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Read a point-in-time snapshot of trace counters.
+#[must_use]
+pub fn trace_metrics_snapshot() -> TraceMetricsSnapshot {
+    TraceMetricsSnapshot {
+        fsqlite_trace_spans_total: FSQLITE_TRACE_SPANS_TOTAL.load(Ordering::Relaxed),
+        fsqlite_trace_export_errors_total: FSQLITE_TRACE_EXPORT_ERRORS_TOTAL
+            .load(Ordering::Relaxed),
+        fsqlite_compat_trace_callbacks_total: FSQLITE_COMPAT_TRACE_CALLBACKS_TOTAL
+            .load(Ordering::Relaxed),
+    }
+}
+
+/// Reset trace counters to zero (tests/diagnostics).
+pub fn reset_trace_metrics() {
+    FSQLITE_TRACE_SPANS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_TRACE_EXPORT_ERRORS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_COMPAT_TRACE_CALLBACKS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
 // ConflictEvent — the core event type
 // ---------------------------------------------------------------------------
 
@@ -767,6 +844,38 @@ mod tests {
 
         assert_eq!(m.ssi_aborts.load(Ordering::Relaxed), 3);
         assert_eq!(m.conflicts_total.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn trace_metrics_snapshot_and_reset() {
+        reset_trace_metrics();
+        record_trace_span_created();
+        record_trace_span_created();
+        record_trace_export(2, 17);
+        record_trace_export_error();
+        record_compat_trace_callback();
+
+        let snapshot = trace_metrics_snapshot();
+        assert_eq!(snapshot.fsqlite_trace_spans_total, 2);
+        assert_eq!(snapshot.fsqlite_trace_export_errors_total, 1);
+        assert_eq!(snapshot.fsqlite_compat_trace_callbacks_total, 1);
+
+        reset_trace_metrics();
+        let reset = trace_metrics_snapshot();
+        assert_eq!(reset.fsqlite_trace_spans_total, 0);
+        assert_eq!(reset.fsqlite_trace_export_errors_total, 0);
+        assert_eq!(reset.fsqlite_compat_trace_callbacks_total, 0);
+    }
+
+    #[test]
+    fn trace_and_decision_ids_are_monotonic() {
+        let first_trace = next_trace_id();
+        let second_trace = next_trace_id();
+        assert!(second_trace > first_trace);
+
+        let first_decision = next_decision_id();
+        let second_decision = next_decision_id();
+        assert!(second_decision > first_decision);
     }
 
     #[test]

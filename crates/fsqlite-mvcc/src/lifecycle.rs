@@ -539,6 +539,35 @@ impl TransactionManager {
         }
     }
 
+    /// Read an inclusive page range and record page-level predicate witnesses.
+    ///
+    /// This is the range-scan callsite for SSI tracking: every scanned page is
+    /// captured in the read-set/witness ledger, including pages with no visible
+    /// committed version (tracked at `snapshot.high` fallback).
+    #[must_use]
+    pub fn read_page_range(
+        &self,
+        txn: &mut Transaction,
+        start_page: PageNumber,
+        end_page: PageNumber,
+    ) -> Vec<(PageNumber, Option<PageData>)> {
+        if start_page.get() > end_page.get() {
+            return Vec::new();
+        }
+
+        let mut pages_touched = Vec::new();
+        let mut visible_pages = Vec::new();
+        for raw_page in start_page.get()..=end_page.get() {
+            if let Some(page) = PageNumber::new(raw_page) {
+                pages_touched.push(page);
+                visible_pages.push((page, self.read_page(txn, page)));
+            }
+        }
+
+        self.record_range_scan(txn, &pages_touched);
+        visible_pages
+    }
+
     /// Write a page within a transaction.
     ///
     /// Per spec §5.4:
@@ -1224,6 +1253,7 @@ impl std::fmt::Debug for TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
     use std::io;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -1324,8 +1354,8 @@ mod tests {
         assert!(read.is_some());
 
         let after = crate::observability::mvcc_snapshot_metrics_snapshot();
-        assert!(after.versions_traversed_samples >= before.versions_traversed_samples + 1);
-        assert!(after.versions_traversed_sum >= before.versions_traversed_sum + 1);
+        assert!(after.versions_traversed_samples > before.versions_traversed_samples);
+        assert!(after.versions_traversed_sum > before.versions_traversed_sum);
         assert!(after.fsqlite_mvcc_active_snapshots >= 1);
         assert!(logs.contains("snapshot_read"));
         assert!(logs.contains("versions_traversed"));
@@ -1519,6 +1549,160 @@ mod tests {
             reader
                 .read_keys
                 .contains(&fsqlite_types::WitnessKey::Page(p2))
+        );
+    }
+
+    #[test]
+    fn test_read_page_range_tracks_predicate_coverage_including_empty_pages() {
+        let m = mgr();
+        let p20 = PageNumber::new(20).unwrap();
+        let p21 = PageNumber::new(21).unwrap();
+        let p22 = PageNumber::new(22).unwrap();
+        let p23 = PageNumber::new(23).unwrap();
+
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, p20, test_data(0x41)).unwrap();
+        m.write_page(&mut seed, p22, test_data(0x42)).unwrap();
+        let committed = m.commit(&mut seed).unwrap();
+
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let scanned = m.read_page_range(&mut reader, p20, p23);
+        assert_eq!(scanned.len(), 4);
+        assert_eq!(
+            scanned
+                .iter()
+                .filter_map(|(page, data)| data.as_ref().map(|_| page.get()))
+                .collect::<Vec<_>>(),
+            vec![20, 22]
+        );
+
+        for page in [p20, p21, p22, p23] {
+            assert!(
+                reader.read_keys.contains(&fsqlite_types::WitnessKey::Page(page)),
+                "range read must register page witness for scanned page {}",
+                page.get()
+            );
+            assert_eq!(
+                reader.read_set_maybe_contains(page),
+                true,
+                "range read-set membership must include scanned page {}",
+                page.get()
+            );
+            assert_eq!(
+                reader.read_version_for_page(page),
+                Some(committed),
+                "scanned page {} should record visible version",
+                page.get()
+            );
+        }
+        assert_eq!(reader.thread_local_read_set_len(), 4);
+    }
+
+    #[test]
+    fn test_read_page_range_inverted_bounds_is_noop() {
+        let m = mgr();
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let p30 = PageNumber::new(30).unwrap();
+        let p25 = PageNumber::new(25).unwrap();
+
+        let scanned = m.read_page_range(&mut reader, p30, p25);
+        assert!(scanned.is_empty());
+        assert!(reader.read_set_versions.is_empty());
+        assert!(reader.read_keys.is_empty());
+        assert_eq!(reader.thread_local_read_set_len(), 0);
+    }
+
+    fn read_page_range_without_tracking(
+        manager: &TransactionManager,
+        txn: &mut Transaction,
+        start_page: PageNumber,
+        end_page: PageNumber,
+    ) -> Vec<(PageNumber, Option<PageData>)> {
+        if start_page.get() > end_page.get() {
+            return Vec::new();
+        }
+        let mut visible_pages = Vec::new();
+        for raw_page in start_page.get()..=end_page.get() {
+            if let Some(page) = PageNumber::new(raw_page) {
+                visible_pages.push((page, manager.read_page(txn, page)));
+            }
+        }
+        visible_pages
+    }
+
+    fn consume_scan_rows(rows: &[(PageNumber, Option<PageData>)]) -> u64 {
+        let mut checksum = 0_u64;
+        for (_, page_data) in rows {
+            if let Some(page_data) = page_data {
+                for byte in page_data.as_bytes() {
+                    checksum = checksum.wrapping_add(u64::from(*byte));
+                }
+            }
+        }
+        checksum
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_range_scan_tracking_overhead_under_five_percent() {
+        const START_PAGE: u32 = 100;
+        const END_PAGE: u32 = 227;
+        const ITERATIONS: u32 = 24;
+        const TRIALS: usize = 3;
+
+        let m = mgr();
+
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        for raw_page in START_PAGE..=END_PAGE {
+            let page = PageNumber::new(raw_page).unwrap();
+            m.write_page(&mut seed, page, test_data((raw_page % 251) as u8))
+                .unwrap();
+        }
+        m.commit(&mut seed).unwrap();
+
+        let start_page = PageNumber::new(START_PAGE).unwrap();
+        let end_page = PageNumber::new(END_PAGE).unwrap();
+
+        let baseline_elapsed = (0..TRIALS)
+            .map(|_| {
+                let run_start = Instant::now();
+                for _ in 0..ITERATIONS {
+                    let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+                    let rows =
+                        read_page_range_without_tracking(&m, &mut reader, start_page, end_page);
+                    let checksum =
+                        consume_scan_rows(&rows).rotate_left(7) ^ consume_scan_rows(&rows);
+                    black_box(checksum);
+                    m.abort(&mut reader);
+                }
+                run_start.elapsed()
+            })
+            .min()
+            .unwrap_or(Duration::ZERO);
+
+        let tracked_elapsed = (0..TRIALS)
+            .map(|_| {
+                let run_start = Instant::now();
+                for _ in 0..ITERATIONS {
+                    let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+                    let rows = m.read_page_range(&mut reader, start_page, end_page);
+                    let checksum =
+                        consume_scan_rows(&rows).rotate_left(7) ^ consume_scan_rows(&rows);
+                    black_box(checksum);
+                    m.abort(&mut reader);
+                }
+                run_start.elapsed()
+            })
+            .min()
+            .unwrap_or(Duration::ZERO);
+
+        let baseline_secs = baseline_elapsed.as_secs_f64().max(f64::EPSILON);
+        let tracked_secs = tracked_elapsed.as_secs_f64();
+        let overhead_ratio = ((tracked_secs - baseline_secs) / baseline_secs).max(0.0);
+        assert!(
+            overhead_ratio <= 0.05,
+            "range-scan tracking overhead must remain <=5%; baseline={baseline_elapsed:?} tracked={tracked_elapsed:?} overhead={:.2}%",
+            overhead_ratio * 100.0
         );
     }
 

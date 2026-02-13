@@ -954,10 +954,13 @@ dependencies = [
 name = "fsqlite-planner"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fsqlite-ast",
  "fsqlite-error",
  "fsqlite-types",
  "proptest",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

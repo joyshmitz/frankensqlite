@@ -3,7 +3,7 @@
 //! This crate will grow a stable, ergonomic API surface over time. In early
 //! phases it also re-exports selected internal crates for integration tests.
 
-pub use fsqlite_core::connection::{Connection, PreparedStatement, Row};
+pub use fsqlite_core::connection::{Connection, PreparedStatement, Row, TraceEvent, TraceMask};
 pub use fsqlite_vfs;
 
 #[cfg(test)]

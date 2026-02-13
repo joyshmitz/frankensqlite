@@ -18,9 +18,10 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use fsqlite_mvcc::{
-    ActiveTxnView, CommitIndex, CommittedWriterInfo, ConcurrentRegistry, DiscoveredEdge, GcTodo,
-    InProcessPageLockTable, VersionArena, VersionIdx, discover_incoming_edges,
-    discover_outgoing_edges, gc_tick, prune_page_chain, validate_first_committer_wins,
+    ActiveTxnView, BeginKind, CommitIndex, CommittedWriterInfo, ConcurrentRegistry,
+    DiscoveredEdge, GcTodo, InProcessPageLockTable, TransactionManager, VersionArena, VersionIdx,
+    discover_incoming_edges, discover_outgoing_edges, gc_tick, prune_page_chain,
+    validate_first_committer_wins,
 };
 use fsqlite_observability::{ConflictObserver, MetricsObserver};
 use fsqlite_types::{
@@ -52,6 +53,26 @@ fn make_page_version(pgno: u32, seq: u64) -> PageVersion {
         data: PageData::zeroed(PageSize::default()),
         prev: None,
     }
+}
+
+fn seeded_scan_manager(start_page: u32, end_page: u32) -> TransactionManager {
+    let mut manager = TransactionManager::new(PageSize::DEFAULT);
+    manager.set_txn_max_duration_ms(u64::MAX);
+
+    let mut writer = manager
+        .begin(BeginKind::Immediate)
+        .expect("seed writer should begin");
+    for raw_page in start_page..=end_page {
+        manager
+            .write_page(
+                &mut writer,
+                page(raw_page),
+                PageData::zeroed(PageSize::default()),
+            )
+            .expect("seed write should succeed");
+    }
+    manager.commit(&mut writer).expect("seed commit should succeed");
+    manager
 }
 
 // ---------------------------------------------------------------------------
@@ -478,6 +499,62 @@ fn bench_gc_tick(c: &mut Criterion) {
                 BatchSize::SmallInput,
             );
         });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// SSI tracking overhead benchmarks
+// ---------------------------------------------------------------------------
+
+/// Benchmark: incremental overhead of range-scan tracking over baseline reads.
+///
+/// Baseline path performs identical page reads without the explicit
+/// `record_range_scan` pass. Tracked path calls `read_page_range`, which
+/// reuses page reads and adds predicate witness/read-set range capture.
+fn bench_range_scan_tracking_overhead(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ssi/range_scan_tracking_overhead");
+    group.sample_size(24);
+    group.measurement_time(Duration::from_secs(10));
+
+    for &pages_per_scan in &[32_u32, 128, 256] {
+        let start_page = 10_u32;
+        let end_page = start_page + pages_per_scan - 1;
+        group.throughput(Throughput::Elements(u64::from(pages_per_scan)));
+
+        group.bench_with_input(
+            BenchmarkId::new("baseline_reads", pages_per_scan),
+            &pages_per_scan,
+            |b, &_| {
+                let manager = seeded_scan_manager(start_page, end_page);
+                b.iter(|| {
+                    let mut reader = manager
+                        .begin(BeginKind::Concurrent)
+                        .expect("reader begin should succeed");
+                    for raw_page in start_page..=end_page {
+                        black_box(manager.read_page(&mut reader, page(raw_page)));
+                    }
+                    manager.abort(&mut reader);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("range_tracking", pages_per_scan),
+            &pages_per_scan,
+            |b, &_| {
+                let manager = seeded_scan_manager(start_page, end_page);
+                b.iter(|| {
+                    let mut reader = manager
+                        .begin(BeginKind::Concurrent)
+                        .expect("reader begin should succeed");
+                    let rows = manager.read_page_range(&mut reader, page(start_page), page(end_page));
+                    black_box(rows.len());
+                    manager.abort(&mut reader);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -945,6 +1022,13 @@ criterion_group!(
 );
 
 criterion_group!(
+    name = ssi_tracking;
+    config = criterion_config();
+    targets =
+        bench_range_scan_tracking_overhead
+);
+
+criterion_group!(
     name = multi_thread;
     config = criterion_config();
     targets =
@@ -959,5 +1043,6 @@ criterion_main!(
     gc,
     concurrent_writers,
     ssi_edge_discovery,
+    ssi_tracking,
     multi_thread
 );

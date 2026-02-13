@@ -267,6 +267,128 @@ fn test_repair_generation_catches_up() {
 }
 
 #[test]
+fn test_repair_generation_backpressure_queue_full() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("queue-full.wal-fec");
+    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
+        queue_capacity: 1,
+        per_symbol_delay: Duration::from_millis(120),
+    })
+    .expect("pipeline should start");
+
+    let item_a = sample_work_item(&sidecar_path, 1, 4, 3, 31, b"queue-a", 900);
+    let item_b = sample_work_item(&sidecar_path, 5, 4, 3, 33, b"queue-b", 904);
+    let item_c = sample_work_item(&sidecar_path, 9, 4, 3, 35, b"queue-c", 908);
+
+    pipeline.enqueue(item_a).expect("enqueue A should succeed");
+    let second = pipeline.enqueue(item_b);
+    let third = pipeline.enqueue(item_c);
+    let queue_full_error = second
+        .err()
+        .or_else(|| third.err())
+        .expect("at least one enqueue must fail from queue-full backpressure");
+    assert!(
+        queue_full_error.to_string().contains("queue full"),
+        "expected queue-full backpressure error, got {queue_full_error}"
+    );
+
+    pipeline.cancel();
+    let _ = pipeline.shutdown().expect("shutdown should succeed");
+}
+
+#[test]
+fn test_repair_generation_shutdown_drains_pending_jobs() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("shutdown-drain.wal-fec");
+    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
+        queue_capacity: 16,
+        per_symbol_delay: Duration::from_millis(10),
+    })
+    .expect("pipeline should start");
+
+    for index in 0_u32..4 {
+        let tag = format!("drain-{index}");
+        let item = sample_work_item(
+            &sidecar_path,
+            (index * 4) + 1,
+            4,
+            2,
+            u8::try_from(index + 41).expect("small index should fit u8"),
+            tag.as_bytes(),
+            1_200 + index,
+        );
+        pipeline.enqueue(item).expect("enqueue should succeed");
+    }
+
+    let stats = pipeline.shutdown().expect("shutdown should drain queue");
+    assert_eq!(stats.completed_jobs, 4);
+    assert_eq!(stats.failed_jobs, 0);
+    assert_eq!(stats.canceled_jobs, 0);
+
+    let scan = scan_wal_fec(&sidecar_path).expect("sidecar scan should succeed");
+    assert_eq!(scan.groups.len(), 4);
+}
+
+#[test]
+#[allow(clippy::cast_precision_loss)]
+fn test_repair_generation_commit_path_overhead_under_one_percent() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("throughput-window.wal-fec");
+    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
+        queue_capacity: 256,
+        per_symbol_delay: Duration::from_millis(12),
+    })
+    .expect("pipeline should start");
+
+    let commits = 80_u32;
+    let simulated_commit_cost = Duration::from_millis(4);
+    let mut queued_work = Vec::with_capacity(usize::try_from(commits).expect("small count"));
+    for index in 0..commits {
+        let tag = format!("overhead-{index}");
+        queued_work.push(sample_work_item(
+            &sidecar_path,
+            (index * 4) + 1,
+            4,
+            2,
+            u8::try_from((index % 200) + 51).expect("small index should fit u8"),
+            tag.as_bytes(),
+            2_000 + index,
+        ));
+    }
+
+    let baseline_start = Instant::now();
+    for _ in 0..commits {
+        thread::sleep(simulated_commit_cost);
+    }
+    let baseline_elapsed = baseline_start.elapsed();
+
+    let async_start = Instant::now();
+    for item in queued_work {
+        thread::sleep(simulated_commit_cost);
+        pipeline
+            .enqueue(item)
+            .expect("enqueue should remain non-blocking under bounded queue");
+    }
+    let async_elapsed = async_start.elapsed();
+
+    assert!(
+        pipeline.flush(Duration::from_secs(40)),
+        "pipeline should catch up after throughput run"
+    );
+    let stats = pipeline.shutdown().expect("shutdown should succeed");
+    assert_eq!(stats.failed_jobs, 0);
+
+    let baseline_secs = baseline_elapsed.as_secs_f64().max(f64::EPSILON);
+    let async_secs = async_elapsed.as_secs_f64();
+    let overhead_ratio = ((async_secs - baseline_secs) / baseline_secs).max(0.0);
+    assert!(
+        overhead_ratio <= 0.01,
+        "critical-path overhead should remain <=1%; baseline={baseline_elapsed:?} async={async_elapsed:?} overhead={:.2}%",
+        overhead_ratio * 100.0
+    );
+}
+
+#[test]
 fn test_repair_generation_cancel_safe() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("cancel.wal-fec");
