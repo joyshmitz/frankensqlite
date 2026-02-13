@@ -363,6 +363,220 @@ pub fn select_ci_lanes_for_paths(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lane selection orchestrator (bd-mblr.7.9)
+// ---------------------------------------------------------------------------
+
+/// Bead identifier for the parent lane selection orchestrator.
+pub const LANE_SELECTION_BEAD_ID: &str = "bd-mblr.7.9";
+
+/// Overall verdict for a lane selection audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaneSelectionVerdict {
+    /// All scenarios resolved, safety floor enforced.
+    Pass,
+    /// Some unresolved paths but safety floor held.
+    Warning,
+    /// Safety floor compromised or critical failures.
+    Fail,
+}
+
+impl std::fmt::Display for LaneSelectionVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pass => write!(f, "PASS"),
+            Self::Warning => write!(f, "WARNING"),
+            Self::Fail => write!(f, "FAIL"),
+        }
+    }
+}
+
+/// Configuration for the lane selection audit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneSelectionAuditConfig {
+    /// Test scenarios: each is a list of changed paths to evaluate.
+    pub test_scenarios: Vec<Vec<String>>,
+    /// Maximum allowed unresolved paths across all scenarios.
+    pub max_unresolved_paths: usize,
+    /// Whether fallback to full suite is acceptable.
+    pub allow_fallback: bool,
+}
+
+impl Default for LaneSelectionAuditConfig {
+    fn default() -> Self {
+        Self {
+            test_scenarios: vec![
+                vec!["crates/fsqlite-pager/src/lib.rs".to_owned()],
+                vec!["crates/fsqlite-btree/src/lib.rs".to_owned()],
+                vec!["crates/fsqlite-parser/src/lib.rs".to_owned()],
+                vec!["crates/fsqlite-mvcc/src/lib.rs".to_owned()],
+                vec![
+                    "crates/fsqlite-vdbe/src/lib.rs".to_owned(),
+                    "crates/fsqlite-planner/src/lib.rs".to_owned(),
+                ],
+            ],
+            max_unresolved_paths: 5,
+            allow_fallback: true,
+        }
+    }
+}
+
+/// Per-scenario result within the audit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneSelectionScenarioResult {
+    /// Changed paths for this scenario.
+    pub changed_paths: Vec<String>,
+    /// Resolved code areas.
+    pub resolved_areas: usize,
+    /// Unresolved paths.
+    pub unresolved_count: usize,
+    /// Whether fallback was triggered.
+    pub fallback_triggered: bool,
+    /// Number of lanes selected.
+    pub lanes_selected: usize,
+    /// The lane selection report.
+    pub report: LaneSelectionReport,
+}
+
+/// Aggregated lane selection audit report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneSelectionAuditReport {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Bead ID.
+    pub bead_id: String,
+    /// Overall verdict.
+    pub verdict: LaneSelectionVerdict,
+    /// Per-scenario results.
+    pub scenario_results: Vec<LaneSelectionScenarioResult>,
+    /// Total scenarios evaluated.
+    pub total_scenarios: usize,
+    /// Total unresolved paths across all scenarios.
+    pub total_unresolved: usize,
+    /// Total fallback triggers.
+    pub total_fallbacks: usize,
+    /// Impact graph validation errors (should be empty).
+    pub graph_validation_errors: Vec<String>,
+    /// Summary for triage.
+    pub summary: String,
+}
+
+impl LaneSelectionAuditReport {
+    /// Render a one-line triage summary.
+    #[must_use]
+    pub fn triage_line(&self) -> String {
+        format!(
+            "{}: {} scenarios, {} unresolved, {} fallbacks, {} graph errors",
+            self.verdict,
+            self.total_scenarios,
+            self.total_unresolved,
+            self.total_fallbacks,
+            self.graph_validation_errors.len(),
+        )
+    }
+
+    /// Whether the audit passed.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.verdict == LaneSelectionVerdict::Pass
+    }
+
+    /// Serialize to JSON.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize from JSON.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Write a lane selection audit report to a file.
+pub fn write_lane_audit_report(
+    path: &std::path::Path,
+    report: &LaneSelectionAuditReport,
+) -> Result<(), String> {
+    let json = report.to_json().map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Load a lane selection audit report from a file.
+pub fn load_lane_audit_report(
+    path: &std::path::Path,
+) -> Result<LaneSelectionAuditReport, String> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    LaneSelectionAuditReport::from_json(&data)
+        .map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Run the lane selection audit: evaluate multiple scenarios against the impact graph.
+#[must_use]
+pub fn run_lane_selection_audit(config: &LaneSelectionAuditConfig) -> LaneSelectionAuditReport {
+    let graph = ImpactGraph::canonical();
+    let graph_errors = graph.validate();
+
+    let mut scenario_results = Vec::with_capacity(config.test_scenarios.len());
+    let mut total_unresolved: usize = 0;
+    let mut total_fallbacks: usize = 0;
+
+    for paths in &config.test_scenarios {
+        let report = select_ci_lanes_for_paths(paths, &graph, None);
+        let unresolved_count = report.unresolved_paths.len();
+        let fallback_triggered = report.fallback_full_suite;
+        let lanes_selected = report.decisions.len();
+        let resolved_areas = report.resolved_code_areas.len();
+
+        total_unresolved += unresolved_count;
+        if fallback_triggered {
+            total_fallbacks += 1;
+        }
+
+        scenario_results.push(LaneSelectionScenarioResult {
+            changed_paths: paths.clone(),
+            resolved_areas,
+            unresolved_count,
+            fallback_triggered,
+            lanes_selected,
+            report,
+        });
+    }
+
+    let verdict = if !graph_errors.is_empty() {
+        LaneSelectionVerdict::Fail
+    } else if total_unresolved > config.max_unresolved_paths {
+        LaneSelectionVerdict::Fail
+    } else if !config.allow_fallback && total_fallbacks > 0 {
+        LaneSelectionVerdict::Fail
+    } else if total_unresolved > 0 || total_fallbacks > 0 {
+        LaneSelectionVerdict::Warning
+    } else {
+        LaneSelectionVerdict::Pass
+    };
+
+    let summary = format!(
+        "Lane audit: {} scenarios, {} unresolved, {} fallbacks, {} graph errors, verdict={}",
+        config.test_scenarios.len(),
+        total_unresolved,
+        total_fallbacks,
+        graph_errors.len(),
+        verdict,
+    );
+
+    LaneSelectionAuditReport {
+        schema_version: 1,
+        bead_id: LANE_SELECTION_BEAD_ID.to_owned(),
+        verdict,
+        scenario_results,
+        total_scenarios: config.test_scenarios.len(),
+        total_unresolved,
+        total_fallbacks,
+        graph_validation_errors: graph_errors,
+        summary,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

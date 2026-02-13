@@ -2288,6 +2288,173 @@ impl DriftReport {
 }
 
 // ---------------------------------------------------------------------------
+// Determinism watchdog orchestrator (bd-mblr.7.8)
+// ---------------------------------------------------------------------------
+
+/// Bead identifier for the parent determinism watchdog.
+pub const WATCHDOG_BEAD_ID: &str = "bd-mblr.7.8";
+
+/// Overall verdict for a watchdog run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WatchdogVerdict {
+    /// All probes pass across all toolchains.
+    Pass,
+    /// Some non-critical drift detected.
+    Warning,
+    /// Critical determinism failures detected.
+    Fail,
+}
+
+impl std::fmt::Display for WatchdogVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pass => write!(f, "PASS"),
+            Self::Warning => write!(f, "WARNING"),
+            Self::Fail => write!(f, "FAIL"),
+        }
+    }
+}
+
+/// Configuration for a determinism watchdog run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchdogConfig {
+    /// Root seed for deterministic derivation.
+    pub root_seed: u64,
+    /// Maximum tolerated failures before verdict is Fail.
+    pub max_failures: usize,
+    /// Maximum statistical-drift warnings before escalating.
+    pub max_drift_warnings: usize,
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            root_seed: 0xD3E7_A001,
+            max_failures: 0,
+            max_drift_warnings: 3,
+        }
+    }
+}
+
+/// Aggregated watchdog report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchdogReport {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+    /// Bead ID for traceability.
+    pub bead_id: String,
+    /// Overall verdict.
+    pub verdict: WatchdogVerdict,
+    /// Run session from the determinism runner.
+    pub session: RunSession,
+    /// Coverage metrics.
+    pub coverage: DeterminismCoverage,
+    /// Number of probe failures.
+    pub probe_failures: usize,
+    /// Number of drift warnings (statistical drift beyond threshold).
+    pub drift_warnings: usize,
+    /// Summary for triage.
+    pub summary: String,
+}
+
+impl WatchdogReport {
+    /// Render a one-line triage summary.
+    #[must_use]
+    pub fn triage_line(&self) -> String {
+        format!(
+            "{}: {} probes, {} toolchains, {} failures, {} drift warnings",
+            self.verdict,
+            self.session.probe_count,
+            self.session.toolchain_count,
+            self.probe_failures,
+            self.drift_warnings,
+        )
+    }
+
+    /// Whether the watchdog passed.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.verdict == WatchdogVerdict::Pass
+    }
+
+    /// Serialize to JSON.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize from JSON.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Write a watchdog report to a file.
+pub fn write_watchdog_report(
+    path: &std::path::Path,
+    report: &WatchdogReport,
+) -> Result<(), String> {
+    let json = report.to_json().map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Load a watchdog report from a file.
+pub fn load_watchdog_report(path: &std::path::Path) -> Result<WatchdogReport, String> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    WatchdogReport::from_json(&data).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Run the determinism watchdog: execute canonical matrix and produce report.
+#[must_use]
+pub fn run_watchdog(config: &WatchdogConfig) -> WatchdogReport {
+    let runner = DeterminismRunner::canonical(config.root_seed);
+    let matrix = &runner.matrix;
+    let coverage = compute_determinism_coverage(matrix);
+    let session = runner.execute_local();
+
+    let probe_failures = session
+        .probe_results
+        .iter()
+        .filter(|r| !r.all_passed)
+        .count();
+
+    let drift_warnings = session
+        .drift_summary
+        .iter()
+        .filter(|(k, _)| k.as_str() != "Identical")
+        .map(|(_, count)| *count)
+        .sum::<usize>();
+
+    let verdict = if probe_failures > config.max_failures {
+        WatchdogVerdict::Fail
+    } else if drift_warnings > config.max_drift_warnings {
+        WatchdogVerdict::Warning
+    } else {
+        WatchdogVerdict::Pass
+    };
+
+    let summary = format!(
+        "Watchdog: {} probes across {} toolchains, {} failures, {} drift warnings, overall={}",
+        session.probe_count,
+        session.toolchain_count,
+        probe_failures,
+        drift_warnings,
+        verdict,
+    );
+
+    WatchdogReport {
+        schema_version: 1,
+        bead_id: WATCHDOG_BEAD_ID.to_owned(),
+        verdict,
+        session,
+        coverage,
+        probe_failures,
+        drift_warnings,
+        summary,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

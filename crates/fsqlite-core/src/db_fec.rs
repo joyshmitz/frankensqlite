@@ -566,6 +566,10 @@ pub fn page_xxh3_128(page_data: &[u8]) -> [u8; 16] {
 /// `all_page_data` — function to read raw page data by pgno.
 /// `repair_symbols` — the R repair symbol data blocks for this group.
 ///
+/// Uses the RFC 6330 RaptorQ `InactivationDecoder` to reconstruct missing
+/// source pages from any combination of intact sources and repair symbols,
+/// provided at least K total symbols are available.
+///
 /// Returns the repaired page bytes or an error.
 #[allow(clippy::too_many_lines)]
 pub fn attempt_page_repair(
@@ -606,7 +610,6 @@ pub fn attempt_page_repair(
 
     // Add repair symbols.
     for (esi, sym_data) in repair_symbols {
-        // Validate repair symbol against expected object_id/oti.
         available.push((*esi, sym_data.clone()));
     }
 
@@ -638,40 +641,51 @@ pub fn attempt_page_repair(
         });
     }
 
-    // Simple XOR-based reconstruction: if we have K symbols including source + repair,
-    // we can reconstruct any missing source symbol.
-    //
-    // For the simulation here, we use a simplified approach:
-    // combine all available source symbols via XOR to recover the missing one
-    // when exactly 1 page is missing and we have repair parity.
-    //
-    // Full RaptorQ decode would be used for > 1 corruption; for the simulation
-    // we verify via the available-symbols count and use XOR parity for single loss.
-
-    // Build the recovered data by XOR of all other sources with the parity symbol.
-    // This works for single-fault recovery with simple XOR parity.
+    // Decode via RFC 6330 RaptorQ InactivationDecoder.
     let page_size = group_meta.page_size as usize;
-    let mut recovered = vec![0u8; page_size];
+    let k_usize = k as usize;
+    let seed = derive_db_fec_repair_seed(group_meta);
+    let decoder = asupersync::raptorq::decoder::InactivationDecoder::new(k_usize, page_size, seed);
 
-    // Use first repair symbol as base parity, XOR with all intact sources.
-    if let Some((_, parity_data)) = repair_symbols.first() {
-        recovered.copy_from_slice(&parity_data[..page_size.min(parity_data.len())]);
-        // XOR all intact source pages into recovered.
-        for i in 0..k {
-            let pgno = group_meta.start_pgno + i;
-            if pgno == target_pgno {
-                continue;
-            }
-            let data = all_page_data(pgno);
-            if verify_page_xxh3_128(&data, &group_meta.source_page_xxh3_128[i as usize]) {
-                for (j, b) in data.iter().enumerate() {
-                    if j < recovered.len() {
-                        recovered[j] ^= b;
-                    }
-                }
-            }
+    let mut received = decoder.constraint_symbols();
+
+    for (esi, data) in &available {
+        if (*esi as usize) < k_usize {
+            let (cols, coefs) = decoder.source_equation(*esi);
+            received.push(asupersync::raptorq::decoder::ReceivedSymbol {
+                esi: *esi,
+                is_source: true,
+                columns: cols,
+                coefficients: coefs,
+                data: data.clone(),
+            });
+        } else {
+            let (cols, coefs) = decoder.repair_equation(*esi);
+            received.push(asupersync::raptorq::decoder::ReceivedSymbol::repair(
+                *esi,
+                cols,
+                coefs,
+                data.clone(),
+            ));
         }
     }
+
+    let result = decoder
+        .decode(&received)
+        .map_err(|err| FrankenError::DatabaseCorrupt {
+            detail: format!("page {target_pgno}: RaptorQ decode failed: {err:?}"),
+        })?;
+
+    if result.source.len() != k_usize {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "page {target_pgno}: RaptorQ decode returned {} source symbols, expected {k}",
+                result.source.len()
+            ),
+        });
+    }
+
+    let recovered = result.source[local_idx as usize].clone();
 
     // Validate recovered page.
     if verify_page_xxh3_128(
@@ -1314,13 +1328,10 @@ mod tests {
         let digest = compute_db_gen_digest(1, 5, 0, 1);
         let meta = DbFecGroupMeta::new(page_size, 2, 4, 4, hashes, digest);
 
-        // Compute XOR parity of all 4 source pages.
-        let mut parity = vec![0u8; page_size as usize];
-        for d in &page_data {
-            for (j, b) in d.iter().enumerate() {
-                parity[j] ^= b;
-            }
-        }
+        // Generate RaptorQ repair symbols.
+        let source_slices: Vec<&[u8]> = page_data.iter().map(Vec::as_slice).collect();
+        let repair_data = compute_raptorq_repair_symbols(&meta, &source_slices, page_size as usize)
+            .expect("encode");
 
         // Corrupt page 3 (pgno=4, index=2 in group).
         let target_pgno = 4;
@@ -1334,7 +1345,12 @@ mod tests {
             }
         };
 
-        let repair_symbols = vec![(4_u32, parity)]; // ESI = K (first repair symbol)
+        // Pair ESIs with repair data: ESI = K + r_idx.
+        let repair_symbols: Vec<(u32, Vec<u8>)> = repair_data
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| (4 + u32::try_from(i).expect("i fits u32"), d))
+            .collect();
         let result = attempt_page_repair(target_pgno, &meta, &read_fn, &repair_symbols);
         let (recovered, status) = result.expect("repair should succeed");
         assert_eq!(
@@ -1384,13 +1400,10 @@ mod tests {
         let digest = compute_db_gen_digest(1, num_pages + 1, 0, 1);
         let meta = DbFecGroupMeta::new(page_size, 2, num_pages, 4, hashes, digest);
 
-        // Compute XOR parity.
-        let mut parity = vec![0u8; page_size as usize];
-        for d in &pages {
-            for (j, b) in d.iter().enumerate() {
-                parity[j] ^= b;
-            }
-        }
+        // Generate RaptorQ repair symbols.
+        let source_slices: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+        let repair_data = compute_raptorq_repair_symbols(&meta, &source_slices, page_size as usize)
+            .expect("encode");
 
         // Corrupt page 2 (index 0 in group, pgno=2).
         let target = 2_u32;
@@ -1404,7 +1417,11 @@ mod tests {
             }
         };
 
-        let repair_symbols = vec![(num_pages, parity)];
+        let repair_symbols: Vec<(u32, Vec<u8>)> = repair_data
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| (num_pages + u32::try_from(i).expect("i fits u32"), d))
+            .collect();
         let (recovered, _) =
             attempt_page_repair(target, &meta, &read_fn, &repair_symbols).expect("repair");
         assert_eq!(recovered, pages[0]);
@@ -1768,5 +1785,107 @@ mod tests {
         let hdr = read_db_fec_header(&sidecar_path).expect("read header");
         assert_eq!(hdr.page_size, 512);
         assert!(hdr.is_current(1, 5, 0, 42));
+    }
+
+    // -- RaptorQ-specific tests (bd-n0g4q.2) --
+
+    #[test]
+    fn test_raptorq_encode_deterministic() {
+        let page_size = 128_u32;
+        let pages: Vec<Vec<u8>> = (0..4_u8).map(|i| vec![i + 1; page_size as usize]).collect();
+        let hashes: Vec<[u8; 16]> = pages.iter().map(|d| page_xxh3_128(d)).collect();
+        let digest = compute_db_gen_digest(1, 5, 0, 1);
+        let meta = DbFecGroupMeta::new(page_size, 2, 4, 4, hashes, digest);
+        let slices: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+        let r1 = compute_raptorq_repair_symbols(&meta, &slices, page_size as usize).expect("e1");
+        let r2 = compute_raptorq_repair_symbols(&meta, &slices, page_size as usize).expect("e2");
+        assert_eq!(r1, r2, "RaptorQ encoding must be deterministic");
+    }
+
+    #[test]
+    fn test_raptorq_encode_produces_correct_count() {
+        let page_size = 64_u32;
+        let pages: Vec<Vec<u8>> = (0..8_u8).map(|i| vec![i; page_size as usize]).collect();
+        let hashes: Vec<[u8; 16]> = pages.iter().map(|d| page_xxh3_128(d)).collect();
+        let digest = compute_db_gen_digest(1, 9, 0, 1);
+        let meta = DbFecGroupMeta::new(page_size, 2, 8, 4, hashes, digest);
+        let slices: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+        let syms =
+            compute_raptorq_repair_symbols(&meta, &slices, page_size as usize).expect("encode");
+        assert_eq!(syms.len(), 4, "should produce R=4 repair symbols");
+        for sym in &syms {
+            assert_eq!(sym.len(), page_size as usize, "symbol size = page_size");
+        }
+    }
+
+    #[test]
+    fn test_raptorq_multi_corruption_recovery() {
+        // Verify that RaptorQ can recover from multiple corrupted pages
+        // (up to R) — something the old XOR parity could not do.
+        let page_size = 128_u32;
+        let k = 8_u32;
+        let r = 4_u32;
+        let pages: Vec<Vec<u8>> = (0..k)
+            .map(|i| {
+                let mut data = vec![0u8; page_size as usize];
+                for (j, b) in data.iter_mut().enumerate() {
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        *b = ((i as usize * 41 + j * 7) & 0xFF) as u8;
+                    }
+                }
+                data
+            })
+            .collect();
+
+        let hashes: Vec<[u8; 16]> = pages.iter().map(|d| page_xxh3_128(d)).collect();
+        let digest = compute_db_gen_digest(1, k + 1, 0, 1);
+        let meta = DbFecGroupMeta::new(page_size, 2, k, r, hashes, digest);
+
+        let slices: Vec<&[u8]> = pages.iter().map(Vec::as_slice).collect();
+        let repair_data =
+            compute_raptorq_repair_symbols(&meta, &slices, page_size as usize).expect("encode");
+        let repair_symbols: Vec<(u32, Vec<u8>)> = repair_data
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| (k + u32::try_from(i).expect("i fits u32"), d))
+            .collect();
+
+        // Corrupt pages 2 and 3 (indices 0 and 1 in the group).
+        let corrupt_pgnos = [2_u32, 3_u32];
+        let corrupted = vec![0xDD_u8; page_size as usize];
+
+        let read_fn = |pgno: u32| -> Vec<u8> {
+            if corrupt_pgnos.contains(&pgno) {
+                corrupted.clone()
+            } else {
+                pages[(pgno - 2) as usize].clone()
+            }
+        };
+
+        // Repair page 2.
+        let (recovered_p2, status) =
+            attempt_page_repair(2, &meta, &read_fn, &repair_symbols).expect("repair page 2");
+        assert_eq!(recovered_p2, pages[0]);
+        assert!(matches!(status, RepairResult::Repaired { pgno: 2, .. }));
+
+        // Repair page 3.
+        let (recovered_p3, status) =
+            attempt_page_repair(3, &meta, &read_fn, &repair_symbols).expect("repair page 3");
+        assert_eq!(recovered_p3, pages[1]);
+        assert!(matches!(status, RepairResult::Repaired { pgno: 3, .. }));
+    }
+
+    #[test]
+    fn test_raptorq_seed_differs_per_group() {
+        let digest = compute_db_gen_digest(1, 200, 0, 42);
+        let meta_a = DbFecGroupMeta::new(4096, 1, 1, 4, vec![[0u8; 16]], digest);
+        let meta_b = DbFecGroupMeta::new(4096, 2, 64, 4, vec![[0u8; 16]; 64], digest);
+        let seed_a = derive_db_fec_repair_seed(&meta_a);
+        let seed_b = derive_db_fec_repair_seed(&meta_b);
+        assert_ne!(
+            seed_a, seed_b,
+            "different groups must produce different seeds"
+        );
     }
 }

@@ -349,6 +349,193 @@ fn build_replay_command(run: &RunRecord) -> Option<String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Forensics workflow orchestrator (bd-mblr.7.5)
+// ---------------------------------------------------------------------------
+
+/// Bead identifier for the parent forensics navigator.
+pub const FORENSICS_BEAD_ID: &str = "bd-mblr.7.5";
+
+/// Overall verdict for a forensics workflow run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForensicsVerdict {
+    /// Index loaded, queries executed, no critical gaps.
+    Pass,
+    /// Queries ran but coverage or correlation gaps detected.
+    Warning,
+    /// Cannot produce reliable forensics (index missing, queries fail).
+    Fail,
+}
+
+impl fmt::Display for ForensicsVerdict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pass => write!(f, "PASS"),
+            Self::Warning => write!(f, "WARNING"),
+            Self::Fail => write!(f, "FAIL"),
+        }
+    }
+}
+
+/// Configuration for the forensics workflow orchestrator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForensicsWorkflowConfig {
+    /// Minimum number of runs required for a meaningful forensics analysis.
+    pub min_runs: usize,
+    /// Maximum number of critical-severity events before failing.
+    pub max_critical_events: usize,
+    /// Filters to apply for the forensics query.
+    pub filters: QueryFilters,
+}
+
+impl Default for ForensicsWorkflowConfig {
+    fn default() -> Self {
+        Self {
+            min_runs: 1,
+            max_critical_events: 0,
+            filters: QueryFilters::default(),
+        }
+    }
+}
+
+/// Aggregated forensics workflow report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForensicsWorkflowReport {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+    /// Bead ID for traceability.
+    pub bead_id: String,
+    /// Overall verdict.
+    pub verdict: ForensicsVerdict,
+    /// Index statistics.
+    pub index_run_count: usize,
+    /// Number of unique scenarios in the index.
+    pub unique_scenarios: usize,
+    /// Number of unique invariants in the index.
+    pub unique_invariants: usize,
+    /// Query results.
+    pub query_result: ForensicsQueryResult,
+    /// Number of critical events found.
+    pub critical_event_count: usize,
+    /// Number of high events found.
+    pub high_event_count: usize,
+    /// Correlation dimension count.
+    pub correlation_count: usize,
+    /// Text report for operator display.
+    pub text_report: String,
+    /// Summary for triage.
+    pub summary: String,
+}
+
+impl ForensicsWorkflowReport {
+    /// Render a one-line triage summary.
+    #[must_use]
+    pub fn triage_line(&self) -> String {
+        format!(
+            "{}: {} runs indexed, {} matched, {} critical, {} correlations",
+            self.verdict,
+            self.index_run_count,
+            self.query_result.matched_run_count,
+            self.critical_event_count,
+            self.correlation_count,
+        )
+    }
+
+    /// Whether the workflow passed.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.verdict == ForensicsVerdict::Pass
+    }
+
+    /// Serialize to JSON.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize from JSON.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Write a forensics workflow report to a file.
+pub fn write_forensics_report(
+    path: &Path,
+    report: &ForensicsWorkflowReport,
+) -> Result<(), String> {
+    let json = report.to_json().map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Load a forensics workflow report from a file.
+pub fn load_forensics_report(path: &Path) -> Result<ForensicsWorkflowReport, String> {
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    ForensicsWorkflowReport::from_json(&data)
+        .map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Run the forensics workflow against an evidence index.
+#[must_use]
+pub fn run_forensics_workflow(
+    index: &EvidenceIndex,
+    config: &ForensicsWorkflowConfig,
+) -> ForensicsWorkflowReport {
+    let index_run_count = index.run_count();
+    let unique_scenarios = index.all_scenario_ids().len();
+    let unique_invariants = index.all_invariant_ids().len();
+
+    let query_result = query_index(index, &config.filters);
+
+    let critical_event_count = query_result
+        .timeline
+        .iter()
+        .filter(|e| e.severity == Severity::Critical)
+        .count();
+    let high_event_count = query_result
+        .timeline
+        .iter()
+        .filter(|e| e.severity == Severity::High)
+        .count();
+    let correlation_count = query_result.correlations.len();
+
+    let text_report = render_text_report(&query_result);
+
+    let verdict = if index_run_count < config.min_runs {
+        ForensicsVerdict::Fail
+    } else if critical_event_count > config.max_critical_events {
+        ForensicsVerdict::Fail
+    } else if high_event_count > 0 {
+        ForensicsVerdict::Warning
+    } else {
+        ForensicsVerdict::Pass
+    };
+
+    let summary = format!(
+        "Forensics: {} runs indexed, {} matched, {} critical, {} high, {} correlations",
+        index_run_count,
+        query_result.matched_run_count,
+        critical_event_count,
+        high_event_count,
+        correlation_count,
+    );
+
+    ForensicsWorkflowReport {
+        schema_version: 1,
+        bead_id: FORENSICS_BEAD_ID.to_owned(),
+        verdict,
+        index_run_count,
+        unique_scenarios,
+        unique_invariants,
+        query_result,
+        critical_event_count,
+        high_event_count,
+        correlation_count,
+        text_report,
+        summary,
+    }
+}
+
 fn build_correlations(events: &[TimelineEvent]) -> Vec<CorrelationRow> {
     #[derive(Default)]
     struct Bucket {
