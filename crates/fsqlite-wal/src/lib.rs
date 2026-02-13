@@ -36,7 +36,10 @@ pub use checksum::{
     wal_header_checksum, write_page_checksum, write_wal_frame_checksum, write_wal_frame_salts,
     write_wal_header_checksum, write_wal_header_salts, zero_page_checksum_trailer,
 };
-pub use metrics::{GLOBAL_WAL_METRICS, WalMetrics, WalMetricsSnapshot};
+pub use metrics::{
+    GLOBAL_WAL_FEC_REPAIR_METRICS, GLOBAL_WAL_METRICS, WalFecRepairCounters,
+    WalFecRepairCountersSnapshot, WalMetrics, WalMetricsSnapshot,
+};
 pub use wal::WalFile;
 pub use wal_fec::{
     DEFAULT_RAPTORQ_REPAIR_SYMBOLS, MAX_RAPTORQ_REPAIR_SYMBOLS, WAL_FEC_GROUP_META_MAGIC,

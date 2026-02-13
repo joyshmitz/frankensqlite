@@ -1591,7 +1591,10 @@ pub fn generate_wal_fec_repair_symbols(
     source_pages: &[Vec<u8>],
 ) -> Result<Vec<SymbolRecord>> {
     match generate_wal_fec_repair_symbols_inner(meta, source_pages, None, Duration::ZERO)? {
-        Some(symbols) => Ok(symbols),
+        Some(symbols) => {
+            crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_encode();
+            Ok(symbols)
+        }
         None => Err(FrankenError::WalCorrupt {
             detail: "unexpected cancellation while generating wal-fec symbols".to_owned(),
         }),
@@ -2155,12 +2158,27 @@ pub fn recover_wal_fec_group_with_config<F>(
 where
     F: FnMut(&WalFecGroupMeta, &[(u32, Vec<u8>)]) -> Result<Vec<Vec<u8>>>,
 {
+    let span = tracing::span!(
+        tracing::Level::WARN,
+        "wal_raptorq",
+        segment_id = group_id.end_frame_no,
+        corruption_detected = tracing::field::Empty,
+        symbols_used_for_repair = tracing::field::Empty,
+        repair_success = tracing::field::Empty,
+        repair_duration_us = tracing::field::Empty,
+    );
+    let _guard = span.enter();
+
     if !config.recovery_enabled {
         info!(
             bead_id = BD_1W6K_25_BEAD_ID,
             group_id = %group_id,
             "wal-fec recovery disabled; falling back to sqlite-compatible truncation"
         );
+        span.record("corruption_detected", false);
+        span.record("symbols_used_for_repair", 0_u32);
+        span.record("repair_success", false);
+        span.record("repair_duration_us", 0_u64);
         let outcome = truncate_outcome(
             group_id,
             first_checksum_mismatch_frame_no,
@@ -2182,6 +2200,7 @@ where
             decode_succeeded: false,
         };
         record_raptorq_recovery_log(&log, Duration::ZERO);
+        crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS.record_repair(false, 0);
         return Ok((outcome, log));
     }
 
@@ -2196,7 +2215,20 @@ where
     )?;
 
     let log = recovery_log_from_outcome(group_id, &outcome, true);
-    record_raptorq_recovery_log(&log, started.elapsed());
+    let elapsed = started.elapsed();
+    let duration_us = crate::metrics::duration_us_saturating(elapsed);
+
+    span.record("corruption_detected", log.corruption_observations > 0);
+    span.record(
+        "symbols_used_for_repair",
+        log.available_symbols.min(log.required_symbols),
+    );
+    span.record("repair_success", log.outcome_is_recovered);
+    span.record("repair_duration_us", duration_us);
+
+    record_raptorq_recovery_log(&log, elapsed);
+    crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS
+        .record_repair(log.outcome_is_recovered, duration_us);
     Ok((outcome, log))
 }
 

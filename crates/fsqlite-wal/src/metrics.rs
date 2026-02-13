@@ -144,6 +144,119 @@ impl fmt::Display for WalMetricsSnapshot {
 }
 
 // ---------------------------------------------------------------------------
+// WAL FEC repair counters
+// ---------------------------------------------------------------------------
+
+/// Global WAL FEC repair metrics singleton.
+pub static GLOBAL_WAL_FEC_REPAIR_METRICS: WalFecRepairCounters = WalFecRepairCounters::new();
+
+/// Atomic counters tracking WAL FEC (RaptorQ) repair operations.
+pub struct WalFecRepairCounters {
+    /// Total repair attempts (successful + failed).
+    pub repairs_total: AtomicU64,
+    /// Total successful repairs.
+    pub repairs_succeeded: AtomicU64,
+    /// Total failed repairs.
+    pub repairs_failed: AtomicU64,
+    /// Cumulative repair latency in microseconds.
+    pub repair_duration_us_total: AtomicU64,
+    /// Total repair symbol encoding operations.
+    pub encode_ops: AtomicU64,
+}
+
+impl WalFecRepairCounters {
+    /// Create a zeroed counters instance.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            repairs_total: AtomicU64::new(0),
+            repairs_succeeded: AtomicU64::new(0),
+            repairs_failed: AtomicU64::new(0),
+            repair_duration_us_total: AtomicU64::new(0),
+            encode_ops: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a repair attempt.
+    pub fn record_repair(&self, succeeded: bool, duration_us: u64) {
+        self.repairs_total.fetch_add(1, Ordering::Relaxed);
+        if succeeded {
+            self.repairs_succeeded.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.repairs_failed.fetch_add(1, Ordering::Relaxed);
+        }
+        self.repair_duration_us_total
+            .fetch_add(duration_us, Ordering::Relaxed);
+    }
+
+    /// Record a repair symbol encoding operation.
+    pub fn record_encode(&self) {
+        self.encode_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Take a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> WalFecRepairCountersSnapshot {
+        WalFecRepairCountersSnapshot {
+            repairs_total: self.repairs_total.load(Ordering::Relaxed),
+            repairs_succeeded: self.repairs_succeeded.load(Ordering::Relaxed),
+            repairs_failed: self.repairs_failed.load(Ordering::Relaxed),
+            repair_duration_us_total: self.repair_duration_us_total.load(Ordering::Relaxed),
+            encode_ops: self.encode_ops.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset all counters to zero.
+    pub fn reset(&self) {
+        self.repairs_total.store(0, Ordering::Relaxed);
+        self.repairs_succeeded.store(0, Ordering::Relaxed);
+        self.repairs_failed.store(0, Ordering::Relaxed);
+        self.repair_duration_us_total.store(0, Ordering::Relaxed);
+        self.encode_ops.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for WalFecRepairCounters {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Point-in-time snapshot of WAL FEC repair counters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalFecRepairCountersSnapshot {
+    pub repairs_total: u64,
+    pub repairs_succeeded: u64,
+    pub repairs_failed: u64,
+    pub repair_duration_us_total: u64,
+    pub encode_ops: u64,
+}
+
+impl WalFecRepairCountersSnapshot {
+    /// Average repair latency in microseconds, or 0 if no repairs.
+    #[must_use]
+    pub fn avg_repair_duration_us(&self) -> u64 {
+        self.repair_duration_us_total
+            .checked_div(self.repairs_total)
+            .unwrap_or(0)
+    }
+}
+
+impl fmt::Display for WalFecRepairCountersSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "wal_fec_repairs={} succeeded={} failed={} repair_duration_us={} encode_ops={}",
+            self.repairs_total,
+            self.repairs_succeeded,
+            self.repairs_failed,
+            self.repair_duration_us_total,
+            self.encode_ops,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
 
@@ -232,5 +345,68 @@ mod tests {
     fn metrics_default() {
         let m = WalMetrics::default();
         assert_eq!(m.snapshot().frames_written_total, 0);
+    }
+
+    // ── WAL FEC repair counters ──
+
+    #[test]
+    fn fec_repair_counting() {
+        let c = WalFecRepairCounters::new();
+        c.record_repair(true, 500);
+        c.record_repair(false, 1200);
+        c.record_repair(true, 300);
+        let snap = c.snapshot();
+        assert_eq!(snap.repairs_total, 3);
+        assert_eq!(snap.repairs_succeeded, 2);
+        assert_eq!(snap.repairs_failed, 1);
+        assert_eq!(snap.repair_duration_us_total, 2000);
+        assert_eq!(snap.avg_repair_duration_us(), 666);
+    }
+
+    #[test]
+    fn fec_repair_avg_zero() {
+        let c = WalFecRepairCounters::new();
+        assert_eq!(c.snapshot().avg_repair_duration_us(), 0);
+    }
+
+    #[test]
+    fn fec_encode_ops() {
+        let c = WalFecRepairCounters::new();
+        c.record_encode();
+        c.record_encode();
+        assert_eq!(c.snapshot().encode_ops, 2);
+    }
+
+    #[test]
+    fn fec_repair_reset() {
+        let c = WalFecRepairCounters::new();
+        c.record_repair(true, 100);
+        c.record_encode();
+        c.reset();
+        let snap = c.snapshot();
+        assert_eq!(snap.repairs_total, 0);
+        assert_eq!(snap.repairs_succeeded, 0);
+        assert_eq!(snap.repairs_failed, 0);
+        assert_eq!(snap.repair_duration_us_total, 0);
+        assert_eq!(snap.encode_ops, 0);
+    }
+
+    #[test]
+    fn fec_repair_display() {
+        let c = WalFecRepairCounters::new();
+        c.record_repair(true, 800);
+        c.record_encode();
+        let s = c.snapshot().to_string();
+        assert!(s.contains("wal_fec_repairs=1"));
+        assert!(s.contains("succeeded=1"));
+        assert!(s.contains("failed=0"));
+        assert!(s.contains("repair_duration_us=800"));
+        assert!(s.contains("encode_ops=1"));
+    }
+
+    #[test]
+    fn fec_repair_default() {
+        let c = WalFecRepairCounters::default();
+        assert_eq!(c.snapshot().repairs_total, 0);
     }
 }
