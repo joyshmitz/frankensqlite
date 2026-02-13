@@ -6,14 +6,12 @@
 
 use std::collections::BTreeMap;
 
-use fsqlite_harness::benchmark_corpus::{
-    build_validated_benchmark_corpus, DEFAULT_ROOT_SEED,
-};
+use fsqlite_harness::benchmark_corpus::{DEFAULT_ROOT_SEED, build_validated_benchmark_corpus};
 use fsqlite_harness::performance_regression_detector::{
-    BenchmarkSample, GovernanceReport, HostContext, PerformanceSlo, RegressionSeverity,
-    RegressionTolerance, SloPolicy, SloVerdict, SloWaiver, WaiverRegistry, GOVERNANCE_BEAD_ID,
-    SCHEMA_VERSION, evaluate_governance, load_governance_report, validate_slo_policy,
-    validate_waiver_registry, write_governance_report,
+    BenchmarkSample, GOVERNANCE_BEAD_ID, HostContext, PerformanceSlo, RegressionSeverity,
+    RegressionTolerance, SCHEMA_VERSION, SloPolicy, SloVerdict, SloWaiver, WaiverRegistry,
+    evaluate_governance, load_governance_report, validate_slo_policy, validate_waiver_registry,
+    write_governance_report,
 };
 use tempfile::TempDir;
 
@@ -222,15 +220,21 @@ fn test_waiver_lookup_active() {
         }],
     };
     assert!(
-        registry.find_active_waiver("bm-test", "2026-02-13").is_some(),
+        registry
+            .find_active_waiver("bm-test", "2026-02-13")
+            .is_some(),
         "waiver should be active on 2026-02-13"
     );
     assert!(
-        registry.find_active_waiver("bm-test", "2026-02-21").is_none(),
+        registry
+            .find_active_waiver("bm-test", "2026-02-21")
+            .is_none(),
         "waiver should be expired on 2026-02-21"
     );
     assert!(
-        registry.find_active_waiver("bm-other", "2026-02-13").is_none(),
+        registry
+            .find_active_waiver("bm-other", "2026-02-13")
+            .is_none(),
         "no waiver for bm-other"
     );
 }
@@ -440,7 +444,7 @@ fn test_governance_multi_scenario_mixed_verdicts() {
 
     let candidates = vec![
         sample(scenario_a, "cand-a", 1_005.0, 5_000.0), // pass
-        sample(scenario_b, "cand-b", 1_120.0, 4_500.0),  // warning
+        sample(scenario_b, "cand-b", 1_120.0, 4_500.0), // warning
     ];
 
     let report = evaluate_governance(

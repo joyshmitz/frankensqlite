@@ -15,11 +15,11 @@ xxhash-rust = { workspace = true }
 crc32c = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
+asupersync = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
-asupersync = { path = "/dp/asupersync" }
 
 [lints]
 workspace = true

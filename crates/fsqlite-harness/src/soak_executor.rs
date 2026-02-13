@@ -1159,6 +1159,301 @@ pub fn run_soak_with_faults(
 }
 
 // ---------------------------------------------------------------------------
+// Endurance orchestrator (bd-mblr.7.2)
+// ---------------------------------------------------------------------------
+
+/// Bead identifier for the parent endurance integration.
+pub const ENDURANCE_BEAD_ID: &str = "bd-mblr.7.2";
+
+/// Overall verdict for an endurance suite run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnduranceVerdict {
+    /// All profiles passed, no leak findings at warning level or above.
+    Pass,
+    /// No critical failures, but some warnings or non-critical findings.
+    Warning,
+    /// At least one profile failed or had critical leak findings.
+    Fail,
+}
+
+impl std::fmt::Display for EnduranceVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pass => write!(f, "PASS"),
+            Self::Warning => write!(f, "WARNING"),
+            Self::Fail => write!(f, "FAIL"),
+        }
+    }
+}
+
+/// Configuration for an endurance suite run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnduranceConfig {
+    /// Root seed for deterministic profile derivation.
+    pub root_seed: u64,
+    /// Which profile names to include (empty = all presets).
+    pub profile_names: Vec<String>,
+    /// Leak detection policy (applied per-profile).
+    pub leak_policy: LeakBudgetPolicy,
+    /// Maximum number of critical leak findings before failing the suite.
+    pub max_critical_leaks: usize,
+    /// Maximum number of warning-level leak findings before escalating to warning verdict.
+    pub max_warning_leaks: usize,
+    /// Minimum commit rate (commits / total_transactions) for each profile.
+    pub min_commit_rate: f64,
+    /// Git SHA for traceability (informational).
+    pub git_sha: String,
+}
+
+impl Default for EnduranceConfig {
+    fn default() -> Self {
+        Self {
+            root_seed: 0xF5A4_7221,
+            profile_names: Vec::new(),
+            leak_policy: LeakBudgetPolicy::default(),
+            max_critical_leaks: 0,
+            max_warning_leaks: 3,
+            min_commit_rate: 0.90,
+            git_sha: String::new(),
+        }
+    }
+}
+
+impl EnduranceConfig {
+    /// Validate the configuration.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.min_commit_rate < 0.0 || self.min_commit_rate > 1.0 {
+            errors.push(format!(
+                "min_commit_rate must be in [0.0, 1.0], got {}",
+                self.min_commit_rate
+            ));
+        }
+        errors
+    }
+}
+
+/// Result of running a single profile within an endurance suite.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnduranceProfileResult {
+    /// Profile name.
+    pub profile_name: String,
+    /// The soak run report.
+    pub soak_report: SoakRunReport,
+    /// Leak detection findings for this profile.
+    pub leak_findings: Vec<LeakDetectorFinding>,
+    /// Commit rate (commits / total_transactions).
+    pub commit_rate: f64,
+    /// Whether this profile met the minimum commit rate threshold.
+    pub commit_rate_ok: bool,
+    /// Per-profile verdict.
+    pub verdict: EnduranceVerdict,
+}
+
+/// Aggregated report for an endurance suite run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnduranceReport {
+    /// Schema version for forward compatibility.
+    pub schema_version: u32,
+    /// Bead ID for traceability.
+    pub bead_id: String,
+    /// Deterministic run identifier.
+    pub run_id: String,
+    /// Git SHA (informational).
+    pub git_sha: String,
+    /// Overall verdict.
+    pub verdict: EnduranceVerdict,
+    /// Per-profile results.
+    pub profile_results: Vec<EnduranceProfileResult>,
+    /// Total transactions across all profiles.
+    pub total_transactions: u64,
+    /// Total commits across all profiles.
+    pub total_commits: u64,
+    /// Total invariant violations across all profiles.
+    pub total_violations: usize,
+    /// Total critical leak findings across all profiles.
+    pub total_critical_leaks: usize,
+    /// Total warning-level leak findings across all profiles.
+    pub total_warning_leaks: usize,
+    /// Number of profiles run.
+    pub profiles_run: usize,
+    /// Number of profiles that passed.
+    pub profiles_passed: usize,
+    /// Summary for triage.
+    pub summary: String,
+}
+
+impl EnduranceReport {
+    /// Render a one-line triage summary.
+    #[must_use]
+    pub fn triage_line(&self) -> String {
+        format!(
+            "{}: {}/{} profiles passed, {} txns, {} violations, {} critical leaks, {} warning leaks",
+            self.verdict,
+            self.profiles_passed,
+            self.profiles_run,
+            self.total_transactions,
+            self.total_violations,
+            self.total_critical_leaks,
+            self.total_warning_leaks,
+        )
+    }
+
+    /// Whether the overall suite passed.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.verdict == EnduranceVerdict::Pass
+    }
+
+    /// Serialize to JSON.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize from JSON.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Write an endurance report to a file.
+pub fn write_endurance_report(
+    path: &std::path::Path,
+    report: &EnduranceReport,
+) -> Result<(), String> {
+    let json = report.to_json().map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Load an endurance report from a file.
+pub fn load_endurance_report(path: &std::path::Path) -> Result<EnduranceReport, String> {
+    let data =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    EnduranceReport::from_json(&data).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Run the full endurance suite: execute each soak profile and aggregate results.
+#[must_use]
+pub fn run_endurance_suite(config: &EnduranceConfig) -> EnduranceReport {
+    use crate::soak_profiles::{SoakWorkloadSpec, all_presets};
+
+    let all = all_presets();
+    let profiles: Vec<_> = if config.profile_names.is_empty() {
+        all
+    } else {
+        all.into_iter()
+            .filter(|p| config.profile_names.contains(&p.name))
+            .collect()
+    };
+
+    let mut profile_results = Vec::with_capacity(profiles.len());
+    let mut total_transactions: u64 = 0;
+    let mut total_commits: u64 = 0;
+    let mut total_violations: usize = 0;
+    let mut total_critical_leaks: usize = 0;
+    let mut total_warning_leaks: usize = 0;
+    let mut profiles_passed: usize = 0;
+
+    for profile in &profiles {
+        let spec = SoakWorkloadSpec::from_profile(profile.clone(), config.root_seed);
+        let soak_report = run_soak(spec);
+
+        // Leak detection on this profile's telemetry
+        let leak_report =
+            detect_leak_budget_violations(&soak_report.resource_telemetry, &config.leak_policy);
+
+        #[allow(clippy::cast_precision_loss)]
+        let commit_rate = if soak_report.total_transactions > 0 {
+            soak_report.total_commits as f64 / soak_report.total_transactions as f64
+        } else {
+            0.0
+        };
+        let commit_rate_ok = commit_rate >= config.min_commit_rate;
+
+        let critical_count = leak_report.critical_count();
+        let warning_count = leak_report.warning_count();
+
+        let profile_verdict = if soak_report.aborted
+            || !soak_report.all_violations.is_empty()
+            || critical_count > 0
+            || !commit_rate_ok
+        {
+            EnduranceVerdict::Fail
+        } else if warning_count > 0 {
+            EnduranceVerdict::Warning
+        } else {
+            EnduranceVerdict::Pass
+        };
+
+        if profile_verdict == EnduranceVerdict::Pass {
+            profiles_passed += 1;
+        }
+
+        total_transactions += soak_report.total_transactions;
+        total_commits += soak_report.total_commits;
+        total_violations += soak_report.all_violations.len();
+        total_critical_leaks += critical_count;
+        total_warning_leaks += warning_count;
+
+        profile_results.push(EnduranceProfileResult {
+            profile_name: profile.name.clone(),
+            soak_report,
+            leak_findings: leak_report.findings,
+            commit_rate,
+            commit_rate_ok,
+            verdict: profile_verdict,
+        });
+    }
+
+    // Compute overall verdict
+    let verdict = if profile_results
+        .iter()
+        .any(|r| r.verdict == EnduranceVerdict::Fail)
+        || total_critical_leaks > config.max_critical_leaks
+    {
+        EnduranceVerdict::Fail
+    } else if total_warning_leaks > config.max_warning_leaks
+        || profile_results
+            .iter()
+            .any(|r| r.verdict == EnduranceVerdict::Warning)
+    {
+        EnduranceVerdict::Warning
+    } else {
+        EnduranceVerdict::Pass
+    };
+
+    let summary = format!(
+        "Endurance suite: {}/{} profiles passed, {} total txns, {} violations, {} critical leaks, {} warning leaks",
+        profiles_passed,
+        profiles.len(),
+        total_transactions,
+        total_violations,
+        total_critical_leaks,
+        total_warning_leaks,
+    );
+
+    let run_id = format!("endurance-{:016x}-{}", config.root_seed, profiles.len());
+
+    EnduranceReport {
+        schema_version: 1,
+        bead_id: ENDURANCE_BEAD_ID.to_owned(),
+        run_id,
+        git_sha: config.git_sha.clone(),
+        verdict,
+        profile_results,
+        total_transactions,
+        total_commits,
+        total_violations,
+        total_critical_leaks,
+        total_warning_leaks,
+        profiles_run: profiles.len(),
+        profiles_passed,
+        summary,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

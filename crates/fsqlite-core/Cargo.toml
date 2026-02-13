@@ -27,9 +27,9 @@ tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
+asupersync = { workspace = true }
 
 [dev-dependencies]
-asupersync = { path = "/dp/asupersync" }
 criterion = { workspace = true }
 rusqlite = { workspace = true }
 tracing = { workspace = true }

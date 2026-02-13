@@ -21,11 +21,8 @@ fn assert_contains_lane(lanes: &[CiLane], lane: CiLane, case: &str) {
 #[test]
 fn e2e_mvcc_change_selects_concurrency_and_recovery_with_safety_floor() {
     let graph = ImpactGraph::canonical();
-    let report = select_ci_lanes_for_paths(
-        &["crates/fsqlite-mvcc/src/witness_plane.rs"],
-        &graph,
-        None,
-    );
+    let report =
+        select_ci_lanes_for_paths(&["crates/fsqlite-mvcc/src/witness_plane.rs"], &graph, None);
     let lanes = report.selected_lanes();
 
     assert_contains_lane(&lanes, CiLane::Unit, "mvcc_unit");
@@ -84,11 +81,8 @@ fn e2e_parser_change_is_deterministic_across_path_order() {
 #[test]
 fn e2e_unmapped_code_path_triggers_full_suite_fallback() {
     let graph = ImpactGraph::canonical();
-    let report = select_ci_lanes_for_paths(
-        &["crates/experimental-new-crate/src/lib.rs"],
-        &graph,
-        None,
-    );
+    let report =
+        select_ci_lanes_for_paths(&["crates/experimental-new-crate/src/lib.rs"], &graph, None);
 
     assert!(
         report.fallback_full_suite,

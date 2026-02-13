@@ -2916,4 +2916,355 @@ mod tests {
             "log2(1) = 0.0 for clamped 0 pages"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Proptest: property-based tests for query planner (bd-1lsfu.4)
+    // -----------------------------------------------------------------------
+
+    mod proptest_planner {
+        use super::*;
+        use fsqlite_ast::{
+            ColumnRef, Distinctness, Expr, Literal, OrderingTerm, ResultColumn, SelectBody,
+            SelectCore, Span,
+        };
+        use proptest::prelude::*;
+
+        /// Generate random table stats with realistic ranges.
+        fn arb_table_stats() -> BoxedStrategy<TableStats> {
+            (
+                prop::string::string_regex("[a-z][a-z0-9]{0,5}").expect("valid regex"),
+                1u64..10_000,
+                1u64..1_000_000,
+            )
+                .prop_map(|(name, n_pages, n_rows)| TableStats {
+                    name,
+                    n_pages,
+                    n_rows,
+                    source: StatsSource::Heuristic,
+                })
+                .boxed()
+        }
+
+        /// Generate random index info for a given table.
+        #[allow(dead_code)]
+        fn arb_index_info(table_name: String) -> BoxedStrategy<IndexInfo> {
+            (
+                prop::string::string_regex("idx_[a-z]{1,4}").expect("valid regex"),
+                proptest::collection::vec(
+                    prop::string::string_regex("[a-z]{1,4}").expect("valid regex"),
+                    1..4,
+                ),
+                any::<bool>(),
+                1u64..5_000,
+            )
+                .prop_map(move |(name, columns, unique, n_pages)| IndexInfo {
+                    name,
+                    table: table_name.clone(),
+                    columns,
+                    unique,
+                    n_pages,
+                    source: StatsSource::Heuristic,
+                })
+                .boxed()
+        }
+
+        /// Generate a selectivity in (0, 1].
+        fn arb_selectivity() -> BoxedStrategy<f64> {
+            (1u32..1000).prop_map(|n| f64::from(n) / 1000.0).boxed()
+        }
+
+        // Property 1: Cost model non-negativity — all costs >= 0.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1000))]
+
+            #[test]
+            fn test_cost_non_negative(
+                table_pages in 0u64..100_000,
+                index_pages in 0u64..100_000,
+                selectivity in arb_selectivity(),
+            ) {
+                let kinds = [
+                    AccessPathKind::FullTableScan,
+                    AccessPathKind::IndexScanEquality,
+                    AccessPathKind::RowidLookup,
+                    AccessPathKind::IndexScanRange { selectivity },
+                    AccessPathKind::CoveringIndexScan { selectivity },
+                ];
+                for kind in &kinds {
+                    let cost = estimate_cost(kind, table_pages, index_pages);
+                    prop_assert!(
+                        cost >= 0.0,
+                        "cost must be non-negative, got {cost} for {kind:?} \
+                         (table_pages={table_pages}, index_pages={index_pages})"
+                    );
+                    prop_assert!(
+                        cost.is_finite(),
+                        "cost must be finite, got {cost} for {kind:?}"
+                    );
+                }
+            }
+        }
+
+        // Property 2: Cost hierarchy — RowidLookup ≤ IndexScanEquality ≤ FullTableScan
+        // for tables with at least a few pages.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(500))]
+
+            #[test]
+            fn test_cost_hierarchy(
+                table_pages in 10u64..100_000,
+                index_pages in 2u64..10_000,
+            ) {
+                let rowid_cost = estimate_cost(
+                    &AccessPathKind::RowidLookup,
+                    table_pages,
+                    index_pages,
+                );
+                let eq_cost = estimate_cost(
+                    &AccessPathKind::IndexScanEquality,
+                    table_pages,
+                    index_pages,
+                );
+                let full_cost = estimate_cost(
+                    &AccessPathKind::FullTableScan,
+                    table_pages,
+                    index_pages,
+                );
+
+                prop_assert!(
+                    rowid_cost <= eq_cost + f64::EPSILON,
+                    "rowid lookup ({rowid_cost}) should be ≤ index equality ({eq_cost}) \
+                     for table_pages={table_pages}, index_pages={index_pages}"
+                );
+                prop_assert!(
+                    eq_cost <= full_cost + f64::EPSILON,
+                    "index equality ({eq_cost}) should be ≤ full scan ({full_cost}) \
+                     for table_pages={table_pages}, index_pages={index_pages}"
+                );
+            }
+        }
+
+        // Property 3: Cost monotonicity in selectivity — lower selectivity means
+        // lower cost for range scans.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(500))]
+
+            #[test]
+            fn test_cost_selectivity_monotonic(
+                table_pages in 10u64..100_000,
+                index_pages in 2u64..10_000,
+                s1 in 1u32..500,
+                s2 in 500u32..1000,
+            ) {
+                let sel_low = f64::from(s1) / 1000.0;
+                let sel_high = f64::from(s2) / 1000.0;
+
+                let cost_low = estimate_cost(
+                    &AccessPathKind::IndexScanRange { selectivity: sel_low },
+                    table_pages,
+                    index_pages,
+                );
+                let cost_high = estimate_cost(
+                    &AccessPathKind::IndexScanRange { selectivity: sel_high },
+                    table_pages,
+                    index_pages,
+                );
+
+                prop_assert!(
+                    cost_low <= cost_high + f64::EPSILON,
+                    "lower selectivity ({sel_low}) should have lower cost ({cost_low}) \
+                     than higher selectivity ({sel_high}) cost ({cost_high})"
+                );
+            }
+        }
+
+        // Property 4: Join ordering determinism — same inputs always produce
+        // the same plan.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn test_join_order_determinism(
+                stats1 in arb_table_stats(),
+                stats2 in arb_table_stats(),
+            ) {
+                // Ensure distinct table names.
+                let s1 = stats1;
+                let mut s2 = stats2;
+                if s1.name == s2.name {
+                    s2.name = format!("{}_b", s2.name);
+                }
+
+                let tables = [s1, s2];
+                let empty_indexes: Vec<IndexInfo> = vec![];
+                let empty_terms: Vec<WhereTerm<'_>> = vec![];
+                let empty_cross: Vec<(String, String)> = vec![];
+
+                let plan_a = order_joins(
+                    &tables,
+                    &empty_indexes,
+                    &empty_terms,
+                    None,
+                    &empty_cross,
+                );
+                let plan_b = order_joins(
+                    &tables,
+                    &empty_indexes,
+                    &empty_terms,
+                    None,
+                    &empty_cross,
+                );
+
+                prop_assert_eq!(
+                    plan_a.join_order,
+                    plan_b.join_order,
+                    "join order should be deterministic"
+                );
+                prop_assert!(
+                    (plan_a.total_cost - plan_b.total_cost).abs() < f64::EPSILON,
+                    "total cost should be deterministic: {:.6} vs {:.6}",
+                    plan_a.total_cost,
+                    plan_b.total_cost,
+                );
+            }
+        }
+
+        // Property 5: Adding an index never increases the best access path cost.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(300))]
+
+            #[test]
+            fn test_index_never_increases_cost(
+                stats in arb_table_stats(),
+            ) {
+                let table = stats;
+                let empty_terms: Vec<WhereTerm<'_>> = vec![];
+
+                // Cost without any index.
+                let no_index_path = best_access_path(
+                    &table,
+                    &[],
+                    &empty_terms,
+                    None,
+                );
+
+                // Create an index on this table.
+                let idx = IndexInfo {
+                    name: "idx_test".to_string(),
+                    table: table.name.clone(),
+                    columns: vec!["col_a".to_string()],
+                    unique: false,
+                    n_pages: table.n_pages / 5 + 1,
+                    source: StatsSource::Heuristic,
+                };
+
+                let with_index_path = best_access_path(
+                    &table,
+                    &[idx],
+                    &empty_terms,
+                    None,
+                );
+
+                prop_assert!(
+                    with_index_path.estimated_cost <= no_index_path.estimated_cost + f64::EPSILON,
+                    "adding an index should not increase cost: \
+                     without={:.2}, with={:.2}",
+                    no_index_path.estimated_cost,
+                    with_index_path.estimated_cost,
+                );
+            }
+        }
+
+        // Property 6: Compound ORDER BY resolution is deterministic.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn test_order_by_resolution_deterministic(
+                ncols in 1usize..5,
+                order_idx in 1usize..5,
+            ) {
+                // Build a synthetic compound SELECT with aliases.
+                let cols: Vec<ResultColumn> = (0..ncols)
+                    .map(|i| ResultColumn::Expr {
+                        expr: Expr::Column(
+                            ColumnRef::bare(format!("c{i}")),
+                            Span::ZERO,
+                        ),
+                        alias: Some(format!("a{i}")),
+                    })
+                    .collect();
+                let core = SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: cols,
+                    from: None,
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                };
+
+                // ORDER BY a numeric index (clamped to valid range).
+                let valid_idx = (order_idx % ncols) + 1;
+                let order_term = OrderingTerm {
+                    expr: Expr::Literal(
+                        Literal::Integer(i64::try_from(valid_idx).unwrap_or(1)),
+                        Span::ZERO,
+                    ),
+                    direction: None,
+                    nulls: None,
+                };
+
+                let body = SelectBody {
+                    select: core,
+                    compounds: vec![],
+                };
+
+                let result1 = resolve_compound_order_by(
+                    &body,
+                    std::slice::from_ref(&order_term),
+                );
+                let result2 = resolve_compound_order_by(
+                    &body,
+                    std::slice::from_ref(&order_term),
+                );
+
+                prop_assert_eq!(
+                    result1, result2,
+                    "ORDER BY resolution should be deterministic"
+                );
+            }
+        }
+
+        // Property 7: Full table scan cost scales linearly with page count.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(500))]
+
+            #[test]
+            fn test_full_scan_linear_scaling(
+                pages in 1u64..100_000,
+                multiplier in 2u64..10,
+            ) {
+                let cost_base = estimate_cost(
+                    &AccessPathKind::FullTableScan,
+                    pages,
+                    0,
+                );
+                let cost_scaled = estimate_cost(
+                    &AccessPathKind::FullTableScan,
+                    pages * multiplier,
+                    0,
+                );
+
+                // For full scan, cost = table_pages, so scaling should be exact.
+                let expected_ratio = multiplier as f64;
+                let actual_ratio = cost_scaled / cost_base;
+                prop_assert!(
+                    (actual_ratio - expected_ratio).abs() < 0.01,
+                    "full scan cost should scale linearly: \
+                     expected ratio {expected_ratio}, got {actual_ratio}"
+                );
+            }
+        }
+    }
 }

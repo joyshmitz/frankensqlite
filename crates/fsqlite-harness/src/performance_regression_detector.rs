@@ -456,9 +456,7 @@ impl SloPolicy {
     /// Look up the SLO for a given scenario, if one exists.
     #[must_use]
     pub fn find_slo(&self, scenario_id: &str) -> Option<&PerformanceSlo> {
-        self.slos
-            .iter()
-            .find(|slo| slo.scenario_id == scenario_id)
+        self.slos.iter().find(|slo| slo.scenario_id == scenario_id)
     }
 }
 
@@ -523,11 +521,7 @@ pub struct WaiverRegistry {
 impl WaiverRegistry {
     /// Find an active (non-expired) waiver for a scenario on a given date.
     #[must_use]
-    pub fn find_active_waiver(
-        &self,
-        scenario_id: &str,
-        current_date: &str,
-    ) -> Option<&SloWaiver> {
+    pub fn find_active_waiver(&self, scenario_id: &str, current_date: &str) -> Option<&SloWaiver> {
         self.waivers.iter().find(|w| {
             w.scenario_id == scenario_id
                 && w.granted_date.as_str() <= current_date
@@ -630,7 +624,10 @@ pub fn evaluate_governance(
 
     let policy_errors = validate_slo_policy(policy);
     if !policy_errors.is_empty() {
-        return Err(format!("SLO policy validation failed: {}", policy_errors.join("; ")));
+        return Err(format!(
+            "SLO policy validation failed: {}",
+            policy_errors.join("; ")
+        ));
     }
 
     let waiver_errors = validate_waiver_registry(waivers);
@@ -763,10 +760,7 @@ pub fn evaluate_governance(
 }
 
 /// Write a governance report as deterministic pretty JSON.
-pub fn write_governance_report(
-    path: &Path,
-    report: &GovernanceReport,
-) -> Result<(), String> {
+pub fn write_governance_report(path: &Path, report: &GovernanceReport) -> Result<(), String> {
     let payload = serde_json::to_vec_pretty(report)
         .map_err(|error| format!("governance_report_serialize_failed: {error}"))?;
     std::fs::write(path, payload).map_err(|error| {

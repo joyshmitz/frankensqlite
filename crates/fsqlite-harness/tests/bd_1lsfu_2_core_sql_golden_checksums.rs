@@ -16,6 +16,9 @@ const GOLDEN_MANIFEST_RELATIVE: &str = "conformance/core_sql_golden_blake3.json"
 const UPDATE_ENV_VAR: &str = "FSQLITE_UPDATE_GOLDEN";
 const SCHEMA_VERSION: u32 = 1;
 const HASH_ALGORITHM: &str = "blake3";
+const FUZZ_SQL_CORPUS_RELATIVE: &str = "../../fuzz/corpus/fuzz_sql_parser";
+const FUZZ_QUERY_SAMPLE_SIZE: usize = 512;
+const MIN_CORE_SQL_QUERY_COUNT: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CoreSqlGoldenEntry {
@@ -36,9 +39,9 @@ struct CoreSqlGoldenManifest {
 
 fn manifest_path() -> Result<PathBuf, String> {
     let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let canonical_root = crate_root
-        .canonicalize()
-        .map_err(|error| format!("bead_id={BEAD_ID} case=manifest_root_canonicalize error={error}"))?;
+    let canonical_root = crate_root.canonicalize().map_err(|error| {
+        format!("bead_id={BEAD_ID} case=manifest_root_canonicalize error={error}")
+    })?;
     Ok(canonical_root.join(GOLDEN_MANIFEST_RELATIVE))
 }
 
@@ -48,6 +51,70 @@ fn fixture_dir() -> Result<PathBuf, String> {
         .canonicalize()
         .map(|path| path.join("conformance"))
         .map_err(|error| format!("bead_id={BEAD_ID} case=fixture_dir_canonicalize error={error}"))
+}
+
+fn fuzz_sql_corpus_dir() -> Result<PathBuf, String> {
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    crate_root
+        .join(FUZZ_SQL_CORPUS_RELATIVE)
+        .canonicalize()
+        .map_err(|error| format!("bead_id={BEAD_ID} case=fuzz_dir_canonicalize error={error}"))
+}
+
+fn is_query_sql(sql: &str) -> bool {
+    let first = sql
+        .trim_start()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(first.as_str(), "SELECT" | "WITH" | "VALUES")
+}
+
+fn load_fuzz_query_corpus(limit: usize) -> Result<Vec<(String, String)>, String> {
+    let dir = fuzz_sql_corpus_dir()?;
+    let mut files = fs::read_dir(&dir)
+        .map_err(|error| format!("bead_id={BEAD_ID} case=fuzz_dir_read error={error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_file())
+        .collect::<Vec<_>>();
+    files.sort_by_key(|entry| entry.path());
+
+    let mut queries = Vec::with_capacity(limit);
+    for entry in files {
+        let path = entry.path();
+        let raw = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let sql = raw.trim();
+        if sql.is_empty() || !is_query_sql(sql) {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "bead_id={BEAD_ID} case=fuzz_filename_invalid path={}",
+                    path.display()
+                )
+            })?;
+        queries.push((format!("fuzz_sql_parser/{file_name}"), sql.to_owned()));
+        if queries.len() == limit {
+            break;
+        }
+    }
+
+    if queries.len() < MIN_CORE_SQL_QUERY_COUNT {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=fuzz_query_underflow required>={MIN_CORE_SQL_QUERY_COUNT} actual={} dir={}",
+            queries.len(),
+            dir.display()
+        ));
+    }
+
+    Ok(queries)
 }
 
 fn update_requested() -> bool {
@@ -60,6 +127,32 @@ fn update_requested() -> bool {
 fn append_record(hasher: &mut Hasher, record: &str) {
     hasher.update(record.as_bytes());
     hasher.update(b"\n");
+}
+
+fn seed_execution_database(conn: &Connection, exec_hasher: &mut Hasher) {
+    const FIXED_SEED_SQL: [&str; 5] = [
+        "CREATE TABLE IF NOT EXISTS __seed_numbers(id INTEGER PRIMARY KEY, x INTEGER, y REAL, tag TEXT)",
+        "DELETE FROM __seed_numbers",
+        "INSERT INTO __seed_numbers VALUES(1, 10, 1.5, 'alpha')",
+        "INSERT INTO __seed_numbers VALUES(2, 20, 2.5, 'beta')",
+        "INSERT INTO __seed_numbers VALUES(3, NULL, 3.5, NULL)",
+    ];
+
+    for sql in FIXED_SEED_SQL {
+        match conn.execute(sql) {
+            Ok(rows) => append_record(exec_hasher, &format!("SEED_OK|{sql}|affected_rows={rows}")),
+            Err(error) => append_error_record(exec_hasher, "SEED_ERR", sql, &error),
+        }
+    }
+}
+
+fn edge_case_queries() -> [&'static str; 4] {
+    [
+        "SELECT NULL IS NULL, COALESCE(NULL, 'fallback')",
+        "SELECT '42' + 8, CAST('3.14' AS REAL), typeof(CAST('3.14' AS REAL))",
+        "SELECT 9223372036854775807 + 1, -9223372036854775808 - 1",
+        "SELECT COUNT(*) FROM __seed_numbers WHERE x > 999999",
+    ]
 }
 
 fn hash_parser_sql(parser_hasher: &mut Hasher, sql: &str) {
@@ -124,7 +217,12 @@ fn canonical_rows(rows: &[Row], ordered: bool) -> Vec<String> {
     normalized
 }
 
-fn append_error_record(hasher: &mut Hasher, prefix: &str, sql: &str, error: &fsqlite_error::FrankenError) {
+fn append_error_record(
+    hasher: &mut Hasher,
+    prefix: &str,
+    sql: &str,
+    error: &fsqlite_error::FrankenError,
+) {
     let category = ErrorCategory::from_franken_error(error);
     append_record(
         hasher,
@@ -227,6 +325,58 @@ fn compute_manifest() -> Result<CoreSqlGoldenManifest, String> {
         });
     }
 
+    {
+        let mut parser_hasher = Hasher::new();
+        let mut planner_hasher = Hasher::new();
+        let mut execution_hasher = Hasher::new();
+        let conn = Connection::open(":memory:").map_err(|error| {
+            format!("bead_id={BEAD_ID} case=open_edge_connection error={error}")
+        })?;
+        seed_execution_database(&conn, &mut execution_hasher);
+
+        let mut statement_count = 0_usize;
+        let mut query_count = 0_usize;
+        for sql in edge_case_queries() {
+            statement_count += 1;
+            query_count += 1;
+            hash_parser_sql(&mut parser_hasher, sql);
+            hash_planner_query(&mut planner_hasher, &conn, sql);
+            hash_query_statement(&mut execution_hasher, &conn, sql, true);
+        }
+
+        entries.push(CoreSqlGoldenEntry {
+            fixture_id: "core_sql_edge_cases".to_owned(),
+            parser_blake3: parser_hasher.finalize().to_hex().to_string(),
+            planner_blake3: planner_hasher.finalize().to_hex().to_string(),
+            execution_blake3: execution_hasher.finalize().to_hex().to_string(),
+            statement_count,
+            query_count,
+        });
+    }
+
+    for (fixture_id, sql) in load_fuzz_query_corpus(FUZZ_QUERY_SAMPLE_SIZE)? {
+        let mut parser_hasher = Hasher::new();
+        let mut planner_hasher = Hasher::new();
+        let mut execution_hasher = Hasher::new();
+        let conn = Connection::open(":memory:").map_err(|error| {
+            format!("bead_id={BEAD_ID} case=open_fuzz_connection error={error}")
+        })?;
+        seed_execution_database(&conn, &mut execution_hasher);
+
+        hash_parser_sql(&mut parser_hasher, &sql);
+        hash_planner_query(&mut planner_hasher, &conn, &sql);
+        hash_query_statement(&mut execution_hasher, &conn, &sql, false);
+
+        entries.push(CoreSqlGoldenEntry {
+            fixture_id,
+            parser_blake3: parser_hasher.finalize().to_hex().to_string(),
+            planner_blake3: planner_hasher.finalize().to_hex().to_string(),
+            execution_blake3: execution_hasher.finalize().to_hex().to_string(),
+            statement_count: 1,
+            query_count: 1,
+        });
+    }
+
     entries.sort_by(|left, right| left.fixture_id.cmp(&right.fixture_id));
     Ok(CoreSqlGoldenManifest {
         schema_version: SCHEMA_VERSION,
@@ -319,7 +469,9 @@ fn diff_entries(expected: &CoreSqlGoldenManifest, actual: &CoreSqlGoldenManifest
                 diff_lines.push(format!("fixture={fixture_id} missing from actual manifest"));
             }
             (None, Some(_)) => {
-                diff_lines.push(format!("fixture={fixture_id} missing from expected manifest"));
+                diff_lines.push(format!(
+                    "fixture={fixture_id} missing from expected manifest"
+                ));
             }
             (None, None) => {}
         }
@@ -332,11 +484,21 @@ fn diff_entries(expected: &CoreSqlGoldenManifest, actual: &CoreSqlGoldenManifest
 fn test_bd_1lsfu_2_core_sql_golden_checksums() -> Result<(), String> {
     let manifest = compute_manifest()?;
     let path = manifest_path()?;
+    let actual_total_queries = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.query_count)
+        .sum::<usize>();
+    if actual_total_queries < MIN_CORE_SQL_QUERY_COUNT {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=query_count_underflow required>={MIN_CORE_SQL_QUERY_COUNT} actual={actual_total_queries}"
+        ));
+    }
 
     if update_requested() {
         write_manifest(&path, &manifest)?;
         eprintln!(
-            "INFO bead_id={BEAD_ID} case=manifest_updated path={} entries={}",
+            "INFO bead_id={BEAD_ID} case=manifest_updated path={} entries={} query_count={actual_total_queries}",
             path.display(),
             manifest.entries.len()
         );
@@ -365,6 +527,16 @@ fn test_bd_1lsfu_2_core_sql_golden_checksums() -> Result<(), String> {
     }
     if expected.entries.is_empty() {
         return Err(format!("bead_id={BEAD_ID} case=manifest_empty"));
+    }
+    let expected_total_queries = expected
+        .entries
+        .iter()
+        .map(|entry| entry.query_count)
+        .sum::<usize>();
+    if expected_total_queries < MIN_CORE_SQL_QUERY_COUNT {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=manifest_query_count_underflow required>={MIN_CORE_SQL_QUERY_COUNT} actual={expected_total_queries}"
+        ));
     }
 
     let diff = diff_entries(&expected, &manifest);

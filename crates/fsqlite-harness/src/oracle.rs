@@ -795,6 +795,7 @@ pub fn load_fixture(path: &Path) -> Result<TestFixture> {
 /// Load all fixtures from a directory.
 pub fn load_fixtures_from_dir(dir: &Path) -> Result<Vec<TestFixture>> {
     let mut fixtures = Vec::new();
+    const NON_FIXTURE_JSON_FILES: [&str; 1] = ["core_sql_golden_blake3.json"];
     if !dir.is_dir() {
         return Err(FrankenError::Internal(format!(
             "fixture directory does not exist: {}",
@@ -808,6 +809,18 @@ pub fn load_fixtures_from_dir(dir: &Path) -> Result<Vec<TestFixture>> {
         .collect();
     entries.sort();
     for entry in entries {
+        let should_skip = entry
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|name| NON_FIXTURE_JSON_FILES.contains(&name));
+        if should_skip {
+            debug!(
+                bead_id = BEAD_ID,
+                path = %entry.display(),
+                "skipping non-fixture JSON artifact while loading fixtures"
+            );
+            continue;
+        }
         fixtures.push(load_fixture(&entry)?);
     }
     info!(

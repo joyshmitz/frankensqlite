@@ -7196,6 +7196,257 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Proptest: additional property tests (bd-1lsfu.4)
+    // -----------------------------------------------------------------------
+
+    mod proptest_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Reuse the statement generator from the roundtrip module.
+        fn arb_ident() -> BoxedStrategy<String> {
+            prop::string::string_regex("[a-z][a-z0-9]{0,5}")
+                .expect("valid regex")
+                .prop_filter("must not be keyword", |s| {
+                    TokenKind::lookup_keyword(s).is_none()
+                })
+                .boxed()
+        }
+
+        fn arb_literal() -> BoxedStrategy<String> {
+            prop_oneof![
+                any::<i32>().prop_map(|n| n.to_string()),
+                (1i32..1000).prop_map(|n| format!("{n}.{}", n % 100)),
+                arb_ident().prop_map(|s| format!("'{s}'")),
+                Just("NULL".to_string()),
+                Just("TRUE".to_string()),
+                Just("FALSE".to_string()),
+            ]
+            .boxed()
+        }
+
+        fn arb_expr(depth: u32) -> BoxedStrategy<String> {
+            if depth == 0 {
+                prop_oneof![arb_literal(), arb_ident(),].boxed()
+            } else {
+                let leaf = arb_expr(0);
+                prop_oneof![
+                    4 => leaf,
+                    2 => (arb_expr(depth - 1), prop_oneof![
+                        Just("+"), Just("-"), Just("*"), Just("/"),
+                        Just("="), Just("!="), Just("<"), Just("<="),
+                        Just(">"), Just(">="), Just("AND"), Just("OR"),
+                    ], arb_expr(depth - 1))
+                        .prop_map(|(l, op, r)| format!("({l} {op} {r})")),
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("(-{e})")),
+                    1 => arb_expr(depth - 1).prop_map(|e| format!("(NOT {e})")),
+                ]
+                .boxed()
+            }
+        }
+
+        fn arb_select() -> BoxedStrategy<String> {
+            use std::fmt::Write as _;
+            let cols =
+                proptest::collection::vec(arb_expr(1), 1..4).prop_map(|cols| cols.join(", "));
+            let table = arb_ident();
+            let where_clause = prop::option::of(arb_expr(1));
+            (cols, table, where_clause)
+                .prop_map(|(cols, tbl, wh)| {
+                    let mut sql = format!("SELECT {cols} FROM {tbl}");
+                    if let Some(w) = wh {
+                        write!(sql, " WHERE {w}").expect("writing to String should not fail");
+                    }
+                    sql
+                })
+                .boxed()
+        }
+
+        fn arb_statement() -> BoxedStrategy<String> {
+            prop_oneof![
+                6 => arb_select(),
+                3 => {
+                    let ncols = 1usize..4;
+                    ncols
+                        .prop_flat_map(|n| {
+                            let tbl = arb_ident();
+                            let cols = proptest::collection::vec(arb_ident(), n..=n);
+                            let vals = proptest::collection::vec(arb_literal(), n..=n);
+                            (tbl, cols, vals).prop_map(
+                                |(t, cs, vs): (String, Vec<String>, Vec<String>)| {
+                                    format!(
+                                        "INSERT INTO {t} ({}) VALUES ({})",
+                                        cs.join(", "),
+                                        vs.join(", ")
+                                    )
+                                },
+                            )
+                        })
+                        .boxed()
+                },
+                1 => arb_expr(2).prop_map(|e| format!("SELECT {e}")),
+                1 => (arb_ident(), arb_expr(1))
+                    .prop_map(|(t, w)| format!("DELETE FROM {t} WHERE {w}")),
+                1 => (arb_ident(), arb_ident(), arb_literal(), arb_expr(1))
+                    .prop_map(|(t, c, v, w)| format!("UPDATE {t} SET {c} = {v} WHERE {w}")),
+            ]
+            .boxed()
+        }
+
+        // Property 2: Determinism — same input always produces the same AST.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(500))]
+
+            #[test]
+            fn test_parser_determinism(sql in arb_statement()) {
+                let mut p1 = Parser::from_sql(&sql);
+                let (stmts1, errs1) = p1.parse_all();
+
+                let mut p2 = Parser::from_sql(&sql);
+                let (stmts2, errs2) = p2.parse_all();
+
+                // Both parses must produce the same number of statements and errors.
+                let msg_stmt = format!("different statement counts for: {sql}");
+                prop_assert_eq!(stmts1.len(), stmts2.len(), "{}", msg_stmt);
+                let msg_err = format!("different error counts for: {sql}");
+                prop_assert_eq!(errs1.len(), errs2.len(), "{}", msg_err);
+
+                // If successful, the rendered SQL must be identical.
+                if errs1.is_empty() && !stmts1.is_empty() {
+                    for (s1, s2) in stmts1.iter().zip(stmts2.iter()) {
+                        let r1 = s1.to_string();
+                        let r2 = s2.to_string();
+                        let msg_det = format!("non-deterministic parse output for: {sql}");
+                        prop_assert_eq!(r1, r2, "{}", msg_det);
+                    }
+                }
+            }
+        }
+
+        // Property 3: Fuzz safety — random byte strings never panic the parser.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(2000))]
+
+            #[test]
+            fn test_parser_fuzz_no_panic(input in prop::collection::vec(any::<u8>(), 0..256)) {
+                let sql = String::from_utf8_lossy(&input);
+                // Must not panic — errors are fine, panics are not.
+                let mut p = Parser::from_sql(&sql);
+                let _ = p.parse_all();
+            }
+        }
+
+        // Property 3b: Fuzz safety with near-valid SQL (more likely to trigger edge cases).
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1000))]
+
+            #[test]
+            fn test_parser_fuzz_near_valid(
+                prefix in prop_oneof![
+                    Just("SELECT "),
+                    Just("INSERT INTO "),
+                    Just("DELETE FROM "),
+                    Just("UPDATE "),
+                    Just("CREATE TABLE "),
+                    Just("DROP TABLE "),
+                    Just("BEGIN "),
+                    Just("PRAGMA "),
+                ],
+                suffix in prop::string::string_regex("[a-zA-Z0-9_ ,.*=<>!()'\";+\\-/]{0,100}")
+                    .expect("valid regex")
+            ) {
+                let sql = format!("{prefix}{suffix}");
+                let mut p = Parser::from_sql(&sql);
+                let _ = p.parse_all();
+            }
+        }
+
+        // Property 4: Unicode identifiers parse correctly.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn test_parser_unicode_identifiers(
+                name in prop::string::string_regex("[\\p{L}][\\p{L}\\p{N}_]{0,10}")
+                    .expect("valid regex")
+                    .prop_filter("must not be keyword", |s| {
+                        TokenKind::lookup_keyword(s).is_none()
+                    })
+            ) {
+                // Double-quoted identifiers with Unicode should parse.
+                let sql = format!("SELECT \"{name}\" FROM \"{name}\"");
+                let mut p = Parser::from_sql(&sql);
+                let (stmts, errs) = p.parse_all();
+                prop_assert!(
+                    errs.is_empty(),
+                    "Unicode identifier should parse: {sql}, errors: {errs:?}"
+                );
+                prop_assert_eq!(stmts.len(), 1);
+            }
+        }
+
+        // Property 5: Rejection — various forms of invalid SQL are rejected.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(300))]
+
+            #[test]
+            fn test_parser_rejects_incomplete_statements(
+                kind in prop_oneof![
+                    Just("SELECT"),
+                    Just("SELECT FROM"),
+                    Just("INSERT INTO"),
+                    Just("DELETE"),
+                    Just("UPDATE SET"),
+                    Just("CREATE"),
+                    Just("CREATE TABLE"),
+                    Just("DROP"),
+                ],
+                trailing in prop::option::of(
+                    prop::string::string_regex("[;, ]{0,3}").expect("valid regex")
+                )
+            ) {
+                let sql = match trailing {
+                    Some(t) => format!("{kind}{t}"),
+                    None => kind.to_string(),
+                };
+                let mut p = Parser::from_sql(&sql);
+                let (stmts, errs) = p.parse_all();
+                // At least one of: parse errors, or no valid statements produced.
+                // The parser should not silently produce a valid-looking AST from
+                // these fundamentally incomplete inputs.
+                prop_assert!(
+                    !errs.is_empty() || stmts.is_empty(),
+                    "Expected rejection of incomplete SQL: {sql}, got {stmts:?}"
+                );
+            }
+        }
+
+        // Property 6: Statement count stability — concatenated statements produce
+        // the right number of parsed statements.
+        proptest::proptest! {
+            #![proptest_config(proptest::prelude::ProptestConfig::with_cases(200))]
+
+            #[test]
+            fn test_parser_multi_statement_count(
+                stmts in proptest::collection::vec(arb_statement(), 1..4)
+            ) {
+                let sql = stmts.join("; ");
+                let mut p = Parser::from_sql(&sql);
+                let (parsed, errors) = p.parse_all();
+                // If no errors, we should get at least as many statements as we joined.
+                if errors.is_empty() {
+                    prop_assert!(
+                        parsed.len() >= stmts.len(),
+                        "Expected at least {} statements from: {sql}, got {}",
+                        stmts.len(),
+                        parsed.len()
+                    );
+                }
+            }
+        }
+    }
+
     // ── bd-1702 repro tests ─────────────────────────────────────────────
     // Reserved-word column names in CREATE TABLE (quoted and unquoted).
 

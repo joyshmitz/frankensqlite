@@ -169,8 +169,7 @@ fn map_path_to_code_area(path: &str) -> Option<&'static str> {
         Some("fsqlite-mvcc")
     } else if path.starts_with("crates/fsqlite-btree/") {
         Some("fsqlite-btree")
-    } else if path.starts_with("crates/fsqlite-parser/")
-        || path.starts_with("crates/fsqlite-ast/")
+    } else if path.starts_with("crates/fsqlite-parser/") || path.starts_with("crates/fsqlite-ast/")
     {
         Some("fsqlite-parser")
     } else if path.starts_with("crates/fsqlite-planner/") {
@@ -293,7 +292,10 @@ pub fn select_ci_lanes_for_paths(
     apply_coverage_gate_policy(&mut acc, coverage_gate);
 
     let mut fallback_full_suite = false;
-    if unresolved_paths.iter().any(|path| looks_like_code_path(path)) {
+    if unresolved_paths
+        .iter()
+        .any(|path| looks_like_code_path(path))
+    {
         fallback_full_suite = true;
         for lane in CiLane::ALL {
             add_lane_reason(
@@ -317,10 +319,7 @@ pub fn select_ci_lanes_for_paths(
                         &mut acc,
                         *lane,
                         edge.mandatory,
-                        format!(
-                            "impact mapping: code area `{area_id}` -> `{}`",
-                            edge.lane
-                        ),
+                        format!("impact mapping: code area `{area_id}` -> `{}`", edge.lane),
                     );
                 }
             }
@@ -423,7 +422,8 @@ mod tests {
     #[test]
     fn json_roundtrip_preserves_report() {
         let graph = ImpactGraph::canonical();
-        let report = select_ci_lanes_for_paths(&["crates/fsqlite-core/src/connection.rs"], &graph, None);
+        let report =
+            select_ci_lanes_for_paths(&["crates/fsqlite-core/src/connection.rs"], &graph, None);
         let json = report.to_json().expect("serialize");
         let restored = LaneSelectionReport::from_json(&json).expect("deserialize");
         assert_eq!(report, restored);

@@ -796,36 +796,48 @@ pub fn parse_db_header_fields(data: &[u8]) -> Result<DbHeaderFields> {
     })
 }
 
-/// Compute XOR parity repair symbols for a group of source pages.
+/// Derive a deterministic RaptorQ encoder seed from group metadata.
 ///
-/// Symbol 0 is the XOR of all source pages (single-fault recovery).
-/// Symbols 1..R-1 use byte-rotated XOR for additional redundancy.
-#[must_use]
-fn compute_xor_parity(source_pages: &[&[u8]], page_size: usize, r_repair: u32) -> Vec<Vec<u8>> {
-    let mut symbols = Vec::with_capacity(r_repair as usize);
+/// Uses xxh3_64 over the group's content-addressed fields to produce a
+/// seed that is unique per group and deterministic across encode/decode.
+fn derive_db_fec_repair_seed(meta: &DbFecGroupMeta) -> u64 {
+    let mut seed_material = Vec::with_capacity(16 + 4 * 4 + 16);
+    seed_material.extend_from_slice(&meta.object_id);
+    seed_material.extend_from_slice(&meta.page_size.to_le_bytes());
+    seed_material.extend_from_slice(&meta.start_pgno.to_le_bytes());
+    seed_material.extend_from_slice(&meta.group_size.to_le_bytes());
+    seed_material.extend_from_slice(&meta.r_repair.to_le_bytes());
+    seed_material.extend_from_slice(&meta.db_gen_digest);
+    xxhash_rust::xxh3::xxh3_64(&seed_material)
+}
 
-    // Symbol 0: straight XOR parity.
-    let mut parity = vec![0u8; page_size];
-    for page in source_pages {
-        for (j, &b) in page.iter().enumerate() {
-            parity[j] ^= b;
-        }
+/// Compute RFC 6330 RaptorQ repair symbols for a group of source pages.
+///
+/// Uses `asupersync::raptorq::systematic::SystematicEncoder` to produce
+/// `r_repair` repair symbols with ESIs `[K, K+R)`.
+fn compute_raptorq_repair_symbols(
+    meta: &DbFecGroupMeta,
+    source_pages: &[&[u8]],
+    page_size: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let seed = derive_db_fec_repair_seed(meta);
+    let source_vecs: Vec<Vec<u8>> = source_pages.iter().map(|s| s.to_vec()).collect();
+    let encoder =
+        asupersync::raptorq::systematic::SystematicEncoder::new(&source_vecs, page_size, seed)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "RaptorQ constraint matrix singular during encoding".to_owned(),
+            })?;
+
+    let k = u32::try_from(source_pages.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+        detail: "source page count does not fit in u32".to_owned(),
+    })?;
+
+    let mut symbols = Vec::with_capacity(meta.r_repair as usize);
+    for r_idx in 0..meta.r_repair {
+        let esi = k + r_idx;
+        symbols.push(encoder.repair_symbol(esi));
     }
-    symbols.push(parity);
-
-    // Symbols 1..R-1: rotated XOR for multi-fault tolerance.
-    for r in 1..r_repair {
-        let mut sym = vec![0u8; page_size];
-        for (i, page) in source_pages.iter().enumerate() {
-            let shift = (r as usize * (i + 1)) % page_size.max(1);
-            for (j, &b) in page.iter().enumerate() {
-                sym[(j + shift) % page_size] ^= b;
-            }
-        }
-        symbols.push(sym);
-    }
-
-    symbols
+    Ok(symbols)
 }
 
 /// Read a single page from raw database bytes, zero-padding if file is short.
@@ -899,7 +911,7 @@ pub fn generate_db_fec_from_bytes(db_data: &[u8]) -> Result<Vec<u8>> {
         );
 
         // Compute repair symbols.
-        let repair_symbols = compute_xor_parity(&source_slices, ps, group.repair);
+        let repair_symbols = compute_raptorq_repair_symbols(&meta, &source_slices, ps)?;
 
         // Write metadata.
         let meta_bytes = meta.to_bytes();

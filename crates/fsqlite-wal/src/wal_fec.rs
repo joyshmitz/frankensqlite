@@ -1006,50 +1006,49 @@ fn generate_wal_fec_repair_symbols_inner(
     let symbol_len = usize::try_from(meta.oti.t).map_err(|_| FrankenError::WalCorrupt {
         detail: format!("OTI symbol size {} does not fit in usize", meta.oti.t),
     })?;
-    let mut symbols = Vec::with_capacity(usize::try_from(meta.r_repair).map_err(|_| {
-        FrankenError::WalCorrupt {
-            detail: format!("r_repair {} does not fit in usize", meta.r_repair),
-        }
-    })?);
+    let r_repair = usize::try_from(meta.r_repair).map_err(|_| FrankenError::WalCorrupt {
+        detail: format!("r_repair {} does not fit in usize", meta.r_repair),
+    })?;
 
-    for repair_index in 0..meta.r_repair {
+    // Derive a deterministic group-level seed for the SystematicEncoder from
+    // the group metadata (object_id, salts, frame range, k, r).
+    let encoder_seed = derive_repair_seed(meta, 0);
+
+    let encoder = asupersync::raptorq::systematic::SystematicEncoder::new(
+        source_pages,
+        symbol_len,
+        encoder_seed,
+    )
+    .ok_or_else(|| FrankenError::WalCorrupt {
+        detail: "RaptorQ constraint matrix singular during encoding".to_owned(),
+    })?;
+
+    let mut symbols = Vec::with_capacity(r_repair);
+
+    for repair_index in 0..r_repair {
         if let Some(flag) = cancel_flag {
             if flag.load(Ordering::SeqCst) {
                 return Ok(None);
             }
         }
-        let mut payload = vec![0_u8; symbol_len];
-        let seed = derive_repair_seed(meta, repair_index);
-        let seed_bytes = seed.to_le_bytes();
-        let repair_index_usize =
-            usize::try_from(repair_index).map_err(|_| FrankenError::WalCorrupt {
-                detail: format!("repair_index {repair_index} does not fit in usize"),
+
+        let esi = meta
+            .k_source
+            .checked_add(
+                u32::try_from(repair_index).map_err(|_| FrankenError::WalCorrupt {
+                    detail: format!("repair_index {repair_index} does not fit in u32"),
+                })?,
+            )
+            .ok_or_else(|| FrankenError::WalCorrupt {
+                detail: "repair symbol ESI overflow".to_owned(),
             })?;
 
-        for byte_index in 0..symbol_len {
-            let mut mixed = seed_bytes[byte_index % seed_bytes.len()];
-            for (page_index, page) in source_pages.iter().enumerate() {
-                let read_index = (byte_index + page_index + repair_index_usize) % symbol_len;
-                let source_byte = page[read_index];
-                let tweak_raw = (page_index + byte_index) & 0xFF;
-                let tweak = u8::try_from(tweak_raw).map_err(|_| FrankenError::WalCorrupt {
-                    detail: format!("tweak value {tweak_raw} does not fit in u8"),
-                })?;
-                mixed ^= source_byte;
-                mixed = mixed.rotate_left(u32::from(tweak & 0x07)) ^ tweak;
-            }
-            payload[byte_index] = mixed;
-        }
+        let payload = encoder.repair_symbol(esi);
 
         if per_symbol_delay > Duration::ZERO {
             thread::sleep(per_symbol_delay);
         }
-        let esi =
-            meta.k_source
-                .checked_add(repair_index)
-                .ok_or_else(|| FrankenError::WalCorrupt {
-                    detail: "repair symbol ESI overflow".to_owned(),
-                })?;
+
         symbols.push(SymbolRecord::new(
             meta.object_id,
             meta.oti,
@@ -1130,6 +1129,83 @@ pub fn build_source_page_hashes(page_payloads: &[Vec<u8>]) -> Vec<Xxh3Checksum12
         .iter()
         .map(|page| wal_fec_source_hash_xxh3_128(page))
         .collect()
+}
+
+/// RFC 6330 RaptorQ decode function for WAL-FEC recovery.
+///
+/// Accepts the group metadata and a slice of `(esi, symbol_data)` pairs
+/// (source symbols with ESI < K and repair symbols with ESI >= K).
+/// Returns `K` recovered source pages on success.
+///
+/// This function is the companion decoder for the `SystematicEncoder`-based
+/// encoding in [`generate_wal_fec_repair_symbols_inner`] and is intended as
+/// the `decode` closure for [`recover_wal_fec_group_with_decoder`].
+pub fn wal_fec_raptorq_decode(
+    meta: &WalFecGroupMeta,
+    symbols: &[(u32, Vec<u8>)],
+) -> Result<Vec<Vec<u8>>> {
+    let k = usize::try_from(meta.k_source).map_err(|_| FrankenError::WalCorrupt {
+        detail: format!("k_source {} does not fit in usize", meta.k_source),
+    })?;
+    let symbol_size = usize::try_from(meta.oti.t).map_err(|_| FrankenError::WalCorrupt {
+        detail: format!("OTI symbol size {} does not fit in usize", meta.oti.t),
+    })?;
+
+    // Must use the same seed as the encoder.
+    let encoder_seed = derive_repair_seed(meta, 0);
+    let decoder =
+        asupersync::raptorq::decoder::InactivationDecoder::new(k, symbol_size, encoder_seed);
+
+    // Start with constraint symbols (LDPC + HDPC with zero data).
+    let mut received = decoder.constraint_symbols();
+
+    // Convert caller-provided (esi, data) pairs into ReceivedSymbol entries.
+    for &(esi, ref data) in symbols {
+        let esi_usize = esi as usize;
+        if esi_usize < k {
+            let (cols, coefs) = decoder.source_equation(esi);
+            received.push(asupersync::raptorq::decoder::ReceivedSymbol {
+                esi,
+                is_source: true,
+                columns: cols,
+                coefficients: coefs,
+                data: data.clone(),
+            });
+        } else {
+            let (cols, coefs) = decoder.repair_equation(esi);
+            received.push(asupersync::raptorq::decoder::ReceivedSymbol::repair(
+                esi,
+                cols,
+                coefs,
+                data.clone(),
+            ));
+        }
+    }
+
+    let result = decoder
+        .decode(&received)
+        .map_err(|err| FrankenError::WalCorrupt {
+            detail: format!("RaptorQ decode failed: {err:?}"),
+        })?;
+
+    if result.source.len() != k {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!(
+                "RaptorQ decode returned {} source symbols, expected {k}",
+                result.source.len()
+            ),
+        });
+    }
+
+    debug!(
+        k_source = k,
+        peeled = result.stats.peeled,
+        inactivated = result.stats.inactivated,
+        gauss_ops = result.stats.gauss_ops,
+        "wal-fec RaptorQ decode succeeded"
+    );
+
+    Ok(result.source)
 }
 
 /// Resolve sidecar path from WAL path.
@@ -2334,5 +2410,166 @@ mod tests {
             "bead_id={BEAD_ID_2HA1} case=checksum_corrupt expected checksum error, got: {msg}"
         );
         eprintln!("ERROR bead_id={BEAD_ID_2HA1} case=checksum_corrupt error={err}");
+    }
+
+    /// Build deterministic source pages of `page_size` bytes each.
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_source_pages(k: u32, page_size: u32) -> Vec<Vec<u8>> {
+        let ps = page_size as usize;
+        (0..k)
+            .map(|i| {
+                (0..ps)
+                    .map(|j| ((i as usize * 37 + j * 13 + 7) % 256) as u8)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_test_init_with_hashes(k: u32, source_pages: &[Vec<u8>]) -> WalFecGroupMetaInit {
+        let page_size = source_pages[0].len() as u32;
+        WalFecGroupMetaInit {
+            wal_salt1: 0x1234_5678,
+            wal_salt2: 0xABCD_EF01,
+            start_frame_no: 1,
+            end_frame_no: k,
+            db_size_pages: 100,
+            page_size,
+            k_source: k,
+            r_repair: 2,
+            oti: Oti {
+                f: u64::from(k) * u64::from(page_size),
+                al: 0,
+                t: page_size,
+                z: 1,
+                n: 1,
+            },
+            object_id: ObjectId::from_bytes([0xAA; 16]),
+            page_numbers: (1..=k).collect(),
+            source_page_xxh3_128: build_source_page_hashes(source_pages),
+        }
+    }
+
+    #[test]
+    fn test_raptorq_encode_produces_valid_symbols() {
+        let k = 4_u32;
+        let page_size = 4096_u32;
+        let source_pages = make_source_pages(k, page_size);
+        let init = make_test_init_with_hashes(k, &source_pages);
+        let meta = WalFecGroupMeta::from_init(init).expect("from_init");
+
+        let symbols =
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+                .expect("encode should succeed")
+                .expect("should not be cancelled");
+
+        assert_eq!(symbols.len(), 2, "expected r_repair=2 repair symbols");
+        for (i, sym) in symbols.iter().enumerate() {
+            assert_eq!(
+                sym.symbol_data.len(),
+                page_size as usize,
+                "repair symbol {i} size"
+            );
+            let expected_esi = k + u32::try_from(i).expect("i fits u32");
+            assert_eq!(sym.esi, expected_esi, "repair symbol {i} ESI");
+        }
+    }
+
+    #[test]
+    fn test_raptorq_encode_decode_roundtrip_all_source() {
+        // When all source symbols are available, decode should still succeed.
+        let k = 4_u32;
+        let page_size = 512_u32;
+        let source_pages = make_source_pages(k, page_size);
+        let init = make_test_init_with_hashes(k, &source_pages);
+        let meta = WalFecGroupMeta::from_init(init).expect("from_init");
+
+        let repair_symbols =
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+                .expect("encode")
+                .expect("not cancelled");
+
+        // Build (esi, data) pairs: all source + all repair.
+        let mut all_symbols: Vec<(u32, Vec<u8>)> = source_pages
+            .iter()
+            .enumerate()
+            .map(|(i, page)| (u32::try_from(i).expect("i fits u32"), page.clone()))
+            .collect();
+        for sym in &repair_symbols {
+            all_symbols.push((sym.esi, sym.symbol_data.clone()));
+        }
+
+        let decoded = wal_fec_raptorq_decode(&meta, &all_symbols)
+            .expect("decode with all symbols should succeed");
+
+        for (i, original) in source_pages.iter().enumerate() {
+            assert_eq!(&decoded[i], original, "decoded source page {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn test_raptorq_encode_decode_roundtrip_with_corruption() {
+        // Lose one source page, recover from remaining source + repair symbols.
+        let k = 4_u32;
+        let page_size = 512_u32;
+        let r_repair = 4_u32; // Need enough repair symbols for recovery
+        let source_pages = make_source_pages(k, page_size);
+        let mut init = make_test_init_with_hashes(k, &source_pages);
+        init.r_repair = r_repair;
+        let meta = WalFecGroupMeta::from_init(init).expect("from_init");
+
+        let repair_symbols =
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+                .expect("encode")
+                .expect("not cancelled");
+
+        // Simulate losing source page 1: only provide pages 0, 2, 3 + all repair.
+        let mut available_symbols: Vec<(u32, Vec<u8>)> = Vec::new();
+        for (i, page) in source_pages.iter().enumerate() {
+            if i != 1 {
+                available_symbols.push((u32::try_from(i).expect("i fits u32"), page.clone()));
+            }
+        }
+        for sym in &repair_symbols {
+            available_symbols.push((sym.esi, sym.symbol_data.clone()));
+        }
+
+        let decoded = wal_fec_raptorq_decode(&meta, &available_symbols)
+            .expect("decode should recover missing page");
+
+        for (i, original) in source_pages.iter().enumerate() {
+            assert_eq!(
+                &decoded[i], original,
+                "decoded source page {i} mismatch (page 1 was lost)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_raptorq_encode_deterministic() {
+        // Same inputs produce identical repair symbols.
+        let k = 3_u32;
+        let page_size = 512_u32;
+        let source_pages = make_source_pages(k, page_size);
+        let init = make_test_init_with_hashes(k, &source_pages);
+        let meta = WalFecGroupMeta::from_init(init).expect("from_init");
+
+        let symbols1 =
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+                .expect("encode 1")
+                .expect("not cancelled");
+
+        let symbols2 =
+            generate_wal_fec_repair_symbols_inner(&meta, &source_pages, None, Duration::ZERO)
+                .expect("encode 2")
+                .expect("not cancelled");
+
+        assert_eq!(symbols1.len(), symbols2.len());
+        for (i, (s1, s2)) in symbols1.iter().zip(symbols2.iter()).enumerate() {
+            assert_eq!(
+                s1.symbol_data, s2.symbol_data,
+                "repair symbol {i} not deterministic"
+            );
+        }
     }
 }
