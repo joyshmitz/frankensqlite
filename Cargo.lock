@@ -854,6 +854,7 @@ name = "fsqlite-harness"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "blake3",
  "fsqlite",
  "fsqlite-ast",
  "fsqlite-btree",

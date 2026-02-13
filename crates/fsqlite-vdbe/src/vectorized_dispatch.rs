@@ -7,7 +7,7 @@
 //! - pipeline barriers between pipeline waves.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 use crossbeam_deque::{Steal, Stealer, Worker};
@@ -162,8 +162,7 @@ pub struct DispatcherConfig {
 impl Default for DispatcherConfig {
     fn default() -> Self {
         let workers = thread::available_parallelism()
-            .map(|count| count.get())
-            .unwrap_or(2)
+            .map_or(2, std::num::NonZeroUsize::get)
             .saturating_sub(1)
             .max(1);
         Self {
@@ -252,7 +251,7 @@ impl WorkStealingDispatcher {
             if tasks.is_empty() {
                 continue;
             }
-            let report = self.execute_single_pipeline(tasks, Arc::clone(&execute))?;
+            let report = self.execute_single_pipeline(tasks, &execute)?;
             reports.push(report);
         }
 
@@ -262,7 +261,7 @@ impl WorkStealingDispatcher {
     fn execute_single_pipeline<R, F>(
         &self,
         tasks: &[PipelineTask],
-        execute: Arc<F>,
+        execute: &Arc<F>,
     ) -> DispatchResult<PipelineExecution<R>>
     where
         R: Send + 'static,
@@ -291,10 +290,13 @@ impl WorkStealingDispatcher {
         }
 
         let mut handles = Vec::with_capacity(self.config.worker_threads);
+        let start_barrier = Arc::new(Barrier::new(self.config.worker_threads));
         for (worker_id, local_worker) in workers.into_iter().enumerate() {
-            let execute = Arc::clone(&execute);
+            let execute = Arc::clone(execute);
             let stealers = stealers.clone();
+            let start_barrier = Arc::clone(&start_barrier);
             handles.push(thread::spawn(move || {
+                start_barrier.wait();
                 let mut completed = Vec::new();
                 let mut count = 0usize;
                 while let Some(task) = pop_or_steal(&local_worker, worker_id, &stealers) {
@@ -364,7 +366,7 @@ fn steal_from_peers<T>(worker_id: usize, stealers: &[Stealer<T>]) -> Option<T> {
             match stealers[peer].steal() {
                 Steal::Success(task) => return Some(task),
                 Steal::Empty => break,
-                Steal::Retry => continue,
+                Steal::Retry => (),
             }
         }
     }
@@ -428,10 +430,10 @@ mod tests {
         let events_for_exec = Arc::clone(&events);
         let reports = dispatcher
             .execute_with_barriers(&[pipeline0, pipeline1], move |task, _worker_id| {
-                let mut guard = events_for_exec
+                events_for_exec
                     .lock()
-                    .expect("event lock should not be poisoned");
-                guard.push(task.pipeline.0);
+                    .expect("event lock should not be poisoned")
+                    .push(task.pipeline.0);
                 task.task_id
             })
             .expect("dispatch should succeed");
@@ -441,15 +443,19 @@ mod tests {
             2,
             "bead_id={BEAD_ID} expected two pipeline reports"
         );
-        let events = events.lock().expect("event lock should not be poisoned");
-        let first_pipeline1 = events
-            .iter()
-            .position(|pipeline| *pipeline == 1)
-            .expect("pipeline 1 events should exist");
-        let last_pipeline0 = events
-            .iter()
-            .rposition(|pipeline| *pipeline == 0)
-            .expect("pipeline 0 events should exist");
+        let (first_pipeline1, last_pipeline0) = {
+            let events = events.lock().expect("event lock should not be poisoned");
+            let first_pipeline1 = events
+                .iter()
+                .position(|pipeline| *pipeline == 1)
+                .expect("pipeline 1 events should exist");
+            let last_pipeline0 = events
+                .iter()
+                .rposition(|pipeline| *pipeline == 0)
+                .expect("pipeline 0 events should exist");
+            drop(events);
+            (first_pipeline1, last_pipeline0)
+        };
         assert!(
             last_pipeline0 < first_pipeline1,
             "bead_id={BEAD_ID} pipeline barrier violated"
