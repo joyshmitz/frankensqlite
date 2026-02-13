@@ -2037,14 +2037,8 @@ mod tests {
         let before = GLOBAL_SNAPSHOT_FEC_METRICS.snapshot();
         GLOBAL_SNAPSHOT_FEC_METRICS.record_encode(7, 256);
         let after = GLOBAL_SNAPSHOT_FEC_METRICS.snapshot();
-        assert_eq!(
-            after.encoded_pages_total - before.encoded_pages_total,
-            7
-        );
-        assert_eq!(
-            after.sidecar_bytes_total - before.sidecar_bytes_total,
-            256
-        );
+        assert_eq!(after.encoded_pages_total - before.encoded_pages_total, 7);
+        assert_eq!(after.sidecar_bytes_total - before.sidecar_bytes_total, 256);
         assert_eq!(after.encode_ops - before.encode_ops, 1);
     }
 }
