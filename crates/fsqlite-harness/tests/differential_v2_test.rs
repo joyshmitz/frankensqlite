@@ -7,8 +7,8 @@
 //! - Reproducibility (two runs with identical envelopes produce identical results)
 
 use fsqlite_harness::differential_v2::{
-    self, CanonicalizationRules, DifferentialResult, ExecutionEnvelope, FsqliteExecutor,
-    NormalizedValue, Outcome, PragmaConfig, SqlExecutor, FORMAT_VERSION,
+    self, CanonicalizationRules, DifferentialResult, ExecutionEnvelope, FORMAT_VERSION,
+    FsqliteExecutor, NormalizedValue, Outcome, PragmaConfig, SqlExecutor,
 };
 
 /// Rusqlite executor for the C SQLite oracle.
@@ -26,9 +26,7 @@ impl RusqliteExecutor {
 
 impl SqlExecutor for RusqliteExecutor {
     fn execute(&self, sql: &str) -> Result<usize, String> {
-        self.conn
-            .execute(sql.trim(), [])
-            .map_err(|e| e.to_string())
+        self.conn.execute(sql.trim(), []).map_err(|e| e.to_string())
     }
 
     fn query(&self, sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
@@ -186,9 +184,7 @@ fn differential_pass_on_schema_and_dml() {
     assert!(result.logical_state_matched);
     eprintln!(
         "bead_id=bd-1dp9.1.2 test=differential_schema_dml matched={} total={} state_hash={}",
-        result.statements_matched,
-        result.statements_total,
-        result.logical_state_hash_csqlite
+        result.statements_matched, result.statements_total, result.logical_state_hash_csqlite
     );
 }
 
@@ -252,31 +248,26 @@ fn differential_result_is_reproducible() {
     let r2 = run_test(&envelope);
 
     assert_eq!(
-        r1.artifact_hashes.envelope_id,
-        r2.artifact_hashes.envelope_id,
+        r1.artifact_hashes.envelope_id, r2.artifact_hashes.envelope_id,
         "envelope_id must be identical across runs"
     );
     assert_eq!(
-        r1.artifact_hashes.result_hash,
-        r2.artifact_hashes.result_hash,
+        r1.artifact_hashes.result_hash, r2.artifact_hashes.result_hash,
         "result_hash must be identical across runs"
     );
     assert_eq!(
-        r1.artifact_hashes.workload_hash,
-        r2.artifact_hashes.workload_hash,
+        r1.artifact_hashes.workload_hash, r2.artifact_hashes.workload_hash,
         "workload_hash must be identical across runs"
     );
     assert_eq!(r1.outcome, r2.outcome);
     assert_eq!(r1.statements_matched, r2.statements_matched);
     assert_eq!(r1.statements_mismatched, r2.statements_mismatched);
     assert_eq!(
-        r1.logical_state_hash_fsqlite,
-        r2.logical_state_hash_fsqlite,
+        r1.logical_state_hash_fsqlite, r2.logical_state_hash_fsqlite,
         "fsqlite logical state must be identical"
     );
     assert_eq!(
-        r1.logical_state_hash_csqlite,
-        r2.logical_state_hash_csqlite,
+        r1.logical_state_hash_csqlite, r2.logical_state_hash_csqlite,
         "csqlite logical state must be identical"
     );
 

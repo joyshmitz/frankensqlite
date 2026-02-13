@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use fsqlite_harness::corpus_ingest::{
-    classify_family, derive_entry_seed, generate_seed_corpus, ingest_conformance_fixtures,
-    CorpusBuilder, CorpusSource, Family, CORPUS_SEED_BASE,
+    CORPUS_SEED_BASE, CorpusBuilder, CorpusSource, Family, classify_family, derive_entry_seed,
+    generate_seed_corpus, ingest_conformance_fixtures,
 };
 
 // ─── Family Classification Tests ─────────────────────────────────────────
@@ -41,10 +41,7 @@ fn classify_begin_commit_as_txn() {
 
 #[test]
 fn classify_savepoint_as_txn() {
-    let stmts = vec![
-        "SAVEPOINT sp1".to_owned(),
-        "RELEASE sp1".to_owned(),
-    ];
+    let stmts = vec!["SAVEPOINT sp1".to_owned(), "RELEASE sp1".to_owned()];
     let (family, _) = classify_family(&stmts);
     assert_eq!(family, Family::TXN);
 }
@@ -86,27 +83,21 @@ fn classify_json_as_ext() {
 
 #[test]
 fn classify_fts_as_ext() {
-    let stmts = vec![
-        "CREATE VIRTUAL TABLE docs USING FTS5(title, body)".to_owned(),
-    ];
+    let stmts = vec!["CREATE VIRTUAL TABLE docs USING FTS5(title, body)".to_owned()];
     let (family, _) = classify_family(&stmts);
     assert_eq!(family, Family::EXT);
 }
 
 #[test]
 fn classify_join_as_pln() {
-    let stmts = vec![
-        "SELECT a.x, b.y FROM t1 a JOIN t2 b ON a.id = b.a_id".to_owned(),
-    ];
+    let stmts = vec!["SELECT a.x, b.y FROM t1 a JOIN t2 b ON a.id = b.a_id".to_owned()];
     let (family, _) = classify_family(&stmts);
     assert_eq!(family, Family::PLN);
 }
 
 #[test]
 fn classify_cte_as_pln() {
-    let stmts = vec![
-        "WITH cte AS (SELECT 1) SELECT * FROM cte".to_owned(),
-    ];
+    let stmts = vec!["WITH cte AS (SELECT 1) SELECT * FROM cte".to_owned()];
     let (family, _) = classify_family(&stmts);
     assert_eq!(family, Family::PLN);
 }
@@ -243,7 +234,11 @@ fn builder_link_features_attaches_ids() {
 
     let manifest = builder.build();
     assert_eq!(manifest.entries[0].taxonomy_features.len(), 2);
-    assert!(manifest.entries[0].taxonomy_features.contains(&"F-FUN.5".to_owned()));
+    assert!(
+        manifest.entries[0]
+            .taxonomy_features
+            .contains(&"F-FUN.5".to_owned())
+    );
 }
 
 // ─── Coverage Report Tests ───────────────────────────────────────────────
@@ -263,10 +258,30 @@ fn coverage_reports_missing_families() {
     let manifest = builder.build();
 
     assert!(manifest.coverage.missing_families.len() >= 7);
-    assert!(manifest.coverage.missing_families.contains(&"TXN".to_owned()));
-    assert!(manifest.coverage.missing_families.contains(&"FUN".to_owned()));
-    assert!(manifest.coverage.missing_families.contains(&"VDB".to_owned()));
-    assert!(!manifest.coverage.missing_families.contains(&"SQL".to_owned()));
+    assert!(
+        manifest
+            .coverage
+            .missing_families
+            .contains(&"TXN".to_owned())
+    );
+    assert!(
+        manifest
+            .coverage
+            .missing_families
+            .contains(&"FUN".to_owned())
+    );
+    assert!(
+        manifest
+            .coverage
+            .missing_families
+            .contains(&"VDB".to_owned())
+    );
+    assert!(
+        !manifest
+            .coverage
+            .missing_families
+            .contains(&"SQL".to_owned())
+    );
 }
 
 #[test]
@@ -334,10 +349,7 @@ fn seed_corpus_has_taxonomy_feature_links() {
         .filter(|e| !e.taxonomy_features.is_empty())
         .count();
 
-    assert!(
-        linked > 0,
-        "seed corpus should have taxonomy feature links"
-    );
+    assert!(linked > 0, "seed corpus should have taxonomy feature links");
     assert!(
         linked >= manifest.entries.len() / 2,
         "at least half of seed corpus entries should have feature links, got {}/{}",

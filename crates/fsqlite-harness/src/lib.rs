@@ -7,6 +7,7 @@
 pub mod commit_pipeline;
 pub mod corpus_ingest;
 pub mod differential_v2;
+pub mod e2e_log_schema;
 pub mod e2e_traceability;
 pub mod eprocess;
 pub mod fault_vfs;

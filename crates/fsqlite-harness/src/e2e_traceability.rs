@@ -189,16 +189,23 @@ impl TraceabilityMatrix {
     }
 
     fn has_gap_for_script(&self, path: &str) -> bool {
-        self.gaps.iter().any(|g| g.area == path || g.area.contains(path))
+        self.gaps
+            .iter()
+            .any(|g| g.area == path || g.area.contains(path))
     }
 
     /// Compute coverage statistics.
     pub fn coverage_stats(&self) -> CoverageStats {
         let total_scripts = self.scripts.len();
-        let scripts_with_scenarios = self.scripts.iter().filter(|s| !s.scenario_ids.is_empty()).count();
+        let scripts_with_scenarios = self
+            .scripts
+            .iter()
+            .filter(|s| !s.scenario_ids.is_empty())
+            .count();
         let scripts_with_beads = self.scripts.iter().filter(|s| s.bead_id.is_some()).count();
 
-        let all_scenario_ids: BTreeSet<_> = self.scripts
+        let all_scenario_ids: BTreeSet<_> = self
+            .scripts
             .iter()
             .flat_map(|s| s.scenario_ids.iter().cloned())
             .collect();
@@ -421,7 +428,10 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .command("bash e2e/bd_bca_1_compliance.sh")
         .scenarios(&["CON-1", "CON-2", "MVCC-1"])
         .storage(&[StorageMode::FileBacked, StorageMode::Wal])
-        .concurrency(&[ConcurrencyMode::ConcurrentWriters, ConcurrencyMode::MvccIsolation])
+        .concurrency(&[
+            ConcurrencyMode::ConcurrentWriters,
+            ConcurrencyMode::MvccIsolation,
+        ])
         .timeout(300)
         .build(),
     );
@@ -657,7 +667,10 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .command("cargo test -p fsqlite-e2e --test correctness_mvcc_isolation")
         .scenarios(&["MVCC-2", "CON-4"])
         .storage(&[StorageMode::FileBacked, StorageMode::Wal])
-        .concurrency(&[ConcurrencyMode::MvccIsolation, ConcurrencyMode::ConcurrentWriters])
+        .concurrency(&[
+            ConcurrencyMode::MvccIsolation,
+            ConcurrencyMode::ConcurrentWriters,
+        ])
         .timeout(120)
         .build(),
     );
@@ -671,7 +684,11 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .bead("bd-244z")
         .command("cargo test -p fsqlite-e2e --test correctness_concurrent_writes")
         .scenarios(&["CON-3", "MVCC-3"])
-        .storage(&[StorageMode::InMemory, StorageMode::FileBacked, StorageMode::Wal])
+        .storage(&[
+            StorageMode::InMemory,
+            StorageMode::FileBacked,
+            StorageMode::Wal,
+        ])
         .concurrency(&[ConcurrencyMode::ConcurrentWriters])
         .timeout(120)
         .build(),
@@ -700,7 +717,10 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .command("cargo test -p fsqlite-e2e --test mvcc_concurrent_writers")
         .scenarios(&["MVCC-4", "CON-5"])
         .storage(&[StorageMode::FileBacked, StorageMode::Wal])
-        .concurrency(&[ConcurrencyMode::ConcurrentWriters, ConcurrencyMode::MvccIsolation])
+        .concurrency(&[
+            ConcurrencyMode::ConcurrentWriters,
+            ConcurrencyMode::MvccIsolation,
+        ])
         .timeout(300)
         .build(),
     );
@@ -813,7 +833,10 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .command("cargo test -p fsqlite-e2e --test seed_reproducibility")
         .scenarios(&["SEED-1"])
         .storage(&[StorageMode::InMemory, StorageMode::FileBacked])
-        .concurrency(&[ConcurrencyMode::Sequential, ConcurrencyMode::ConcurrentWriters])
+        .concurrency(&[
+            ConcurrencyMode::Sequential,
+            ConcurrencyMode::ConcurrentWriters,
+        ])
         .timeout(120)
         .build(),
     );
@@ -877,7 +900,10 @@ fn add_harness_tests(scripts: &mut Vec<ScriptEntry>) {
         .command("cargo test -p fsqlite-harness --test bd_2npr_mvcc_concurrent_writer_stress")
         .scenarios(&["MVCC-5", "CON-7"])
         .storage(&[StorageMode::FileBacked, StorageMode::Wal])
-        .concurrency(&[ConcurrencyMode::ConcurrentWriters, ConcurrencyMode::MvccIsolation])
+        .concurrency(&[
+            ConcurrencyMode::ConcurrentWriters,
+            ConcurrencyMode::MvccIsolation,
+        ])
         .timeout(300)
         .build(),
     );
@@ -965,7 +991,9 @@ fn add_harness_tests(scripts: &mut Vec<ScriptEntry>) {
             "WAL checksum chain validation and recovery",
         )
         .bead("bd-2fas")
-        .command("cargo test -p fsqlite-harness --test bd_2fas_wal_checksum_chain_recovery_compliance")
+        .command(
+            "cargo test -p fsqlite-harness --test bd_2fas_wal_checksum_chain_recovery_compliance",
+        )
         .scenarios(&["WAL-3", "CHECKSUM-1"])
         .storage(&[StorageMode::FileBacked, StorageMode::Wal])
         .concurrency(&[ConcurrencyMode::Sequential])
@@ -1176,7 +1204,9 @@ fn add_harness_tests(scripts: &mut Vec<ScriptEntry>) {
             "File format version compatibility",
         )
         .bead("bd-1uzb")
-        .command("cargo test -p fsqlite-harness --test bd_1uzb_file_format_compatibility_compliance")
+        .command(
+            "cargo test -p fsqlite-harness --test bd_1uzb_file_format_compatibility_compliance",
+        )
         .scenarios(&["COMPAT-5"])
         .storage(&[StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::Sequential])
@@ -1206,7 +1236,9 @@ fn add_harness_tests(scripts: &mut Vec<ScriptEntry>) {
             "Cross-database 2-phase commit",
         )
         .bead("bd-d2m7")
-        .command("cargo test -p fsqlite-harness --test bd_d2m7_begin_concurrent_cross_db_2pc_compliance")
+        .command(
+            "cargo test -p fsqlite-harness --test bd_d2m7_begin_concurrent_cross_db_2pc_compliance",
+        )
         .scenarios(&["TXN-4", "CON-8"])
         .storage(&[StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::ConcurrentWriters])
@@ -1404,7 +1436,9 @@ fn add_harness_tests(scripts: &mut Vec<ScriptEntry>) {
             "Observability evidence ledger",
         )
         .bead("bd-3q1g")
-        .command("cargo test -p fsqlite-harness --test bd_3q1g_observability_evidence_ledger_compliance")
+        .command(
+            "cargo test -p fsqlite-harness --test bd_3q1g_observability_evidence_ledger_compliance",
+        )
         .scenarios(&["OBS-1"])
         .storage(&[StorageMode::InMemory])
         .concurrency(&[ConcurrencyMode::Sequential])
@@ -1626,8 +1660,7 @@ fn build_gap_annotations() -> Vec<GapAnnotation> {
         },
         GapAnnotation {
             area: "BACKUP-*".to_owned(),
-            rationale: "Online backup API (sqlite3_backup_*) not yet implemented"
-                .to_owned(),
+            rationale: "Online backup API (sqlite3_backup_*) not yet implemented".to_owned(),
             intentional: true,
         },
         GapAnnotation {
@@ -1745,7 +1778,11 @@ mod tests {
     fn coverage_stats_are_plausible() {
         let matrix = build_canonical_inventory();
         let stats = matrix.coverage_stats();
-        assert!(stats.total_scripts >= 50, "Expected at least 50 scripts, got {}", stats.total_scripts);
+        assert!(
+            stats.total_scripts >= 50,
+            "Expected at least 50 scripts, got {}",
+            stats.total_scripts
+        );
         assert!(stats.scripts_with_scenarios >= 50);
         assert!(stats.unique_scenario_count >= 40);
         assert!(stats.gap_count >= 5);
@@ -1776,9 +1813,21 @@ mod tests {
     fn all_concurrency_modes_covered() {
         let matrix = build_canonical_inventory();
         let stats = matrix.coverage_stats();
-        assert!(stats.by_concurrency.contains_key(&ConcurrencyMode::Sequential));
-        assert!(stats.by_concurrency.contains_key(&ConcurrencyMode::ConcurrentWriters));
-        assert!(stats.by_concurrency.contains_key(&ConcurrencyMode::MvccIsolation));
+        assert!(
+            stats
+                .by_concurrency
+                .contains_key(&ConcurrencyMode::Sequential)
+        );
+        assert!(
+            stats
+                .by_concurrency
+                .contains_key(&ConcurrencyMode::ConcurrentWriters)
+        );
+        assert!(
+            stats
+                .by_concurrency
+                .contains_key(&ConcurrencyMode::MvccIsolation)
+        );
         assert!(stats.by_concurrency.contains_key(&ConcurrencyMode::Ssi));
     }
 
@@ -1809,8 +1858,7 @@ mod tests {
     fn json_roundtrip() {
         let matrix = build_canonical_inventory();
         let json = matrix.to_json().expect("serialize");
-        let deserialized: TraceabilityMatrix =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: TraceabilityMatrix = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(deserialized.scripts.len(), matrix.scripts.len());
         assert_eq!(deserialized.gaps.len(), matrix.gaps.len());
     }
@@ -1829,7 +1877,11 @@ mod tests {
     fn gap_annotations_have_rationale() {
         let matrix = build_canonical_inventory();
         for g in &matrix.gaps {
-            assert!(!g.rationale.is_empty(), "Gap {} has empty rationale", g.area);
+            assert!(
+                !g.rationale.is_empty(),
+                "Gap {} has empty rationale",
+                g.area
+            );
             assert!(!g.area.is_empty(), "Gap has empty area");
         }
     }

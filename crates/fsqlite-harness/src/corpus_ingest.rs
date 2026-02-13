@@ -234,7 +234,10 @@ pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
     let mut scores: BTreeMap<Family, u32> = BTreeMap::new();
 
     // Extension patterns (check first — highest specificity).
-    if has_any_pattern(&combined, &["FTS3", "FTS4", "FTS5", "MATCH", "RANK(", "BM25("]) {
+    if has_any_pattern(
+        &combined,
+        &["FTS3", "FTS4", "FTS5", "MATCH", "RANK(", "BM25("],
+    ) {
         *scores.entry(Family::EXT).or_default() += 10;
     }
     if has_any_pattern(&combined, &["JSON(", "JSON_", "->", "->>"]) {
@@ -261,8 +264,14 @@ pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
     if has_any_pattern(
         &combined,
         &[
-            "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE",
-            "BEGIN CONCURRENT", "BEGIN IMMEDIATE", "BEGIN EXCLUSIVE",
+            "BEGIN",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT",
+            "RELEASE",
+            "BEGIN CONCURRENT",
+            "BEGIN IMMEDIATE",
+            "BEGIN EXCLUSIVE",
         ],
     ) {
         *scores.entry(Family::TXN).or_default() += 8;
@@ -272,14 +281,40 @@ pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
     if has_any_pattern(
         &combined,
         &[
-            "ABS(", "MAX(", "MIN(", "SUM(", "AVG(", "COUNT(",
-            "LENGTH(", "SUBSTR(", "UPPER(", "LOWER(", "TRIM(",
-            "ROUND(", "RANDOM(", "TYPEOF(", "COALESCE(", "NULLIF(",
-            "REPLACE(", "INSTR(", "HEX(", "ZEROBLOB(",
-            "DATE(", "TIME(", "DATETIME(", "STRFTIME(", "JULIANDAY(",
-            "TOTAL(", "GROUP_CONCAT(", "UNICODE(",
-            "PRINTF(", "CHAR(", "LIKELIHOOD(",
-            "IIF(", "GLOB(", "LIKE(",
+            "ABS(",
+            "MAX(",
+            "MIN(",
+            "SUM(",
+            "AVG(",
+            "COUNT(",
+            "LENGTH(",
+            "SUBSTR(",
+            "UPPER(",
+            "LOWER(",
+            "TRIM(",
+            "ROUND(",
+            "RANDOM(",
+            "TYPEOF(",
+            "COALESCE(",
+            "NULLIF(",
+            "REPLACE(",
+            "INSTR(",
+            "HEX(",
+            "ZEROBLOB(",
+            "DATE(",
+            "TIME(",
+            "DATETIME(",
+            "STRFTIME(",
+            "JULIANDAY(",
+            "TOTAL(",
+            "GROUP_CONCAT(",
+            "UNICODE(",
+            "PRINTF(",
+            "CHAR(",
+            "LIKELIHOOD(",
+            "IIF(",
+            "GLOB(",
+            "LIKE(",
         ],
     ) {
         *scores.entry(Family::FUN).or_default() += 6;
@@ -289,9 +324,18 @@ pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
     if has_any_pattern(
         &combined,
         &[
-            "OVER(", "OVER (", "PARTITION BY", "ROW_NUMBER(",
-            "RANK(", "DENSE_RANK(", "NTILE(", "LAG(", "LEAD(",
-            "FIRST_VALUE(", "LAST_VALUE(", "NTH_VALUE(",
+            "OVER(",
+            "OVER (",
+            "PARTITION BY",
+            "ROW_NUMBER(",
+            "RANK(",
+            "DENSE_RANK(",
+            "NTILE(",
+            "LAG(",
+            "LEAD(",
+            "FIRST_VALUE(",
+            "LAST_VALUE(",
+            "NTH_VALUE(",
         ],
     ) {
         *scores.entry(Family::FUN).or_default() += 4;
@@ -302,8 +346,12 @@ pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
     if has_any_pattern(
         &combined,
         &[
-            "JOIN", "LEFT JOIN", "RIGHT JOIN", "CROSS JOIN",
-            "NATURAL JOIN", "USING(",
+            "JOIN",
+            "LEFT JOIN",
+            "RIGHT JOIN",
+            "CROSS JOIN",
+            "NATURAL JOIN",
+            "USING(",
         ],
     ) {
         *scores.entry(Family::PLN).or_default() += 4;
@@ -323,9 +371,14 @@ pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
     if has_any_pattern(
         &combined,
         &[
-            "CREATE TABLE", "ALTER TABLE", "DROP TABLE",
-            "CREATE VIEW", "CREATE TRIGGER",
-            "INSERT", "UPDATE", "DELETE",
+            "CREATE TABLE",
+            "ALTER TABLE",
+            "DROP TABLE",
+            "CREATE VIEW",
+            "CREATE TRIGGER",
+            "INSERT",
+            "UPDATE",
+            "DELETE",
             "SELECT",
         ],
     ) {
@@ -334,10 +387,22 @@ pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
     if has_any_pattern(
         &combined,
         &[
-            "CASE WHEN", "CAST(", "BETWEEN", "IN (",
-            "EXISTS(", "UNION", "INTERSECT", "EXCEPT",
-            "COLLATE", "GROUP BY", "HAVING", "LIMIT", "OFFSET",
-            "ORDER BY", "DISTINCT", "ON CONFLICT",
+            "CASE WHEN",
+            "CAST(",
+            "BETWEEN",
+            "IN (",
+            "EXISTS(",
+            "UNION",
+            "INTERSECT",
+            "EXCEPT",
+            "COLLATE",
+            "GROUP BY",
+            "HAVING",
+            "LIMIT",
+            "OFFSET",
+            "ORDER BY",
+            "DISTINCT",
+            "ON CONFLICT",
         ],
     ) {
         *scores.entry(Family::SQL).or_default() += 2;
@@ -347,9 +412,7 @@ pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
     let mut sorted: Vec<_> = scores.into_iter().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let primary = sorted
-        .first()
-        .map_or(Family::SQL, |(fam, _)| *fam);
+    let primary = sorted.first().map_or(Family::SQL, |(fam, _)| *fam);
 
     let secondary: Vec<Family> = sorted
         .iter()
@@ -484,7 +547,8 @@ impl CorpusBuilder {
     /// Link the last entry to taxonomy feature IDs.
     pub fn link_features(&mut self, feature_ids: impl IntoIterator<Item = impl Into<String>>) {
         if let Some(entry) = self.entries.last_mut() {
-            entry.taxonomy_features
+            entry
+                .taxonomy_features
                 .extend(feature_ids.into_iter().map(Into::into));
         }
     }
@@ -516,20 +580,14 @@ fn compute_coverage(
 
     for &(fam, min) in FAMILY_MINIMUMS {
         let fam_str = fam.to_string();
-        let fam_entries: Vec<_> = active
-            .iter()
-            .filter(|e| e.family == fam)
-            .collect();
+        let fam_entries: Vec<_> = active.iter().filter(|e| e.family == fam).collect();
 
         let features_covered: BTreeSet<String> = fam_entries
             .iter()
             .flat_map(|e| e.taxonomy_features.iter().cloned())
             .collect();
 
-        let all_features = taxonomy_features
-            .get(&fam_str)
-            .cloned()
-            .unwrap_or_default();
+        let all_features = taxonomy_features.get(&fam_str).cloned().unwrap_or_default();
 
         let features_missing: Vec<String> = all_features
             .iter()
@@ -598,11 +656,7 @@ pub fn ingest_conformance_fixtures(
 
     let mut files: Vec<_> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "json")
-        })
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .collect();
     files.sort_by_key(|e| e.path());
 
@@ -624,19 +678,17 @@ pub fn ingest_conformance_fixtures(
             continue;
         }
 
-        let fixture_id = fixture["id"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_owned();
-        let description = fixture["description"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
+        let fixture_id = fixture["id"].as_str().unwrap_or("unknown").to_owned();
+        let description = fixture["description"].as_str().unwrap_or("").to_owned();
 
         builder.add_statements(
             statements,
             CorpusSource::Fixture {
-                file: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                file: path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
             },
             format!("{fixture_id}: {description}"),
         );
@@ -886,9 +938,7 @@ pub fn generate_seed_corpus(builder: &mut CorpusBuilder) {
 
     builder.add_with_family(
         Family::PLN,
-        [
-            "WITH cte AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM cte WHERE n < 5) SELECT * FROM cte",
-        ],
+        ["WITH cte AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM cte WHERE n < 5) SELECT * FROM cte"],
         src("pln_cte"),
         "Planner: recursive CTE",
     );
