@@ -3,12 +3,24 @@ set -euo pipefail
 
 BEAD_ID="bd-2ddl"
 LOG_STANDARD_REF="bd-1fpm"
+LOG_SCHEMA_VERSION="1.0.0"
+SCENARIO_ID="INFRA-6"
+SEED=202602130201
+BACKEND="fsqlite"
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPORT_DIR="${WORKSPACE_ROOT}/test-results"
-REPORT_JSONL="${REPORT_DIR}/bd_2ddl_compliance_report.jsonl"
-LOG_DIR="${REPORT_DIR}/bd_2ddl_logs"
+RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+REPORT_ROOT="${WORKSPACE_ROOT}/test-results/bd_2ddl"
+REPORT_JSONL="${REPORT_ROOT}/${RUN_ID}.jsonl"
+REPORT_REL="${REPORT_JSONL#${WORKSPACE_ROOT}/}"
+LOG_DIR="${REPORT_ROOT}/logs/${RUN_ID}"
+WORKER="${HOSTNAME:-local}"
 RUN_PER_CRATE_TESTS="${BD_2DDL_RUN_PER_CRATE_TESTS:-1}"
 RUN_WORKSPACE_TEST="${BD_2DDL_RUN_WORKSPACE_TEST:-1}"
+JSON_OUTPUT=false
+
+if [[ "${1:-}" == "--json" ]]; then
+    JSON_OUTPUT=true
+fi
 
 CRATES=(
     "fsqlite-types"
@@ -36,12 +48,168 @@ CRATES=(
     "fsqlite-harness"
 )
 
+emit_event() {
+    local phase="$1"
+    local event_type="$2"
+    local outcome="$3"
+    local message="$4"
+    local error_code="$5"
+    local artifact_paths_json="$6"
+    local context_json="$7"
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    jq -nc \
+        --arg schema_version "${LOG_SCHEMA_VERSION}" \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg timestamp "${timestamp}" \
+        --arg phase "${phase}" \
+        --arg event_type "${event_type}" \
+        --arg scenario_id "${SCENARIO_ID}" \
+        --argjson seed "${SEED}" \
+        --arg backend "${BACKEND}" \
+        --arg worker "${WORKER}" \
+        --arg outcome "${outcome}" \
+        --arg message "${message}" \
+        --arg error_code "${error_code}" \
+        --arg log_standard_ref "${LOG_STANDARD_REF}" \
+        --argjson artifact_paths "${artifact_paths_json}" \
+        --argjson context "${context_json}" \
+        '{
+            schema_version: $schema_version,
+            bead_id: $bead_id,
+            run_id: $run_id,
+            timestamp: $timestamp,
+            phase: $phase,
+            event_type: $event_type,
+            scenario_id: $scenario_id,
+            seed: $seed,
+            backend: $backend,
+            outcome: $outcome,
+            error_code: (if $error_code == "" then null else $error_code end),
+            artifact_paths: $artifact_paths,
+            context: ($context + {
+                message: $message,
+                worker: $worker,
+                log_standard_ref: $log_standard_ref,
+                artifact_paths: ($artifact_paths | join(","))
+            })
+        }' >>"${REPORT_JSONL}"
+}
+
+sanitize_case_name() {
+    printf '%s' "$1" \
+        | tr '[:lower:]-' '[:upper:]_' \
+        | tr -cd 'A-Z0-9_'
+}
+
 log_line() {
     local level="$1"
     local case_name="$2"
     shift 2
-    printf 'bead_id=%s level=%s case=%s %s reference=%s\n' \
-        "${BEAD_ID}" "${level}" "${case_name}" "$*" "${LOG_STANDARD_REF}"
+    local details="$*"
+    local phase="validate"
+    local event_type="info"
+    local outcome="info"
+    local error_code=""
+
+    case "${case_name}" in
+        start)
+            phase="setup"
+            event_type="start"
+            outcome="running"
+            ;;
+        pass)
+            phase="report"
+            event_type="pass"
+            outcome="pass"
+            ;;
+        terminal_failure)
+            phase="report"
+            event_type="fail"
+            outcome="fail"
+            ;;
+        terminal_failure_count)
+            phase="report"
+            event_type="info"
+            outcome="pass"
+            ;;
+        workspace_summary)
+            phase="report"
+            event_type="info"
+            outcome="info"
+            ;;
+        degraded_mode | degraded_mode_count | missing_test_category | public_api_coverage_gap)
+            phase="validate"
+            event_type="warn"
+            outcome="warn"
+            ;;
+        crate_test_failed | workspace_test_failed | missing_workspace_manifest | missing_crate_dir)
+            phase="validate"
+            event_type="fail"
+            outcome="fail"
+            ;;
+    esac
+
+    case "${level}" in
+        WARN)
+            event_type="warn"
+            outcome="warn"
+            ;;
+        ERROR)
+            if [[ "${case_name}" == "terminal_failure_count" ]]; then
+                event_type="info"
+                outcome="pass"
+            elif [[ "${event_type}" != "fail" ]]; then
+                event_type="error"
+                outcome="fail"
+            fi
+            ;;
+    esac
+
+    if [[ "${event_type}" == "fail" || "${event_type}" == "error" ]]; then
+        error_code="E_$(sanitize_case_name "${case_name}")"
+    fi
+
+    local log_path=""
+    if [[ "${details}" =~ (^|[[:space:]])log=([^[:space:]]+) ]]; then
+        log_path="${BASH_REMATCH[2]}"
+    fi
+
+    local artifact_paths_json
+    if [[ -n "${log_path}" ]]; then
+        local log_rel="${log_path#${WORKSPACE_ROOT}/}"
+        artifact_paths_json="$(
+            jq -nc \
+                --arg report "${REPORT_REL}" \
+                --arg log "${log_rel}" \
+                '[ $report, $log ] | unique'
+        )"
+    else
+        artifact_paths_json="$(jq -nc --arg report "${REPORT_REL}" '[ $report ]')"
+    fi
+
+    local context_json
+    context_json="$(
+        jq -nc \
+            --arg level "${level}" \
+            --arg case_name "${case_name}" \
+            --arg details "${details}" \
+            '{level: $level, case: $case_name, details: $details}'
+    )"
+
+    emit_event \
+        "${phase}" \
+        "${event_type}" \
+        "${outcome}" \
+        "${case_name}" \
+        "${error_code}" \
+        "${artifact_paths_json}" \
+        "${context_json}"
+
+    printf 'bead_id=%s level=%s run_id=%s scenario_id=%s phase=%s event_type=%s case=%s %s reference=%s\n' \
+        "${BEAD_ID}" "${level}" "${RUN_ID}" "${SCENARIO_ID}" "${phase}" "${event_type}" "${case_name}" "${details}" "${LOG_STANDARD_REF}"
 }
 
 count_pattern() {
@@ -90,10 +258,8 @@ collect_test_corpus() {
     fi
 }
 
-mkdir -p "${REPORT_DIR}" "${LOG_DIR}"
-
-printf '# bead_id=%s compliance report\n' "${BEAD_ID}" >"${REPORT_JSONL}"
-printf '# crate\tunit\tprop\tconformance\tfuzz\tpublic_fn_total\tpublic_fn_covered\tcargo_test_exit\n' >>"${REPORT_JSONL}"
+mkdir -p "${REPORT_ROOT}" "${LOG_DIR}"
+: >"${REPORT_JSONL}"
 
 log_line "DEBUG" "start" \
     "workspace=${WORKSPACE_ROOT} report=${REPORT_JSONL} per_crate_tests=${RUN_PER_CRATE_TESTS} workspace_test=${RUN_WORKSPACE_TEST}"
@@ -189,19 +355,6 @@ for crate in "${CRATES[@]}"; do
 
     log_line "INFO" "crate_matrix_summary" \
         "crate=${crate} unit=${unit_count} prop=${prop_count} conformance=${conformance_count} fuzz=${fuzz_count} public_fn_covered=${public_fn_covered}/${public_fn_total} cargo_test_exit=${cargo_test_exit}"
-
-    jq -nc \
-        --arg bead_id "${BEAD_ID}" \
-        --arg crate "${crate}" \
-        --argjson unit "${unit_count}" \
-        --argjson prop "${prop_count}" \
-        --argjson conformance "${conformance_count}" \
-        --argjson fuzz "${fuzz_count}" \
-        --argjson public_fn_total "${public_fn_total}" \
-        --argjson public_fn_covered "${public_fn_covered}" \
-        --argjson cargo_test_exit "${cargo_test_exit}" \
-        '{bead_id:$bead_id,crate:$crate,unit:$unit,prop:$prop,conformance:$conformance,fuzz:$fuzz,public_fn_total:$public_fn_total,public_fn_covered:$public_fn_covered,cargo_test_exit:$cargo_test_exit}' \
-        >>"${REPORT_JSONL}"
 done
 
 workspace_test_exit=0
@@ -224,6 +377,8 @@ fi
 log_line "INFO" "workspace_summary" \
     "crates=${#CRATES[@]} failing_crates=${#failing_crates[@]} zero_test_crates=${#zero_test_crates[@]} missing_public_api_test_crates=${#missing_public_api_test_crates[@]} workspace_test_exit=${workspace_test_exit} report=${REPORT_JSONL}"
 
+summary_sha256="$(sha256sum "${REPORT_JSONL}" | awk '{print $1}')"
+
 if [[ "${#failing_crates[@]}" -gt 0 ]]; then
     log_line "WARN" "degraded_mode" "type=crate_failures crates=${failing_crates[*]}"
 fi
@@ -236,10 +391,35 @@ fi
 
 if [[ "${#failing_crates[@]}" -gt 0 || "${#zero_test_crates[@]}" -gt 0 || "${#missing_public_api_test_crates[@]}" -gt 0 || "${workspace_test_exit}" -ne 0 ]]; then
     log_line "ERROR" "terminal_failure" \
-        "failing_crates=${failing_crates[*]:-none} zero_test_crates=${zero_test_crates[*]:-none} missing_public_api_test_crates=${missing_public_api_test_crates[*]:-none} workspace_test_exit=${workspace_test_exit} report=${REPORT_JSONL}"
+        "failing_crates=${failing_crates[*]:-none} zero_test_crates=${zero_test_crates[*]:-none} missing_public_api_test_crates=${missing_public_api_test_crates[*]:-none} workspace_test_exit=${workspace_test_exit} report=${REPORT_JSONL} report_sha256=${summary_sha256}"
+    if ${JSON_OUTPUT}; then
+        cat <<ENDJSON
+{
+  "bead_id": "${BEAD_ID}",
+  "run_id": "${RUN_ID}",
+  "status": "fail",
+  "report_jsonl": "${REPORT_JSONL}",
+  "report_sha256": "${summary_sha256}",
+  "failing_crates": [$(printf '"%s",' "${failing_crates[@]}" | sed 's/,$//')]
+}
+ENDJSON
+    fi
     exit 1
 fi
 
 log_line "WARN" "degraded_mode_count" "count=0"
 log_line "ERROR" "terminal_failure_count" "count=0"
-log_line "INFO" "pass" "report=${REPORT_JSONL}"
+log_line "INFO" "pass" "report=${REPORT_JSONL} report_sha256=${summary_sha256}"
+
+if ${JSON_OUTPUT}; then
+    cat <<ENDJSON
+{
+  "bead_id": "${BEAD_ID}",
+  "run_id": "${RUN_ID}",
+  "status": "pass",
+  "report_jsonl": "${REPORT_JSONL}",
+  "report_sha256": "${summary_sha256}",
+  "failing_crates": []
+}
+ENDJSON
+fi

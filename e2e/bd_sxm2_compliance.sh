@@ -2,10 +2,183 @@
 set -euo pipefail
 
 BEAD_ID="bd-sxm2"
+LOG_STANDARD_REF="bd-1fpm"
+LOG_SCHEMA_VERSION="1.0.0"
+SCENARIO_ID="SPEC-8"
+SEED=202602130202
+BACKEND="fsqlite"
 SPEC_PATH="COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md"
+WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+REPORT_ROOT="${WORKSPACE_ROOT}/test-results/bd_sxm2"
+REPORT_JSONL="${REPORT_ROOT}/${RUN_ID}.jsonl"
+REPORT_REL="${REPORT_JSONL#${WORKSPACE_ROOT}/}"
+WORKER="${HOSTNAME:-local}"
+JSON_OUTPUT=false
+
+if [[ "${1:-}" == "--json" ]]; then
+    JSON_OUTPUT=true
+fi
+
+emit_event() {
+    local phase="$1"
+    local event_type="$2"
+    local outcome="$3"
+    local message="$4"
+    local error_code="$5"
+    local context_json="$6"
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    jq -nc \
+        --arg schema_version "${LOG_SCHEMA_VERSION}" \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg timestamp "${timestamp}" \
+        --arg phase "${phase}" \
+        --arg event_type "${event_type}" \
+        --arg scenario_id "${SCENARIO_ID}" \
+        --argjson seed "${SEED}" \
+        --arg backend "${BACKEND}" \
+        --arg worker "${WORKER}" \
+        --arg outcome "${outcome}" \
+        --arg message "${message}" \
+        --arg error_code "${error_code}" \
+        --arg log_standard_ref "${LOG_STANDARD_REF}" \
+        --arg report_rel "${REPORT_REL}" \
+        --argjson context "${context_json}" \
+        '{
+            schema_version: $schema_version,
+            bead_id: $bead_id,
+            run_id: $run_id,
+            timestamp: $timestamp,
+            phase: $phase,
+            event_type: $event_type,
+            scenario_id: $scenario_id,
+            seed: $seed,
+            backend: $backend,
+            outcome: $outcome,
+            error_code: (if $error_code == "" then null else $error_code end),
+            artifact_paths: [$report_rel],
+            context: ($context + {
+                message: $message,
+                worker: $worker,
+                log_standard_ref: $log_standard_ref,
+                artifact_paths: $report_rel
+            })
+        }' >>"${REPORT_JSONL}"
+}
+
+sanitize_case_name() {
+    printf '%s' "$1" \
+        | tr '[:lower:]-' '[:upper:]_' \
+        | tr -cd 'A-Z0-9_'
+}
+
+log_line() {
+    local level="$1"
+    local case_name="$2"
+    shift 2
+    local details="$*"
+    local phase="validate"
+    local event_type="info"
+    local outcome="info"
+    local error_code=""
+
+    case "${case_name}" in
+        start)
+            phase="setup"
+            event_type="start"
+            outcome="running"
+            ;;
+        summary)
+            phase="report"
+            event_type="info"
+            outcome="info"
+            ;;
+        violations)
+            phase="report"
+            event_type="fail"
+            outcome="fail"
+            ;;
+        pass)
+            phase="report"
+            event_type="pass"
+            outcome="pass"
+            ;;
+        degraded_mode_count)
+            phase="report"
+            event_type="warn"
+            outcome="warn"
+            ;;
+        terminal_failure_count)
+            phase="report"
+            event_type="info"
+            outcome="pass"
+            ;;
+        missing_spec | missing_sections)
+            phase="setup"
+            event_type="fail"
+            outcome="fail"
+            ;;
+    esac
+
+    case "${level}" in
+        WARN)
+            event_type="warn"
+            outcome="warn"
+            ;;
+        ERROR)
+            if [[ "${case_name}" == "terminal_failure_count" ]]; then
+                event_type="info"
+                outcome="pass"
+            elif [[ "${event_type}" != "fail" ]]; then
+                event_type="error"
+                outcome="fail"
+            fi
+            ;;
+    esac
+
+    if [[ "${event_type}" == "fail" || "${event_type}" == "error" ]]; then
+        error_code="E_$(sanitize_case_name "${case_name}")"
+    fi
+
+    local context_json
+    context_json="$(
+        jq -nc \
+            --arg level "${level}" \
+            --arg case_name "${case_name}" \
+            --arg details "${details}" \
+            '{level: $level, case: $case_name, details: $details}'
+    )"
+
+    emit_event \
+        "${phase}" \
+        "${event_type}" \
+        "${outcome}" \
+        "${case_name}" \
+        "${error_code}" \
+        "${context_json}"
+
+    printf 'bead_id=%s level=%s run_id=%s scenario_id=%s phase=%s event_type=%s case=%s %s reference=%s\n' \
+        "${BEAD_ID}" "${level}" "${RUN_ID}" "${SCENARIO_ID}" "${phase}" "${event_type}" "${case_name}" "${details}" "${LOG_STANDARD_REF}"
+}
+
+mkdir -p "${REPORT_ROOT}"
+: >"${REPORT_JSONL}"
 
 if [[ ! -f "${SPEC_PATH}" ]]; then
-    printf 'bead_id=%s level=ERROR case=missing_spec path=%s\n' "${BEAD_ID}" "${SPEC_PATH}"
+    log_line "ERROR" "missing_spec" "path=${SPEC_PATH}"
+    if ${JSON_OUTPUT}; then
+        cat <<ENDJSON
+{
+  "bead_id": "${BEAD_ID}",
+  "run_id": "${RUN_ID}",
+  "status": "fail",
+  "report_jsonl": "${REPORT_JSONL}"
+}
+ENDJSON
+    fi
     exit 1
 fi
 
@@ -75,12 +248,22 @@ section_8_3="$(extract_section_8_3)"
 section_8_4="$(extract_section_8_4)"
 
 if [[ -z "${section_8_3}" || -z "${section_8_4}" ]]; then
-    printf 'bead_id=%s level=ERROR case=missing_sections spec=%s\n' "${BEAD_ID}" "${SPEC_PATH}"
+    log_line "ERROR" "missing_sections" "spec=${SPEC_PATH}"
+    if ${JSON_OUTPUT}; then
+        cat <<ENDJSON
+{
+  "bead_id": "${BEAD_ID}",
+  "run_id": "${RUN_ID}",
+  "status": "fail",
+  "report_jsonl": "${REPORT_JSONL}"
+}
+ENDJSON
+    fi
     exit 1
 fi
 
-printf 'bead_id=%s level=DEBUG case=start expected_crates=%s spec=%s\n' \
-    "${BEAD_ID}" "${#EXPECTED_CRATES[@]}" "${SPEC_PATH}"
+log_line "DEBUG" "start" \
+    "expected_crates=${#EXPECTED_CRATES[@]} spec=${SPEC_PATH} report=${REPORT_JSONL}"
 
 declare -a violations=()
 described_count=0
@@ -131,22 +314,46 @@ for crate_name in "${EXPECTED_CRATES[@]}"; do
         violations+=("dependency_direction_missing:${crate_name}")
     fi
 
-    printf \
-        'bead_id=%s level=DEBUG case=crate_scan crate=%s described=1 modules=%s block_len=%s\n' \
-        "${BEAD_ID}" "${crate_name}" "${has_modules}" "${block_len}"
+    log_line "DEBUG" "crate_scan" \
+        "crate=${crate_name} described=1 modules=${has_modules} block_len=${block_len}"
 done
 
-printf \
-    'bead_id=%s level=INFO case=summary described_count=%s module_listed_count=%s expected=%s\n' \
-    "${BEAD_ID}" "${described_count}" "${module_listed_count}" "${#EXPECTED_CRATES[@]}"
+log_line "INFO" "summary" \
+    "described_count=${described_count} module_listed_count=${module_listed_count} expected=${#EXPECTED_CRATES[@]}"
+
+summary_sha256="$(sha256sum "${REPORT_JSONL}" | awk '{print $1}')"
 
 if [[ "${#violations[@]}" -gt 0 ]]; then
-    printf 'bead_id=%s level=WARN case=degraded_mode_count=%s reference=bd-1fpm\n' \
-        "${BEAD_ID}" "${#violations[@]}"
-    printf 'bead_id=%s level=ERROR case=violations items=%s\n' "${BEAD_ID}" "${violations[*]}"
+    log_line "WARN" "degraded_mode_count" "count=${#violations[@]}"
+    log_line "ERROR" "violations" "items=${violations[*]} report_sha256=${summary_sha256}"
+    if ${JSON_OUTPUT}; then
+        cat <<ENDJSON
+{
+  "bead_id": "${BEAD_ID}",
+  "run_id": "${RUN_ID}",
+  "status": "fail",
+  "violations": [$(printf '"%s",' "${violations[@]}" | sed 's/,$//')],
+  "report_jsonl": "${REPORT_JSONL}",
+  "report_sha256": "${summary_sha256}"
+}
+ENDJSON
+    fi
     exit 1
 fi
 
-printf 'bead_id=%s level=WARN case=degraded_mode_count=0 reference=bd-1fpm\n' "${BEAD_ID}"
-printf 'bead_id=%s level=ERROR case=terminal_failure_count=0 reference=bd-1fpm\n' "${BEAD_ID}"
-printf 'bead_id=%s level=INFO case=pass\n' "${BEAD_ID}"
+log_line "WARN" "degraded_mode_count" "count=0"
+log_line "ERROR" "terminal_failure_count" "count=0"
+log_line "INFO" "pass" "report=${REPORT_JSONL} report_sha256=${summary_sha256}"
+
+if ${JSON_OUTPUT}; then
+    cat <<ENDJSON
+{
+  "bead_id": "${BEAD_ID}",
+  "run_id": "${RUN_ID}",
+  "status": "pass",
+  "violations": [],
+  "report_jsonl": "${REPORT_JSONL}",
+  "report_sha256": "${summary_sha256}"
+}
+ENDJSON
+fi

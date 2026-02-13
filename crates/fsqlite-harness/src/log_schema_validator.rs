@@ -829,7 +829,7 @@ mod tests {
         let stream = decode_jsonl_stream(&jsonl);
         assert!(stream.is_clean());
         assert_eq!(stream.event_count(), 2);
-        assert_eq!(stream.blank_lines, 3); // leading + 2 between/trailing blanks
+        assert_eq!(stream.blank_lines, 2); // leading blank + blank between events
     }
 
     #[test]

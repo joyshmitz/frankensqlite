@@ -44,6 +44,8 @@ const BEAD_ID: &str = "bd-1dp9.2.4";
 
 /// Schema version for replay harness output format.
 pub const REPLAY_SCHEMA_VERSION: u32 = 1;
+/// Schema version for bisect-ready replay manifest contracts.
+pub const BISECT_REPLAY_MANIFEST_SCHEMA_VERSION: &str = "1.0.0";
 
 // ===========================================================================
 // Regime Classification
@@ -615,8 +617,273 @@ impl ReplaySummary {
 }
 
 // ===========================================================================
+// Bisect Replay Manifest Contract
+// ===========================================================================
+
+/// Pass/fail thresholds applied during bisect candidate evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayPassCriteria {
+    /// Maximum divergent entries allowed for a passing candidate.
+    pub max_divergent_entries: usize,
+    /// Maximum error entries allowed for a passing candidate.
+    pub max_error_entries: usize,
+    /// Maximum regime shifts/alerts allowed for a passing candidate.
+    pub max_shift_alerts: usize,
+}
+
+impl Default for ReplayPassCriteria {
+    fn default() -> Self {
+        Self {
+            max_divergent_entries: 0,
+            max_error_entries: 0,
+            max_shift_alerts: 0,
+        }
+    }
+}
+
+/// Optional environment constraints that bisect candidates should match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReplayManifestEnvironment {
+    /// Toolchain constraint (e.g., `nightly-2026-02-13`).
+    pub toolchain: Option<String>,
+    /// Platform constraint (e.g., `x86_64-unknown-linux-gnu`).
+    pub platform: Option<String>,
+}
+
+/// Versioned, machine-readable replay contract for deterministic bisect runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BisectReplayManifest {
+    /// Manifest schema version for strict compatibility checks.
+    pub schema_version: String,
+    /// Deterministic manifest identifier.
+    pub manifest_id: String,
+    /// Owning bead identifier.
+    pub bead_id: String,
+    /// Correlates with structured logs and failure bundles.
+    pub run_id: String,
+    /// ISO-8601 UTC timestamp when this manifest was created.
+    pub created_at: String,
+    /// Summary hash this manifest was generated from.
+    pub source_summary_hash: String,
+    /// Deterministic base seed to replay.
+    pub base_seed: u64,
+    /// Number of entries expected in each candidate replay run.
+    pub expected_entry_count: usize,
+    /// Number of windows expected in each candidate replay run.
+    pub expected_window_count: usize,
+    /// Canonical command used to execute replay.
+    pub replay_command: String,
+    /// Pass/fail predicate thresholds.
+    pub pass_criteria: ReplayPassCriteria,
+    /// Optional environment constraints.
+    pub environment: ReplayManifestEnvironment,
+    /// Optional operator notes.
+    pub notes: Vec<String>,
+}
+
+impl BisectReplayManifest {
+    /// Construct a contract from a replay summary.
+    #[must_use]
+    pub fn from_summary(
+        summary: &ReplaySummary,
+        bead_id: &str,
+        run_id: &str,
+        created_at: &str,
+        replay_command: &str,
+        pass_criteria: ReplayPassCriteria,
+    ) -> Self {
+        let manifest_id = compute_manifest_id(summary, bead_id, run_id);
+        Self {
+            schema_version: BISECT_REPLAY_MANIFEST_SCHEMA_VERSION.to_owned(),
+            manifest_id,
+            bead_id: bead_id.to_owned(),
+            run_id: run_id.to_owned(),
+            created_at: created_at.to_owned(),
+            source_summary_hash: summary.summary_hash.clone(),
+            base_seed: summary.base_seed,
+            expected_entry_count: summary.total_entries,
+            expected_window_count: summary.windows.len(),
+            replay_command: replay_command.to_owned(),
+            pass_criteria,
+            environment: ReplayManifestEnvironment::default(),
+            notes: Vec::new(),
+        }
+    }
+
+    /// Validate required manifest fields.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.schema_version != BISECT_REPLAY_MANIFEST_SCHEMA_VERSION {
+            errors.push(format!(
+                "schema_version mismatch: expected {BISECT_REPLAY_MANIFEST_SCHEMA_VERSION}, got {}",
+                self.schema_version
+            ));
+        }
+        if self.manifest_id.is_empty() {
+            errors.push("manifest_id is empty".to_owned());
+        }
+        if self.bead_id.is_empty() {
+            errors.push("bead_id is empty".to_owned());
+        }
+        if self.run_id.is_empty() {
+            errors.push("run_id is empty".to_owned());
+        }
+        if self.created_at.is_empty() {
+            errors.push("created_at is empty".to_owned());
+        }
+        if self.source_summary_hash.is_empty() {
+            errors.push("source_summary_hash is empty".to_owned());
+        }
+        if self.replay_command.is_empty() {
+            errors.push("replay_command is empty".to_owned());
+        }
+        if self.expected_entry_count == 0 {
+            errors.push("expected_entry_count must be > 0".to_owned());
+        }
+        errors
+    }
+
+    /// Serialize contract to pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when serialization fails.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize contract from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when JSON is malformed.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// Decode and enforce strict schema compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if schema version mismatches or validation fails.
+    pub fn from_json_strict(json: &str) -> Result<Self, String> {
+        let manifest: Self = serde_json::from_str(json)
+            .map_err(|error| format!("manifest parse failed: {error}"))?;
+
+        if manifest.schema_version != BISECT_REPLAY_MANIFEST_SCHEMA_VERSION {
+            return Err(format!(
+                "schema mismatch: expected {BISECT_REPLAY_MANIFEST_SCHEMA_VERSION}, got {}",
+                manifest.schema_version
+            ));
+        }
+
+        let errors = manifest.validate();
+        if errors.is_empty() {
+            Ok(manifest)
+        } else {
+            Err(format!("manifest validation failed: {}", errors.join("; ")))
+        }
+    }
+
+    /// Evaluate a replay summary against this manifest's pass/fail predicate.
+    #[must_use]
+    pub fn evaluate_summary(&self, summary: &ReplaySummary) -> ReplayEvaluation {
+        let mut reasons = Vec::new();
+
+        if summary.base_seed != self.base_seed {
+            reasons.push(format!(
+                "base_seed mismatch: expected 0x{:016X}, got 0x{:016X}",
+                self.base_seed, summary.base_seed
+            ));
+        }
+        if summary.total_entries != self.expected_entry_count {
+            reasons.push(format!(
+                "entry_count mismatch: expected {}, got {}",
+                self.expected_entry_count, summary.total_entries
+            ));
+        }
+        if summary.windows.len() != self.expected_window_count {
+            reasons.push(format!(
+                "window_count mismatch: expected {}, got {}",
+                self.expected_window_count,
+                summary.windows.len()
+            ));
+        }
+        if summary.total_divergent > self.pass_criteria.max_divergent_entries {
+            reasons.push(format!(
+                "divergent entries {} exceed threshold {}",
+                summary.total_divergent, self.pass_criteria.max_divergent_entries
+            ));
+        }
+        if summary.total_errors > self.pass_criteria.max_error_entries {
+            reasons.push(format!(
+                "error entries {} exceed threshold {}",
+                summary.total_errors, self.pass_criteria.max_error_entries
+            ));
+        }
+        let shift_alerts = summary.shift_count();
+        if shift_alerts > self.pass_criteria.max_shift_alerts {
+            reasons.push(format!(
+                "shift alerts {} exceed threshold {}",
+                shift_alerts, self.pass_criteria.max_shift_alerts
+            ));
+        }
+
+        let verdict = if reasons.is_empty() {
+            ReplayVerdict::Pass
+        } else {
+            ReplayVerdict::Fail
+        };
+
+        ReplayEvaluation {
+            verdict,
+            divergent_entries: summary.total_divergent,
+            error_entries: summary.total_errors,
+            shift_alerts,
+            reasons,
+        }
+    }
+}
+
+/// Evaluation verdict for a bisect candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayVerdict {
+    /// Candidate satisfied all manifest predicates.
+    Pass,
+    /// Candidate violated one or more manifest predicates.
+    Fail,
+}
+
+/// Result of evaluating a replay summary against a manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayEvaluation {
+    /// Pass/fail verdict.
+    pub verdict: ReplayVerdict,
+    /// Number of divergent entries observed.
+    pub divergent_entries: usize,
+    /// Number of error entries observed.
+    pub error_entries: usize,
+    /// Number of shift alerts observed.
+    pub shift_alerts: usize,
+    /// Human-readable violation reasons when verdict is `Fail`.
+    pub reasons: Vec<String>,
+}
+
+// ===========================================================================
 // Helpers
 // ===========================================================================
+
+fn compute_manifest_id(summary: &ReplaySummary, bead_id: &str, run_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bisect-manifest-v1:");
+    hasher.update(summary.summary_hash.as_bytes());
+    hasher.update(bead_id.as_bytes());
+    hasher.update(run_id.as_bytes());
+    hasher.update(summary.base_seed.to_le_bytes());
+    let digest = hasher.finalize();
+    format!("rmf-{}", hex_encode_truncated(&digest, 16))
+}
 
 /// Encode bytes as hex, truncated to `max_chars` characters.
 fn hex_encode_truncated(bytes: &[u8], max_chars: usize) -> String {
@@ -664,6 +931,22 @@ mod tests {
             },
             artifact_id: format!("artifact-{id}"),
         }
+    }
+
+    fn make_manifest_summary() -> ReplaySummary {
+        let config = ReplayConfig {
+            drift_config: DriftDetectorConfig {
+                window_size: 2,
+                warmup_windows: 1,
+                sensitivity_threshold: 1.0,
+                ..DriftDetectorConfig::default()
+            },
+            ..ReplayConfig::default()
+        };
+        let mut session = ReplaySession::new(config);
+        session.record_entry(make_entry_result("m1", Outcome::Pass, 0, 10));
+        session.record_entry(make_entry_result("m2", Outcome::Divergence, 1, 10));
+        session.finalize()
     }
 
     // --- Drift Detector ---
@@ -946,6 +1229,93 @@ mod tests {
         let s1 = make_summary();
         let s2 = make_summary();
         assert_eq!(s1.summary_hash, s2.summary_hash);
+    }
+
+    // --- Bisect replay manifest ---
+
+    #[test]
+    fn test_bisect_manifest_roundtrip_and_validate() {
+        let summary = make_manifest_summary();
+        let criteria = ReplayPassCriteria {
+            max_divergent_entries: summary.total_divergent,
+            max_error_entries: summary.total_errors,
+            max_shift_alerts: summary.shift_count(),
+        };
+        let manifest = BisectReplayManifest::from_summary(
+            &summary,
+            "bd-mblr.7.6.1",
+            "run-manifest-1",
+            "2026-02-13T09:00:00Z",
+            "cargo test -p fsqlite-harness bisect_manifest",
+            criteria,
+        );
+
+        assert_eq!(
+            manifest.schema_version,
+            BISECT_REPLAY_MANIFEST_SCHEMA_VERSION
+        );
+        assert!(!manifest.manifest_id.is_empty());
+        assert!(manifest.validate().is_empty());
+
+        let json = manifest.to_json().expect("serialize");
+        let restored = BisectReplayManifest::from_json(&json).expect("deserialize");
+        let strict = BisectReplayManifest::from_json_strict(&json).expect("strict deserialize");
+        assert_eq!(restored, manifest);
+        assert_eq!(strict, manifest);
+    }
+
+    #[test]
+    fn test_bisect_manifest_strict_rejects_incompatible_schema() {
+        let summary = make_manifest_summary();
+        let manifest = BisectReplayManifest::from_summary(
+            &summary,
+            "bd-mblr.7.6.1",
+            "run-manifest-2",
+            "2026-02-13T09:00:00Z",
+            "cargo test -p fsqlite-harness bisect_manifest",
+            ReplayPassCriteria::default(),
+        );
+
+        let mut json_value = serde_json::to_value(&manifest).expect("serialize value");
+        json_value["schema_version"] = serde_json::Value::String("0.0.1".to_owned());
+        let bad_json = serde_json::to_string(&json_value).expect("serialize json");
+
+        let error =
+            BisectReplayManifest::from_json_strict(&bad_json).expect_err("schema mismatch error");
+        assert!(error.contains("schema mismatch"));
+    }
+
+    #[test]
+    fn test_bisect_manifest_evaluate_summary_pass_and_fail() {
+        let summary = make_manifest_summary();
+        let criteria = ReplayPassCriteria {
+            max_divergent_entries: summary.total_divergent,
+            max_error_entries: summary.total_errors,
+            max_shift_alerts: summary.shift_count(),
+        };
+        let manifest = BisectReplayManifest::from_summary(
+            &summary,
+            "bd-mblr.7.6.1",
+            "run-manifest-3",
+            "2026-02-13T09:00:00Z",
+            "cargo test -p fsqlite-harness bisect_manifest",
+            criteria,
+        );
+
+        let pass_eval = manifest.evaluate_summary(&summary);
+        assert_eq!(pass_eval.verdict, ReplayVerdict::Pass);
+        assert!(pass_eval.reasons.is_empty());
+
+        let mut failing = summary.clone();
+        failing.total_divergent += 1;
+        let fail_eval = manifest.evaluate_summary(&failing);
+        assert_eq!(fail_eval.verdict, ReplayVerdict::Fail);
+        assert!(
+            fail_eval
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("divergent entries"))
+        );
     }
 
     // --- Regime Display ---

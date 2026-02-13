@@ -8,6 +8,8 @@
 //! - probe definitions used by CI/workflows for parity and drift detection.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -151,6 +153,75 @@ impl DurabilityMatrix {
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
+}
+
+/// Write matrix JSON to a file path.
+pub fn write_matrix_json(path: &Path, matrix: &DurabilityMatrix) -> Result<(), String> {
+    let payload = serde_json::to_string_pretty(matrix)
+        .map_err(|error| format!("durability_matrix_serialize_failed: {error}"))?;
+    std::fs::write(path, payload).map_err(|error| {
+        format!(
+            "durability_matrix_write_failed path={} error={error}",
+            path.display()
+        )
+    })
+}
+
+/// Render an operator-friendly workflow from the matrix.
+#[must_use]
+pub fn render_operator_workflow(matrix: &DurabilityMatrix) -> String {
+    let mut out = String::new();
+    writeln!(
+        out,
+        "durability_matrix bead_id={} schema_version={} root_seed={} log_standard_ref={}",
+        matrix.bead_id, matrix.schema_version, matrix.root_seed, matrix.log_standard_ref
+    )
+    .expect("writing to string cannot fail");
+    writeln!(out, "environments:").expect("writing to string cannot fail");
+    for environment in &matrix.environments {
+        writeln!(
+            out,
+            "- id={} os={:?} fs={:?} toolchain={:?} atomic_rename={} fsync={} notes={}",
+            environment.id,
+            environment.os,
+            environment.filesystem,
+            environment.toolchain,
+            environment.requires_atomic_rename,
+            environment.requires_fsync_durability,
+            environment.notes
+        )
+        .expect("writing to string cannot fail");
+    }
+    writeln!(out, "scenarios:").expect("writing to string cannot fail");
+    for scenario in &matrix.scenarios {
+        writeln!(
+            out,
+            "- id={} crash_mode={:?} seed={} command={} scenario_ids={} invariants={}",
+            scenario.id,
+            scenario.crash_mode,
+            scenario.derived_seed(matrix.root_seed),
+            scenario.command,
+            scenario.scenario_ids.join(","),
+            scenario.invariants.join(",")
+        )
+        .expect("writing to string cannot fail");
+    }
+    writeln!(out, "probes:").expect("writing to string cannot fail");
+    for probe in &matrix.probes {
+        let lanes = probe
+            .required_lanes
+            .iter()
+            .map(|lane| format!("{lane:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        writeln!(
+            out,
+            "- id={} environment={} scenario={} lanes={}",
+            probe.id, probe.environment_id, probe.scenario_id, lanes
+        )
+        .expect("writing to string cannot fail");
+    }
+    out
 }
 
 /// Build and validate the canonical matrix.
@@ -410,6 +481,8 @@ fn lanes_for_scenario(scenario_id: &str) -> Vec<DurabilityLane> {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -473,5 +546,30 @@ mod tests {
         assert_eq!(restored.environments.len(), matrix.environments.len());
         assert_eq!(restored.scenarios.len(), matrix.scenarios.len());
         assert_eq!(restored.probes.len(), matrix.probes.len());
+    }
+
+    #[test]
+    fn operator_workflow_includes_core_sections() {
+        let matrix = DurabilityMatrix::canonical(DEFAULT_ROOT_SEED);
+        let workflow = render_operator_workflow(&matrix);
+        assert!(workflow.contains("durability_matrix bead_id=bd-mblr.7.4"));
+        assert!(workflow.contains("environments:"));
+        assert!(workflow.contains("scenarios:"));
+        assert!(workflow.contains("probes:"));
+        assert!(workflow.contains("id=env-linux-ext4-nightly"));
+        assert!(workflow.contains("id=REC-1"));
+    }
+
+    #[test]
+    fn write_matrix_json_roundtrip() {
+        let matrix = DurabilityMatrix::canonical(DEFAULT_ROOT_SEED);
+        let temp = tempdir().expect("create tempdir");
+        let path = temp.path().join("durability_matrix.json");
+        write_matrix_json(&path, &matrix).expect("write matrix json");
+        let payload = std::fs::read_to_string(&path).expect("read matrix json");
+        let restored: DurabilityMatrix =
+            serde_json::from_str(&payload).expect("deserialize matrix json");
+        assert_eq!(restored.bead_id, matrix.bead_id);
+        assert_eq!(restored.schema_version, MATRIX_SCHEMA_VERSION);
     }
 }

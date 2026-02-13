@@ -113,6 +113,8 @@ impl Config {
             .map_err(|error| format!("workspace_root_canonicalize_failed: {error}"))?;
         let mut run_dir = workspace_root.join("artifacts/unit-coverage-drift-gate");
         let mut unit_shard_root = workspace_root.join("artifacts/unit-shards");
+        let mut run_dir_overridden = false;
+        let mut unit_shard_root_overridden = false;
         let mut required_lanes: Vec<String> = DEFAULT_REQUIRED_LANES
             .iter()
             .map(|lane| (*lane).to_owned())
@@ -130,6 +132,12 @@ impl Config {
                         .get(idx)
                         .ok_or_else(|| "missing value for --workspace-root".to_owned())?;
                     workspace_root = PathBuf::from(value);
+                    if !run_dir_overridden {
+                        run_dir = workspace_root.join("artifacts/unit-coverage-drift-gate");
+                    }
+                    if !unit_shard_root_overridden {
+                        unit_shard_root = workspace_root.join("artifacts/unit-shards");
+                    }
                 }
                 "--run-dir" => {
                     idx += 1;
@@ -137,6 +145,7 @@ impl Config {
                         .get(idx)
                         .ok_or_else(|| "missing value for --run-dir".to_owned())?;
                     run_dir = PathBuf::from(value);
+                    run_dir_overridden = true;
                 }
                 "--unit-shard-root" => {
                     idx += 1;
@@ -144,6 +153,7 @@ impl Config {
                         .get(idx)
                         .ok_or_else(|| "missing value for --unit-shard-root".to_owned())?;
                     unit_shard_root = PathBuf::from(value);
+                    unit_shard_root_overridden = true;
                 }
                 "--required-lanes" => {
                     idx += 1;
