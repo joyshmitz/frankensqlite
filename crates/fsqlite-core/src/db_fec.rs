@@ -829,7 +829,7 @@ fn derive_db_fec_repair_seed(meta: &DbFecGroupMeta) -> u64 {
 ///
 /// Uses `asupersync::raptorq::systematic::SystematicEncoder` to produce
 /// `r_repair` repair symbols with ESIs `[K, K+R)`.
-fn compute_raptorq_repair_symbols(
+pub fn compute_raptorq_repair_symbols(
     meta: &DbFecGroupMeta,
     source_pages: &[&[u8]],
     page_size: usize,

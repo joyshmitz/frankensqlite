@@ -20,6 +20,7 @@ pub mod permeation_map;
 pub mod raptorq_integration;
 pub mod region;
 pub mod remote_effects;
+pub mod repair_engine;
 pub mod repair_symbols;
 pub mod replication_receiver;
 pub mod replication_sender;
