@@ -44,6 +44,82 @@ pub mod validation;
 pub mod verification_gates;
 pub mod workload;
 
+// ─── Deterministic Seed Constants (bd-mblr.4.3.1) ────────────────────────────
+//
+// FrankenSQLite E2E tests use deterministic seeding to ensure reproducibility.
+// All scenarios derive their RNG state from a base seed, enabling exact replay
+// of any test execution by specifying the same seed.
+
+/// Canonical default seed for all E2E scenarios.
+///
+/// The value 0xFRANKEN (as ASCII bytes: "FRANKEN") serves as a memorable,
+/// project-specific default that is unlikely to collide with common test seeds
+/// like 0, 1, or 42.
+///
+/// ## Usage
+///
+/// ```rust
+/// use fsqlite_e2e::FRANKEN_SEED;
+///
+/// let seed = std::env::var("E2E_SEED")
+///     .ok()
+///     .and_then(|s| s.parse::<u64>().ok())
+///     .unwrap_or(FRANKEN_SEED);
+/// ```
+///
+/// ## CLI Override
+///
+/// All E2E binaries accept `--seed <u64>` to override the default:
+/// ```sh
+/// cargo run -p fsqlite-e2e --bin realdb_e2e -- --seed 12345 run
+/// ```
+///
+/// ## Reproducibility Contract
+///
+/// Given identical:
+/// - Seed value
+/// - RNG algorithm (StdRng/ChaCha12)
+/// - rand crate version (0.8.x)
+/// - Scenario ID
+///
+/// The test execution MUST produce identical:
+/// - Operation sequences
+/// - Database states
+/// - Corruption patterns (for COR-* scenarios)
+pub const FRANKEN_SEED: u64 = 0x4652_414E_4B45_4E; // "FRANKEN" as ASCII bytes
+
+/// Minimum valid seed value (0 is reserved for "use default").
+pub const SEED_MIN: u64 = 1;
+
+/// Maximum valid seed value.
+pub const SEED_MAX: u64 = u64::MAX;
+
+/// Derives a worker-specific seed from a base seed and worker ID.
+///
+/// This ensures each worker in a concurrent scenario has a distinct but
+/// deterministic RNG stream.
+///
+/// ## Algorithm
+///
+/// `worker_seed = base_seed ^ (worker_id as u64 * 0x9E3779B97F4A7C15)`
+///
+/// The multiplier is the golden ratio constant, providing good distribution.
+#[inline]
+#[must_use]
+pub const fn derive_worker_seed(base_seed: u64, worker_id: u16) -> u64 {
+    base_seed ^ ((worker_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// Derives a scenario-specific seed from a base seed and scenario ID hash.
+///
+/// This allows different scenarios to have independent RNG streams while
+/// maintaining reproducibility.
+#[inline]
+#[must_use]
+pub const fn derive_scenario_seed(base_seed: u64, scenario_hash: u64) -> u64 {
+    base_seed ^ scenario_hash
+}
+
 /// Determinism and durability knobs that the harness sets consistently
 /// on **both** sqlite3 and FrankenSQLite runs.
 ///
