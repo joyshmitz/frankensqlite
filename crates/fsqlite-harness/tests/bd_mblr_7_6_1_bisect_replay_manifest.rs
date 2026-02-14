@@ -61,7 +61,7 @@ fn make_bisect_request() -> BisectRequest {
 
     BisectRequest {
         request_id: "req-bisect-001".to_owned(),
-        trigger: BisectTrigger::GateFailure,
+        trigger: BisectTrigger::GateRegression,
         lane: "correctness".to_owned(),
         failing_gate: "phase_4_6_gate".to_owned(),
         good_commit: "abc1234".to_owned(),

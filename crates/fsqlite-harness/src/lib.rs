@@ -39,6 +39,7 @@ pub mod log_schema_validator;
 pub mod maintenance_parity;
 pub mod metamorphic;
 pub mod mismatch_minimizer;
+pub mod no_mock_critical_path_gate;
 pub mod no_mock_evidence;
 pub mod oracle;
 pub mod parity_evidence_matrix;

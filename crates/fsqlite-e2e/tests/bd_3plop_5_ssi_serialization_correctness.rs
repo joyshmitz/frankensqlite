@@ -7,8 +7,9 @@
 //! - A conflict graph derived from committed transactions is acyclic.
 //! - Abort rate and throughput stay within target bounds for CI scale.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
@@ -16,7 +17,7 @@ use std::time::Instant;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use fsqlite_types::error::FrankenError;
+use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
 const CI_WRITERS: usize = 10;
@@ -31,7 +32,7 @@ const MIX_DEPOSIT_PCT: u8 = 20;
 const MIX_BALANCE_CHECK_PCT: u8 = 10;
 const MIN_CI_THROUGHPUT_TXN_PER_SEC: f64 = 1_000.0;
 const MAX_ABORT_RATE: f64 = 0.20;
-const TEST_SEED: u64 = 0xBDBD_3P10_P5AA_55EE;
+const TEST_SEED: u64 = 0xBDBD_3010_05AA_55EE;
 
 #[derive(Clone, Copy)]
 enum TxnKind {
@@ -121,24 +122,24 @@ fn run_ssi_workload(
     let db_path = db_dir.path().join("ssi_serialization.db");
     initialize_db(&db_path);
 
-    let start_counter = AtomicU64::new(1);
-    let commit_counter = AtomicU64::new(1);
+    let start_counter = Arc::new(AtomicU64::new(1));
+    let commit_counter = Arc::new(AtomicU64::new(1));
 
     let started = Instant::now();
     let mut handles = Vec::with_capacity(writers);
     for worker_id in 0..writers {
         let path = db_path.clone();
         let worker_seed = derive_worker_seed(seed, worker_id);
-        let start_ref = &start_counter;
-        let commit_ref = &commit_counter;
+        let start_ref = Arc::clone(&start_counter);
+        let commit_ref = Arc::clone(&commit_counter);
         handles.push(thread::spawn(move || {
             run_worker(
                 &path,
                 worker_id,
                 txns_per_writer,
                 worker_seed,
-                start_ref,
-                commit_ref,
+                &start_ref,
+                &commit_ref,
             )
         }));
     }
@@ -241,7 +242,7 @@ fn run_worker(
             let start_order = start_counter.fetch_add(1, Ordering::SeqCst);
             let kind = choose_txn_kind(&mut rng);
 
-            let execute_result = execute_single_txn(&conn, &mut rng, kind);
+            let execute_result: Result<_, FrankenError> = execute_single_txn(&conn, &mut rng, kind);
             match execute_result {
                 Ok((read_set, write_set, delta_sum)) => {
                     let commit_order = commit_counter.fetch_add(1, Ordering::SeqCst);
@@ -299,7 +300,7 @@ fn execute_single_txn(
             if to == from {
                 to = if to == ACCOUNT_COUNT { 1 } else { to + 1 };
             }
-            let amount = i64::from(rng.random_range(1_u8..=5_u8));
+            let amount = i64::from(rng.gen_range(1_u8..=5_u8));
 
             let from_balance = read_balance(conn, from)?;
             let _to_balance = read_balance(conn, to)?;
@@ -319,7 +320,7 @@ fn execute_single_txn(
         }
         TxnKind::Deposit => {
             let account = random_account(rng);
-            let amount = i64::from(rng.random_range(1_u8..=3_u8));
+            let amount = i64::from(rng.gen_range(1_u8..=3_u8));
 
             let _before = read_balance(conn, account)?;
             read_set.insert(account);
@@ -340,7 +341,7 @@ fn execute_single_txn(
 }
 
 fn choose_txn_kind(rng: &mut StdRng) -> TxnKind {
-    let bucket = rng.random_range(0_u8..100_u8);
+    let bucket = rng.gen_range(0_u8..100_u8);
     if bucket < MIX_TRANSFER_PCT {
         TxnKind::Transfer
     } else if bucket < MIX_TRANSFER_PCT + MIX_DEPOSIT_PCT {
@@ -355,7 +356,7 @@ fn choose_txn_kind(rng: &mut StdRng) -> TxnKind {
 }
 
 fn random_account(rng: &mut StdRng) -> i64 {
-    rng.random_range(1_i64..=ACCOUNT_COUNT)
+    rng.gen_range(1_i64..=ACCOUNT_COUNT)
 }
 
 fn rollback_best_effort(conn: &fsqlite::Connection) {
@@ -377,10 +378,10 @@ fn read_sum(conn: &fsqlite::Connection) -> Result<i64, FrankenError> {
 fn extract_int(row: &fsqlite::Row, index: usize) -> Result<i64, FrankenError> {
     match row.get(index) {
         Some(SqliteValue::Integer(value)) => Ok(*value),
-        Some(other) => Err(FrankenError::Execution(format!(
+        Some(other) => Err(FrankenError::Internal(format!(
             "expected integer column at index {index}, got {other:?}"
         ))),
-        None => Err(FrankenError::Execution(format!(
+        None => Err(FrankenError::Internal(format!(
             "missing column at index {index}"
         ))),
     }
