@@ -52,16 +52,29 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Workspace:** 24 crates under `crates/` (see members list in root `Cargo.toml`)
 - **Dependency versions:** Explicit versions for stability
-- **Configuration:** Cargo.toml only (workspace-level and per-crate)
+- **Configuration:** Cargo.toml workspace with `workspace = true` pattern
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` via workspace lints)
 - **Clippy:** Pedantic + nursery lints denied at workspace level
 
-### Key External Dependencies
+### Async Runtime: asupersync (MANDATORY — NO TOKIO)
+
+**This project uses [asupersync](/dp/asupersync) for async operations where needed. Tokio and the entire tokio ecosystem are FORBIDDEN.**
+
+- **Structured concurrency**: `Cx`, `Scope`, `region()` — no orphan tasks
+- **Cancel-correct channels**: Two-phase `reserve()/send()` — no data loss on cancellation
+- **Sync primitives**: `asupersync::sync::Mutex`, `RwLock`, `OnceCell`, `Pool` — cancel-aware
+- **Deterministic testing**: `LabRuntime` with virtual time, DPOR, oracles
+
+**Forbidden crates**: `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, or any crate that transitively depends on tokio.
+
+**Pattern**: All async functions take `&Cx` as first parameter. The `Cx` flows down from the consumer's runtime — FrankenSQLite does NOT create its own runtime.
+
+### Key Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| `asupersync` | Async I/O runtime (local at `/dp/asupersync`) |
-| `frankentui` | TUI framework (local at `/dp/frankentui`) |
+| `asupersync` | Structured async runtime (channels, sync, regions, testing) |
+| `ftui` | TUI framework (local at `/dp/frankentui`) |
 | `thiserror` | Derive macro for `Error` trait implementations |
 | `serde` + `serde_json` | Serialization/deserialization |
 | `bitflags` | Type-safe bitflag types for page flags, lock modes, etc. |
@@ -70,6 +83,16 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `smallvec` | Stack-allocated small vectors for hot paths |
 | `memchr` | SIMD-accelerated byte search |
 | `sha2` | SHA-256 checksums for page integrity |
+| `xxhash-rust` | XXH3 fast hashing |
+| `crc32c` | CRC32C checksums |
+| `blake3` | BLAKE3 hashing |
+| `crossbeam-epoch` | Epoch-based memory reclamation |
+| `crossbeam-deque` | Work-stealing deques |
+| `chacha20poly1305` | AEAD encryption for encrypted databases |
+| `argon2` | Key derivation for database encryption |
+| `rand` | Random number generation |
+| `nix` | POSIX filesystem operations |
+| `rusqlite` | C SQLite reference implementation (for conformance testing) |
 | `criterion` | Benchmarking framework (dev) |
 | `proptest` | Property-based testing (dev) |
 | `insta` | Snapshot testing (dev) |
@@ -136,17 +159,96 @@ We do not care about backwards compatibility—we're in early development with n
 **After any substantive code changes, you MUST verify no errors were introduced:**
 
 ```bash
-# Check for compiler errors and warnings
-cargo check --all-targets
+# Check for compiler errors and warnings (workspace-wide)
+cargo check --workspace --all-targets
 
 # Check for clippy lints (pedantic + nursery are enabled)
-cargo clippy --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Verify formatting
 cargo fmt --check
 ```
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
+
+---
+
+## Testing
+
+### Testing Policy
+
+Every component crate includes inline `#[cfg(test)]` unit tests alongside the implementation. Tests must cover:
+- Happy path
+- Edge cases (empty input, max values, boundary conditions)
+- Error conditions
+
+Cross-component integration tests live in the workspace `tests/` directory.
+
+### Unit Tests
+
+```bash
+# Run all tests across the workspace
+cargo test --workspace
+
+# Run with output
+cargo test --workspace -- --nocapture
+
+# Run tests for a specific crate
+cargo test -p fsqlite-types
+cargo test -p fsqlite-mvcc
+cargo test -p fsqlite-parser
+cargo test -p fsqlite-btree
+cargo test -p fsqlite-vdbe
+cargo test -p fsqlite-core
+cargo test -p fsqlite-e2e
+
+# Run a specific test by name
+cargo test --workspace -- test_name_here
+
+# Run tests with all features enabled
+cargo test --workspace --all-features
+```
+
+### Test Categories
+
+| Crate | Focus Areas |
+|-------|-------------|
+| `fsqlite-types` | Type invariants, value conversions, serialization round-trips |
+| `fsqlite-error` | Error construction, display formatting, conversion |
+| `fsqlite-vfs` | File I/O, locking, platform abstraction |
+| `fsqlite-pager` | Page cache eviction, dirty tracking, buffer management |
+| `fsqlite-wal` | WAL append/recovery, checkpoint, crash simulation |
+| `fsqlite-mvcc` | Version chain creation/traversal, visibility rules, conflict detection |
+| `fsqlite-btree` | Insert/delete/search, splits/merges, cursor navigation |
+| `fsqlite-ast` | AST node construction, visitor traversal |
+| `fsqlite-parser` | SQL parsing (SELECT, INSERT, UPDATE, DELETE, CREATE, etc.) |
+| `fsqlite-planner` | Plan generation, cost estimation, index selection |
+| `fsqlite-vdbe` | Bytecode compilation, VM execution, opcode correctness |
+| `fsqlite-func` | Built-in function correctness (math, string, date, etc.) |
+| `fsqlite-ext-*` | Extension-specific functionality |
+| `fsqlite-core` | Full-stack integration (SQL in, results out) |
+| `fsqlite` | Public API contract tests |
+| `fsqlite-cli` | CLI argument parsing, REPL behavior |
+| `fsqlite-harness` | SQLite conformance test suite execution |
+| `fsqlite-e2e` | End-to-end concurrent writer tests, fairness benchmarks |
+| `fsqlite-observability` | Metrics collection, tracing integration |
+| `tests/` (workspace) | Cross-component integration and end-to-end tests |
+| `benches/` (workspace) | Criterion benchmarks |
+
+### Property-Based & Snapshot Tests
+
+- **proptest** is used for property-based testing (e.g., B-Tree invariants hold for arbitrary insert sequences)
+- **insta** is used for snapshot testing (e.g., parser output, query plans, bytecode dumps)
+
+### Test Fixtures
+
+Conformance test data lives in the `conformance/` directory. Fuzz testing targets are in the `fuzz/` directory.
+
+---
+
+## Third-Party Library Usage
+
+If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and current best practices.
 
 ---
 
@@ -182,8 +284,6 @@ FrankenSQLite exists for ONE reason: to eliminate SQLite's single-writer seriali
 
 **Why this rule exists:** On Feb 10 2026, an agent set `concurrent_mode_default` to `false` and implemented serialized file locking in `MemoryVfs`, completely defeating the project's core innovation. It took an emergency session to identify and revert the damage. This must never happen again. If you are unsure whether a change affects concurrency behavior, ASK before making it.
 
----
-
 ### Architecture
 
 ```
@@ -196,201 +296,184 @@ Storage: VFS --> Pager --> WAL --> MVCC --> B-Tree --> Page I/O
 
 **Storage pipeline:** The VFS (Virtual File System) abstracts platform I/O. The Pager manages fixed-size pages in a cache. The WAL (Write-Ahead Log) provides crash recovery. MVCC manages page version chains for concurrent access. The B-Tree layer organizes rows and indexes on pages.
 
-### Workspace Crates
+### Workspace Structure
 
-| Crate | Purpose |
-|-------|---------|
-| `fsqlite-types` | Shared type definitions (Value, PageNumber, RowId, etc.) |
-| `fsqlite-error` | Unified error types and result aliases |
-| `fsqlite-vfs` | Virtual File System — platform-agnostic I/O abstraction |
-| `fsqlite-pager` | Page cache and buffer pool management |
-| `fsqlite-wal` | Write-Ahead Log for crash recovery and durability |
-| `fsqlite-mvcc` | Multi-Version Concurrency Control — page version chains |
-| `fsqlite-btree` | B-Tree and B+Tree for tables and indexes |
-| `fsqlite-ast` | Abstract Syntax Tree node definitions for SQL |
-| `fsqlite-parser` | SQL tokenizer and parser (SQL text to AST) |
-| `fsqlite-planner` | Query planner and optimizer (AST to logical plan) |
-| `fsqlite-vdbe` | Virtual Database Engine — bytecode compiler and VM |
-| `fsqlite-func` | Built-in scalar, aggregate, and window functions |
-| `fsqlite-ext-fts3` | Extension: Full-Text Search v3 |
-| `fsqlite-ext-fts5` | Extension: Full-Text Search v5 |
-| `fsqlite-ext-rtree` | Extension: R-Tree spatial indexing |
-| `fsqlite-ext-json` | Extension: JSON1 functions |
-| `fsqlite-ext-session` | Extension: Session/changeset tracking |
-| `fsqlite-ext-icu` | Extension: ICU Unicode collation |
-| `fsqlite-ext-misc` | Extension: Miscellaneous loadable extensions |
-| `fsqlite-core` | Core database engine — ties all layers together |
-| `fsqlite` | Public API crate — the user-facing library interface |
-| `fsqlite-cli` | Command-line shell (like `sqlite3` CLI) |
-| `fsqlite-harness` | Test harness and conformance testing framework |
-
-### Key Files
-
-| Path | Purpose |
-|------|---------|
-| `Cargo.toml` | Workspace root — all 24 members, shared deps, profiles |
-| `rust-toolchain.toml` | Nightly toolchain requirement |
-| `crates/fsqlite-types/` | Foundation types used across all crates |
-| `crates/fsqlite-error/` | Error definitions used across all crates |
-| `crates/fsqlite-mvcc/` | The core MVCC innovation — page version chains |
-| `crates/fsqlite-parser/` | SQL parser — entry point for all queries |
-| `crates/fsqlite-vdbe/` | Bytecode VM — where queries actually execute |
-| `crates/fsqlite-core/` | Integration layer connecting all subsystems |
-| `crates/fsqlite/` | Public API — what external users depend on |
-| `crates/fsqlite-cli/` | Interactive shell binary |
-| `crates/fsqlite-harness/` | SQLite conformance and compatibility tests |
-| `src/` | Additional source files and utilities |
-| `tests/` | Integration and end-to-end tests |
-| `benches/` | Criterion benchmarks |
-| `fuzz/` | Fuzz testing targets |
-| `conformance/` | SQLite conformance test data |
-
----
-
-## Testing
-
-### Running Tests
-
-```bash
-# Run all tests across the entire workspace
-cargo test --workspace
-
-# Run with output visible
-cargo test --workspace -- --nocapture
-
-# Run tests for a specific crate
-cargo test -p fsqlite-mvcc
-cargo test -p fsqlite-parser
-cargo test -p fsqlite-btree
-
-# Run a specific test by name
-cargo test --workspace -- test_name_here
+```
+frankensqlite/
+├── Cargo.toml                         # Workspace root — all 24 members, shared deps, profiles
+├── rust-toolchain.toml                # Nightly toolchain requirement
+├── crates/
+│   ├── fsqlite-types/                 # Foundation types (Value, PageNumber, RowId, etc.)
+│   ├── fsqlite-error/                 # Unified error types and result aliases
+│   ├── fsqlite-vfs/                   # Virtual File System — platform-agnostic I/O
+│   ├── fsqlite-pager/                 # Page cache and buffer pool management
+│   ├── fsqlite-wal/                   # Write-Ahead Log for crash recovery
+│   ├── fsqlite-mvcc/                  # MVCC — page version chains (core innovation)
+│   ├── fsqlite-btree/                 # B-Tree and B+Tree for tables and indexes
+│   ├── fsqlite-ast/                   # Abstract Syntax Tree node definitions
+│   ├── fsqlite-parser/                # SQL tokenizer and parser (SQL text to AST)
+│   ├── fsqlite-planner/               # Query planner and optimizer (AST to plan)
+│   ├── fsqlite-vdbe/                  # Virtual Database Engine — bytecode compiler and VM
+│   ├── fsqlite-func/                  # Built-in scalar, aggregate, and window functions
+│   ├── fsqlite-ext-fts3/              # Extension: Full-Text Search v3
+│   ├── fsqlite-ext-fts5/              # Extension: Full-Text Search v5
+│   ├── fsqlite-ext-rtree/             # Extension: R-Tree spatial indexing
+│   ├── fsqlite-ext-json/              # Extension: JSON1 functions
+│   ├── fsqlite-ext-session/           # Extension: Session/changeset tracking
+│   ├── fsqlite-ext-icu/               # Extension: ICU Unicode collation
+│   ├── fsqlite-ext-misc/              # Extension: Miscellaneous loadable extensions
+│   ├── fsqlite-core/                  # Core engine — ties all layers together
+│   ├── fsqlite/                       # Public API crate — user-facing library interface
+│   ├── fsqlite-cli/                   # Command-line shell (like sqlite3 CLI)
+│   ├── fsqlite-harness/               # Test harness and conformance testing framework
+│   ├── fsqlite-e2e/                   # End-to-end tests, concurrent writer harness
+│   └── fsqlite-observability/         # Metrics collection and tracing integration
+├── src/                               # Additional source files and utilities
+├── tests/                             # Integration and end-to-end tests
+├── benches/                           # Criterion benchmarks
+├── fuzz/                              # Fuzz testing targets
+└── conformance/                       # SQLite conformance test data
 ```
 
-### Test Categories by Crate
+### Key Files by Crate
 
-| Crate | Focus |
-|-------|-------|
-| `fsqlite-types` | Type invariants, value conversions, serialization round-trips |
-| `fsqlite-error` | Error construction, display formatting, conversion |
-| `fsqlite-vfs` | File I/O, locking, platform abstraction |
-| `fsqlite-pager` | Page cache eviction, dirty tracking, buffer management |
-| `fsqlite-wal` | WAL append/recovery, checkpoint, crash simulation |
-| `fsqlite-mvcc` | Version chain creation/traversal, visibility rules, conflict detection |
-| `fsqlite-btree` | Insert/delete/search, splits/merges, cursor navigation |
-| `fsqlite-ast` | AST node construction, visitor traversal |
-| `fsqlite-parser` | SQL parsing (SELECT, INSERT, UPDATE, DELETE, CREATE, etc.) |
-| `fsqlite-planner` | Plan generation, cost estimation, index selection |
-| `fsqlite-vdbe` | Bytecode compilation, VM execution, opcode correctness |
-| `fsqlite-func` | Built-in function correctness (math, string, date, etc.) |
-| `fsqlite-ext-*` | Extension-specific functionality |
-| `fsqlite-core` | Full-stack integration (SQL in, results out) |
-| `fsqlite` | Public API contract tests |
-| `fsqlite-cli` | CLI argument parsing, REPL behavior |
-| `fsqlite-harness` | SQLite conformance test suite execution |
+| Crate | Key Files | Purpose |
+|-------|-----------|---------|
+| `fsqlite-types` | `src/lib.rs` | Foundation types: `Value`, `PageNumber`, `RowId`, column types |
+| `fsqlite-error` | `src/lib.rs` | `FsqliteError` enum, `Result` alias, error conversions |
+| `fsqlite-vfs` | `src/lib.rs` | `Vfs` trait, `MemoryVfs`, platform I/O abstraction |
+| `fsqlite-pager` | `src/lib.rs` | Page cache, buffer pool, dirty page tracking |
+| `fsqlite-wal` | `src/lib.rs` | WAL append/recovery, checkpoint logic |
+| `fsqlite-mvcc` | `src/lib.rs` | Page version chains, visibility rules, conflict detection |
+| `fsqlite-btree` | `src/lib.rs` | B-Tree insert/delete/search, splits/merges, cursors |
+| `fsqlite-ast` | `src/lib.rs` | AST node definitions for all SQL statement types |
+| `fsqlite-parser` | `src/lib.rs` | SQL tokenizer and recursive descent parser |
+| `fsqlite-planner` | `src/lib.rs` | Query plan generation, cost estimation, index selection |
+| `fsqlite-vdbe` | `src/lib.rs` | Bytecode compiler, VM executor, opcode dispatch |
+| `fsqlite-func` | `src/lib.rs` | Built-in functions (math, string, date, aggregate, window) |
+| `fsqlite-core` | `src/connection.rs` | `Connection` struct — integration layer, `concurrent_mode_default` |
+| `fsqlite` | `src/lib.rs` | Public API facade — what external users depend on |
+| `fsqlite-cli` | `src/main.rs` | Interactive shell binary (like `sqlite3`) |
+| `fsqlite-harness` | `src/lib.rs` | SQLite conformance test suite runner |
+| `fsqlite-e2e` | `src/lib.rs` | `HarnessSettings`, concurrent writer test framework |
+| `fsqlite-e2e` | `src/fsqlite_executor.rs` | `FsqliteExecConfig` with `concurrent_mode` default |
+| `fsqlite-e2e` | `src/fairness.rs` | Fairness benchmarks, `benchmark_settings()` |
+| `fsqlite-observability` | `src/lib.rs` | Metrics collection, structured tracing integration |
 
-### Property-Based & Snapshot Tests
+### Key Design Decisions
 
-- **proptest** is used for property-based testing (e.g., B-Tree invariants hold for arbitrary insert sequences)
-- **insta** is used for snapshot testing (e.g., parser output, query plans, bytecode dumps)
+- **MVCC page-level versioning** replaces SQLite's single WAL_WRITE_LOCK — concurrent writers only conflict when touching the same page
+- **`BEGIN` auto-promotes to `BEGIN CONCURRENT`** by default — concurrent mode is always on unless explicitly opted out
+- **Clean-room implementation** — no C SQLite code, pure Rust
+- **VDBE bytecode VM** — same execution model as SQLite for compatibility
+- **Crash recovery via WAL** — write-ahead logging with checkpoint support
+- **Extension system** — FTS3, FTS5, R-Tree, JSON1, Session, ICU, misc (matching SQLite's extension surface)
+- **Conformance testing against C SQLite** — `rusqlite` is a dev dependency for reference comparison
+- **Property-based testing** — proptest for invariant verification on B-Trees, MVCC chains, parser
+- **Snapshot testing** — insta for parser output, query plans, bytecode dumps
+- **`#![forbid(unsafe_code)]`** — zero unsafe blocks across all crates
+- **Structured tracing** throughout — every layer emits spans for diagnostics
 
 ---
 
-## Third-Party Library Usage
+## MCP Agent Mail — Multi-Agent Coordination
 
-If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and current best practices.
+A mail-like layer that lets coding agents coordinate asynchronously via MCP tools and resources. Provides identities, inbox/outbox, searchable threads, and advisory file reservations with human-auditable artifacts in Git.
 
----
+### Why It's Useful
 
-## Landing the Plane (Session Completion)
+- **Prevents conflicts:** Explicit file reservations (leases) for files/globs
+- **Token-efficient:** Messages stored in per-project archive, not in context
+- **Quick reads:** `resource://inbox/...`, `resource://thread/...`
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+### Same Repository Workflow
 
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   br sync --flush-only    # Export beads to JSONL (no git ops)
-   git add .beads/         # Stage beads changes
-   git add <other files>   # Stage code changes
-   git commit -m "..."     # Commit everything
-   git push
-   git status  # MUST show "up to date with origin"
+1. **Register identity:**
    ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
+   ensure_project(project_key=<abs-path>)
+   register_agent(project_key, program, model)
+   ```
 
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+2. **Reserve files before editing:**
+   ```
+   file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)
+   ```
+
+3. **Communicate with threads:**
+   ```
+   send_message(..., thread_id="FEAT-123")
+   fetch_inbox(project_key, agent_name)
+   acknowledge_message(project_key, agent_name, message_id)
+   ```
+
+4. **Quick reads:**
+   ```
+   resource://inbox/{Agent}?project=<abs-path>&limit=20
+   resource://thread/{id}?project=<abs-path>&include_bodies=true
+   ```
+
+### Macros vs Granular Tools
+
+- **Prefer macros for speed:** `macro_start_session`, `macro_prepare_thread`, `macro_file_reservation_cycle`, `macro_contact_handshake`
+- **Use granular tools for control:** `register_agent`, `file_reservation_paths`, `send_message`, `fetch_inbox`, `acknowledge_message`
+
+### Common Pitfalls
+
+- `"from_agent not registered"`: Always `register_agent` in the correct `project_key` first
+- `"FILE_RESERVATION_CONFLICT"`: Adjust patterns, wait for expiry, or use non-exclusive reservation
+- **Auth errors:** If JWT+JWKS enabled, include bearer token with matching `kid`
 
 ---
 
-## Beads Workflow Integration
+## Beads (br) — Dependency-Aware Issue Tracking
 
-This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+Beads provides a lightweight, dependency-aware issue database and CLI (`br` - beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
 
-**Important:** `br` is non-invasive—it NEVER executes git commands. After `br sync --flush-only`, you must manually run `git add .beads/ && git commit`.
+**Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
 
-### Essential Commands
+### Conventions
 
-```bash
-# View issues (launches TUI - avoid in automated sessions)
-bv
+- **Single source of truth:** Beads for task status/priority/dependencies; Agent Mail for conversation and audit
+- **Shared identifiers:** Use Beads issue ID (e.g., `br-123`) as Mail `thread_id` and prefix subjects with `[br-123]`
+- **Reservations:** When starting a task, call `file_reservation_paths()` with the issue ID in `reason`
 
-# CLI commands for agents (use these instead)
-br ready              # Show issues ready to work (no blockers)
-br list --status=open # All open issues
-br show <id>          # Full issue details with dependencies
-br create --title="..." --type=task --priority=2
-br update <id> --status=in_progress
-br close <id> --reason "Completed"
-br close <id1> <id2>  # Close multiple issues at once
-br sync --flush-only  # Export to JSONL (NO git operations)
-```
+### Typical Agent Flow
 
-### Workflow Pattern
+1. **Pick ready work (Beads):**
+   ```bash
+   br ready --json  # Choose highest priority, no blockers
+   ```
 
-1. **Start**: Run `br ready` to find actionable work
-2. **Claim**: Use `br update <id> --status=in_progress`
-3. **Work**: Implement the task
-4. **Complete**: Use `br close <id>`
-5. **Sync**: Run `br sync --flush-only` then manually commit
+2. **Reserve edit surface (Mail):**
+   ```
+   file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true, reason="br-123")
+   ```
 
-### Key Concepts
+3. **Announce start (Mail):**
+   ```
+   send_message(..., thread_id="br-123", subject="[br-123] Start: <title>", ack_required=true)
+   ```
 
-- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
-- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
-- **Types**: task, bug, feature, epic, question, docs
-- **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
+4. **Work and update:** Reply in-thread with progress
 
-### Session Protocol
+5. **Complete and release:**
+   ```bash
+   br close 123 --reason "Completed"
+   br sync --flush-only  # Export to JSONL (no git operations)
+   ```
+   ```
+   release_file_reservations(project_key, agent_name, paths=["src/**"])
+   ```
+   Final Mail reply: `[br-123] Completed` with summary
 
-**Before ending any session, run this checklist:**
+### Mapping Cheat Sheet
 
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-br sync --flush-only    # Export beads to JSONL
-git add .beads/         # Stage beads changes
-git commit -m "..."     # Commit everything together
-git push                # Push to remote
-```
-
-### Best Practices
-
-- Check `br ready` at session start to find available work
-- Update status as you work (in_progress -> closed)
-- Create new issues with `br create` when you discover tasks
-- Use descriptive titles and set appropriate priority/type
-- Always `br sync --flush-only && git add .beads/` before ending session
+| Concept | Value |
+|---------|-------|
+| Mail `thread_id` | `br-###` |
+| Mail subject | `[br-###] ...` |
+| File reservation `reason` | `br-###` |
+| Commit messages | Include `br-###` for traceability |
 
 ---
 
@@ -500,21 +583,21 @@ ubs .                                   # Whole project (ignores target/, Cargo.
 ### Output Format
 
 ```
-Warning Category (N errors)
-    file.rs:42:5 - Issue description
-    Suggested fix
+⚠️  Category (N errors)
+    file.rs:42:5 – Issue description
+    💡 Suggested fix
 Exit code: 1
 ```
 
-Parse: `file:line:col` -> location | Suggested fix -> how to fix | Exit 0/1 -> pass/fail
+Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
 
 ### Fix Workflow
 
-1. Read finding -> category + fix suggestion
-2. Navigate `file:line:col` -> view context
+1. Read finding → category + fix suggestion
+2. Navigate `file:line:col` → view context
 3. Verify real issue (not false positive)
 4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` -> exit 0
+5. Re-run `ubs <file>` → exit 0
 6. Commit
 
 ### Bug Severity
@@ -522,6 +605,185 @@ Parse: `file:line:col` -> location | Suggested fix -> how to fix | Exit 0/1 -> p
 - **Critical (always fix):** Memory safety, use-after-free, data races, SQL injection
 - **Important (production):** Unwrap panics, resource leaks, overflow checks
 - **Contextual (judgment):** TODO/FIXME, println! debugging
+
+---
+
+## RCH — Remote Compilation Helper
+
+RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
+
+**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
+
+To manually offload a build:
+```bash
+rch exec -- cargo build --release
+rch exec -- cargo test
+rch exec -- cargo clippy
+```
+
+Quick commands:
+```bash
+rch doctor                    # Health check
+rch workers probe --all       # Test connectivity to all 8 workers
+rch status                    # Overview of current state
+rch queue                     # See active/waiting builds
+```
+
+If rch or its workers are unavailable, it fails open — builds run locally as normal.
+
+**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+
+---
+
+## ast-grep vs ripgrep
+
+**Use `ast-grep` when structure matters.** It parses code and matches AST nodes, ignoring comments/strings, and can **safely rewrite** code.
+
+- Refactors/codemods: rename APIs, change import forms
+- Policy checks: enforce patterns across a repo
+- Editor/automation: LSP mode, `--json` output
+
+**Use `ripgrep` when text is enough.** Fastest way to grep literals/regex.
+
+- Recon: find strings, TODOs, log lines, config values
+- Pre-filter: narrow candidate files before ast-grep
+
+### Rule of Thumb
+
+- Need correctness or **applying changes** → `ast-grep`
+- Need raw speed or **hunting text** → `rg`
+- Often combine: `rg` to shortlist files, then `ast-grep` to match/modify
+
+### Rust Examples
+
+```bash
+# Find structured code (ignores comments)
+ast-grep run -l Rust -p 'fn $NAME($$$ARGS) -> $RET { $$$BODY }'
+
+# Find all unwrap() calls
+ast-grep run -l Rust -p '$EXPR.unwrap()'
+
+# Quick textual hunt
+rg -n 'println!' -t rust
+
+# Combine speed + precision
+rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
+```
+
+---
+
+## Morph Warp Grep — AI-Powered Code Search
+
+**Use `mcp__morph-mcp__warp_grep` for exploratory "how does X work?" questions.** An AI agent expands your query, greps the codebase, reads relevant files, and returns precise line ranges with full context.
+
+**Use `ripgrep` for targeted searches.** When you know exactly what you're looking for.
+
+**Use `ast-grep` for structural patterns.** When you need AST precision for matching/rewriting.
+
+### When to Use What
+
+| Scenario | Tool | Why |
+|----------|------|-----|
+| "How does the MVCC version chain work?" | `warp_grep` | Exploratory; don't know where to start |
+| "Where is conflict detection implemented?" | `warp_grep` | Need to understand architecture |
+| "Find all uses of `PageNumber`" | `ripgrep` | Targeted literal search |
+| "Find files with `println!`" | `ripgrep` | Simple pattern |
+| "Replace all `unwrap()` with `expect()`" | `ast-grep` | Structural refactor |
+
+### warp_grep Usage
+
+```
+mcp__morph-mcp__warp_grep(
+  repoPath: "/dp/frankensqlite",
+  query: "How does the page-level MVCC versioning work?"
+)
+```
+
+Returns structured results with file paths, line ranges, and extracted code snippets.
+
+### Anti-Patterns
+
+- **Don't** use `warp_grep` to find a specific function name → use `ripgrep`
+- **Don't** use `ripgrep` to understand "how does X work" → wastes time with manual reads
+- **Don't** use `ripgrep` for codemods → risks collateral edits
+
+<!-- bv-agent-instructions-v1 -->
+
+---
+
+## Beads Workflow Integration
+
+This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) (`br`) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+
+**Important:** `br` is non-invasive—it NEVER executes git commands. After `br sync --flush-only`, you must manually run `git add .beads/ && git commit`.
+
+### Essential Commands
+
+```bash
+# View issues (launches TUI - avoid in automated sessions)
+bv
+
+# CLI commands for agents (use these instead)
+br ready              # Show issues ready to work (no blockers)
+br list --status=open # All open issues
+br show <id>          # Full issue details with dependencies
+br create --title="..." --type=task --priority=2
+br update <id> --status=in_progress
+br close <id> --reason "Completed"
+br close <id1> <id2>  # Close multiple issues at once
+br sync --flush-only  # Export to JSONL (NO git operations)
+```
+
+### Workflow Pattern
+
+1. **Start**: Run `br ready` to find actionable work
+2. **Claim**: Use `br update <id> --status=in_progress`
+3. **Work**: Implement the task
+4. **Complete**: Use `br close <id>`
+5. **Sync**: Run `br sync --flush-only` then manually commit
+
+### Key Concepts
+
+- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
+- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
+- **Types**: task, bug, feature, epic, question, docs
+- **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
+
+### Session Protocol
+
+**Before ending any session, run this checklist:**
+
+```bash
+git status              # Check what changed
+git add <files>         # Stage code changes
+br sync --flush-only    # Export beads to JSONL
+git add .beads/         # Stage beads changes
+git commit -m "..."     # Commit everything together
+git push                # Push to remote
+```
+
+### Best Practices
+
+- Check `br ready` at session start to find available work
+- Update status as you work (in_progress → closed)
+- Create new issues with `br create` when you discover tasks
+- Use descriptive titles and set appropriate priority/type
+- Always `br sync --flush-only && git add .beads/` before ending session
+
+<!-- end-bv-agent-instructions -->
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **Sync beads** - `br sync --flush-only` to export to JSONL
+5. **Hand off** - Provide context for next session
+
 
 ---
 
@@ -541,7 +803,7 @@ Next steps (pick one)
 3. If you want a full suite run later, fix conformance/clippy blockers and re-run cargo test --all.
 ```
 
-NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
+NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurrence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
 
 ---
 

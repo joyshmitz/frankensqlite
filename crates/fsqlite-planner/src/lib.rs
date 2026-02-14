@@ -414,7 +414,7 @@ pub struct TableStats {
 }
 
 /// Metadata about an index, used for cost estimation and usability checks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexInfo {
     /// Index name.
     pub name: String,
@@ -428,6 +428,13 @@ pub struct IndexInfo {
     pub n_pages: u64,
     /// Source of the page count.
     pub source: StatsSource,
+    /// For partial indexes: the WHERE clause that restricts which rows appear.
+    /// The planner can only use this index if the query's WHERE implies this predicate.
+    pub partial_where: Option<Expr>,
+    /// For expression indexes: the expressions indexed (parallel to `columns`).
+    /// When present, the planner matches query expressions structurally against these.
+    /// `columns` should contain synthetic names; the real matching uses these exprs.
+    pub expression_columns: Vec<Expr>,
 }
 
 // ---------------------------------------------------------------------------
@@ -541,10 +548,21 @@ pub fn best_access_path(
         estimated_rows: table.n_rows as f64,
     };
 
+    let mut candidates_considered: usize = 0;
+
     // Check each index for usability.
     for idx in indexes {
         if !idx.table.eq_ignore_ascii_case(&table.name) {
             continue;
+        }
+
+        // Partial index gate: skip unless the query's WHERE implies the
+        // index's WHERE predicate. We use a conservative structural check:
+        // the index predicate must appear as a conjunct in the query WHERE.
+        if let Some(ref partial_pred) = idx.partial_where {
+            if !where_terms_imply_predicate(where_terms, partial_pred) {
+                continue;
+            }
         }
 
         let usability = analyze_index_usability(idx, where_terms);
@@ -552,6 +570,8 @@ pub fn best_access_path(
         if matches!(usability, IndexUsability::NotUsable) {
             continue;
         }
+
+        candidates_considered += 1;
 
         let is_covering = needed_columns.is_some_and(|needed| {
             needed
@@ -574,6 +594,34 @@ pub fn best_access_path(
                         },
                         rows,
                     )
+                } else {
+                    (AccessPathKind::IndexScanEquality, rows)
+                }
+            }
+            IndexUsability::MultiColumnEquality {
+                eq_columns,
+                has_trailing_range,
+            } => {
+                // Multi-column equality narrows selectivity geometrically.
+                // Each additional equality column reduces rows by ~1/10.
+                #[allow(clippy::cast_precision_loss)]
+                let base_rows = if idx.unique && eq_columns == idx.columns.len() {
+                    1.0
+                } else {
+                    let divisor = 10.0_f64.powi(eq_columns as i32);
+                    (table.n_rows as f64 / divisor).max(1.0)
+                };
+                let (rows, sel) = if has_trailing_range {
+                    let range_factor = DEFAULT_RANGE_SELECTIVITY;
+                    let r = (base_rows * range_factor).max(1.0);
+                    (r, range_factor * base_rows / table.n_rows.max(1) as f64)
+                } else {
+                    (base_rows, base_rows / table.n_rows.max(1) as f64)
+                };
+                if is_covering {
+                    (AccessPathKind::CoveringIndexScan { selectivity: sel }, rows)
+                } else if has_trailing_range {
+                    (AccessPathKind::IndexScanRange { selectivity: sel }, rows)
                 } else {
                     (AccessPathKind::IndexScanEquality, rows)
                 }
@@ -637,16 +685,45 @@ pub fn best_access_path(
         }
     }
 
-    tracing::debug!(
+    let chosen_index = best.index.as_deref().unwrap_or("(none)");
+    let selectivity = match &best.kind {
+        AccessPathKind::IndexScanRange { selectivity }
+        | AccessPathKind::CoveringIndexScan { selectivity } => *selectivity,
+        AccessPathKind::IndexScanEquality | AccessPathKind::RowidLookup => {
+            best.estimated_rows / table.n_rows.max(1) as f64
+        }
+        AccessPathKind::FullTableScan => 1.0,
+    };
+
+    tracing::info!(
         table = %table.name,
+        candidates = candidates_considered,
+        chosen_index = %chosen_index,
+        estimated_selectivity = selectivity,
         access_path = %access_path_kind_label(&best.kind),
-        index = ?best.index,
         estimated_cost = best.estimated_cost,
         estimated_rows = best.estimated_rows,
-        "planner.best_access_path"
+        "index_select"
     );
 
     best
+}
+
+/// Check if the WHERE terms collectively imply a partial index predicate.
+///
+/// Conservative structural check: the predicate (or each conjunct of it)
+/// must appear as the expression of one of the WHERE terms.
+fn where_terms_imply_predicate(terms: &[WhereTerm<'_>], predicate: &Expr) -> bool {
+    // Decompose the predicate into conjuncts.
+    let pred_conjuncts = decompose_where(predicate);
+
+    // Each conjunct of the predicate must be matched by some WHERE term.
+    pred_conjuncts.iter().all(|pc| {
+        terms.iter().any(|t| {
+            // Structural equality of the AST nodes.
+            *t.expr == **pc
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -659,6 +736,14 @@ pub fn best_access_path(
 pub enum IndexUsability {
     /// Index can satisfy an equality constraint on its leftmost column.
     Equality,
+    /// Multi-column equality prefix: equality on the first `eq_columns` index
+    /// columns, optionally followed by a range constraint on the next column.
+    MultiColumnEquality {
+        /// Number of leading columns with equality constraints.
+        eq_columns: usize,
+        /// Whether the column after the equality prefix has a range constraint.
+        has_trailing_range: bool,
+    },
     /// Index can satisfy a range constraint (rightmost usable position).
     Range { selectivity: f64 },
     /// `IN (...)` expanded to multiple equality probes.
@@ -906,19 +991,67 @@ fn extract_like_prefix(pattern: &Expr) -> Option<String> {
 
 /// Determine the usability of an index for a set of WHERE terms.
 ///
-/// Rules from §10.5:
-/// - Equality (`col = expr`): usable if col is the LEFTMOST column of the index.
-/// - Range: usable as the RIGHTMOST constraint after any equality prefixes.
-/// - IN: expanded to multiple equality probes (leftmost column).
-/// - LIKE prefix: usable if column is leftmost and prefix is constant.
+/// Rules from §10.5, extended for multi-column indexes:
+/// - Walk the index columns left-to-right; for each column, check if the WHERE
+///   has an equality constraint. The equality prefix can be extended as long as
+///   consecutive leading columns have equality terms.
+/// - After the equality prefix, check for a range/BETWEEN on the next column.
+/// - For single-column leftmost matches, also check IN and LIKE prefix.
+/// - For expression indexes, match query expressions structurally against the
+///   index's expression columns.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> IndexUsability {
     if index.columns.is_empty() {
         return IndexUsability::NotUsable;
     }
 
+    // --- Expression index matching ---
+    // If the index has expression columns, try to match WHERE terms against
+    // the expressions structurally (AST PartialEq) rather than by column name.
+    if !index.expression_columns.is_empty() {
+        return analyze_expression_index_usability(index, terms);
+    }
+
     let leftmost = &index.columns[0];
 
+    // --- Multi-column equality prefix ---
+    // Walk index columns left-to-right, counting how many have equality terms.
+    let mut eq_columns = 0;
+    for idx_col in &index.columns {
+        let has_eq = terms.iter().any(|t| {
+            t.column.as_ref().is_some_and(|wc| {
+                wc.column.eq_ignore_ascii_case(idx_col) && matches!(t.kind, WhereTermKind::Equality)
+            })
+        });
+        if has_eq {
+            eq_columns += 1;
+        } else {
+            break;
+        }
+    }
+
+    // If we have equality on 2+ columns, return MultiColumnEquality.
+    if eq_columns >= 2 {
+        // Check for trailing range on the next column after the prefix.
+        let has_trailing_range = if eq_columns < index.columns.len() {
+            let next_col = &index.columns[eq_columns];
+            terms.iter().any(|t| {
+                t.column.as_ref().is_some_and(|wc| {
+                    wc.column.eq_ignore_ascii_case(next_col)
+                        && matches!(t.kind, WhereTermKind::Range | WhereTermKind::Between)
+                })
+            })
+        } else {
+            false
+        };
+        return IndexUsability::MultiColumnEquality {
+            eq_columns,
+            has_trailing_range,
+        };
+    }
+
+    // --- Single leftmost column checks (original logic) ---
     // Check for equality on the leftmost column.
     for term in terms {
         if let Some(ref wc) = term.column {
@@ -954,6 +1087,39 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
         }
     }
 
+    IndexUsability::NotUsable
+}
+
+/// Analyze usability for an expression index by matching WHERE term expressions
+/// against the index's expression columns using structural equality (AST `PartialEq`).
+fn analyze_expression_index_usability(
+    index: &IndexInfo,
+    terms: &[WhereTerm<'_>],
+) -> IndexUsability {
+    // For expression indexes, we check if any WHERE equality term's left-side
+    // expression structurally matches the index's first expression column.
+    if let Some(first_expr) = index.expression_columns.first() {
+        for term in terms {
+            if matches!(term.kind, WhereTermKind::Equality) {
+                // Check if the term's expression is `expr_col = value` where
+                // expr_col matches the index expression.
+                if let Expr::BinaryOp { left, .. } = term.expr {
+                    if **left == *first_expr {
+                        return IndexUsability::Equality;
+                    }
+                }
+            }
+            if matches!(term.kind, WhereTermKind::Range | WhereTermKind::Between) {
+                if let Expr::BinaryOp { left, .. } | Expr::Between { expr: left, .. } = term.expr {
+                    if **left == *first_expr {
+                        return IndexUsability::Range {
+                            selectivity: DEFAULT_RANGE_SELECTIVITY,
+                        };
+                    }
+                }
+            }
+        }
+    }
     IndexUsability::NotUsable
 }
 
