@@ -91,3 +91,14 @@ screenshots_for_diagnostics/
 rustc-ice-*.txt
 reports/
 .agent-mail.yaml
+
+# Profiling and benchmark data
+perf.data
+perf.data.*
+flamegraph*.svg
+
+# FastEmbed model caches (downloaded at runtime)
+.fastembed_cache/
+
+# Beads history snapshots
+.beads/.br_history/
