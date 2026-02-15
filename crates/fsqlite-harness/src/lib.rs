@@ -69,6 +69,7 @@ pub mod tla;
 pub mod toolchain_determinism;
 pub mod unit_fixtures;
 pub mod unit_matrix;
+pub mod validation_manifest;
 pub mod verification_contract_enforcement;
 pub mod verification_gates;
 pub mod wal_journal_parity;
