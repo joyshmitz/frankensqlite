@@ -851,6 +851,194 @@ pub fn render_shell_script_log_profile_json() -> Result<String, serde_json::Erro
     serde_json::to_string_pretty(&build_shell_script_log_profile())
 }
 
+const PROFILED_SHELL_MARKERS: &[&str] = &[
+    "run_id",
+    "scenario_id",
+    "phase",
+    "event_type",
+    "seed",
+    "LOG_STANDARD_REF",
+];
+
+fn push_shell_issue(
+    issues: &mut Vec<ShellScriptConformanceIssue>,
+    script_path: &str,
+    issue_code: &str,
+    severity: ShellScriptConformanceSeverity,
+    detail: impl Into<String>,
+) {
+    issues.push(ShellScriptConformanceIssue {
+        script_path: script_path.to_owned(),
+        issue_code: issue_code.to_owned(),
+        severity,
+        detail: detail.into(),
+    });
+}
+
+/// Assess static shell-script conformance for all `e2e/*.sh` entrypoints.
+///
+/// The assessment is intentionally staged:
+/// - scripts missing inventory entries or missing required profile markers are `error`s,
+/// - legacy scripts without an assigned `log_schema_version` are `warning`s.
+///
+/// # Errors
+///
+/// Returns an error when the workspace root or `e2e/` directory cannot be read.
+pub fn assess_shell_script_profile_conformance(
+    workspace_root: &Path,
+    traceability: &TraceabilityMatrix,
+) -> Result<ShellScriptConformanceReport, String> {
+    let e2e_dir = workspace_root.join("e2e");
+    let mut discovered_shell_paths = Vec::new();
+    let directory_entries = fs::read_dir(&e2e_dir)
+        .map_err(|error| format!("failed to read {}: {error}", e2e_dir.display()))?;
+
+    for entry in directory_entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to iterate e2e directory {}: {error}",
+                e2e_dir.display()
+            )
+        })?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !file_name.ends_with(".sh") {
+            continue;
+        }
+        discovered_shell_paths.push(format!("e2e/{file_name}"));
+    }
+    discovered_shell_paths.sort();
+
+    let inventory_shell = traceability
+        .scripts
+        .iter()
+        .filter(|script| script.kind == e2e_traceability::ScriptKind::ShellE2e)
+        .map(|script| (script.path.clone(), script))
+        .collect::<BTreeMap<_, _>>();
+    let discovered_set = discovered_shell_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut issues = Vec::new();
+    let mut profiled_shell_scripts = 0_usize;
+    let mut compliant_profiled_scripts = 0_usize;
+
+    for script_path in &discovered_shell_paths {
+        let Some(inventory_entry) = inventory_shell.get(script_path) else {
+            push_shell_issue(
+                &mut issues,
+                script_path,
+                "missing_inventory_entry",
+                ShellScriptConformanceSeverity::Error,
+                "shell script exists on disk but is missing from e2e_traceability inventory",
+            );
+            continue;
+        };
+
+        let profiled = inventory_entry.log_schema_version.as_deref() == Some(LOG_SCHEMA_VERSION);
+        if !profiled {
+            push_shell_issue(
+                &mut issues,
+                script_path,
+                "script_not_profiled",
+                ShellScriptConformanceSeverity::Warning,
+                "script lacks log_schema_version=1.0.0 and is treated as migration backlog",
+            );
+            continue;
+        }
+
+        profiled_shell_scripts = profiled_shell_scripts.saturating_add(1);
+        let absolute_path = workspace_root.join(script_path);
+        let script_body = fs::read_to_string(&absolute_path).map_err(|error| {
+            format!(
+                "failed to read profiled script {}: {error}",
+                absolute_path.display()
+            )
+        })?;
+
+        let mut missing_markers = Vec::new();
+        for marker in PROFILED_SHELL_MARKERS {
+            if !script_body.contains(marker) {
+                missing_markers.push((*marker).to_owned());
+            }
+        }
+
+        if missing_markers.is_empty() {
+            compliant_profiled_scripts = compliant_profiled_scripts.saturating_add(1);
+        } else {
+            push_shell_issue(
+                &mut issues,
+                script_path,
+                "profile_marker_missing",
+                ShellScriptConformanceSeverity::Error,
+                format!(
+                    "profiled script missing required markers: {}",
+                    missing_markers.join(", ")
+                ),
+            );
+        }
+    }
+
+    for inventory_path in inventory_shell.keys() {
+        if !discovered_set.contains(inventory_path) {
+            push_shell_issue(
+                &mut issues,
+                inventory_path,
+                "stale_inventory_entry",
+                ShellScriptConformanceSeverity::Error,
+                "inventory references shell script path that does not exist on disk",
+            );
+        }
+    }
+
+    issues.sort_by(|left, right| {
+        left.script_path
+            .cmp(&right.script_path)
+            .then_with(|| left.issue_code.cmp(&right.issue_code))
+            .then_with(|| left.severity.cmp(&right.severity))
+    });
+
+    let warning_count = issues
+        .iter()
+        .filter(|issue| issue.severity == ShellScriptConformanceSeverity::Warning)
+        .count();
+    let error_count = issues
+        .iter()
+        .filter(|issue| issue.severity == ShellScriptConformanceSeverity::Error)
+        .count();
+
+    Ok(ShellScriptConformanceReport {
+        schema_version: LOG_SCHEMA_VERSION.to_owned(),
+        bead_id: SHELL_SCRIPT_CONFORMANCE_BEAD_ID.to_owned(),
+        profile_version: SHELL_SCRIPT_LOG_PROFILE_VERSION.to_owned(),
+        total_shell_scripts: discovered_shell_paths.len(),
+        profiled_shell_scripts,
+        compliant_profiled_scripts,
+        warning_count,
+        error_count,
+        issues,
+        overall_pass: error_count == 0,
+    })
+}
+
+/// Build a shell-script conformance report for the current workspace.
+///
+/// # Errors
+///
+/// Returns an error when repository roots cannot be resolved or files are unreadable.
+pub fn build_workspace_shell_script_conformance_report(
+) -> Result<ShellScriptConformanceReport, String> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve workspace root: {error}"))?;
+    let traceability = e2e_traceability::build_canonical_inventory();
+    assess_shell_script_profile_conformance(&workspace_root, &traceability)
+}
+
 /// Classify a version transition according to schema policy.
 pub fn classify_version_transition(from: &str, to: &str) -> Result<VersionTransition, String> {
     let from = SchemaVersion::parse(from)?;
@@ -1714,11 +1902,43 @@ pub fn validate_log_event(event: &LogEventSchema) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::Path, path::PathBuf};
 
     fn shell_script_profile_doc_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../docs/e2e_shell_script_log_profile.json")
+    }
+
+    fn shell_entry(path: &str, profiled: bool) -> crate::e2e_traceability::ScriptEntry {
+        let builder = crate::e2e_traceability::ScriptEntryBuilder::new(
+            path,
+            crate::e2e_traceability::ScriptKind::ShellE2e,
+            "test shell entry",
+        )
+        .command(&format!("bash {path}"))
+        .scenarios(&["INFRA-6"])
+        .storage(&[crate::e2e_traceability::StorageMode::InMemory])
+        .concurrency(&[crate::e2e_traceability::ConcurrencyMode::Sequential]);
+        if profiled {
+            builder.log_schema(LOG_SCHEMA_VERSION).build()
+        } else {
+            builder.build()
+        }
+    }
+
+    fn test_matrix(entries: Vec<crate::e2e_traceability::ScriptEntry>) -> TraceabilityMatrix {
+        TraceabilityMatrix {
+            schema_version: "1.0.0".to_owned(),
+            bead_id: "test".to_owned(),
+            scripts: entries,
+            gaps: Vec::new(),
+        }
+    }
+
+    fn write_shell(path: &Path, body: &str) {
+        let parent = path.parent().expect("shell path should have parent");
+        fs::create_dir_all(parent).expect("create parent dirs");
+        fs::write(path, body).expect("write shell script");
     }
 
     #[test]
@@ -1946,6 +2166,82 @@ mod tests {
             doc_value, generated_value,
             "profile doc must stay in sync with canonical generator"
         );
+    }
+
+    #[test]
+    fn shell_conformance_flags_missing_inventory_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_shell(
+            &temp.path().join("e2e/untracked.sh"),
+            "#!/usr/bin/env bash\nrun_id scenario_id phase event_type seed LOG_STANDARD_REF\n",
+        );
+
+        let report = assess_shell_script_profile_conformance(temp.path(), &test_matrix(Vec::new()))
+            .expect("conformance report");
+        assert!(!report.overall_pass);
+        assert!(report.error_count >= 1);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.issue_code == "missing_inventory_entry")
+        );
+    }
+
+    #[test]
+    fn shell_conformance_flags_profile_marker_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_shell(
+            &temp.path().join("e2e/profiled.sh"),
+            "#!/usr/bin/env bash\nrun_id scenario_id phase seed LOG_STANDARD_REF\n",
+        );
+        let matrix = test_matrix(vec![shell_entry("e2e/profiled.sh", true)]);
+
+        let report =
+            assess_shell_script_profile_conformance(temp.path(), &matrix).expect("report build");
+        assert!(!report.overall_pass);
+        assert!(report.error_count >= 1);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.issue_code == "profile_marker_missing")
+        );
+    }
+
+    #[test]
+    fn shell_conformance_treats_unprofiled_scripts_as_warnings() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_shell(
+            &temp.path().join("e2e/legacy.sh"),
+            "#!/usr/bin/env bash\necho legacy\n",
+        );
+        let matrix = test_matrix(vec![shell_entry("e2e/legacy.sh", false)]);
+
+        let report =
+            assess_shell_script_profile_conformance(temp.path(), &matrix).expect("report build");
+        assert!(report.overall_pass);
+        assert_eq!(report.error_count, 0);
+        assert!(report.warning_count >= 1);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.issue_code == "script_not_profiled")
+        );
+    }
+
+    #[test]
+    fn workspace_shell_conformance_has_no_errors() {
+        let report =
+            build_workspace_shell_script_conformance_report().expect("workspace report builds");
+        assert_eq!(
+            report.error_count, 0,
+            "workspace shell scripts should have zero hard conformance errors: {:?}",
+            report.issues
+        );
+        assert!(report.total_shell_scripts >= report.profiled_shell_scripts);
+        assert!(report.profiled_shell_scripts >= 1);
     }
 
     #[test]
