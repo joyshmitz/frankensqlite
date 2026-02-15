@@ -287,3 +287,89 @@ Scenarios marked "TBD - gap identified" require test implementation:
 - [Critical Invariants Catalog](critical-invariants.md)
 - [Coverage Gap Report](coverage-gap-report.md)
 - [Test Realism Inventory](test-realism/README.md)
+- [Unified E2E Log Schema Contract](e2e_log_schema_contract.md)
+- [Shell Script Log Profile](e2e_shell_script_log_profile.json)
+
+---
+
+## Operator Failure Triage Runbook (bd-mblr.5.4.2)
+
+This runbook is the canonical first-response flow for E2E failures.
+
+- Log schema version: `1.0.0` (see `docs/e2e_log_schema_contract.md`)
+- Artifact roots:
+  - `test-results/<bead>/...` for run-level JSONL reports
+  - `test-results/<bead>/logs/<run_id>/...` for phase logs, SQL traces, diagnostics, mismatch extracts
+
+### Fast Triage Workflow
+
+1. Start from the run-level JSONL referenced by CI (`test-results/.../<run_id>.jsonl`).
+2. Identify terminal error and divergence markers:
+   - `event_type == "fail"` or `status == "fail"`
+   - `error_code != null`
+   - `first_divergence == true` or `mismatch_digest != "none"`
+3. Pivot to artifacts listed in `artifact_paths` and `context.artifact_paths`.
+4. Replay deterministically using the mapped command in the table below.
+5. Confirm whether failure reproduces, then classify root cause by signature.
+
+### Annotated Failure Trace A: Terminal Failure (`E_TERMINAL_FAILURE`)
+
+Source: `test-results/bd_2ddl/bd-2ddl-20260213T092408Z-109509.jsonl`
+
+```json
+{"run_id":"bd-2ddl-20260213T092408Z-109509","phase":"report","event_type":"fail","scenario_id":"INFRA-6","outcome":"fail","error_code":"E_TERMINAL_FAILURE","context":{"case":"terminal_failure","details":"... missing_public_api_test_crates=fsqlite-types ... fsqlite-harness ..."}}
+```
+
+What this tells you:
+
+- Failure is terminal, not a warning (`event_type=fail`, `outcome=fail`).
+- Classification is explicit (`context.case=terminal_failure`).
+- Root-cause hints are already embedded in `context.details` (for this run: missing public API test coverage across listed crates).
+- Replay target is the same bead script and scenario (`bd-2ddl`, `INFRA-6`).
+
+### Annotated Failure Trace B: Differential First Divergence
+
+Source: `test-results/bd_1dp9_5_4/bd-1dp9.5.4-20260213T085338Z-3400784.jsonl`
+
+```json
+{"run_id":"bd-1dp9.5.4-20260213T085338Z-3400784","scenario_id":"EXT-1","phase":"json_fts_differential_wave","status":"pass","mismatch_digest":"6871f37f9294...","first_divergence":true}
+```
+
+What this tells you:
+
+- The phase did not hard-fail (`status=pass`) but still produced divergence evidence.
+- `first_divergence=true` means the mismatch stream must be treated as a correctness incident, even if exit code is `0`.
+- `mismatch_digest` is the stable handle for correlation across `.mismatch.log`, `.diagnostics.log`, and SQL traces.
+- Start with the run-local mismatch artifact:
+  - `test-results/bd_1dp9_5_4/logs/bd-1dp9.5.4-20260213T085338Z-3400784/json_fts_differential_wave.mismatch.log`
+
+### Signature to Action Map
+
+| Signature | Detection command | First response | Deterministic replay |
+| --- | --- | --- | --- |
+| Terminal failure (`E_TERMINAL_FAILURE`) | `jq -rc 'select(.event_type=="fail" and .error_code=="E_TERMINAL_FAILURE")' test-results/bd_2ddl/*.jsonl` | Parse `context.details` for explicit failing dimensions; confirm report SHA and artifact path continuity. | `rch exec -- bash e2e/bd_2ddl_compliance.sh --json` |
+| Differential divergence (`first_divergence=true`) | `jq -rc 'select((.first_divergence // false) == true)' test-results/bd_1dp9_5_4/*.jsonl` | Open `.mismatch.log` and `.diagnostics.log`; compare `mismatch_digest` and scenario/phase to isolate first drift point. | `rch exec -- bash e2e/extension_integrated_wave_report.sh --json` |
+| Schema/contract drift | `jq -r '.validation_errors, .result' test-results/bd-mblr.5.3-schema-integration-verify.json` | Validate schema version and required fields against `docs/e2e_log_schema_contract.md`; treat nonzero `validation_errors` as gate-breaking. | `rch exec -- bash scripts/verify_e2e_log_schema.sh --json --deterministic --seed 424242` |
+
+### CI-to-Raw-Event Drilldown Commands
+
+```bash
+# 1) Show terminal failures and divergence markers in one pass.
+jq -rc 'select(.event_type=="fail" or (.first_divergence // false) == true)' \
+  test-results/bd_2ddl/*.jsonl test-results/bd_1dp9_5_4/*.jsonl
+
+# 2) For a chosen run, list event timeline with phase/status/error.
+jq -r '[.timestamp, .scenario_id, .phase, (.event_type // .marker), (.status // .outcome), (.error_code // "none")] | @tsv' \
+  test-results/bd_2ddl/bd-2ddl-20260213T092408Z-109509.jsonl
+
+# 3) Follow artifact pointers for deep inspection.
+jq -r '.artifact_paths[]?' test-results/bd_2ddl/bd-2ddl-20260213T092408Z-109509.jsonl | sort -u
+```
+
+### Synchronization Notes
+
+- This runbook is pinned to schema version `1.0.0` and current artifact layout under `test-results/`.
+- If schema or artifact layout changes, update:
+  - `docs/e2e_log_schema_contract.md`
+  - `docs/e2e_shell_script_log_profile.json`
+  - This runbook section and detection/replay commands in lockstep.
