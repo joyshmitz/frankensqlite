@@ -100,5 +100,8 @@ flamegraph*.svg
 # FastEmbed model caches (downloaded at runtime)
 .fastembed_cache/
 
+# Codex build artifacts
+target-codex*/
+
 # Beads history snapshots
 .beads/.br_history/
