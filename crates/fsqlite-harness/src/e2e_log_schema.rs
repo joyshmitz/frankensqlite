@@ -505,6 +505,7 @@ pub struct ShellScriptLogProfile {
 
 /// Build the canonical shell-script logging profile for E2E scripts.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_shell_script_log_profile() -> ShellScriptLogProfile {
     let required_fields = REQUIRED_EVENT_FIELDS
         .iter()
@@ -607,7 +608,7 @@ pub fn build_shell_script_log_profile() -> ShellScriptLogProfile {
                 phase: LogPhase::Validate,
                 event_type: LogEventType::Pass,
                 scenario_id: Some("MVCC-3".to_owned()),
-                seed: Some(424242),
+                seed: Some(424_242),
                 backend: Some("fsqlite".to_owned()),
                 artifact_hash: Some(
                     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
@@ -624,7 +625,7 @@ pub fn build_shell_script_log_profile() -> ShellScriptLogProfile {
                 phase: LogPhase::Validate,
                 event_type: LogEventType::Fail,
                 scenario_id: Some("COR-2".to_owned()),
-                seed: Some(424242),
+                seed: Some(424_242),
                 backend: Some("both".to_owned()),
                 artifact_hash: Some(
                     "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned(),
@@ -654,6 +655,7 @@ pub fn build_shell_script_log_profile() -> ShellScriptLogProfile {
 
 /// Validate shell-script profile integrity and alignment with core schema invariants.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn validate_shell_script_log_profile(profile: &ShellScriptLogProfile) -> Vec<String> {
     let mut errors = Vec::new();
 
