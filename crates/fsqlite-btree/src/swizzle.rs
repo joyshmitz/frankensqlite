@@ -45,9 +45,7 @@ impl PageTemperature {
     pub const fn can_transition_to(self, next: Self) -> bool {
         if matches!(
             (self, next),
-            (Self::Hot, Self::Hot)
-                | (Self::Cooling, Self::Cooling)
-                | (Self::Cold, Self::Cold)
+            (Self::Hot, Self::Hot) | (Self::Cooling, Self::Cooling) | (Self::Cold, Self::Cold)
         ) {
             return true;
         }
