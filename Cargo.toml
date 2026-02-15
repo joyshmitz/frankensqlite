@@ -80,7 +80,7 @@ fsqlite-e2e = { path = "crates/fsqlite-e2e" }
 fsqlite-observability = { path = "crates/fsqlite-observability" }
 
 # External dependencies
-ftui = { path = "../frankentui/crates/ftui" }
+ftui = { version = "0.2.0", path = "../frankentui/crates/ftui" }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
