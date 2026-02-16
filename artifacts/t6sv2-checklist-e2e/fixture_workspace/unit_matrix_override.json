@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "bd-test",
+  "root_seed": 42,
+  "tests": [
+    {
+      "test_id": "UT-T6SV2-004",
+      "category": "SqlGrammar",
+      "crate_name": "fsqlite-harness",
+      "module_path": "synthetic::tests",
+      "description": "synthetic unit evidence",
+      "invariants": ["synthetic_invariant"],
+      "seed": 99,
+      "property_based": false,
+      "failure_diagnostics": {
+        "dump_targets": ["rows"],
+        "log_spans": ["checklist.synthetic"],
+        "related_beads": ["bd-t6sv2.4"]
+      }
+    }
+  ],
+  "coverage": [
+    {
+      "category": "SqlGrammar",
+      "test_count": 1,
+      "invariant_count": 1,
+      "property_test_count": 0,
+      "contributing_crates": ["fsqlite-harness"],
+      "missing_coverage": [],
+      "fill_pct": 1.0
+    }
+  ]
+}

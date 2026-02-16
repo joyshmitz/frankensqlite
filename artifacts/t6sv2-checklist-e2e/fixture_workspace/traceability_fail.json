@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "bd-test",
+  "scripts": [
+    {
+      "path": "scripts/verify_t6sv2_4.sh",
+      "kind": "ShellUtility",
+      "bead_id": "bd-t6sv2.4",
+      "description": "synthetic e2e evidence",
+      "invocation": {
+        "command": "bash scripts/verify_t6sv2_4.sh",
+        "env_vars": [],
+        "json_output": true,
+        "timeout_secs": 60
+      },
+      "scenario_ids": ["OBS-400"],
+      "storage_modes": ["InMemory"],
+      "concurrency_modes": ["Sequential"],
+      "artifact_paths": ["artifacts/t6sv2-4.json"],
+      "log_schema_version": "1.0.0"
+    },
+    {
+      "path": "scripts/missing_t6sv2_6.sh",
+      "kind": "ShellUtility",
+      "bead_id": "bd-t6sv2.6",
+      "description": "stale link fixture",
+      "invocation": {
+        "command": "bash scripts/missing_t6sv2_6.sh",
+        "env_vars": [],
+        "json_output": true,
+        "timeout_secs": 60
+      },
+      "scenario_ids": ["OBS-600"],
+      "storage_modes": ["InMemory"],
+      "concurrency_modes": ["Sequential"],
+      "artifact_paths": ["artifacts/t6sv2-6.json"],
+      "log_schema_version": "bad"
+    }
+  ],
+  "gaps": []
+}

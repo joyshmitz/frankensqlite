@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "bead_id": "bd-t6sv2.16",
+  "generated_unix_ms": 1700000000000,
+  "workspace_root": "/data/projects/frankensqlite/artifacts/t6sv2-checklist-e2e/fixture_workspace",
+  "rows": [
+    {
+      "bead_id": "bd-t6sv2.4",
+      "title": "Conformance dashboard",
+      "status": "open",
+      "priority": 2,
+      "owner": "ops-a",
+      "unit_test_ids": [
+        "UT-T6SV2-004"
+      ],
+      "e2e_script_paths": [
+        "scripts/verify_t6sv2_4.sh"
+      ],
+      "log_schema_refs": [
+        "scripts/verify_t6sv2_4.sh@1.0.0"
+      ],
+      "missing": [],
+      "stale_links": [],
+      "triage_command": "br show bd-t6sv2.4 --json",
+      "remediation": []
+    },
+    {
+      "bead_id": "bd-t6sv2.6",
+      "title": "Plan hints",
+      "status": "open",
+      "priority": 2,
+      "owner": "ops-b",
+      "unit_test_ids": [],
+      "e2e_script_paths": [
+        "scripts/missing_t6sv2_6.sh"
+      ],
+      "log_schema_refs": [
+        "scripts/missing_t6sv2_6.sh@bad"
+      ],
+      "missing": [
+        "unit_evidence"
+      ],
+      "stale_links": [
+        "invalid log schema version: bad",
+        "missing e2e script path: scripts/missing_t6sv2_6.sh"
+      ],
+      "triage_command": "br show bd-t6sv2.6 --json",
+      "remediation": [
+        "Add deterministic unit/property tests and link bead ID in failure diagnostics.",
+        "Fix stale evidence links or remove invalid references so checklist rows are actionable."
+      ]
+    }
+  ],
+  "violations": [
+    {
+      "bead_id": "bd-t6sv2.6",
+      "owner": "ops-b",
+      "kind": "missing_unit_evidence",
+      "detail": "no linked unit/property evidence",
+      "triage_command": "br show bd-t6sv2.6 --json"
+    },
+    {
+      "bead_id": "bd-t6sv2.6",
+      "owner": "ops-b",
+      "kind": "invalid_e2e_reference",
+      "detail": "missing e2e script path: scripts/missing_t6sv2_6.sh",
+      "triage_command": "br show bd-t6sv2.6 --json"
+    },
+    {
+      "bead_id": "bd-t6sv2.6",
+      "owner": "ops-b",
+      "kind": "invalid_log_reference",
+      "detail": "invalid log schema version: bad",
+      "triage_command": "br show bd-t6sv2.6 --json"
+    }
+  ],
+  "summary": {
+    "child_count": 2,
+    "open_count": 2,
+    "in_progress_count": 0,
+    "closed_count": 0,
+    "other_status_count": 0,
+    "missing_unit_count": 1,
+    "missing_e2e_count": 0,
+    "missing_log_count": 0,
+    "stale_link_count": 2,
+    "violation_count": 3,
+    "overall_pass": false
+  }
+}

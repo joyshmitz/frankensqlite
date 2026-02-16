@@ -9,12 +9,22 @@ set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_ROOT="$WORKSPACE_ROOT/artifacts/t6sv2-checklist-e2e"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+if [[ "$SCRIPT_PATH" != /* ]]; then
+  SCRIPT_PATH="$WORKSPACE_ROOT/$SCRIPT_PATH"
+fi
+
 JSON_OUTPUT=false
+NO_RCH=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --json)
       JSON_OUTPUT=true
+      shift
+      ;;
+    --no-rch)
+      NO_RCH=true
       shift
       ;;
     *)
@@ -26,11 +36,15 @@ done
 
 mkdir -p "$RUN_ROOT"
 
-if command -v rch >/dev/null 2>&1; then
-  RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin t6sv2_checklist_runner --)
-else
-  RUNNER=(cargo run -p fsqlite-harness --bin t6sv2_checklist_runner --)
+if ! $NO_RCH && command -v rch >/dev/null 2>&1; then
+  RCH_CMD=(rch exec -- bash "$SCRIPT_PATH" --no-rch)
+  if $JSON_OUTPUT; then
+    RCH_CMD+=(--json)
+  fi
+  exec "${RCH_CMD[@]}"
 fi
+
+RUNNER=(cargo run -p fsqlite-harness --bin t6sv2_checklist_runner --)
 
 FIXTURE_ROOT="$RUN_ROOT/fixture_workspace"
 FIXTURE_BEADS_DIR="$FIXTURE_ROOT/.beads"

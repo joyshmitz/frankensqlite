@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "bead_id": "bd-t6sv2.16",
+  "generated_unix_ms": 1700000000000,
+  "workspace_root": "/data/projects/frankensqlite/artifacts/t6sv2-checklist-e2e/fixture_workspace",
+  "rows": [
+    {
+      "bead_id": "bd-t6sv2.4",
+      "title": "Conformance dashboard",
+      "status": "open",
+      "priority": 2,
+      "owner": "ops-a",
+      "unit_test_ids": [
+        "UT-T6SV2-004"
+      ],
+      "e2e_script_paths": [
+        "scripts/verify_t6sv2_4.sh"
+      ],
+      "log_schema_refs": [
+        "scripts/verify_t6sv2_4.sh@1.0.0"
+      ],
+      "missing": [],
+      "stale_links": [],
+      "triage_command": "br show bd-t6sv2.4 --json",
+      "remediation": []
+    }
+  ],
+  "violations": [],
+  "summary": {
+    "child_count": 1,
+    "open_count": 1,
+    "in_progress_count": 0,
+    "closed_count": 0,
+    "other_status_count": 0,
+    "missing_unit_count": 0,
+    "missing_e2e_count": 0,
+    "missing_log_count": 0,
+    "stale_link_count": 0,
+    "violation_count": 0,
+    "overall_pass": true
+  }
+}
