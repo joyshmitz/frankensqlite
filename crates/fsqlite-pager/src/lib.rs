@@ -20,7 +20,10 @@ pub use journal::{
 pub use page_buf::{PageBuf, PageBufPool};
 pub use page_cache::PageCache;
 pub use pager::{SimplePager, SimplePagerCheckpointWriter, SimpleTransaction};
-pub use s3_fifo::{QueueKind, QueueLocation, S3Fifo, S3FifoConfig, S3FifoEvent};
+pub use s3_fifo::{
+    QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,
+    S3FifoEvent, S3FifoRolloutGate,
+};
 pub use traits::{
     CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MockCheckpointPageWriter,
     MockMvccPager, MockTransaction, MvccPager, TransactionHandle, TransactionMode, WalBackend,
