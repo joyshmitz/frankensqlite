@@ -672,6 +672,74 @@ impl TriggerDef {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TriggerFrame {
+    table_name: String,
+    column_names: Vec<String>,
+    old_row: Option<Vec<SqliteValue>>,
+    new_row: Option<Vec<SqliteValue>>,
+}
+
+impl TriggerFrame {
+    fn column_index(&self, column_name: &str) -> Option<usize> {
+        self.column_names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(column_name))
+    }
+
+    fn references_pseudo_column(&self, table_prefix: Option<&str>, column_name: &str) -> bool {
+        if self.column_index(column_name).is_none() {
+            return false;
+        }
+        match table_prefix {
+            Some(prefix) => {
+                prefix.eq_ignore_ascii_case("old")
+                    || prefix.eq_ignore_ascii_case("new")
+                    || prefix.eq_ignore_ascii_case(&self.table_name)
+            }
+            None => true,
+        }
+    }
+
+    fn lookup_value(&self, table_prefix: Option<&str>, column_name: &str) -> Option<SqliteValue> {
+        let column_index = self.column_index(column_name)?;
+        match table_prefix {
+            Some(prefix) if prefix.eq_ignore_ascii_case("old") => {
+                Self::lookup_from_row(&self.old_row, column_index)
+            }
+            Some(prefix) if prefix.eq_ignore_ascii_case("new") => {
+                Self::lookup_from_row(&self.new_row, column_index)
+            }
+            Some(prefix) if prefix.eq_ignore_ascii_case(&self.table_name) => self
+                .new_row
+                .as_ref()
+                .and_then(|row| row.get(column_index).cloned())
+                .or_else(|| Self::lookup_from_row(&self.old_row, column_index)),
+            Some(_) => None,
+            None => self
+                .new_row
+                .as_ref()
+                .and_then(|row| row.get(column_index).cloned())
+                .or_else(|| Self::lookup_from_row(&self.old_row, column_index)),
+        }
+    }
+
+    fn lookup_from_row(row: &Option<Vec<SqliteValue>>, column_index: usize) -> Option<SqliteValue> {
+        row.as_ref()
+            .and_then(|values| values.get(column_index).cloned())
+    }
+}
+
+struct TriggerFrameGuard<'a> {
+    stack: &'a RefCell<Vec<TriggerFrame>>,
+}
+
+impl Drop for TriggerFrameGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.stack.borrow_mut().pop();
+    }
+}
+
 /// Check if a trigger event matches a DML event.
 ///
 /// For INSERT/DELETE, this is an exact match.
@@ -708,13 +776,17 @@ fn trigger_event_matches(
 /// If evaluation fails (for example due to unresolved OLD/NEW references),
 /// return `true` to preserve current trigger behavior until pseudo-table
 /// bindings are fully implemented.
-fn trigger_when_matches(when_clause: Option<&Expr>) -> bool {
+fn trigger_when_matches(when_clause: Option<&Expr>, frame: Option<&TriggerFrame>) -> bool {
     let Some(expr) = when_clause else {
         return true;
     };
+    let mut bound_expr = expr.clone();
+    if let Some(active_frame) = frame {
+        bind_trigger_columns_in_expr(&mut bound_expr, active_frame);
+    }
     let row: [SqliteValue; 0] = [];
     let col_map: [(String, String); 0] = [];
-    match eval_join_expr(expr, &row, &col_map) {
+    match eval_join_expr(&bound_expr, &row, &col_map) {
         Ok(value) => is_sqlite_truthy(&value),
         Err(_) => true,
     }
@@ -780,6 +852,8 @@ pub struct Connection {
     views: RefCell<Vec<ViewDef>>,
     /// Trigger definitions stored in-memory.
     triggers: RefCell<Vec<TriggerDef>>,
+    /// Stack of active trigger OLD/NEW bindings for nested trigger execution.
+    trigger_frame_stack: RefCell<Vec<TriggerFrame>>,
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
     func_registry: Arc<FunctionRegistry>,
     /// Whether an explicit transaction is active (BEGIN without matching COMMIT/ROLLBACK).
@@ -897,6 +971,7 @@ impl Connection {
             schema: RefCell::new(Vec::new()),
             views: RefCell::new(Vec::new()),
             triggers: RefCell::new(Vec::new()),
+            trigger_frame_stack: RefCell::new(Vec::new()),
             func_registry: default_function_registry(),
             in_transaction: RefCell::new(false),
             txn_snapshot: RefCell::new(None),
@@ -2681,6 +2756,39 @@ impl Connection {
     // BEFORE/AFTER Trigger Firing (Phase 5G.2/5G.3 - bd-iqam, bd-khol)
     // ═══════════════════════════════════════════════════════════════════════════
 
+    fn make_trigger_frame(
+        &self,
+        table_name: &str,
+        old_values: Option<&[SqliteValue]>,
+        new_values: Option<&[SqliteValue]>,
+    ) -> Result<TriggerFrame> {
+        let schema = self.schema.borrow();
+        let table_schema = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.to_owned(),
+            })?;
+        let column_names = table_schema
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect();
+        Ok(TriggerFrame {
+            table_name: table_schema.name.clone(),
+            column_names,
+            old_row: old_values.map(ToOwned::to_owned),
+            new_row: new_values.map(ToOwned::to_owned),
+        })
+    }
+
+    fn push_trigger_frame(&self, frame: TriggerFrame) -> TriggerFrameGuard<'_> {
+        self.trigger_frame_stack.borrow_mut().push(frame);
+        TriggerFrameGuard {
+            stack: &self.trigger_frame_stack,
+        }
+    }
+
     /// Fire BEFORE triggers for a DML event on a table.
     ///
     /// Returns `true` if any trigger executed RAISE(IGNORE), indicating the DML
@@ -2689,8 +2797,8 @@ impl Connection {
         &self,
         table_name: &str,
         event: &fsqlite_ast::TriggerEvent,
-        _old_values: Option<&[fsqlite_types::value::SqliteValue]>,
-        _new_values: Option<&[fsqlite_types::value::SqliteValue]>,
+        old_values: Option<&[SqliteValue]>,
+        new_values: Option<&[SqliteValue]>,
     ) -> Result<bool> {
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
@@ -2708,18 +2816,20 @@ impl Connection {
             return Ok(false);
         }
 
+        let frame = self.make_trigger_frame(table_name, old_values, new_values)?;
         for trigger in matching {
+            let _frame_guard = self.push_trigger_frame(frame.clone());
             // Evaluate constant WHEN expressions now; unresolved OLD/NEW-based
             // clauses still fall back to firing until pseudo-tables are wired.
-            if !trigger_when_matches(trigger.when_clause.as_ref()) {
+            if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame)) {
                 continue;
             }
 
             // Execute each statement in the trigger body.
             for stmt in &trigger.body {
-                // Execute the trigger statement recursively.
-                // TODO: Set up proper OLD/NEW access via frame stack.
-                self.execute_statement(stmt.clone(), None)?;
+                let mut bound_stmt = stmt.clone();
+                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
+                self.execute_statement(bound_stmt, None)?;
             }
         }
 
@@ -2731,8 +2841,8 @@ impl Connection {
         &self,
         table_name: &str,
         event: &fsqlite_ast::TriggerEvent,
-        _old_values: Option<&[fsqlite_types::value::SqliteValue]>,
-        _new_values: Option<&[fsqlite_types::value::SqliteValue]>,
+        old_values: Option<&[SqliteValue]>,
+        new_values: Option<&[SqliteValue]>,
     ) -> Result<()> {
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
@@ -2750,14 +2860,18 @@ impl Connection {
             return Ok(());
         }
 
+        let frame = self.make_trigger_frame(table_name, old_values, new_values)?;
         for trigger in matching {
-            if !trigger_when_matches(trigger.when_clause.as_ref()) {
+            let _frame_guard = self.push_trigger_frame(frame.clone());
+            if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame)) {
                 continue;
             }
 
             // Execute each statement in the trigger body.
             for stmt in &trigger.body {
-                self.execute_statement(stmt.clone(), None)?;
+                let mut bound_stmt = stmt.clone();
+                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
+                self.execute_statement(bound_stmt, None)?;
             }
         }
 
@@ -8694,6 +8808,349 @@ fn sqlite_value_to_literal(value: &SqliteValue) -> Literal {
     }
 }
 
+fn bind_trigger_columns_in_statement(statement: &mut Statement, frame: &TriggerFrame) {
+    match statement {
+        Statement::Select(select) => {
+            bind_trigger_columns_in_select_statement(select, frame);
+        }
+        Statement::Insert(insert) => {
+            if let Some(with_clause) = &mut insert.with {
+                for cte in &mut with_clause.ctes {
+                    bind_trigger_columns_in_select_statement(&mut cte.query, frame);
+                }
+            }
+            match &mut insert.source {
+                fsqlite_ast::InsertSource::Values(rows) => {
+                    for row in rows {
+                        for expr in row {
+                            bind_trigger_columns_in_expr(expr, frame);
+                        }
+                    }
+                }
+                fsqlite_ast::InsertSource::Select(select) => {
+                    bind_trigger_columns_in_select_statement(select, frame);
+                }
+                fsqlite_ast::InsertSource::DefaultValues => {}
+            }
+            for upsert in &mut insert.upsert {
+                if let Some(target) = &mut upsert.target {
+                    if let Some(where_clause) = &mut target.where_clause {
+                        bind_trigger_columns_in_expr(where_clause, frame);
+                    }
+                }
+                if let fsqlite_ast::UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                } = &mut upsert.action
+                {
+                    for assignment in assignments {
+                        bind_trigger_columns_in_expr(&mut assignment.value, frame);
+                    }
+                    if let Some(predicate) = where_clause {
+                        bind_trigger_columns_in_expr(predicate, frame);
+                    }
+                }
+            }
+            for column in &mut insert.returning {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    bind_trigger_columns_in_expr(expr, frame);
+                }
+            }
+        }
+        Statement::Update(update) => {
+            if let Some(with_clause) = &mut update.with {
+                for cte in &mut with_clause.ctes {
+                    bind_trigger_columns_in_select_statement(&mut cte.query, frame);
+                }
+            }
+            for assignment in &mut update.assignments {
+                bind_trigger_columns_in_expr(&mut assignment.value, frame);
+            }
+            if let Some(from_clause) = &mut update.from {
+                bind_trigger_columns_in_from_clause(from_clause, frame);
+            }
+            if let Some(where_clause) = &mut update.where_clause {
+                bind_trigger_columns_in_expr(where_clause, frame);
+            }
+            for column in &mut update.returning {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    bind_trigger_columns_in_expr(expr, frame);
+                }
+            }
+            for ordering in &mut update.order_by {
+                bind_trigger_columns_in_expr(&mut ordering.expr, frame);
+            }
+            if let Some(limit_clause) = &mut update.limit {
+                bind_trigger_columns_in_expr(&mut limit_clause.limit, frame);
+                if let Some(offset) = &mut limit_clause.offset {
+                    bind_trigger_columns_in_expr(offset, frame);
+                }
+            }
+        }
+        Statement::Delete(delete) => {
+            if let Some(with_clause) = &mut delete.with {
+                for cte in &mut with_clause.ctes {
+                    bind_trigger_columns_in_select_statement(&mut cte.query, frame);
+                }
+            }
+            if let Some(where_clause) = &mut delete.where_clause {
+                bind_trigger_columns_in_expr(where_clause, frame);
+            }
+            for column in &mut delete.returning {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    bind_trigger_columns_in_expr(expr, frame);
+                }
+            }
+            for ordering in &mut delete.order_by {
+                bind_trigger_columns_in_expr(&mut ordering.expr, frame);
+            }
+            if let Some(limit_clause) = &mut delete.limit {
+                bind_trigger_columns_in_expr(&mut limit_clause.limit, frame);
+                if let Some(offset) = &mut limit_clause.offset {
+                    bind_trigger_columns_in_expr(offset, frame);
+                }
+            }
+        }
+        Statement::CreateTrigger(create_trigger) => {
+            if let Some(when_clause) = &mut create_trigger.when {
+                bind_trigger_columns_in_expr(when_clause, frame);
+            }
+            for body_stmt in &mut create_trigger.body {
+                bind_trigger_columns_in_statement(body_stmt, frame);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn bind_trigger_columns_in_select_statement(select: &mut SelectStatement, frame: &TriggerFrame) {
+    if let Some(with_clause) = &mut select.with {
+        for cte in &mut with_clause.ctes {
+            bind_trigger_columns_in_select_statement(&mut cte.query, frame);
+        }
+    }
+
+    bind_trigger_columns_in_select_core(&mut select.body.select, frame);
+    for (_, core) in &mut select.body.compounds {
+        bind_trigger_columns_in_select_core(core, frame);
+    }
+
+    for ordering in &mut select.order_by {
+        bind_trigger_columns_in_expr(&mut ordering.expr, frame);
+    }
+    if let Some(limit_clause) = &mut select.limit {
+        bind_trigger_columns_in_expr(&mut limit_clause.limit, frame);
+        if let Some(offset) = &mut limit_clause.offset {
+            bind_trigger_columns_in_expr(offset, frame);
+        }
+    }
+}
+
+fn bind_trigger_columns_in_select_core(core: &mut SelectCore, frame: &TriggerFrame) {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    bind_trigger_columns_in_expr(expr, frame);
+                }
+            }
+            if let Some(from_clause) = from {
+                bind_trigger_columns_in_from_clause(from_clause, frame);
+            }
+            if let Some(predicate) = where_clause {
+                bind_trigger_columns_in_expr(predicate, frame);
+            }
+            for expr in group_by {
+                bind_trigger_columns_in_expr(expr, frame);
+            }
+            if let Some(predicate) = having {
+                bind_trigger_columns_in_expr(predicate, frame);
+            }
+            for window in windows {
+                bind_trigger_columns_in_window_spec(&mut window.spec, frame);
+            }
+        }
+        SelectCore::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    bind_trigger_columns_in_expr(expr, frame);
+                }
+            }
+        }
+    }
+}
+
+fn bind_trigger_columns_in_from_clause(from: &mut fsqlite_ast::FromClause, frame: &TriggerFrame) {
+    bind_trigger_columns_in_table_or_subquery(&mut from.source, frame);
+    for join in &mut from.joins {
+        bind_trigger_columns_in_table_or_subquery(&mut join.table, frame);
+        if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+            bind_trigger_columns_in_expr(expr, frame);
+        }
+    }
+}
+
+fn bind_trigger_columns_in_table_or_subquery(source: &mut TableOrSubquery, frame: &TriggerFrame) {
+    match source {
+        TableOrSubquery::Table { .. } => {}
+        TableOrSubquery::Subquery { query, .. } => {
+            bind_trigger_columns_in_select_statement(query, frame);
+        }
+        TableOrSubquery::TableFunction { args, .. } => {
+            for arg in args {
+                bind_trigger_columns_in_expr(arg, frame);
+            }
+        }
+        TableOrSubquery::ParenJoin(from_clause) => {
+            bind_trigger_columns_in_from_clause(from_clause, frame);
+        }
+    }
+}
+
+fn bind_trigger_columns_in_window_spec(spec: &mut fsqlite_ast::WindowSpec, frame: &TriggerFrame) {
+    for expr in &mut spec.partition_by {
+        bind_trigger_columns_in_expr(expr, frame);
+    }
+    for ordering in &mut spec.order_by {
+        bind_trigger_columns_in_expr(&mut ordering.expr, frame);
+    }
+    if let Some(window_frame) = &mut spec.frame {
+        bind_trigger_columns_in_frame_bound(&mut window_frame.start, frame);
+        if let Some(end) = &mut window_frame.end {
+            bind_trigger_columns_in_frame_bound(end, frame);
+        }
+    }
+}
+
+fn bind_trigger_columns_in_frame_bound(bound: &mut fsqlite_ast::FrameBound, frame: &TriggerFrame) {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            bind_trigger_columns_in_expr(expr, frame);
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => {}
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
+    match expr {
+        Expr::Literal(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {}
+        Expr::Column(col_ref, _) => {
+            let table_prefix = col_ref.table.as_deref();
+            let column_name = col_ref.column.clone();
+            if frame.references_pseudo_column(table_prefix, &column_name) {
+                if let Some(value) = frame.lookup_value(table_prefix, &column_name) {
+                    *expr = value_to_literal_expr(value);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            bind_trigger_columns_in_expr(left, frame);
+            bind_trigger_columns_in_expr(right, frame);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => {
+            bind_trigger_columns_in_expr(inner, frame);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            bind_trigger_columns_in_expr(inner, frame);
+            bind_trigger_columns_in_expr(low, frame);
+            bind_trigger_columns_in_expr(high, frame);
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            bind_trigger_columns_in_expr(inner, frame);
+            match set {
+                InSet::List(values) => {
+                    for value in values {
+                        bind_trigger_columns_in_expr(value, frame);
+                    }
+                }
+                InSet::Subquery(query) => {
+                    bind_trigger_columns_in_select_statement(query, frame);
+                }
+                InSet::Table(_) => {}
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            bind_trigger_columns_in_expr(inner, frame);
+            bind_trigger_columns_in_expr(pattern, frame);
+            if let Some(escape_expr) = escape {
+                bind_trigger_columns_in_expr(escape_expr, frame);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(base) = operand {
+                bind_trigger_columns_in_expr(base, frame);
+            }
+            for (when_expr, then_expr) in whens {
+                bind_trigger_columns_in_expr(when_expr, frame);
+                bind_trigger_columns_in_expr(then_expr, frame);
+            }
+            if let Some(else_branch) = else_expr {
+                bind_trigger_columns_in_expr(else_branch, frame);
+            }
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            bind_trigger_columns_in_select_statement(subquery, frame);
+        }
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            if let FunctionArgs::List(arguments) = args {
+                for arg in arguments {
+                    bind_trigger_columns_in_expr(arg, frame);
+                }
+            }
+            if let Some(filter_expr) = filter {
+                bind_trigger_columns_in_expr(filter_expr, frame);
+            }
+            if let Some(window_spec) = over {
+                bind_trigger_columns_in_window_spec(window_spec, frame);
+            }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            bind_trigger_columns_in_expr(inner, frame);
+            bind_trigger_columns_in_expr(path, frame);
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                bind_trigger_columns_in_expr(value, frame);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn bind_placeholders_in_expr(
     expr: &mut Expr,
@@ -10894,6 +11351,57 @@ mod tests {
             row_values(&rows[0])[0],
             SqliteValue::Text("fired".to_owned())
         );
+    }
+
+    #[test]
+    fn test_trigger_when_clause_uses_new_frame_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_when_new BEFORE INSERT ON t WHEN NEW.id > 0 BEGIN INSERT INTO log VALUES ('fired'); END;",
+        )
+        .unwrap();
+
+        let event = fsqlite_ast::TriggerEvent::Insert;
+        let positive_new = [SqliteValue::Integer(7)];
+        conn.fire_before_triggers("t", &event, None, Some(&positive_new))
+            .unwrap();
+
+        let non_positive_new = [SqliteValue::Integer(0)];
+        conn.fire_before_triggers("t", &event, None, Some(&non_positive_new))
+            .unwrap();
+
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("fired".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_trigger_body_binds_old_new_columns_from_frame() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE log (old_id INTEGER, new_id INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_hist AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (OLD.id, NEW.id); END;",
+        )
+        .unwrap();
+
+        let event = fsqlite_ast::TriggerEvent::Update(vec!["id".to_owned()]);
+        let old_row = [SqliteValue::Integer(3)];
+        let new_row = [SqliteValue::Integer(9)];
+        conn.fire_after_triggers("t", &event, Some(&old_row), Some(&new_row))
+            .unwrap();
+
+        let rows = conn.query("SELECT old_id, new_id FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(3));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(9));
+        assert!(conn.trigger_frame_stack.borrow().is_empty());
     }
 
     #[test]
