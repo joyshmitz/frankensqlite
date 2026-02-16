@@ -705,28 +705,27 @@ impl TriggerFrame {
         let column_index = self.column_index(column_name)?;
         match table_prefix {
             Some(prefix) if prefix.eq_ignore_ascii_case("old") => {
-                Self::lookup_from_row(&self.old_row, column_index)
+                Self::lookup_from_row(self.old_row.as_deref(), column_index)
             }
             Some(prefix) if prefix.eq_ignore_ascii_case("new") => {
-                Self::lookup_from_row(&self.new_row, column_index)
+                Self::lookup_from_row(self.new_row.as_deref(), column_index)
             }
             Some(prefix) if prefix.eq_ignore_ascii_case(&self.table_name) => self
                 .new_row
                 .as_ref()
                 .and_then(|row| row.get(column_index).cloned())
-                .or_else(|| Self::lookup_from_row(&self.old_row, column_index)),
+                .or_else(|| Self::lookup_from_row(self.old_row.as_deref(), column_index)),
             Some(_) => None,
             None => self
                 .new_row
                 .as_ref()
                 .and_then(|row| row.get(column_index).cloned())
-                .or_else(|| Self::lookup_from_row(&self.old_row, column_index)),
+                .or_else(|| Self::lookup_from_row(self.old_row.as_deref(), column_index)),
         }
     }
 
-    fn lookup_from_row(row: &Option<Vec<SqliteValue>>, column_index: usize) -> Option<SqliteValue> {
-        row.as_ref()
-            .and_then(|values| values.get(column_index).cloned())
+    fn lookup_from_row(row: Option<&[SqliteValue]>, column_index: usize) -> Option<SqliteValue> {
+        row.and_then(|values| values.get(column_index).cloned())
     }
 }
 
@@ -8808,6 +8807,7 @@ fn sqlite_value_to_literal(value: &SqliteValue) -> Literal {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn bind_trigger_columns_in_statement(statement: &mut Statement, frame: &TriggerFrame) {
     match statement {
         Statement::Select(select) => {
