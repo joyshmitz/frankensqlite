@@ -15,8 +15,15 @@ on:
       - "crates/fsqlite-core/**"
       - "crates/fsqlite-harness/src/backlog_quality_gate.rs"
       - "crates/fsqlite-harness/src/bin/backlog_quality_gate_runner.rs"
+      - "crates/fsqlite-harness/src/bin/perf_baseline_pack_runner.rs"
+      - "crates/fsqlite-harness/src/perf_loop.rs"
+      - "crates/fsqlite-harness/src/performance_regression_detector.rs"
       - "crates/fsqlite-vdbe/**"
       - "scripts/verify_backlog_quality_gate.sh"
+      - "scripts/verify_ci_artifact_gates.sh"
+      - "scripts/verify_perf_baseline_pack.sh"
+      - "scripts/coverage.sh"
+      - "baselines/criterion/bd-1dp9.6.1-baseline.json"
 
 jobs:
   backlog-quality-gate:
@@ -279,6 +286,63 @@ jobs:
         with:
           name: e2e-matrix-${{ matrix.lane.id }}-artifacts
           path: artifacts/e2e-matrix/${{ matrix.lane.id }}/
+          retention-days: 21
+
+  ci-artifact-gates:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Install cargo-llvm-cov
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-llvm-cov --locked
+
+      - name: Install miri component
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup component add miri --toolchain nightly
+
+      - name: Run CI artifact gate orchestrator
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash ./scripts/verify_ci_artifact_gates.sh
+
+      - name: Publish CI artifact gate summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary_path="artifacts/ci-artifact-gates/summary.md"
+          if [[ -f "${summary_path}" ]]; then
+            cat "${summary_path}" >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "CI artifact gate summary missing at ${summary_path}" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload CI artifact gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-artifact-gates-artifacts
+          path: |
+            artifacts/ci-artifact-gates/
+            artifacts/perf/bd-1dp9.6.1/
+            target/coverage/
           retention-days: 21
 
   verification-gates:
