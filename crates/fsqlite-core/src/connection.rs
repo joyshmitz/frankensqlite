@@ -791,6 +791,35 @@ fn trigger_when_matches(when_clause: Option<&Expr>, frame: Option<&TriggerFrame>
     }
 }
 
+/// For `UPDATE OF col1, col2` triggers, ensure at least one listed column
+/// actually changed between OLD and NEW snapshots.
+fn trigger_update_of_columns_changed(
+    trigger_event: &fsqlite_ast::TriggerEvent,
+    frame: &TriggerFrame,
+) -> bool {
+    use fsqlite_ast::TriggerEvent;
+    let TriggerEvent::Update(trigger_cols) = trigger_event else {
+        return true;
+    };
+    if trigger_cols.is_empty() {
+        return true;
+    }
+    let (Some(old_row), Some(new_row)) = (frame.old_row.as_deref(), frame.new_row.as_deref())
+    else {
+        // Conservatively allow firing when snapshots are incomplete.
+        return true;
+    };
+
+    trigger_cols.iter().any(|column| {
+        let Some(column_index) = frame.column_index(column) else {
+            return false;
+        };
+        let old_value = old_row.get(column_index).unwrap_or(&SqliteValue::Null);
+        let new_value = new_row.get(column_index).unwrap_or(&SqliteValue::Null);
+        cmp_values(old_value, new_value) != std::cmp::Ordering::Equal
+    })
+}
+
 /// Snapshot of the database + schema state at a point in time.
 /// Used for transaction rollback and savepoint restore.
 #[derive(Debug, Clone)]
@@ -3137,6 +3166,9 @@ impl Connection {
         let frame = self.make_trigger_frame(table_name, old_values, new_values)?;
         for trigger in matching {
             let _frame_guard = self.push_trigger_frame(frame.clone());
+            if !trigger_update_of_columns_changed(&trigger.event, &frame) {
+                continue;
+            }
             // Evaluate constant WHEN expressions now; unresolved OLD/NEW-based
             // clauses still fall back to firing until pseudo-tables are wired.
             if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame)) {
@@ -3181,6 +3213,9 @@ impl Connection {
         let frame = self.make_trigger_frame(table_name, old_values, new_values)?;
         for trigger in matching {
             let _frame_guard = self.push_trigger_frame(frame.clone());
+            if !trigger_update_of_columns_changed(&trigger.event, &frame) {
+                continue;
+            }
             if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame)) {
                 continue;
             }
@@ -11727,6 +11762,148 @@ mod tests {
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(3));
         assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(9));
         assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_insert_trigger_row_images_via_execute_statement() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_insert AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.id, NEW.name); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+
+        let rows = conn.query("SELECT id, name FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("alice".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_update_trigger_row_images_via_execute_statement() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (old_name TEXT, new_name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_update AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (OLD.name, NEW.name); END;",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET name = 'bob' WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT old_name, new_name FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("alice".to_owned())
+        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("bob".to_owned()));
+    }
+
+    #[test]
+    fn test_delete_trigger_row_images_via_execute_statement() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_delete AFTER DELETE ON t BEGIN INSERT INTO log VALUES (OLD.id, OLD.name); END;",
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM t WHERE id = 1;").unwrap();
+
+        let rows = conn.query("SELECT id, name FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("alice".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_update_trigger_when_clause_uses_old_new_during_execute_statement() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_when_update AFTER UPDATE ON t WHEN OLD.name <> NEW.name BEGIN INSERT INTO log VALUES ('changed'); END;",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET name = name WHERE id = 1;")
+            .unwrap();
+        conn.execute("UPDATE t SET name = 'bob' WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("changed".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_update_of_trigger_skips_when_listed_column_unchanged() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_update_of_name AFTER UPDATE OF name ON t BEGIN INSERT INTO log VALUES ('fired'); END;",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET name = name WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "UPDATE OF name trigger should not fire when name is unchanged"
+        );
+    }
+
+    #[test]
+    fn test_update_of_trigger_fires_when_listed_column_changes() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_update_of_name AFTER UPDATE OF name ON t BEGIN INSERT INTO log VALUES ('fired'); END;",
+        )
+        .unwrap();
+
+        conn.execute("UPDATE t SET name = 'bob' WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("fired".to_owned())
+        );
     }
 
     #[test]
