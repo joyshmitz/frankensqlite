@@ -32,6 +32,11 @@
 | CMP-1 | SQLite format roundtrip | e2e_runner | format_check.json |
 | CMP-2 | Differential comparison | e2e_dashboard | diff_report.html |
 
+### Quality/Forensics Contracts (fsqlite-harness + scripts)
+| ID | Scenario | Runner | Artifacts |
+|----|----------|--------|-----------|
+| QLT-1 | Bisect replay manifest contract verification | `scripts/verify_bisect_replay_manifest.sh` | `artifacts/bisect-replay-manifest-e2e/<run_id>/verification_summary.json`, `debug_log.jsonl` |
+
 ## Test Runners
 
 | Binary | Path | Description |

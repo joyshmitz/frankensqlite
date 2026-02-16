@@ -42,6 +42,11 @@ Complete E2E scenario catalog with pass criteria and test entrypoints.
 | CMP-1 | SQLite roundtrip | .db file | `cargo run -p fsqlite-e2e --bin e2e_runner -- compat` | Same data in both engines |
 | CMP-2 | Differential | Test workload | `cargo run -p fsqlite-e2e --bin e2e_dashboard` | No divergence in results |
 
+### 6. Quality/Forensics Contracts (QLT-*)
+| ID | Scenario | Prerequisites | Command | Pass Criteria |
+|----|----------|---------------|---------|---------------|
+| QLT-1 | Bisect replay manifest contract | `rch` + `fsqlite-harness` test targets | `./scripts/verify_bisect_replay_manifest.sh --json --seed 424242` | `result=pass`, `deterministic_match=true`, artifact bundle contains `run_id`/`trace_id`/`scenario_id` and replay command |
+
 ## Deterministic Seed Policy
 
 All scenarios use deterministic RNG seeding:
