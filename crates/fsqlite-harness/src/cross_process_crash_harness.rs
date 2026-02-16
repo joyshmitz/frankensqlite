@@ -337,7 +337,7 @@ impl SimulationState {
         }
     }
 
-    fn visible_left_right_version(self) -> u64 {
+    fn visible_left_right_version(&self) -> u64 {
         match self.active_side {
             ActiveSide::Left => self.left_right_left,
             ActiveSide::Right => self.left_right_right,
@@ -420,7 +420,7 @@ fn execute_cycle(
     }
     state.slots[slot_idx] = Some(process_id);
 
-    let mut crashed = !matches!(crash_point, CrashPoint::PostCommit);
+    let crashed = !matches!(crash_point, CrashPoint::PostCommit);
     if crashed {
         metrics.crash_cycles_total += 1;
     }

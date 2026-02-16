@@ -15,6 +15,7 @@ pub mod concurrent_writer_parity;
 pub mod confidence_gates;
 pub mod corpus_ingest;
 pub mod crash_recovery_parity;
+pub mod cross_process_crash_harness;
 pub mod differential_v2;
 pub mod drift_monitor;
 pub mod durability_matrix;
