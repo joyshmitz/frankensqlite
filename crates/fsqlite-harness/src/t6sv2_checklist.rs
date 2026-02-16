@@ -136,14 +136,20 @@ impl T6sv2ChecklistReport {
         let mut out = String::new();
         out.push_str("# t6sv2 Evidence Checklist Report\n\n");
         out.push_str(&format!("- bead_id: `{}`\n", self.bead_id));
-        out.push_str(&format!("- overall_pass: `{}`\n", self.summary.overall_pass));
+        out.push_str(&format!(
+            "- overall_pass: `{}`\n",
+            self.summary.overall_pass
+        ));
         out.push_str(&format!("- child_count: `{}`\n", self.summary.child_count));
         out.push_str(&format!("- open_count: `{}`\n", self.summary.open_count));
         out.push_str(&format!(
             "- in_progress_count: `{}`\n",
             self.summary.in_progress_count
         ));
-        out.push_str(&format!("- closed_count: `{}`\n", self.summary.closed_count));
+        out.push_str(&format!(
+            "- closed_count: `{}`\n",
+            self.summary.closed_count
+        ));
         out.push_str(&format!(
             "- missing_unit_count: `{}`\n",
             self.summary.missing_unit_count
@@ -350,7 +356,10 @@ fn is_t6sv2_child(issue_id: &str) -> bool {
 }
 
 fn is_child_kind(issue_type: &str) -> bool {
-    matches!(issue_type.trim().to_ascii_lowercase().as_str(), "task" | "feature" | "bug")
+    matches!(
+        issue_type.trim().to_ascii_lowercase().as_str(),
+        "task" | "feature" | "bug"
+    )
 }
 
 fn resolve_owner(owner: Option<String>, assignee: Option<String>, created_by: String) -> String {
@@ -779,7 +788,8 @@ mod tests {
         );
 
         let unit_matrix = minimal_unit_matrix("bd-t6sv2.4");
-        let traceability = minimal_traceability("bd-t6sv2.4", "scripts/verify_t6sv2_4.sh", Some("1.0.0"));
+        let traceability =
+            minimal_traceability("bd-t6sv2.4", "scripts/verify_t6sv2_4.sh", Some("1.0.0"));
         let report = generate_t6sv2_checklist_report(
             workspace,
             &issues_path,
@@ -876,7 +886,8 @@ mod tests {
         );
 
         let unit_matrix = minimal_unit_matrix("bd-t6sv2.4");
-        let traceability = minimal_traceability("bd-t6sv2.4", "scripts/verify_t6sv2_4.sh", Some("1.0.0"));
+        let traceability =
+            minimal_traceability("bd-t6sv2.4", "scripts/verify_t6sv2_4.sh", Some("1.0.0"));
 
         let report_a = generate_t6sv2_checklist_report(
             workspace,

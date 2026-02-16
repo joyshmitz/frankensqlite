@@ -157,13 +157,10 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
 fn run(args: &[String]) -> Result<i32, String> {
     let config = parse_args(args)?;
 
-    let issues_path = config
-        .issues_path
-        .as_ref()
-        .map_or_else(
-            || config.workspace_root.join(".beads/issues.jsonl"),
-            |path| resolve_path(&config.workspace_root, path),
-        );
+    let issues_path = config.issues_path.as_ref().map_or_else(
+        || config.workspace_root.join(".beads/issues.jsonl"),
+        |path| resolve_path(&config.workspace_root, path),
+    );
 
     let unit_matrix = match config.unit_matrix_override {
         Some(path) => {
