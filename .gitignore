@@ -122,6 +122,7 @@ SESSION_TODO.md
 SESSION_REPORT.md
 SESSION_*.md
 verify_*.sh
+!scripts/verify_bisect_replay_manifest.sh
 newfile.txt
 repro_*.rs
 
