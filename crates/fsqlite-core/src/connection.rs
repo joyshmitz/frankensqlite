@@ -10775,10 +10775,10 @@ mod tests {
     };
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
-    use fsqlite_types::{PageData, PageNumber};
     use fsqlite_types::cx::Cx;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
+    use fsqlite_types::{PageData, PageNumber};
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values().to_vec()
