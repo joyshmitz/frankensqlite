@@ -194,6 +194,21 @@ impl PageCache {
         self.pages.remove(&page_no).is_some()
     }
 
+    /// Evict an arbitrary page from the cache to free up space.
+    ///
+    /// Returns `true` if a page was evicted, `false` if the cache was empty.
+    pub fn evict_any(&mut self) -> bool {
+        // We pick an arbitrary key to evict. Since we don't track usage,
+        // this is effectively random eviction.
+        let key = self.pages.keys().next().copied();
+        if let Some(key) = key {
+            self.pages.remove(&key);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Evict all pages from the cache.
     pub fn clear(&mut self) {
         self.pages.clear();

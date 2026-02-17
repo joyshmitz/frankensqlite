@@ -590,9 +590,14 @@ impl S3Fifo {
             return;
         };
 
-        let Some(EntryState::Resident(state)) = self.index.get(&page_id).copied() else {
-            return;
+        let state = if let Some(EntryState::Resident(state)) = self.index.get(&page_id).copied() {
+            state
+        } else {
+            // Invariant violation: page in SMALL queue but missing/wrong in index.
+            // Self-heal by treating as unaccessed.
+            ResidentState::small()
         };
+
         self.evictions_since_adapt = self.evictions_since_adapt.saturating_add(1);
 
         if state.accessed {
@@ -613,9 +618,15 @@ impl S3Fifo {
             return false;
         };
 
-        let Some(EntryState::Resident(mut state)) = self.index.get(&page_id).copied() else {
-            return true;
+        let mut state = if let Some(EntryState::Resident(state)) = self.index.get(&page_id).copied()
+        {
+            state
+        } else {
+            // Invariant violation: page in MAIN queue but missing/wrong in index.
+            // Self-heal by treating as unaccessed.
+            ResidentState::main()
         };
+
         self.evictions_since_adapt = self.evictions_since_adapt.saturating_add(1);
         if state.accessed {
             self.main_pressure_since_adapt = self.main_pressure_since_adapt.saturating_add(1);

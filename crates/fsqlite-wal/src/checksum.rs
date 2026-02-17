@@ -1306,10 +1306,14 @@ pub fn sqlite_wal_checksum(
     let mut s2 = seed_s2;
 
     for chunk in data.chunks_exact(8) {
-        let first = decode_u32_words(&chunk[..4], big_endian_checksum_words);
-        let second = decode_u32_words(&chunk[4..], big_endian_checksum_words);
-        s1 = s1.wrapping_add(first).wrapping_add(s2);
-        s2 = s2.wrapping_add(second).wrapping_add(s1);
+        let x0 = decode_u32_words(&chunk[..4], big_endian_checksum_words);
+        let x1 = decode_u32_words(&chunk[4..], big_endian_checksum_words);
+
+        s1 = s1.wrapping_add(x0).wrapping_add(s2);
+        s2 = s2.wrapping_add(s1);
+
+        s1 = s1.wrapping_add(x1).wrapping_add(s2);
+        s2 = s2.wrapping_add(s1);
     }
 
     Ok(SqliteWalChecksum { s1, s2 })

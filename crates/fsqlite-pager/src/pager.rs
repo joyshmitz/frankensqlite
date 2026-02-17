@@ -79,7 +79,20 @@ impl<F: VfsFile> PagerInner<F> {
             return Ok(vec![0_u8; self.page_size.as_usize()]);
         }
 
-        let mut buf = self.cache.pool().clone().acquire()?;
+        // Acquire a buffer for reading from disk. If the pool is exhausted,
+        // try evicting a page from the cache to free up a buffer.
+        let mut buf = match self.cache.pool().clone().acquire() {
+            Ok(buf) => buf,
+            Err(FrankenError::OutOfMemory) => {
+                if self.cache.evict_any() {
+                    self.cache.pool().clone().acquire()?
+                } else {
+                    return Err(FrankenError::OutOfMemory);
+                }
+            }
+            Err(err) => return Err(err),
+        };
+
         let page_size = self.page_size.as_usize();
         let offset = u64::from(page_no.get() - 1) * page_size as u64;
         let bytes_read = self.db_file.read(cx, buf.as_mut_slice(), offset)?;
@@ -93,7 +106,24 @@ impl<F: VfsFile> PagerInner<F> {
         }
         let out = buf.as_slice()[..page_size].to_vec();
 
-        let fresh = self.cache.insert_fresh(page_no)?;
+        // Insert into cache. If pool is exhausted (because we're holding one
+        // buffer in `buf` and the rest are cached), try evicting again.
+        // Note: insert_fresh acquires a *new* buffer from the pool.
+        let fresh = match self.cache.insert_fresh(page_no) {
+            Ok(fresh) => fresh,
+            Err(FrankenError::OutOfMemory) => {
+                if self.cache.evict_any() {
+                    // Retry insertion.
+                    self.cache.insert_fresh(page_no)?
+                } else {
+                    // If we can't cache it, we just return the read data.
+                    // This is a valid degradation (cache miss).
+                    return Ok(out);
+                }
+            }
+            Err(err) => return Err(err),
+        };
+
         fresh.copy_from_slice(&out);
         Ok(out)
     }
@@ -104,16 +134,23 @@ impl<F: VfsFile> PagerInner<F> {
             let len = cached.len().min(data.len());
             cached[..len].copy_from_slice(&data[..len]);
         } else {
-            // Cache population is best-effort: if the bounded buffer pool is
-            // temporarily exhausted by an in-flight transaction write-set, we
-            // still want commits to succeed (the authoritative copy is written
-            // to the backing VFS file below).
+            // Cache population is best-effort. If the pool is full, try to
+            // evict a page to make room.
             match self.cache.insert_fresh(page_no) {
                 Ok(fresh) => {
                     let len = fresh.len().min(data.len());
                     fresh[..len].copy_from_slice(&data[..len]);
                 }
-                Err(FrankenError::OutOfMemory) => {}
+                Err(FrankenError::OutOfMemory) => {
+                    if self.cache.evict_any() {
+                        if let Ok(fresh) = self.cache.insert_fresh(page_no) {
+                            let len = fresh.len().min(data.len());
+                            fresh[..len].copy_from_slice(&data[..len]);
+                        }
+                    }
+                    // If still OOM or eviction failed, we skip caching and
+                    // write directly to disk. This is valid write-through behavior.
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -176,6 +213,7 @@ where
             inner: Arc::clone(&self.inner),
             write_set: HashMap::new(),
             freed_pages: Vec::new(),
+            allocated_from_freelist: Vec::new(),
             mode,
             is_writer: eager_writer,
             committed: false,
@@ -468,6 +506,14 @@ struct SavepointEntry {
     write_set_snapshot: HashMap<PageNumber, Vec<u8>>,
     /// Snapshot of freed pages at the time the savepoint was created.
     freed_pages_snapshot: Vec<PageNumber>,
+    /// Snapshot of the pager's next_page counter.
+    /// Used to restore allocation state on rollback.
+    next_page_snapshot: u32,
+    /// Snapshot of the pager's freelist.
+    /// Used to restore allocation state on rollback.
+    freelist_snapshot: Vec<PageNumber>,
+    /// Snapshot of pages allocated from freelist by this transaction.
+    allocated_from_freelist_snapshot: Vec<PageNumber>,
 }
 
 /// Transaction handle produced by [`SimplePager`].
@@ -477,6 +523,7 @@ pub struct SimpleTransaction<V: Vfs> {
     inner: Arc<Mutex<PagerInner<V::File>>>,
     write_set: HashMap<PageNumber, PageBuf>,
     freed_pages: Vec<PageNumber>,
+    allocated_from_freelist: Vec<PageNumber>,
     mode: TransactionMode,
     is_writer: bool,
     committed: bool,
@@ -705,6 +752,7 @@ where
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
         if let Some(page) = inner.freelist.pop() {
+            self.allocated_from_freelist.push(page);
             return Ok(page);
         }
 
@@ -793,6 +841,12 @@ where
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+
+        // Restore pages allocated from the freelist.
+        for page in self.allocated_from_freelist.drain(..) {
+            inner.freelist.push(page);
+        }
+
         if self.is_writer {
             inner.db_size = self.original_db_size;
 
@@ -815,6 +869,11 @@ where
     }
 
     fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+
         self.savepoint_stack.push(SavepointEntry {
             name: name.to_owned(),
             write_set_snapshot: self
@@ -823,6 +882,9 @@ where
                 .map(|(&k, v)| (k, v.to_vec()))
                 .collect(),
             freed_pages_snapshot: self.freed_pages.clone(),
+            next_page_snapshot: inner.next_page,
+            freelist_snapshot: inner.freelist.clone(),
+            allocated_from_freelist_snapshot: self.allocated_from_freelist.clone(),
         });
         Ok(())
     }
@@ -862,6 +924,18 @@ where
             })
             .collect::<Result<HashMap<_, _>>>()?;
         self.freed_pages = entry.freed_pages_snapshot.clone();
+        self.allocated_from_freelist = entry.allocated_from_freelist_snapshot.clone();
+
+        // Restore allocation state.
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            inner.next_page = entry.next_page_snapshot;
+            inner.freelist = entry.freelist_snapshot.clone();
+        }
+
         // Discard savepoints created after the named one, but keep
         // the named savepoint itself (it can be rolled back to again).
         self.savepoint_stack.truncate(pos + 1);
@@ -2001,6 +2075,72 @@ mod tests {
         txn.write_page(&cx, p1, &vec![0x22; ps]).unwrap();
         txn.rollback_to_savepoint(&cx, "sp1").unwrap();
 
+        // Should be back to 0x11.
+        let data = txn.get_page(&cx, p1).unwrap();
+        assert_eq!(data.as_ref()[0], 0x11);
+
+        // Modify again.
+        txn.write_page(&cx, p1, &vec![0x33; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let data2 = txn2.get_page(&cx, p1).unwrap();
+        assert_eq!(data2.as_ref()[0], 0x33);
+    }
+
+    #[test]
+    fn test_savepoint_rollback_reclaims_allocated_pages() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        // Initial state: 1 page (header)
+        let p1 = txn.allocate_page(&cx).unwrap(); // Page 2
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+
+        txn.savepoint(&cx, "sp1").unwrap();
+
+        // Allocate Page 3 inside savepoint
+        let p2 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p2, &vec![0x22; ps]).unwrap();
+
+        assert_eq!(p2.get(), p1.get() + 1, "Expected sequential allocation");
+
+        // Rollback to sp1. This should ideally "un-allocate" p2.
+        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+
+        // Allocate again. Should we get p2 again?
+        // If next_page wasn't reverted, we'll get p2 + 1 (Page 4), leaving Page 3 as a hole.
+        let p3 = txn.allocate_page(&cx).unwrap();
+
+        assert_eq!(
+            p3.get(),
+            p2.get(),
+            "bead_id={BEAD_ID} case=rollback_reclaims_allocation: expected page {} but got {}",
+            p2.get(),
+            p3.get()
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_rollback_to_preserves_savepoint_multi() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p1 = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p1, &vec![0x11; ps]).unwrap();
+
+        txn.savepoint(&cx, "sp1").unwrap();
+
+        txn.write_page(&cx, p1, &vec![0x22; ps]).unwrap();
+        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+
         // Second modification + rollback (savepoint still exists).
         txn.write_page(&cx, p1, &vec![0x33; ps]).unwrap();
         txn.rollback_to_savepoint(&cx, "sp1").unwrap();
@@ -2845,5 +2985,90 @@ mod tests {
             "[5A1][test=write_empty_leaf_65536][step=verify] \
              content_start=65536 encoding=0x0000 \u{2713}"
         );
+    }
+
+    #[test]
+    fn test_freelist_leak_on_rollback() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // 1. Allocate a page and commit.
+        let mut txn1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn1.allocate_page(&cx).unwrap();
+        txn1.write_page(&cx, p, &vec![0xAA; ps]).unwrap();
+        txn1.commit(&cx).unwrap();
+
+        // 2. Free the page and commit -> moves to freelist.
+        let mut txn2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn2.free_page(&cx, p).unwrap();
+        txn2.commit(&cx).unwrap();
+
+        // Verify freelist has the page.
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(inner.freelist.len(), 1);
+            assert_eq!(inner.freelist[0], p);
+        }
+
+        // 3. Allocate the page again (pops from freelist).
+        let mut txn3 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p2 = txn3.allocate_page(&cx).unwrap();
+        assert_eq!(p2, p, "should reuse freed page");
+
+        // Verify freelist is empty (in-flight).
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert!(inner.freelist.is_empty());
+        }
+
+        // 4. Rollback.
+        txn3.rollback(&cx).unwrap();
+
+        // 5. Verify freelist has the page again (no leak).
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(
+                inner.freelist.len(),
+                1,
+                "bead_id={BEAD_ID} case=freelist_leak_on_rollback"
+            );
+            assert_eq!(inner.freelist[0], p);
+        }
+    }
+
+    #[test]
+    fn test_cache_eviction_under_pressure() {
+        // Verify that SimplePager can handle more pages than the cache capacity.
+        // PageCache is initialized with 256 pages. We write 300 pages.
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::new();
+
+        // Write 300 pages. This exceeds the 256-page cache capacity.
+        for i in 0..300u32 {
+            let p = txn.allocate_page(&cx).unwrap();
+            pages.push(p);
+            // Unique pattern per page to verify content.
+            let byte = (i % 256) as u8;
+            let data = vec![byte; ps];
+            txn.write_page(&cx, p, &data).unwrap();
+        }
+        txn.commit(&cx).unwrap();
+
+        // Read all pages back. Some will be cache misses, requiring eviction of others.
+        let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for (i, &p) in pages.iter().enumerate() {
+            let data = txn.get_page(&cx, p).unwrap();
+            let expected_byte = (i % 256) as u8;
+            assert_eq!(
+                data.as_ref()[0],
+                expected_byte,
+                "bead_id={BEAD_ID} case=cache_pressure page={p}"
+            );
+        }
     }
 }

@@ -22,7 +22,7 @@ use crate::checkpoint::{
     CheckpointMode, CheckpointPlan, CheckpointPostAction, CheckpointProgress, CheckpointState,
     plan_checkpoint,
 };
-use crate::checksum::WalSalts;
+use crate::checksum::{WAL_FRAME_HEADER_SIZE, WalSalts};
 use crate::wal::WalFile;
 
 // ---------------------------------------------------------------------------
@@ -115,9 +115,10 @@ pub fn execute_checkpoint<F: VfsFile>(
 
     let mut frames_backfilled: u32 = 0;
     let mut last_db_size: Option<u32> = None;
+    let mut frame_buf = vec![0u8; wal.frame_size()];
 
     for frame_idx in start..end {
-        let (header, page_data) = wal.read_frame(cx, frame_idx)?;
+        let header = wal.read_frame_into(cx, frame_idx, &mut frame_buf)?;
 
         let page_no =
             PageNumber::new(header.page_number).ok_or_else(|| FrankenError::OutOfRange {
@@ -125,7 +126,8 @@ pub fn execute_checkpoint<F: VfsFile>(
                 value: header.page_number.to_string(),
             })?;
 
-        target.write_page(cx, page_no, &page_data)?;
+        let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
+        target.write_page(cx, page_no, page_data)?;
         frames_backfilled += 1;
 
         if header.is_commit() && header.db_size > 0 {
