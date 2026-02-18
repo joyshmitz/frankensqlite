@@ -11,6 +11,9 @@ pub mod swiss_index;
 pub mod swizzle;
 pub mod traits;
 
+#[cfg(test)]
+mod btree_invariant_tests;
+
 pub use cell::{
     BtreePageHeader, BtreePageType, CellRef, has_overflow, header_offset_for_page,
     local_payload_size, max_local_payload, min_local_payload, read_cell_pointers,

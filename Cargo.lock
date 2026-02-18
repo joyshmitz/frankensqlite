@@ -1028,6 +1028,7 @@ dependencies = [
  "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-wal",
+ "proptest",
  "tempfile",
  "tracing",
 ]
