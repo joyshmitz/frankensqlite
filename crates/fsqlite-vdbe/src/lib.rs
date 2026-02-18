@@ -19,6 +19,7 @@ pub mod vectorized_hash_join;
 pub mod vectorized_join;
 pub mod vectorized_ops;
 pub mod vectorized_scan;
+pub mod vectorized_sort;
 
 // ── Label System ────────────────────────────────────────────────────────────
 
