@@ -40,6 +40,9 @@ pub mod witness_refinement;
 pub mod write_coordinator;
 pub mod xor_delta;
 
+#[cfg(test)]
+mod ssi_anomaly_tests;
+
 pub use begin_concurrent::{
     ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult, MAX_CONCURRENT_WRITERS,
     SsiResult, concurrent_abort, concurrent_commit, concurrent_commit_with_ssi,
