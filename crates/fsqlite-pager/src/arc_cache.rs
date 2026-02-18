@@ -30,6 +30,79 @@ use parking_lot::{Condvar, Mutex};
 use crate::page_buf::PageBuf;
 
 // ═══════════════════════════════════════════════════════════════════════
+// CacheMetricsSnapshot
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Point-in-time snapshot of ARC cache performance counters and structural
+/// state.  All fields are cheap `Copy` values captured under the ARC mutex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheMetricsSnapshot {
+    // -- counters (monotonic since last reset) --
+    /// Total cache hits (T1 + T2).
+    pub hits: u64,
+    /// Total cache misses.
+    pub misses: u64,
+    /// Ghost hits in B1 (recency signal).
+    pub ghost_hits_b1: u64,
+    /// Ghost hits in B2 (frequency signal).
+    pub ghost_hits_b2: u64,
+    /// Pages evicted from T1 → B1.
+    pub evictions_t1: u64,
+    /// Pages evicted from T2 → B2.
+    pub evictions_t2: u64,
+    /// Superseded versions coalesced by GC.
+    pub version_coalesce_count: u64,
+    /// Pages admitted into the cache.
+    pub admits: u64,
+
+    // -- structural gauges (instantaneous) --
+    /// Current pages in T1 (recency list).
+    pub t1_len: usize,
+    /// Current pages in T2 (frequency list).
+    pub t2_len: usize,
+    /// Current ghost entries in B1.
+    pub b1_len: usize,
+    /// Current ghost entries in B2.
+    pub b2_len: usize,
+    /// Adaptive target size for T1.
+    pub p: usize,
+    /// Maximum resident-page capacity.
+    pub capacity: usize,
+    /// Current byte footprint of resident pages.
+    pub total_bytes: usize,
+    /// Hard byte limit (PRAGMA cache_size).
+    pub max_bytes: usize,
+    /// Distinct page numbers with >1 cached version.
+    pub multi_version_pages: usize,
+    /// Safety-valve overflow events (all victims pinned).
+    pub capacity_overflow_events: usize,
+}
+
+impl CacheMetricsSnapshot {
+    /// Hit rate as a percentage (0.0–100.0).  Returns 0.0 when no accesses.
+    #[must_use]
+    pub fn hit_rate_pct(&self) -> f64 {
+        let total = self.hits + self.misses + self.ghost_hits_b1 + self.ghost_hits_b2;
+        if total == 0 {
+            return 0.0;
+        }
+        (self.hits as f64 / total as f64) * 100.0
+    }
+
+    /// Total accesses (hits + misses + ghost hits).
+    #[must_use]
+    pub fn total_accesses(&self) -> u64 {
+        self.hits + self.misses + self.ghost_hits_b1 + self.ghost_hits_b2
+    }
+
+    /// Resident page count (T1 + T2).
+    #[must_use]
+    pub fn resident_pages(&self) -> usize {
+        self.t1_len + self.t2_len
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // CacheKey
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -443,6 +516,24 @@ pub struct ArcCacheInner {
     /// Number of times ARC had to allow temporary growth because all
     /// candidate victims were pinned.
     capacity_overflow_events: usize,
+
+    // -- performance counters (bd-t6sv2.8) --
+    /// Total cache hits (T1 + T2).
+    hits: u64,
+    /// Total cache misses.
+    misses: u64,
+    /// Ghost hits in B1.
+    ghost_hits_b1: u64,
+    /// Ghost hits in B2.
+    ghost_hits_b2: u64,
+    /// Pages evicted from T1.
+    evictions_t1: u64,
+    /// Pages evicted from T2.
+    evictions_t2: u64,
+    /// Superseded versions coalesced.
+    version_coalesce_count: u64,
+    /// Pages admitted.
+    admits: u64,
 }
 
 impl ArcCacheInner {
@@ -465,6 +556,14 @@ impl ArcCacheInner {
             page_versions: HashMap::new(),
             gc_horizon: CommitSeq::ZERO,
             capacity_overflow_events: 0,
+            hits: 0,
+            misses: 0,
+            ghost_hits_b1: 0,
+            ghost_hits_b2: 0,
+            evictions_t1: 0,
+            evictions_t2: 0,
+            version_coalesce_count: 0,
+            admits: 0,
         }
     }
 
@@ -548,6 +647,51 @@ impl ArcCacheInner {
     #[must_use]
     pub fn capacity_overflow_events(&self) -> usize {
         self.capacity_overflow_events
+    }
+
+    /// Capture a point-in-time snapshot of all cache metrics.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> CacheMetricsSnapshot {
+        let multi_version_pages = self
+            .page_versions
+            .values()
+            .filter(|&&count| count > 1)
+            .count();
+
+        CacheMetricsSnapshot {
+            hits: self.hits,
+            misses: self.misses,
+            ghost_hits_b1: self.ghost_hits_b1,
+            ghost_hits_b2: self.ghost_hits_b2,
+            evictions_t1: self.evictions_t1,
+            evictions_t2: self.evictions_t2,
+            version_coalesce_count: self.version_coalesce_count,
+            admits: self.admits,
+            t1_len: self.t1.len(),
+            t2_len: self.t2.len(),
+            b1_len: self.b1.len(),
+            b2_len: self.b2.len(),
+            p: self.p,
+            capacity: self.capacity,
+            total_bytes: self.total_bytes,
+            max_bytes: self.max_bytes,
+            multi_version_pages,
+            capacity_overflow_events: self.capacity_overflow_events,
+        }
+    }
+
+    /// Reset all performance counters to zero.
+    ///
+    /// Structural gauges (t1_len, capacity, etc.) are not affected.
+    pub fn reset_metrics(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
+        self.ghost_hits_b1 = 0;
+        self.ghost_hits_b2 = 0;
+        self.evictions_t1 = 0;
+        self.evictions_t2 = 0;
+        self.version_coalesce_count = 0;
+        self.admits = 0;
     }
 
     /// O(1) snapshot visibility check (§6.8).
@@ -720,11 +864,13 @@ impl ArcCacheInner {
                 let page = self.t1.remove(idx);
                 let new_idx = self.t2.push_back(page);
                 self.directory.insert(*key, Location::T2(new_idx));
+                self.hits += 1;
                 CacheLookup::Hit
             }
             Some(Location::T2(idx)) => {
                 // Hit in T2 → move to MRU of T2 (refresh).
                 self.t2.move_to_back(idx);
+                self.hits += 1;
                 CacheLookup::Hit
             }
             Some(Location::B1(idx)) => {
@@ -734,6 +880,7 @@ impl ArcCacheInner {
                 // Remove ghost.
                 self.b1.remove(idx);
                 self.directory.remove(key);
+                self.ghost_hits_b1 += 1;
                 CacheLookup::GhostHitB1
             }
             Some(Location::B2(idx)) => {
@@ -743,9 +890,13 @@ impl ArcCacheInner {
                 // Remove ghost.
                 self.b2.remove(idx);
                 self.directory.remove(key);
+                self.ghost_hits_b2 += 1;
                 CacheLookup::GhostHitB2
             }
-            None => CacheLookup::Miss,
+            None => {
+                self.misses += 1;
+                CacheLookup::Miss
+            }
         }
     }
 
@@ -761,6 +912,8 @@ impl ArcCacheInner {
             !matches!(lookup, CacheLookup::Hit),
             "admit called after a cache hit"
         );
+
+        self.admits += 1;
 
         if self.capacity == 0 {
             // PRAGMA cache_size=0 disables caching of resident pages.
@@ -881,6 +1034,7 @@ impl ArcCacheInner {
             let ghost_idx = self.b1.push_back(key);
             self.directory.insert(key, Location::B1(ghost_idx));
             drop(page);
+            self.evictions_t1 += 1;
             true
         } else {
             false
@@ -899,6 +1053,7 @@ impl ArcCacheInner {
             let ghost_idx = self.b2.push_back(key);
             self.directory.insert(key, Location::B2(ghost_idx));
             drop(page);
+            self.evictions_t2 += 1;
             true
         } else {
             false
@@ -1090,6 +1245,9 @@ impl ArcCacheInner {
             self.directory.remove(&key);
             removed += 1;
         }
+
+        let removed_u64 = u64::try_from(removed).unwrap_or(u64::MAX);
+        self.version_coalesce_count = self.version_coalesce_count.saturating_add(removed_u64);
 
         removed
     }
