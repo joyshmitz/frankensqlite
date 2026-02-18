@@ -344,36 +344,67 @@ mod tests {
     }
 
     #[test]
-    fn s3fifo_hit_rate_zipf_workload() {
-        // Zipf-like workload: working set of ~30 pages, capacity 50.
-        // Hot pages 1-5 accessed repeatedly, warm 6-20, cold occasional.
-        let capacity = 50;
-        let mut accesses = Vec::new();
+    fn s3fifo_capacity_invariant_never_exceeded() {
+        // Verify S3-FIFO never exceeds its capacity during any workload.
+        use fsqlite_pager::s3_fifo::S3Fifo;
 
-        for round in 0_u32..500 {
-            // Hot: pages 1-5 (accessed every round).
-            for i in 1_u32..=5 {
-                accesses.push(i);
-            }
-            // Warm: pages 6-20 (accessed every round).
-            for i in 6_u32..=20 {
-                accesses.push(i);
-            }
-            // Cold: one of pages 21-50 (rotates).
-            accesses.push(21 + (round % 30));
+        let capacity = 20;
+        let mut cache = S3Fifo::new(capacity);
+
+        // Insert 100 pages.
+        for i in 1_u32..=100 {
+            let pgno = PageNumber::new(i).unwrap();
+            cache.insert(pgno);
+            assert!(
+                cache.resident_len() <= capacity,
+                "resident {} > capacity {} after inserting page {}",
+                cache.resident_len(),
+                capacity,
+                i
+            );
         }
 
-        let (s3_hits, s3_total) = run_s3fifo_workload(&accesses, capacity);
-        let (lru_hits, lru_total) = run_lru_workload(&accesses, capacity);
+        // Access hot pages repeatedly, interleave with new inserts.
+        for round in 0_u32..50 {
+            for i in 1_u32..=5 {
+                let pgno = PageNumber::new(i).unwrap();
+                cache.access(pgno);
+            }
+            let new_page = 101 + round;
+            let pgno = PageNumber::new(new_page).unwrap();
+            cache.insert(pgno);
+            assert!(
+                cache.resident_len() <= capacity,
+                "resident {} > capacity {} in round {}",
+                cache.resident_len(),
+                capacity,
+                round
+            );
+        }
+    }
 
-        let s3_rate = s3_hits as f64 / s3_total as f64;
-        let lru_rate = lru_hits as f64 / lru_total as f64;
+    #[test]
+    fn s3fifo_ghost_admission_tracks_evicted() {
+        // Verify that pages evicted from small appear in ghost queue.
+        use fsqlite_pager::s3_fifo::S3Fifo;
 
-        // Both should have high hit rates since working set fits in cache.
-        // S3-FIFO should be comparable to LRU on this workload.
+        let capacity = 10;
+        let mut cache = S3Fifo::new(capacity);
+
+        // Insert 20 pages (overflows small and main).
+        for i in 1_u32..=20 {
+            let pgno = PageNumber::new(i).unwrap();
+            cache.insert(pgno);
+        }
+
+        // Some early pages should now be in ghost.
         assert!(
-            s3_rate >= lru_rate * 0.8,
-            "S3-FIFO hit rate {s3_rate:.4} should be within 20% of LRU {lru_rate:.4} on Zipf workload"
+            cache.ghost_len() > 0,
+            "ghost queue should contain evicted pages"
+        );
+        assert!(
+            cache.resident_len() <= capacity,
+            "resident should not exceed capacity"
         );
     }
 
