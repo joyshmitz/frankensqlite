@@ -4,12 +4,9 @@
 //! invariant catalog, drift monitors, confidence gates, adversarial search,
 //! and CI artifacts into a machine-verifiable release certificate.
 
-use fsqlite_harness::adversarial_search::{AdversarialConfig, run_campaign};
-use fsqlite_harness::ci_gate_matrix::ArtifactEntry;
-use fsqlite_harness::confidence_gates::{
-    GateConfig, GateDecision, build_evidence_ledger, evaluate_full,
-};
-use fsqlite_harness::drift_monitor::{ParityDriftConfig, ParityDriftMonitor};
+use fsqlite_harness::adversarial_search::run_campaign;
+use fsqlite_harness::confidence_gates::{GateDecision, build_evidence_ledger, evaluate_full};
+use fsqlite_harness::drift_monitor::ParityDriftMonitor;
 use fsqlite_harness::parity_invariant_catalog::build_canonical_catalog;
 use fsqlite_harness::parity_taxonomy::build_canonical_universe;
 use fsqlite_harness::release_certificate::{

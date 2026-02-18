@@ -10796,7 +10796,6 @@ mod tests {
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
     use fsqlite_types::PageNumber;
-    use fsqlite_types::cx::Cx;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
 

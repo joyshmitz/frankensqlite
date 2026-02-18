@@ -7572,7 +7572,7 @@ mod tests {
     fn test_swiss_index_replaces_hashmap_in_engine() {
         // Smoke test: run a simple expression program to exercise the engine's
         // SwissIndex-based internal maps (sorters, cursors, aggregates).
-        use fsqlite_btree::instrumentation::{btree_metrics_snapshot, reset_btree_metrics};
+        use fsqlite_btree::instrumentation::reset_btree_metrics;
 
         reset_btree_metrics();
 

@@ -718,7 +718,7 @@ fn normalize_manifest(manifest: &mut ValidationManifest) {
         });
 }
 
-fn aggregate_outcome(outcomes: &[GateOutcome]) -> GateOutcome {
+fn _aggregate_outcome(outcomes: &[GateOutcome]) -> GateOutcome {
     if outcomes.contains(&GateOutcome::Fail) {
         GateOutcome::Fail
     } else if outcomes.contains(&GateOutcome::PassWithWarnings) {

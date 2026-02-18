@@ -8,7 +8,7 @@
 //! CI can run this gate in "regression" mode using a baseline. In that mode the
 //! gate fails only when new critical-path completeness failures are introduced.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
