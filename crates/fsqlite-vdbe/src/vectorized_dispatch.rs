@@ -541,6 +541,7 @@ impl WorkStealingDispatcher {
         Ok(reports)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute_single_pipeline<R, F>(
         &self,
         tasks: &[PipelineTask],

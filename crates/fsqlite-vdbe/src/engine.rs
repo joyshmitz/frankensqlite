@@ -293,6 +293,7 @@ impl SorterCursor {
         let mut bytes_written: u64 = 0;
         for row in &self.rows {
             let blob = serialize_record(row);
+            #[allow(clippy::cast_possible_truncation)]
             let len_bytes = (blob.len() as u32).to_le_bytes();
             writer
                 .write_all(&len_bytes)
@@ -306,7 +307,8 @@ impl SorterCursor {
             .flush()
             .map_err(|e| FrankenError::internal(format!("sorter spill flush: {e}")))?;
 
-        let pages = (bytes_written as usize + SORTER_SPILL_PAGE_SIZE - 1) / SORTER_SPILL_PAGE_SIZE;
+        #[allow(clippy::cast_possible_truncation)]
+        let pages = (bytes_written as usize).div_ceil(SORTER_SPILL_PAGE_SIZE);
         self.spill_pages_total += pages as u64;
 
         tracing::warn!(

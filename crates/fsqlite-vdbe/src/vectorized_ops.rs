@@ -69,13 +69,12 @@ pub fn filter_batch_int64(
 
     let input_rows = sel.len() as u64;
     let output_rows = result.len();
-    let selectivity_milli = if input_rows > 0 {
-        (output_rows as u64 * 1000) / input_rows
-    } else {
-        0
-    };
+    let selectivity_milli = (output_rows as u64 * 1000)
+        .checked_div(input_rows)
+        .unwrap_or(0);
 
     record_vectorized_rows(input_rows);
+    update_filter_simd_utilization(simd_path);
 
     let _span = tracing::debug_span!(
         "vectorized_batch",
@@ -128,13 +127,12 @@ pub fn filter_batch_float64(
 
     let input_rows = sel.len() as u64;
     let output_rows = result.len();
-    let selectivity_milli = if input_rows > 0 {
-        (output_rows as u64 * 1000) / input_rows
-    } else {
-        0
-    };
+    let selectivity_milli = (output_rows as u64 * 1000)
+        .checked_div(input_rows)
+        .unwrap_or(0);
 
     record_vectorized_rows(input_rows);
+    update_filter_simd_utilization(simd_path);
 
     let _span = tracing::debug_span!(
         "vectorized_batch",
@@ -246,7 +244,246 @@ pub fn hash_batch_columns(batch: &Batch, column_indices: &[usize]) -> Result<Vec
     Ok(hashes)
 }
 
+// ── Selection Vector Composition ────────────────────────────────────────────
+
+/// Compute the intersection (AND) of two selection vectors.
+///
+/// Produces a new selection vector containing only row indices present in
+/// *both* inputs.  Output is sorted ascending.
+#[must_use]
+pub fn and_selection(lhs: &SelectionVector, rhs: &SelectionVector) -> SelectionVector {
+    // Both inputs are sorted, so use a merge-intersect.
+    let a = lhs.as_slice();
+    let b = rhs.as_slice();
+    let mut result = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                result.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    SelectionVector::from_indices(result)
+}
+
+/// Compute the union (OR) of two selection vectors.
+///
+/// Produces a new selection vector containing all row indices present in
+/// *either* input.  Output is sorted ascending with duplicates removed.
+#[must_use]
+pub fn or_selection(lhs: &SelectionVector, rhs: &SelectionVector) -> SelectionVector {
+    let a = lhs.as_slice();
+    let b = rhs.as_slice();
+    let mut result = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => {
+                result.push(a[i]);
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                result.push(b[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                result.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    result.extend_from_slice(&a[i..]);
+    result.extend_from_slice(&b[j..]);
+    SelectionVector::from_indices(result)
+}
+
+// ── Typed Filter Operators ─────────────────────────────────────────────────
+
+/// Apply an int32 comparison predicate against a constant value.
+pub fn filter_batch_int32(
+    batch: &Batch,
+    column_idx: usize,
+    op: CompareOp,
+    value: i32,
+) -> Result<SelectionVector, String> {
+    let column = batch
+        .columns()
+        .get(column_idx)
+        .ok_or_else(|| format!("column index {column_idx} out of bounds"))?;
+
+    let ColumnData::Int32(aligned) = &column.data else {
+        return Err(format!(
+            "column {column_idx} is not Int32, cannot apply int32 filter"
+        ));
+    };
+
+    let data = aligned.as_slice();
+    let sel = batch.selection();
+    let simd_path = simd_path_label();
+
+    let mut result = Vec::with_capacity(sel.len());
+    for &idx in sel.as_slice() {
+        let row = usize::from(idx);
+        if row < data.len() && column.validity.is_valid(row) && compare_i32(data[row], op, value) {
+            result.push(idx);
+        }
+    }
+
+    let input_rows = sel.len() as u64;
+    let output_rows = result.len();
+    let selectivity_milli = (output_rows as u64 * 1000)
+        .checked_div(input_rows)
+        .unwrap_or(0);
+
+    record_vectorized_rows(input_rows);
+    update_filter_simd_utilization(simd_path);
+
+    let _span = tracing::debug_span!(
+        "vectorized_batch",
+        batch_size = input_rows,
+        selectivity = selectivity_milli as f64 / 1000.0,
+        simd_path = simd_path,
+        op = "filter_int32",
+    )
+    .entered();
+
+    Ok(SelectionVector::from_indices(result))
+}
+
+/// Apply a text (UTF-8 string) comparison predicate against a constant value.
+///
+/// Comparison uses lexicographic byte ordering (consistent with SQLite's
+/// BINARY collation).
+pub fn filter_batch_text(
+    batch: &Batch,
+    column_idx: usize,
+    op: CompareOp,
+    value: &str,
+) -> Result<SelectionVector, String> {
+    let column = batch
+        .columns()
+        .get(column_idx)
+        .ok_or_else(|| format!("column index {column_idx} out of bounds"))?;
+
+    let ColumnData::Text { offsets, data } = &column.data else {
+        return Err(format!(
+            "column {column_idx} is not Text, cannot apply text filter"
+        ));
+    };
+
+    let sel = batch.selection();
+    let simd_path = simd_path_label();
+    let value_bytes = value.as_bytes();
+
+    let mut result = Vec::with_capacity(sel.len());
+    for &idx in sel.as_slice() {
+        let row = usize::from(idx);
+        if !column.validity.is_valid(row) {
+            continue;
+        }
+        let start = offsets.get(row).copied().unwrap_or(0) as usize;
+        let end = offsets.get(row + 1).copied().unwrap_or(0) as usize;
+        let row_bytes = data.get(start..end).unwrap_or(&[]);
+        if compare_bytes(row_bytes, op, value_bytes) {
+            result.push(idx);
+        }
+    }
+
+    let input_rows = sel.len() as u64;
+    record_vectorized_rows(input_rows);
+
+    let _span = tracing::debug_span!(
+        "vectorized_batch",
+        batch_size = input_rows,
+        simd_path = simd_path,
+        op = "filter_text",
+    )
+    .entered();
+
+    Ok(SelectionVector::from_indices(result))
+}
+
+/// Apply a binary (blob) comparison predicate against a constant value.
+///
+/// Comparison uses raw byte ordering.  Only Eq and Ne are well-defined for
+/// binary data; the remaining operators use lexicographic byte order.
+pub fn filter_batch_binary(
+    batch: &Batch,
+    column_idx: usize,
+    op: CompareOp,
+    value: &[u8],
+) -> Result<SelectionVector, String> {
+    let column = batch
+        .columns()
+        .get(column_idx)
+        .ok_or_else(|| format!("column index {column_idx} out of bounds"))?;
+
+    let ColumnData::Binary { offsets, data } = &column.data else {
+        return Err(format!(
+            "column {column_idx} is not Binary, cannot apply binary filter"
+        ));
+    };
+
+    let sel = batch.selection();
+    let simd_path = simd_path_label();
+
+    let mut result = Vec::with_capacity(sel.len());
+    for &idx in sel.as_slice() {
+        let row = usize::from(idx);
+        if !column.validity.is_valid(row) {
+            continue;
+        }
+        let start = offsets.get(row).copied().unwrap_or(0) as usize;
+        let end = offsets.get(row + 1).copied().unwrap_or(0) as usize;
+        let row_bytes = data.get(start..end).unwrap_or(&[]);
+        if compare_bytes(row_bytes, op, value) {
+            result.push(idx);
+        }
+    }
+
+    let input_rows = sel.len() as u64;
+    record_vectorized_rows(input_rows);
+
+    let _span = tracing::debug_span!(
+        "vectorized_batch",
+        batch_size = input_rows,
+        simd_path = simd_path,
+        op = "filter_binary",
+    )
+    .entered();
+
+    Ok(SelectionVector::from_indices(result))
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Update SIMD utilization gauge based on the active path.
+fn update_filter_simd_utilization(simd_path: &str) {
+    let milli = match simd_path {
+        "avx2" => 750,
+        "sse2" => 400,
+        _ => 0,
+    };
+    set_vectorized_simd_utilization(milli);
+}
+
+#[inline]
+fn compare_i32(lhs: i32, op: CompareOp, rhs: i32) -> bool {
+    match op {
+        CompareOp::Eq => lhs == rhs,
+        CompareOp::Ne => lhs != rhs,
+        CompareOp::Lt => lhs < rhs,
+        CompareOp::Le => lhs <= rhs,
+        CompareOp::Gt => lhs > rhs,
+        CompareOp::Ge => lhs >= rhs,
+    }
+}
 
 #[inline]
 fn compare_i64(lhs: i64, op: CompareOp, rhs: i64) -> bool {
@@ -272,22 +509,30 @@ fn compare_f64(lhs: f64, op: CompareOp, rhs: f64) -> bool {
     }
 }
 
+#[inline]
+fn compare_bytes(lhs: &[u8], op: CompareOp, rhs: &[u8]) -> bool {
+    match op {
+        CompareOp::Eq => lhs == rhs,
+        CompareOp::Ne => lhs != rhs,
+        CompareOp::Lt => lhs < rhs,
+        CompareOp::Le => lhs <= rhs,
+        CompareOp::Gt => lhs > rhs,
+        CompareOp::Ge => lhs >= rhs,
+    }
+}
+
 /// Hash a single column value at a given row index.
 #[inline]
+#[allow(clippy::cast_sign_loss)]
 fn hash_column_value(data: &ColumnData, row: usize) -> u64 {
     match data {
         ColumnData::Int8(v) => v.as_slice().get(row).map_or(0, |&x| x as u64),
         ColumnData::Int16(v) => v.as_slice().get(row).map_or(0, |&x| x as u64),
         ColumnData::Int32(v) => v.as_slice().get(row).map_or(0, |&x| x as u64),
         ColumnData::Int64(v) => v.as_slice().get(row).map_or(0, |&x| x as u64),
-        ColumnData::Float32(v) => v.as_slice().get(row).map_or(0, |&x| x.to_bits() as u64),
+        ColumnData::Float32(v) => v.as_slice().get(row).map_or(0, |&x| u64::from(x.to_bits())),
         ColumnData::Float64(v) => v.as_slice().get(row).map_or(0, |&x| x.to_bits()),
-        ColumnData::Binary { offsets, data } => {
-            let start = offsets.get(row).copied().unwrap_or(0) as usize;
-            let end = offsets.get(row + 1).copied().unwrap_or(0) as usize;
-            fnv1a_bytes(data.get(start..end).unwrap_or(&[]))
-        }
-        ColumnData::Text { offsets, data } => {
+        ColumnData::Binary { offsets, data } | ColumnData::Text { offsets, data } => {
             let start = offsets.get(row).copied().unwrap_or(0) as usize;
             let end = offsets.get(row + 1).copied().unwrap_or(0) as usize;
             fnv1a_bytes(data.get(start..end).unwrap_or(&[]))
@@ -531,5 +776,361 @@ mod tests {
         );
         #[cfg(not(target_arch = "x86_64"))]
         assert_eq!(label, "scalar");
+    }
+
+    // ── Selection Vector Composition tests (bd-14vp7.3) ─────────────────
+
+    const BEAD_FILTER: &str = "bd-14vp7.3";
+
+    #[test]
+    fn and_selection_intersection() {
+        let a = SelectionVector::from_indices(vec![0, 1, 2, 3]);
+        let b = SelectionVector::from_indices(vec![1, 3, 4]);
+        let result = and_selection(&a, &b);
+        assert_eq!(
+            result.as_slice(),
+            &[1, 3],
+            "bead_id={BEAD_FILTER} case=and_intersection"
+        );
+    }
+
+    #[test]
+    fn and_selection_disjoint() {
+        let a = SelectionVector::from_indices(vec![0, 2]);
+        let b = SelectionVector::from_indices(vec![1, 3]);
+        let result = and_selection(&a, &b);
+        assert!(result.is_empty(), "bead_id={BEAD_FILTER} case=and_disjoint");
+    }
+
+    #[test]
+    fn and_selection_empty_input() {
+        let a = SelectionVector::from_indices(vec![0, 1, 2]);
+        let b = SelectionVector::from_indices(vec![]);
+        let result = and_selection(&a, &b);
+        assert!(
+            result.is_empty(),
+            "bead_id={BEAD_FILTER} case=and_empty_input"
+        );
+    }
+
+    #[test]
+    fn or_selection_union() {
+        let a = SelectionVector::from_indices(vec![0, 2]);
+        let b = SelectionVector::from_indices(vec![1, 2, 3]);
+        let result = or_selection(&a, &b);
+        assert_eq!(
+            result.as_slice(),
+            &[0, 1, 2, 3],
+            "bead_id={BEAD_FILTER} case=or_union"
+        );
+    }
+
+    #[test]
+    fn or_selection_identical() {
+        let a = SelectionVector::from_indices(vec![1, 3]);
+        let b = SelectionVector::from_indices(vec![1, 3]);
+        let result = or_selection(&a, &b);
+        assert_eq!(
+            result.as_slice(),
+            &[1, 3],
+            "bead_id={BEAD_FILTER} case=or_identical_no_dupes"
+        );
+    }
+
+    #[test]
+    fn or_selection_empty() {
+        let a = SelectionVector::from_indices(vec![]);
+        let b = SelectionVector::from_indices(vec![2, 5]);
+        let result = or_selection(&a, &b);
+        assert_eq!(
+            result.as_slice(),
+            &[2, 5],
+            "bead_id={BEAD_FILTER} case=or_empty_lhs"
+        );
+    }
+
+    #[test]
+    fn and_or_composition_multi_predicate() {
+        // Simulate: (val > 10) AND (val < 40) using composition.
+        let batch = int64_batch(&[5, 10, 20, 30, 40, 50]);
+        let gt10 = filter_batch_int64(&batch, 0, CompareOp::Gt, 10).unwrap();
+        let lt40 = filter_batch_int64(&batch, 0, CompareOp::Lt, 40).unwrap();
+        let result = and_selection(&gt10, &lt40);
+        // Rows 2 (20), 3 (30) match both predicates.
+        assert_eq!(
+            result.as_slice(),
+            &[2, 3],
+            "bead_id={BEAD_FILTER} case=and_composition"
+        );
+    }
+
+    #[test]
+    fn or_composition_multi_predicate() {
+        // Simulate: (val < 10) OR (val > 40) using composition.
+        let batch = int64_batch(&[5, 10, 20, 30, 40, 50]);
+        let lt10 = filter_batch_int64(&batch, 0, CompareOp::Lt, 10).unwrap();
+        let gt40 = filter_batch_int64(&batch, 0, CompareOp::Gt, 40).unwrap();
+        let result = or_selection(&lt10, &gt40);
+        // Row 0 (5) and row 5 (50).
+        assert_eq!(
+            result.as_slice(),
+            &[0, 5],
+            "bead_id={BEAD_FILTER} case=or_composition"
+        );
+    }
+
+    // ── Typed filter tests (bd-14vp7.3) ─────────────────────────────────
+
+    fn int32_batch(values: &[i32]) -> Batch {
+        let specs = vec![ColumnSpec::new("val", ColumnVectorType::Int32)];
+        let rows: Vec<Vec<SqliteValue>> = values
+            .iter()
+            .map(|&v| vec![SqliteValue::Integer(i64::from(v))])
+            .collect();
+        Batch::from_rows(&rows, &specs, DEFAULT_BATCH_ROW_CAPACITY).expect("batch should build")
+    }
+
+    fn text_batch(values: &[&str]) -> Batch {
+        let specs = vec![ColumnSpec::new("name", ColumnVectorType::Text)];
+        let rows: Vec<Vec<SqliteValue>> = values
+            .iter()
+            .map(|&v| vec![SqliteValue::Text(v.to_owned())])
+            .collect();
+        Batch::from_rows(&rows, &specs, DEFAULT_BATCH_ROW_CAPACITY).expect("batch should build")
+    }
+
+    fn binary_batch(values: &[&[u8]]) -> Batch {
+        let specs = vec![ColumnSpec::new("data", ColumnVectorType::Binary)];
+        let rows: Vec<Vec<SqliteValue>> = values
+            .iter()
+            .map(|v| vec![SqliteValue::Blob(v.to_vec())])
+            .collect();
+        Batch::from_rows(&rows, &specs, DEFAULT_BATCH_ROW_CAPACITY).expect("batch should build")
+    }
+
+    #[test]
+    fn filter_int32_eq() {
+        let batch = int32_batch(&[10, 20, 30, 20]);
+        let sel = filter_batch_int32(&batch, 0, CompareOp::Eq, 20).unwrap();
+        assert_eq!(
+            sel.as_slice(),
+            &[1, 3],
+            "bead_id={BEAD_FILTER} case=int32_eq"
+        );
+    }
+
+    #[test]
+    fn filter_int32_lt() {
+        let batch = int32_batch(&[5, 15, 25]);
+        let sel = filter_batch_int32(&batch, 0, CompareOp::Lt, 15).unwrap();
+        assert_eq!(sel.as_slice(), &[0], "bead_id={BEAD_FILTER} case=int32_lt");
+    }
+
+    #[test]
+    fn filter_int32_type_mismatch() {
+        let batch = int64_batch(&[1, 2]);
+        let err = filter_batch_int32(&batch, 0, CompareOp::Eq, 1).unwrap_err();
+        assert!(
+            err.contains("not Int32"),
+            "bead_id={BEAD_FILTER} case=int32_type_mismatch"
+        );
+    }
+
+    #[test]
+    fn filter_text_eq() {
+        let batch = text_batch(&["alice", "bob", "charlie", "alice"]);
+        let sel = filter_batch_text(&batch, 0, CompareOp::Eq, "alice").unwrap();
+        assert_eq!(
+            sel.as_slice(),
+            &[0, 3],
+            "bead_id={BEAD_FILTER} case=text_eq"
+        );
+    }
+
+    #[test]
+    fn filter_text_lt() {
+        let batch = text_batch(&["banana", "apple", "cherry"]);
+        let sel = filter_batch_text(&batch, 0, CompareOp::Lt, "banana").unwrap();
+        assert_eq!(sel.as_slice(), &[1], "bead_id={BEAD_FILTER} case=text_lt");
+    }
+
+    #[test]
+    fn filter_text_ge() {
+        let batch = text_batch(&["a", "b", "c", "d"]);
+        let sel = filter_batch_text(&batch, 0, CompareOp::Ge, "c").unwrap();
+        assert_eq!(
+            sel.as_slice(),
+            &[2, 3],
+            "bead_id={BEAD_FILTER} case=text_ge"
+        );
+    }
+
+    #[test]
+    fn filter_text_type_mismatch() {
+        let batch = int64_batch(&[1, 2]);
+        let err = filter_batch_text(&batch, 0, CompareOp::Eq, "x").unwrap_err();
+        assert!(
+            err.contains("not Text"),
+            "bead_id={BEAD_FILTER} case=text_type_mismatch"
+        );
+    }
+
+    #[test]
+    fn filter_binary_eq() {
+        let batch = binary_batch(&[&[1, 2], &[3, 4], &[1, 2]]);
+        let sel = filter_batch_binary(&batch, 0, CompareOp::Eq, &[1, 2]).unwrap();
+        assert_eq!(
+            sel.as_slice(),
+            &[0, 2],
+            "bead_id={BEAD_FILTER} case=binary_eq"
+        );
+    }
+
+    #[test]
+    fn filter_binary_ne() {
+        let batch = binary_batch(&[&[1, 2], &[3, 4], &[1, 2]]);
+        let sel = filter_batch_binary(&batch, 0, CompareOp::Ne, &[1, 2]).unwrap();
+        assert_eq!(sel.as_slice(), &[1], "bead_id={BEAD_FILTER} case=binary_ne");
+    }
+
+    #[test]
+    fn filter_binary_type_mismatch() {
+        let batch = int64_batch(&[1]);
+        let err = filter_batch_binary(&batch, 0, CompareOp::Eq, &[]).unwrap_err();
+        assert!(
+            err.contains("not Binary"),
+            "bead_id={BEAD_FILTER} case=binary_type_mismatch"
+        );
+    }
+
+    // ── NULL semantics tests (bd-14vp7.3) ───────────────────────────────
+
+    fn int64_batch_with_nulls(values: &[Option<i64>]) -> Batch {
+        let specs = vec![ColumnSpec::new("val", ColumnVectorType::Int64)];
+        let rows: Vec<Vec<SqliteValue>> = values
+            .iter()
+            .map(|v| match v {
+                Some(i) => vec![SqliteValue::Integer(*i)],
+                None => vec![SqliteValue::Null],
+            })
+            .collect();
+        Batch::from_rows(&rows, &specs, DEFAULT_BATCH_ROW_CAPACITY).expect("batch should build")
+    }
+
+    #[test]
+    fn filter_null_rows_excluded_from_eq() {
+        let batch = int64_batch_with_nulls(&[Some(10), None, Some(10), None]);
+        let sel = filter_batch_int64(&batch, 0, CompareOp::Eq, 10).unwrap();
+        // NULL rows are never selected.
+        assert_eq!(
+            sel.as_slice(),
+            &[0, 2],
+            "bead_id={BEAD_FILTER} case=null_excluded_eq"
+        );
+    }
+
+    #[test]
+    fn filter_null_rows_excluded_from_ne() {
+        let batch = int64_batch_with_nulls(&[Some(10), None, Some(20)]);
+        let sel = filter_batch_int64(&batch, 0, CompareOp::Ne, 10).unwrap();
+        // NULL is not != 10 either; NULL comparisons produce false.
+        assert_eq!(
+            sel.as_slice(),
+            &[2],
+            "bead_id={BEAD_FILTER} case=null_excluded_ne"
+        );
+    }
+
+    #[test]
+    fn filter_all_nulls_returns_empty() {
+        let batch = int64_batch_with_nulls(&[None, None, None]);
+        let sel = filter_batch_int64(&batch, 0, CompareOp::Ge, 0).unwrap();
+        assert!(
+            sel.is_empty(),
+            "bead_id={BEAD_FILTER} case=all_nulls_empty_result"
+        );
+    }
+
+    // ── SIMD utilization metric test (bd-14vp7.3) ───────────────────────
+
+    #[test]
+    fn filter_updates_simd_utilization() {
+        reset_vectorized_metrics();
+        let batch = int64_batch(&[10, 20, 30]);
+        let _ = filter_batch_int64(&batch, 0, CompareOp::Eq, 20).unwrap();
+        let metrics = vectorized_metrics_snapshot();
+        // On x86_64 with AVX2 or SSE2, utilization should be non-zero.
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            metrics.simd_utilization_milli > 0,
+            "bead_id={BEAD_FILTER} case=simd_utilization_nonzero"
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        assert_eq!(metrics.simd_utilization_milli, 0);
+    }
+
+    // ── Row-at-a-time equivalence proof (bd-14vp7.3) ────────────────────
+
+    #[test]
+    fn filter_matches_row_at_a_time_evaluation() {
+        // Build a batch and compute filter result both vectorized and row-at-a-time.
+        let values = [5_i64, 10, 15, 20, 25, 30, 35, 40];
+        let batch = int64_batch(&values);
+
+        // Vectorized result.
+        let vec_sel = filter_batch_int64(&batch, 0, CompareOp::Le, 20).unwrap();
+
+        // Row-at-a-time reference.
+        let row_sel: Vec<u16> = values
+            .iter()
+            .enumerate()
+            .filter(|&(_, v)| *v <= 20)
+            .map(|(i, _)| i as u16)
+            .collect();
+
+        assert_eq!(
+            vec_sel.as_slice(),
+            &row_sel,
+            "bead_id={BEAD_FILTER} case=vectorized_matches_row_at_a_time"
+        );
+    }
+
+    #[test]
+    fn filter_text_matches_row_at_a_time() {
+        let values = ["delta", "alpha", "gamma", "beta"];
+        let batch = text_batch(&values);
+        let vec_sel = filter_batch_text(&batch, 0, CompareOp::Lt, "delta").unwrap();
+
+        let row_sel: Vec<u16> = values
+            .iter()
+            .enumerate()
+            .filter(|&(_, v)| v.as_bytes() < "delta".as_bytes())
+            .map(|(i, _)| i as u16)
+            .collect();
+
+        assert_eq!(
+            vec_sel.as_slice(),
+            &row_sel,
+            "bead_id={BEAD_FILTER} case=text_vectorized_matches_row_at_a_time"
+        );
+    }
+
+    // ── Chained multi-predicate test (bd-14vp7.3) ───────────────────────
+
+    #[test]
+    fn chained_filter_on_multi_column_batch() {
+        let batch = multi_column_batch();
+        // id > 1 AND score < 16.0
+        let id_filter = filter_batch_int64(&batch, 0, CompareOp::Gt, 1).unwrap();
+        // Apply id_filter as selection before score filter.
+        let mut filtered_batch = batch.clone();
+        filtered_batch.apply_selection(id_filter).unwrap();
+        let score_filter = filter_batch_float64(&filtered_batch, 1, CompareOp::Lt, 16.0).unwrap();
+        // id=2/score=20 fails score<16, id=3/score=15.5 passes, id=4/score=5.0 passes.
+        assert_eq!(
+            score_filter.as_slice(),
+            &[2, 3],
+            "bead_id={BEAD_FILTER} case=chained_multi_column"
+        );
     }
 }
