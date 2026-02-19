@@ -519,6 +519,7 @@ mod tests {
     };
 
     use crossbeam_epoch as epoch;
+    use proptest::{prelude::*, test_runner::Config as ProptestConfig};
 
     use super::{
         EbrMetrics, GLOBAL_EBR_METRICS, StaleReaderConfig, VersionGuard, VersionGuardRegistry,
@@ -643,6 +644,80 @@ mod tests {
         }
 
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 2_500,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_deferred_retire_respects_pin_lifetime_and_eventually_reclaims(
+            deferred_count in 1_u8..33,
+        ) {
+            let registry = Arc::new(VersionGuardRegistry::default());
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let expected = usize::from(deferred_count);
+
+            {
+                let guard = VersionGuard::pin(Arc::clone(&registry));
+                for _ in 0..expected {
+                    guard.defer_retire(DropCounter(Arc::clone(&dropped)));
+                }
+                guard.flush();
+                prop_assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            }
+
+            for _ in 0..512 {
+                let flush_guard = epoch::pin();
+                flush_guard.flush();
+                if dropped.load(Ordering::SeqCst) == expected {
+                    break;
+                }
+                thread::yield_now();
+            }
+
+            prop_assert_eq!(dropped.load(Ordering::SeqCst), expected);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 1_000,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_thread_termination_does_not_lose_deferred_retirements(
+            deferred_count in 1_u8..17,
+        ) {
+            let registry = Arc::new(VersionGuardRegistry::default());
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let expected = usize::from(deferred_count);
+
+            let worker_registry = Arc::clone(&registry);
+            let worker_dropped = Arc::clone(&dropped);
+            let worker = thread::spawn(move || {
+                let ticket = VersionGuardTicket::register(worker_registry);
+                for _ in 0..expected {
+                    ticket.defer_retire(DropCounter(Arc::clone(&worker_dropped)));
+                }
+            });
+            worker.join().expect("worker thread must not panic");
+            prop_assert_eq!(registry.active_guard_count(), 0);
+
+            for _ in 0..512 {
+                let flush_guard = epoch::pin();
+                flush_guard.flush();
+                if dropped.load(Ordering::SeqCst) == expected {
+                    break;
+                }
+                thread::yield_now();
+            }
+
+            prop_assert_eq!(dropped.load(Ordering::SeqCst), expected);
+        }
     }
 
     // ===================================================================

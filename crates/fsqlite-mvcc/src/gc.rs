@@ -461,6 +461,7 @@ mod tests {
     use fsqlite_types::{
         CommitSeq, PageData, PageNumber, PageSize, PageVersion, TxnEpoch, TxnId, TxnToken,
     };
+    use proptest::{prelude::*, test_runner::Config as ProptestConfig};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -495,6 +496,23 @@ mod tests {
         }
         let head = *indices.last().expect("non-empty chain");
         (head, indices)
+    }
+
+    fn collect_chain_commit_seqs(
+        pgno: PageNumber,
+        arena: &VersionArena,
+        chain_heads: &HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
+    ) -> Vec<u64> {
+        let mut seqs = Vec::new();
+        let mut cur = chain_heads.get(&pgno).copied();
+        while let Some(idx) = cur {
+            let v = arena
+                .get(idx)
+                .expect("chain head/index must reference a live version");
+            seqs.push(v.commit_seq.get());
+            cur = v.prev.map(ptr_to_idx);
+        }
+        seqs
     }
 
     // -----------------------------------------------------------------------
@@ -1199,5 +1217,143 @@ mod tests {
             retained_len,
             active_txns + 1
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2y306.5: property tests for EBR/GC invariants under varied schedules
+    // -----------------------------------------------------------------------
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 10_000,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_gc_prune_preserves_horizon_visibility_and_expected_freed(
+            n in 1_u32..257,
+            horizon in 0_u64..301,
+        ) {
+            let mut arena = VersionArena::new();
+            let pgno = PageNumber::new(900).expect("fixed test pgno should be valid");
+            let (head, _) = build_chain(&mut arena, pgno, n);
+            let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+            chain_heads.insert(pgno, head);
+
+            let result = prune_page_chain(pgno, CommitSeq::new(horizon), &mut arena, &mut chain_heads);
+
+            let n_u64 = u64::from(n);
+            let expected_freed_u64 = if horizon == 0 {
+                0
+            } else {
+                horizon.saturating_sub(1).min(n_u64.saturating_sub(1))
+            };
+            let expected_freed = u32::try_from(expected_freed_u64).expect("bounded by n<=256");
+            prop_assert_eq!(result.freed, expected_freed);
+
+            // Keep floor is the oldest commit_seq still required by visibility.
+            let keep_floor = if horizon == 0 { 1 } else { horizon.min(n_u64) };
+            let retained = collect_chain_commit_seqs(pgno, &arena, &chain_heads);
+            let expected_retained_len = usize::try_from(n.saturating_sub(expected_freed))
+                .expect("u32 fits usize");
+            prop_assert_eq!(retained.len(), expected_retained_len);
+            prop_assert!(!retained.is_empty());
+            prop_assert_eq!(retained.iter().copied().min(), Some(keep_floor));
+            for seq in &retained {
+                prop_assert!(*seq >= keep_floor);
+                prop_assert!(*seq <= n_u64);
+            }
+
+            for (_, seq) in &result.pruned_keys {
+                prop_assert!(seq.get() < keep_floor);
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 2_500,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_gc_prune_monotonic_with_increasing_horizon(
+            n in 2_u32..257,
+            horizon_a in 0_u64..301,
+            horizon_b in 0_u64..301,
+        ) {
+            let low = horizon_a.min(horizon_b);
+            let high = horizon_a.max(horizon_b);
+
+            let pgno_step = PageNumber::new(901).expect("fixed test pgno should be valid");
+            let mut arena_step = VersionArena::new();
+            let (head_step, _) = build_chain(&mut arena_step, pgno_step, n);
+            let mut chain_heads_step = HashMap::with_hasher(PageNumberBuildHasher::default());
+            chain_heads_step.insert(pgno_step, head_step);
+
+            let r_low = prune_page_chain(
+                pgno_step,
+                CommitSeq::new(low),
+                &mut arena_step,
+                &mut chain_heads_step,
+            );
+            let r_high = prune_page_chain(
+                pgno_step,
+                CommitSeq::new(high),
+                &mut arena_step,
+                &mut chain_heads_step,
+            );
+            let retained_step = collect_chain_commit_seqs(pgno_step, &arena_step, &chain_heads_step);
+
+            let pgno_direct = PageNumber::new(902).expect("fixed test pgno should be valid");
+            let mut arena_direct = VersionArena::new();
+            let (head_direct, _) = build_chain(&mut arena_direct, pgno_direct, n);
+            let mut chain_heads_direct = HashMap::with_hasher(PageNumberBuildHasher::default());
+            chain_heads_direct.insert(pgno_direct, head_direct);
+
+            let r_direct = prune_page_chain(
+                pgno_direct,
+                CommitSeq::new(high),
+                &mut arena_direct,
+                &mut chain_heads_direct,
+            );
+            let retained_direct =
+                collect_chain_commit_seqs(pgno_direct, &arena_direct, &chain_heads_direct);
+
+            prop_assert_eq!(retained_step, retained_direct);
+            prop_assert_eq!(r_low.freed.saturating_add(r_high.freed), r_direct.freed);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 2_500,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_gc_chain_length_bounded_by_active_txns_plus_one(
+            n in 1_u32..513,
+            active_txns in 0_u32..65,
+        ) {
+            let mut arena = VersionArena::new();
+            let pgno = PageNumber::new(903).expect("fixed test pgno should be valid");
+            let (head, _) = build_chain(&mut arena, pgno, n);
+            let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+            chain_heads.insert(pgno, head);
+
+            let keep_u64 = u64::from(active_txns) + 1;
+            let n_u64 = u64::from(n);
+            let horizon = if n_u64 > keep_u64 {
+                CommitSeq::new(n_u64 - keep_u64 + 1)
+            } else {
+                CommitSeq::new(0)
+            };
+
+            let _ = prune_page_chain(pgno, horizon, &mut arena, &mut chain_heads);
+            let retained = collect_chain_commit_seqs(pgno, &arena, &chain_heads);
+            let keep_usize = usize::try_from(keep_u64).expect("bounded");
+            prop_assert!(retained.len() <= keep_usize);
+        }
     }
 }

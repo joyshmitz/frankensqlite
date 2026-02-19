@@ -5104,7 +5104,7 @@ mod tests {
         let after = GLOBAL_EBR_METRICS.snapshot();
 
         assert!(
-            after.retirements_deferred_total >= before.retirements_deferred_total + 1,
+            after.retirements_deferred_total > before.retirements_deferred_total,
             "publishing a replacement version should defer retirement of previous chain head"
         );
         assert_eq!(mgr.version_guard_registry().active_guard_count(), 0);

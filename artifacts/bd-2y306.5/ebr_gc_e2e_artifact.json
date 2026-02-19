@@ -1,0 +1,43 @@
+{
+  "bead_id": "bd-2y306.5",
+  "run_id": "bd-2y306.5-seed-20260218",
+  "trace_id": "20260218",
+  "scenario_id": "EBR-GC-1",
+  "seed": 20260218,
+  "overall_status": "pass",
+  "tests": [
+    {
+      "test_id": "mvcc_prop_horizon_visibility",
+      "crate": "fsqlite-mvcc",
+      "filter": "prop_gc_prune_preserves_horizon_visibility_and_expected_freed",
+      "status": "pass",
+      "elapsed_ms": 70883,
+      "log_path": "artifacts/bd-2y306.5/mvcc_prop_horizon_visibility.log"
+    },
+    {
+      "test_id": "ebr_prop_deferred_retire_lifetime",
+      "crate": "fsqlite-mvcc",
+      "filter": "prop_deferred_retire_respects_pin_lifetime_and_eventually_reclaims",
+      "status": "pass",
+      "elapsed_ms": 66234,
+      "log_path": "artifacts/bd-2y306.5/ebr_prop_deferred_retire_lifetime.log"
+    },
+    {
+      "test_id": "ebr_prop_thread_retirements",
+      "crate": "fsqlite-mvcc",
+      "filter": "prop_thread_termination_does_not_lose_deferred_retirements",
+      "status": "pass",
+      "elapsed_ms": 66444,
+      "log_path": "artifacts/bd-2y306.5/ebr_prop_thread_retirements.log"
+    },
+    {
+      "test_id": "file_backed_integrity_check",
+      "crate": "fsqlite-e2e",
+      "filter": "integrity_check_populates_report_for_file_db",
+      "status": "pass",
+      "elapsed_ms": 90388,
+      "log_path": "artifacts/bd-2y306.5/file_backed_integrity_check.log"
+    }
+  ],
+  "replay_command": "scripts/bd_2y306_5_ebr_gc_e2e.sh --json"
+}
