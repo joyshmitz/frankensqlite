@@ -158,10 +158,13 @@ pub struct LeapfrogMetricsSnapshot {
     pub fsqlite_leapfrog_tuples_total: u64,
     /// Total seek operations issued by Leapfrog across all executions.
     pub fsqlite_leapfrog_seeks_total: u64,
+    /// Total key comparisons performed by galloping/binary seek.
+    pub fsqlite_leapfrog_seek_comparisons_total: u64,
 }
 
 static FSQLITE_LEAPFROG_TUPLES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_LEAPFROG_SEEKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_LEAPFROG_SEEK_COMPARISONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot Leapfrog counters.
 #[must_use]
@@ -169,6 +172,8 @@ pub fn leapfrog_metrics_snapshot() -> LeapfrogMetricsSnapshot {
     LeapfrogMetricsSnapshot {
         fsqlite_leapfrog_tuples_total: FSQLITE_LEAPFROG_TUPLES_TOTAL.load(AtomicOrdering::Relaxed),
         fsqlite_leapfrog_seeks_total: FSQLITE_LEAPFROG_SEEKS_TOTAL.load(AtomicOrdering::Relaxed),
+        fsqlite_leapfrog_seek_comparisons_total: FSQLITE_LEAPFROG_SEEK_COMPARISONS_TOTAL
+            .load(AtomicOrdering::Relaxed),
     }
 }
 
@@ -176,6 +181,7 @@ pub fn leapfrog_metrics_snapshot() -> LeapfrogMetricsSnapshot {
 pub fn reset_leapfrog_metrics() {
     FSQLITE_LEAPFROG_TUPLES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_LEAPFROG_SEEKS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_LEAPFROG_SEEK_COMPARISONS_TOTAL.store(0, AtomicOrdering::Relaxed);
 }
 
 /// Errors produced by Leapfrog Triejoin execution.
@@ -547,6 +553,7 @@ impl<'a> TrieCursor<'a> {
                 node_index,
                 depth: 0,
             })?;
+        FSQLITE_LEAPFROG_SEEK_COMPARISONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         node.key
             .partial_cmp(target)
             .ok_or_else(|| TrieSeekError::NonComparableTarget {
@@ -680,6 +687,7 @@ fn lower_bound(
                 node_index: mid,
                 depth: 0,
             })?;
+        FSQLITE_LEAPFROG_SEEK_COMPARISONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         let ordering =
             node.key
                 .partial_cmp(target)
@@ -992,6 +1000,10 @@ mod tests {
             metrics.fsqlite_leapfrog_seeks_total >= 1,
             "seek metric should capture alignment seeks"
         );
+        assert!(
+            metrics.fsqlite_leapfrog_seek_comparisons_total >= 1,
+            "seek comparison metric should capture galloping/binary search work"
+        );
     }
 
     #[test]
@@ -1027,6 +1039,82 @@ mod tests {
         );
         assert_eq!(matches[0].tuple_multiplicity(), 1);
         assert_eq!(matches[1].tuple_multiplicity(), 1);
+    }
+
+    fn relation_with_common_and_unique_keys(
+        relation_index: usize,
+    ) -> Result<TrieRelation, TrieBuildError> {
+        let relation_index_i64 = i64::try_from(relation_index).expect("index should fit i64");
+        let mut rows = vec![
+            TrieRow::new(vec![SqliteValue::Integer(-100 - relation_index_i64)], 0),
+            TrieRow::new(vec![SqliteValue::Integer(10)], 1),
+            TrieRow::new(vec![SqliteValue::Integer(20)], 2),
+            TrieRow::new(vec![SqliteValue::Integer(30 + relation_index_i64)], 3),
+        ];
+        if relation_index % 2 == 0 {
+            rows.insert(3, TrieRow::new(vec![SqliteValue::Integer(20)], 4));
+        }
+        TrieRelation::from_sorted_rows(rows)
+    }
+
+    #[test]
+    fn leapfrog_join_supports_four_to_six_relations() {
+        for relation_width in 4..=6 {
+            let owned_relations: Vec<TrieRelation> = (0..relation_width)
+                .map(relation_with_common_and_unique_keys)
+                .collect::<Result<_, _>>()
+                .expect("relation build should succeed");
+            let relation_refs: Vec<&TrieRelation> = owned_relations.iter().collect();
+            let matches = leapfrog_join(&relation_refs).expect("join should succeed");
+            assert_eq!(matches.len(), 2, "expected two common keys for width={relation_width}");
+            assert_eq!(matches[0].key, vec![SqliteValue::Integer(10)]);
+            assert_eq!(matches[1].key, vec![SqliteValue::Integer(20)]);
+            assert_eq!(matches[0].tuple_multiplicity(), 1);
+            let expected_multiplicity = (0..relation_width).fold(
+                1_u64,
+                |product, relation_index| {
+                    if relation_index % 2 == 0 {
+                        product.saturating_mul(2)
+                    } else {
+                        product
+                    }
+                },
+            );
+            assert_eq!(
+                matches[1].tuple_multiplicity(),
+                expected_multiplicity,
+                "unexpected multiplicity for width={relation_width}"
+            );
+        }
+    }
+
+    #[test]
+    fn seek_galloping_comparisons_sublinear() {
+        reset_leapfrog_metrics();
+        let rows: Vec<TrieRow> = (0_usize..8_192_usize)
+            .map(|value| {
+                let key = i64::try_from(value).expect("key should fit i64");
+                TrieRow::new(vec![SqliteValue::Integer(key)], value)
+            })
+            .collect();
+        let trie = TrieRelation::from_sorted_rows(rows).expect("build should succeed");
+        let mut cursor = trie.open_root_cursor();
+        let before = leapfrog_metrics_snapshot().fsqlite_leapfrog_seek_comparisons_total;
+        let exact = cursor
+            .seek(&SqliteValue::Integer(8_000))
+            .expect("seek should succeed");
+        assert!(exact, "exact key should be found");
+        assert_eq!(cursor.current_key(), Some(&SqliteValue::Integer(8_000)));
+        let after = leapfrog_metrics_snapshot().fsqlite_leapfrog_seek_comparisons_total;
+        let comparisons = after.saturating_sub(before);
+        assert!(
+            comparisons > 0,
+            "seek should perform at least one key comparison"
+        );
+        assert!(
+            comparisons < 160,
+            "galloping seek should remain sublinear; comparisons={comparisons}"
+        );
     }
 
     #[test]
