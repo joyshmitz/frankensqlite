@@ -9,6 +9,9 @@
 #
 # Usage:
 #   ./scripts/verify_validation_manifest.sh [--json] [--seed <u64>] [--generated-unix-ms <u128>]
+#
+# Env:
+#   VALIDATION_MANIFEST_USE_RCH=1   Use `rch exec -- cargo run ...` for the runner invocations.
 
 set -euo pipefail
 
@@ -16,7 +19,7 @@ WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JSON_OUTPUT=false
 ROOT_SEED="${VALIDATION_MANIFEST_SEED:-424242}"
 GENERATED_UNIX_MS="${VALIDATION_MANIFEST_GENERATED_UNIX_MS:-1700000000000}"
-SCENARIO_ID="QUALITY-VALIDATION-MANIFEST"
+SCENARIO_ID="QUALITY-351"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,6 +57,9 @@ MANIFEST_A="$RUN_A/validation_manifest.json"
 MANIFEST_B="$RUN_B/validation_manifest.json"
 SUMMARY_A="$RUN_A/validation_manifest.md"
 SUMMARY_B="$RUN_B/validation_manifest.md"
+RUN_A_LOG="$RUN_A/validation_manifest_runner.log"
+RUN_B_LOG="$RUN_B/validation_manifest_runner.log"
+ARTIFACT_URI_PREFIX="artifacts/validation-manifest-e2e/shared"
 
 mkdir -p "$RUN_A" "$RUN_B"
 
@@ -61,7 +67,8 @@ COMMIT_SHA="$(git -C "$WORKSPACE_ROOT" rev-parse HEAD 2>/dev/null || echo unknow
 RUN_ID="bd-mblr.3.5.1-seed-${ROOT_SEED}"
 TRACE_ID="trace-$(printf '%s' "$RUN_ID" | sha256sum | awk '{print $1}' | cut -c1-16)"
 
-if command -v rch >/dev/null 2>&1; then
+USE_RCH_RUNNER="${VALIDATION_MANIFEST_USE_RCH:-0}"
+if [[ "${USE_RCH_RUNNER}" == "1" ]] && command -v rch >/dev/null 2>&1; then
     RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin validation_manifest_runner --)
 else
     RUNNER=(cargo run -p fsqlite-harness --bin validation_manifest_runner --)
@@ -77,19 +84,41 @@ COMMON_ARGS=(
     --generated-unix-ms "$GENERATED_UNIX_MS"
 )
 
-"${RUNNER[@]}" \
-    "${COMMON_ARGS[@]}" \
-    --output-dir "$RUN_A" \
-    --output-json "$MANIFEST_A" \
-    --output-human "$SUMMARY_A" \
-    --artifact-uri-prefix "artifacts/validation-manifest-e2e/run-a"
+run_manifest() {
+    local output_dir="$1"
+    local output_json="$2"
+    local output_human="$3"
+    local runner_log="$4"
+    local run_status
 
-"${RUNNER[@]}" \
-    "${COMMON_ARGS[@]}" \
-    --output-dir "$RUN_B" \
-    --output-json "$MANIFEST_B" \
-    --output-human "$SUMMARY_B" \
-    --artifact-uri-prefix "artifacts/validation-manifest-e2e/run-b"
+    set +e
+    "${RUNNER[@]}" \
+        "${COMMON_ARGS[@]}" \
+        --output-dir "$output_dir" \
+        --output-json "$output_json" \
+        --output-human "$output_human" \
+        --artifact-uri-prefix "$ARTIFACT_URI_PREFIX" \
+        >"$runner_log" 2>&1
+    run_status=$?
+    set -e
+
+    if [[ ${run_status} -ne 0 && ${run_status} -ne 1 ]]; then
+        echo "ERROR: validation_manifest_runner failed unexpectedly (exit=${run_status})" >&2
+        echo "----- runner log: ${runner_log} -----" >&2
+        cat "$runner_log" >&2
+        exit 1
+    fi
+
+    printf '%s' "${run_status}"
+}
+
+run_a_status="$(run_manifest "$RUN_A" "$MANIFEST_A" "$SUMMARY_A" "$RUN_A_LOG")"
+run_b_status="$(run_manifest "$RUN_B" "$MANIFEST_B" "$SUMMARY_B" "$RUN_B_LOG")"
+
+if [[ "${run_a_status}" != "${run_b_status}" ]]; then
+    echo "ERROR: validation manifest reruns produced different exit codes (run-a=${run_a_status}, run-b=${run_b_status})" >&2
+    exit 1
+fi
 
 if [[ ! -f "$MANIFEST_A" || ! -f "$MANIFEST_B" ]]; then
     echo "ERROR: manifest output missing" >&2
@@ -102,11 +131,13 @@ jq -e '
     (.commit_sha | length) > 0 and
     (.run_id | length) > 0 and
     (.trace_id | length) > 0 and
-    (.scenario_id == "QUALITY-VALIDATION-MANIFEST") and
+    (.scenario_id == "QUALITY-351") and
     (.gates | length) >= 5 and
     (.artifact_uris | length) >= 6 and
     (.replay.command | length) > 0 and
-    (.logging_conformance.log_validation.passed == true)
+    (.logging_conformance.gate_id == "bd-mblr.5.5.1") and
+    (.logging_conformance.log_validation.passed == true) and
+    (.logging_conformance.shell_script_conformance.overall_pass == true)
 ' "$MANIFEST_A" >/dev/null
 
 if ! diff -u "$MANIFEST_A" "$MANIFEST_B" >/dev/null; then
@@ -116,6 +147,14 @@ if ! diff -u "$MANIFEST_A" "$MANIFEST_B" >/dev/null; then
 fi
 
 REPLAY_COMMAND="$(jq -r '.replay.command' "$MANIFEST_A")"
+EXPECTED_REPLAY_COMMAND="cargo run -p fsqlite-harness --bin validation_manifest_runner -- --root-seed ${ROOT_SEED} --generated-unix-ms ${GENERATED_UNIX_MS} --commit-sha '${COMMIT_SHA}' --run-id '${RUN_ID}' --trace-id '${TRACE_ID}' --scenario-id '${SCENARIO_ID}' --artifact-uri-prefix '${ARTIFACT_URI_PREFIX}'"
+if [[ "${REPLAY_COMMAND}" != "${EXPECTED_REPLAY_COMMAND}" ]]; then
+    echo "ERROR: replay command mismatch (expected deterministic exact command)" >&2
+    echo "expected: ${EXPECTED_REPLAY_COMMAND}" >&2
+    echo "actual:   ${REPLAY_COMMAND}" >&2
+    exit 1
+fi
+
 GATE_COUNT="$(jq -r '.gates | length' "$MANIFEST_A")"
 ARTIFACT_COUNT="$(jq -r '.artifact_uris | length' "$MANIFEST_A")"
 OVERALL_OUTCOME="$(jq -r '.overall_outcome' "$MANIFEST_A")"
@@ -135,6 +174,10 @@ if $JSON_OUTPUT; then
   "manifest_b": "${MANIFEST_B#$WORKSPACE_ROOT/}",
   "summary_a": "${SUMMARY_A#$WORKSPACE_ROOT/}",
   "summary_b": "${SUMMARY_B#$WORKSPACE_ROOT/}",
+  "runner_log_a": "${RUN_A_LOG#$WORKSPACE_ROOT/}",
+  "runner_log_b": "${RUN_B_LOG#$WORKSPACE_ROOT/}",
+  "run_a_exit_code": ${run_a_status},
+  "run_b_exit_code": ${run_b_status},
   "gate_count": $GATE_COUNT,
   "artifact_count": $ARTIFACT_COUNT,
   "overall_outcome": "$OVERALL_OUTCOME",
@@ -155,6 +198,10 @@ else
     echo "Overall outcome:    $OVERALL_OUTCOME"
     echo "Manifest A:         ${MANIFEST_A#$WORKSPACE_ROOT/}"
     echo "Manifest B:         ${MANIFEST_B#$WORKSPACE_ROOT/}"
+    echo "Runner log A:       ${RUN_A_LOG#$WORKSPACE_ROOT/}"
+    echo "Runner log B:       ${RUN_B_LOG#$WORKSPACE_ROOT/}"
+    echo "Run A exit code:    ${run_a_status}"
+    echo "Run B exit code:    ${run_b_status}"
     echo "Deterministic:      PASS"
     echo "Replay command:"
     echo "  $REPLAY_COMMAND"
