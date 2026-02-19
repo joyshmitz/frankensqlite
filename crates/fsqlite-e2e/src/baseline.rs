@@ -53,7 +53,7 @@ pub enum Operation {
 impl Operation {
     /// Returns all 9 operations in canonical order.
     #[must_use]
-    pub const fn all() -> [Operation; 9] {
+    pub const fn all() -> [Self; 9] {
         [
             Self::SequentialScan,
             Self::PointLookup,
@@ -168,11 +168,7 @@ impl BaselineReport {
     /// Returns a list of regressions where p50 latency increased by more
     /// than `threshold` (e.g., 0.10 for 10%).
     #[must_use]
-    pub fn check_regression(
-        &self,
-        current: &BaselineReport,
-        threshold: f64,
-    ) -> Vec<RegressionResult> {
+    pub fn check_regression(&self, current: &Self, threshold: f64) -> Vec<RegressionResult> {
         let mut results = Vec::new();
 
         for old in &self.baselines {
@@ -300,7 +296,8 @@ where
         let start = std::time::Instant::now();
         f();
         let elapsed = start.elapsed();
-        samples_micros.push(elapsed.as_micros() as u64);
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        samples_micros.push(micros);
     }
 
     samples_micros.sort_unstable();
@@ -342,7 +339,9 @@ fn percentile(sorted: &[u64], pct: u32) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
-    let idx = ((f64::from(pct) / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    let last_index = sorted.len() - 1;
+    let pct_usize = usize::try_from(pct).map_or(100, |value| value.min(100));
+    let idx = pct_usize.saturating_mul(last_index).saturating_add(50) / 100;
     sorted[idx.min(sorted.len() - 1)]
 }
 
@@ -359,7 +358,7 @@ mod tests {
     fn operation_display_names_are_unique() {
         let names: Vec<&str> = Operation::all()
             .iter()
-            .map(|op| op.display_name())
+            .map(Operation::display_name)
             .collect();
         let mut deduped = names.clone();
         deduped.sort_unstable();

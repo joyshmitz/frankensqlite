@@ -88,7 +88,7 @@ pub mod workload;
 /// - Operation sequences
 /// - Database states
 /// - Corruption patterns (for COR-* scenarios)
-pub const FRANKEN_SEED: u64 = 0x4652_414E_4B45_4E; // "FRANKEN" as ASCII bytes
+pub const FRANKEN_SEED: u64 = 0x0046_5241_4E4B_454E; // "FRANKEN" as ASCII bytes
 
 /// Minimum valid seed value (0 is reserved for "use default").
 pub const SEED_MIN: u64 = 1;

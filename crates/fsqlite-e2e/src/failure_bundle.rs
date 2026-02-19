@@ -36,6 +36,9 @@ use crate::{FRANKEN_SEED, HarnessSettings};
 
 /// Current bundle schema version.
 pub const BUNDLE_SCHEMA_VERSION: &str = "1.0";
+const SECS_PER_DAY: u64 = 86_400;
+const SECS_PER_HOUR: u64 = 3_600;
+const SECS_PER_MIN: u64 = 60;
 
 // ─── Bundle Manifest (manifest.json) ────────────────────────────────────
 
@@ -246,8 +249,7 @@ impl FailureBundleBuilder {
     pub fn new(output_base: impl AsRef<Path>) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis());
         let bundle_id = format!("failure_{timestamp}");
         let output_dir = output_base.as_ref().join(&bundle_id);
 
@@ -263,12 +265,14 @@ impl FailureBundleBuilder {
     }
 
     /// Set the scenario information.
+    #[must_use]
     pub fn scenario(mut self, info: ScenarioInfo) -> Self {
         self.scenario = Some(info);
         self
     }
 
     /// Set reproducibility information with default seed.
+    #[must_use]
     pub fn reproducibility_default(mut self, scenario_id: &str) -> Self {
         self.reproducibility = Some(ReproducibilityInfo {
             seed: FRANKEN_SEED,
@@ -283,18 +287,21 @@ impl FailureBundleBuilder {
     }
 
     /// Set full reproducibility information.
+    #[must_use]
     pub fn reproducibility(mut self, info: ReproducibilityInfo) -> Self {
         self.reproducibility = Some(info);
         self
     }
 
     /// Set environment information.
+    #[must_use]
     pub fn environment(mut self, info: EnvironmentInfo) -> Self {
         self.environment = Some(info);
         self
     }
 
     /// Set environment from current system.
+    #[must_use]
     pub fn environment_auto(mut self, settings: &HarnessSettings) -> Self {
         let mut env_vars = HashMap::new();
         for key in ["E2E_SEED", "RUST_BACKTRACE", "RUST_LOG"] {
@@ -316,12 +323,14 @@ impl FailureBundleBuilder {
     }
 
     /// Set failure information.
+    #[must_use]
     pub fn failure(mut self, info: FailureInfo) -> Self {
         self.failure = Some(info);
         self
     }
 
     /// Add a file to the bundle.
+    #[must_use]
     pub fn add_file(
         mut self,
         relative_path: impl Into<String>,
@@ -339,6 +348,7 @@ impl FailureBundleBuilder {
     }
 
     /// Add a text file to the bundle.
+    #[must_use]
     pub fn add_text_file(
         self,
         relative_path: impl Into<String>,
@@ -354,6 +364,7 @@ impl FailureBundleBuilder {
     }
 
     /// Add a JSON file to the bundle.
+    #[must_use]
     pub fn add_json_file<T: Serialize>(
         self,
         relative_path: impl Into<String>,
@@ -412,7 +423,7 @@ impl FailureBundleBuilder {
                 scenario_id: "UNKNOWN".to_owned(),
                 scenario_name: "Unknown scenario".to_owned(),
                 category: "unknown".to_owned(),
-                test_command: "".to_owned(),
+                test_command: String::new(),
             }),
             reproducibility: self.reproducibility.unwrap_or_else(|| ReproducibilityInfo {
                 seed: FRANKEN_SEED,
@@ -421,7 +432,7 @@ impl FailureBundleBuilder {
                 fixture_id: None,
                 workload_preset: None,
                 worker_count: None,
-                replay_command: "".to_owned(),
+                replay_command: String::new(),
             }),
             environment: self.environment.unwrap_or_else(|| EnvironmentInfo {
                 fsqlite_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -471,8 +482,10 @@ fn rustc_version() -> String {
     std::process::Command::new("rustc")
         .arg("--version")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|_| "unknown".to_owned())
+        .map_or_else(
+            |_| "unknown".to_owned(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+        )
 }
 
 /// Infer the target triple from available environment constants.
@@ -512,10 +525,6 @@ fn iso8601_now() -> String {
     // Convert Unix timestamp to ISO 8601 format (UTC).
     // Simple implementation without external chrono crate.
     // Days since Unix epoch calculation.
-    const SECS_PER_DAY: u64 = 86400;
-    const SECS_PER_HOUR: u64 = 3600;
-    const SECS_PER_MIN: u64 = 60;
-
     let days_since_epoch = secs / SECS_PER_DAY;
     let remaining = secs % SECS_PER_DAY;
     let hour = remaining / SECS_PER_HOUR;
@@ -532,18 +541,18 @@ fn iso8601_now() -> String {
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
 fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     // Days in each month (non-leap year).
-    const DAYS_IN_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    const DAYS_IN_MONTH: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
-    fn is_leap_year(year: u32) -> bool {
+    fn is_leap_year(year: u64) -> bool {
         (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
     }
 
-    fn days_in_year(year: u32) -> u32 {
+    fn days_in_year(year: u64) -> u64 {
         if is_leap_year(year) { 366 } else { 365 }
     }
 
-    let mut remaining_days = days as u32;
-    let mut year = 1970u32;
+    let mut remaining_days = days;
+    let mut year: u64 = 1970;
 
     // Find the year.
     loop {
@@ -556,7 +565,7 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     }
 
     // Find the month.
-    let mut month = 1u32;
+    let mut month: u64 = 1;
     for (i, &days_in_month) in DAYS_IN_MONTH.iter().enumerate() {
         let days_this_month = if i == 1 && is_leap_year(year) {
             29
@@ -572,25 +581,28 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
 
     let day = remaining_days + 1; // Days are 1-indexed.
 
-    (year, month, day)
+    (
+        u32::try_from(year).unwrap_or(u32::MAX),
+        u32::try_from(month).unwrap_or(12),
+        u32::try_from(day).unwrap_or(31),
+    )
 }
 
 fn generate_repro_script(manifest: &FailureBundleManifest) -> String {
+    use std::fmt::Write as _;
+
     let mut script = String::new();
     script.push_str("#!/bin/bash\n");
     script.push_str("# Reproduction script for failure bundle\n");
-    script.push_str(&format!("# Bundle ID: {}\n", manifest.bundle_id));
-    script.push_str(&format!("# Scenario: {}\n", manifest.scenario.scenario_id));
-    script.push_str("\n");
+    let _ = writeln!(script, "# Bundle ID: {}", manifest.bundle_id);
+    let _ = writeln!(script, "# Scenario: {}", manifest.scenario.scenario_id);
+    script.push('\n');
     script.push_str("set -e\n");
-    script.push_str("\n");
-    script.push_str(&format!(
-        "export E2E_SEED={}\n",
-        manifest.reproducibility.seed
-    ));
-    script.push_str("\n");
+    script.push('\n');
+    let _ = writeln!(script, "export E2E_SEED={}", manifest.reproducibility.seed);
+    script.push('\n');
     script.push_str("# Replay command:\n");
-    script.push_str(&format!("{}\n", manifest.reproducibility.replay_command));
+    let _ = writeln!(script, "{}", manifest.reproducibility.replay_command);
     script
 }
 
