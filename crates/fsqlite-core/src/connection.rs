@@ -2560,105 +2560,42 @@ impl Connection {
         let long_running_count = metrics
             .long_running_count
             .saturating_add(active_long_running);
-
-        vec![
-            Row {
+        let entries = [
+            ("active_count", active_count),
+            ("avg_duration_ms", avg_duration_ms),
+            ("long_running_count", long_running_count),
+            ("max_snapshot_age_ms", max_snapshot_age_ms),
+            ("first_read_ms", first_read_ms),
+            ("first_write_ms", first_write_ms),
+            ("read_ops", metrics.active_read_ops),
+            ("write_ops", metrics.active_write_ops),
+            ("savepoint_depth", metrics.active_savepoint_depth),
+            ("rollback_count_active", metrics.active_rollbacks),
+            ("rollback_count_total", metrics.rollback_count_total),
+            ("long_txn_threshold_ms", metrics.long_txn_threshold_ms),
+            (
+                "advisor_large_read_ops_threshold",
+                metrics.advisor_large_read_ops_threshold,
+            ),
+            (
+                "advisor_savepoint_depth_threshold",
+                metrics.advisor_savepoint_depth_threshold,
+            ),
+            (
+                "advisor_rollback_ratio_percent",
+                metrics.advisor_rollback_ratio_percent,
+            ),
+            ("completed_count", metrics.completed_count),
+        ];
+        entries
+            .into_iter()
+            .map(|(name, value)| Row {
                 values: vec![
-                    SqliteValue::Text("active_count".into()),
-                    SqliteValue::Integer(to_i64(active_count)),
+                    SqliteValue::Text(name.to_owned()),
+                    SqliteValue::Integer(to_i64(value)),
                 ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("avg_duration_ms".into()),
-                    SqliteValue::Integer(to_i64(avg_duration_ms)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("long_running_count".into()),
-                    SqliteValue::Integer(to_i64(long_running_count)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("max_snapshot_age_ms".into()),
-                    SqliteValue::Integer(to_i64(max_snapshot_age_ms)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("first_read_ms".into()),
-                    SqliteValue::Integer(to_i64(first_read_ms)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("first_write_ms".into()),
-                    SqliteValue::Integer(to_i64(first_write_ms)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("read_ops".into()),
-                    SqliteValue::Integer(to_i64(metrics.active_read_ops)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("write_ops".into()),
-                    SqliteValue::Integer(to_i64(metrics.active_write_ops)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("savepoint_depth".into()),
-                    SqliteValue::Integer(to_i64(metrics.active_savepoint_depth)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("rollback_count_active".into()),
-                    SqliteValue::Integer(to_i64(metrics.active_rollbacks)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("rollback_count_total".into()),
-                    SqliteValue::Integer(to_i64(metrics.rollback_count_total)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("long_txn_threshold_ms".into()),
-                    SqliteValue::Integer(to_i64(metrics.long_txn_threshold_ms)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("advisor_large_read_ops_threshold".into()),
-                    SqliteValue::Integer(to_i64(metrics.advisor_large_read_ops_threshold)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("advisor_savepoint_depth_threshold".into()),
-                    SqliteValue::Integer(to_i64(metrics.advisor_savepoint_depth_threshold)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("advisor_rollback_ratio_percent".into()),
-                    SqliteValue::Integer(to_i64(metrics.advisor_rollback_ratio_percent)),
-                ],
-            },
-            Row {
-                values: vec![
-                    SqliteValue::Text("completed_count".into()),
-                    SqliteValue::Integer(to_i64(metrics.completed_count)),
-                ],
-            },
-        ]
+            })
+            .collect()
     }
 
     fn txn_live_rows(&self) -> Vec<Row> {
