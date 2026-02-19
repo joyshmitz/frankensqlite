@@ -2772,6 +2772,54 @@ impl Connection {
         rows
     }
 
+    fn txn_timeline_json_rows(&self) -> Vec<Row> {
+        let metrics = self.txn_lifecycle_metrics.borrow();
+        let active = if metrics.active_started_at.is_some() {
+            "true"
+        } else {
+            "false"
+        };
+        let snapshot = format!(
+            concat!(
+                "{{",
+                "\"active\":{},",
+                "\"snapshot_age_ms\":{},",
+                "\"first_read_ms\":{},",
+                "\"first_write_ms\":{},",
+                "\"read_ops\":{},",
+                "\"write_ops\":{},",
+                "\"savepoint_depth\":{},",
+                "\"active_rollbacks\":{},",
+                "\"completed_count\":{},",
+                "\"rollback_count_total\":{},",
+                "\"advisor\":{{",
+                "\"long_txn_threshold_ms\":{},",
+                "\"large_read_ops_threshold\":{},",
+                "\"savepoint_depth_threshold\":{},",
+                "\"rollback_ratio_percent_threshold\":{}",
+                "}}",
+                "}}"
+            ),
+            active,
+            metrics.current_snapshot_age_ms(),
+            metrics.current_first_read_ms(),
+            metrics.current_first_write_ms(),
+            metrics.active_read_ops,
+            metrics.active_write_ops,
+            metrics.active_savepoint_depth,
+            metrics.active_rollbacks,
+            metrics.completed_count,
+            metrics.rollback_count_total,
+            metrics.long_txn_threshold_ms,
+            metrics.advisor_large_read_ops_threshold,
+            metrics.advisor_savepoint_depth_threshold,
+            metrics.advisor_rollback_ratio_percent,
+        );
+        vec![Row {
+            values: vec![SqliteValue::Text(snapshot)],
+        }]
+    }
+
     // ── autocommit pager transaction wrapping (bd-14dj / 5B.5) ──────────
 
     /// Ensure a pager transaction is active.  If the connection is NOT
@@ -4946,6 +4994,9 @@ impl Connection {
             "fsqlite.txn_stats" | "txn_stats" | "fsqlite_txn_stats" => Ok(self.txn_metrics_rows()),
             "fsqlite.transactions" | "transactions" | "fsqlite_transactions" => {
                 Ok(self.txn_live_rows())
+            }
+            "fsqlite.txn_timeline_json" | "txn_timeline_json" | "fsqlite_txn_timeline_json" => {
+                Ok(self.txn_timeline_json_rows())
             }
             "fsqlite.txn_advisor" | "txn_advisor" | "fsqlite_txn_advisor" => {
                 Ok(self.txn_advisor_rows())
@@ -20375,6 +20426,59 @@ mod schema_loading_tests {
         conn.execute("COMMIT;").unwrap();
         let after_rows = conn.query("PRAGMA fsqlite_transactions;").unwrap();
         assert!(after_rows.is_empty(), "committed transaction should disappear");
+    }
+
+    #[test]
+    fn test_pragma_txn_timeline_json_tracks_active_and_committed_states() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.query("SELECT 1;").unwrap();
+        conn.execute("SAVEPOINT s1;").unwrap();
+        conn.execute("ROLLBACK TO SAVEPOINT s1;").unwrap();
+
+        let active_rows = conn.query("PRAGMA txn_timeline_json;").unwrap();
+        assert_eq!(active_rows.len(), 1);
+        let active_payload = match active_rows[0].values().first() {
+            Some(SqliteValue::Text(payload)) => payload,
+            other => panic!("expected timeline payload text, got {other:?}"),
+        };
+        assert!(
+            active_payload.contains("\"active\":true"),
+            "expected active=true in timeline payload: {active_payload}"
+        );
+        assert!(
+            active_payload.contains("\"read_ops\":"),
+            "expected read_ops field in timeline payload: {active_payload}"
+        );
+        assert!(
+            active_payload.contains("\"savepoint_depth\":1"),
+            "expected savepoint_depth=1 in timeline payload: {active_payload}"
+        );
+        assert!(
+            active_payload.contains("\"active_rollbacks\":1"),
+            "expected active_rollbacks=1 in timeline payload: {active_payload}"
+        );
+
+        conn.execute("COMMIT;").unwrap();
+        let committed_rows = conn.query("PRAGMA fsqlite.txn_timeline_json;").unwrap();
+        assert_eq!(committed_rows.len(), 1);
+        let committed_payload = match committed_rows[0].values().first() {
+            Some(SqliteValue::Text(payload)) => payload,
+            other => panic!("expected timeline payload text, got {other:?}"),
+        };
+        assert!(
+            committed_payload.contains("\"active\":false"),
+            "expected active=false in timeline payload after commit: {committed_payload}"
+        );
+        assert!(
+            committed_payload.contains("\"completed_count\":1"),
+            "expected completed_count=1 after commit: {committed_payload}"
+        );
+        assert!(
+            committed_payload.contains("\"active_rollbacks\":0"),
+            "expected active_rollbacks=0 after commit: {committed_payload}"
+        );
     }
 
     #[test]
