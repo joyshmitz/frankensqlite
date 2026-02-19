@@ -193,7 +193,7 @@ fn is_bisect_ready_requires_range_and_strategy() {
         "run-ready-1",
         "2026-02-13T10:15:00Z",
         "cargo test",
-        criteria.clone(),
+        criteria,
     );
     assert!(
         !manifest.is_bisect_ready(),

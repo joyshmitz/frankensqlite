@@ -71,7 +71,11 @@ fn pipeline_stages_comprehensive() {
 #[test]
 fn parity_score_full() {
     let report = assess_sql_semantic_differential(&SqlSemanticDiffConfig::default());
-    assert_eq!(report.parity_score, 1.0, "bead_id={BEAD_ID} case=score");
+    assert!(
+        (report.parity_score - 1.0).abs() < f64::EPSILON,
+        "bead_id={BEAD_ID} case=score got={}",
+        report.parity_score
+    );
     assert_eq!(
         report.checks_at_parity, report.total_checks,
         "bead_id={BEAD_ID} case=all_pass",
@@ -106,7 +110,12 @@ fn report_json_roundtrip() {
     let json = report.to_json().expect("serialize");
     let parsed = SqlSemanticDiffReport::from_json(&json).expect("parse");
     assert_eq!(parsed.verdict, report.verdict);
-    assert_eq!(parsed.parity_score, report.parity_score);
+    assert!(
+        (parsed.parity_score - report.parity_score).abs() < f64::EPSILON,
+        "bead_id={BEAD_ID} case=parity_score_roundtrip parsed={} report={}",
+        parsed.parity_score,
+        report.parity_score
+    );
 }
 
 #[test]

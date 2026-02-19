@@ -37,6 +37,7 @@ impl CrashScenario {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct ScenarioRunArtifact {
     scenario: String,
     crash_point: usize,

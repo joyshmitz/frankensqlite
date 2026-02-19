@@ -11,7 +11,7 @@ use fsqlite_harness::ci_gate_matrix::{
     ArtifactEntry, ArtifactKind, CiLane, build_artifact_manifest_with_contract,
 };
 use fsqlite_harness::confidence_gates::{
-    apply_contract_outcome_to_gate_report, build_evidence_ledger, evaluate_full,
+    GateConfig, apply_contract_outcome_to_gate_report, build_evidence_ledger, evaluate_full,
 };
 use fsqlite_harness::parity_evidence_matrix::{
     EvidenceSummary, EvidenceViolation, EvidenceViolationKind, ParityEvidenceReport,
@@ -26,7 +26,7 @@ use fsqlite_harness::verification_contract_enforcement::{
 };
 
 const BEAD_ID: &str = "bd-1dp9.7.7";
-const SEED: u64 = 20260213;
+const SEED: u64 = 20_260_213;
 
 fn synthetic_parity_report(violations: Vec<EvidenceViolation>) -> ParityEvidenceReport {
     ParityEvidenceReport {
@@ -161,11 +161,11 @@ fn e2e_scorecard_release_blocked_when_contract_missing() {
 fn e2e_release_handoff_ledger_carries_contract_verdict() {
     let catalog = build_canonical_catalog();
     let universe = build_canonical_universe();
-    let (report, ranking) = evaluate_full(&catalog, &universe, &Default::default());
+    let (report, ranking) = evaluate_full(&catalog, &universe, &GateConfig::default());
     let contract =
         classify_parity_evidence_report(&synthetic_parity_report(vec![missing_violation()]));
     let enforcement = enforce_gate_decision(true, &contract);
-    let enforced_report = apply_contract_outcome_to_gate_report(report, enforcement.clone());
+    let enforced_report = apply_contract_outcome_to_gate_report(report, enforcement);
     let ledger = build_evidence_ledger(&enforced_report, &ranking);
 
     let ledger_contract = ledger

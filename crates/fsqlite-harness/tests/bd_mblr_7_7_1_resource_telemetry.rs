@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fsqlite_harness::soak_executor::{TelemetryBoundary, run_soak};
+use fsqlite_harness::soak_executor::{SoakRunReport, TelemetryBoundary, run_soak};
 use fsqlite_harness::soak_profiles::{SoakWorkloadSpec, profile_light};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -48,15 +48,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{digest:x}")
 }
 
-#[test]
-fn soak_lane_emits_normalized_resource_telemetry() -> Result<(), String> {
-    let mut profile = profile_light();
-    profile.target_transactions = 240;
-    profile.invariant_check_interval = 60;
-    profile.scenario_ids = vec!["LEAK-HEAP".to_owned(), "LEAK-WAL".to_owned()];
-    let spec = SoakWorkloadSpec::from_profile(profile, RESOURCE_SEED);
+#[derive(Debug)]
+struct ResourceTelemetrySummary {
+    run_id: String,
+    scenarios: BTreeSet<String>,
+    startup_count: usize,
+    steady_state_count: usize,
+    teardown_count: usize,
+}
 
-    let report = run_soak(spec);
+fn summarize_resource_telemetry(
+    report: &SoakRunReport,
+) -> Result<ResourceTelemetrySummary, String> {
     assert!(
         !report.resource_telemetry.is_empty(),
         "bead_id={BEAD_ID} case=resource_telemetry_nonempty"
@@ -92,12 +95,13 @@ fn soak_lane_emits_normalized_resource_telemetry() -> Result<(), String> {
     );
     let run_id = run_ids
         .first()
-        .ok_or_else(|| format!("bead_id={BEAD_ID} case=missing_run_id"))?;
+        .ok_or_else(|| format!("bead_id={BEAD_ID} case=missing_run_id"))?
+        .to_string();
 
-    let scenarios: BTreeSet<&str> = report
+    let scenarios: BTreeSet<String> = report
         .resource_telemetry
         .iter()
-        .map(|record| record.scenario_id.as_str())
+        .map(|record| record.scenario_id.clone())
         .collect();
     assert!(
         scenarios.contains("LEAK-HEAP"),
@@ -120,34 +124,43 @@ fn soak_lane_emits_normalized_resource_telemetry() -> Result<(), String> {
         previous_sequence = Some(record.sequence);
     }
 
-    let startup_count = report
-        .resource_telemetry
-        .iter()
-        .filter(|record| record.boundary == TelemetryBoundary::Startup)
-        .count();
-    let steady_state_count = report
-        .resource_telemetry
-        .iter()
-        .filter(|record| record.boundary == TelemetryBoundary::SteadyState)
-        .count();
-    let teardown_count = report
-        .resource_telemetry
-        .iter()
-        .filter(|record| record.boundary == TelemetryBoundary::Teardown)
-        .count();
+    Ok(ResourceTelemetrySummary {
+        run_id,
+        scenarios,
+        startup_count: report
+            .resource_telemetry
+            .iter()
+            .filter(|record| record.boundary == TelemetryBoundary::Startup)
+            .count(),
+        steady_state_count: report
+            .resource_telemetry
+            .iter()
+            .filter(|record| record.boundary == TelemetryBoundary::SteadyState)
+            .count(),
+        teardown_count: report
+            .resource_telemetry
+            .iter()
+            .filter(|record| record.boundary == TelemetryBoundary::Teardown)
+            .count(),
+    })
+}
 
+fn write_resource_telemetry_artifact(
+    report: &SoakRunReport,
+    summary: &ResourceTelemetrySummary,
+) -> Result<(PathBuf, String), String> {
     let artifact = json!({
         "bead_id": BEAD_ID,
         "log_standard_ref": LOG_STANDARD_REF,
-        "run_id": run_id,
+        "run_id": summary.run_id,
         "seed": RESOURCE_SEED,
         "records_total": report.resource_telemetry.len(),
         "boundary_counts": {
-            "startup": startup_count,
-            "steady_state": steady_state_count,
-            "teardown": teardown_count
+            "startup": summary.startup_count,
+            "steady_state": summary.steady_state_count,
+            "teardown": summary.teardown_count
         },
-        "scenario_ids": scenarios,
+        "scenario_ids": summary.scenarios,
         "records": report.resource_telemetry
     });
     let artifact_bytes = serde_json::to_vec_pretty(&artifact).map_err(|error| {
@@ -164,16 +177,33 @@ fn soak_lane_emits_normalized_resource_telemetry() -> Result<(), String> {
         )
     })?;
 
+    Ok((artifact_path, artifact_sha256))
+}
+
+#[test]
+fn soak_lane_emits_normalized_resource_telemetry() -> Result<(), String> {
+    let mut profile = profile_light();
+    profile.target_transactions = 240;
+    profile.invariant_check_interval = 60;
+    profile.scenario_ids = vec!["LEAK-HEAP".to_owned(), "LEAK-WAL".to_owned()];
+    let spec = SoakWorkloadSpec::from_profile(profile, RESOURCE_SEED);
+
+    let report = run_soak(spec);
+    let summary = summarize_resource_telemetry(&report)?;
+    let (artifact_path, artifact_sha256) = write_resource_telemetry_artifact(&report, &summary)?;
+
     eprintln!(
-        "DEBUG bead_id={BEAD_ID} phase=resource_telemetry_soak_lane run_id={run_id} seed={RESOURCE_SEED} reference={LOG_STANDARD_REF} artifact_path={} artifact_sha256={artifact_sha256}",
+        "DEBUG bead_id={BEAD_ID} phase=resource_telemetry_soak_lane run_id={} seed={RESOURCE_SEED} reference={LOG_STANDARD_REF} artifact_path={} artifact_sha256={artifact_sha256}",
+        summary.run_id,
         artifact_path.display()
     );
     eprintln!(
-        "INFO bead_id={BEAD_ID} phase=resource_telemetry_soak_lane run_id={run_id} records_total={} startup={} steady_state={} teardown={}",
+        "INFO bead_id={BEAD_ID} phase=resource_telemetry_soak_lane run_id={} records_total={} startup={} steady_state={} teardown={}",
+        summary.run_id,
         report.resource_telemetry.len(),
-        startup_count,
-        steady_state_count,
-        teardown_count
+        summary.startup_count,
+        summary.steady_state_count,
+        summary.teardown_count
     );
 
     Ok(())

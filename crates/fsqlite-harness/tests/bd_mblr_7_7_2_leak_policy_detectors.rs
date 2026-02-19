@@ -82,6 +82,7 @@ fn make_record(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn leak_detector_classifies_synthetic_signatures_and_writes_report_artifact() -> Result<(), String>
 {
     let records = vec![
@@ -181,7 +182,7 @@ fn leak_detector_classifies_synthetic_signatures_and_writes_report_artifact() ->
     let triage_lines: Vec<String> = report
         .findings
         .iter()
-        .map(|finding| finding.triage_line())
+        .map(fsqlite_harness::soak_executor::LeakDetectorFinding::triage_line)
         .collect();
     assert!(
         triage_lines

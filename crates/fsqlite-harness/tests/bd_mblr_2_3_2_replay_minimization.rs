@@ -21,7 +21,7 @@ fn make_entry(id: &str, outcome: Outcome) -> ReplayEntryResult {
         entry_id: id.to_owned(),
         outcome,
         statements_total: 10,
-        statements_mismatched: if outcome == Outcome::Divergence { 1 } else { 0 },
+        statements_mismatched: usize::from(outcome == Outcome::Divergence),
         mismatch_rate: if outcome == Outcome::Divergence {
             0.1
         } else {
@@ -54,7 +54,7 @@ fn test_bd_mblr_2_3_2_replay_minimization_package_contract() {
             sensitivity_threshold: 0.5,
             ..DriftDetectorConfig::default()
         },
-        base_seed: 20260213,
+        base_seed: 20_260_213,
         ..ReplayConfig::default()
     };
     let mut session = ReplaySession::new(config);
@@ -93,7 +93,7 @@ fn test_bd_mblr_2_3_2_replay_minimization_package_contract() {
         .expect("bead_id=bd-mblr.2.3.2 package should be produced");
 
     assert_eq!(package.run_id, "run-bd-mblr-2-3-2");
-    assert_eq!(package.base_seed, 20260213);
+    assert_eq!(package.base_seed, 20_260_213);
     assert_eq!(
         package.evidence.before.evidence_hash, summary.summary_hash,
         "bead_id={BEAD_ID} case=before_hash",

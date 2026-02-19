@@ -105,7 +105,7 @@ fn build_realistic_event_stream() -> Vec<LogEventSchema> {
 
     // Phase 5: Report with artifact
     events.push(LogEventSchema {
-        run_id: run_id.clone(),
+        run_id,
         timestamp: "2026-02-13T09:00:08.000Z".to_owned(),
         phase: LogPhase::Report,
         event_type: LogEventType::ArtifactGenerated,
@@ -341,14 +341,11 @@ fn e2e_validation_diagnostics_ci_output() {
         "bead_id={BEAD_ID} case=ci_diagnostics should fail with missing seed for fail event",
     );
 
-    // Should have errors
-    let errors: Vec<_> = report
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == DiagnosticSeverity::Error)
-        .collect();
     assert!(
-        !errors.is_empty(),
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error),
         "bead_id={BEAD_ID} case=ci_errors should have errors",
     );
 

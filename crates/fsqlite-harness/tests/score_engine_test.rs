@@ -10,7 +10,7 @@
 //! - JSON serialisation round-trip
 //! - Score determinism across runs
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use fsqlite_harness::parity_taxonomy::{
@@ -33,7 +33,10 @@ fn build_uniform_universe(status: ParityStatus, count_per_category: usize) -> Fe
     let mut features = BTreeMap::new();
     for cat in FeatureCategory::ALL {
         for i in 0..count_per_category {
-            let id = FeatureId::new(cat.prefix(), (i + 1) as u16);
+            let id = FeatureId::new(
+                cat.prefix(),
+                u16::try_from(i + 1).expect("feature index must fit in u16"),
+            );
             let mut feat = Feature {
                 id: id.clone(),
                 title: format!("{} feature {}", cat.display_name(), i + 1),
@@ -43,7 +46,7 @@ fn build_uniform_universe(status: ParityStatus, count_per_category: usize) -> Fe
                 status,
                 exclusion: None,
                 observability: ObservabilityMapping::default(),
-                tags: Default::default(),
+                tags: BTreeSet::new(),
             };
             if status == ParityStatus::Excluded {
                 feat.exclusion = Some(ExclusionRationale {

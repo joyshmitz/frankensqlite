@@ -101,7 +101,7 @@ fn multiple_reopen_cycles_no_data_loss() {
 
     for cycle in 0..5 {
         let conn = Connection::open(&db_str).expect("reopen");
-        let id = i64::try_from(cycle + 2).expect("i64");
+        let id = i64::from(cycle + 2);
         conn.execute_with_params(
             "INSERT INTO t1 VALUES (?, ?)",
             &[
@@ -489,7 +489,7 @@ fn alternating_commit_rollback_cycles_with_reopen() {
     // 10 cycles: even → commit, odd → rollback. Reopen between each.
     for cycle in 0..10 {
         let conn = Connection::open(&db_str).expect("reopen");
-        let id = i64::try_from(cycle + 1).expect("i64");
+        let id = i64::from(cycle + 1);
         conn.execute("BEGIN").expect("begin");
         conn.execute_with_params(
             "INSERT INTO t1 VALUES (?, ?)",

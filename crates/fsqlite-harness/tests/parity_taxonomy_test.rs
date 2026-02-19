@@ -203,11 +203,11 @@ fn taxonomy_parity_score_is_deterministic() {
 
     // Print current score for observability
     eprintln!(
-        "Parity score: {:.4} ({:.1}%) \u{2014} {}/{} weight points passing",
+        "Parity score: {:.4} ({:.1}%) \u{2014} {:.0}/{:.0} weight points passing",
         score,
         score * 100.0,
-        passing_weight as u32,
-        total_weight as u32
+        passing_weight,
+        total_weight
     );
 }
 

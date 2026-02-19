@@ -12,6 +12,7 @@ use fsqlite_ext_rtree as rtree_ext;
 use fsqlite_ext_session as session_ext;
 use fsqlite_func::scalar::ScalarFunction;
 use fsqlite_types::SqliteValue;
+use std::f64::consts::PI;
 
 const BEAD_ID: &str = "bd-mblr.2.4";
 
@@ -177,7 +178,7 @@ fn json_object_construction_round_trip() {
             SqliteValue::Text("x".to_owned()),
             SqliteValue::Integer(10),
             SqliteValue::Text("y".to_owned()),
-            SqliteValue::Float(3.14),
+            SqliteValue::Float(PI),
         ])
         .expect("json_object");
 
@@ -378,7 +379,7 @@ fn session_changeset_encode_store_decode() {
             .expect("create");
         conn.execute_with_params(
             "INSERT INTO changesets VALUES (1, ?1)",
-            &[SqliteValue::Blob(encoded.clone())],
+            &[SqliteValue::Blob(encoded)],
         )
         .expect("insert changeset blob");
     }
@@ -574,7 +575,7 @@ fn misc_uuid_blob_text_conversion_round_trip() {
 
     // Convert to blob
     let uuid_blob = fsqlite_ext_misc::UuidBlobFunc
-        .invoke(&[uuid_text.clone()])
+        .invoke(std::slice::from_ref(&uuid_text))
         .expect("uuid_blob");
 
     {

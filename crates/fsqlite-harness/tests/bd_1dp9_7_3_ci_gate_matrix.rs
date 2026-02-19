@@ -13,7 +13,7 @@ use fsqlite_harness::ci_gate_matrix::{
 };
 
 const BEAD_ID: &str = "bd-1dp9.7.3";
-const SEED: u64 = 20260213;
+const SEED: u64 = 20_260_213;
 
 fn build_regression_lane_result() -> fsqlite_harness::ci_gate_matrix::FlakeBudgetResult {
     fsqlite_harness::ci_gate_matrix::FlakeBudgetResult {
@@ -529,7 +529,7 @@ fn e2e_artifact_manifest_multi_artifact() {
     let deserialized: fsqlite_harness::ci_gate_matrix::ArtifactManifest =
         serde_json::from_str(&json).expect("deserialize manifest");
     assert_eq!(deserialized.artifacts.len(), 4);
-    assert_eq!(deserialized.gate_passed, true);
+    assert!(deserialized.gate_passed);
     assert_eq!(deserialized.seed, SEED);
 
     let summary = manifest.render_summary();
@@ -569,7 +569,7 @@ fn e2e_pipeline_determinism() {
 
     // Same for global evaluation
     let g1 = evaluate_global_flake_budget(&[r1], &policy);
-    let g2 = evaluate_global_flake_budget(&[r2.clone()], &policy);
+    let g2 = evaluate_global_flake_budget(std::slice::from_ref(&r2), &policy);
     let gj1 = serde_json::to_string(&g1).expect("serialize g1");
     let gj2 = serde_json::to_string(&g2).expect("serialize g2");
     assert_eq!(

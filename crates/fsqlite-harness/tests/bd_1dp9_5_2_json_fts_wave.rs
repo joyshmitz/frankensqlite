@@ -165,9 +165,9 @@ fn test_json1_secondary_differential_wave() -> Result<(), String> {
         .run_id(run_id)
         .engines("fsqlite", "sqlite")
         .workload([
-            r#"SELECT json_quote('alpha')"#.to_owned(),
-            r#"SELECT json_array(1, 'x', NULL)"#.to_owned(),
-            r#"SELECT json_extract(json_object('k', 'v', 'n', 2), '$.n')"#.to_owned(),
+            r"SELECT json_quote('alpha')".to_owned(),
+            r"SELECT json_array(1, 'x', NULL)".to_owned(),
+            r"SELECT json_extract(json_object('k', 'v', 'n', 2), '$.n')".to_owned(),
             r#"SELECT json_valid(json_patch('{"a":1}', '{"b":2}'))"#.to_owned(),
         ])
         .build();
@@ -192,7 +192,7 @@ fn test_wave_writes_structured_artifact() -> Result<(), String> {
         .engines("fsqlite", "sqlite")
         .workload([
             r#"SELECT json_valid('{"artifact":true}')"#.to_owned(),
-            r#"SELECT json_quote('artifact')"#.to_owned(),
+            r"SELECT json_quote('artifact')".to_owned(),
         ])
         .build();
 

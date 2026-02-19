@@ -375,7 +375,7 @@ fn result_hash_changes_when_outcome_changes() {
     // Force a different result by using a query that returns different results
     // between engines (if there is one). Since both engines should agree on basic
     // SQL, let's just verify the hash depends on the outcome fields.
-    let hash1 = pass_result.artifact_hashes.result_hash.clone();
+    let hash1 = pass_result.artifact_hashes.result_hash;
 
     // Same envelope, same result — hashes must match.
     let pass_result2 = run_test(&pass_envelope);

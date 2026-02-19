@@ -360,8 +360,10 @@ fn endurance_config_default_is_valid() {
 
 #[test]
 fn endurance_config_invalid_commit_rate() {
-    let mut config = EnduranceConfig::default();
-    config.min_commit_rate = 1.5;
+    let config = EnduranceConfig {
+        min_commit_rate: 1.5,
+        ..EnduranceConfig::default()
+    };
     let errors = config.validate();
     assert!(
         errors.iter().any(|e| e.contains("min_commit_rate")),

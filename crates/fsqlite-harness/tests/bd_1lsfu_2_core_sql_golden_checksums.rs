@@ -63,7 +63,6 @@ fn fuzz_sql_corpus_dir() -> Result<PathBuf, String> {
 
 fn is_query_sql(sql: &str) -> bool {
     let first = sql
-        .trim_start()
         .split_whitespace()
         .next()
         .unwrap_or("")
@@ -78,14 +77,13 @@ fn load_fuzz_query_corpus(limit: usize) -> Result<Vec<(String, String)>, String>
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_file())
         .collect::<Vec<_>>();
-    files.sort_by_key(|entry| entry.path());
+    files.sort_by_key(std::fs::DirEntry::path);
 
     let mut queries = Vec::with_capacity(limit);
     for entry in files {
         let path = entry.path();
-        let raw = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(_) => continue,
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
         };
         let sql = raw.trim();
         if sql.is_empty() || !is_query_sql(sql) {

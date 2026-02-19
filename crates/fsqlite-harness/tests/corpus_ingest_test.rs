@@ -150,7 +150,7 @@ fn seed_derivation_varies_by_base() {
 
 #[test]
 fn corpus_seed_base_is_franken_seed() {
-    assert_eq!(CORPUS_SEED_BASE, 0x4652_414E_4B45_4E);
+    assert_eq!(CORPUS_SEED_BASE, 0x0046_5241_4E4B_454E);
 }
 
 // ─── Corpus Builder Tests ────────────────────────────────────────────────

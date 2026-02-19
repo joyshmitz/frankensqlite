@@ -14,16 +14,29 @@ use tempfile::TempDir;
 
 const BEAD_ID: &str = "bd-mblr.7.5.2";
 
-fn sample_run(
-    run_id: &str,
-    started_at: &str,
+struct SampleRunSpec<'a> {
+    run_id: &'a str,
+    started_at: &'a str,
     success: bool,
     seed: u64,
     scenario_verdict: ScenarioVerdict,
-    code_area: &str,
+    code_area: &'a str,
     invariant_verdict: InvariantVerdict,
     artifacts: Vec<ArtifactRecord>,
-) -> RunRecord {
+}
+
+fn sample_run(spec: SampleRunSpec<'_>) -> RunRecord {
+    let SampleRunSpec {
+        run_id,
+        started_at,
+        success,
+        seed,
+        scenario_verdict,
+        code_area,
+        invariant_verdict,
+        artifacts,
+    } = spec;
+
     RunRecord {
         schema_version: EVIDENCE_INDEX_SCHEMA_VERSION,
         run_id: RunId(run_id.to_owned()),
@@ -92,36 +105,36 @@ fn write_jsonl(dir: &TempDir, file_name: &str, runs: &[RunRecord]) -> PathBuf {
 fn test_query_filters_sorts_and_limits_timeline() {
     let mut index = fsqlite_harness::evidence_index::EvidenceIndex::new();
 
-    let run_b = sample_run(
-        "run-b",
-        "2026-02-13T00:00:02Z",
-        false,
-        2,
-        ScenarioVerdict::Fail,
-        "planner",
-        InvariantVerdict::Held,
-        vec![artifact(ArtifactKind::Log, "artifacts/run-b/log.json")],
-    );
-    let run_a = sample_run(
-        "run-a",
-        "2026-02-13T00:00:01Z",
-        false,
-        1,
-        ScenarioVerdict::Fail,
-        "planner",
-        InvariantVerdict::Held,
-        vec![artifact(ArtifactKind::Log, "artifacts/run-a/log.json")],
-    );
-    let other = sample_run(
-        "run-c",
-        "2026-02-13T00:00:00Z",
-        true,
-        3,
-        ScenarioVerdict::Pass,
-        "pager",
-        InvariantVerdict::Held,
-        vec![artifact(ArtifactKind::Log, "artifacts/run-c/log.json")],
-    );
+    let run_b = sample_run(SampleRunSpec {
+        run_id: "run-b",
+        started_at: "2026-02-13T00:00:02Z",
+        success: false,
+        seed: 2,
+        scenario_verdict: ScenarioVerdict::Fail,
+        code_area: "planner",
+        invariant_verdict: InvariantVerdict::Held,
+        artifacts: vec![artifact(ArtifactKind::Log, "artifacts/run-b/log.json")],
+    });
+    let run_a = sample_run(SampleRunSpec {
+        run_id: "run-a",
+        started_at: "2026-02-13T00:00:01Z",
+        success: false,
+        seed: 1,
+        scenario_verdict: ScenarioVerdict::Fail,
+        code_area: "planner",
+        invariant_verdict: InvariantVerdict::Held,
+        artifacts: vec![artifact(ArtifactKind::Log, "artifacts/run-a/log.json")],
+    });
+    let other = sample_run(SampleRunSpec {
+        run_id: "run-c",
+        started_at: "2026-02-13T00:00:00Z",
+        success: true,
+        seed: 3,
+        scenario_verdict: ScenarioVerdict::Pass,
+        code_area: "pager",
+        invariant_verdict: InvariantVerdict::Held,
+        artifacts: vec![artifact(ArtifactKind::Log, "artifacts/run-c/log.json")],
+    });
 
     index.insert(run_b);
     index.insert(run_a);
@@ -145,30 +158,36 @@ fn test_query_filters_sorts_and_limits_timeline() {
 #[test]
 fn test_query_builds_correlations_and_replay_command() {
     let mut index = fsqlite_harness::evidence_index::EvidenceIndex::new();
-    index.insert(sample_run(
-        "run-1",
-        "2026-02-13T00:00:00Z",
-        false,
-        7,
-        ScenarioVerdict::Fail,
-        "planner",
-        InvariantVerdict::Violated,
-        vec![
-            artifact(ArtifactKind::ReplayManifest, "artifacts/run-1/replay-02.json"),
-            artifact(ArtifactKind::ReplayManifest, "artifacts/run-1/replay-01.json"),
+    index.insert(sample_run(SampleRunSpec {
+        run_id: "run-1",
+        started_at: "2026-02-13T00:00:00Z",
+        success: false,
+        seed: 7,
+        scenario_verdict: ScenarioVerdict::Fail,
+        code_area: "planner",
+        invariant_verdict: InvariantVerdict::Violated,
+        artifacts: vec![
+            artifact(
+                ArtifactKind::ReplayManifest,
+                "artifacts/run-1/replay-02.json",
+            ),
+            artifact(
+                ArtifactKind::ReplayManifest,
+                "artifacts/run-1/replay-01.json",
+            ),
             artifact(ArtifactKind::FailureBundle, "artifacts/run-1/failure.json"),
         ],
-    ));
-    index.insert(sample_run(
-        "run-2",
-        "2026-02-13T00:01:00Z",
-        false,
-        8,
-        ScenarioVerdict::Fail,
-        "planner",
-        InvariantVerdict::Held,
-        vec![artifact(ArtifactKind::Log, "artifacts/run-2/log.json")],
-    ));
+    }));
+    index.insert(sample_run(SampleRunSpec {
+        run_id: "run-2",
+        started_at: "2026-02-13T00:01:00Z",
+        success: false,
+        seed: 8,
+        scenario_verdict: ScenarioVerdict::Fail,
+        code_area: "planner",
+        invariant_verdict: InvariantVerdict::Held,
+        artifacts: vec![artifact(ArtifactKind::Log, "artifacts/run-2/log.json")],
+    }));
 
     let result = query_index(&index, &QueryFilters::default());
     assert_eq!(result.matched_run_count, 2);
@@ -217,16 +236,16 @@ fn test_query_builds_correlations_and_replay_command() {
 fn test_load_index_from_jsonl_reports_line_number_on_parse_failure() {
     let temp_dir = tempfile::tempdir().expect("create tempdir");
     let path = temp_dir.path().join("evidence.jsonl");
-    let valid_line = run_to_jsonl(&sample_run(
-        "run-good",
-        "2026-02-13T00:00:00Z",
-        true,
-        9,
-        ScenarioVerdict::Pass,
-        "planner",
-        InvariantVerdict::Held,
-        vec![artifact(ArtifactKind::Log, "artifacts/run-good/log.json")],
-    ))
+    let valid_line = run_to_jsonl(&sample_run(SampleRunSpec {
+        run_id: "run-good",
+        started_at: "2026-02-13T00:00:00Z",
+        success: true,
+        seed: 9,
+        scenario_verdict: ScenarioVerdict::Pass,
+        code_area: "planner",
+        invariant_verdict: InvariantVerdict::Held,
+        artifacts: vec![artifact(ArtifactKind::Log, "artifacts/run-good/log.json")],
+    }))
     .expect("serialize valid run");
     fs::write(&path, format!("{valid_line}\n{{not-json}}\n")).expect("write malformed JSONL");
 
@@ -248,26 +267,26 @@ fn test_cli_emits_json_and_applies_seed_filter() {
         &temp_dir,
         "evidence.jsonl",
         &[
-            sample_run(
-                "run-keep",
-                "2026-02-13T00:00:00Z",
-                false,
-                11,
-                ScenarioVerdict::Fail,
-                "pager",
-                InvariantVerdict::Held,
-                vec![artifact(ArtifactKind::Log, "artifacts/run-keep/log.json")],
-            ),
-            sample_run(
-                "run-drop",
-                "2026-02-13T00:01:00Z",
-                true,
-                22,
-                ScenarioVerdict::Pass,
-                "planner",
-                InvariantVerdict::Held,
-                vec![artifact(ArtifactKind::Log, "artifacts/run-drop/log.json")],
-            ),
+            sample_run(SampleRunSpec {
+                run_id: "run-keep",
+                started_at: "2026-02-13T00:00:00Z",
+                success: false,
+                seed: 11,
+                scenario_verdict: ScenarioVerdict::Fail,
+                code_area: "pager",
+                invariant_verdict: InvariantVerdict::Held,
+                artifacts: vec![artifact(ArtifactKind::Log, "artifacts/run-keep/log.json")],
+            }),
+            sample_run(SampleRunSpec {
+                run_id: "run-drop",
+                started_at: "2026-02-13T00:01:00Z",
+                success: true,
+                seed: 22,
+                scenario_verdict: ScenarioVerdict::Pass,
+                code_area: "planner",
+                invariant_verdict: InvariantVerdict::Held,
+                artifacts: vec![artifact(ArtifactKind::Log, "artifacts/run-drop/log.json")],
+            }),
         ],
     );
 

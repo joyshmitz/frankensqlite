@@ -7,6 +7,7 @@
 
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
+use std::f64::consts::PI;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -462,7 +463,7 @@ fn all_sqlite_types_round_trip_on_file_backend() {
             "INSERT INTO t1 VALUES (?, ?, ?, ?, ?)",
             &[
                 SqliteValue::Integer(42),
-                SqliteValue::Float(3.14),
+                SqliteValue::Float(PI),
                 SqliteValue::Text("hello".to_owned()),
                 SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
                 SqliteValue::Null,
@@ -483,7 +484,7 @@ fn all_sqlite_types_round_trip_on_file_backend() {
         );
         if let SqliteValue::Float(f) = rows[0].get(1).unwrap() {
             assert!(
-                (*f - 3.14).abs() < 1e-10,
+                (*f - PI).abs() < 1e-10,
                 "bead_id={BEAD_ID} case=type_float got={f}"
             );
         } else {
@@ -793,7 +794,7 @@ fn database_file_grows_with_data() {
         conn.execute("CREATE TABLE t1 (data TEXT)").expect("ddl");
     }
 
-    let size_after_create = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let size_after_create = std::fs::metadata(&db_path).map_or(0, |m| m.len());
 
     {
         let conn = Connection::open(&db_str).expect("reopen");
@@ -809,13 +810,11 @@ fn database_file_grows_with_data() {
         }
     }
 
-    let size_after_inserts = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let size_after_inserts = std::fs::metadata(&db_path).map_or(0, |m| m.len());
 
     // WAL file may hold the data instead of the main DB growing,
     // but at least one of them should have grown
-    let wal_size = std::fs::metadata(wal_path(&db_str))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let wal_size = std::fs::metadata(wal_path(&db_str)).map_or(0, |m| m.len());
 
     let total_after = size_after_inserts + wal_size;
     assert!(
@@ -905,8 +904,8 @@ fn run_seeded_workload(seed: u64) -> (usize, i64) {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        let k = (state % 1000) as i64;
-        let v = (state % 10000) as i64;
+        let k = i64::try_from(state % 1_000).expect("k in i64 range");
+        let v = i64::try_from(state % 10_000).expect("v in i64 range");
         // INSERT OR REPLACE to handle collisions deterministically
         let _ = conn.execute_with_params(
             "INSERT OR REPLACE INTO t1 VALUES (?, ?)",

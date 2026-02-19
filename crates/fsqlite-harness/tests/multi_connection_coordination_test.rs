@@ -222,7 +222,7 @@ fn sequential_writers_on_same_table() {
     for writer_id in 0..5 {
         let conn = Connection::open(&db_str).expect("writer");
         for row in 0..3 {
-            let id = i64::try_from(writer_id * 3 + row + 1).expect("i64");
+            let id = i64::from(writer_id * 3 + row + 1);
             conn.execute_with_params(
                 "INSERT INTO t1 VALUES (?, ?)",
                 &[
@@ -368,7 +368,7 @@ fn interleaved_commit_rollback_across_connections() {
     // Pattern: conn_A commits, conn_B rollbacks, conn_C commits, etc.
     for i in 0..6 {
         let conn = Connection::open(&db_str).expect("conn");
-        let id = i64::try_from(i + 1).expect("i64");
+        let id = i64::from(i + 1);
         conn.execute("BEGIN").expect("begin");
         conn.execute_with_params(
             "INSERT INTO t1 VALUES (?, ?)",
@@ -636,8 +636,8 @@ fn round_robin_writers_maintain_consistency() {
     for round in 0..rows_per_actor {
         for actor in 0..num_actors {
             let conn = Connection::open(&db_str).expect("actor");
-            let id = i64::try_from(round * num_actors + actor + 1).expect("i64");
-            let actor_id = i64::try_from(actor).expect("i64");
+            let id = i64::from(round * num_actors + actor + 1);
+            let actor_id = i64::from(actor);
             conn.execute_with_params(
                 "INSERT INTO t1 VALUES (?, ?)",
                 &[SqliteValue::Integer(id), SqliteValue::Integer(actor_id)],

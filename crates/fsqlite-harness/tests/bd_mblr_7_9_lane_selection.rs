@@ -117,7 +117,6 @@ fn lane_audit_fails_when_fallback_disallowed_but_triggered() {
         test_scenarios: vec![vec!["nonexistent/src/unknown.rs".to_owned()]],
         allow_fallback: false,
         max_unresolved_paths: 0,
-        ..Default::default()
     };
     let report = run_lane_selection_audit(&config);
 
