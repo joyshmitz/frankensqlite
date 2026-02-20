@@ -33,6 +33,34 @@ use crate::datetime::register_datetime_builtins;
 use crate::math::register_math_builtins;
 use crate::{FunctionRegistry, ScalarFunction};
 
+// Thread-local storage for connection state that scalar functions need access to.
+// Set by the Connection during DML operations; read by stub functions like
+// last_insert_rowid(), changes(), total_changes().
+thread_local! {
+    static LAST_INSERT_ROWID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    static LAST_CHANGES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the last insert rowid (called by Connection after INSERT).
+pub fn set_last_insert_rowid(rowid: i64) {
+    LAST_INSERT_ROWID.set(rowid);
+}
+
+/// Get the current last insert rowid.
+pub fn get_last_insert_rowid() -> i64 {
+    LAST_INSERT_ROWID.get()
+}
+
+/// Set the last changes count (called by Connection after DML).
+pub fn set_last_changes(count: i64) {
+    LAST_CHANGES.set(count);
+}
+
+/// Get the current last changes count.
+pub fn get_last_changes() -> i64 {
+    LAST_CHANGES.get()
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /// Standard NULL propagation: if any arg is NULL, return NULL.
@@ -1595,8 +1623,7 @@ pub struct ChangesFunc;
 
 impl ScalarFunction for ChangesFunc {
     fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
-        // Stub: will be wired to connection state in VDBE integration
-        Ok(SqliteValue::Integer(0))
+        Ok(SqliteValue::Integer(LAST_CHANGES.get()))
     }
 
     fn is_deterministic(&self) -> bool {
@@ -1616,7 +1643,7 @@ pub struct TotalChangesFunc;
 
 impl ScalarFunction for TotalChangesFunc {
     fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
-        Ok(SqliteValue::Integer(0))
+        Ok(SqliteValue::Integer(LAST_CHANGES.get()))
     }
 
     fn is_deterministic(&self) -> bool {
@@ -1636,7 +1663,7 @@ pub struct LastInsertRowidFunc;
 
 impl ScalarFunction for LastInsertRowidFunc {
     fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
-        Ok(SqliteValue::Integer(0))
+        Ok(SqliteValue::Integer(LAST_INSERT_ROWID.get()))
     }
 
     fn is_deterministic(&self) -> bool {

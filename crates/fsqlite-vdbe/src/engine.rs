@@ -1257,6 +1257,8 @@ pub struct VdbeEngine {
     schema_cookie: u32,
     /// Result of the last `Opcode::Compare` operation.
     last_compare_result: Option<Ordering>,
+    /// Rowid of the last INSERT operation (for `last_insert_rowid()` support).
+    last_insert_rowid: i64,
 }
 
 struct AggregateContext {
@@ -1287,7 +1289,13 @@ impl VdbeEngine {
             aggregates: SwissIndex::new(),
             schema_cookie: 0,
             last_compare_result: None,
+            last_insert_rowid: 0,
         }
+    }
+
+    /// Returns the rowid of the last INSERT operation.
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.last_insert_rowid
     }
 
     /// Attach an in-memory database for cursor operations.
@@ -2670,6 +2678,9 @@ impl VdbeEngine {
                             }
                         }
                     }
+
+                    // Track last insert rowid for last_insert_rowid() support.
+                    self.last_insert_rowid = rowid;
 
                     // br-22iss: Clear pending_next_after_delete since Insert repositions
                     // the cursor. This is critical for UPDATE (Delete+Insert) to avoid

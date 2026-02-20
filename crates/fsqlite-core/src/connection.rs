@@ -25,9 +25,12 @@ use fsqlite_ast::{
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_func::FunctionRegistry;
+use fsqlite_func::{
+    FunctionRegistry, get_last_changes, get_last_insert_rowid, set_last_changes,
+    set_last_insert_rowid,
+};
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
-use fsqlite_pager::{CheckpointMode, JournalMode, SimplePager};
+use fsqlite_pager::{CheckpointMode, JournalMode, PageCacheMetricsSnapshot, SimplePager};
 use fsqlite_parser::Parser;
 use fsqlite_types::DATABASE_HEADER_SIZE;
 use fsqlite_types::cx::Cx;
@@ -42,8 +45,10 @@ use fsqlite_vdbe::codegen::{
 };
 use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine};
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
+#[cfg(target_os = "linux")]
+use fsqlite_vfs::IoUringVfs;
 use fsqlite_vfs::MemoryVfs;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::Vfs;
 use fsqlite_wal::{
@@ -79,7 +84,7 @@ use crate::wal_adapter::WalBackendAdapter;
 /// Pager backend that dispatches across VFS implementations.
 ///
 /// Wraps [`SimplePager`] for both in-memory (`:memory:`) and on-disk
-/// (Unix filesystem) connections without making [`Connection`] generic.
+/// connections without making [`Connection`] generic.
 ///
 /// # Future sub-tasks
 ///
@@ -92,8 +97,11 @@ use crate::wal_adapter::WalBackendAdapter;
 pub enum PagerBackend {
     /// In-memory VFS backend (`:memory:` databases).
     Memory(Arc<SimplePager<MemoryVfs>>),
+    /// Linux io_uring VFS backend (file-backed databases).
+    #[cfg(target_os = "linux")]
+    IoUring(Arc<SimplePager<IoUringVfs>>),
     /// Unix filesystem VFS backend (file-backed databases).
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     Unix(Arc<SimplePager<UnixVfs>>),
 }
 
@@ -101,7 +109,9 @@ impl std::fmt::Debug for PagerBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Memory(_) => f.write_str("PagerBackend::Memory"),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
+            Self::IoUring(_) => f.write_str("PagerBackend::IoUring"),
+            #[cfg(all(unix, not(target_os = "linux")))]
             Self::Unix(_) => f.write_str("PagerBackend::Unix"),
         }
     }
@@ -110,7 +120,10 @@ impl std::fmt::Debug for PagerBackend {
 impl PagerBackend {
     /// Open a pager for the given path.
     ///
-    /// Uses [`MemoryVfs`] for `:memory:` and [`UnixVfs`] for file paths.
+    /// Uses [`MemoryVfs`] for `:memory:`.
+    ///
+    /// File-backed paths use [`IoUringVfs`] on Linux and [`UnixVfs`] on other
+    /// Unix platforms.
     fn open(path: &str) -> Result<Self> {
         if path == ":memory:" {
             let vfs = MemoryVfs::new();
@@ -118,7 +131,14 @@ impl PagerBackend {
             let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
             Ok(Self::Memory(Arc::new(pager)))
         } else {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
+            {
+                let vfs = IoUringVfs::new();
+                let db_path = PathBuf::from(path);
+                let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
+                Ok(Self::IoUring(Arc::new(pager)))
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
             {
                 let vfs = UnixVfs::new();
                 let db_path = PathBuf::from(path);
@@ -138,7 +158,9 @@ impl PagerBackend {
     fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Box<dyn TransactionHandle>> {
         match self {
             Self::Memory(p) => Ok(Box::new(p.begin(cx, mode)?)),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => Ok(Box::new(p.begin(cx, mode)?)),
+            #[cfg(all(unix, not(target_os = "linux")))]
             Self::Unix(p) => Ok(Box::new(p.begin(cx, mode)?)),
         }
     }
@@ -146,7 +168,9 @@ impl PagerBackend {
     fn journal_mode(&self) -> JournalMode {
         match self {
             Self::Memory(p) => p.journal_mode(),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.journal_mode(),
+            #[cfg(all(unix, not(target_os = "linux")))]
             Self::Unix(p) => p.journal_mode(),
         }
     }
@@ -154,7 +178,9 @@ impl PagerBackend {
     fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         match self {
             Self::Memory(p) => p.set_journal_mode(cx, mode),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.set_journal_mode(cx, mode),
+            #[cfg(all(unix, not(target_os = "linux")))]
             Self::Unix(p) => p.set_journal_mode(cx, mode),
         }
     }
@@ -166,7 +192,12 @@ impl PagerBackend {
                 let vfs = MemoryVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => {
+                let vfs = IoUringVfs::new();
+                install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
@@ -182,8 +213,32 @@ impl PagerBackend {
     ) -> Result<fsqlite_pager::CheckpointResult> {
         match self {
             Self::Memory(p) => p.checkpoint(cx, mode),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.checkpoint(cx, mode),
+            #[cfg(all(unix, not(target_os = "linux")))]
             Self::Unix(p) => p.checkpoint(cx, mode),
+        }
+    }
+
+    /// Snapshot current page-cache counters from the active pager backend.
+    fn cache_metrics_snapshot(&self) -> Result<PageCacheMetricsSnapshot> {
+        match self {
+            Self::Memory(p) => p.cache_metrics_snapshot(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.cache_metrics_snapshot(),
+            #[cfg(all(unix, not(target_os = "linux")))]
+            Self::Unix(p) => p.cache_metrics_snapshot(),
+        }
+    }
+
+    /// Reset page-cache counters for the active pager backend.
+    fn reset_cache_metrics(&self) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.reset_cache_metrics(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.reset_cache_metrics(),
+            #[cfg(all(unix, not(target_os = "linux")))]
+            Self::Unix(p) => p.reset_cache_metrics(),
         }
     }
 }
@@ -1753,6 +1808,7 @@ impl Connection {
                         }
                         // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                         *self.last_changes.borrow_mut() = affected;
+                        set_last_changes(affected as i64);
                         return Ok(Vec::new());
                     }
                 }
@@ -1799,6 +1855,7 @@ impl Connection {
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 *self.last_changes.borrow_mut() = affected;
+                set_last_changes(affected as i64);
                 if insert.returning.is_empty() {
                     Ok(Vec::new())
                 } else {
@@ -1890,6 +1947,7 @@ impl Connection {
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 *self.last_changes.borrow_mut() = affected;
+                set_last_changes(affected as i64);
                 if update.returning.is_empty() {
                     Ok(Vec::new())
                 } else {
@@ -1965,6 +2023,7 @@ impl Connection {
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 *self.last_changes.borrow_mut() = affected;
+                set_last_changes(affected as i64);
                 if delete.returning.is_empty() {
                     Ok(Vec::new())
                 } else {
@@ -2351,6 +2410,7 @@ impl Connection {
                         if let Some(table) = db.get_table_mut(root_page) {
                             table.insert_row(rowid, col_values);
                         }
+                        set_last_insert_rowid(rowid);
                         affected += 1;
                     }
                     ConflictAction::Ignore => {
@@ -2358,6 +2418,7 @@ impl Connection {
                             if let Some(table) = db.get_table_mut(root_page) {
                                 table.insert_row(rowid, col_values);
                             }
+                            set_last_insert_rowid(rowid);
                             affected += 1;
                         }
                         // else: silently skip this row
@@ -2371,6 +2432,7 @@ impl Connection {
                         if let Some(table) = db.get_table_mut(root_page) {
                             table.insert_row(rowid, col_values);
                         }
+                        set_last_insert_rowid(rowid);
                         affected += 1;
                     }
                 }
@@ -2380,6 +2442,7 @@ impl Connection {
                 if let Some(table) = db.get_table_mut(root_page) {
                     let new_rowid = table.alloc_rowid();
                     table.insert_row(new_rowid, col_values);
+                    set_last_insert_rowid(new_rowid);
                 }
                 affected += 1;
             }
@@ -3263,14 +3326,34 @@ impl Connection {
         rootpage: i32,
         sql: &str,
     ) -> Result<()> {
-        let rowid = {
-            let mut rid = self.next_master_rowid.borrow_mut();
-            let r = *rid;
-            *rid += 1;
-            r
-        };
         self.with_pager_write_txn(|cx, txn| {
             let usable_size = PageSize::DEFAULT.get();
+            let mut cursor = fsqlite_btree::BtCursor::new(
+                TransactionPageIo::new(txn),
+                PageNumber::ONE,
+                usable_size,
+                true,
+            );
+
+            // Defensive allocation: derive a floor from actual sqlite_master
+            // rowids so stale in-memory counters can never reissue rowids.
+            let mut max_rowid = 0_i64;
+            if cursor.first(cx)? {
+                loop {
+                    max_rowid = max_rowid.max(cursor.rowid(cx)?);
+                    if !cursor.next(cx)? {
+                        break;
+                    }
+                }
+            }
+            let rowid = {
+                let mut rid = self.next_master_rowid.borrow_mut();
+                let floor = max_rowid.saturating_add(1).max(1);
+                let chosen = (*rid).max(floor);
+                *rid = chosen.saturating_add(1);
+                chosen
+            };
+
             let record = serialize_record(&[
                 SqliteValue::Text(type_.to_owned()),
                 SqliteValue::Text(name.to_owned()),
@@ -3278,12 +3361,6 @@ impl Connection {
                 SqliteValue::Integer(i64::from(rootpage)),
                 SqliteValue::Text(sql.to_owned()),
             ]);
-            let mut cursor = fsqlite_btree::BtCursor::new(
-                TransactionPageIo::new(txn),
-                PageNumber::ONE,
-                usable_size,
-                true,
-            );
             cursor.table_insert(cx, rowid, &record)
         })
     }
@@ -3506,6 +3583,14 @@ impl Connection {
 
     /// Execute a DROP statement (TABLE, INDEX, VIEW, TRIGGER).
     fn execute_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
+        let swallow_missing_master =
+            |err: FrankenError| -> Result<()> {
+                if drop_stmt.if_exists && is_sqlite_master_entry_missing(&err) {
+                    Ok(())
+                } else {
+                    Err(err)
+                }
+            };
         let obj_name = &drop_stmt.name.name;
         let dropped = match drop_stmt.object_type {
             DropObjectType::Table => {
@@ -3514,14 +3599,21 @@ impl Connection {
                     .iter()
                     .position(|t| t.name.eq_ignore_ascii_case(obj_name));
                 if let Some(idx) = table_idx {
-                    let root_page = schema[idx].root_page;
-                    schema.remove(idx);
+                    let table = schema.remove(idx);
                     drop(schema);
-                    self.db.borrow_mut().destroy_table(root_page);
+                    self.db.borrow_mut().destroy_table(table.root_page);
+                    for index in &table.indexes {
+                        self.db.borrow_mut().destroy_table(index.root_page);
+                        if let Err(err) = self.delete_sqlite_master_row(&index.name) {
+                            swallow_missing_master(err)?;
+                        }
+                    }
                     self.rowid_alias_columns
                         .borrow_mut()
                         .remove(&obj_name.to_ascii_lowercase());
-                    self.delete_sqlite_master_row(obj_name)?;
+                    if let Err(err) = self.delete_sqlite_master_row(obj_name) {
+                        swallow_missing_master(err)?;
+                    }
                     true
                 } else {
                     if drop_stmt.if_exists {
@@ -3535,22 +3627,31 @@ impl Connection {
             DropObjectType::Index => {
                 let mut schema = self.schema.borrow_mut();
                 let mut found = false;
+                let mut dropped_root_page = None;
                 for table in schema.iter_mut() {
                     if let Some(pos) = table
                         .indexes
                         .iter()
                         .position(|idx| idx.name.eq_ignore_ascii_case(obj_name))
                     {
-                        table.indexes.remove(pos);
+                        let removed = table.indexes.remove(pos);
+                        dropped_root_page = Some(removed.root_page);
                         found = true;
                         break;
                     }
                 }
+                drop(schema);
                 if !found {
                     if drop_stmt.if_exists {
                         return Ok(());
                     }
                     return Err(FrankenError::Internal(format!("no such index: {obj_name}")));
+                }
+                if let Some(root_page) = dropped_root_page {
+                    self.db.borrow_mut().destroy_table(root_page);
+                }
+                if let Err(err) = self.delete_sqlite_master_row(obj_name) {
+                    swallow_missing_master(err)?;
                 }
                 true
             }
@@ -3586,7 +3687,9 @@ impl Connection {
                     let trigger = triggers.remove(idx);
                     drop(triggers);
                     if !trigger.temporary {
-                        self.delete_sqlite_master_row(obj_name)?;
+                        if let Err(err) = self.delete_sqlite_master_row(obj_name) {
+                            swallow_missing_master(err)?;
+                        }
                     }
                     true
                 } else {
@@ -5115,6 +5218,27 @@ impl Connection {
             }
         }
 
+        // Persist header-backed pragmas so values survive reopen.
+        if pragma.value.is_some() {
+            match pragma_name.as_str() {
+                "user_version" => {
+                    let user_version = self.pragma_state.borrow().user_version;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    {
+                        self.update_database_header_metadata(Some(user_version as u32), None)?;
+                    }
+                }
+                "application_id" => {
+                    let application_id = self.pragma_state.borrow().application_id;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    {
+                        self.update_database_header_metadata(None, Some(application_id as u32))?;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         match pragma_out {
             fsqlite_vdbe::pragma::PragmaOutput::Text(s) => {
                 return Ok(vec![Row {
@@ -5288,6 +5412,121 @@ impl Connection {
             }
             "fsqlite.trace_reset" | "trace_reset" => {
                 reset_trace_metrics();
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Text("ok".into())],
+                }])
+            }
+            // ── Page-cache observability PRAGMAs (bd-t6sv2.8) ─────────────
+            "fsqlite.cache_stats" | "cache_stats" | "fsqlite_cache_stats" => {
+                let to_i64_u64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                let to_i64_usize = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+                let snapshot = self.pager.cache_metrics_snapshot()?;
+                let total_accesses = snapshot.total_accesses();
+                let hit_rate_pct = if total_accesses == 0 {
+                    0
+                } else {
+                    let rounded_pct = snapshot
+                        .hits
+                        .saturating_mul(100)
+                        .saturating_add(total_accesses / 2)
+                        / total_accesses;
+                    to_i64_u64(rounded_pct)
+                };
+                Ok(vec![
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("hits".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.hits)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("misses".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.misses)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("total_accesses".into()),
+                            SqliteValue::Integer(to_i64_u64(total_accesses)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("hit_rate_pct".into()),
+                            SqliteValue::Integer(hit_rate_pct),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("eviction_count".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.evictions)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("admit_count".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.admits)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("dirty_ratio_pct".into()),
+                            SqliteValue::Integer(0),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("t1_size".into()),
+                            SqliteValue::Integer(0),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("t2_size".into()),
+                            SqliteValue::Integer(0),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("b1_size".into()),
+                            SqliteValue::Integer(0),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("b2_size".into()),
+                            SqliteValue::Integer(0),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("p_target".into()),
+                            SqliteValue::Integer(0),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("mvcc_multi_version_pages".into()),
+                            SqliteValue::Integer(0),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("cached_pages".into()),
+                            SqliteValue::Integer(to_i64_usize(snapshot.cached_pages)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("capacity_pages".into()),
+                            SqliteValue::Integer(to_i64_usize(snapshot.pool_capacity)),
+                        ],
+                    },
+                ])
+            }
+            "fsqlite.cache_reset" | "cache_reset" | "fsqlite_cache_reset" => {
+                self.pager.reset_cache_metrics()?;
                 Ok(vec![Row {
                     values: vec![SqliteValue::Text("ok".into())],
                 }])
@@ -7041,6 +7280,43 @@ impl Connection {
 
     // ── Schema cookie and change counter tracking (bd-3mmj) ─────────
 
+    /// Persist selected database header metadata fields on page 1.
+    fn update_database_header_metadata(
+        &self,
+        user_version: Option<u32>,
+        application_id: Option<u32>,
+    ) -> Result<()> {
+        if user_version.is_none() && application_id.is_none() {
+            return Ok(());
+        }
+        self.with_pager_write_txn(|cx, txn| {
+            let page1 = txn.get_page(cx, PageNumber::ONE)?;
+            let mut page_bytes = page1.as_ref().to_vec();
+            if page_bytes.len() < DATABASE_HEADER_SIZE {
+                return Err(FrankenError::internal(format!(
+                    "page 1 too short for database header: {} bytes",
+                    page_bytes.len()
+                )));
+            }
+            let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+            header_bytes.copy_from_slice(&page_bytes[..DATABASE_HEADER_SIZE]);
+            let mut header = DatabaseHeader::from_bytes(&header_bytes)
+                .map_err(|e| FrankenError::internal(format!("invalid database header: {e}")))?;
+            if let Some(version) = user_version {
+                header.user_version = version;
+            }
+            if let Some(app_id) = application_id {
+                header.application_id = app_id;
+            }
+            let encoded = header
+                .to_bytes()
+                .map_err(|e| FrankenError::internal(format!("failed to encode header: {e}")))?;
+            page_bytes[..DATABASE_HEADER_SIZE].copy_from_slice(&encoded);
+            txn.write_page(cx, PageNumber::ONE, &page_bytes)?;
+            Ok(())
+        })
+    }
+
     /// Increment the schema cookie.  Must be called for every DDL
     /// operation (CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE INDEX,
     /// CREATE VIEW, DROP INDEX, DROP VIEW, etc.).
@@ -7108,8 +7384,9 @@ impl Connection {
         }
 
         // Read sqlite_master entries from page 1's B-tree.
-        let master_entries = {
+        let (master_entries, max_master_rowid) = {
             let mut entries = Vec::new();
+            let mut max_rowid = 0_i64;
             let master_root = PageNumber::ONE;
             let mut cursor = fsqlite_btree::BtCursor::new(
                 TransactionPageIo::new(txn.as_mut()),
@@ -7120,6 +7397,8 @@ impl Connection {
 
             if cursor.first(cx)? {
                 loop {
+                    let rowid = cursor.rowid(cx)?;
+                    max_rowid = max_rowid.max(rowid);
                     let payload = cursor.payload(cx)?;
                     if let Some(values) = parse_record(&payload) {
                         entries.push(values);
@@ -7129,7 +7408,7 @@ impl Connection {
                     }
                 }
             }
-            entries
+            (entries, max_rowid)
         };
 
         // Parse each sqlite_master row and rebuild schema + MemDatabase.
@@ -7137,6 +7416,7 @@ impl Connection {
         let mut new_schema = Vec::new();
         let mut new_db = MemDatabase::new();
         let mut new_triggers = Vec::new();
+        let mut pending_indexes: Vec<(String, String, i32, Vec<String>)> = Vec::new();
         let mut new_alias_map = HashMap::new();
 
         for entry in &master_entries {
@@ -7156,6 +7436,43 @@ impl Connection {
                 if let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql) {
                     new_triggers.push(TriggerDef::from_create_statement(&stmt, create_sql));
                 }
+                continue;
+            }
+
+            if entry_type.eq_ignore_ascii_case("index") {
+                let index_name = match &entry[1] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => continue,
+                };
+                let table_name = match &entry[2] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => continue,
+                };
+                let root_page_num = match &entry[3] {
+                    SqliteValue::Integer(n) => *n,
+                    _ => continue,
+                };
+                let create_sql = match &entry[4] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => continue,
+                };
+                let root_page = i32::try_from(root_page_num).unwrap_or(0);
+                if root_page <= 0 {
+                    continue;
+                }
+                let indexed_columns = match parse_single_statement(&create_sql) {
+                    Ok(Statement::CreateIndex(stmt)) => stmt
+                        .columns
+                        .iter()
+                        .filter_map(normalize_indexed_column_term)
+                        .map(|term| term.column_name)
+                        .collect::<Vec<_>>(),
+                    _ => Vec::new(),
+                };
+                if indexed_columns.is_empty() {
+                    continue;
+                }
+                pending_indexes.push((index_name, table_name, root_page, indexed_columns));
                 continue;
             }
 
@@ -7233,8 +7550,32 @@ impl Connection {
             }
         }
 
+        // Attach indexes after all table schemas are available.
+        for (index_name, table_name, root_page, columns) in pending_indexes {
+            if let Some(table) = new_schema
+                .iter_mut()
+                .find(|t| t.name.eq_ignore_ascii_case(&table_name))
+            {
+                if table
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.name.eq_ignore_ascii_case(&index_name))
+                {
+                    continue;
+                }
+                table.indexes.push(IndexSchema {
+                    name: index_name,
+                    root_page,
+                    columns,
+                });
+                if !new_db.tables.contains_key(&root_page) {
+                    new_db.create_table_at(root_page, 0);
+                }
+            }
+        }
+
         // Read schema_cookie and change_counter from database header (page 1).
-        let (schema_cookie, change_counter) = {
+        let (schema_cookie, change_counter, user_version, application_id) = {
             let hdr = page1_bytes;
             let cookie = if hdr.len() >= 44 {
                 u32::from_be_bytes([hdr[40], hdr[41], hdr[42], hdr[43]])
@@ -7246,7 +7587,17 @@ impl Connection {
             } else {
                 0
             };
-            (cookie, counter)
+            let user_version = if hdr.len() >= 64 {
+                u32::from_be_bytes([hdr[60], hdr[61], hdr[62], hdr[63]])
+            } else {
+                0
+            };
+            let application_id = if hdr.len() >= 72 {
+                u32::from_be_bytes([hdr[68], hdr[69], hdr[70], hdr[71]])
+            } else {
+                0
+            };
+            (cookie, counter, user_version, application_id)
         };
 
         // Apply the reloaded state.
@@ -7260,7 +7611,12 @@ impl Connection {
         *self.rowid_alias_columns.borrow_mut() = new_alias_map;
         #[allow(clippy::cast_possible_wrap)]
         {
-            *self.next_master_rowid.borrow_mut() = (master_entries.len() as i64) + 1;
+            *self.next_master_rowid.borrow_mut() = max_master_rowid.saturating_add(1).max(1);
+        }
+        {
+            let mut pragma_state = self.pragma_state.borrow_mut();
+            pragma_state.user_version = i64::from(user_version);
+            pragma_state.application_id = i64::from(application_id);
         }
         *self.schema_cookie.borrow_mut() = schema_cookie;
         *self.change_counter.borrow_mut() = change_counter;
@@ -7633,6 +7989,10 @@ fn canonical_sqlite_schema_name(name: &str) -> Option<&'static str> {
 
 fn is_sqlite_schema_name(name: &str) -> bool {
     canonical_sqlite_schema_name(name).is_some()
+}
+
+fn is_sqlite_master_entry_missing(err: &FrankenError) -> bool {
+    matches!(err, FrankenError::Internal(msg) if msg.starts_with("sqlite_master entry not found:"))
 }
 
 fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
@@ -8903,6 +9263,12 @@ fn execute_table_program_with_db(
     if exec_res.is_err() || matches!(exec_res, Ok(ExecOutcome::Error { .. })) {
         record_trace_export_error();
     }
+    // Track the last inserted rowid from the VDBE engine.
+    let engine_rowid = engine.last_insert_rowid();
+    if engine_rowid != 0 {
+        set_last_insert_rowid(engine_rowid);
+    }
+
     if let Some(db_value) = engine.take_database() {
         *db.borrow_mut() = db_value;
     }
@@ -12074,9 +12440,12 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             }
         }
         "sqlite_version" => SqliteValue::Text("3.45.0".to_owned()),
-        "total_changes" | "changes" | "last_insert_rowid" => {
-            // Stub: return 0 since we don't have full state tracking here.
-            SqliteValue::Integer(0)
+        "last_insert_rowid" => SqliteValue::Integer(get_last_insert_rowid()),
+        "changes" => SqliteValue::Integer(get_last_changes()),
+        "total_changes" => {
+            // total_changes tracks cumulative changes across the connection lifetime;
+            // approximate with per-statement changes for now.
+            SqliteValue::Integer(get_last_changes())
         }
         "likely" | "unlikely" => args.first().cloned().unwrap_or(SqliteValue::Null),
         _ => SqliteValue::Null,
@@ -12108,7 +12477,8 @@ fn project_join_column(
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitSeq, Connection, InProcessPageLockTable, Row, SchemaEpoch, Snapshot, lock_unpoisoned,
+        CommitSeq, Connection, InProcessPageLockTable, PagerBackend, Row, SchemaEpoch, Snapshot,
+        is_sqlite_master_entry_missing, lock_unpoisoned,
     };
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
@@ -12148,6 +12518,32 @@ mod tests {
             conn2.root_cx().trace_id(),
             "each connection should have a unique trace_id"
         );
+    }
+
+    #[test]
+    fn test_memory_connection_uses_memory_pager_backend() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(matches!(conn.pager, PagerBackend::Memory(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_file_backed_connection_uses_iouring_pager_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pager_backend_iouring.db");
+        let path_str = path.to_string_lossy().into_owned();
+        let conn = Connection::open(path_str).unwrap();
+        assert!(matches!(conn.pager, PagerBackend::IoUring(_)));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn test_file_backed_connection_uses_unix_pager_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pager_backend_unix.db");
+        let path_str = path.to_string_lossy().into_owned();
+        let conn = Connection::open(path_str).unwrap();
+        assert!(matches!(conn.pager, PagerBackend::Unix(_)));
     }
 
     #[test]
@@ -12859,6 +13255,27 @@ mod tests {
     fn test_drop_table_if_exists_ignores_missing_table() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("DROP TABLE IF EXISTS t_missing;").unwrap();
+    }
+
+    #[test]
+    fn test_drop_table_removes_associated_index_master_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t_drop_idx (x INTEGER, y TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_drop_idx_x ON t_drop_idx(x);")
+            .unwrap();
+
+        conn.execute("DROP TABLE t_drop_idx;").unwrap();
+
+        let table_missing = conn
+            .delete_sqlite_master_row("t_drop_idx")
+            .expect_err("dropped table row should be absent from sqlite_master");
+        assert!(is_sqlite_master_entry_missing(&table_missing));
+
+        let index_missing = conn
+            .delete_sqlite_master_row("idx_t_drop_idx_x")
+            .expect_err("dropped index row should be absent from sqlite_master");
+        assert!(is_sqlite_master_entry_missing(&index_missing));
     }
 
     #[test]
@@ -17622,6 +18039,30 @@ mod tests {
     }
 
     #[test]
+    fn test_pragma_user_version_and_application_id_persist_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pragma_header_roundtrip.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("PRAGMA user_version=123;").unwrap();
+            conn.execute("PRAGMA application_id=456;").unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            let rows = conn.query("PRAGMA user_version;").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(123));
+
+            let rows = conn.query("PRAGMA application_id;").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(456));
+        }
+    }
+
+    #[test]
     fn test_pragma_serializable_and_raptorq_return_rows() {
         let conn = Connection::open(":memory:").unwrap();
 
@@ -20792,6 +21233,57 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_reopen_loads_index_metadata_into_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("index_reload.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);").unwrap();
+            conn.execute("CREATE INDEX idx_t1_a ON t1(a);").unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            let schema = conn.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case("t1"))
+                .expect("table should load");
+            assert!(
+                table
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.name.eq_ignore_ascii_case("idx_t1_a")),
+                "index metadata should reload from sqlite_master"
+            );
+        }
+    }
+
+    #[test]
+    fn test_drop_index_after_reopen_removes_sqlite_master_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop_index_reopen.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("CREATE TABLE t1 (a INTEGER, b TEXT);").unwrap();
+            conn.execute("CREATE INDEX idx_t1_a ON t1(a);").unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("DROP INDEX IF EXISTS idx_t1_a;").unwrap();
+            let missing = conn
+                .delete_sqlite_master_row("idx_t1_a")
+                .expect_err("dropped index row should be absent from sqlite_master");
+            assert!(is_sqlite_master_entry_missing(&missing));
+        }
+    }
+
+    #[test]
     fn test_schema_survives_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("roundtrip.db");
@@ -20955,6 +21447,49 @@ mod schema_loading_tests {
             let schema = conn.schema.borrow();
             assert_eq!(schema.len(), 4);
         }
+    }
+
+    #[test]
+    fn test_next_master_rowid_uses_max_rowid_after_schema_holes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("master_rowid_hole.db");
+        let db_str = db_path.to_str().unwrap();
+
+        // Create 3 schema rows, then drop the middle one to create a hole.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+            conn.execute("CREATE TABLE t2 (b TEXT);").unwrap();
+            conn.execute("CREATE TABLE t3 (c REAL);").unwrap();
+            conn.execute("DROP TABLE t2;").unwrap();
+        }
+
+        // Reopen and create one more table. If next_master_rowid is derived
+        // from count instead of max(rowid), this would collide on rowid=3.
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t4 (d BLOB);")
+                .expect("rowid allocator should avoid sqlite_master PK collisions");
+            conn.execute("INSERT INTO t4 VALUES (X'01');")
+                .expect("newly created table should be writable");
+            let rows = conn.query("SELECT COUNT(*) FROM t4;").unwrap();
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        }
+    }
+
+    #[test]
+    fn test_insert_sqlite_master_row_recovers_from_stale_counter() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+
+        // Simulate stale in-memory rowid state (e.g., after drift/reload anomalies).
+        *conn.next_master_rowid.borrow_mut() = 1;
+
+        conn.execute("CREATE TABLE t3 (c INTEGER);")
+            .expect("sqlite_master allocator should self-heal from stale counters");
+        let rows = conn.query("SELECT COUNT(*) FROM t3;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
     }
 
     // ── bd-3uzh: SQLITE_BUSY_SNAPSHOT error handling tests ────────────────────
@@ -21661,6 +22196,80 @@ mod schema_loading_tests {
             snapshot.fsqlite_trace_export_errors_total, 0,
             "trace_reset should clear export error counter"
         );
+    }
+
+    #[test]
+    fn test_pragma_cache_stats_reports_pager_snapshot() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.query("PRAGMA fsqlite_cache_reset;").unwrap();
+
+        let cx = Cx::new();
+        let mut first = conn.pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let _ = first.get_page(&cx, PageNumber::ONE).unwrap();
+        first.rollback(&cx).unwrap();
+
+        let mut second = conn.pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let _ = second.get_page(&cx, PageNumber::ONE).unwrap();
+        second.rollback(&cx).unwrap();
+
+        let snapshot = conn.pager.cache_metrics_snapshot().unwrap();
+        let metrics = txn_metrics_map(&conn.query("PRAGMA fsqlite_cache_stats;").unwrap());
+
+        let snapshot_hits = i64::try_from(snapshot.hits).unwrap_or(i64::MAX);
+        let snapshot_misses = i64::try_from(snapshot.misses).unwrap_or(i64::MAX);
+        let snapshot_total = i64::try_from(snapshot.total_accesses()).unwrap_or(i64::MAX);
+
+        assert_eq!(metrics.get("hits"), Some(&snapshot_hits));
+        assert_eq!(metrics.get("misses"), Some(&snapshot_misses));
+        assert_eq!(metrics.get("total_accesses"), Some(&snapshot_total));
+        assert_eq!(
+            metrics.get("eviction_count"),
+            Some(&i64::try_from(snapshot.evictions).unwrap_or(i64::MAX))
+        );
+        assert_eq!(
+            metrics.get("admit_count"),
+            Some(&i64::try_from(snapshot.admits).unwrap_or(i64::MAX))
+        );
+        assert_eq!(metrics.get("t1_size"), Some(&0));
+        assert_eq!(metrics.get("t2_size"), Some(&0));
+        assert_eq!(metrics.get("b1_size"), Some(&0));
+        assert_eq!(metrics.get("b2_size"), Some(&0));
+        assert_eq!(metrics.get("p_target"), Some(&0));
+        assert_eq!(metrics.get("mvcc_multi_version_pages"), Some(&0));
+    }
+
+    #[test]
+    fn test_pragma_cache_reset_zeros_counters() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.query("PRAGMA fsqlite_cache_reset;").unwrap();
+
+        let cx = Cx::new();
+        let mut txn = conn.pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let _ = txn.get_page(&cx, PageNumber::ONE).unwrap();
+        txn.rollback(&cx).unwrap();
+
+        let before_reset = txn_metrics_map(&conn.query("PRAGMA cache_stats;").unwrap());
+        assert!(
+            before_reset
+                .get("total_accesses")
+                .copied()
+                .unwrap_or_default()
+                > 0
+        );
+
+        let reset_rows = conn.query("PRAGMA cache_reset;").unwrap();
+        assert_eq!(reset_rows.len(), 1);
+        assert_eq!(
+            *reset_rows[0].get(0).unwrap(),
+            SqliteValue::Text("ok".to_owned())
+        );
+
+        let after_reset = txn_metrics_map(&conn.query("PRAGMA cache_stats;").unwrap());
+        assert_eq!(after_reset.get("hits"), Some(&0));
+        assert_eq!(after_reset.get("misses"), Some(&0));
+        assert_eq!(after_reset.get("total_accesses"), Some(&0));
+        assert_eq!(after_reset.get("admit_count"), Some(&0));
+        assert_eq!(after_reset.get("eviction_count"), Some(&0));
     }
 
     #[test]
