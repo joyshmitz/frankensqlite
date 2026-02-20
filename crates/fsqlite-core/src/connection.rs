@@ -1144,7 +1144,9 @@ impl Connection {
     pub fn current_concurrent_snapshot_seq(&self) -> Option<u64> {
         let session_id = (*self.concurrent_session_id.borrow())?;
         let registry = lock_unpoisoned(&self.concurrent_registry);
-        registry.get(session_id).map(|handle| handle.snapshot().high.get())
+        registry
+            .get(session_id)
+            .map(|handle| handle.snapshot().high.get())
     }
 
     /// Returns a reference to the root capability context for this connection.
@@ -1172,7 +1174,8 @@ impl Connection {
 
     #[inline]
     fn advance_commit_clock(&self) -> CommitSeq {
-        let committed_seq = CommitSeq::new(self.next_commit_seq.fetch_add(1, AtomicOrdering::AcqRel));
+        let committed_seq =
+            CommitSeq::new(self.next_commit_seq.fetch_add(1, AtomicOrdering::AcqRel));
         *self.memdb_visible_commit_seq.borrow_mut() = committed_seq;
         *self.last_local_commit_seq.borrow_mut() = Some(committed_seq);
         committed_seq
@@ -2122,17 +2125,129 @@ impl Connection {
         let insert_sql =
             format!("INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders});");
 
-        let mut affected = 0usize;
+        // Execute row-by-row inside an internal pager savepoint so that if one
+        // row fails we preserve statement-level atomicity in explicit txns.
+        let cx = self.op_cx();
+        let internal_savepoint = if self.active_txn.borrow().is_some() {
+            let mut suffix = 0u64;
+            let savepoint_name = loop {
+                let candidate = format!(
+                    "__fsqlite_insert_select_stmt_{}_{}",
+                    next_trace_id(),
+                    suffix
+                );
+                let conflicts = self
+                    .savepoints
+                    .borrow()
+                    .iter()
+                    .any(|sp| sp.name.eq_ignore_ascii_case(&candidate));
+                if !conflicts {
+                    break candidate;
+                }
+                suffix = suffix.saturating_add(1);
+            };
+
+            if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                txn.savepoint(&cx, &savepoint_name)?;
+            }
+
+            let concurrent_snapshot = if *self.concurrent_txn.borrow() {
+                let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
+                    FrankenError::Internal(
+                        "concurrent transaction active but no session ID".to_owned(),
+                    )
+                })?;
+                let registry = lock_unpoisoned(&self.concurrent_registry);
+                let handle = registry.get(session_id).ok_or_else(|| {
+                    FrankenError::Internal("concurrent session handle not found".to_owned())
+                })?;
+                Some(concurrent_savepoint(handle, &savepoint_name).map_err(|e| {
+                    FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
+                })?)
+            } else {
+                None
+            };
+
+            Some((savepoint_name, concurrent_snapshot))
+        } else {
+            None
+        };
+
+        let mut statement_result: Result<usize> = Ok(0);
         for row in &source_rows {
             let mut ordered_values = vec![SqliteValue::Null; table_columns.len()];
             for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
                 ordered_values[target_idx] = row.values()[source_idx].clone();
             }
-            self.execute_with_params(&insert_sql, &ordered_values)?;
-            affected += 1;
+            match self.execute_with_params(&insert_sql, &ordered_values) {
+                Ok(_) => {
+                    statement_result = statement_result.map(|count| count.saturating_add(1));
+                }
+                Err(error) => {
+                    statement_result = Err(error);
+                    break;
+                }
+            }
         }
 
-        Ok(affected)
+        match statement_result {
+            Ok(affected) => {
+                if let Some((savepoint_name, _)) = internal_savepoint.as_ref() {
+                    if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                        txn.release_savepoint(&cx, savepoint_name)?;
+                    }
+                }
+                Ok(affected)
+            }
+            Err(statement_error) => {
+                if let Some((savepoint_name, concurrent_snapshot)) = internal_savepoint.as_ref() {
+                    let mut cleanup_errors = Vec::new();
+                    if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                        if let Err(err) = txn.rollback_to_savepoint(&cx, savepoint_name) {
+                            cleanup_errors.push(format!(
+                                "pager rollback_to_savepoint('{savepoint_name}') failed: {err}"
+                            ));
+                        } else if let Err(err) = txn.release_savepoint(&cx, savepoint_name) {
+                            cleanup_errors.push(format!(
+                                "pager release_savepoint('{savepoint_name}') failed: {err}"
+                            ));
+                        }
+                    }
+
+                    if let Some(concurrent_snap) = concurrent_snapshot {
+                        if let Some(session_id) = *self.concurrent_session_id.borrow() {
+                            let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                            if let Some(handle) = registry.get_mut(session_id) {
+                                if let Err(err) =
+                                    concurrent_rollback_to_savepoint(handle, concurrent_snap)
+                                {
+                                    cleanup_errors.push(format!(
+                                        "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
+                                    ));
+                                }
+                            } else {
+                                cleanup_errors.push(format!(
+                                    "concurrent session {session_id} missing during rollback"
+                                ));
+                            }
+                        } else {
+                            cleanup_errors.push(
+                                "concurrent transaction active but no session ID during rollback"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+
+                    if !cleanup_errors.is_empty() {
+                        return Err(FrankenError::Internal(format!(
+                            "INSERT ... SELECT fallback failed: {statement_error}; cleanup failed: {}",
+                            cleanup_errors.join("; ")
+                        )));
+                    }
+                }
+                Err(statement_error)
+            }
+        }
     }
 
     /// Handle INSERT OR REPLACE / INSERT OR IGNORE for VALUES source by
@@ -11995,12 +12110,12 @@ mod tests {
     use super::{
         CommitSeq, Connection, InProcessPageLockTable, Row, SchemaEpoch, Snapshot, lock_unpoisoned,
     };
-    use std::sync::Arc;
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
     use fsqlite_types::PageNumber;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
+    use std::sync::Arc;
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values().to_vec()
@@ -13974,6 +14089,46 @@ mod tests {
                 SqliteValue::Integer(20),
             ]
         );
+    }
+
+    #[test]
+    fn test_insert_select_explicit_txn_preserves_statement_atomicity_on_conflict() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO dst VALUES (1, 'existing');")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        let err = conn
+            .execute("INSERT INTO dst SELECT id, name FROM src ORDER BY id DESC;")
+            .expect_err("duplicate primary key should fail INSERT ... SELECT");
+        let err_text = err.to_string();
+        assert!(
+            matches!(&err, FrankenError::UniqueViolation { .. })
+                || err_text.contains("PRIMARY KEY constraint failed"),
+            "expected unique/primary-key violation, got {err}"
+        );
+
+        // Statement-level ABORT semantics: the successful row before the
+        // conflict (id=2) must be rolled back, while the transaction remains open.
+        assert!(conn.in_transaction());
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("existing".to_owned()),
+            ]
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
     }
 
     #[test]
@@ -17185,15 +17340,20 @@ mod tests {
         {
             let conn = Connection::open(&db).unwrap();
             conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
-            conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL);")
-                .unwrap();
+            conn.execute(
+                "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL);",
+            )
+            .unwrap();
             conn.execute("INSERT INTO accounts VALUES (1, 0);").unwrap();
         }
 
         let conn1 = Connection::open(&db).unwrap();
         let conn2 = Connection::open(&db).unwrap();
         assert!(
-            Arc::ptr_eq(&conn1.concurrent_commit_index, &conn2.concurrent_commit_index),
+            Arc::ptr_eq(
+                &conn1.concurrent_commit_index,
+                &conn2.concurrent_commit_index
+            ),
             "connections on same path must share commit index"
         );
         assert!(

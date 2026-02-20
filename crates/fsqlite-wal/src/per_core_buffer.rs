@@ -395,6 +395,13 @@ impl PerCoreWalBufferPool {
                 );
 
                 let core_records = if should_drain {
+                    // Records without an end_seq represent aborted writes and must never
+                    // participate in durable replay ordering.
+                    guard
+                        .flush_lane
+                        .records
+                        .retain(|record| record.end_seq.is_some());
+
                     if guard
                         .flush_lane
                         .records
@@ -667,7 +674,7 @@ fn make_record(core_id: usize, seq: u64, payload_len: usize) -> WalRecord {
         epoch: seq,
         page_id,
         begin_seq: CommitSeq::new(seq),
-        end_seq: None,
+        end_seq: Some(CommitSeq::new(seq.saturating_add(1))),
         before_image: vec![0x10; payload_len],
         after_image: vec![0x20; payload_len],
     }
@@ -717,6 +724,44 @@ fn bd_ncivz_1_state_machine_double_buffering() {
     assert_eq!(
         buffer.fallback_decision(),
         FallbackDecision::ContinueParallel
+    );
+}
+
+#[test]
+fn bd_ncivz_1_sealed_lane_rejects_mutating_appends() {
+    let config = BufferConfig {
+        capacity_bytes: 640,
+        ..BufferConfig::default()
+    };
+    let mut buffer = PerCoreWalBuffer::new(0, config);
+
+    let seeded = make_record(0, 1, 64);
+    assert_eq!(buffer.append(seeded.clone()), AppendOutcome::Appended);
+    buffer
+        .seal_active(3)
+        .expect("active lane should seal before flush");
+
+    assert_eq!(
+        buffer.append(make_record(0, 2, 64)),
+        AppendOutcome::Blocked,
+        "sealed lane must reject mutating appends"
+    );
+
+    let flushed_records = buffer
+        .begin_flush()
+        .expect("sealed records should move into flush lane");
+    assert_eq!(flushed_records, 1);
+    assert_eq!(buffer.flush_lane.records.len(), 1);
+
+    let flushed = &buffer.flush_lane.records[0];
+    assert_eq!(
+        flushed.txn_token.id.get(),
+        seeded.txn_token.id.get(),
+        "flushed lane contents must remain unchanged after blocked append"
+    );
+    assert_eq!(
+        flushed.end_seq, seeded.end_seq,
+        "commit metadata must remain intact while lane is sealed"
     );
 }
 
@@ -1081,5 +1126,57 @@ fn bd_ncivz_2_commits_across_epochs_preserve_serial_epoch_order() {
                     && pair[0].begin_seq.get() <= pair[1].begin_seq.get())
         }),
         "recovery ordering should be monotonic by epoch and begin_seq"
+    );
+}
+
+#[test]
+fn bd_ncivz_2_abort_cleanup_drops_non_committed_records() {
+    let coordinator =
+        EpochOrderCoordinator::new(1, BufferConfig::default(), EpochConfig::default());
+    coordinator
+        .observe_epoch(0)
+        .expect("core 0 observation should succeed");
+
+    coordinator
+        .append_to_core(0, 1, 64)
+        .expect("committed append should succeed");
+
+    let mut aborted = make_record(0, 2, 64);
+    aborted.epoch = coordinator.current_epoch();
+    aborted.end_seq = None;
+    let aborted_txn_id = aborted.txn_token.id.get();
+    assert_eq!(
+        coordinator
+            .pool
+            .append_to_core(0, aborted)
+            .expect("aborted append should still enter active lane"),
+        AppendOutcome::Appended
+    );
+
+    coordinator
+        .advance_epoch_and_wait(&[], Duration::from_millis(25))
+        .expect("epoch advance should succeed");
+    let batch = coordinator
+        .flush_epoch(0)
+        .expect("flush should prune aborted records");
+
+    assert_eq!(batch.total_records(), 1);
+    assert!(
+        batch.records.iter().all(|record| record.end_seq.is_some()),
+        "all flushed records must be committed"
+    );
+    assert!(
+        batch
+            .records
+            .iter()
+            .all(|record| record.txn_token.id.get() != aborted_txn_id),
+        "aborted record must not survive cleanup"
+    );
+
+    let ordered = EpochOrderCoordinator::recovery_order(&batch.records);
+    assert_eq!(ordered.len(), 1);
+    assert!(
+        ordered[0].end_seq.is_some(),
+        "recovery input should only contain committed records"
     );
 }
