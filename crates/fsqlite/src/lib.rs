@@ -294,6 +294,113 @@ mod tests {
     }
 
     #[test]
+    fn update_preserves_integer_primary_key_rowid_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO accounts VALUES (1, 100);").unwrap();
+        conn.execute("INSERT INTO accounts VALUES (2, 200);").unwrap();
+
+        conn.execute("UPDATE accounts SET balance = balance + 5 WHERE id = 1;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT id, balance FROM accounts ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2, "update must not create or lose rows");
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(105)],
+            "id=1 row must be updated in place"
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Integer(200)],
+            "id=2 row must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn concurrent_same_row_deposit_commits_must_conflict_or_serialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("concurrent_same_row_deposit.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL);")
+                .unwrap();
+            conn.execute("INSERT INTO accounts VALUES (1, 0);").unwrap();
+        }
+
+        let conn1 = Connection::open(&db).unwrap();
+        let conn2 = Connection::open(&db).unwrap();
+        conn1.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        conn2.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+
+        conn1.execute("BEGIN CONCURRENT;").unwrap();
+        conn2.execute("BEGIN CONCURRENT;").unwrap();
+
+        assert_eq!(
+            conn1
+                .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;")
+                .unwrap(),
+            1
+        );
+        let update2 = conn2.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;");
+
+        let commit1 = conn1.execute("COMMIT;");
+        let commit2 = match update2 {
+            Ok(changes2) => {
+                assert_eq!(changes2, 1, "second update should affect one row");
+                conn2.execute("COMMIT;")
+            }
+            Err(err) => {
+                assert!(
+                    err.is_transient(),
+                    "second concurrent writer should fail transiently on conflict, got: {err}"
+                );
+                let rollback = conn2.execute("ROLLBACK;");
+                assert!(
+                    rollback.is_ok(),
+                    "second writer should remain rollback-able after transient conflict: {rollback:?}"
+                );
+                Err(err)
+            }
+        };
+
+        let verify = Connection::open(&db).unwrap();
+        let row = verify
+            .query_row("SELECT balance FROM accounts WHERE id = 1;")
+            .unwrap();
+        let balance = row.get(0).cloned().unwrap_or(SqliteValue::Null);
+        match (commit1, commit2) {
+            (Ok(_), Ok(_)) => {
+                assert_eq!(
+                    balance,
+                    SqliteValue::Integer(2),
+                    "if both commits succeed, both deposits must be visible"
+                );
+            }
+            (Ok(_), Err(err)) | (Err(err), Ok(_)) => {
+                assert!(
+                    err.is_transient(),
+                    "conflicting concurrent writer should fail with transient busy snapshot/busy, got: {err}"
+                );
+                assert_eq!(
+                    balance,
+                    SqliteValue::Integer(1),
+                    "if one writer aborts, exactly one deposit should persist"
+                );
+            }
+            (Err(err1), Err(err2)) => {
+                panic!("at least one concurrent writer must commit: err1={err1}; err2={err2}");
+            }
+        }
+    }
+
+    #[test]
     fn delete_removes_rows() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (v INTEGER);").unwrap();

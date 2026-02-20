@@ -101,6 +101,14 @@ pub struct CheckpointResult {
 /// The pager calls into this trait during WAL-mode commits and page lookups
 /// instead of writing a rollback journal.
 pub trait WalBackend: Send {
+    /// Prepare WAL state for a newly-started transaction.
+    ///
+    /// Implementations may refresh internal snapshot metadata so reads during
+    /// this transaction see a coherent view without per-page refresh costs.
+    fn begin_transaction(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+
     /// Append a single frame to the WAL.
     ///
     /// `page_number` is the 1-based database page.

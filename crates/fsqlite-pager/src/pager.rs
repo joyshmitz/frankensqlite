@@ -181,7 +181,7 @@ where
 {
     type Txn = SimpleTransaction<V>;
 
-    fn begin(&self, _cx: &Cx, mode: TransactionMode) -> Result<Self::Txn> {
+    fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Self::Txn> {
         let mut inner = self
             .inner
             .lock()
@@ -189,6 +189,13 @@ where
 
         if inner.checkpoint_active {
             return Err(FrankenError::Busy);
+        }
+
+        if inner.journal_mode == JournalMode::Wal {
+            let wal = inner.wal_backend.as_mut().ok_or_else(|| {
+                FrankenError::internal("WAL mode active but no WAL backend installed")
+            })?;
+            wal.begin_transaction(cx)?;
         }
 
         let eager_writer = matches!(

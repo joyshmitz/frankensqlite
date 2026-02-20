@@ -22,7 +22,7 @@ use tracing::{debug, error};
 use crate::checksum::{
     SqliteWalChecksum, WAL_FORMAT_VERSION, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WAL_MAGIC_LE,
     WalFrameHeader, WalHeader, WalSalts, compute_wal_frame_checksum, read_wal_header_checksum,
-    write_wal_frame_checksum, write_wal_frame_salts,
+    wal_header_checksum, write_wal_frame_checksum, write_wal_frame_salts,
 };
 
 /// A WAL file backed by a VFS file handle.
@@ -41,6 +41,166 @@ pub struct WalFile<F: VfsFile> {
 }
 
 impl<F: VfsFile> WalFile<F> {
+    /// Re-synchronize this handle with the on-disk WAL if another writer has
+    /// appended frames or reset/truncated the file.
+    ///
+    /// This keeps `frame_count` and `running_checksum` coherent across
+    /// multiple concurrently-open `WalFile` handles.
+    pub fn refresh(&mut self, cx: &Cx) -> Result<()> {
+        let frame_size = self.frame_size();
+        let expected_size = u64::try_from(WAL_HEADER_SIZE)
+            .expect("WAL header size fits u64")
+            .saturating_add(
+                u64::try_from(self.frame_count)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(u64::try_from(frame_size).unwrap_or(u64::MAX)),
+            );
+        let file_size = self.file.file_size(cx)?;
+        if file_size == expected_size {
+            return Ok(());
+        }
+
+        // If file shrank (checkpoint reset/truncate, external compaction, etc.),
+        // or changed in a way we cannot safely reason about incrementally,
+        // rebuild state from the on-disk WAL from scratch.
+        if file_size < expected_size {
+            return self.rebuild_state_from_file(cx);
+        }
+
+        // Validate current on-disk header and confirm it matches our view.
+        let mut header_buf = [0u8; WAL_HEADER_SIZE];
+        let header_read = self.file.read(cx, &mut header_buf, 0)?;
+        if header_read < WAL_HEADER_SIZE {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL file too small for header during refresh: read {header_read}, need {WAL_HEADER_SIZE}"
+                ),
+            });
+        }
+
+        let disk_header = WalHeader::from_bytes(&header_buf)?;
+        let disk_big_endian = disk_header.big_endian_checksum();
+        let disk_header_checksum = read_wal_header_checksum(&header_buf)?;
+        let expected_header_checksum = wal_header_checksum(&header_buf, disk_big_endian)?;
+        if disk_header_checksum != expected_header_checksum {
+            return Err(FrankenError::WalCorrupt {
+                detail: "WAL header checksum mismatch during refresh".to_owned(),
+            });
+        }
+
+        // Header changed under us (e.g., RESET/TRUNCATE checkpoint) — rebuild.
+        if disk_header.magic != self.header.magic
+            || disk_header.format_version != self.header.format_version
+            || disk_header.page_size != self.header.page_size
+            || disk_header.salts != self.header.salts
+        {
+            return self.rebuild_state_from_file(cx);
+        }
+
+        // Incrementally absorb newly appended complete frames.
+        //
+        // For live multi-connection operation we only need:
+        // - the new valid prefix length (`frame_count`)
+        // - the checksum seed for the next append (`running_checksum`)
+        //
+        // SQLite WAL frame headers already carry the post-frame rolling
+        // checksum, so we can ingest appended frames by reading headers only.
+        // Full checksum-chain verification is still performed on open/rebuild.
+        let frame_size_u64 = u64::try_from(frame_size).unwrap_or(u64::MAX);
+        let available_frames =
+            usize::try_from(file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).unwrap_or(0))
+                / frame_size_u64)
+            .unwrap_or(usize::MAX);
+        if available_frames <= self.frame_count {
+            return Ok(());
+        }
+
+        let mut frame_header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
+        for frame_index in self.frame_count..available_frames {
+            let offset = self.frame_offset(frame_index);
+            let bytes_read = self.file.read(cx, &mut frame_header_buf, offset)?;
+            if bytes_read < WAL_FRAME_HEADER_SIZE {
+                break; // Partial/torn tail frame; keep prior valid prefix.
+            }
+
+            let frame_header = WalFrameHeader::from_bytes(&frame_header_buf)?;
+            if frame_header.salts != self.header.salts {
+                break; // End of valid chain for this generation.
+            }
+
+            self.running_checksum = frame_header.checksum;
+            self.frame_count += 1;
+        }
+
+        Ok(())
+    }
+
+    fn rebuild_state_from_file(&mut self, cx: &Cx) -> Result<()> {
+        let mut header_buf = [0u8; WAL_HEADER_SIZE];
+        let header_read = self.file.read(cx, &mut header_buf, 0)?;
+        if header_read < WAL_HEADER_SIZE {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL file too small for header during rebuild: read {header_read}, need {WAL_HEADER_SIZE}"
+                ),
+            });
+        }
+
+        let header = WalHeader::from_bytes(&header_buf)?;
+        let page_size = usize::try_from(header.page_size).expect("WAL header page size fits usize");
+        let big_endian_checksum = header.big_endian_checksum();
+        let header_checksum = read_wal_header_checksum(&header_buf)?;
+        let expected_header_checksum = wal_header_checksum(&header_buf, big_endian_checksum)?;
+        if header_checksum != expected_header_checksum {
+            return Err(FrankenError::WalCorrupt {
+                detail: "WAL header checksum mismatch during rebuild".to_owned(),
+            });
+        }
+
+        self.header = header;
+        self.page_size = page_size;
+        self.big_endian_checksum = big_endian_checksum;
+        self.running_checksum = header_checksum;
+        self.frame_count = 0;
+
+        let frame_size = self.frame_size();
+        let file_size = self.file.file_size(cx)?;
+        let max_frames = usize::try_from(
+            file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).unwrap_or(0))
+                / u64::try_from(frame_size).unwrap_or(1),
+        )
+        .unwrap_or(usize::MAX);
+
+        let mut frame_buf = vec![0u8; frame_size];
+        for frame_index in 0..max_frames {
+            let offset = self.frame_offset(frame_index);
+            let bytes_read = self.file.read(cx, &mut frame_buf, offset)?;
+            if bytes_read < frame_size {
+                break;
+            }
+
+            let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
+            if frame_header.salts != self.header.salts {
+                break;
+            }
+
+            let expected = compute_wal_frame_checksum(
+                &frame_buf,
+                self.page_size,
+                self.running_checksum,
+                self.big_endian_checksum,
+            )?;
+            if frame_header.checksum != expected {
+                break;
+            }
+
+            self.running_checksum = expected;
+            self.frame_count += 1;
+        }
+
+        Ok(())
+    }
+
     /// Size in bytes of a single frame (header + page data).
     #[must_use]
     pub fn frame_size(&self) -> usize {

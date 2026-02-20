@@ -33,6 +33,8 @@ use crate::wal_fec_adapter::{FecCommitHook, FecCommitResult};
 /// `fsqlite-wal`.
 pub struct WalBackendAdapter<F: VfsFile> {
     wal: WalFile<F>,
+    /// Guard so commit-time append refresh runs only once per commit batch.
+    refresh_before_append: bool,
     /// Optional FEC commit hook for encoding repair symbols on commit.
     fec_hook: Option<FecCommitHook>,
     /// Accumulated FEC commit results (for later sidecar persistence).
@@ -45,6 +47,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     pub fn new(wal: WalFile<F>) -> Self {
         Self {
             wal,
+            refresh_before_append: true,
             fec_hook: None,
             fec_pending: Vec::new(),
         }
@@ -55,6 +58,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     pub fn with_fec_hook(wal: WalFile<F>, hook: FecCommitHook) -> Self {
         Self {
             wal,
+            refresh_before_append: true,
             fec_hook: Some(hook),
             fec_pending: Vec::new(),
         }
@@ -109,6 +113,14 @@ fn to_wal_mode(mode: CheckpointMode) -> WalCheckpointMode {
 }
 
 impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
+    fn begin_transaction(&mut self, cx: &Cx) -> Result<()> {
+        // Establish a transaction-bounded snapshot once, instead of doing an
+        // expensive refresh for every page read.
+        self.wal.refresh(cx)?;
+        self.refresh_before_append = true;
+        Ok(())
+    }
+
     fn append_frame(
         &mut self,
         cx: &Cx,
@@ -116,8 +128,14 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         page_data: &[u8],
         db_size_if_commit: u32,
     ) -> Result<()> {
+        if self.refresh_before_append {
+            // Keep this handle synchronized with external WAL growth/reset
+            // before choosing append offset and checksum seed.
+            self.wal.refresh(cx)?;
+        }
         self.wal
             .append_frame(cx, page_number, page_data, db_size_if_commit)?;
+        self.refresh_before_append = false;
 
         // Feed the frame to the FEC hook.  On commit, it encodes repair
         // symbols and stores them for later sidecar persistence.
@@ -168,7 +186,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 
     fn sync(&mut self, cx: &Cx) -> Result<()> {
-        self.wal.sync(cx, SyncFlags::NORMAL)
+        let result = self.wal.sync(cx, SyncFlags::NORMAL);
+        self.refresh_before_append = true;
+        result
     }
 
     fn frame_count(&self) -> usize {
@@ -183,6 +203,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         backfilled_frames: u32,
         oldest_reader_frame: Option<u32>,
     ) -> Result<CheckpointResult> {
+        // Refresh so planner state reflects the latest on-disk WAL shape.
+        self.wal.refresh(cx)?;
+        self.refresh_before_append = true;
         let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
 
         // Build checkpoint state for the planner.
@@ -413,6 +436,60 @@ mod tests {
             result,
             Some(new_data),
             "adapter should return the latest WAL version"
+        );
+    }
+
+    #[test]
+    fn test_adapter_refreshes_cross_handle_visibility_and_append_position() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+
+        let file1 = open_wal_file(&vfs, &cx);
+        let wal1 = WalFile::create(&cx, file1, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        let mut adapter1 = WalBackendAdapter::new(wal1);
+
+        let file2 = open_wal_file(&vfs, &cx);
+        let wal2 = WalFile::open(&cx, file2).expect("open WAL");
+        let mut adapter2 = WalBackendAdapter::new(wal2);
+
+        let page1 = sample_page(0x11);
+        adapter1
+            .append_frame(&cx, 1, &page1, 1)
+            .expect("adapter1 append commit");
+        adapter1.sync(&cx).expect("adapter1 sync");
+        adapter2
+            .begin_transaction(&cx)
+            .expect("adapter2 begin transaction");
+        assert_eq!(
+            adapter2.read_page(&cx, 1).expect("adapter2 read page1"),
+            Some(page1.clone()),
+            "adapter2 should observe adapter1 commit at transaction begin"
+        );
+
+        let page2 = sample_page(0x22);
+        adapter2
+            .append_frame(&cx, 2, &page2, 2)
+            .expect("adapter2 append commit");
+        adapter2.sync(&cx).expect("adapter2 sync");
+        adapter1
+            .begin_transaction(&cx)
+            .expect("adapter1 begin transaction");
+        assert_eq!(
+            adapter1.read_page(&cx, 2).expect("adapter1 read page2"),
+            Some(page2.clone()),
+            "adapter1 should observe adapter2 commit at transaction begin"
+        );
+
+        // Ensure the second writer appended to frame 1 (not frame 0 overwrite).
+        assert_eq!(
+            adapter1.frame_count(),
+            2,
+            "shared WAL should contain both commit frames"
+        );
+        assert_eq!(
+            adapter2.frame_count(),
+            2,
+            "shared WAL should contain both commit frames"
         );
     }
 

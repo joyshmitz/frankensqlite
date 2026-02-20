@@ -56,10 +56,11 @@ use fsqlite_wal::{
 // MVCC concurrent-writer support (bd-14zc / 5E.1, bd-kivg / 5E.2, bd-3bql / 5E.5)
 use fsqlite_mvcc::{
     CommitIndex, ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult, GcScheduler,
-    GcTickResult, GcTodo, InProcessPageLockTable, MvccError, SsiDecisionCard, SsiDecisionCardDraft,
-    SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger, SsiReadSetSummary, VersionStore,
-    concurrent_abort, concurrent_rollback_to_savepoint, concurrent_savepoint,
-    validate_first_committer_wins,
+    GcTickResult, GcTodo, InProcessPageLockTable, MvccError, PreparedConcurrentCommit,
+    SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger,
+    SsiReadSetSummary, VersionStore, concurrent_abort, concurrent_rollback_to_savepoint,
+    concurrent_savepoint, finalize_prepared_concurrent_commit_with_ssi,
+    prepare_concurrent_commit_with_ssi,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 use fsqlite_observability::{
@@ -67,7 +68,7 @@ use fsqlite_observability::{
     record_trace_export, record_trace_export_error, record_trace_span_created, reset_trace_metrics,
     trace_metrics_snapshot,
 };
-use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnId, TxnToken};
+use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
 
 use crate::wal_adapter::WalBackendAdapter;
 
@@ -990,6 +991,9 @@ pub struct Connection {
     /// Registry of active concurrent-writer sessions.
     /// Wrapped in Rc for sharing with VdbeEngine during execution (bd-kivg).
     concurrent_registry: Arc<Mutex<ConcurrentRegistry>>,
+    /// Keeps the per-database shared MVCC bundle alive while this connection
+    /// is open, so same-path connections reuse the same state entry.
+    _shared_mvcc_state: Arc<SharedMvccState>,
     /// Session ID for the current concurrent transaction (if any).
     /// Set by execute_begin() when mode is Concurrent.
     concurrent_session_id: RefCell<Option<u64>>,
@@ -1000,6 +1004,12 @@ pub struct Connection {
     concurrent_commit_index: Arc<CommitIndex>,
     /// Next commit sequence to assign (simple in-process monotonic counter).
     next_commit_seq: Arc<AtomicU64>,
+    /// Highest commit sequence reflected in this connection's in-memory
+    /// `MemDatabase` image. Used to reload from pager before BEGIN when stale.
+    memdb_visible_commit_seq: RefCell<CommitSeq>,
+    /// Last commit sequence assigned to a successful local COMMIT executed
+    /// through this connection.
+    last_local_commit_seq: RefCell<Option<CommitSeq>>,
     /// Global per-database commit serialization guard to keep WAL appends
     /// single-file ordered across multiple connections.
     commit_write_mutex: Arc<Mutex<()>>,
@@ -1050,6 +1060,12 @@ impl Connection {
         // storage layer. The pager handles all persistence via WAL.
         let pager = PagerBackend::open(&path)?;
         let shared_mvcc_state = shared_mvcc_state_for_path(&path);
+        let initial_visible_commit_seq = CommitSeq::new(
+            shared_mvcc_state
+                .next_commit_seq
+                .load(AtomicOrdering::Acquire)
+                .saturating_sub(1),
+        );
 
         let conn = Self {
             path,
@@ -1081,10 +1097,13 @@ impl Connection {
             ssi_evidence_ledger: SsiEvidenceLedger::new(4096),
             // MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2)
             concurrent_registry: Arc::clone(&shared_mvcc_state.registry),
+            _shared_mvcc_state: Arc::clone(&shared_mvcc_state),
             concurrent_session_id: RefCell::new(None),
             concurrent_lock_table: Arc::clone(&shared_mvcc_state.lock_table),
             concurrent_commit_index: Arc::clone(&shared_mvcc_state.commit_index),
             next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
+            memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
+            last_local_commit_seq: RefCell::new(None),
             commit_write_mutex: Arc::clone(&shared_mvcc_state.commit_write_mutex),
             closed: RefCell::new(false),
             // Cx capability context (bd-2g5.6)
@@ -1108,6 +1127,26 @@ impl Connection {
         &self.path
     }
 
+    /// Returns the most recent commit sequence assigned to a successful
+    /// COMMIT on this connection.
+    ///
+    /// Returns `None` when this connection has not committed yet.
+    #[must_use]
+    pub fn last_local_commit_seq(&self) -> Option<u64> {
+        (*self.last_local_commit_seq.borrow()).map(CommitSeq::get)
+    }
+
+    /// Returns the active concurrent transaction snapshot sequence observed at
+    /// `BEGIN CONCURRENT` time for this connection.
+    ///
+    /// Returns `None` when no concurrent transaction is active.
+    #[must_use]
+    pub fn current_concurrent_snapshot_seq(&self) -> Option<u64> {
+        let session_id = (*self.concurrent_session_id.borrow())?;
+        let registry = lock_unpoisoned(&self.concurrent_registry);
+        registry.get(session_id).map(|handle| handle.snapshot().high.get())
+    }
+
     /// Returns a reference to the root capability context for this connection.
     #[must_use]
     pub fn root_cx(&self) -> &Cx {
@@ -1120,6 +1159,37 @@ impl Connection {
     /// can distinguish individual SQL operations within a connection's trace.
     fn op_cx(&self) -> Cx {
         self.root_cx.clone().with_decision_id(next_decision_id())
+    }
+
+    #[inline]
+    fn current_global_commit_seq(&self) -> CommitSeq {
+        CommitSeq::new(
+            self.next_commit_seq
+                .load(AtomicOrdering::Acquire)
+                .saturating_sub(1),
+        )
+    }
+
+    #[inline]
+    fn advance_commit_clock(&self) -> CommitSeq {
+        let committed_seq = CommitSeq::new(self.next_commit_seq.fetch_add(1, AtomicOrdering::AcqRel));
+        *self.memdb_visible_commit_seq.borrow_mut() = committed_seq;
+        *self.last_local_commit_seq.borrow_mut() = Some(committed_seq);
+        committed_seq
+    }
+
+    /// Ensure the in-memory execution image matches the latest committed pager state.
+    ///
+    /// Connections keep a local `MemDatabase` cache for VDBE execution. When other
+    /// connections commit, this cache can become stale; before starting a new SQL
+    /// transaction we must reload from pager to preserve snapshot correctness.
+    fn refresh_memdb_if_stale(&self, cx: &Cx) -> Result<()> {
+        let latest_commit_seq = self.current_global_commit_seq();
+        if latest_commit_seq > *self.memdb_visible_commit_seq.borrow() {
+            self.reload_memdb_from_pager(cx)?;
+            *self.memdb_visible_commit_seq.borrow_mut() = latest_commit_seq;
+        }
+        Ok(())
     }
 
     /// Bootstrap connection-local journal mode from on-disk artifacts.
@@ -2897,6 +2967,7 @@ impl Connection {
             return Ok(false);
         }
         let cx = self.op_cx();
+        self.refresh_memdb_if_stale(&cx)?;
         let mut txn = self.pager.begin(&cx, mode)?;
         let is_concurrent = mode == TransactionMode::Concurrent;
         let concurrent_session = if is_concurrent {
@@ -2968,13 +3039,11 @@ impl Connection {
             };
 
             txn.commit(&cx)?;
+            let committed_seq = self.advance_commit_clock();
 
-            if let Some((session_id, write_pages)) = concurrent_plan {
-                let committed_seq =
-                    CommitSeq::new(self.next_commit_seq.fetch_add(1, AtomicOrdering::AcqRel));
-                self.finalize_concurrent_commit(session_id, committed_seq, write_pages);
+            if let Some(plan) = concurrent_plan {
+                self.finalize_concurrent_commit(plan, committed_seq);
             }
-
             Ok(())
         } else {
             txn.rollback(&cx)
@@ -3060,6 +3129,7 @@ impl Connection {
                 if result.is_ok() {
                     let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
                     txn.commit(&cx)?;
+                    let _ = self.advance_commit_clock();
                 } else {
                     txn.rollback(&cx)?;
                 }
@@ -4205,6 +4275,7 @@ impl Connection {
         };
 
         let cx = self.op_cx();
+        self.refresh_memdb_if_stale(&cx)?;
         let mut txn = self.pager.begin(&cx, pager_mode)?;
         // MVCC concurrent-writer session (bd-14zc / 5E.1):
         // When mode is Concurrent, register with ConcurrentRegistry for
@@ -4375,161 +4446,159 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn plan_concurrent_commit(&self) -> Result<Option<(u64, Vec<PageNumber>)>> {
+    fn plan_concurrent_commit_with_registry(
+        &self,
+        registry: &mut ConcurrentRegistry,
+    ) -> Result<Option<PreparedConcurrentCommit>> {
         // MVCC concurrent-writer commit path (bd-14zc / 5E.1):
-        // Validate FCW/SSI preconditions first, but delay commit-index
-        // publication and lock release until pager commit succeeds. This
-        // prevents publishing a committed sequence if physical commit fails.
+        // Validate FCW/SSI preconditions first, but delay commit-side
+        // publication until pager commit succeeds.
         let Some(session_id) = *self.concurrent_session_id.borrow() else {
             return Ok(None);
         };
 
         let mut abort_card: Option<SsiDecisionCardDraft> = None;
+        let assigned_commit_seq =
+            CommitSeq::new(self.next_commit_seq.load(AtomicOrdering::Acquire));
 
-        let validate_result: std::result::Result<Vec<PageNumber>, (MvccError, FcwResult)> = {
-            let mut registry = lock_unpoisoned(&self.concurrent_registry);
-            let (fcw_result, snapshot, write_pages) = match registry.get_mut(session_id) {
-                Some(handle) if handle.is_active() => (
-                    validate_first_committer_wins(handle, &self.concurrent_commit_index),
-                    Self::capture_ssi_snapshot(handle),
-                    handle.write_set_pages(),
-                ),
-                Some(_) | None => {
-                    return Err(FrankenError::Internal(
-                        "MVCC session invalid or inactive".to_owned(),
-                    ));
-                }
-            };
-            let active_conflicts =
-                Self::collect_active_conflict_evidence(&registry, session_id, &snapshot);
+        let (snapshot, active_conflicts) = match registry.get(session_id) {
+            Some(handle) if handle.is_active() => {
+                let snapshot = Self::capture_ssi_snapshot(handle);
+                let active_conflicts =
+                    Self::collect_active_conflict_evidence(registry, session_id, &snapshot);
+                (snapshot, active_conflicts)
+            }
+            Some(_) | None => {
+                return Err(FrankenError::Internal(
+                    "MVCC session invalid or inactive".to_owned(),
+                ));
+            }
+        };
+        let validate_result: std::result::Result<PreparedConcurrentCommit, (MvccError, FcwResult)> =
+            match prepare_concurrent_commit_with_ssi(
+                registry,
+                &self.concurrent_commit_index,
+                &self.concurrent_lock_table,
+                session_id,
+                assigned_commit_seq,
+            ) {
+                Ok(plan) => Ok(plan),
+                Err((err, fcw_result)) => {
+                    let (decision_type, rationale, conflict_pages) = match &fcw_result {
+                        FcwResult::Conflict {
+                            conflicting_pages,
+                            conflicting_commit_seq,
+                        } => (
+                            SsiDecisionType::AbortCycle,
+                            format!(
+                                "fcw_conflict_conflicting_commit_seq={}",
+                                conflicting_commit_seq.get()
+                            ),
+                            Self::merge_conflict_pages(
+                                conflicting_pages.clone(),
+                                active_conflicts.conflict_pages.clone(),
+                                &snapshot.write_pages,
+                            ),
+                        ),
+                        FcwResult::Clean if snapshot.marked_for_abort => (
+                            SsiDecisionType::AbortCycle,
+                            "marked_for_abort_by_pivot_rule".to_owned(),
+                            Self::merge_conflict_pages(
+                                Vec::new(),
+                                active_conflicts.conflict_pages.clone(),
+                                &snapshot.write_pages,
+                            ),
+                        ),
+                        FcwResult::Clean if snapshot.has_in_rw && snapshot.has_out_rw => (
+                            SsiDecisionType::AbortWriteSkew,
+                            "dangerous_structure_in_and_out_rw".to_owned(),
+                            Self::merge_conflict_pages(
+                                Vec::new(),
+                                active_conflicts.conflict_pages.clone(),
+                                &snapshot.write_pages,
+                            ),
+                        ),
+                        FcwResult::Clean => (
+                            SsiDecisionType::AbortCycle,
+                            "ssi_validation_abort".to_owned(),
+                            Self::merge_conflict_pages(
+                                Vec::new(),
+                                active_conflicts.conflict_pages.clone(),
+                                &snapshot.write_pages,
+                            ),
+                        ),
+                    };
 
-            let result = match &fcw_result {
-                FcwResult::Conflict {
-                    conflicting_pages,
-                    conflicting_commit_seq,
-                } => {
-                    if let Some(txn_id) = TxnId::new(session_id) {
-                        self.concurrent_lock_table.release_all(txn_id);
-                    }
-                    if let Some(handle) = registry.get_mut(session_id) {
-                        handle.mark_aborted();
-                    }
-                    let conflict_pages = Self::merge_conflict_pages(
-                        conflicting_pages.clone(),
-                        active_conflicts.conflict_pages,
-                        &snapshot.write_pages,
-                    );
                     abort_card = Some(Self::build_ssi_decision_draft(
                         &snapshot,
-                        SsiDecisionType::AbortCycle,
+                        decision_type,
                         active_conflicts.conflicting_txns,
                         conflict_pages,
-                        format!(
-                            "fcw_conflict_conflicting_commit_seq={}",
-                            conflicting_commit_seq.get()
-                        ),
+                        rationale,
                     ));
-                    Err((MvccError::BusySnapshot, fcw_result))
-                }
-                FcwResult::Clean => {
-                    if snapshot.marked_for_abort {
-                        if let Some(txn_id) = TxnId::new(session_id) {
-                            self.concurrent_lock_table.release_all(txn_id);
-                        }
-                        if let Some(handle) = registry.get_mut(session_id) {
-                            handle.mark_aborted();
-                        }
-                        abort_card = Some(Self::build_ssi_decision_draft(
-                            &snapshot,
-                            SsiDecisionType::AbortCycle,
-                            active_conflicts.conflicting_txns,
-                            Self::merge_conflict_pages(
-                                Vec::new(),
-                                active_conflicts.conflict_pages,
-                                &snapshot.write_pages,
-                            ),
-                            "marked_for_abort_by_pivot_rule",
-                        ));
-                        Err((MvccError::BusySnapshot, FcwResult::Clean))
-                    } else if snapshot.has_in_rw && snapshot.has_out_rw {
-                        if let Some(txn_id) = TxnId::new(session_id) {
-                            self.concurrent_lock_table.release_all(txn_id);
-                        }
-                        if let Some(handle) = registry.get_mut(session_id) {
-                            handle.mark_aborted();
-                        }
-                        abort_card = Some(Self::build_ssi_decision_draft(
-                            &snapshot,
-                            SsiDecisionType::AbortWriteSkew,
-                            active_conflicts.conflicting_txns,
-                            Self::merge_conflict_pages(
-                                Vec::new(),
-                                active_conflicts.conflict_pages,
-                                &snapshot.write_pages,
-                            ),
-                            "dangerous_structure_in_and_out_rw",
-                        ));
-                        Err((MvccError::BusySnapshot, FcwResult::Clean))
-                    } else {
-                        Ok(write_pages)
-                    }
+                    Err((err, fcw_result))
                 }
             };
-            drop(registry);
-            result
-        };
 
         if let Some(card) = abort_card {
             self.ssi_evidence_ledger.record_async(card);
         }
 
         match validate_result {
-            Ok(write_pages) => Ok(Some((session_id, write_pages))),
+            Ok(plan) => Ok(Some(plan)),
             Err((err, fcw_result)) => {
-                lock_unpoisoned(&self.concurrent_registry).remove(session_id);
+                registry.remove(session_id);
                 *self.concurrent_session_id.borrow_mut() = None;
                 Err(Self::map_mvcc_commit_error(err, fcw_result))
             }
         }
     }
 
-    fn finalize_concurrent_commit(
+    fn finalize_concurrent_commit_with_registry(
         &self,
-        session_id: u64,
+        registry: &mut ConcurrentRegistry,
+        plan: PreparedConcurrentCommit,
         committed_seq: CommitSeq,
-        write_pages: Vec<PageNumber>,
     ) {
-        for page in write_pages {
-            self.concurrent_commit_index.update(page, committed_seq);
-        }
-        if let Some(txn_id) = TxnId::new(session_id) {
-            self.concurrent_lock_table.release_all(txn_id);
-        }
-        let commit_card = {
-            let mut registry = lock_unpoisoned(&self.concurrent_registry);
-            registry.remove(session_id).map(|mut handle| {
-                let snapshot = Self::capture_ssi_snapshot(&handle);
-                let active_conflicts =
-                    Self::collect_active_conflict_evidence(&registry, session_id, &snapshot);
-                handle.mark_committed();
-                Self::build_ssi_decision_draft(
-                    &snapshot,
-                    SsiDecisionType::CommitAllowed,
-                    active_conflicts.conflicting_txns,
-                    Self::merge_conflict_pages(
-                        Vec::new(),
-                        active_conflicts.conflict_pages,
-                        &snapshot.write_pages,
-                    ),
-                    format!("commit_allowed_commit_seq={}", committed_seq.get()),
-                )
-                .with_commit_seq(committed_seq)
-            })
-        };
+        let session_id = plan.session_id();
+        finalize_prepared_concurrent_commit_with_ssi(
+            registry,
+            &self.concurrent_commit_index,
+            &self.concurrent_lock_table,
+            &plan,
+            committed_seq,
+        );
+        let commit_card = registry.remove(session_id).map(|handle| {
+            let snapshot = Self::capture_ssi_snapshot(&handle);
+            let active_conflicts =
+                Self::collect_active_conflict_evidence(registry, session_id, &snapshot);
+            Self::build_ssi_decision_draft(
+                &snapshot,
+                SsiDecisionType::CommitAllowed,
+                active_conflicts.conflicting_txns,
+                Self::merge_conflict_pages(
+                    Vec::new(),
+                    active_conflicts.conflict_pages,
+                    &snapshot.write_pages,
+                ),
+                format!("commit_allowed_commit_seq={}", committed_seq.get()),
+            )
+            .with_commit_seq(committed_seq)
+        });
         if let Some(card) = commit_card {
             self.ssi_evidence_ledger.record_async(card);
         }
         *self.concurrent_session_id.borrow_mut() = None;
+    }
+
+    fn plan_concurrent_commit(&self) -> Result<Option<PreparedConcurrentCommit>> {
+        let mut registry = lock_unpoisoned(&self.concurrent_registry);
+        self.plan_concurrent_commit_with_registry(&mut registry)
+    }
+
+    fn finalize_concurrent_commit(&self, plan: PreparedConcurrentCommit, committed_seq: CommitSeq) {
+        let mut registry = lock_unpoisoned(&self.concurrent_registry);
+        self.finalize_concurrent_commit_with_registry(&mut registry, plan, committed_seq);
     }
 
     /// Handle COMMIT.
@@ -4556,10 +4625,9 @@ impl Connection {
                 txn.commit(&cx)?;
             }
 
-            if let Some((session_id, write_pages)) = concurrent_commit_plan {
-                let committed_seq =
-                    CommitSeq::new(self.next_commit_seq.fetch_add(1, AtomicOrdering::AcqRel));
-                self.finalize_concurrent_commit(session_id, committed_seq, write_pages);
+            let committed_seq = self.advance_commit_clock();
+            if let Some(plan) = concurrent_commit_plan {
+                self.finalize_concurrent_commit(plan, committed_seq);
             }
         }
 
@@ -6834,6 +6902,7 @@ impl Connection {
                     session_id,
                     registry: Arc::clone(&self.concurrent_registry),
                     lock_table: Arc::clone(&self.concurrent_lock_table),
+                    busy_timeout_ms: self.pragma_state.borrow().busy_timeout_ms.max(0) as u64,
                 })
         } else {
             None
@@ -6919,6 +6988,7 @@ impl Connection {
             *self.next_master_rowid.borrow_mut() = 1;
             *self.schema_cookie.borrow_mut() = 0;
             *self.change_counter.borrow_mut() = 0;
+            *self.memdb_visible_commit_seq.borrow_mut() = self.current_global_commit_seq();
             return Ok(());
         }
 
@@ -7079,6 +7149,7 @@ impl Connection {
         }
         *self.schema_cookie.borrow_mut() = schema_cookie;
         *self.change_counter.borrow_mut() = change_counter;
+        *self.memdb_visible_commit_seq.borrow_mut() = self.current_global_commit_seq();
 
         Ok(())
     }
@@ -8654,6 +8725,7 @@ struct ConcurrentExecContext {
     session_id: u64,
     registry: Arc<Mutex<ConcurrentRegistry>>,
     lock_table: Arc<InProcessPageLockTable>,
+    busy_timeout_ms: u64,
 }
 
 fn execute_table_program_with_db(
@@ -8690,7 +8762,13 @@ fn execute_table_program_with_db(
     // to enable MVCC page-level locking.
     if let Some(txn) = txn {
         if let Some(ctx) = concurrent_ctx {
-            engine.set_transaction_concurrent(txn, ctx.session_id, ctx.registry, ctx.lock_table);
+            engine.set_transaction_concurrent(
+                txn,
+                ctx.session_id,
+                ctx.registry,
+                ctx.lock_table,
+                ctx.busy_timeout_ms,
+            );
         } else {
             engine.set_transaction(txn);
         }
@@ -11917,6 +11995,7 @@ mod tests {
     use super::{
         CommitSeq, Connection, InProcessPageLockTable, Row, SchemaEpoch, Snapshot, lock_unpoisoned,
     };
+    use std::sync::Arc;
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
     use fsqlite_types::PageNumber;
@@ -17095,6 +17174,132 @@ mod tests {
             PageData::from_vec(vec![0u8; 4096]),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_sql_concurrent_updates_populate_write_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("write_set_probe.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL);")
+                .unwrap();
+            conn.execute("INSERT INTO accounts VALUES (1, 0);").unwrap();
+        }
+
+        let conn1 = Connection::open(&db).unwrap();
+        let conn2 = Connection::open(&db).unwrap();
+        assert!(
+            Arc::ptr_eq(&conn1.concurrent_commit_index, &conn2.concurrent_commit_index),
+            "connections on same path must share commit index"
+        );
+        assert!(
+            Arc::ptr_eq(&conn1.concurrent_lock_table, &conn2.concurrent_lock_table),
+            "connections on same path must share lock table"
+        );
+        conn1.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        conn2.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+
+        conn1.execute("BEGIN CONCURRENT;").unwrap();
+        conn2.execute("BEGIN CONCURRENT;").unwrap();
+
+        assert_eq!(
+            conn1
+                .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;")
+                .unwrap(),
+            1,
+            "first concurrent writer should update one row"
+        );
+        let update2 = conn2.execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1;");
+
+        let s1 = conn1
+            .concurrent_session_id
+            .borrow()
+            .expect("conn1 should have active concurrent session");
+        {
+            let reg1 = lock_unpoisoned(&conn1.concurrent_registry);
+            let h1 = reg1.get(s1).expect("session1 handle missing");
+            assert!(
+                h1.write_set_len() > 0,
+                "conn1 UPDATE should populate concurrent write set"
+            );
+            let mut pages = h1.write_set_pages();
+            pages.sort_unstable();
+            assert!(
+                !pages.is_empty(),
+                "conn1 write set should include at least one page"
+            );
+        }
+        match update2 {
+            Ok(changes2) => {
+                assert_eq!(changes2, 1, "second writer update should affect one row");
+                let s2 = conn2
+                    .concurrent_session_id
+                    .borrow()
+                    .expect("conn2 should have active concurrent session");
+                let mut pages2 = {
+                    let reg2 = lock_unpoisoned(&conn2.concurrent_registry);
+                    let h2 = reg2.get(s2).expect("session2 handle missing");
+                    assert!(
+                        h2.write_set_len() > 0,
+                        "conn2 UPDATE should populate concurrent write set"
+                    );
+                    let mut pages = h2.write_set_pages();
+                    pages.sort_unstable();
+                    pages
+                };
+                pages2.sort_unstable();
+
+                let pages1 = {
+                    let reg1 = lock_unpoisoned(&conn1.concurrent_registry);
+                    let h1 = reg1.get(s1).expect("session1 handle missing");
+                    let mut pages = h1.write_set_pages();
+                    pages.sort_unstable();
+                    pages
+                };
+                let overlap = pages1.iter().any(|p| pages2.contains(p));
+                assert!(
+                    overlap,
+                    "same-row concurrent updates should overlap on at least one written page; pages1={pages1:?} pages2={pages2:?}"
+                );
+
+                let commit1 = conn1.execute("COMMIT;");
+                let commit2 = conn2.execute("COMMIT;");
+                assert!(
+                    commit1.is_ok(),
+                    "first commit should succeed in conflict probe: {commit1:?}"
+                );
+                assert!(
+                    commit2.is_err(),
+                    "second commit should fail with FCW conflict; pages1={pages1:?} pages2={pages2:?}"
+                );
+                if let Err(err) = commit2 {
+                    assert!(
+                        err.is_transient(),
+                        "second commit should return transient busy/busy_snapshot, got {err}"
+                    );
+                }
+            }
+            Err(err2) => {
+                assert!(
+                    err2.is_transient(),
+                    "second writer should fail with transient conflict (busy/busy_snapshot), got {err2}"
+                );
+                let commit1 = conn1.execute("COMMIT;");
+                assert!(
+                    commit1.is_ok(),
+                    "first commit should still succeed after second writer conflict: {commit1:?}"
+                );
+                let rollback2 = conn2.execute("ROLLBACK;");
+                assert!(
+                    rollback2.is_ok(),
+                    "second writer should remain rollback-able after transient conflict: {rollback2:?}"
+                );
+            }
+        }
     }
 
     #[test]
