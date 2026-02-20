@@ -45,7 +45,9 @@ mod ssi_anomaly_tests;
 
 pub use begin_concurrent::{
     ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult, MAX_CONCURRENT_WRITERS,
-    SsiResult, concurrent_abort, concurrent_commit, concurrent_commit_with_ssi,
+    PreparedConcurrentCommit, SsiResult, concurrent_abort, concurrent_commit,
+    concurrent_commit_with_ssi, finalize_prepared_concurrent_commit_with_ssi,
+    prepare_concurrent_commit_with_ssi,
     concurrent_read_page, concurrent_rollback_to_savepoint, concurrent_savepoint,
     concurrent_write_page, is_concurrent_mode, validate_first_committer_wins,
 };

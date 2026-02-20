@@ -232,6 +232,11 @@ pub struct CommittedWriterInfo {
     pub token: TxnToken,
     /// Commit sequence.
     pub commit_seq: CommitSeq,
+    /// Whether the writer had outgoing rw edges at commit time.
+    ///
+    /// Used for committed-pivot checks when a later transaction discovers an
+    /// outgoing edge to this already-committed writer.
+    pub had_out_rw: bool,
     /// Pages the writer modified.
     pub pages: Vec<PageNumber>,
 }
@@ -250,21 +255,6 @@ struct IndexedTxnRecord<'a> {
     /// The specific witness key triggering this index entry (if available).
     /// Used for fine-grained filtering (e.g. Cell tag matching) to avoid false positives.
     key: Option<&'a WitnessKey>,
-}
-
-fn interval_end(end: Option<CommitSeq>) -> u64 {
-    end.map_or(u64::MAX, CommitSeq::get)
-}
-
-fn intervals_overlap(
-    left_begin: CommitSeq,
-    left_end: Option<CommitSeq>,
-    right_begin: CommitSeq,
-    right_end: Option<CommitSeq>,
-) -> bool {
-    let left_end = interval_end(left_end);
-    let right_end = interval_end(right_end);
-    left_begin.get() <= right_end && right_begin.get() <= left_end
 }
 
 fn build_reader_index<'a>(
@@ -340,7 +330,7 @@ fn build_writer_index<'a>(
                 begin_seq: writer.begin_seq(),
                 commit_seq: None,
                 source_is_active: true,
-                source_has_in_rw: false,
+                source_has_in_rw: writer.has_out_rw(),
                 key: Some(key),
             });
         }
@@ -360,7 +350,7 @@ fn build_writer_index<'a>(
                 begin_seq: CommitSeq::ZERO,
                 commit_seq: Some(writer.commit_seq),
                 source_is_active: false,
-                source_has_in_rw: false,
+                source_has_in_rw: writer.had_out_rw,
                 key: None,
             });
         }
@@ -398,6 +388,8 @@ pub fn discover_incoming_edges(
         committed_readers,
         &target_pages,
     );
+    let committing_begin = committing_begin_seq.get();
+    let committing_end = committing_commit_seq.get();
     let mut seen_sources = HashSet::new();
     for write_key in write_keys {
         let page = witness_key_page(write_key);
@@ -418,12 +410,9 @@ pub fn discover_incoming_edges(
                 }
             }
 
-            let overlaps = intervals_overlap(
-                committing_begin_seq,
-                Some(committing_commit_seq),
-                candidate.begin_seq,
-                candidate.commit_seq,
-            );
+            let candidate_begin = candidate.begin_seq.get();
+            let candidate_end = candidate.commit_seq.map_or(u64::MAX, CommitSeq::get);
+            let overlaps = committing_begin <= candidate_end && candidate_begin <= committing_end;
             if !overlaps || !seen_sources.insert(candidate.token) {
                 continue;
             }
@@ -483,6 +472,8 @@ pub fn discover_outgoing_edges(
         committed_writers,
         &target_pages,
     );
+    let committing_begin = committing_begin_seq.get();
+    let committing_end = committing_commit_seq.get();
     let mut seen_targets = HashSet::new();
     for read_key in read_keys {
         let page = witness_key_page(read_key);
@@ -501,12 +492,9 @@ pub fn discover_outgoing_edges(
                 }
             }
 
-            let overlaps = intervals_overlap(
-                committing_begin_seq,
-                Some(committing_commit_seq),
-                candidate.begin_seq,
-                candidate.commit_seq,
-            );
+            let candidate_begin = candidate.begin_seq.get();
+            let candidate_end = candidate.commit_seq.map_or(u64::MAX, CommitSeq::get);
+            let overlaps = committing_begin <= candidate_end && candidate_begin <= committing_end;
             if !overlaps || !seen_targets.insert(candidate.token) {
                 continue;
             }
@@ -529,7 +517,10 @@ pub fn discover_outgoing_edges(
                 to: candidate.token,
                 overlap_key: read_key.clone(),
                 source_is_active: candidate.source_is_active,
-                source_has_in_rw: false,
+                // For outgoing edges, this flag carries whether the target writer
+                // had outgoing rw state (active: current has_out_rw; committed:
+                // had_out_rw at commit time). It enables committed-writer pivot checks.
+                source_has_in_rw: candidate.source_has_in_rw,
             });
         }
     }
@@ -832,25 +823,77 @@ pub fn ssi_validate_and_publish(
         }
     }
     for edge in &out_edges {
-        if !edge.source_is_active {
-            continue;
-        }
-        // W is active: set W.has_in_rw = true (W now has an incoming edge from T).
-        // If W already has_out_rw: mark W for abort.
-        for writer in active_writers {
-            if writer.token() == edge.to {
-                writer.set_has_in_rw(true);
-                if writer.has_out_rw() {
-                    debug!(
-                        bead_id = "bd-31bo",
-                        pivot = ?edge.to,
-                        "T3 rule: active writer is pivot, marking for abort"
-                    );
-                    writer.set_marked_for_abort(true);
+        if edge.source_is_active {
+            // W is active: set W.has_in_rw = true (W now has an incoming edge from T).
+            // If W already has_out_rw: mark W for abort.
+            for writer in active_writers {
+                if writer.token() == edge.to {
+                    writer.set_has_in_rw(true);
+                    if writer.has_out_rw() {
+                        debug!(
+                            bead_id = "bd-31bo",
+                            pivot = ?edge.to,
+                            "T3 rule: active writer is pivot, marking for abort"
+                        );
+                        writer.set_marked_for_abort(true);
+                    }
+                    break;
                 }
-                break;
             }
+        } else if edge.source_has_in_rw {
+            // W is committed and had outgoing rw at commit time.
+            // Symmetric committed-pivot check: T -> W with W already a pivot
+            // implies T must abort.
+            let discovered_edges: Vec<DiscoveredEdge> = in_edges
+                .iter()
+                .cloned()
+                .chain(out_edges.iter().cloned())
+                .collect();
+            record_evidence_decision(
+                SsiDecisionType::AbortCycle,
+                txn,
+                begin_seq,
+                Some(commit_seq),
+                read_keys,
+                write_keys,
+                &discovered_edges,
+                "committed_writer_pivot_abort",
+            );
+            span.record("conflict_detected", true);
+            span.record("decision_reason", "committed_writer_pivot_abort");
+            warn!(
+                bead_id = "bd-31bo",
+                txn = ?txn,
+                committed_pivot = ?edge.to,
+                "T3 rule: committed writer was pivot, T must abort"
+            );
+            observability::record_ssi_abort(
+                fsqlite_observability::SsiAbortCategory::CommittedPivot,
+            );
+            let all_edges = build_dependency_edges(&in_edges, &out_edges, txn, commit_seq);
+            let witness = AbortWitness {
+                txn,
+                begin_seq,
+                abort_seq: commit_seq,
+                reason: AbortReason::SsiPivot,
+                edges_observed: all_edges,
+            };
+            return Err(SsiBusySnapshot {
+                txn,
+                reason: SsiAbortReason::CommittedPivot,
+                witness,
+            });
         }
+    }
+
+    // Keep outgoing edges deterministic for proof/evidence generation.
+    // (Incoming edges are already deterministic by construction.)
+    if !out_edges.is_empty() {
+        debug!(
+            bead_id = "bd-31bo",
+            outgoing_edges = out_edges.len(),
+            "ssi_validate: outgoing edge propagation complete"
+        );
     }
 
     // Step 7: Publish edges and build CommitProof.
@@ -1465,6 +1508,7 @@ mod tests {
         let committed_w = CommittedWriterInfo {
             token: TxnToken::new(TxnId::new(3).unwrap(), TxnEpoch::new(0)),
             commit_seq: CommitSeq::new(3),
+            had_out_rw: false,
             pages: vec![PageNumber::new(7).unwrap()],
         };
 
@@ -1515,6 +1559,7 @@ mod tests {
         let committed_w = CommittedWriterInfo {
             token: TxnToken::new(TxnId::new(3).unwrap(), TxnEpoch::new(0)),
             commit_seq: CommitSeq::new(3),
+            had_out_rw: false,
             pages: vec![PageNumber::new(7).unwrap()],
         };
 
@@ -1614,6 +1659,7 @@ mod tests {
         let stale_writer = CommittedWriterInfo {
             token: TxnToken::new(TxnId::new(3).unwrap(), TxnEpoch::new(0)),
             commit_seq: CommitSeq::new(4),
+            had_out_rw: false,
             pages: vec![PageNumber::new(7).unwrap()],
         };
 
@@ -1666,6 +1712,7 @@ mod tests {
         let committed_writer_t1 = CommittedWriterInfo {
             token: t1,
             commit_seq: CommitSeq::new(2),
+            had_out_rw: t1_commit.ssi_state.has_out_rw,
             pages: vec![PageNumber::new(100).unwrap()],
         };
 
@@ -1724,6 +1771,7 @@ mod tests {
         let committed_writer_d1 = CommittedWriterInfo {
             token: d1,
             commit_seq: CommitSeq::new(2),
+            had_out_rw: d1_commit.ssi_state.has_out_rw,
             pages: vec![PageNumber::new(310).unwrap()],
         };
 
@@ -2185,6 +2233,7 @@ mod tests {
         let writer_t1 = CommittedWriterInfo {
             token: t1_token,
             commit_seq: CommitSeq::new(2),
+            had_out_rw: ok_t1.ssi_state.has_out_rw,
             pages: vec![PageNumber::new(10).unwrap()],
         };
 
@@ -2341,6 +2390,7 @@ mod tests {
                 committed_writers.push(CommittedWriterInfo {
                     token: t1,
                     commit_seq: CommitSeq::new(2),
+                    had_out_rw: ok.ssi_state.has_out_rw,
                     pages: keys_to_pages(&v1.writes),
                 });
             }
@@ -2374,6 +2424,7 @@ mod tests {
                 committed_writers.push(CommittedWriterInfo {
                     token: t2,
                     commit_seq: CommitSeq::new(3),
+                    had_out_rw: ok.ssi_state.has_out_rw,
                     pages: keys_to_pages(&v2.writes),
                 });
             }
@@ -2513,6 +2564,7 @@ mod tests {
                     committed_writers.push(CommittedWriterInfo {
                         token: current.token,
                         commit_seq,
+                        had_out_rw: ok.ssi_state.has_out_rw,
                         pages: keys_to_pages(&current.writes),
                     });
                 }

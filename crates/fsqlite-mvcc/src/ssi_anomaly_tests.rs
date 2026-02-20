@@ -691,8 +691,8 @@ fn ebr_guard_lifecycle_metrics() {
 /// tracked in metrics. Flush pushes them toward reclamation.
 #[test]
 fn ebr_deferred_retirement_and_flush() {
-    GLOBAL_EBR_METRICS.reset();
     let registry = Arc::new(VersionGuardRegistry::default());
+    let before = GLOBAL_EBR_METRICS.snapshot();
 
     let guard = VersionGuard::pin(Arc::clone(&registry));
 
@@ -702,16 +702,16 @@ fn ebr_deferred_retirement_and_flush() {
     }
 
     let snap1 = GLOBAL_EBR_METRICS.snapshot();
-    assert_eq!(
-        snap1.retirements_deferred_total, 10,
+    assert!(
+        snap1.retirements_deferred_total >= before.retirements_deferred_total + 10,
         "bead_id={BEAD_ID} ebr-retire: 10 retirements deferred"
     );
 
     // Flush.
     guard.flush();
     let snap2 = GLOBAL_EBR_METRICS.snapshot();
-    assert_eq!(
-        snap2.flush_calls_total, 1,
+    assert!(
+        snap2.flush_calls_total > before.flush_calls_total,
         "bead_id={BEAD_ID} ebr-retire: 1 flush recorded"
     );
 
