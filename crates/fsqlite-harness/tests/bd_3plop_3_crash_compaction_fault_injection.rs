@@ -168,7 +168,7 @@ fn run_fault_scenario(scenario: CrashScenario, crash_point: usize) -> ScenarioRu
             for _ in 0..10 {
                 match state.check_sync(wal_path) {
                     SyncDecision::Allow => {}
-                    SyncDecision::PowerCut | SyncDecision::PoweredOff => {
+                    SyncDecision::PowerCut | SyncDecision::IoError | SyncDecision::PoweredOff => {
                         triggered = true;
                         break;
                     }
@@ -188,7 +188,7 @@ fn run_fault_scenario(scenario: CrashScenario, crash_point: usize) -> ScenarioRu
             for _ in 0..10 {
                 match state.check_sync(db_path) {
                     SyncDecision::Allow => {}
-                    SyncDecision::PowerCut | SyncDecision::PoweredOff => {
+                    SyncDecision::PowerCut | SyncDecision::IoError | SyncDecision::PoweredOff => {
                         triggered = true;
                         break;
                     }
@@ -201,7 +201,7 @@ fn run_fault_scenario(scenario: CrashScenario, crash_point: usize) -> ScenarioRu
             for _ in 0..10 {
                 match state.check_sync(db_path) {
                     SyncDecision::Allow => {}
-                    SyncDecision::PowerCut | SyncDecision::PoweredOff => {
+                    SyncDecision::PowerCut | SyncDecision::IoError | SyncDecision::PoweredOff => {
                         triggered = true;
                         break;
                     }

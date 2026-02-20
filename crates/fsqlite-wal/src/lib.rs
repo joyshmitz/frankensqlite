@@ -3,6 +3,7 @@
 pub mod checkpoint;
 pub mod checkpoint_executor;
 pub mod checksum;
+pub mod group_commit;
 pub mod metrics;
 pub mod native_commit;
 #[cfg(test)]
@@ -12,6 +13,11 @@ pub mod wal;
 pub mod wal_fec;
 pub mod wal_index;
 
+pub use group_commit::{
+    ConsolidationMetrics, ConsolidationMetricsSnapshot, ConsolidationPhase,
+    FrameSubmission, GLOBAL_CONSOLIDATION_METRICS, GroupCommitConfig, GroupCommitConsolidator,
+    SubmitOutcome, TransactionFrameBatch, write_consolidated_frames,
+};
 pub use checkpoint::{
     CheckpointMode, CheckpointPlan, CheckpointPostAction, CheckpointProgress, CheckpointState,
     plan_checkpoint,

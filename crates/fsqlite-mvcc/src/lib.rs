@@ -46,10 +46,9 @@ mod ssi_anomaly_tests;
 pub use begin_concurrent::{
     ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult, MAX_CONCURRENT_WRITERS,
     PreparedConcurrentCommit, SsiResult, concurrent_abort, concurrent_commit,
-    concurrent_commit_with_ssi, finalize_prepared_concurrent_commit_with_ssi,
-    prepare_concurrent_commit_with_ssi,
-    concurrent_read_page, concurrent_rollback_to_savepoint, concurrent_savepoint,
-    concurrent_write_page, is_concurrent_mode, validate_first_committer_wins,
+    concurrent_commit_with_ssi, concurrent_read_page, concurrent_rollback_to_savepoint,
+    concurrent_savepoint, concurrent_write_page, finalize_prepared_concurrent_commit_with_ssi,
+    is_concurrent_mode, prepare_concurrent_commit_with_ssi, validate_first_committer_wins,
 };
 pub use bocpd::{BocpdConfig, BocpdMonitor, ConjugateModel, HazardFunction, RegimeStats};
 pub use cache_aligned::{

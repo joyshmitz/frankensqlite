@@ -835,8 +835,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
     committed_seq: CommitSeq,
 ) {
     debug_assert_eq!(
-        committed_seq,
-        prepared.assigned_commit_seq,
+        committed_seq, prepared.assigned_commit_seq,
         "prepared commit sequence mismatch"
     );
 
@@ -879,7 +878,10 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         &active_refs,
         &[],
     ) {
-        if incoming_edges.iter().all(|existing| existing.from != edge.from) {
+        if incoming_edges
+            .iter()
+            .all(|existing| existing.from != edge.from)
+        {
             incoming_edges.push(edge);
         }
     }
@@ -2257,13 +2259,19 @@ mod tests {
             s1,
             CommitSeq::new(11),
         );
-        assert!(result1.is_ok(), "T1 should commit with only outgoing rw edge");
+        assert!(
+            result1.is_ok(),
+            "T1 should commit with only outgoing rw edge"
+        );
         let t1_writer = registry
             .committed_writers
             .iter()
             .find(|entry| entry.token.id.get() == s1)
             .expect("T1 writer history should be present");
-        assert!(t1_writer.had_out_rw, "T1 should be recorded with had_out_rw");
+        assert!(
+            t1_writer.had_out_rw,
+            "T1 should be recorded with had_out_rw"
+        );
 
         // T3 now performs its workload using the earlier snapshot.
         {

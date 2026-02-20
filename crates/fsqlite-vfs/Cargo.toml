@@ -14,6 +14,10 @@ nix = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+pollster = "0.4.0"
+uring-fs = "1.4.0"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 advisory-lock = "0.3.0"
 

@@ -741,6 +741,11 @@ pub struct UnixFile {
 }
 
 impl UnixFile {
+    pub(crate) fn with_inode_io_file<R>(&self, op: impl FnOnce(&File) -> Result<R>) -> Result<R> {
+        let _inode_guard = self.inode_info.lock().expect("inode info lock poisoned");
+        op(self.file.as_ref())
+    }
+
     fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<ShmInfo>>> {
         if let Some(info) = &self.shm_info {
             return Ok(Arc::clone(info));

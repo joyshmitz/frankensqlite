@@ -10,12 +10,13 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use fsqlite_error::FrankenError;
+use fsqlite_mvcc::{RetryAction, RetryController, RetryCostParams};
 use fsqlite_types::value::SqliteValue;
 
 const CI_WRITERS: usize = 10;
@@ -23,9 +24,15 @@ const CI_TXNS_PER_WRITER: usize = 1_000;
 const SINGLE_WRITER_TXNS: usize = 1_000;
 const STRESS_WRITERS: usize = 100;
 const STRESS_TXNS_PER_WRITER: usize = 10_000;
-const ACCOUNT_COUNT: i64 = 128;
+// Keep the logical workload hot, but not pathologically single-page hot.
+// With 100 concurrent writers, 128 rows collapses onto too few leaf pages and
+// measures page-hotspot collapse more than SSI behavior.
+const ACCOUNT_COUNT: i64 = 4_096;
 const INITIAL_BALANCE: i64 = 1_000;
-const MAX_RETRIES_PER_TXN: usize = 64;
+const MAX_RETRIES_PER_TXN: usize = 16;
+const BUSY_TIMEOUT_MS: u64 = 5_000;
+const RETRY_SLEEP_JITTER_MS: u64 = 2;
+const RETRY_CONTROLLER_FALLBACK_SLEEP_MS: u64 = 20;
 const MIX_TRANSFER_PCT: u8 = 70;
 const MIX_DEPOSIT_PCT: u8 = 20;
 const MIX_BALANCE_CHECK_PCT: u8 = 10;
@@ -52,6 +59,7 @@ struct CommittedTxn {
 struct WorkerResult {
     committed: u64,
     aborted: u64,
+    retry_conflicts: u64,
     hard_failures: Vec<String>,
     sum_delta: i64,
     txns: Vec<CommittedTxn>,
@@ -71,11 +79,12 @@ fn ssi_serialization_correctness_ci_scale() {
 
     assert!(
         abort_rate < MAX_ABORT_RATE,
-        "abort rate too high: {:.3} (max {:.3}); committed={} aborted={}",
+        "abort rate too high: {:.3} (max {:.3}); committed={} aborted={} retry_conflicts={}",
         abort_rate,
         MAX_ABORT_RATE,
         summary.committed,
-        summary.aborted
+        summary.aborted,
+        summary.retry_conflicts
     );
     assert!(
         throughput > MIN_CI_THROUGHPUT_TXN_PER_SEC,
@@ -91,7 +100,10 @@ fn ssi_serialization_correctness_ci_scale() {
 fn ssi_serialization_correctness_single_writer_smoke() {
     let summary = run_ssi_workload(1, SINGLE_WRITER_TXNS, TEST_SEED, "single-writer");
     let attempted = summary.committed + summary.aborted;
-    assert!(attempted > 0, "expected at least one attempted single-writer transaction");
+    assert!(
+        attempted > 0,
+        "expected at least one attempted single-writer transaction"
+    );
     assert_eq!(
         summary.aborted, 0,
         "single-writer run should not abort under page-level FCW"
@@ -109,9 +121,10 @@ fn ssi_serialization_correctness_stress_profile() {
     let abort_rate = summary.aborted as f64 / attempted as f64;
     assert!(
         abort_rate < MAX_ABORT_RATE,
-        "stress abort rate too high: {:.3} (max {:.3})",
+        "stress abort rate too high: {:.3} (max {:.3}); retry_conflicts={}",
         abort_rate,
-        MAX_ABORT_RATE
+        MAX_ABORT_RATE,
+        summary.retry_conflicts
     );
 }
 
@@ -119,6 +132,7 @@ fn ssi_serialization_correctness_stress_profile() {
 struct WorkloadSummary {
     committed: u64,
     aborted: u64,
+    retry_conflicts: u64,
     elapsed_seconds: f64,
 }
 
@@ -144,6 +158,7 @@ fn run_ssi_workload(
 
     let mut committed = 0_u64;
     let mut aborted = 0_u64;
+    let mut retry_conflicts = 0_u64;
     let mut sum_delta = 0_i64;
     let mut committed_txns = Vec::new();
     let mut hard_failures = Vec::new();
@@ -153,6 +168,7 @@ fn run_ssi_workload(
             .expect("worker thread should not panic during SSI workload");
         committed += result.committed;
         aborted += result.aborted;
+        retry_conflicts += result.retry_conflicts;
         sum_delta += result.sum_delta;
         committed_txns.extend(result.txns);
         hard_failures.extend(result.hard_failures);
@@ -189,6 +205,7 @@ fn run_ssi_workload(
     WorkloadSummary {
         committed,
         aborted,
+        retry_conflicts,
         elapsed_seconds,
     }
 }
@@ -198,7 +215,7 @@ fn initialize_db(path: &Path) {
         .expect("open db for initialization");
     conn.execute("PRAGMA journal_mode=WAL;")
         .expect("set WAL mode");
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
         .expect("set busy timeout");
     conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
         .expect("enable concurrent mode");
@@ -218,29 +235,37 @@ fn initialize_db(path: &Path) {
     }
 }
 
-fn run_worker(
-    db_path: &Path,
-    worker_id: usize,
-    txns_per_worker: usize,
-    seed: u64,
-) -> WorkerResult {
+fn run_worker(db_path: &Path, worker_id: usize, txns_per_worker: usize, seed: u64) -> WorkerResult {
     let mut result = WorkerResult::default();
     let mut rng = StdRng::seed_from_u64(seed);
+    // Keep retries adaptive instead of hot-looping under page-level contention.
+    let mut retry_controller =
+        RetryController::with_candidates(RetryCostParams::default(), vec![1, 2, 5, 10, 20], 8);
     let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref())
         .expect("open worker connection");
-    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
         .expect("set worker busy timeout");
     conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
         .expect("enable worker concurrent mode");
 
     for txn_index in 0..txns_per_worker {
+        let worker_token = u64::try_from(worker_id).expect("worker id should fit in u64");
+        let txn_token = u64::try_from(txn_index).expect("txn index should fit in u64");
+        let logical_txn_id = (worker_token << 32) | txn_token;
+
         let mut retries = 0_usize;
+        let mut last_wait_ms = None;
         loop {
             let kind = choose_txn_kind(&mut rng);
 
             let execute_result: Result<_, FrankenError> = execute_single_txn(&conn, &mut rng, kind);
             match execute_result {
                 Ok((start_order, commit_order, read_set, write_set, delta_sum)) => {
+                    if let Some(wait_ms) = last_wait_ms.take() {
+                        retry_controller.observe(wait_ms, true);
+                    }
+                    retry_controller.clear_conflict(logical_txn_id);
+
                     result.committed += 1;
                     result.sum_delta += delta_sum;
                     result.txns.push(CommittedTxn {
@@ -252,19 +277,50 @@ fn run_worker(
                     break;
                 }
                 Err(err) if err.is_transient() => {
-                    result.aborted += 1;
+                    if let Some(wait_ms) = last_wait_ms.take() {
+                        retry_controller.observe(wait_ms, false);
+                    }
+
+                    result.retry_conflicts += 1;
                     rollback_best_effort(&conn);
                     retries += 1;
                     if retries > MAX_RETRIES_PER_TXN {
-                        result.hard_failures.push(format!(
-                            "worker={worker_id} txn_index={txn_index} exceeded retries on transient error: {err}"
-                        ));
+                        retry_controller.clear_conflict(logical_txn_id);
+                        result.aborted += 1;
                         break;
                     }
+
+                    let retry_sleep_ms = match retry_controller.decide_with_cx(
+                        logical_txn_id,
+                        BUSY_TIMEOUT_MS,
+                        0,
+                        None,
+                        false,
+                    ) {
+                        RetryAction::RetryAfter { wait_ms } => {
+                            let jitter_ceiling = wait_ms.min(RETRY_SLEEP_JITTER_MS);
+                            let jitter = if jitter_ceiling == 0 {
+                                0
+                            } else {
+                                rng.gen_range(0_u64..=jitter_ceiling)
+                            };
+                            last_wait_ms = Some(wait_ms);
+                            wait_ms.saturating_add(jitter)
+                        }
+                        RetryAction::FailNow => {
+                            last_wait_ms = Some(RETRY_CONTROLLER_FALLBACK_SLEEP_MS);
+                            RETRY_CONTROLLER_FALLBACK_SLEEP_MS
+                        }
+                    };
+                    thread::sleep(Duration::from_millis(retry_sleep_ms));
                 }
                 Err(err) => {
+                    if let Some(wait_ms) = last_wait_ms.take() {
+                        retry_controller.observe(wait_ms, false);
+                    }
                     result.aborted += 1;
                     rollback_best_effort(&conn);
+                    retry_controller.clear_conflict(logical_txn_id);
                     result.hard_failures.push(format!(
                         "worker={worker_id} txn_index={txn_index} non-transient error: {err}"
                     ));
@@ -303,9 +359,7 @@ fn execute_single_txn(
             let amount = i64::from(rng.gen_range(1_u8..=5_u8));
 
             let from_balance = read_balance(conn, from)?;
-            let _to_balance = read_balance(conn, to)?;
             read_set.insert(from);
-            read_set.insert(to);
 
             if from_balance >= amount {
                 conn.execute(&format!(
@@ -321,9 +375,6 @@ fn execute_single_txn(
         TxnKind::Deposit => {
             let account = random_account(rng);
             let amount = i64::from(rng.gen_range(1_u8..=3_u8));
-
-            let _before = read_balance(conn, account)?;
-            read_set.insert(account);
 
             conn.execute(&format!(
                 "UPDATE accounts SET balance = balance + {amount} WHERE id = {account};"

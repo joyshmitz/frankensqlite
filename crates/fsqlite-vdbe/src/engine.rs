@@ -674,7 +674,9 @@ impl PageWriter for SharedTxnPageIo {
                         backoff = (backoff * 2).min(Duration::from_millis(5));
                     }
                     Err(e) => {
-                        return Err(FrankenError::Internal(format!("MVCC write_page failed: {e}")));
+                        return Err(FrankenError::Internal(format!(
+                            "MVCC write_page failed: {e}"
+                        )));
                     }
                 }
             }

@@ -107,10 +107,10 @@ impl<F: VfsFile> WalFile<F> {
         // checksum, so we can ingest appended frames by reading headers only.
         // Full checksum-chain verification is still performed on open/rebuild.
         let frame_size_u64 = u64::try_from(frame_size).unwrap_or(u64::MAX);
-        let available_frames =
-            usize::try_from(file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).unwrap_or(0))
-                / frame_size_u64)
-            .unwrap_or(usize::MAX);
+        let available_frames = usize::try_from(
+            file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).unwrap_or(0)) / frame_size_u64,
+        )
+        .unwrap_or(usize::MAX);
         if available_frames <= self.frame_count {
             return Ok(());
         }

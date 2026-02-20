@@ -1,0 +1,364 @@
+//! Linux `io_uring`-backed VFS.
+//!
+//! This backend preserves Unix lock and SHM semantics by delegating lock/SHM
+//! operations to [`UnixFile`]. Data-path read/write can use `io_uring` when it
+//! is available at runtime, and transparently falls back to the Unix path when
+//! `io_uring` initialization fails.
+
+use std::fmt;
+use std::fs::File;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::LockLevel;
+use fsqlite_types::cx::Cx;
+use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use nix::unistd::{Whence, lseek};
+
+use crate::shm::ShmRegion;
+use crate::traits::{Vfs, VfsFile};
+use crate::unix::{UnixFile, UnixVfs};
+
+fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
+    cx.checkpoint().map_err(|_| FrankenError::Abort)
+}
+
+fn seek_to(file: &File, offset: u64) -> Result<()> {
+    let off = i64::try_from(offset).map_err(|_| {
+        FrankenError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("io_uring offset too large: {offset}"),
+        ))
+    })?;
+    lseek(file.as_raw_fd(), off, Whence::SeekSet).map_err(|err| FrankenError::Io(err.into()))?;
+    Ok(())
+}
+
+fn current_offset(file: &File) -> Result<u64> {
+    let off =
+        lseek(file.as_raw_fd(), 0, Whence::SeekCur).map_err(|err| FrankenError::Io(err.into()))?;
+    u64::try_from(off).map_err(|_| {
+        FrankenError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("negative seek position returned by kernel: {off}"),
+        ))
+    })
+}
+
+struct IoUringRuntime {
+    ring: Option<Mutex<uring_fs::IoUring>>,
+    status: String,
+}
+
+impl fmt::Debug for IoUringRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IoUringRuntime")
+            .field("available", &self.ring.is_some())
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+impl IoUringRuntime {
+    fn new() -> Self {
+        match uring_fs::IoUring::new() {
+            Ok(ring) => Self {
+                ring: Some(Mutex::new(ring)),
+                status: "available".to_owned(),
+            },
+            Err(error) => Self {
+                ring: None,
+                status: format!("unavailable:{error}"),
+            },
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.ring.is_some()
+    }
+}
+
+/// Linux VFS that prefers `io_uring` for the data path.
+#[derive(Debug)]
+pub struct IoUringVfs {
+    unix: UnixVfs,
+    runtime: Arc<IoUringRuntime>,
+}
+
+impl IoUringVfs {
+    /// Create a new `io_uring` VFS.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            unix: UnixVfs::new(),
+            runtime: Arc::new(IoUringRuntime::new()),
+        }
+    }
+
+    /// Returns whether `io_uring` was successfully initialized.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.runtime.is_available()
+    }
+
+    /// Human-readable runtime status.
+    #[must_use]
+    pub fn status(&self) -> &str {
+        &self.runtime.status
+    }
+}
+
+impl Default for IoUringVfs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vfs for IoUringVfs {
+    type File = IoUringFile;
+
+    fn name(&self) -> &'static str {
+        "io_uring"
+    }
+
+    fn open(
+        &self,
+        cx: &Cx,
+        path: Option<&Path>,
+        flags: VfsOpenFlags,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
+        let (file, out_flags) = self.unix.open(cx, path, flags)?;
+        Ok((
+            IoUringFile {
+                inner: file,
+                runtime: Arc::clone(&self.runtime),
+            },
+            out_flags,
+        ))
+    }
+
+    fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()> {
+        self.unix.delete(cx, path, sync_dir)
+    }
+
+    fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool> {
+        self.unix.access(cx, path, flags)
+    }
+
+    fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
+        self.unix.full_pathname(cx, path)
+    }
+
+    fn randomness(&self, cx: &Cx, buf: &mut [u8]) {
+        self.unix.randomness(cx, buf);
+    }
+
+    fn current_time(&self, cx: &Cx) -> f64 {
+        self.unix.current_time(cx)
+    }
+}
+
+/// File handle for [`IoUringVfs`].
+#[derive(Debug)]
+pub struct IoUringFile {
+    inner: UnixFile,
+    runtime: Arc<IoUringRuntime>,
+}
+
+impl IoUringFile {
+    fn read_via_uring(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        let ring_mutex = self.runtime.ring.as_ref().ok_or_else(|| {
+            FrankenError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "io_uring runtime unavailable",
+            ))
+        })?;
+
+        let requested = u32::try_from(buf.len()).map_err(|_| {
+            FrankenError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("read size too large for io_uring: {}", buf.len()),
+            ))
+        })?;
+
+        let data = self.inner.with_inode_io_file(|file| {
+            seek_to(file, offset)?;
+            let ring = ring_mutex.lock().expect("io_uring runtime lock poisoned");
+            pollster::block_on(ring.read(file, requested)).map_err(FrankenError::Io)
+        })?;
+
+        let total = data.len();
+        buf[..total].copy_from_slice(&data);
+        if total < buf.len() {
+            buf[total..].fill(0);
+        }
+        Ok(total)
+    }
+
+    fn write_via_uring(&self, buf: &[u8], offset: u64) -> Result<()> {
+        let ring_mutex = self.runtime.ring.as_ref().ok_or_else(|| {
+            FrankenError::Io(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "io_uring runtime unavailable",
+            ))
+        })?;
+
+        self.inner.with_inode_io_file(|file| {
+            let mut total = 0_usize;
+            while total < buf.len() {
+                let off = offset
+                    .checked_add(u64::try_from(total).expect("usize must fit into u64"))
+                    .ok_or_else(|| {
+                        FrankenError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "offset overflow during io_uring write",
+                        ))
+                    })?;
+                seek_to(file, off)?;
+                let before = current_offset(file)?;
+                let payload = buf[total..].to_vec();
+                {
+                    let ring = ring_mutex.lock().expect("io_uring runtime lock poisoned");
+                    pollster::block_on(ring.write(file, payload)).map_err(FrankenError::Io)?;
+                }
+                let after = current_offset(file)?;
+                let advanced_u64 = after.checked_sub(before).ok_or_else(|| {
+                    FrankenError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "io_uring write moved cursor backwards: before={before} after={after}"
+                        ),
+                    ))
+                })?;
+                let advanced = usize::try_from(advanced_u64).map_err(|_| {
+                    FrankenError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("io_uring write advanced too far: {advanced_u64}"),
+                    ))
+                })?;
+                if advanced == 0 {
+                    return Err(FrankenError::Io(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "io_uring write advanced by 0 bytes",
+                    )));
+                }
+                let remaining = buf.len() - total;
+                total += advanced.min(remaining);
+            }
+            Ok(())
+        })
+    }
+}
+
+impl VfsFile for IoUringFile {
+    fn close(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.close(cx)
+    }
+
+    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+        checkpoint_or_abort(cx)?;
+        if self.runtime.is_available() {
+            self.read_via_uring(buf, offset)
+        } else {
+            self.inner.read(cx, buf, offset)
+        }
+    }
+
+    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        if self.runtime.is_available() {
+            self.write_via_uring(buf, offset)
+        } else {
+            self.inner.write(cx, buf, offset)
+        }
+    }
+
+    fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+        self.inner.truncate(cx, size)
+    }
+
+    fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+        self.inner.sync(cx, flags)
+    }
+
+    fn file_size(&self, cx: &Cx) -> Result<u64> {
+        self.inner.file_size(cx)
+    }
+
+    fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        self.inner.lock(cx, level)
+    }
+
+    fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        self.inner.unlock(cx, level)
+    }
+
+    fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+        self.inner.check_reserved_lock(cx)
+    }
+
+    fn sector_size(&self) -> u32 {
+        self.inner.sector_size()
+    }
+
+    fn device_characteristics(&self) -> u32 {
+        self.inner.device_characteristics()
+    }
+
+    fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
+        self.inner.shm_map(cx, region, size, extend)
+    }
+
+    fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        self.inner.shm_lock(cx, offset, n, flags)
+    }
+
+    fn shm_barrier(&self) {
+        self.inner.shm_barrier();
+    }
+
+    fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+        self.inner.shm_unmap(cx, delete)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use fsqlite_types::flags::VfsOpenFlags;
+
+    fn open_flags_create() -> VfsOpenFlags {
+        VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
+    }
+
+    #[test]
+    fn test_io_uring_vfs_name_and_status() {
+        let vfs = IoUringVfs::new();
+        assert_eq!(vfs.name(), "io_uring");
+        assert!(!vfs.status().is_empty());
+    }
+
+    #[test]
+    fn test_io_uring_vfs_roundtrip_write_read() {
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("uring_roundtrip.db");
+
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open should succeed");
+        file.write(&cx, b"hello io_uring", 0)
+            .expect("write should succeed");
+
+        let mut buf = [0_u8; 14];
+        let n = file.read(&cx, &mut buf, 0).expect("read should succeed");
+        assert_eq!(n, 14);
+        assert_eq!(&buf, b"hello io_uring");
+        file.close(&cx).expect("close should succeed");
+    }
+}

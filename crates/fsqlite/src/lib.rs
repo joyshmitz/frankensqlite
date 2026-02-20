@@ -298,8 +298,10 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);")
             .unwrap();
-        conn.execute("INSERT INTO accounts VALUES (1, 100);").unwrap();
-        conn.execute("INSERT INTO accounts VALUES (2, 200);").unwrap();
+        conn.execute("INSERT INTO accounts VALUES (1, 100);")
+            .unwrap();
+        conn.execute("INSERT INTO accounts VALUES (2, 200);")
+            .unwrap();
 
         conn.execute("UPDATE accounts SET balance = balance + 5 WHERE id = 1;")
             .unwrap();
@@ -329,8 +331,10 @@ mod tests {
         {
             let conn = Connection::open(&db).unwrap();
             conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
-            conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL);")
-                .unwrap();
+            conn.execute(
+                "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL);",
+            )
+            .unwrap();
             conn.execute("INSERT INTO accounts VALUES (1, 0);").unwrap();
         }
 
