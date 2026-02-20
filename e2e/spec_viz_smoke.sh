@@ -1,24 +1,51 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+BEAD_ID="bd-3oan"
+SCENARIO_ID="${SCENARIO_ID:-INFRA-1}"
+SEED="${SEED:-2026022008}"
+RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LOG_STANDARD_REF="${LOG_STANDARD_REF:-docs/e2e_shell_script_log_profile.json}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${PORT:-4177}"
 SPEC_URL="http://127.0.0.1:${PORT}/visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html"
 RESULT_DIR="${ROOT_DIR}/test-results"
 CONSOLE_LOG="${RESULT_DIR}/spec_viz_smoke_console.log"
 SERVER_LOG="${RESULT_DIR}/spec_viz_smoke_server.log"
+SCHEMA_LOG_PATH="${RESULT_DIR}/spec_viz_smoke_events.jsonl"
 
 mkdir -p "${RESULT_DIR}"
 : >"${CONSOLE_LOG}"
 : >"${SERVER_LOG}"
+: >"${SCHEMA_LOG_PATH}"
+
+emit_schema_event() {
+    local phase="$1"
+    local event_type="$2"
+    local outcome="$3"
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    printf '{"run_id":"%s","timestamp":"%s","phase":"%s","event_type":"%s","scenario_id":"%s","seed":"%s","context":{"bead_id":"%s","outcome":"%s","log_standard_ref":"%s","schema_log_path":"%s"}}\n' \
+        "${RUN_ID}" "${timestamp}" "${phase}" "${event_type}" "${SCENARIO_ID}" "${SEED}" "${BEAD_ID}" "${outcome}" "${LOG_STANDARD_REF}" "${SCHEMA_LOG_PATH}" \
+        >>"${SCHEMA_LOG_PATH}"
+}
 
 python3 -m http.server "${PORT}" --bind 127.0.0.1 --directory "${ROOT_DIR}" >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
 cleanup() {
+    local exit_code=$?
+    if [[ ${exit_code} -eq 0 ]]; then
+        emit_schema_event "report" "pass" "pass"
+    else
+        emit_schema_event "report" "fail" "fail"
+    fi
     kill "${SERVER_PID}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
+
+emit_schema_event "setup" "start" "running"
 
 sleep 1
 

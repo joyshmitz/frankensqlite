@@ -1314,37 +1314,44 @@ fn balance_shallower<W: PageWriter>(
     let child_offset = header_offset_for_page(child_pgno);
     let child_header = BtreePageHeader::parse(&child_data, child_offset)?;
 
-    // Build the new root page from the child's content.
-    let mut new_root = vec![0u8; usable_size as usize];
-
-    #[allow(clippy::cast_possible_truncation)]
-    if root_offset == child_offset {
-        // Same header offset — direct copy of the child page data.
-        new_root[..usable_size as usize].copy_from_slice(&child_data[..usable_size as usize]);
-    } else {
-        // Root is page 1 (root_offset = 100), child is offset 0.
-        // All byte offsets must shift up by root_offset.
-        let delta = root_offset as u32;
-        let child_ptrs = read_cell_pointers(&child_data, &child_header, child_offset)?;
-
-        let mut new_header = child_header;
-        new_header.cell_content_offset = child_header.cell_content_offset.saturating_add(delta);
-        new_header.write(&mut new_root, root_offset);
-
-        // Adjust cell pointers by +delta.
-        let adjusted: Vec<u16> = child_ptrs
-            .iter()
-            .map(|&p| p.saturating_add(delta as u16))
-            .collect();
-        write_cell_pointers(&mut new_root, root_offset, &new_header, &adjusted);
-
-        // Copy the cell content area.
-        let child_content_start = child_header.cell_content_offset as usize;
-        let content_len = usable_size as usize - child_content_start;
-        let root_content_start = new_header.cell_content_offset as usize;
-        new_root[root_content_start..root_content_start + content_len]
-            .copy_from_slice(&child_data[child_content_start..child_content_start + content_len]);
+    // Rebuild child cells using the root's header offset. This handles page-1
+    // (100-byte header) safely and avoids raw offset shifting pitfalls.
+    let child_ptrs = read_cell_pointers(&child_data, &child_header, child_offset)?;
+    let mut child_cells: Vec<GatheredCell> = Vec::with_capacity(child_ptrs.len());
+    for &ptr in &child_ptrs {
+        let cell_offset = usize::from(ptr);
+        let cell_ref = CellRef::parse(
+            &child_data,
+            cell_offset,
+            child_header.page_type,
+            usable_size,
+        )?;
+        let cell_end = cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
+        let data = child_data[cell_offset..cell_end].to_vec();
+        let size = u16::try_from(data.len()).map_err(|_| {
+            FrankenError::Internal("cell too large during balance_shallower".to_owned())
+        })?;
+        child_cells.push(GatheredCell { data, size });
     }
+
+    // If the child cannot fit on the root due to header-offset reduction
+    // (typically page 1), keep the existing shallow form instead of panicking.
+    if !page_fits(
+        &child_cells,
+        child_header.page_type,
+        root_offset,
+        usable_size,
+    ) {
+        return Ok(());
+    }
+
+    let mut new_root = build_page(
+        &child_cells,
+        child_header.page_type,
+        root_offset,
+        usable_size,
+        child_header.right_child,
+    )?;
 
     // Preserve the database file header on page 1.
     if root_offset > 0 {
@@ -2287,6 +2294,77 @@ mod tests {
             root_header.cell_count, 5,
             "all cells including overflow should be preserved"
         );
+    }
+
+    #[test]
+    fn test_balance_shallower_page1_skips_when_child_cannot_fit() {
+        let cx = Cx::new();
+        let mut store = MemPageStore::new(10);
+
+        // Build a child leaf page whose payload fits offset=0 pages but not
+        // page-1 offset=100 pages.
+        let child_data = {
+            let mut selected: Option<Vec<u8>> = None;
+            'search: for payload_len in [96usize, 112, 128, 144, 160] {
+                for entry_count in 16usize..64usize {
+                    let payload = vec![b'x'; payload_len];
+                    let mut entries: Vec<(i64, &[u8])> = Vec::with_capacity(entry_count);
+                    for rowid in 1..=entry_count {
+                        let rowid_i64 = i64::try_from(rowid).expect("rowid fits in i64");
+                        entries.push((rowid_i64, payload.as_slice()));
+                    }
+                    let candidate = build_leaf_table(&entries);
+                    let header = BtreePageHeader::parse(&candidate, 0).expect("parse child header");
+                    let ptrs =
+                        read_cell_pointers(&candidate, &header, 0).expect("read child pointers");
+                    let mut cells: Vec<GatheredCell> = Vec::with_capacity(ptrs.len());
+                    for ptr in ptrs {
+                        let cell_offset = usize::from(ptr);
+                        let cell_ref =
+                            CellRef::parse(&candidate, cell_offset, header.page_type, USABLE)
+                                .expect("cell ref");
+                        let cell_end =
+                            cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
+                        let data = candidate[cell_offset..cell_end].to_vec();
+                        let size = u16::try_from(data.len()).expect("cell size");
+                        cells.push(GatheredCell { data, size });
+                    }
+                    if page_fits(&cells, header.page_type, 0, USABLE)
+                        && !page_fits(&cells, header.page_type, 100, USABLE)
+                    {
+                        selected = Some(candidate);
+                        break 'search;
+                    }
+                }
+            }
+            selected.expect("find child page that only fits non-page1 offset")
+        };
+
+        let db_header = vec![0xAB; 100];
+        let mut root_page = vec![0u8; USABLE as usize];
+        root_page[..100].copy_from_slice(&db_header);
+        let root_header = BtreePageHeader {
+            page_type: BtreePageType::InteriorTable,
+            first_freeblock: 0,
+            cell_count: 0,
+            cell_content_offset: USABLE,
+            fragmented_free_bytes: 0,
+            right_child: Some(pn(2)),
+        };
+        root_header.write(&mut root_page, 100);
+
+        store.pages.insert(1, root_page.clone());
+        store.pages.insert(2, child_data);
+
+        balance_shallower(&cx, &mut store, pn(1), pn(2), USABLE).expect("balance shallower");
+
+        // Root remains unchanged interior page with right-child pointer.
+        let updated_root = store.pages.get(&1).expect("root page exists");
+        assert_eq!(&updated_root[..100], db_header.as_slice());
+        let updated_header = BtreePageHeader::parse(updated_root, 100).expect("root header");
+        assert_eq!(updated_header.page_type, BtreePageType::InteriorTable);
+        assert_eq!(updated_header.cell_count, 0);
+        assert_eq!(updated_header.right_child, Some(pn(2)));
     }
 
     // -- insert_cell_into_page test --

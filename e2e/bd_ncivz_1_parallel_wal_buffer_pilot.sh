@@ -4,6 +4,7 @@ set -euo pipefail
 BEAD_ID="${BEAD_ID:-bd-ncivz.1}"
 SCENARIO_ID="${SCENARIO_ID:-E2E-CNC-007}"
 SEED="${SEED:-2026021601}"
+LOG_STANDARD_REF="${LOG_STANDARD_REF:-docs/e2e_shell_script_log_profile.json}"
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_ROOT="${WORKSPACE_ROOT}/artifacts/ncivz_1_parallel_wal_buffer"
 TEST_FILTER="${TEST_FILTER:-bd_ncivz_1_}"
@@ -90,6 +91,7 @@ emit_event() {
         --arg replay_command "${REPLAY_COMMAND}" \
         --arg log_path "${LOG_PATH}" \
         --arg report_jsonl "${REPORT_JSONL}" \
+        --arg log_standard_ref "${LOG_STANDARD_REF}" \
         --argjson duration_us "${duration_us}" \
         --argjson seed "${SEED}" \
         --argjson schema_conforms "${schema_conforms}" \
@@ -109,6 +111,7 @@ emit_event() {
             error_code: (if $error_code == "null" then null else $error_code end),
             seed: $seed,
             schema_conforms: $schema_conforms,
+            log_standard_ref: $log_standard_ref,
             replay_command: $replay_command,
             artifact_paths: [$log_path, $report_jsonl]
         }' >>"${REPORT_JSONL}"

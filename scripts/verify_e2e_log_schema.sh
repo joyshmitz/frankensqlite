@@ -8,17 +8,20 @@
 # 3. Checks critical scenario coverage
 # 4. Emits structured log output
 #
-# Usage: ./scripts/verify_e2e_log_schema.sh [--json] [--deterministic] [--seed <u64>]
+# Usage: ./scripts/verify_e2e_log_schema.sh [--json] [--deterministic] [--seed <u64>] [--skip-runtime]
 
 set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 JSON_OUTPUT=false
 DETERMINISTIC=false
+RUN_RUNTIME=true
 SEED="${E2E_LOG_SCHEMA_SEED:-424242}"
 MODULE_FILE="$WORKSPACE_ROOT/crates/fsqlite-harness/src/e2e_log_schema.rs"
 CONTRACT_DOC="$WORKSPACE_ROOT/docs/e2e_log_schema_contract.md"
 PROFILE_DOC="$WORKSPACE_ROOT/docs/e2e_shell_script_log_profile.json"
+RUNTIME_REPORT_REL="test-results/e2e_log_schema_runtime_conformance.jsonl"
+RUNTIME_REPORT_PATH="$WORKSPACE_ROOT/$RUNTIME_REPORT_REL"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -37,6 +40,10 @@ while [[ $# -gt 0 ]]; do
             fi
             SEED="$2"
             shift 2
+            ;;
+        --skip-runtime)
+            RUN_RUNTIME=false
+            shift
             ;;
         *)
             echo "ERROR: unknown argument '$1'" >&2
@@ -132,6 +139,106 @@ fi
 
 REPLAY_COMMAND="$(jq -r '.replay_instructions[0] // ""' "$PROFILE_DOC")"
 
+# Representative runtime shell-script conformance checks.
+# These probes validate runtime event shape + trace continuity + artifact linkage.
+RUNTIME_STATUS="pass"
+RUNTIME_PROBES_TOTAL=0
+RUNTIME_PROBES_PASSED=0
+RUNTIME_PROBES_FAILED=0
+
+mkdir -p "$(dirname "$RUNTIME_REPORT_PATH")"
+: >"$RUNTIME_REPORT_PATH"
+
+record_runtime_probe() {
+    local probe="$1"
+    local script_path="$2"
+    local event_log_rel="$3"
+    local result="$4"
+    local detail="$5"
+    jq -nc \
+        --arg probe "$probe" \
+        --arg script_path "$script_path" \
+        --arg event_log "$event_log_rel" \
+        --arg result "$result" \
+        --arg detail "$detail" \
+        '{probe: $probe, script_path: $script_path, event_log: $event_log, result: $result, detail: $detail}' \
+        >>"$RUNTIME_REPORT_PATH"
+}
+
+run_runtime_probe() {
+    local probe_name="$1"
+    local script_rel="$2"
+    local event_log_rel="$3"
+    local scenario_id="$4"
+    local script_abs="$WORKSPACE_ROOT/$script_rel"
+    local event_log_abs="$WORKSPACE_ROOT/$event_log_rel"
+    local probe_output="$WORKSPACE_ROOT/test-results/e2e_log_schema_runtime_${probe_name}.log"
+
+    RUNTIME_PROBES_TOTAL=$((RUNTIME_PROBES_TOTAL + 1))
+
+    if [[ ! -f "$script_abs" ]]; then
+        ERRORS=$((ERRORS + 1))
+        RUNTIME_PROBES_FAILED=$((RUNTIME_PROBES_FAILED + 1))
+        RUNTIME_STATUS="fail"
+        record_runtime_probe "$probe_name" "$script_rel" "$event_log_rel" "fail" "script_missing"
+        return
+    fi
+
+    if ! (cd "$WORKSPACE_ROOT" && SEED="$SEED" SCENARIO_ID="$scenario_id" bash "$script_rel") >"$probe_output" 2>&1; then
+        ERRORS=$((ERRORS + 1))
+        RUNTIME_PROBES_FAILED=$((RUNTIME_PROBES_FAILED + 1))
+        RUNTIME_STATUS="fail"
+        record_runtime_probe "$probe_name" "$script_rel" "$event_log_rel" "fail" "script_execution_failed"
+        return
+    fi
+
+    if [[ ! -s "$event_log_abs" ]]; then
+        ERRORS=$((ERRORS + 1))
+        RUNTIME_PROBES_FAILED=$((RUNTIME_PROBES_FAILED + 1))
+        RUNTIME_STATUS="fail"
+        record_runtime_probe "$probe_name" "$script_rel" "$event_log_rel" "fail" "missing_or_empty_event_log"
+        return
+    fi
+
+    if ! jq -s -e --arg scenario_id "$scenario_id" --arg event_log "$event_log_rel" '
+        length > 0
+        and all(.[]; type == "object")
+        and all(.[]; ((.run_id | type) == "string") and ((.run_id | length) > 0))
+        and all(.[]; ((.timestamp | type) == "string") and ((.timestamp | length) > 0))
+        and all(.[]; ((.phase | type) == "string") and ((.phase | length) > 0))
+        and all(.[]; ((.event_type | type) == "string") and ((.event_type | length) > 0))
+        and all(.[]; ((.scenario_id | type) == "string") and ((.scenario_id | length) > 0))
+        and all(.[]; has("seed"))
+        and all(.[]; ((.context | type) == "object"))
+        and all(.[]; ((.context.log_standard_ref | type) == "string") and ((.context.log_standard_ref | length) > 0))
+        and all(.[]; ((.context.schema_log_path | type) == "string") and (.context.schema_log_path | endswith($event_log)))
+        and ([.[].run_id] | unique | length == 1)
+        and ([.[].scenario_id] | unique == [$scenario_id])
+        and ([.[].event_type] | index("start") != null)
+        and (([.[].event_type] | index("pass") != null) or ([.[].event_type] | index("fail") != null))
+        and all(.[]; if (.event_type == "fail" or .event_type == "error")
+                      then ((.context.outcome // "") | tostring | length > 0)
+                      else true end)
+    ' "$event_log_abs" >/dev/null; then
+        ERRORS=$((ERRORS + 1))
+        RUNTIME_PROBES_FAILED=$((RUNTIME_PROBES_FAILED + 1))
+        RUNTIME_STATUS="fail"
+        record_runtime_probe "$probe_name" "$script_rel" "$event_log_rel" "fail" "runtime_schema_or_trace_validation_failed"
+        return
+    fi
+
+    RUNTIME_PROBES_PASSED=$((RUNTIME_PROBES_PASSED + 1))
+    record_runtime_probe "$probe_name" "$script_rel" "$event_log_rel" "pass" "ok"
+}
+
+if $RUN_RUNTIME; then
+    run_runtime_probe "risk_register" "e2e/risk_register_report.sh" "test-results/bd_3kp_2_risk_register_events.jsonl" "DOC-1"
+    run_runtime_probe "future_work" "e2e/future_work_report.sh" "test-results/bd_3kp_3_future_work_events.jsonl" "DOC-2"
+    run_runtime_probe "reference_index" "e2e/reference_index_audit.sh" "test-results/reference_index_audit_events.jsonl" "IDX-1"
+else
+    RUNTIME_STATUS="skipped"
+fi
+
 # Output results
 if $JSON_OUTPUT; then
     cat <<ENDJSON
@@ -161,6 +268,14 @@ if $JSON_OUTPUT; then
     "path": "docs/e2e_shell_script_log_profile.json",
     "status": "$PROFILE_STATUS"
   },
+  "runtime_conformance": {
+    "enabled": $RUN_RUNTIME,
+    "status": "$RUNTIME_STATUS",
+    "probes_total": $RUNTIME_PROBES_TOTAL,
+    "probes_passed": $RUNTIME_PROBES_PASSED,
+    "probes_failed": $RUNTIME_PROBES_FAILED,
+    "report_path": "$RUNTIME_REPORT_REL"
+  },
   "replay": {
     "command": "$REPLAY_COMMAND"
   },
@@ -187,6 +302,14 @@ else
     echo "Contract doc:     $CONTRACT_STATUS"
     echo "Profile doc:      $PROFILE_STATUS"
     echo "Replay command:   $REPLAY_COMMAND"
+    echo ""
+    echo "--- Runtime Conformance ---"
+    echo "Enabled:          $RUN_RUNTIME"
+    echo "Status:           $RUNTIME_STATUS"
+    echo "Probes total:     $RUNTIME_PROBES_TOTAL"
+    echo "Probes passed:    $RUNTIME_PROBES_PASSED"
+    echo "Probes failed:    $RUNTIME_PROBES_FAILED"
+    echo "Report path:      $RUNTIME_REPORT_REL"
     echo ""
     echo "--- Validation ---"
     echo "Errors:           $ERRORS"

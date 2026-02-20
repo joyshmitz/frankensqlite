@@ -2,12 +2,44 @@
 set -euo pipefail
 
 BEAD_ID="bd-i0m5"
+SCENARIO_ID="${SCENARIO_ID:-NET-1}"
+SEED="${SEED:-2026022005}"
+RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LOG_STANDARD_REF="${LOG_STANDARD_REF:-docs/e2e_shell_script_log_profile.json}"
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ISSUES_PATH="${WORKSPACE_ROOT}/.beads/issues.jsonl"
 TEST_TARGET="bd_i0m5_networking_stack_compliance"
+REPORT_DIR="${WORKSPACE_ROOT}/test-results"
+SCHEMA_LOG_PATH="${REPORT_DIR}/bd_i0m5_networking_stack_events.jsonl"
+
+mkdir -p "${REPORT_DIR}"
+: >"${SCHEMA_LOG_PATH}"
+
+emit_schema_event() {
+    local phase="$1"
+    local event_type="$2"
+    local outcome="$3"
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    printf '{"run_id":"%s","timestamp":"%s","phase":"%s","event_type":"%s","scenario_id":"%s","seed":"%s","context":{"bead_id":"%s","outcome":"%s","log_standard_ref":"%s","schema_log_path":"%s"}}\n' \
+        "${RUN_ID}" "${timestamp}" "${phase}" "${event_type}" "${SCENARIO_ID}" "${SEED}" "${BEAD_ID}" "${outcome}" "${LOG_STANDARD_REF}" "${SCHEMA_LOG_PATH}" \
+        >>"${SCHEMA_LOG_PATH}"
+}
+
+on_exit() {
+    local exit_code=$?
+    if [[ ${exit_code} -eq 0 ]]; then
+        emit_schema_event "report" "pass" "pass"
+    else
+        emit_schema_event "report" "fail" "fail"
+    fi
+}
+trap on_exit EXIT
 
 printf 'bead_id=%s level=DEBUG case=start workspace=%s target=%s\n' \
     "${BEAD_ID}" "${WORKSPACE_ROOT}" "${TEST_TARGET}"
+emit_schema_event "setup" "start" "running"
 
 if [[ ! -f "${ISSUES_PATH}" ]]; then
     printf 'bead_id=%s level=ERROR case=missing_issues_jsonl path=%s\n' "${BEAD_ID}" "${ISSUES_PATH}"

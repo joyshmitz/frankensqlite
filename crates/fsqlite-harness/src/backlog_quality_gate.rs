@@ -461,27 +461,31 @@ fn missing_requirements(acceptance_criteria: &str) -> Vec<RequirementKind> {
     let mut missing = Vec::new();
     let normalized = normalize_text(acceptance_criteria);
     let words = token_words(&normalized);
+    let tokens = token_sequence(&normalized);
 
-    if !has_unit_property_tests(&normalized, &words) {
+    if !has_unit_property_tests(&normalized, &words, &tokens) {
         missing.push(RequirementKind::UnitPropertyTests);
     }
-    if !has_deterministic_e2e(&normalized, &words) {
+    if !has_deterministic_e2e(&normalized, &words, &tokens) {
         missing.push(RequirementKind::DeterministicE2e);
     }
-    if !has_structured_logging(&normalized, &words) {
+    if !has_structured_logging(&normalized, &words, &tokens) {
         missing.push(RequirementKind::StructuredLogging);
     }
     missing
 }
 
-fn has_unit_property_tests(normalized: &str, words: &BTreeSet<String>) -> bool {
+fn has_unit_property_tests(normalized: &str, words: &BTreeSet<String>, tokens: &[String]) -> bool {
     let mentions_test = words.contains("test") || words.contains("tests");
     let mentions_unit = words.contains("unit");
     let mentions_property = words.contains("property") || normalized.contains("proptest");
+    if is_negated_requirement(tokens, &["test", "tests", "unit", "property", "proptest"]) {
+        return false;
+    }
     mentions_test && (mentions_unit || mentions_property)
 }
 
-fn has_deterministic_e2e(normalized: &str, words: &BTreeSet<String>) -> bool {
+fn has_deterministic_e2e(normalized: &str, words: &BTreeSet<String>, tokens: &[String]) -> bool {
     let mentions_e2e = words.contains("e2e")
         || normalized.contains("end-to-end")
         || normalized.contains("end to end");
@@ -490,10 +494,18 @@ fn has_deterministic_e2e(normalized: &str, words: &BTreeSet<String>) -> bool {
         || words.contains("seeds")
         || words.contains("replay")
         || normalized.contains("replay instructions");
+    let negated = normalized.contains("no end-to-end")
+        || normalized.contains("no end to end")
+        || normalized.contains("without end-to-end")
+        || normalized.contains("without end to end")
+        || is_negated_requirement(tokens, &["e2e", "deterministic", "seed", "seeds", "replay"]);
+    if negated {
+        return false;
+    }
     mentions_e2e && mentions_determinism
 }
 
-fn has_structured_logging(normalized: &str, words: &BTreeSet<String>) -> bool {
+fn has_structured_logging(normalized: &str, words: &BTreeSet<String>, tokens: &[String]) -> bool {
     let mentions_logging = words.contains("logging")
         || words.contains("metrics")
         || normalized.contains("logging/metrics");
@@ -502,6 +514,20 @@ fn has_structured_logging(normalized: &str, words: &BTreeSet<String>) -> bool {
         || normalized.contains("scenario_id")
         || normalized.contains("trace/run/scenario")
         || (words.contains("trace") && words.contains("scenario"));
+    if is_negated_requirement(
+        tokens,
+        &[
+            "logging",
+            "metrics",
+            "trace_id",
+            "run_id",
+            "scenario_id",
+            "trace",
+            "scenario",
+        ],
+    ) {
+        return false;
+    }
     mentions_logging && mentions_traceability
 }
 
@@ -523,6 +549,51 @@ fn token_words(input: &str) -> BTreeSet<String> {
         words.insert(current);
     }
     words
+}
+
+fn token_sequence(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            tokens.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_negated_requirement(tokens: &[String], requirement_terms: &[&str]) -> bool {
+    const NEGATION_TERMS: &[&str] = &[
+        "no", "not", "without", "missing", "lack", "lacking", "lacks", "absent", "none", "neither",
+        "nor",
+    ];
+    const WINDOW: usize = 6;
+
+    let requirement_positions: Vec<usize> = tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, token)| requirement_terms.contains(&token.as_str()).then_some(idx))
+        .collect();
+    if requirement_positions.is_empty() {
+        return false;
+    }
+
+    tokens.iter().enumerate().any(|(neg_idx, token)| {
+        if !NEGATION_TERMS.contains(&token.as_str()) {
+            return false;
+        }
+        if token == "not" && tokens.get(neg_idx + 1).is_some_and(|next| next == "only") {
+            return false;
+        }
+        requirement_positions
+            .iter()
+            .any(|&req_idx| req_idx >= neg_idx && req_idx.saturating_sub(neg_idx) <= WINDOW)
+    })
 }
 
 fn join_requirements(requirements: &[RequirementKind]) -> String {
@@ -599,7 +670,10 @@ mod tests {
         assert_eq!(report.regression_failures.len(), 1);
         assert_eq!(
             report.failures[0].missing_requirements,
-            vec![RequirementKind::DeterministicE2e]
+            vec![
+                RequirementKind::DeterministicE2e,
+                RequirementKind::StructuredLogging
+            ]
         );
     }
 
@@ -626,7 +700,10 @@ mod tests {
             schema_version: BACKLOG_QUALITY_GATE_SCHEMA_VERSION.to_owned(),
             entries: vec![BacklogQualityBaselineEntry {
                 issue_id: "bd-known".to_owned(),
-                missing_requirements: vec![RequirementKind::DeterministicE2e],
+                missing_requirements: vec![
+                    RequirementKind::DeterministicE2e,
+                    RequirementKind::StructuredLogging,
+                ],
             }],
         };
         fs::write(
@@ -685,12 +762,13 @@ mod tests {
             "Community testing and telemetry mention neither end-to-end nor trace_id logging.",
         );
         let words = token_words(&normalized);
+        let tokens = token_sequence(&normalized);
         assert!(
-            !has_unit_property_tests(&normalized, &words),
+            !has_unit_property_tests(&normalized, &words, &tokens),
             "community should not satisfy unit test requirement"
         );
         assert!(
-            !has_deterministic_e2e(&normalized, &words),
+            !has_deterministic_e2e(&normalized, &words, &tokens),
             "must require deterministic e2e wording"
         );
     }

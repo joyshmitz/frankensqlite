@@ -755,6 +755,8 @@ mod tests {
         received: &mut Vec<ReceivedSymbol>,
         constraints: &ConstraintMatrix,
         base_rows: usize,
+        k_prime: usize,
+        symbol_size: usize,
         source: &[Vec<u8>],
         source_indexes: &[usize],
     ) {
@@ -776,6 +778,29 @@ mod tests {
                 columns,
                 coefficients,
                 data: source[source_index].clone(),
+            });
+        }
+
+        // RFC 6330 decode domain uses K' source-domain rows, not just K.
+        // The K'−K PI rows correspond to zero-padded source symbols.
+        for source_index in source.len()..k_prime {
+            let row = base_rows + source_index;
+            let mut columns = Vec::new();
+            let mut coefficients = Vec::new();
+            for col in 0..constraints.cols {
+                let coeff = constraints.get(row, col);
+                if !coeff.is_zero() {
+                    columns.push(col);
+                    coefficients.push(coeff);
+                }
+            }
+
+            received.push(ReceivedSymbol {
+                esi: u32::try_from(source_index).expect("source index fits u32"),
+                is_source: true,
+                columns,
+                coefficients,
+                data: vec![0_u8; symbol_size],
             });
         }
     }
@@ -1521,6 +1546,8 @@ mod tests {
             &mut received,
             &constraints,
             base_rows,
+            params.k_prime,
+            symbol_size,
             &source,
             &source_indexes,
         );
@@ -1569,6 +1596,8 @@ mod tests {
             &mut received,
             &constraints,
             base_rows,
+            params.k_prime,
+            symbol_size,
             &source,
             &source_indexes,
         );
@@ -1608,6 +1637,8 @@ mod tests {
             &mut received,
             &constraints,
             base_rows,
+            params.k_prime,
+            symbol_size,
             &source,
             &source_indexes,
         );

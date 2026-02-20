@@ -381,10 +381,7 @@ mod tests {
             })
             .unwrap();
 
-        rt.scheduler
-            .lock()
-            .expect("LabRuntime scheduler lock poisoned")
-            .schedule(task_id, 0);
+        rt.scheduler.lock().schedule(task_id, 0);
         rt.run_until_quiescent();
 
         assert!(

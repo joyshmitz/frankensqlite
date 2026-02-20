@@ -2,11 +2,33 @@
 set -euo pipefail
 
 BEAD_ID="bd-2v8x"
+SCENARIO_ID="${SCENARIO_ID:-BUILD-2}"
+SEED="${SEED:-2026022003}"
+RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LOG_STANDARD_REF="${LOG_STANDARD_REF:-docs/e2e_shell_script_log_profile.json}"
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FSQLITE_MANIFEST="${WORKSPACE_ROOT}/crates/fsqlite/Cargo.toml"
 WORKSPACE_MANIFEST="${WORKSPACE_ROOT}/Cargo.toml"
+REPORT_DIR="${WORKSPACE_ROOT}/test-results"
+SCHEMA_LOG_PATH="${REPORT_DIR}/bd_2v8x_compliance_events.jsonl"
+
+mkdir -p "${REPORT_DIR}"
+: >"${SCHEMA_LOG_PATH}"
+
+emit_schema_event() {
+    local phase="$1"
+    local event_type="$2"
+    local outcome="$3"
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    printf '{"run_id":"%s","timestamp":"%s","phase":"%s","event_type":"%s","scenario_id":"%s","seed":"%s","context":{"bead_id":"%s","outcome":"%s","log_standard_ref":"%s","schema_log_path":"%s"}}\n' \
+        "${RUN_ID}" "${timestamp}" "${phase}" "${event_type}" "${SCENARIO_ID}" "${SEED}" "${BEAD_ID}" "${outcome}" "${LOG_STANDARD_REF}" "${SCHEMA_LOG_PATH}" \
+        >>"${SCHEMA_LOG_PATH}"
+}
 
 printf 'bead_id=%s level=DEBUG case=start workspace=%s\n' "${BEAD_ID}" "${WORKSPACE_ROOT}"
+emit_schema_event "setup" "start" "running"
 
 if [[ ! -f "${FSQLITE_MANIFEST}" || ! -f "${WORKSPACE_MANIFEST}" ]]; then
     printf 'bead_id=%s level=ERROR case=missing_manifest fsqlite=%s workspace=%s\n' \
@@ -56,6 +78,12 @@ done
 
 metadata_json="$(mktemp)"
 cleanup() {
+    local exit_code=$?
+    if [[ ${exit_code} -eq 0 ]]; then
+        emit_schema_event "report" "pass" "pass"
+    else
+        emit_schema_event "report" "fail" "fail"
+    fi
     rm -f "${metadata_json}"
 }
 trap cleanup EXIT

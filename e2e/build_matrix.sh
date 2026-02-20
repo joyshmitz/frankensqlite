@@ -2,11 +2,17 @@
 set -u -o pipefail
 
 BEAD_ID="bd-2v8x"
+SCENARIO_ID="${SCENARIO_ID:-BUILD-1}"
+SEED="${SEED:-2026022002}"
+RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LOG_STANDARD_REF="${LOG_STANDARD_REF:-docs/e2e_shell_script_log_profile.json}"
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-${WORKSPACE_ROOT}/target/bd-2v8x-build-matrix}"
 LOG_DIR="${WORKSPACE_ROOT}/target/bd-2v8x-build-matrix/logs"
+SCHEMA_LOG_PATH="${LOG_DIR}/build_matrix_events.jsonl"
 
 mkdir -p "${TARGET_DIR}" "${LOG_DIR}"
+: >"${SCHEMA_LOG_PATH}"
 
 declare -a failures=()
 
@@ -22,6 +28,30 @@ log_result() {
         'bead_id=%s level=%s variant=%s cmd="%s" exit_code=%s duration_ms=%s log=%s\n' \
         "${BEAD_ID}" "${level}" "${variant}" "${cmd}" "${exit_code}" "${duration_ms}" "${log_path}"
 }
+
+emit_schema_event() {
+    local phase="$1"
+    local event_type="$2"
+    local outcome="$3"
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    printf '{"run_id":"%s","timestamp":"%s","phase":"%s","event_type":"%s","scenario_id":"%s","seed":"%s","context":{"bead_id":"%s","outcome":"%s","log_standard_ref":"%s","schema_log_path":"%s"}}\n' \
+        "${RUN_ID}" "${timestamp}" "${phase}" "${event_type}" "${SCENARIO_ID}" "${SEED}" "${BEAD_ID}" "${outcome}" "${LOG_STANDARD_REF}" "${SCHEMA_LOG_PATH}" \
+        >>"${SCHEMA_LOG_PATH}"
+}
+
+on_exit() {
+    local exit_code=$?
+    if [[ ${exit_code} -eq 0 ]]; then
+        emit_schema_event "report" "pass" "pass"
+    else
+        emit_schema_event "report" "fail" "fail"
+    fi
+}
+trap on_exit EXIT
+
+emit_schema_event "setup" "start" "running"
 
 run_variant() {
     local variant="$1"

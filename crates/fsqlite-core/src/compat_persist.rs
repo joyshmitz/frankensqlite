@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use fsqlite_ast::SortDirection;
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
@@ -367,19 +368,43 @@ pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
     sql
 }
 
+/// Indexed term metadata used to reconstruct `CREATE INDEX` SQL.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CreateIndexSqlTerm<'a> {
+    pub(crate) column_name: &'a str,
+    pub(crate) collation: Option<&'a str>,
+    pub(crate) direction: Option<SortDirection>,
+}
+
 /// Reconstruct a `CREATE INDEX` statement from index metadata.
 pub(crate) fn build_create_index_sql(
     index_name: &str,
     table_name: &str,
-    columns: &[String],
+    unique: bool,
+    terms: &[CreateIndexSqlTerm<'_>],
 ) -> String {
     use std::fmt::Write as _;
-    let mut sql = format!("CREATE INDEX \"{}\" ON \"{}\" (", index_name, table_name);
-    for (i, col) in columns.iter().enumerate() {
+    let mut sql = if unique {
+        format!(
+            "CREATE UNIQUE INDEX \"{}\" ON \"{}\" (",
+            index_name, table_name
+        )
+    } else {
+        format!("CREATE INDEX \"{}\" ON \"{}\" (", index_name, table_name)
+    };
+    for (i, term) in terms.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
         }
-        let _ = write!(sql, "\"{}\"", col);
+        let _ = write!(sql, "\"{}\"", term.column_name);
+        if let Some(collation) = term.collation {
+            let _ = write!(sql, " COLLATE \"{}\"", collation);
+        }
+        match term.direction {
+            Some(SortDirection::Asc) => sql.push_str(" ASC"),
+            Some(SortDirection::Desc) => sql.push_str(" DESC"),
+            None => {}
+        }
     }
     sql.push(')');
     sql
@@ -906,6 +931,29 @@ mod tests {
         assert_eq!(type_to_affinity("VARCHAR"), 'C');
         assert_eq!(type_to_affinity("BLOB"), 'B');
         assert_eq!(type_to_affinity("NUMERIC"), 'A');
+    }
+
+    #[test]
+    fn test_build_create_index_sql_preserves_unique_collation_and_direction() {
+        let terms = [
+            CreateIndexSqlTerm {
+                column_name: "project_id",
+                collation: None,
+                direction: Some(SortDirection::Asc),
+            },
+            CreateIndexSqlTerm {
+                column_name: "name",
+                collation: Some("NOCASE"),
+                direction: Some(SortDirection::Desc),
+            },
+        ];
+
+        let sql = build_create_index_sql("idx_agents_project_name_nocase", "agents", true, &terms);
+
+        assert_eq!(
+            sql,
+            "CREATE UNIQUE INDEX \"idx_agents_project_name_nocase\" ON \"agents\" (\"project_id\" ASC, \"name\" COLLATE \"NOCASE\" DESC)"
+        );
     }
 
     #[test]

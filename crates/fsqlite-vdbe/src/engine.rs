@@ -16,8 +16,8 @@ use std::collections::HashSet;
 
 use fsqlite_btree::swiss_index::SwissIndex;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
@@ -529,9 +529,9 @@ struct ConcurrentContext {
     /// Session ID for this concurrent transaction.
     session_id: u64,
     /// Shared reference to the concurrent writer registry.
-    registry: Rc<RefCell<ConcurrentRegistry>>,
+    registry: Arc<Mutex<ConcurrentRegistry>>,
     /// Shared reference to the page-level lock table.
-    lock_table: Rc<InProcessPageLockTable>,
+    lock_table: Arc<InProcessPageLockTable>,
 }
 
 /// Shared wrapper around a boxed [`TransactionHandle`] so multiple
@@ -568,8 +568,8 @@ impl SharedTxnPageIo {
     fn with_concurrent(
         txn: Box<dyn TransactionHandle>,
         session_id: u64,
-        registry: Rc<RefCell<ConcurrentRegistry>>,
-        lock_table: Rc<InProcessPageLockTable>,
+        registry: Arc<Mutex<ConcurrentRegistry>>,
+        lock_table: Arc<InProcessPageLockTable>,
     ) -> Self {
         Self {
             txn: Rc::new(RefCell::new(txn)),
@@ -612,19 +612,25 @@ impl PageWriter for SharedTxnPageIo {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         // bd-kivg / 5E.2: Acquire page-level lock and record in write set if concurrent.
         if let Some(ref ctx) = self.concurrent {
-            let mut registry = ctx.registry.borrow_mut();
-            let handle = registry.get_mut(ctx.session_id).ok_or_else(|| {
-                FrankenError::Internal(format!(
-                    "MVCC session {} not found in registry during write",
-                    ctx.session_id
-                ))
-            })?;
-            let page_data = PageData::from_vec(data.to_vec());
-            concurrent_write_page(handle, &ctx.lock_table, ctx.session_id, page_no, page_data)
-                .map_err(|e| match e {
-                    MvccError::Busy => FrankenError::Busy,
-                    _ => FrankenError::Internal(format!("MVCC write_page failed: {e}")),
+            {
+                let mut registry = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handle = registry.get_mut(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} not found in registry during write",
+                        ctx.session_id
+                    ))
                 })?;
+                let page_data = PageData::from_vec(data.to_vec());
+                concurrent_write_page(handle, &ctx.lock_table, ctx.session_id, page_no, page_data)
+                    .map_err(|e| match e {
+                        MvccError::Busy => FrankenError::Busy,
+                        _ => FrankenError::Internal(format!("MVCC write_page failed: {e}")),
+                    })?;
+                drop(registry);
+            }
         }
         // Persist to the underlying transaction.
         self.txn.borrow_mut().write_page(cx, page_no, data)
@@ -1276,8 +1282,8 @@ impl VdbeEngine {
         &mut self,
         txn: Box<dyn TransactionHandle>,
         session_id: u64,
-        registry: Rc<RefCell<ConcurrentRegistry>>,
-        lock_table: Rc<InProcessPageLockTable>,
+        registry: Arc<Mutex<ConcurrentRegistry>>,
+        lock_table: Arc<InProcessPageLockTable>,
     ) {
         self.txn_page_io = Some(SharedTxnPageIo::with_concurrent(
             txn, session_id, registry, lock_table,
@@ -7191,8 +7197,8 @@ mod tests {
 
         // Deliberately install concurrent context without a registered session.
         // SharedTxnPageIo::write_page will fail before touching pager state.
-        let registry = std::rc::Rc::new(std::cell::RefCell::new(ConcurrentRegistry::new()));
-        let lock_table = std::rc::Rc::new(InProcessPageLockTable::new());
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
         engine.set_transaction_concurrent(Box::new(txn), 999, registry, lock_table);
 
         let opened = engine.open_storage_cursor(0, root, true);

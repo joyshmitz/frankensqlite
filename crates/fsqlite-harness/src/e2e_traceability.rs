@@ -382,6 +382,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .storage(&[StorageMode::InMemory])
         .concurrency(&[ConcurrencyMode::Sequential])
         .artifacts(&["target/bd-2v8x-build-matrix/logs/"])
+        .log_schema("1.0.0")
         .timeout(600)
         .build(),
     );
@@ -433,6 +434,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["BUILD-2"])
         .storage(&[StorageMode::InMemory])
         .concurrency(&[ConcurrencyMode::Sequential])
+        .log_schema("1.0.0")
         .timeout(600)
         .build(),
     );
@@ -451,6 +453,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
             ConcurrencyMode::ConcurrentWriters,
             ConcurrencyMode::MvccIsolation,
         ])
+        .log_schema("1.0.0")
         .timeout(300)
         .build(),
     );
@@ -482,6 +485,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["NET-1", "REP-1"])
         .storage(&[StorageMode::FileBacked, StorageMode::Wal])
         .concurrency(&[ConcurrencyMode::ConcurrentWriters])
+        .log_schema("1.0.0")
         .timeout(600)
         .build(),
     );
@@ -499,6 +503,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .storage(&[StorageMode::Wal, StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::ConcurrentWriters])
         .artifacts(&["artifacts/ncivz_1_parallel_wal_buffer/"])
+        .log_schema("1.0.0")
         .timeout(900)
         .build(),
     );
@@ -513,6 +518,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["EXT-1"])
         .storage(&[StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::Sequential])
+        .log_schema("1.0.0")
         .timeout(300)
         .build(),
     );
@@ -563,7 +569,30 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["PERF-1"])
         .storage(&[StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::Sequential])
+        .log_schema("1.0.0")
         .timeout(300)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "e2e/bd_1dp9_6_2_sql_pipeline_optimization_report.sh",
+            ScriptKind::ShellE2e,
+            "SQL pipeline hotspot optimization evidence report",
+        )
+        .bead("bd-1dp9.6.2")
+        .command("bash e2e/bd_1dp9_6_2_sql_pipeline_optimization_report.sh --json")
+        .json_output()
+        .scenarios(&[
+            "SQL-PIPELINE-OPT",
+            "SQL-PIPELINE-OPT-UNIT",
+            "SQL-PIPELINE-OPT-ARTIFACT",
+        ])
+        .storage(&[StorageMode::InMemory, StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .artifacts(&["test-results/bd_1dp9_6_2/"])
+        .log_schema("1.0.0")
+        .timeout(900)
         .build(),
     );
 
@@ -611,6 +640,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["IDX-1"])
         .storage(&[StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::Sequential])
+        .log_schema("1.0.0")
         .timeout(300)
         .build(),
     );
@@ -625,6 +655,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["INFRA-1"])
         .storage(&[StorageMode::InMemory])
         .concurrency(&[ConcurrencyMode::Sequential])
+        .log_schema("1.0.0")
         .timeout(60)
         .build(),
     );
@@ -640,6 +671,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["DOC-1"])
         .storage(&[StorageMode::InMemory])
         .concurrency(&[ConcurrencyMode::Sequential])
+        .log_schema("1.0.0")
         .timeout(120)
         .build(),
     );
@@ -655,6 +687,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["DOC-2"])
         .storage(&[StorageMode::InMemory])
         .concurrency(&[ConcurrencyMode::Sequential])
+        .log_schema("1.0.0")
         .timeout(120)
         .build(),
     );

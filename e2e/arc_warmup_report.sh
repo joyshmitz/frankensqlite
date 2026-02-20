@@ -3,10 +3,19 @@ set -euo pipefail
 
 BEAD_ID="bd-2zoa"
 LOG_STANDARD_REF="bd-1fpm"
+LOG_SCHEMA_VERSION="1.0.0"
+SCENARIO_ID="PERF-1"
+SEED="${BD_2ZOA_SEED:-2026022001}"
+BACKEND="fsqlite"
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ISSUES_PATH="${WORKSPACE_ROOT}/.beads/issues.jsonl"
 REPORT_DIR="${WORKSPACE_ROOT}/test-results"
 REPORT_JSONL="${REPORT_DIR}/bd_2zoa_arc_warmup_report.jsonl"
+LOG_JSONL="${REPORT_DIR}/bd_2zoa_arc_warmup_events.jsonl"
+REPORT_REL="${REPORT_JSONL#${WORKSPACE_ROOT}/}"
+LOG_REL="${LOG_JSONL#${WORKSPACE_ROOT}/}"
+WORKER="${HOSTNAME:-local}"
 
 declare -a UNIT_IDS=(
     "test_bd_2zoa_unit_compliance_gate"
@@ -40,16 +49,165 @@ declare -a PREWARM_MARKERS=(
     "sqlite_master root pages"
 )
 
-printf 'bead_id=%s level=DEBUG case=start workspace=%s report=%s reference=%s\n' \
-    "${BEAD_ID}" "${WORKSPACE_ROOT}" "${REPORT_JSONL}" "${LOG_STANDARD_REF}"
+emit_event() {
+    local phase="$1"
+    local event_type="$2"
+    local outcome="$3"
+    local case_name="$4"
+    local message="$5"
+    local error_code="$6"
+    local artifact_paths_json="$7"
+    local context_json="$8"
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-if [[ ! -f "${ISSUES_PATH}" ]]; then
-    printf 'bead_id=%s level=ERROR case=missing_issues_jsonl path=%s reference=%s\n' \
-        "${BEAD_ID}" "${ISSUES_PATH}" "${LOG_STANDARD_REF}"
-    exit 1
-fi
+    jq -nc \
+        --arg schema_version "${LOG_SCHEMA_VERSION}" \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg timestamp "${timestamp}" \
+        --arg phase "${phase}" \
+        --arg event_type "${event_type}" \
+        --arg scenario_id "${SCENARIO_ID}" \
+        --arg seed "${SEED}" \
+        --arg backend "${BACKEND}" \
+        --arg outcome "${outcome}" \
+        --arg case_name "${case_name}" \
+        --arg message "${message}" \
+        --arg error_code "${error_code}" \
+        --arg worker "${WORKER}" \
+        --arg log_standard_ref "${LOG_STANDARD_REF}" \
+        --argjson artifact_paths "${artifact_paths_json}" \
+        --argjson context "${context_json}" \
+        '{
+            schema_version: $schema_version,
+            bead_id: $bead_id,
+            run_id: $run_id,
+            timestamp: $timestamp,
+            phase: $phase,
+            event_type: $event_type,
+            scenario_id: $scenario_id,
+            seed: ($seed | tonumber? // $seed),
+            backend: $backend,
+            outcome: $outcome,
+            error_code: (if $error_code == "" then null else $error_code end),
+            artifact_paths: $artifact_paths,
+            context: ($context + {
+                case: $case_name,
+                message: $message,
+                worker: $worker,
+                log_standard_ref: $log_standard_ref
+            })
+        }' >>"${LOG_JSONL}"
+}
+
+log_line() {
+    local level="$1"
+    local case_name="$2"
+    shift 2
+    local details="$*"
+
+    local phase="validate"
+    local event_type="info"
+    local outcome="info"
+    local error_code=""
+
+    case "${case_name}" in
+        start)
+            phase="setup"
+            event_type="start"
+            outcome="running"
+            ;;
+        trace)
+            phase="execute"
+            event_type="info"
+            outcome="running"
+            ;;
+        summary)
+            phase="report"
+            event_type="info"
+            outcome="info"
+            ;;
+        missing_marker | degraded_mode_count)
+            phase="validate"
+            event_type="warn"
+            outcome="warn"
+            ;;
+        pass)
+            phase="report"
+            event_type="pass"
+            outcome="pass"
+            ;;
+        terminal_failure)
+            phase="report"
+            event_type="fail"
+            outcome="fail"
+            ;;
+        terminal_failure_count)
+            phase="report"
+            event_type="info"
+            outcome="pass"
+            ;;
+    esac
+
+    case "${level}" in
+        WARN)
+            event_type="warn"
+            outcome="warn"
+            ;;
+        ERROR)
+            if [[ "${case_name}" == "terminal_failure_count" ]]; then
+                event_type="info"
+                outcome="pass"
+            elif [[ "${event_type}" != "fail" ]]; then
+                event_type="error"
+                outcome="fail"
+            fi
+            ;;
+    esac
+
+    if [[ "${event_type}" == "fail" || "${event_type}" == "error" ]]; then
+        error_code="E_$(printf '%s' "${case_name}" | tr '[:lower:]-' '[:upper:]_' | tr -cd 'A-Z0-9_')"
+    fi
+
+    local context_json
+    context_json="$(
+        jq -nc \
+            --arg level "${level}" \
+            --arg case_name "${case_name}" \
+            --arg details "${details}" \
+            '{level: $level, details: $details, case: $case_name}'
+    )"
+    local artifact_paths_json
+    artifact_paths_json="$(
+        jq -nc --arg report "${REPORT_REL}" --arg log "${LOG_REL}" '[ $report, $log ] | unique'
+    )"
+
+    emit_event \
+        "${phase}" \
+        "${event_type}" \
+        "${outcome}" \
+        "${case_name}" \
+        "${case_name}" \
+        "${error_code}" \
+        "${artifact_paths_json}" \
+        "${context_json}"
+
+    printf 'bead_id=%s level=%s run_id=%s scenario_id=%s phase=%s event_type=%s case=%s %s reference=%s\n' \
+        "${BEAD_ID}" "${level}" "${RUN_ID}" "${SCENARIO_ID}" "${phase}" "${event_type}" "${case_name}" "${details}" "${LOG_STANDARD_REF}"
+}
 
 mkdir -p "${REPORT_DIR}"
+: >"${REPORT_JSONL}"
+: >"${LOG_JSONL}"
+
+log_line "DEBUG" "start" \
+    "workspace=${WORKSPACE_ROOT} report=${REPORT_JSONL} event_log=${LOG_JSONL}"
+
+if [[ ! -f "${ISSUES_PATH}" ]]; then
+    log_line "ERROR" "missing_issues_jsonl" "path=${ISSUES_PATH}"
+    exit 1
+fi
 
 description="$(
     jq -r '
@@ -60,14 +218,12 @@ description="$(
 )"
 
 if [[ -z "${description//[[:space:]]/}" ]]; then
-    printf 'bead_id=%s level=ERROR case=missing_bead_description path=%s reference=%s\n' \
-        "${BEAD_ID}" "${ISSUES_PATH}" "${LOG_STANDARD_REF}"
+    log_line "ERROR" "missing_bead_description" "path=${ISSUES_PATH}"
     exit 1
 fi
 
 trace_id="$(printf '%s' "${description}" | sha256sum | awk '{print substr($1, 1, 16)}')"
-printf 'bead_id=%s level=DEBUG case=trace trace_id=%s reference=%s\n' \
-    "${BEAD_ID}" "${trace_id}" "${LOG_STANDARD_REF}"
+log_line "DEBUG" "trace" "trace_id=${trace_id}"
 
 printf '# bead_id=%s ARC performance warmup report\n' "${BEAD_ID}" >"${REPORT_JSONL}"
 printf '# kind\tmarker\tpresent\n' >>"${REPORT_JSONL}"
@@ -109,27 +265,23 @@ for marker in "${PREWARM_MARKERS[@]}"; do
     check_marker "prewarm" "${marker}"
 done
 
-printf 'bead_id=%s level=INFO case=summary total_checks=%s missing=%s trace_id=%s report=%s\n' \
-    "${BEAD_ID}" \
-    "$(( ${#UNIT_IDS[@]} + ${#E2E_IDS[@]} + ${#LOG_LEVELS[@]} + ${#WORKLOAD_MARKERS[@]} + ${#WARMUP_MARKERS[@]} + ${#PREWARM_MARKERS[@]} + 1 ))" \
-    "${#missing_markers[@]}" \
-    "${trace_id}" \
-    "${REPORT_JSONL}"
+log_line "INFO" "summary" \
+    "total_checks=$(( ${#UNIT_IDS[@]} + ${#E2E_IDS[@]} + ${#LOG_LEVELS[@]} + ${#WORKLOAD_MARKERS[@]} + ${#WARMUP_MARKERS[@]} + ${#PREWARM_MARKERS[@]} + 1 )) missing=${#missing_markers[@]} trace_id=${trace_id} report=${REPORT_JSONL}"
 
 for marker in "${missing_markers[@]}"; do
-    printf 'bead_id=%s level=WARN case=missing_marker marker=%s trace_id=%s reference=%s\n' \
-        "${BEAD_ID}" "${marker}" "${trace_id}" "${LOG_STANDARD_REF}"
+    log_line "WARN" "missing_marker" \
+        "marker=${marker} trace_id=${trace_id}"
 done
 
 if [[ "${#missing_markers[@]}" -gt 0 ]]; then
-    printf 'bead_id=%s level=ERROR case=terminal_failure missing=%s trace_id=%s report=%s reference=%s\n' \
-        "${BEAD_ID}" "${missing_markers[*]}" "${trace_id}" "${REPORT_JSONL}" "${LOG_STANDARD_REF}"
+    log_line "ERROR" "terminal_failure" \
+        "missing=${missing_markers[*]} trace_id=${trace_id} report=${REPORT_JSONL}"
     exit 1
 fi
 
-printf 'bead_id=%s level=WARN case=degraded_mode_count=0 trace_id=%s reference=%s\n' \
-    "${BEAD_ID}" "${trace_id}" "${LOG_STANDARD_REF}"
-printf 'bead_id=%s level=ERROR case=terminal_failure_count=0 trace_id=%s reference=%s\n' \
-    "${BEAD_ID}" "${trace_id}" "${LOG_STANDARD_REF}"
-printf 'bead_id=%s level=INFO case=pass trace_id=%s report=%s\n' \
-    "${BEAD_ID}" "${trace_id}" "${REPORT_JSONL}"
+log_line "WARN" "degraded_mode_count" \
+    "value=0 trace_id=${trace_id}"
+log_line "ERROR" "terminal_failure_count" \
+    "value=0 trace_id=${trace_id}"
+log_line "INFO" "pass" \
+    "trace_id=${trace_id} report=${REPORT_JSONL}"

@@ -560,6 +560,7 @@ impl Vfs for UnixVfs {
                         path: resolved,
                         lock_level: LockLevel::None,
                         delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
+                        closed: false,
                         inode_key,
                         inode_info,
                         shm_owner_id: next_shm_owner_id(),
@@ -620,6 +621,7 @@ impl Vfs for UnixVfs {
             path: resolved,
             lock_level: LockLevel::None,
             delete_on_close: flags.contains(VfsOpenFlags::DELETEONCLOSE),
+            closed: false,
             inode_key,
             inode_info,
             shm_owner_id: next_shm_owner_id(),
@@ -730,6 +732,7 @@ pub struct UnixFile {
     path: PathBuf,
     lock_level: LockLevel,
     delete_on_close: bool,
+    closed: bool,
     inode_key: InodeKey,
     inode_info: Arc<Mutex<InodeInfo>>,
     shm_owner_id: u64,
@@ -1459,6 +1462,10 @@ impl UnixFile {
 
 impl VfsFile for UnixFile {
     fn close(&mut self, cx: &Cx) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+
         // Downgrade to no lock before closing.
         if self.lock_level != LockLevel::None {
             self.unlock(cx, LockLevel::None)?;
@@ -1476,6 +1483,7 @@ impl VfsFile for UnixFile {
             drop(fs::remove_file(&self.path));
         }
 
+        self.closed = true;
         Ok(())
     }
 
@@ -1779,6 +1787,16 @@ impl VfsFile for UnixFile {
 
     fn shm_unmap(&mut self, _cx: &Cx, delete: bool) -> Result<()> {
         self.release_shm_owner_state(delete)
+    }
+}
+
+impl Drop for UnixFile {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let cx = Cx::new();
+        let _ = self.close(&cx);
     }
 }
 

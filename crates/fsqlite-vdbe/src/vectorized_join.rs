@@ -1066,20 +1066,22 @@ mod tests {
                 .expect("relation build should succeed");
             let relation_refs: Vec<&TrieRelation> = owned_relations.iter().collect();
             let matches = leapfrog_join(&relation_refs).expect("join should succeed");
-            assert_eq!(matches.len(), 2, "expected two common keys for width={relation_width}");
+            assert_eq!(
+                matches.len(),
+                2,
+                "expected two common keys for width={relation_width}"
+            );
             assert_eq!(matches[0].key, vec![SqliteValue::Integer(10)]);
             assert_eq!(matches[1].key, vec![SqliteValue::Integer(20)]);
             assert_eq!(matches[0].tuple_multiplicity(), 1);
-            let expected_multiplicity = (0..relation_width).fold(
-                1_u64,
-                |product, relation_index| {
+            let expected_multiplicity =
+                (0..relation_width).fold(1_u64, |product, relation_index| {
                     if relation_index % 2 == 0 {
                         product.saturating_mul(2)
                     } else {
                         product
                     }
-                },
-            );
+                });
             assert_eq!(
                 matches[1].tuple_multiplicity(),
                 expected_multiplicity,

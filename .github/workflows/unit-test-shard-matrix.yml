@@ -208,6 +208,7 @@ jobs:
           artifact_root="artifacts/unit-coverage-drift-gate"
           coverage_root="${artifact_root}/coverage"
           coverage_log="${coverage_root}/coverage_wrapper.log"
+          coverage_status_file="${artifact_root}/coverage_wrapper.status"
           coverage_json="${coverage_root}/coverage_latest.json"
           per_crate_json="${coverage_root}/coverage_per_crate_delta.json"
 
@@ -218,6 +219,7 @@ jobs:
             > "${coverage_log}" 2>&1
           coverage_status=$?
           set -e
+          printf '%s\n' "${coverage_status}" > "${coverage_status_file}"
 
           if [[ -f "target/coverage/coverage_latest.json" ]]; then
             cp "target/coverage/coverage_latest.json" "${coverage_json}"
@@ -289,17 +291,15 @@ jobs:
               echo "- per_crate_delta: \`${per_crate_json}\`"
               echo "- crates_below_slo: \`${failing_crates}\`"
               echo "- local_parity_command: \`bash ./scripts/coverage.sh --json --fail-under-lines 70 --fail-under-functions 65\`"
+              echo "- status_file: \`${coverage_status_file}\`"
             } >> "${GITHUB_STEP_SUMMARY}"
           else
             {
               echo "### Canonical coverage wrapper"
               echo "- exit_code: ${coverage_status}"
               echo "- coverage JSON not produced; see \`${coverage_log}\`"
+              echo "- status_file: \`${coverage_status_file}\`"
             } >> "${GITHUB_STEP_SUMMARY}"
-          fi
-
-          if [[ ${coverage_status} -ne 0 ]]; then
-            exit "${coverage_status}"
           fi
 
       - name: Run unit coverage drift gate
@@ -311,6 +311,7 @@ jobs:
           report_json="${artifact_root}/unit_coverage_drift_report.json"
           report_md="${artifact_root}/unit_coverage_drift_summary.md"
           gate_log="${artifact_root}/unit_coverage_drift_gate_runner.log"
+          gate_status_file="${artifact_root}/unit_coverage_drift_gate.status"
 
           mkdir -p "${artifact_root}"
 
@@ -324,17 +325,15 @@ jobs:
             > "${gate_log}" 2>&1
           gate_status=$?
           set -e
+          printf '%s\n' "${gate_status}" > "${gate_status_file}"
 
           {
             echo "### Unit coverage drift gate"
             echo "- exit_code: ${gate_status}"
             echo "- report: \`${report_json}\`"
             echo "- summary: \`${report_md}\`"
+            echo "- status_file: \`${gate_status_file}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
-
-          if [[ ${gate_status} -ne 0 ]]; then
-            exit "${gate_status}"
-          fi
 
       - name: Run no-mock critical-path gate
         shell: bash
@@ -345,6 +344,7 @@ jobs:
           report_json="${artifact_root}/no_mock_critical_path_report.json"
           report_md="${artifact_root}/no_mock_critical_path_summary.md"
           gate_log="${artifact_root}/no_mock_critical_path_gate_runner.log"
+          gate_status_file="${artifact_root}/no_mock_critical_path_gate.status"
 
           mkdir -p "${artifact_root}"
 
@@ -355,6 +355,7 @@ jobs:
             > "${gate_log}" 2>&1
           gate_status=$?
           set -e
+          printf '%s\n' "${gate_status}" > "${gate_status_file}"
 
           verdict="unknown"
           blocking_count="unknown"
@@ -373,11 +374,42 @@ jobs:
             echo "- warning_count: ${warning_count}"
             echo "- report: \`${report_json}\`"
             echo "- summary: \`${report_md}\`"
+            echo "- status_file: \`${gate_status_file}\`"
             echo "- local_parity_command: \`cargo run -p fsqlite-harness --bin no_mock_critical_path_gate_runner -- --output-json ${report_json} --output-human ${report_md}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-          if [[ ${gate_status} -ne 0 ]]; then
-            exit "${gate_status}"
+      - name: Enforce aggregated gate outcomes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          coverage_status_file="artifacts/unit-coverage-drift-gate/coverage_wrapper.status"
+          unit_drift_status_file="artifacts/unit-coverage-drift-gate/unit_coverage_drift_gate.status"
+          no_mock_status_file="artifacts/no-mock-critical-path-gate/no_mock_critical_path_gate.status"
+
+          status_from_file() {
+            local file_path="$1"
+            if [[ -f "${file_path}" ]]; then
+              tr -d '[:space:]' < "${file_path}"
+            else
+              echo "99"
+            fi
+          }
+
+          coverage_status="$(status_from_file "${coverage_status_file}")"
+          unit_drift_status="$(status_from_file "${unit_drift_status_file}")"
+          no_mock_status="$(status_from_file "${no_mock_status_file}")"
+
+          {
+            echo "### Aggregated gate verdict"
+            echo "- coverage_wrapper_exit: ${coverage_status}"
+            echo "- unit_coverage_drift_exit: ${unit_drift_status}"
+            echo "- no_mock_critical_path_exit: ${no_mock_status}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ "${coverage_status}" != "0" || "${unit_drift_status}" != "0" || "${no_mock_status}" != "0" ]]; then
+            echo "ERROR: one or more CI coverage/no-mock gates failed."
+            exit 1
           fi
 
       - name: Upload unit coverage drift artifacts

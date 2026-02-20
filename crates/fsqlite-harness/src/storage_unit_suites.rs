@@ -705,8 +705,14 @@ mod mvcc_tests {
         let idx2 = arena.alloc(v2);
         let ctx_reuse = DiagContext::new(BEAD_ID)
             .case("arena_reuse")
-            .invariant("Freed slot reused on next alloc");
-        diag_assert_eq!(ctx_reuse, idx1, idx2);
+            .invariant("Freed slot reuses location and advances generation");
+        diag_assert_eq!(ctx_reuse.clone(), idx1.chunk(), idx2.chunk());
+        diag_assert_eq!(ctx_reuse.clone(), idx1.offset(), idx2.offset());
+        diag_assert!(
+            ctx_reuse,
+            idx1.generation() != idx2.generation(),
+            "generation must advance on slot reuse"
+        );
     }
 
     // -- Page lock table --

@@ -28,7 +28,7 @@
 //! - **bd-mblr.3.5**: Unified quality evidence rollup
 //! - **bd-mblr.3.3**: Flake budget and quarantine workflow
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as FmtWrite;
 
 use serde::{Deserialize, Serialize};
@@ -43,11 +43,17 @@ const BEAD_ID: &str = "bd-mblr.3.4.1";
 pub const NO_MOCK_GATE_SCHEMA_VERSION: &str = "1.0.0";
 
 /// Default critical categories that require non-mock evidence.
+///
+/// Kept explicit for auditability, then validated against taxonomy-derived
+/// critical categories at runtime to fail closed on drift.
 pub const DEFAULT_CRITICAL_CATEGORIES: [FeatureCategory; 3] = [
     FeatureCategory::SqlGrammar,
     FeatureCategory::VdbeOpcodes,
     FeatureCategory::StorageTransaction,
 ];
+
+/// Any category at or above this global weight is treated as critical.
+pub const MIN_CRITICAL_GLOBAL_WEIGHT: f64 = 0.15;
 
 // ---------------------------------------------------------------------------
 // Verdict
@@ -272,6 +278,67 @@ pub fn evaluate_no_mock_critical_path_gate(
     evaluate_with_data(&matrix, &evidence_map, critical_categories)
 }
 
+fn taxonomy_critical_categories() -> Vec<FeatureCategory> {
+    FeatureCategory::ALL
+        .into_iter()
+        .filter(|category| category.global_weight() >= MIN_CRITICAL_GLOBAL_WEIGHT)
+        .collect()
+}
+
+fn normalize_critical_categories(
+    critical_categories: &[FeatureCategory],
+) -> (Vec<FeatureCategory>, Vec<NoMockViolation>) {
+    let mut configured_categories: BTreeSet<FeatureCategory> = BTreeSet::new();
+    let mut duplicate_categories: BTreeSet<FeatureCategory> = BTreeSet::new();
+
+    for category in critical_categories {
+        if !configured_categories.insert(*category) {
+            duplicate_categories.insert(*category);
+        }
+    }
+
+    let mut violations = Vec::new();
+
+    for duplicate in duplicate_categories {
+        violations.push(NoMockViolation {
+            invariant: format!("critical-category-config:{}", duplicate.prefix()),
+            matrix_test_id: format!("CFG-NO-MOCK-DUP-{}", duplicate.prefix()),
+            category: duplicate.display_name().to_owned(),
+            severity: NoMockViolationSeverity::Blocking,
+            reason: format!(
+                "Critical category configured multiple times: {}",
+                duplicate.display_name()
+            ),
+            remediation: format!(
+                "Remove duplicate FeatureCategory::{duplicate:?} from the no-mock critical \
+                 category configuration."
+            ),
+        });
+    }
+
+    for expected in taxonomy_critical_categories() {
+        if !configured_categories.contains(&expected) {
+            violations.push(NoMockViolation {
+                invariant: format!("critical-category-config:{}", expected.prefix()),
+                matrix_test_id: format!("CFG-NO-MOCK-MISSING-{}", expected.prefix()),
+                category: expected.display_name().to_owned(),
+                severity: NoMockViolationSeverity::Blocking,
+                reason: format!(
+                    "Taxonomy marks this category as critical (global_weight={:.2}), but the \
+                     no-mock gate configuration omits it",
+                    expected.global_weight()
+                ),
+                remediation: format!(
+                    "Add FeatureCategory::{expected:?} to the no-mock critical category \
+                     configuration so newly critical paths cannot bypass enforcement."
+                ),
+            });
+        }
+    }
+
+    (configured_categories.into_iter().collect(), violations)
+}
+
 /// Evaluate the gate with pre-built data (for testing).
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -280,6 +347,8 @@ pub fn evaluate_with_data(
     evidence_map: &NoMockEvidenceMap,
     critical_categories: &[FeatureCategory],
 ) -> NoMockCriticalPathReport {
+    let (critical_categories, mut violations) = normalize_critical_categories(critical_categories);
+
     // Build evidence lookup: matrix_test_id -> Vec<evidence entries>
     let mut evidence_by_test: BTreeMap<String, Vec<&crate::no_mock_evidence::NoMockEvidenceEntry>> =
         BTreeMap::new();
@@ -290,14 +359,13 @@ pub fn evaluate_with_data(
             .push(entry);
     }
 
-    let mut violations = Vec::new();
     let mut category_results = Vec::new();
     let mut total_critical = 0_usize;
     let mut total_real = 0_usize;
     let mut total_exception = 0_usize;
     let mut total_missing = 0_usize;
 
-    for &cat in critical_categories {
+    for cat in critical_categories {
         let mut cat_total = 0_usize;
         let mut cat_real = 0_usize;
         let mut cat_exception = 0_usize;
@@ -666,6 +734,59 @@ mod tests {
         let report = evaluate_with_data(&matrix, &evidence, &DEFAULT_CRITICAL_CATEGORIES);
         assert_eq!(report.verdict, NoMockVerdict::Pass);
         assert_eq!(report.total_critical_invariants, 0);
+    }
+
+    #[test]
+    fn default_critical_categories_match_taxonomy_threshold() {
+        assert_eq!(
+            taxonomy_critical_categories(),
+            DEFAULT_CRITICAL_CATEGORIES.to_vec()
+        );
+    }
+
+    #[test]
+    fn fail_when_taxonomy_critical_category_is_missing_from_configuration() {
+        let matrix = make_test_matrix(vec![make_test_entry(
+            "UT-SQL-001",
+            FeatureCategory::SqlGrammar,
+            vec!["parse SELECT"],
+        )]);
+        let evidence = make_evidence_map(vec![make_evidence("UT-SQL-001", "parse SELECT", false)]);
+        let configured = [FeatureCategory::SqlGrammar, FeatureCategory::VdbeOpcodes];
+
+        let report = evaluate_with_data(&matrix, &evidence, &configured);
+        assert_eq!(report.verdict, NoMockVerdict::Fail);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.matrix_test_id == "CFG-NO-MOCK-MISSING-STOR")
+        );
+    }
+
+    #[test]
+    fn fail_when_critical_category_configuration_has_duplicates() {
+        let matrix = make_test_matrix(vec![make_test_entry(
+            "UT-SQL-001",
+            FeatureCategory::SqlGrammar,
+            vec!["parse SELECT"],
+        )]);
+        let evidence = make_evidence_map(vec![make_evidence("UT-SQL-001", "parse SELECT", false)]);
+        let configured = [
+            FeatureCategory::SqlGrammar,
+            FeatureCategory::SqlGrammar,
+            FeatureCategory::VdbeOpcodes,
+            FeatureCategory::StorageTransaction,
+        ];
+
+        let report = evaluate_with_data(&matrix, &evidence, &configured);
+        assert_eq!(report.verdict, NoMockVerdict::Fail);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.matrix_test_id == "CFG-NO-MOCK-DUP-SQL")
+        );
     }
 
     #[test]

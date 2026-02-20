@@ -12,7 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 use fsqlite_ast::{
@@ -856,11 +857,10 @@ impl Default for TxnLifecycleMetrics {
 
 impl TxnLifecycleMetrics {
     fn current_snapshot_age_ms(&self) -> u64 {
-        self.active_started_at
-            .map_or(0, |started| {
-                let elapsed = started.elapsed().as_millis();
-                u64::try_from(elapsed).unwrap_or(u64::MAX)
-            })
+        self.active_started_at.map_or(0, |started| {
+            let elapsed = started.elapsed().as_millis();
+            u64::try_from(elapsed).unwrap_or(u64::MAX)
+        })
     }
 
     fn current_first_read_ms(&self) -> u64 {
@@ -989,17 +989,20 @@ pub struct Connection {
     // ── MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2) ─────
     /// Registry of active concurrent-writer sessions.
     /// Wrapped in Rc for sharing with VdbeEngine during execution (bd-kivg).
-    concurrent_registry: Rc<RefCell<ConcurrentRegistry>>,
+    concurrent_registry: Arc<Mutex<ConcurrentRegistry>>,
     /// Session ID for the current concurrent transaction (if any).
     /// Set by execute_begin() when mode is Concurrent.
     concurrent_session_id: RefCell<Option<u64>>,
     /// Page-level lock table for concurrent writers.
     /// Wrapped in Rc for sharing with VdbeEngine during execution (bd-kivg).
-    concurrent_lock_table: Rc<InProcessPageLockTable>,
+    concurrent_lock_table: Arc<InProcessPageLockTable>,
     /// Commit index mapping pages to their latest committed sequence.
-    concurrent_commit_index: CommitIndex,
+    concurrent_commit_index: Arc<CommitIndex>,
     /// Next commit sequence to assign (simple in-process monotonic counter).
-    next_commit_seq: RefCell<u64>,
+    next_commit_seq: Arc<AtomicU64>,
+    /// Global per-database commit serialization guard to keep WAL appends
+    /// single-file ordered across multiple connections.
+    commit_write_mutex: Arc<Mutex<()>>,
     /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
     /// double-run rollback/checkpoint logic.
     closed: RefCell<bool>,
@@ -1046,6 +1049,7 @@ impl Connection {
         // Phase 5 (bd-3iw8): initialize the pager backend as the primary
         // storage layer. The pager handles all persistence via WAL.
         let pager = PagerBackend::open(&path)?;
+        let shared_mvcc_state = shared_mvcc_state_for_path(&path);
 
         let conn = Self {
             path,
@@ -1076,11 +1080,12 @@ impl Connection {
             // SSI evidence ledger (bd-1lsfu.3)
             ssi_evidence_ledger: SsiEvidenceLedger::new(4096),
             // MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2)
-            concurrent_registry: Rc::new(RefCell::new(ConcurrentRegistry::new())),
+            concurrent_registry: Arc::clone(&shared_mvcc_state.registry),
             concurrent_session_id: RefCell::new(None),
-            concurrent_lock_table: Rc::new(InProcessPageLockTable::new()),
-            concurrent_commit_index: CommitIndex::new(),
-            next_commit_seq: RefCell::new(1),
+            concurrent_lock_table: Arc::clone(&shared_mvcc_state.lock_table),
+            concurrent_commit_index: Arc::clone(&shared_mvcc_state.commit_index),
+            next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
+            commit_write_mutex: Arc::clone(&shared_mvcc_state.commit_write_mutex),
             closed: RefCell::new(false),
             // Cx capability context (bd-2g5.6)
             root_cx: Cx::new().with_trace_context(next_trace_id(), 0, 0),
@@ -1090,6 +1095,7 @@ impl Connection {
             gc_todo: RefCell::new(GcTodo::new()),
             gc_clock_millis: RefCell::new(0),
         };
+        conn.bootstrap_journal_mode_from_storage();
         conn.apply_current_journal_mode_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
         // The pager already opened the database file; we load schema + data from it.
@@ -1114,6 +1120,28 @@ impl Connection {
     /// can distinguish individual SQL operations within a connection's trace.
     fn op_cx(&self) -> Cx {
         self.root_cx.clone().with_decision_id(next_decision_id())
+    }
+
+    /// Bootstrap connection-local journal mode from on-disk artifacts.
+    ///
+    /// SQLite persists WAL intent across connections in the main database
+    /// header (`read_version`/`write_version` == 2). Mirror that behavior,
+    /// and fall back to probing for a non-empty sibling `-wal` file.
+    fn bootstrap_journal_mode_from_storage(&self) {
+        if self.path == ":memory:" {
+            return;
+        }
+        let header_requests_wal = self
+            .pragma_database_header()
+            .ok()
+            .flatten()
+            .is_some_and(|header| header.write_version == 2 || header.read_version == 2);
+        let wal_path = wal_path_for_db_path(&self.path);
+        let wal_file_present = std::fs::metadata(wal_path).is_ok_and(|meta| meta.len() >= 32);
+        if header_requests_wal || wal_file_present {
+            let mut pragma_state = self.pragma_state.borrow_mut();
+            "wal".clone_into(&mut pragma_state.journal_mode);
+        }
     }
 
     /// Register or clear sqlite3_trace_v2-compatible callbacks.
@@ -2636,7 +2664,7 @@ impl Connection {
 
         let session_id = *self.concurrent_session_id.borrow();
         if let Some(session_id) = session_id {
-            let registry = self.concurrent_registry.borrow();
+            let registry = lock_unpoisoned(&self.concurrent_registry);
             if let Some(handle) = registry.get(session_id) {
                 let pages_read = u64::try_from(handle.read_set().len()).unwrap_or(u64::MAX);
                 let pages_written =
@@ -2719,17 +2747,18 @@ impl Connection {
         let metrics = self.txn_lifecycle_metrics.borrow();
         let mut rows = Vec::new();
 
-        let mut push_row = |code: &str, severity: &str, message: String, actual: u64, threshold: u64| {
-            rows.push(Row {
-                values: vec![
-                    SqliteValue::Text(code.to_owned()),
-                    SqliteValue::Text(severity.to_owned()),
-                    SqliteValue::Text(message),
-                    SqliteValue::Integer(to_i64(actual)),
-                    SqliteValue::Integer(to_i64(threshold)),
-                ],
-            });
-        };
+        let mut push_row =
+            |code: &str, severity: &str, message: String, actual: u64, threshold: u64| {
+                rows.push(Row {
+                    values: vec![
+                        SqliteValue::Text(code.to_owned()),
+                        SqliteValue::Text(severity.to_owned()),
+                        SqliteValue::Text(message),
+                        SqliteValue::Integer(to_i64(actual)),
+                        SqliteValue::Integer(to_i64(threshold)),
+                    ],
+                });
+            };
 
         let snapshot_age_ms = metrics.current_snapshot_age_ms();
         if metrics.active_started_at.is_some() && snapshot_age_ms >= metrics.long_txn_threshold_ms {
@@ -2871,16 +2900,14 @@ impl Connection {
         let mut txn = self.pager.begin(&cx, mode)?;
         let is_concurrent = mode == TransactionMode::Concurrent;
         let concurrent_session = if is_concurrent {
-            let commit_seq = *self.next_commit_seq.borrow();
+            let commit_seq = self.next_commit_seq.load(AtomicOrdering::Acquire);
             let snapshot = Snapshot::new(
                 CommitSeq::new(commit_seq.saturating_sub(1)),
                 SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
             );
-            match self
-                .concurrent_registry
-                .borrow_mut()
-                .begin_concurrent(snapshot)
-            {
+            let begin_result =
+                lock_unpoisoned(&self.concurrent_registry).begin_concurrent(snapshot);
+            match begin_result {
                 Ok(session_id) => Some(session_id),
                 Err(error) => {
                     let _ = txn.rollback(&cx);
@@ -2919,24 +2946,9 @@ impl Connection {
             txn
         };
 
-        let concurrent_plan = if ok && *self.concurrent_txn.borrow() {
-            match self.plan_concurrent_commit() {
-                Ok(plan) => plan,
-                Err(err) => {
-                    let _ = txn.rollback(&cx);
-                    *self.concurrent_txn.borrow_mut() = false;
-                    *self.concurrent_session_id.borrow_mut() = None;
-                    self.txn_metrics_mark_finished();
-                    return Err(err);
-                }
-            }
-        } else {
-            None
-        };
-
         if !ok && *self.concurrent_txn.borrow() {
             if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
-                let mut registry = self.concurrent_registry.borrow_mut();
+                let mut registry = lock_unpoisoned(&self.concurrent_registry);
                 if let Some(handle) = registry.get_mut(session_id) {
                     concurrent_abort(handle, &self.concurrent_lock_table, session_id);
                 }
@@ -2948,7 +2960,22 @@ impl Connection {
             self.txn_metrics_note_rollback();
         }
         let txn_result = if ok {
-            txn.commit(&cx)
+            let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
+            let concurrent_plan = if *self.concurrent_txn.borrow() {
+                self.plan_concurrent_commit()?
+            } else {
+                None
+            };
+
+            txn.commit(&cx)?;
+
+            if let Some((session_id, write_pages)) = concurrent_plan {
+                let committed_seq =
+                    CommitSeq::new(self.next_commit_seq.fetch_add(1, AtomicOrdering::AcqRel));
+                self.finalize_concurrent_commit(session_id, committed_seq, write_pages);
+            }
+
+            Ok(())
         } else {
             txn.rollback(&cx)
         };
@@ -2959,7 +2986,7 @@ impl Connection {
             let _ = txn.rollback(&cx);
             if *self.concurrent_txn.borrow() {
                 if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
-                    let mut registry = self.concurrent_registry.borrow_mut();
+                    let mut registry = lock_unpoisoned(&self.concurrent_registry);
                     if let Some(handle) = registry.get_mut(session_id) {
                         concurrent_abort(handle, &self.concurrent_lock_table, session_id);
                     }
@@ -2970,10 +2997,6 @@ impl Connection {
             *self.concurrent_session_id.borrow_mut() = None;
             self.txn_metrics_mark_finished();
             return Err(err);
-        }
-
-        if let Some((session_id, committed_seq, write_pages)) = concurrent_plan {
-            self.finalize_concurrent_commit(session_id, committed_seq, write_pages);
         }
 
         *self.concurrent_txn.borrow_mut() = false;
@@ -3035,6 +3058,7 @@ impl Connection {
             let mut guard = self.active_txn.borrow_mut();
             if let Some(txn) = guard.as_deref_mut() {
                 if result.is_ok() {
+                    let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
                     txn.commit(&cx)?;
                 } else {
                     txn.rollback(&cx)?;
@@ -3492,8 +3516,8 @@ impl Connection {
             }
         }
 
-        // Phase 2: Validate columns and collect names (with borrow)
-        let col_names = {
+        // Phase 2: Validate indexed terms and collect column names (with borrow)
+        let indexed_terms = {
             let schema = self.schema.borrow();
             let table = schema
                 .iter()
@@ -3501,9 +3525,9 @@ impl Connection {
                 .ok_or_else(|| FrankenError::NoSuchTable {
                     name: table_name.clone(),
                 })?;
-            let mut names = Vec::with_capacity(stmt.columns.len());
+            let mut terms = Vec::with_capacity(stmt.columns.len());
             for idx_col in &stmt.columns {
-                let col_name = expr_col_name(&idx_col.expr).ok_or_else(|| {
+                let normalized = normalize_indexed_column_term(idx_col).ok_or_else(|| {
                     FrankenError::NotImplemented(
                         "only column references are supported in CREATE INDEX".to_owned(),
                     )
@@ -3511,16 +3535,21 @@ impl Connection {
                 if !table
                     .columns
                     .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(col_name))
+                    .any(|c| c.name.eq_ignore_ascii_case(&normalized.column_name))
                 {
                     return Err(FrankenError::Internal(format!(
-                        "no such column: {col_name}"
+                        "no such column: {}",
+                        normalized.column_name
                     )));
                 }
-                names.push(col_name.to_owned());
+                terms.push(normalized);
             }
-            names
+            terms
         };
+        let col_names: Vec<String> = indexed_terms
+            .iter()
+            .map(|term| term.column_name.clone())
+            .collect();
 
         // Phase 3: Allocate index B-tree root page (no borrow held)
         let root_page = self.allocate_index_root_page()?;
@@ -3540,14 +3569,26 @@ impl Connection {
                 })?;
             table.indexes.push(IndexSchema {
                 name: index_name.clone(),
-                columns: col_names.clone(),
+                columns: col_names,
                 root_page,
             });
         }
 
         // Phase 6: Persist to sqlite_master
-        let create_sql =
-            crate::compat_persist::build_create_index_sql(&index_name, table_name, &col_names);
+        let create_sql_terms: Vec<crate::compat_persist::CreateIndexSqlTerm<'_>> = indexed_terms
+            .iter()
+            .map(|term| crate::compat_persist::CreateIndexSqlTerm {
+                column_name: term.column_name.as_str(),
+                collation: term.collation.as_deref(),
+                direction: term.direction,
+            })
+            .collect();
+        let create_sql = crate::compat_persist::build_create_index_sql(
+            &index_name,
+            table_name,
+            stmt.unique,
+            &create_sql_terms,
+        );
         self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)?;
 
         self.increment_schema_cookie();
@@ -4169,14 +4210,12 @@ impl Connection {
         // When mode is Concurrent, register with ConcurrentRegistry for
         // page-level MVCC locking and first-committer-wins validation.
         let concurrent_session = if is_concurrent {
-            let commit_seq = *self.next_commit_seq.borrow();
+            let commit_seq = self.next_commit_seq.load(AtomicOrdering::Acquire);
             let snapshot = Snapshot::new(
                 CommitSeq::new(commit_seq.saturating_sub(1)),
                 SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
             );
-            let session_id = self
-                .concurrent_registry
-                .borrow_mut()
+            let session_id = lock_unpoisoned(&self.concurrent_registry)
                 .begin_concurrent(snapshot)
                 .map_err(|e| match e {
                     MvccError::Busy => FrankenError::Busy,
@@ -4336,7 +4375,7 @@ impl Connection {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn plan_concurrent_commit(&self) -> Result<Option<(u64, CommitSeq, Vec<PageNumber>)>> {
+    fn plan_concurrent_commit(&self) -> Result<Option<(u64, Vec<PageNumber>)>> {
         // MVCC concurrent-writer commit path (bd-14zc / 5E.1):
         // Validate FCW/SSI preconditions first, but delay commit-index
         // publication and lock release until pager commit succeeds. This
@@ -4344,12 +4383,11 @@ impl Connection {
         let Some(session_id) = *self.concurrent_session_id.borrow() else {
             return Ok(None);
         };
-        let assign_seq = CommitSeq::new(*self.next_commit_seq.borrow());
 
         let mut abort_card: Option<SsiDecisionCardDraft> = None;
 
         let validate_result: std::result::Result<Vec<PageNumber>, (MvccError, FcwResult)> = {
-            let mut registry = self.concurrent_registry.borrow_mut();
+            let mut registry = lock_unpoisoned(&self.concurrent_registry);
             let (fcw_result, snapshot, write_pages) = match registry.get_mut(session_id) {
                 Some(handle) if handle.is_active() => (
                     validate_first_committer_wins(handle, &self.concurrent_commit_index),
@@ -4365,7 +4403,7 @@ impl Connection {
             let active_conflicts =
                 Self::collect_active_conflict_evidence(&registry, session_id, &snapshot);
 
-            match &fcw_result {
+            let result = match &fcw_result {
                 FcwResult::Conflict {
                     conflicting_pages,
                     conflicting_commit_seq,
@@ -4436,7 +4474,9 @@ impl Connection {
                         Ok(write_pages)
                     }
                 }
-            }
+            };
+            drop(registry);
+            result
         };
 
         if let Some(card) = abort_card {
@@ -4444,9 +4484,9 @@ impl Connection {
         }
 
         match validate_result {
-            Ok(write_pages) => Ok(Some((session_id, assign_seq, write_pages))),
+            Ok(write_pages) => Ok(Some((session_id, write_pages))),
             Err((err, fcw_result)) => {
-                self.concurrent_registry.borrow_mut().remove(session_id);
+                lock_unpoisoned(&self.concurrent_registry).remove(session_id);
                 *self.concurrent_session_id.borrow_mut() = None;
                 Err(Self::map_mvcc_commit_error(err, fcw_result))
             }
@@ -4466,7 +4506,7 @@ impl Connection {
             self.concurrent_lock_table.release_all(txn_id);
         }
         let commit_card = {
-            let mut registry = self.concurrent_registry.borrow_mut();
+            let mut registry = lock_unpoisoned(&self.concurrent_registry);
             registry.remove(session_id).map(|mut handle| {
                 let snapshot = Self::capture_ssi_snapshot(&handle);
                 let active_conflicts =
@@ -4489,7 +4529,6 @@ impl Connection {
         if let Some(card) = commit_card {
             self.ssi_evidence_ledger.record_async(card);
         }
-        *self.next_commit_seq.borrow_mut() = committed_seq.get() + 1;
         *self.concurrent_session_id.borrow_mut() = None;
     }
 
@@ -4501,29 +4540,32 @@ impl Connection {
             ));
         }
 
-        let concurrent_commit_plan = if *self.concurrent_txn.borrow() {
-            self.plan_concurrent_commit()?
-        } else {
-            None
-        };
         let cx = self.op_cx();
 
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
         {
+            let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
+            let concurrent_commit_plan = if *self.concurrent_txn.borrow() {
+                self.plan_concurrent_commit()?
+            } else {
+                None
+            };
             let mut txn_guard = self.active_txn.borrow_mut();
             if let Some(txn) = txn_guard.as_mut() {
                 txn.commit(&cx)?;
+            }
+
+            if let Some((session_id, write_pages)) = concurrent_commit_plan {
+                let committed_seq =
+                    CommitSeq::new(self.next_commit_seq.fetch_add(1, AtomicOrdering::AcqRel));
+                self.finalize_concurrent_commit(session_id, committed_seq, write_pages);
             }
         }
 
         // Commit succeeded; now consume and drop the handle.
         *self.active_txn.borrow_mut() = None;
         self.txn_metrics_mark_finished();
-
-        if let Some((session_id, committed_seq, write_pages)) = concurrent_commit_plan {
-            self.finalize_concurrent_commit(session_id, committed_seq, write_pages);
-        }
 
         // Discard rollback snapshot and savepoints — changes are committed.
         *self.txn_snapshot.borrow_mut() = None;
@@ -4575,13 +4617,14 @@ impl Connection {
                         "concurrent savepoint present but no active session".to_owned(),
                     )
                 })?;
-                let mut registry = self.concurrent_registry.borrow_mut();
+                let mut registry = lock_unpoisoned(&self.concurrent_registry);
                 let handle = registry.get_mut(session_id).ok_or_else(|| {
                     FrankenError::Internal("concurrent session handle not found".to_owned())
                 })?;
                 concurrent_rollback_to_savepoint(handle, &concurrent_snap).map_err(|e| {
                     FrankenError::Internal(format!("concurrent rollback failed: {e}"))
                 })?;
+                drop(registry);
             }
 
             {
@@ -4605,7 +4648,7 @@ impl Connection {
             // When in concurrent mode, call concurrent_abort to release page locks.
             if *self.concurrent_txn.borrow() {
                 if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
-                    let mut registry = self.concurrent_registry.borrow_mut();
+                    let mut registry = lock_unpoisoned(&self.concurrent_registry);
                     if let Some(handle) = registry.get_mut(session_id) {
                         concurrent_abort(handle, &self.concurrent_lock_table, session_id);
                     }
@@ -4657,13 +4700,12 @@ impl Connection {
     fn compute_gc_horizon(&self) -> CommitSeq {
         // Use ConcurrentRegistry::gc_horizon() to find the minimum snapshot.high
         // across all active concurrent transactions.
-        self.concurrent_registry
-            .borrow()
+        lock_unpoisoned(&self.concurrent_registry)
             .gc_horizon()
             .unwrap_or_else(|| {
                 // No active transactions: use the current commit sequence as horizon.
                 // This allows pruning everything except the latest version.
-                CommitSeq::new(*self.next_commit_seq.borrow())
+                CommitSeq::new(self.next_commit_seq.load(AtomicOrdering::Acquire))
             })
     }
 
@@ -4762,14 +4804,12 @@ impl Connection {
             };
             let mut txn = self.pager.begin(&cx, pager_mode)?;
             let concurrent_session = if is_concurrent {
-                let commit_seq = *self.next_commit_seq.borrow();
+                let commit_seq = self.next_commit_seq.load(AtomicOrdering::Acquire);
                 let snapshot = Snapshot::new(
                     CommitSeq::new(commit_seq.saturating_sub(1)),
                     SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
                 );
-                let session_id = self
-                    .concurrent_registry
-                    .borrow_mut()
+                let session_id = lock_unpoisoned(&self.concurrent_registry)
                     .begin_concurrent(snapshot)
                     .map_err(|error| match error {
                         MvccError::Busy => FrankenError::Busy,
@@ -4807,15 +4847,14 @@ impl Connection {
             let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
                 FrankenError::Internal("concurrent transaction active but no session ID".to_owned())
             })?;
-            let registry = self.concurrent_registry.borrow();
+            let registry = lock_unpoisoned(&self.concurrent_registry);
             let handle = registry.get(session_id).ok_or_else(|| {
                 FrankenError::Internal("concurrent session handle not found".to_owned())
             })?;
-            Some(
-                concurrent_savepoint(handle, name).map_err(|e| {
-                    FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
-                })?,
-            )
+            let snapshot = concurrent_savepoint(handle, name)
+                .map_err(|e| FrankenError::Internal(format!("concurrent savepoint failed: {e}")))?;
+            drop(registry);
+            Some(snapshot)
         } else {
             None
         };
@@ -5101,7 +5140,8 @@ impl Connection {
             | "txn_advisor_large_read_ops"
             | "fsqlite_txn_advisor_large_read_ops" => {
                 let threshold = if let Some(ref value) = pragma.value {
-                    let parsed = parse_pragma_nonnegative_usize(value, "txn_advisor_large_read_ops")?;
+                    let parsed =
+                        parse_pragma_nonnegative_usize(value, "txn_advisor_large_read_ops")?;
                     let parsed_u64 = u64::try_from(parsed).unwrap_or(u64::MAX);
                     self.txn_metrics_set_large_read_ops_threshold(parsed_u64)
                 } else {
@@ -5392,7 +5432,7 @@ impl Connection {
     /// sharing this registry (bd-14zc / 5E.1).
     #[must_use]
     pub fn concurrent_writer_count(&self) -> usize {
-        self.concurrent_registry.borrow().active_count()
+        lock_unpoisoned(&self.concurrent_registry).active_count()
     }
 
     /// Returns a snapshot of retained SSI decision cards.
@@ -5557,17 +5597,16 @@ impl Connection {
                             }
                         }
                         FunctionArgs::List(exprs) if exprs.len() == 1 => {
-                            let col_name = expr_col_name(&exprs[0]).ok_or_else(|| {
-                                FrankenError::NotImplemented(format!(
-                                    "non-column argument to aggregate {func}() in GROUP BY+JOIN"
-                                ))
-                            })?;
-                            let table_prefix = match &exprs[0] {
-                                Expr::Column(cr, _) => cr.table.as_deref(),
-                                _ => None,
-                            };
-                            let idx = find_col_in_map(&col_map, table_prefix, col_name)?;
-                            Some(idx)
+                            if let Some(col_name) = expr_col_name(&exprs[0]) {
+                                let table_prefix = match &exprs[0] {
+                                    Expr::Column(cr, _) => cr.table.as_deref(),
+                                    _ => None,
+                                };
+                                Some(find_col_in_map(&col_map, table_prefix, col_name)?)
+                            } else {
+                                arg_expr = Some(Box::new(exprs[0].clone()));
+                                None
+                            }
                         }
                         FunctionArgs::List(exprs)
                             if exprs.len() == 2
@@ -5662,10 +5701,9 @@ impl Connection {
                             } else if let Some(expr) = arg_expr {
                                 group_rows
                                     .iter()
-                                    .map(|r| {
-                                        eval_join_expr(expr, r, &col_map)
-                                            .unwrap_or(SqliteValue::Null)
-                                    })
+                                    .map(|r| eval_join_expr(expr, r, &col_map))
+                                    .collect::<Result<Vec<_>>>()?
+                                    .into_iter()
                                     .filter(|v| !matches!(v, SqliteValue::Null))
                                     .collect()
                             } else {
@@ -5682,8 +5720,7 @@ impl Connection {
                             let evaluated_separator = separator.clone().or_else(|| {
                                 separator_expr.as_ref().and_then(|expr| {
                                     group_rows.first().and_then(|r| {
-                                        let val =
-                                            eval_join_expr(expr, r, &col_map).ok()?;
+                                        let val = eval_join_expr(expr, r, &col_map).ok()?;
                                         (!matches!(val, SqliteValue::Null))
                                             .then(|| sqlite_value_to_text(&val))
                                     })
@@ -6088,10 +6125,9 @@ impl Connection {
                             } else if let Some(expr) = arg_expr {
                                 group_rows
                                     .iter()
-                                    .map(|r| {
-                                        eval_join_expr(expr, r, &col_map)
-                                            .unwrap_or(SqliteValue::Null)
-                                    })
+                                    .map(|r| eval_join_expr(expr, r, &col_map))
+                                    .collect::<Result<Vec<_>>>()?
+                                    .into_iter()
                                     .filter(|v| !matches!(v, SqliteValue::Null))
                                     .collect()
                             } else {
@@ -6108,8 +6144,7 @@ impl Connection {
                             let evaluated_separator = separator.clone().or_else(|| {
                                 separator_expr.as_ref().and_then(|expr| {
                                     group_rows.first().and_then(|r| {
-                                        let val =
-                                            eval_join_expr(expr, r, &col_map).ok()?;
+                                        let val = eval_join_expr(expr, r, &col_map).ok()?;
                                         (!matches!(val, SqliteValue::Null))
                                             .then(|| sqlite_value_to_text(&val))
                                     })
@@ -6797,8 +6832,8 @@ impl Connection {
                 .borrow()
                 .map(|session_id| ConcurrentExecContext {
                     session_id,
-                    registry: Rc::clone(&self.concurrent_registry),
-                    lock_table: Rc::clone(&self.concurrent_lock_table),
+                    registry: Arc::clone(&self.concurrent_registry),
+                    lock_table: Arc::clone(&self.concurrent_lock_table),
                 })
         } else {
             None
@@ -7198,7 +7233,9 @@ fn select_contains_match_operator(select: &SelectStatement) -> bool {
                     || from_clause.joins.iter().any(|join| {
                         table_source_has_match(&join.table)
                             || match &join.constraint {
-                                Some(JoinConstraint::On(expr)) => expr_contains_match_operator(expr),
+                                Some(JoinConstraint::On(expr)) => {
+                                    expr_contains_match_operator(expr)
+                                }
                                 Some(JoinConstraint::Using(_)) | None => false,
                             }
                     })
@@ -7224,9 +7261,7 @@ fn select_contains_match_operator(select: &SelectStatement) -> bool {
                     .as_ref()
                     .is_some_and(|expr| expr_contains_match_operator(expr))
                 || group_by.iter().any(expr_contains_match_operator)
-                || having
-                    .as_deref()
-                    .is_some_and(expr_contains_match_operator)
+                || having.as_deref().is_some_and(expr_contains_match_operator)
                 || from.as_ref().is_some_and(|f| {
                     table_source_has_match(&f.source)
                         || f.joins.iter().any(|j| {
@@ -7256,9 +7291,7 @@ fn expr_contains_match_operator(expr: &Expr) -> bool {
             *op == LikeOp::Match
                 || expr_contains_match_operator(expr)
                 || expr_contains_match_operator(pattern)
-                || escape
-                    .as_deref()
-                    .is_some_and(expr_contains_match_operator)
+                || escape.as_deref().is_some_and(expr_contains_match_operator)
         }
         Expr::BinaryOp { left, right, .. } => {
             expr_contains_match_operator(left) || expr_contains_match_operator(right)
@@ -7288,9 +7321,7 @@ fn expr_contains_match_operator(expr: &Expr) -> bool {
             else_expr,
             ..
         } => {
-            operand
-                .as_deref()
-                .is_some_and(expr_contains_match_operator)
+            operand.as_deref().is_some_and(expr_contains_match_operator)
                 || whens.iter().any(|(w, t)| {
                     expr_contains_match_operator(w) || expr_contains_match_operator(t)
                 })
@@ -7301,19 +7332,19 @@ fn expr_contains_match_operator(expr: &Expr) -> bool {
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
             select_contains_match_operator(subquery)
         }
-        Expr::FunctionCall { args, filter, over, .. } => {
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
             let args_has_match = match args {
                 FunctionArgs::List(exprs) => exprs.iter().any(expr_contains_match_operator),
                 FunctionArgs::Star => false,
             };
             let over_has_match = over.as_ref().is_some_and(|window| {
-                window
-                    .partition_by
-                    .iter()
-                    .any(expr_contains_match_operator)
-                    || window.order_by.iter().any(|ordering| {
-                        expr_contains_match_operator(&ordering.expr)
-                    })
+                window.partition_by.iter().any(expr_contains_match_operator)
+                    || window
+                        .order_by
+                        .iter()
+                        .any(|ordering| expr_contains_match_operator(&ordering.expr))
                     || match &window.frame {
                         Some(frame) => {
                             frame_bound_contains_match(&frame.start)
@@ -7323,16 +7354,16 @@ fn expr_contains_match_operator(expr: &Expr) -> bool {
                     }
             });
             args_has_match
-                || filter
-                    .as_deref()
-                    .is_some_and(expr_contains_match_operator)
+                || filter.as_deref().is_some_and(expr_contains_match_operator)
                 || over_has_match
         }
         Expr::JsonAccess { expr, path, .. } => {
             expr_contains_match_operator(expr) || expr_contains_match_operator(path)
         }
         Expr::RowValue(values, _) => values.iter().any(expr_contains_match_operator),
-        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => {
+            false
+        }
     }
 }
 
@@ -7389,9 +7420,7 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
 
 /// Detect INSERT INTO t(t) VALUES('optimize') maintenance commands.
 fn is_fts5_optimize_noop_insert(insert: &fsqlite_ast::InsertStatement) -> bool {
-    if insert.columns.len() != 1
-        || !insert.columns[0].eq_ignore_ascii_case(&insert.table.name)
-    {
+    if insert.columns.len() != 1 || !insert.columns[0].eq_ignore_ascii_case(&insert.table.name) {
         return false;
     }
     match &insert.source {
@@ -7580,6 +7609,64 @@ fn rewrite_in_select_core(
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct SharedMvccState {
+    registry: Arc<Mutex<ConcurrentRegistry>>,
+    lock_table: Arc<InProcessPageLockTable>,
+    commit_index: Arc<CommitIndex>,
+    next_commit_seq: Arc<AtomicU64>,
+    commit_write_mutex: Arc<Mutex<()>>,
+}
+
+impl SharedMvccState {
+    fn new() -> Self {
+        Self {
+            registry: Arc::new(Mutex::new(ConcurrentRegistry::new())),
+            lock_table: Arc::new(InProcessPageLockTable::new()),
+            commit_index: Arc::new(CommitIndex::new()),
+            next_commit_seq: Arc::new(AtomicU64::new(1)),
+            commit_write_mutex: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+static SHARED_MVCC_STATE_BY_PATH: OnceLock<Mutex<HashMap<String, Weak<SharedMvccState>>>> =
+    OnceLock::new();
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn mvcc_state_key(path: &str) -> String {
+    if path == ":memory:" {
+        return path.to_owned();
+    }
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| PathBuf::from(path))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn shared_mvcc_state_for_path(path: &str) -> Arc<SharedMvccState> {
+    if path == ":memory:" {
+        return Arc::new(SharedMvccState::new());
+    }
+
+    let key = mvcc_state_key(path);
+    let state_map = SHARED_MVCC_STATE_BY_PATH.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = lock_unpoisoned(state_map);
+
+    if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+
+    let state = Arc::new(SharedMvccState::new());
+    map.insert(key, Arc::downgrade(&state));
+    state
 }
 
 /// Recursively walk an expression tree and eagerly evaluate subquery
@@ -7819,6 +7906,48 @@ fn expr_col_name(expr: &Expr) -> Option<&str> {
         Expr::Column(col_ref, _) => Some(col_ref.column.as_str()),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedIndexedColumnTerm {
+    column_name: String,
+    collation: Option<String>,
+    direction: Option<SortDirection>,
+}
+
+/// Normalize an indexed-column AST node into execution/persistence metadata.
+///
+/// `CREATE INDEX` currently supports only column references as indexed terms,
+/// but accepts SQL forms where `COLLATE` is represented either as a postfix
+/// expression (`name COLLATE NOCASE`) or as parser-level indexed-column
+/// metadata.
+fn normalize_indexed_column_term(
+    indexed: &fsqlite_ast::IndexedColumn,
+) -> Option<NormalizedIndexedColumnTerm> {
+    fn extract(expr: &Expr) -> Option<(&str, Option<&str>)> {
+        match expr {
+            Expr::Column(col_ref, _) => Some((col_ref.column.as_str(), None)),
+            Expr::Collate {
+                expr, collation, ..
+            } => {
+                let (column_name, _) = extract(expr)?;
+                Some((column_name, Some(collation.as_str())))
+            }
+            _ => None,
+        }
+    }
+
+    let (column_name, expr_collation) = extract(&indexed.expr)?;
+    let collation = indexed
+        .collation
+        .clone()
+        .or_else(|| expr_collation.map(str::to_owned));
+
+    Some(NormalizedIndexedColumnTerm {
+        column_name: column_name.to_owned(),
+        collation,
+        direction: indexed.direction,
+    })
 }
 
 /// Build a `SELECT *` scan from a GROUP BY SELECT (strips aggregates and GROUP BY).
@@ -8523,8 +8652,8 @@ fn execute_program_with_postprocess(
 /// Passed to `execute_table_program_with_db` when in concurrent mode.
 struct ConcurrentExecContext {
     session_id: u64,
-    registry: Rc<RefCell<ConcurrentRegistry>>,
-    lock_table: Rc<InProcessPageLockTable>,
+    registry: Arc<Mutex<ConcurrentRegistry>>,
+    lock_table: Arc<InProcessPageLockTable>,
 }
 
 fn execute_table_program_with_db(
@@ -11016,7 +11145,9 @@ fn eval_join_expr(
                 return Ok(SqliteValue::Text(text));
             }
 
-            Err(FrankenError::Internal(format!("column not found: {col_name}")))
+            Err(FrankenError::Internal(format!(
+                "column not found: {col_name}"
+            )))
         }
         Expr::Literal(lit, _) => Ok(literal_to_join_value(lit)),
         Expr::BinaryOp {
@@ -11783,7 +11914,9 @@ fn project_join_column(
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitSeq, Connection, InProcessPageLockTable, Row, SchemaEpoch, Snapshot};
+    use super::{
+        CommitSeq, Connection, InProcessPageLockTable, Row, SchemaEpoch, Snapshot, lock_unpoisoned,
+    };
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
     use fsqlite_types::PageNumber;
@@ -11792,6 +11925,13 @@ mod tests {
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values().to_vec()
+    }
+
+    fn raptorq_telemetry_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("raptorq telemetry test mutex should not be poisoned")
     }
 
     // ── Cx trace context propagation tests (bd-2g5.6) ─────────────────
@@ -12649,6 +12789,52 @@ mod tests {
         assert_eq!(table.indexes.len(), 1);
         assert_eq!(table.indexes[0].name, "idx_name");
         assert_eq!(table.indexes[0].columns, vec!["name"]);
+    }
+
+    #[test]
+    fn test_create_index_with_collate_nocase_term() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE agents (project_id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_agents_project_name_nocase ON agents(project_id, name COLLATE NOCASE);",
+        )
+        .unwrap();
+
+        // Verify index metadata remains usable by execution/planner paths.
+        let schema = conn.schema.borrow();
+        let table = schema.iter().find(|t| t.name == "agents").unwrap();
+        assert_eq!(table.indexes.len(), 1);
+        assert_eq!(
+            table.indexes[0].columns,
+            vec!["project_id".to_string(), "name".to_string()]
+        );
+        drop(schema);
+
+        // Verify sqlite_master row exists for the new index.
+        let rows = conn
+            .query("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_agents_project_name_nocase';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_create_index_with_collate_and_direction_is_accepted() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (name TEXT, created_ts INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_t_name_ci_desc ON t(name COLLATE NOCASE DESC, created_ts ASC);",
+        )
+        .unwrap();
+
+        let schema = conn.schema.borrow();
+        let table = schema.iter().find(|t| t.name == "t").unwrap();
+        assert_eq!(table.indexes.len(), 1);
+        assert_eq!(
+            table.indexes[0].columns,
+            vec!["name".to_string(), "created_ts".to_string()]
+        );
     }
 
     #[test]
@@ -15956,7 +16142,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
         {
-            let mut registry = conn.concurrent_registry.borrow_mut();
+            let mut registry = lock_unpoisoned(&conn.concurrent_registry);
             for _ in 0..fsqlite_mvcc::MAX_CONCURRENT_WRITERS {
                 registry.begin_concurrent(snapshot).unwrap();
             }
@@ -15974,7 +16160,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
         {
-            let mut registry = conn.concurrent_registry.borrow_mut();
+            let mut registry = lock_unpoisoned(&conn.concurrent_registry);
             for _ in 0..fsqlite_mvcc::MAX_CONCURRENT_WRITERS {
                 registry.begin_concurrent(snapshot).unwrap();
             }
@@ -17106,6 +17292,7 @@ mod tests {
 
     #[test]
     fn test_pragma_raptorq_stats_events_and_reset() {
+        let _guard = raptorq_telemetry_test_guard();
         let conn = Connection::open(":memory:").unwrap();
         fsqlite_wal::reset_raptorq_repair_telemetry();
 
@@ -17214,6 +17401,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_pragma_raptorq_repair_evidence_filters() {
+        let _guard = raptorq_telemetry_test_guard();
         let conn = Connection::open(":memory:").unwrap();
         fsqlite_wal::reset_raptorq_repair_telemetry();
 
@@ -17345,12 +17533,13 @@ mod tests {
             .borrow()
             .expect("concurrent session should exist");
         {
-            let mut registry = conn.concurrent_registry.borrow_mut();
+            let mut registry = lock_unpoisoned(&conn.concurrent_registry);
             let handle = registry
                 .get_mut(session_id)
                 .expect("session handle should exist");
             fsqlite_mvcc::ActiveTxnView::set_has_in_rw(handle, true);
             fsqlite_mvcc::ActiveTxnView::set_has_out_rw(handle, true);
+            drop(registry);
         }
         let err = conn.execute("COMMIT;").expect_err("SSI pivot must abort");
         assert!(
@@ -17440,12 +17629,13 @@ mod tests {
             .borrow()
             .expect("concurrent session should exist");
         {
-            let mut registry = conn.concurrent_registry.borrow_mut();
+            let mut registry = lock_unpoisoned(&conn.concurrent_registry);
             let handle = registry
                 .get_mut(session_id)
                 .expect("session handle should exist");
             fsqlite_mvcc::ActiveTxnView::set_has_in_rw(handle, true);
             fsqlite_mvcc::ActiveTxnView::set_has_out_rw(handle, true);
+            drop(registry);
         }
         let _ = conn.execute("COMMIT;");
 
@@ -20340,6 +20530,39 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_update_preserves_rowid_alias_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ipk_update_reopen.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, balance INTEGER);")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);")
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        for _ in 0..64 {
+            conn.execute("UPDATE t SET balance = balance + 1 WHERE id = 1;")
+                .unwrap();
+        }
+
+        let id1_rows = conn
+            .query("SELECT id, balance FROM t WHERE id = 1;")
+            .unwrap();
+        assert_eq!(id1_rows.len(), 1, "id=1 row must remain addressable");
+
+        let count_rows = conn.query("SELECT COUNT(*) FROM t;").unwrap();
+        assert_eq!(
+            count_rows[0].values()[0],
+            SqliteValue::Integer(3),
+            "UPDATE on non-IPK column must not change row cardinality"
+        );
+    }
+
+    #[test]
     fn test_next_master_rowid_advanced_past_loaded() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("master_rowid.db");
@@ -20886,7 +21109,11 @@ mod schema_loading_tests {
 
         conn.execute("BEGIN;").unwrap();
         let live_rows = conn.query("PRAGMA fsqlite.transactions;").unwrap();
-        assert_eq!(live_rows.len(), 1, "active transaction should expose one row");
+        assert_eq!(
+            live_rows.len(),
+            1,
+            "active transaction should expose one row"
+        );
         assert_eq!(live_rows[0].values().len(), 5, "row shape should be stable");
 
         let duration = match live_rows[0].values().get(1) {
@@ -20913,7 +21140,10 @@ mod schema_loading_tests {
 
         conn.execute("COMMIT;").unwrap();
         let after_rows = conn.query("PRAGMA fsqlite_transactions;").unwrap();
-        assert!(after_rows.is_empty(), "committed transaction should disappear");
+        assert!(
+            after_rows.is_empty(),
+            "committed transaction should disappear"
+        );
     }
 
     #[test]

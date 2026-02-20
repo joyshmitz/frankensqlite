@@ -613,10 +613,11 @@ mod tests {
         assert!(cfg.require_isomorphism_proof);
         assert_eq!(cfg.min_opportunity_score, 2.0);
         assert_eq!(cfg.min_selected_sql_hotspots, 1);
-        assert!(cfg
-            .opportunity_matrix_path
-            .to_string_lossy()
-            .contains("bd-1dp9.6.1/opportunity_matrix.json"));
+        assert!(
+            cfg.opportunity_matrix_path
+                .to_string_lossy()
+                .contains("bd-1dp9.6.1/opportunity_matrix.json")
+        );
     }
 
     #[test]
@@ -632,10 +633,12 @@ mod tests {
         let report = assess_sql_pipeline_optimization(&SqlPipelineOptConfig::default());
         assert_eq!(report.domains_profiled.len(), 8);
         assert_eq!(report.domains_at_parity.len(), 8);
-        assert!(report
-            .checks
-            .iter()
-            .any(|check| check.check_name == "sql_hotspot_opportunity_gate"));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.check_name == "sql_hotspot_opportunity_gate")
+        );
     }
 
     #[test]
@@ -796,8 +799,7 @@ mod tests {
         );
         eprintln!(
             "WARN bead_id={SQL_PIPELINE_OPT_BEAD_ID} phase=opportunity run_id={run_id} scenario_id={} threshold={:.3}",
-            report.opportunity_matrix_scenario_id,
-            report.opportunity_matrix_threshold
+            report.opportunity_matrix_scenario_id, report.opportunity_matrix_threshold
         );
         eprintln!(
             "ERROR bead_id={SQL_PIPELINE_OPT_BEAD_ID} phase=gate run_id={run_id} opportunity_gate={:?}",

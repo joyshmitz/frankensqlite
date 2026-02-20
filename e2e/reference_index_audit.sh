@@ -1,13 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+BEAD_ID="bd-4eue"
+SCENARIO_ID="${SCENARIO_ID:-IDX-1}"
+SEED="${SEED:-2026022007}"
+RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+LOG_STANDARD_REF="${LOG_STANDARD_REF:-docs/e2e_shell_script_log_profile.json}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULT_DIR="${ROOT_DIR}/test-results"
 REPORT_JSONL="${RESULT_DIR}/reference_index_audit.jsonl"
+SCHEMA_LOG_PATH="${RESULT_DIR}/reference_index_audit_events.jsonl"
 REQUIRE_ASUPERSYNC="${REQUIRE_ASUPERSYNC:-0}"
 
 mkdir -p "${RESULT_DIR}"
 : >"${REPORT_JSONL}"
+: >"${SCHEMA_LOG_PATH}"
+
+emit_schema_event() {
+    local phase="$1"
+    local event_type="$2"
+    local outcome="$3"
+    local timestamp
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    printf '{"run_id":"%s","timestamp":"%s","phase":"%s","event_type":"%s","scenario_id":"%s","seed":"%s","context":{"bead_id":"%s","outcome":"%s","log_standard_ref":"%s","schema_log_path":"%s"}}\n' \
+        "${RUN_ID}" "${timestamp}" "${phase}" "${event_type}" "${SCENARIO_ID}" "${SEED}" "${BEAD_ID}" "${outcome}" "${LOG_STANDARD_REF}" "${SCHEMA_LOG_PATH}" \
+        >>"${SCHEMA_LOG_PATH}"
+}
+
+on_exit() {
+    local exit_code=$?
+    if [[ ${exit_code} -eq 0 ]]; then
+        emit_schema_event "report" "pass" "pass"
+    else
+        emit_schema_event "report" "fail" "fail"
+    fi
+}
+trap on_exit EXIT
+
+emit_schema_event "setup" "start" "running"
 
 failures=0
 warnings=0

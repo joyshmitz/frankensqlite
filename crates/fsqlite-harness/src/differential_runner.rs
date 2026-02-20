@@ -38,12 +38,12 @@ use sha2::{Digest, Sha256};
 
 use crate::corpus_ingest::CorpusEntry;
 use crate::differential_v2::{
-    CanonicalizationRules, DifferentialResult, EnvelopeBuilder, ExecutionEnvelope, Outcome,
-    PragmaConfig, SqlExecutor, StatementDivergence, minimize_mismatch_workload,
+    CanonicalizationRules, DifferentialResult, ExecutionEnvelope, Outcome, PragmaConfig,
+    SqlExecutor, StatementDivergence,
 };
 use crate::metamorphic::{
     EquivalenceExpectation, MetamorphicTestCase, MismatchClassification, TransformRegistry,
-    classify_mismatch, generate_metamorphic_corpus,
+    generate_metamorphic_corpus,
 };
 use crate::mismatch_minimizer::{
     DeduplicatedFailures, MinimalReproduction, MinimizerConfig, attribute_subsystem, deduplicate,
@@ -53,6 +53,7 @@ use crate::mismatch_minimizer::{
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-mblr.7.1.2";
+const DEFAULT_BASE_SEED: u64 = u64::from_be_bytes(*b"\0FRANKEN");
 
 // ===========================================================================
 // Configuration
@@ -82,7 +83,7 @@ pub struct RunConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
-            base_seed: 0x4652_414E_4B45_4E, // "FRANKEN"
+            base_seed: DEFAULT_BASE_SEED,
             max_cases_per_entry: 8,
             pragmas: PragmaConfig::default(),
             canonicalization: CanonicalizationRules::default(),
@@ -188,17 +189,21 @@ pub fn run_metamorphic_differential<FFactory, CFactory, F, C>(
     entries: &[CorpusEntry],
     config: &RunConfig,
     make_fsqlite: FFactory,
-    make_csqlite: CFactory,
+    make_reference_sqlite: CFactory,
 ) -> Result<DifferentialRunReport, String>
 where
-    FFactory: Fn() -> Result<F, String>,
-    CFactory: Fn() -> Result<C, String>,
+    FFactory: Fn() -> Result<F, String> + Clone + 'static,
+    CFactory: Fn() -> Result<C, String> + Clone + 'static,
     F: SqlExecutor,
     C: SqlExecutor,
 {
     let registry = TransformRegistry::new();
-    let cases =
-        generate_metamorphic_corpus(entries, &registry, config.base_seed, config.max_cases_per_entry);
+    let cases = generate_metamorphic_corpus(
+        entries,
+        &registry,
+        config.base_seed,
+        config.max_cases_per_entry,
+    );
 
     let data_hash = compute_corpus_hash(entries);
 
@@ -223,7 +228,12 @@ where
             .entry(case.equivalence.to_string())
             .or_insert(0) += 1;
 
-        match run_single_case(case, config, &make_fsqlite, &make_csqlite)? {
+        match run_single_case(
+            case,
+            config,
+            make_fsqlite.clone(),
+            make_reference_sqlite.clone(),
+        )? {
             SingleCaseOutcome::Passed => {
                 passed += 1;
             }
@@ -235,7 +245,7 @@ where
                 if let Some(ref repro) = result.minimal_reproduction {
                     all_reproductions.push(repro.clone());
                 }
-                divergent_cases.push(result);
+                divergent_cases.push(*result);
             }
         }
     }
@@ -268,7 +278,7 @@ where
 
 enum SingleCaseOutcome {
     Passed,
-    Diverged(CaseResult),
+    Diverged(Box<CaseResult>),
 }
 
 /// Execute a single metamorphic test case against both engines.
@@ -276,12 +286,12 @@ enum SingleCaseOutcome {
 fn run_single_case<FFactory, CFactory, F, C>(
     case: &MetamorphicTestCase,
     config: &RunConfig,
-    make_fsqlite: &FFactory,
-    make_csqlite: &CFactory,
+    make_fsqlite: FFactory,
+    make_csqlite: CFactory,
 ) -> Result<SingleCaseOutcome, String>
 where
-    FFactory: Fn() -> Result<F, String>,
-    CFactory: Fn() -> Result<C, String>,
+    FFactory: Fn() -> Result<F, String> + Clone + 'static,
+    CFactory: Fn() -> Result<C, String> + Clone + 'static,
     F: SqlExecutor,
     C: SqlExecutor,
 {
@@ -326,10 +336,18 @@ where
         return Ok(SingleCaseOutcome::Passed);
     }
 
-    let (divergence_source, failing_envelope, failing_result) = if !original_passed {
-        (DivergenceSource::Original, &original_envelope, &original_result)
+    let (divergence_source, failing_envelope, failing_result) = if original_passed {
+        (
+            DivergenceSource::Transformed,
+            &transformed_envelope,
+            &transformed_result,
+        )
     } else {
-        (DivergenceSource::Transformed, &transformed_envelope, &transformed_result)
+        (
+            DivergenceSource::Original,
+            &original_envelope,
+            &original_result,
+        )
     };
 
     // Classify the mismatch using metamorphic classification.
@@ -339,21 +357,28 @@ where
     let minimal_reproduction = if config.enable_minimization
         && failing_envelope.workload.len() <= config.max_envelope_reduction_size
     {
-        try_minimize(failing_envelope, &classification, case.seed, config, make_fsqlite, make_csqlite)?
+        try_minimize(
+            failing_envelope,
+            &classification,
+            case.seed,
+            config,
+            make_fsqlite,
+            make_csqlite,
+        )
     } else {
         None
     };
 
-    Ok(SingleCaseOutcome::Diverged(CaseResult {
+    Ok(SingleCaseOutcome::Diverged(Box::new(CaseResult {
         case_id: case.id.clone(),
         transform_name: case.transform_name.clone(),
-        equivalence: case.equivalence.clone(),
+        equivalence: case.equivalence,
         original_passed,
         transformed_passed,
         classification: Some(classification),
         minimal_reproduction,
         divergence_source: Some(divergence_source),
-    }))
+    })))
 }
 
 // ===========================================================================
@@ -366,26 +391,25 @@ fn try_minimize<FFactory, CFactory, F, C>(
     classification: &MismatchClassification,
     seed: u64,
     config: &RunConfig,
-    make_fsqlite: &FFactory,
-    make_csqlite: &CFactory,
-) -> Result<Option<MinimalReproduction>, String>
+    make_fsqlite: FFactory,
+    make_reference_sqlite: CFactory,
+) -> Option<MinimalReproduction>
 where
-    FFactory: Fn() -> Result<F, String>,
-    CFactory: Fn() -> Result<C, String>,
+    FFactory: Fn() -> Result<F, String> + Clone + 'static,
+    CFactory: Fn() -> Result<C, String> + Clone + 'static,
     F: SqlExecutor,
     C: SqlExecutor,
 {
+    let pragmas = config.pragmas.clone();
+    let canonicalization = config.canonicalization.clone();
+
     // Use the mismatch_minimizer's delta-debugging.
-    let test_fn = |schema: &[String], workload: &[String]| -> Option<Vec<StatementDivergence>> {
-        let probe_envelope = build_envelope(
-            schema,
-            workload,
-            seed,
-            &config.pragmas,
-            &config.canonicalization,
-        );
+    let test_fn = move |schema: &[String],
+                        workload: &[String]|
+          -> Option<Vec<StatementDivergence>> {
+        let probe_envelope = build_envelope(schema, workload, seed, &pragmas, &canonicalization);
         let f = make_fsqlite().ok()?;
-        let c = make_csqlite().ok()?;
+        let c = make_reference_sqlite().ok()?;
         let result = crate::differential_v2::run_differential(&probe_envelope, &f, &c);
         if has_divergence(&result) {
             Some(result.divergences)
@@ -410,8 +434,7 @@ where
             MismatchClassification::TrueDivergence { .. }
         ) {
             // Re-compute signature with the metamorphic classification.
-            let subsystem =
-                attribute_subsystem(&r.divergences, &r.schema, &r.minimal_workload);
+            let subsystem = attribute_subsystem(&r.divergences, &r.schema, &r.minimal_workload);
             r.signature = crate::mismatch_minimizer::MismatchSignature::compute(
                 &r.schema,
                 &r.minimal_workload,
@@ -422,7 +445,7 @@ where
         }
     }
 
-    Ok(repro)
+    repro
 }
 
 // ===========================================================================
@@ -437,8 +460,7 @@ fn build_envelope(
     pragmas: &PragmaConfig,
     canonicalization: &CanonicalizationRules,
 ) -> ExecutionEnvelope {
-    EnvelopeBuilder::new()
-        .seed(seed)
+    ExecutionEnvelope::builder(seed)
         .pragmas(pragmas.clone())
         .schema(schema.to_vec())
         .workload(workload.to_vec())
@@ -492,7 +514,7 @@ fn classify_divergence(
 
     for div in &result.divergences {
         // Use the metamorphic classify_mismatch if we have row data.
-        let classified = classify_from_divergence(div, &case.equivalence);
+        let classified = classify_from_divergence(div, case.equivalence);
         if !matches!(classified, MismatchClassification::FalsePositive { .. }) {
             return classified;
         }
@@ -509,7 +531,7 @@ fn classify_divergence(
 /// Classify a single statement divergence using metamorphic rules.
 fn classify_from_divergence(
     div: &StatementDivergence,
-    equivalence: &EquivalenceExpectation,
+    equivalence: EquivalenceExpectation,
 ) -> MismatchClassification {
     use crate::differential_v2::StmtOutcome;
 
@@ -537,9 +559,7 @@ fn classify_from_divergence(
                 if f_sorted == c_sorted {
                     return match equivalence {
                         EquivalenceExpectation::ExactRowMatch => {
-                            MismatchClassification::OrderDependentDifference {
-                                description: format!("rows match as multiset but order differs: {}", div.sql),
-                            }
+                            MismatchClassification::OrderDependentDifference
                         }
                         _ => MismatchClassification::FalsePositive {
                             reason: "multiset-equivalent under relaxed equivalence".to_owned(),
@@ -594,9 +614,9 @@ mod tests {
     fn make_entry(id: &str, statements: Vec<&str>) -> CorpusEntry {
         CorpusEntry {
             id: id.to_owned(),
-            family: Family::Dml,
+            family: Family::SQL,
             secondary_families: Vec::new(),
-            source: CorpusSource::Manual {
+            source: CorpusSource::Custom {
                 author: "test".to_owned(),
             },
             statements: statements.into_iter().map(String::from).collect(),
@@ -608,6 +628,7 @@ mod tests {
     }
 
     /// Stub executor that records/returns canned data.
+    #[derive(Clone)]
     struct StubExecutor {
         results: std::collections::HashMap<String, crate::differential_v2::StmtOutcome>,
     }
@@ -652,7 +673,7 @@ mod tests {
     #[test]
     fn test_run_config_default() {
         let config = RunConfig::default();
-        assert_eq!(config.base_seed, 0x4652_414E_4B45_4E);
+        assert_eq!(config.base_seed, DEFAULT_BASE_SEED);
         assert_eq!(config.max_cases_per_entry, 8);
         assert!(config.enable_minimization);
     }
@@ -762,16 +783,15 @@ mod tests {
             ]),
         };
 
-        let classified =
-            classify_from_divergence(&div, &EquivalenceExpectation::ExactRowMatch);
+        let classified = classify_from_divergence(&div, EquivalenceExpectation::ExactRowMatch);
         assert!(matches!(
             classified,
-            MismatchClassification::OrderDependentDifference { .. }
+            MismatchClassification::OrderDependentDifference
         ));
 
         // With multiset equivalence, this should be a false positive.
         let classified_multiset =
-            classify_from_divergence(&div, &EquivalenceExpectation::MultisetEquivalence);
+            classify_from_divergence(&div, EquivalenceExpectation::MultisetEquivalence);
         assert!(matches!(
             classified_multiset,
             MismatchClassification::FalsePositive { .. }
@@ -793,8 +813,7 @@ mod tests {
             ]]),
         };
 
-        let classified =
-            classify_from_divergence(&div, &EquivalenceExpectation::ExactRowMatch);
+        let classified = classify_from_divergence(&div, EquivalenceExpectation::ExactRowMatch);
         assert!(matches!(
             classified,
             MismatchClassification::TrueDivergence { .. }
@@ -814,8 +833,7 @@ mod tests {
             ),
         };
 
-        let classified =
-            classify_from_divergence(&div, &EquivalenceExpectation::ExactRowMatch);
+        let classified = classify_from_divergence(&div, EquivalenceExpectation::ExactRowMatch);
         assert!(matches!(
             classified,
             MismatchClassification::FalsePositive { .. }
@@ -858,5 +876,52 @@ mod tests {
         assert_eq!(envelope.seed, 42);
         assert_eq!(envelope.schema.len(), 1);
         assert_eq!(envelope.workload.len(), 1);
+    }
+
+    #[test]
+    fn test_try_minimize_preserves_non_true_divergence_classification() {
+        use crate::differential_v2::{NormalizedValue, StmtOutcome};
+
+        let mut fsqlite = StubExecutor::new();
+        fsqlite.results.insert(
+            "SELECT 1".to_owned(),
+            StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(1)]]),
+        );
+
+        let mut csqlite = StubExecutor::new();
+        csqlite.results.insert(
+            "SELECT 1".to_owned(),
+            StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(2)]]),
+        );
+
+        let config = RunConfig {
+            minimizer: crate::mismatch_minimizer::MinimizerConfig {
+                max_iterations: 16,
+                one_minimal: true,
+                max_workload_size: 16,
+            },
+            ..RunConfig::default()
+        };
+
+        let envelope = build_envelope(
+            &["CREATE TABLE t(a INTEGER)".to_owned()],
+            &["SELECT 1".to_owned()],
+            42,
+            &config.pragmas,
+            &config.canonicalization,
+        );
+
+        let classification = MismatchClassification::OrderDependentDifference;
+        let minimized = try_minimize(
+            &envelope,
+            &classification,
+            42,
+            &config,
+            move || Ok(fsqlite.clone()),
+            move || Ok(csqlite.clone()),
+        )
+        .expect("divergence should produce minimal reproduction");
+
+        assert_eq!(minimized.signature.classification, classification);
     }
 }
