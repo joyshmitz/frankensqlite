@@ -274,7 +274,7 @@ impl Parser {
             TokenKind::Id(_) | TokenKind::QuotedId(_, _) => {
                 return Ok(Some(self.parse_identifier()?));
             }
-            k if is_nonreserved_kw(k) => {
+            k if is_nonreserved_kw(k) && !is_alias_terminator_kw(k) => {
                 return Ok(Some(self.parse_identifier()?));
             }
             _ => {}
@@ -1927,6 +1927,35 @@ pub(crate) fn is_nonreserved_kw(k: &TokenKind) -> bool {
     )
 }
 
+/// Keywords that should never be consumed as implicit aliases because they
+/// begin/continue the next clause in this grammar position.
+fn is_alias_terminator_kw(k: &TokenKind) -> bool {
+    matches!(
+        k,
+        TokenKind::KwCross
+            | TokenKind::KwExcept
+            | TokenKind::KwFull
+            | TokenKind::KwGroup
+            | TokenKind::KwHaving
+            | TokenKind::KwInner
+            | TokenKind::KwIntersect
+            | TokenKind::KwJoin
+            | TokenKind::KwLeft
+            | TokenKind::KwLimit
+            | TokenKind::KwNatural
+            | TokenKind::KwOffset
+            | TokenKind::KwOn
+            | TokenKind::KwOrder
+            | TokenKind::KwOuter
+            | TokenKind::KwReturning
+            | TokenKind::KwRight
+            | TokenKind::KwUnion
+            | TokenKind::KwUsing
+            | TokenKind::KwWhere
+            | TokenKind::KwWindow
+    )
+}
+
 pub(crate) fn kw_to_str(k: &TokenKind) -> String {
     let dbg = format!("{k:?}");
     dbg.strip_prefix("Kw").unwrap_or(&dbg).to_ascii_uppercase()
@@ -2362,6 +2391,22 @@ mod tests {
         if let Statement::Select(s) = stmt {
             if let SelectCore::Select { from, .. } = &s.body.select {
                 let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Full);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_join_full_outer_with_semicolon() {
+        let stmt = parse_one("SELECT l.name, r.tag FROM l FULL OUTER JOIN r ON l.id = r.l_id;");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins.len(), 1);
                 assert_eq!(from.joins[0].join_type.kind, JoinKind::Full);
             } else {
                 unreachable!("expected Select core");
@@ -4019,6 +4064,18 @@ mod tests {
         let stmt = parse_one("INSERT INTO t (a, b) VALUES (1, 2) RETURNING a, b, rowid");
         if let Statement::Insert(i) = stmt {
             assert_eq!(i.returning.len(), 3);
+        } else {
+            unreachable!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn test_returning_insert_select_with_semicolon() {
+        let stmt = parse_one("INSERT INTO t2 SELECT * FROM t RETURNING *;");
+        if let Statement::Insert(i) = stmt {
+            assert!(matches!(i.source, InsertSource::Select(_)));
+            assert_eq!(i.returning.len(), 1);
+            assert!(matches!(i.returning[0], ResultColumn::Star));
         } else {
             unreachable!("expected Insert");
         }
