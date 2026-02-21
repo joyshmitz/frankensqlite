@@ -56,9 +56,6 @@ impl<F: VfsFile> WalFile<F> {
                     .saturating_mul(u64::try_from(frame_size).unwrap_or(u64::MAX)),
             );
         let file_size = self.file.file_size(cx)?;
-        if file_size == expected_size {
-            return Ok(());
-        }
 
         // If file shrank (checkpoint reset/truncate, external compaction, etc.),
         // or changed in a way we cannot safely reason about incrementally,
@@ -68,6 +65,8 @@ impl<F: VfsFile> WalFile<F> {
         }
 
         // Validate current on-disk header and confirm it matches our view.
+        // This is necessary even if file_size == expected_size to detect ABA
+        // where the WAL was reset and then appended back to the exact same size.
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         let header_read = self.file.read(cx, &mut header_buf, 0)?;
         if header_read < WAL_HEADER_SIZE {
@@ -97,6 +96,10 @@ impl<F: VfsFile> WalFile<F> {
             return self.rebuild_state_from_file(cx);
         }
 
+        if file_size == expected_size {
+            return Ok(());
+        }
+
         // Incrementally absorb newly appended complete frames.
         //
         // For live multi-connection operation we only need:
@@ -115,22 +118,45 @@ impl<F: VfsFile> WalFile<F> {
             return Ok(());
         }
 
-        let mut frame_header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
+        let mut new_frame_count = self.frame_count;
+        let mut new_running_checksum = self.running_checksum;
+        let mut last_commit_count = self.frame_count;
+        let mut last_commit_checksum = self.running_checksum;
+
+        let mut frame_buf = vec![0u8; frame_size];
         for frame_index in self.frame_count..available_frames {
             let offset = self.frame_offset(frame_index);
-            let bytes_read = self.file.read(cx, &mut frame_header_buf, offset)?;
-            if bytes_read < WAL_FRAME_HEADER_SIZE {
+            let bytes_read = self.file.read(cx, &mut frame_buf, offset)?;
+            if bytes_read < frame_size {
                 break; // Partial/torn tail frame; keep prior valid prefix.
             }
 
-            let frame_header = WalFrameHeader::from_bytes(&frame_header_buf)?;
+            let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             if frame_header.salts != self.header.salts {
                 break; // End of valid chain for this generation.
             }
 
-            self.running_checksum = frame_header.checksum;
-            self.frame_count += 1;
+            let expected = compute_wal_frame_checksum(
+                &frame_buf,
+                self.page_size,
+                new_running_checksum,
+                self.big_endian_checksum,
+            )?;
+            if frame_header.checksum != expected {
+                break; // Checksum mismatch
+            }
+
+            new_running_checksum = expected;
+            new_frame_count += 1;
+
+            if frame_header.is_commit() {
+                last_commit_count = new_frame_count;
+                last_commit_checksum = new_running_checksum;
+            }
         }
+
+        self.frame_count = last_commit_count;
+        self.running_checksum = last_commit_checksum;
 
         Ok(())
     }
@@ -163,6 +189,11 @@ impl<F: VfsFile> WalFile<F> {
         self.running_checksum = header_checksum;
         self.frame_count = 0;
 
+        let mut new_frame_count = 0;
+        let mut new_running_checksum = header_checksum;
+        let mut last_commit_count = 0;
+        let mut last_commit_checksum = header_checksum;
+
         let frame_size = self.frame_size();
         let file_size = self.file.file_size(cx)?;
         let max_frames = usize::try_from(
@@ -187,16 +218,24 @@ impl<F: VfsFile> WalFile<F> {
             let expected = compute_wal_frame_checksum(
                 &frame_buf,
                 self.page_size,
-                self.running_checksum,
+                new_running_checksum,
                 self.big_endian_checksum,
             )?;
             if frame_header.checksum != expected {
                 break;
             }
 
-            self.running_checksum = expected;
-            self.frame_count += 1;
+            new_running_checksum = expected;
+            new_frame_count += 1;
+
+            if frame_header.is_commit() {
+                last_commit_count = new_frame_count;
+                last_commit_checksum = new_running_checksum;
+            }
         }
+
+        self.frame_count = last_commit_count;
+        self.running_checksum = last_commit_checksum;
 
         Ok(())
     }
@@ -334,6 +373,8 @@ impl<F: VfsFile> WalFile<F> {
 
         let mut running_checksum = header_checksum;
         let mut valid_frames = 0_usize;
+        let mut last_commit_frames = 0_usize;
+        let mut last_commit_checksum = header_checksum;
         let mut frame_buf = vec![0u8; frame_size];
 
         for frame_index in 0..max_frames {
@@ -375,13 +416,18 @@ impl<F: VfsFile> WalFile<F> {
 
             running_checksum = expected;
             valid_frames += 1;
+
+            if frame_header.is_commit() {
+                last_commit_frames = valid_frames;
+                last_commit_checksum = running_checksum;
+            }
         }
 
         debug!(
             page_size,
             big_endian_checksum,
             checkpoint_seq = header.checkpoint_seq,
-            valid_frames,
+            valid_frames = last_commit_frames,
             "WAL file opened"
         );
 
@@ -390,8 +436,8 @@ impl<F: VfsFile> WalFile<F> {
             page_size,
             big_endian_checksum,
             header,
-            running_checksum,
-            frame_count: valid_frames,
+            running_checksum: last_commit_checksum,
+            frame_count: last_commit_frames,
         })
     }
 
