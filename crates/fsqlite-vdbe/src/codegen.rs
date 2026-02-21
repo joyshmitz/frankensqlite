@@ -1522,12 +1522,71 @@ fn has_aggregate_columns(columns: &[ResultColumn]) -> bool {
     })
 }
 
-/// Check whether an expression is an aggregate function call.
+/// Check whether an expression contains an aggregate function call.
 fn is_aggregate_expr(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::FunctionCall { name, .. } if is_aggregate_function(name)
-    )
+    match expr {
+        Expr::FunctionCall { name, .. } if is_aggregate_function(name) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            is_aggregate_expr(left) || is_aggregate_expr(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => is_aggregate_expr(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => is_aggregate_expr(inner) || is_aggregate_expr(low) || is_aggregate_expr(high),
+        Expr::In { expr: inner, set, .. } => {
+            if is_aggregate_expr(inner) {
+                return true;
+            }
+            match set {
+                fsqlite_ast::InSet::List(items) => items.iter().any(is_aggregate_expr),
+                _ => false,
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            is_aggregate_expr(inner)
+                || is_aggregate_expr(pattern)
+                || escape.as_deref().is_some_and(is_aggregate_expr)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if operand.as_deref().is_some_and(is_aggregate_expr) {
+                return true;
+            }
+            if whens.iter().any(|(cond, then_expr)| {
+                is_aggregate_expr(cond) || is_aggregate_expr(then_expr)
+            }) {
+                return true;
+            }
+            if else_expr.as_deref().is_some_and(is_aggregate_expr) {
+                return true;
+            }
+            false
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::List(args),
+            ..
+        } => args.iter().any(is_aggregate_expr),
+        Expr::RowValue(items, _) => items.iter().any(is_aggregate_expr),
+        Expr::JsonAccess { expr: inner, path, .. } => {
+            is_aggregate_expr(inner) || is_aggregate_expr(path)
+        }
+        _ => false,
+    }
 }
 
 /// Description of one aggregate column for codegen.
@@ -6578,7 +6637,7 @@ mod tests {
         assert_eq!(err, CodegenError::TableNotFound("u".to_owned()));
     }
 
-    // === Test 9: SELECT with index ===
+    // === Test 9: SELECT with indexed predicate ===
     #[test]
     fn test_codegen_select_with_index() {
         let stmt = simple_select(&["a"], "t", Some(col_eq_param("b", 1)));
@@ -6588,29 +6647,35 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // Should use OpenRead on both table and index.
+        // Index-seek planning is intentionally disabled for now (see
+        // codegen_select comment near `index_eq`), so this should compile to
+        // a full table scan even when an index exists on the filtered column.
         let open_reads = prog
             .ops()
             .iter()
             .filter(|op| op.opcode == Opcode::OpenRead)
             .count();
-        assert_eq!(open_reads, 2, "should open both table and index");
+        assert_eq!(open_reads, 1, "index seek disabled: only table cursor should open");
 
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::MakeRecord),
-            "expected probe-key record construction for index seek"
+            prog.ops().iter().any(|op| op.opcode == Opcode::Rewind),
+            "expected full scan to rewind the table cursor"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
-            "expected SeekGE on index cursor"
+            prog.ops().iter().any(|op| op.opcode == Opcode::Next),
+            "expected full scan loop to advance with Next"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid),
-            "expected IdxRowid to map index entry to table rowid"
+            !prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "index seek is disabled: no SeekGE expected"
         );
         assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
-            "expected table cursor lookup by rowid"
+            !prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid),
+            "index seek is disabled: no IdxRowid expected"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "index seek is disabled: no SeekRowid expected in this path"
         );
     }
 
