@@ -128,7 +128,8 @@ pub use index_regen::{
     eval_rebase_expr, regenerate_index_ops,
 };
 pub use invariants::{
-    SerializedWriteMutex, SnapshotResolveTrace, TxnManager, VersionStore, VersionVisibilityRange,
+    CHAIN_HEAD_EMPTY, CHAIN_HEAD_SHARDS, CasInstallResult, ChainHeadTable, SerializedWriteMutex,
+    SnapshotResolveTrace, TxnManager, VersionStore, VersionVisibilityRange,
     idx_to_version_pointer, visible,
 };
 pub use left_right::{
@@ -137,11 +138,12 @@ pub use left_right::{
 };
 pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
 pub use observability::{
-    SharedObserver, SnapshotReadMetricsSnapshot, SsiMetricsSnapshot, VersionsTraversedHistogram,
-    emit_conflict_resolved, emit_fcw_base_drift, emit_page_lock_contention, emit_ssi_abort,
-    mvcc_snapshot_established, mvcc_snapshot_metrics_snapshot, mvcc_snapshot_released,
+    CasMetricsSnapshot, CasRetriesHistogram, SharedObserver, SnapshotReadMetricsSnapshot,
+    SsiMetricsSnapshot, VersionsTraversedHistogram, cas_metrics_snapshot, emit_conflict_resolved,
+    emit_fcw_base_drift, emit_page_lock_contention, emit_ssi_abort, mvcc_snapshot_established,
+    mvcc_snapshot_metrics_snapshot, mvcc_snapshot_released, record_cas_attempt,
     record_snapshot_read_versions_traversed, record_ssi_abort, record_ssi_commit,
-    reset_mvcc_snapshot_metrics, reset_ssi_metrics, ssi_metrics_snapshot,
+    reset_cas_metrics, reset_mvcc_snapshot_metrics, reset_ssi_metrics, ssi_metrics_snapshot,
 };
 pub use rcu::{
     MAX_RCU_THREADS, QsbrHandle, QsbrRegistry, RcuCell, RcuMetrics, RcuPair, RcuTriple,

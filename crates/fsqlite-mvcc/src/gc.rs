@@ -14,6 +14,7 @@ use fsqlite_types::{CommitSeq, PageNumber, PageNumberBuildHasher, VersionPointer
 
 use crate::core_types::{VersionArena, VersionIdx};
 use crate::ebr::{VersionGuard, VersionGuardRegistry};
+use crate::invariants::ChainHeadTable;
 
 /// Convert a `VersionPointer` stored in `PageVersion.prev` to a `VersionIdx`.
 #[inline]
@@ -240,7 +241,7 @@ pub fn prune_page_chain(
     pgno: PageNumber,
     horizon: CommitSeq,
     arena: &mut VersionArena,
-    chain_heads: &mut std::collections::HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
+    chain_heads: &ChainHeadTable,
 ) -> PruneResult {
     let guard_registry = Arc::new(VersionGuardRegistry::default());
     prune_page_chain_with_registry(pgno, horizon, arena, chain_heads, &guard_registry)
@@ -252,10 +253,10 @@ pub fn prune_page_chain_with_registry(
     pgno: PageNumber,
     horizon: CommitSeq,
     arena: &mut VersionArena,
-    chain_heads: &mut std::collections::HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
+    chain_heads: &ChainHeadTable,
     guard_registry: &Arc<VersionGuardRegistry>,
 ) -> PruneResult {
-    let Some(&head_idx) = chain_heads.get(&pgno) else {
+    let Some(head_idx) = chain_heads.get_head(pgno) else {
         return PruneResult {
             freed: 0,
             head_removed: false,
@@ -380,7 +381,7 @@ pub fn gc_tick(
     todo: &mut GcTodo,
     horizon: CommitSeq,
     arena: &mut VersionArena,
-    chain_heads: &mut std::collections::HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
+    chain_heads: &ChainHeadTable,
 ) -> GcTickResult {
     let guard_registry = Arc::new(VersionGuardRegistry::default());
     gc_tick_with_registry(todo, horizon, arena, chain_heads, &guard_registry)
@@ -392,7 +393,7 @@ pub fn gc_tick_with_registry(
     todo: &mut GcTodo,
     horizon: CommitSeq,
     arena: &mut VersionArena,
-    chain_heads: &mut std::collections::HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
+    chain_heads: &ChainHeadTable,
     guard_registry: &Arc<VersionGuardRegistry>,
 ) -> GcTickResult {
     let start = Instant::now();
@@ -469,12 +470,12 @@ mod tests {
     use super::*;
     use crate::core_types::VersionArena;
     use crate::ebr::{GLOBAL_EBR_METRICS, VersionGuardRegistry};
-    use crate::invariants::idx_to_version_pointer;
+    use crate::invariants::{ChainHeadTable, idx_to_version_pointer};
     use fsqlite_types::{
         CommitSeq, PageData, PageNumber, PageSize, PageVersion, TxnEpoch, TxnId, TxnToken,
     };
     use proptest::{prelude::*, test_runner::Config as ProptestConfig};
-    use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     const BEAD_ZCDN: &str = "bd-zcdn";
@@ -510,13 +511,25 @@ mod tests {
         (head, indices)
     }
 
+    /// Helper: build a chain and install the head into a `ChainHeadTable`.
+    fn build_chain_in_table(
+        arena: &mut VersionArena,
+        chain_heads: &ChainHeadTable,
+        pgno: PageNumber,
+        n: u32,
+    ) -> (VersionIdx, Vec<VersionIdx>) {
+        let (head, indices) = build_chain(arena, pgno, n);
+        chain_heads.install_with_retry(pgno, head);
+        (head, indices)
+    }
+
     fn collect_chain_commit_seqs(
         pgno: PageNumber,
         arena: &VersionArena,
-        chain_heads: &HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
+        chain_heads: &ChainHeadTable,
     ) -> Vec<u64> {
         let mut seqs = Vec::new();
-        let mut cur = chain_heads.get(&pgno).copied();
+        let mut cur = chain_heads.get_head(pgno);
         while let Some(idx) = cur {
             let v = arena
                 .get(idx)
@@ -689,15 +702,13 @@ mod tests {
         let pgno = PageNumber::new(42).unwrap();
 
         // Build chain: seq 1 → 2 → 3 → 4 → 5 (head=5).
-        let (head, indices) = build_chain(&mut arena, pgno, 5);
-
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, head);
+        let chain_heads = ChainHeadTable::new();
+        let (_head, indices) = build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
 
         // Horizon at seq 3 means: keep version 3 as the last safe version.
         // Versions 1 and 2 should be freed.
         let horizon = CommitSeq::new(3);
-        let result = prune_page_chain(pgno, horizon, &mut arena, &mut chain_heads);
+        let result = prune_page_chain(pgno, horizon, &mut arena, &chain_heads);
 
         assert_eq!(
             result.freed, 2,
@@ -731,9 +742,8 @@ mod tests {
     fn test_prune_page_chain_uses_ebr_deferral() {
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(4242).unwrap();
-        let (head, _) = build_chain(&mut arena, pgno, 5);
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, head);
+        let chain_heads = ChainHeadTable::new();
+        build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
         let registry = Arc::new(VersionGuardRegistry::default());
         let before = GLOBAL_EBR_METRICS.snapshot();
 
@@ -741,7 +751,7 @@ mod tests {
             pgno,
             CommitSeq::new(3),
             &mut arena,
-            &mut chain_heads,
+            &chain_heads,
             &registry,
         );
 
@@ -767,13 +777,12 @@ mod tests {
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(7).unwrap();
 
-        let (head, _) = build_chain(&mut arena, pgno, 3);
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, head);
+        let chain_heads = ChainHeadTable::new();
+        build_chain_in_table(&mut arena, &chain_heads, pgno, 3);
 
         // Horizon at 0: everything is above it — no pruning.
         let horizon = CommitSeq::new(0);
-        let result = prune_page_chain(pgno, horizon, &mut arena, &mut chain_heads);
+        let result = prune_page_chain(pgno, horizon, &mut arena, &chain_heads);
 
         assert_eq!(
             result.freed, 0,
@@ -785,9 +794,9 @@ mod tests {
     fn test_prune_page_chain_nonexistent_page() {
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(99).unwrap();
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let chain_heads = ChainHeadTable::new();
 
-        let result = prune_page_chain(pgno, CommitSeq::new(10), &mut arena, &mut chain_heads);
+        let result = prune_page_chain(pgno, CommitSeq::new(10), &mut arena, &chain_heads);
         assert_eq!(
             result.freed, 0,
             "bead_id={BEAD_ZCDN} nonexistent page should prune nothing"
@@ -803,10 +812,10 @@ mod tests {
         let v = make_version(pgno, 5, None);
         let idx = arena.alloc(v);
 
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, idx);
+        let chain_heads = ChainHeadTable::new();
+        chain_heads.install_with_retry(pgno, idx);
 
-        let result = prune_page_chain(pgno, CommitSeq::new(5), &mut arena, &mut chain_heads);
+        let result = prune_page_chain(pgno, CommitSeq::new(5), &mut arena, &chain_heads);
         assert_eq!(
             result.freed, 0,
             "bead_id={BEAD_ZCDN} single version has nothing below to prune"
@@ -823,14 +832,13 @@ mod tests {
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(10).unwrap();
 
-        let (head, _) = build_chain(&mut arena, pgno, 8);
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, head);
+        let chain_heads = ChainHeadTable::new();
+        build_chain_in_table(&mut arena, &chain_heads, pgno, 8);
 
         let free_before = arena.free_count();
 
         // Horizon at 5: versions 1-4 freed (4 slots).
-        let result = prune_page_chain(pgno, CommitSeq::new(5), &mut arena, &mut chain_heads);
+        let result = prune_page_chain(pgno, CommitSeq::new(5), &mut arena, &chain_heads);
         assert_eq!(result.freed, 4);
 
         let free_after = arena.free_count();
@@ -848,14 +856,13 @@ mod tests {
         let pgno = PageNumber::new(20).unwrap();
 
         // Chain: seq 1, 2, 3, 4, 5, 6, 7, 8, 9, 10.
-        let (head, indices) = build_chain(&mut arena, pgno, 10);
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, head);
+        let chain_heads = ChainHeadTable::new();
+        let (head, indices) = build_chain_in_table(&mut arena, &chain_heads, pgno, 10);
 
         // Horizon at 6: a snapshot at commit_seq 6 would see version 6.
         // Versions 7-10 are above horizon (needed by newer snapshots).
         // Version 6 is the last safe version — kept. Versions 1-5 are freed.
-        let result = prune_page_chain(pgno, CommitSeq::new(6), &mut arena, &mut chain_heads);
+        let result = prune_page_chain(pgno, CommitSeq::new(6), &mut arena, &chain_heads);
         assert_eq!(result.freed, 5, "versions 1-5 should be freed");
 
         // Verify: versions 6-10 are all still accessible.
@@ -886,19 +893,18 @@ mod tests {
     fn test_gc_tick_incremental_pruning() {
         // bead_id=bd-zcdn: Incremental pruning with GcTodo queue.
         let mut arena = VersionArena::new();
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let chain_heads = ChainHeadTable::new();
         let mut todo = GcTodo::new();
 
         // Set up 3 pages, each with 5 versions.
         for i in 1..=3 {
             let pgno = PageNumber::new(i).unwrap();
-            let (head, _) = build_chain(&mut arena, pgno, 5);
-            chain_heads.insert(pgno, head);
+            build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
             todo.enqueue(pgno);
         }
 
         let horizon = CommitSeq::new(3); // keep version 3, free 1 & 2 per page.
-        let result = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+        let result = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
 
         assert_eq!(result.pages_pruned, 3, "should prune all 3 pages");
         assert_eq!(
@@ -914,18 +920,17 @@ mod tests {
     fn test_gc_tick_respects_pages_budget() {
         // bead_id=bd-zcdn: GC scheduling avoids starvation — budget enforcement.
         let mut arena = VersionArena::new();
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let chain_heads = ChainHeadTable::new();
         let mut todo = GcTodo::new();
 
         // Enqueue 100 pages (more than GC_PAGES_BUDGET=64).
         for i in 1..=100 {
             let pgno = PageNumber::new(i).unwrap();
-            let (head, _) = build_chain(&mut arena, pgno, 3);
-            chain_heads.insert(pgno, head);
+            build_chain_in_table(&mut arena, &chain_heads, pgno, 3);
             todo.enqueue(pgno);
         }
 
-        let result = gc_tick(&mut todo, CommitSeq::new(2), &mut arena, &mut chain_heads);
+        let result = gc_tick(&mut todo, CommitSeq::new(2), &mut arena, &chain_heads);
 
         assert_eq!(
             result.pages_pruned, GC_PAGES_BUDGET,
@@ -942,7 +947,7 @@ mod tests {
     fn test_gc_tick_respects_versions_budget() {
         // Create pages with very long chains to exhaust versions budget.
         let mut arena = VersionArena::new();
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let chain_heads = ChainHeadTable::new();
         let mut todo = GcTodo::new();
 
         // 10 pages, each with 1000 versions (seq 1..1000).
@@ -956,12 +961,11 @@ mod tests {
         // Page 6: budget=0, loop exits.
         for i in 1..=10 {
             let pgno = PageNumber::new(i).unwrap();
-            let (head, _) = build_chain(&mut arena, pgno, 1000);
-            chain_heads.insert(pgno, head);
+            build_chain_in_table(&mut arena, &chain_heads, pgno, 1000);
             todo.enqueue(pgno);
         }
 
-        let result = gc_tick(&mut todo, CommitSeq::new(999), &mut arena, &mut chain_heads);
+        let result = gc_tick(&mut todo, CommitSeq::new(999), &mut arena, &chain_heads);
 
         assert!(
             result.pages_pruned <= 10,
@@ -984,10 +988,10 @@ mod tests {
     #[test]
     fn test_gc_tick_empty_queue() {
         let mut arena = VersionArena::new();
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let chain_heads = ChainHeadTable::new();
         let mut todo = GcTodo::new();
 
-        let result = gc_tick(&mut todo, CommitSeq::new(100), &mut arena, &mut chain_heads);
+        let result = gc_tick(&mut todo, CommitSeq::new(100), &mut arena, &chain_heads);
 
         assert_eq!(result.pages_pruned, 0);
         assert_eq!(result.versions_freed, 0);
@@ -1003,12 +1007,11 @@ mod tests {
         // If it compiled, it cannot do I/O. This test documents that guarantee.
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(1).unwrap();
-        let (head, _) = build_chain(&mut arena, pgno, 5);
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, head);
+        let chain_heads = ChainHeadTable::new();
+        build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
 
         // This compiles and runs: proof that prune_page_chain is pure in-memory.
-        let result = prune_page_chain(pgno, CommitSeq::new(3), &mut arena, &mut chain_heads);
+        let result = prune_page_chain(pgno, CommitSeq::new(3), &mut arena, &chain_heads);
         assert_eq!(
             result.freed, 2,
             "bead_id={BEAD_ZCDN} pure in-memory prune works correctly"
@@ -1024,20 +1027,19 @@ mod tests {
         // bead_id=bd-3t3.10: Enqueue 100 pages. First gc_tick processes 64
         // (pages budget). Second gc_tick processes remaining 36.
         let mut arena = VersionArena::new();
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let chain_heads = ChainHeadTable::new();
         let mut todo = GcTodo::new();
 
         for i in 1..=100 {
             let pgno = PageNumber::new(i).unwrap();
-            let (head, _) = build_chain(&mut arena, pgno, 5);
-            chain_heads.insert(pgno, head);
+            build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
             todo.enqueue(pgno);
         }
         assert_eq!(todo.len(), 100);
 
         // Tick 1: processes exactly GC_PAGES_BUDGET=64 pages.
         let horizon = CommitSeq::new(3); // free versions 1,2 per page
-        let r1 = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+        let r1 = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
         assert_eq!(
             r1.pages_pruned, GC_PAGES_BUDGET,
             "bead_id=bd-3t3.10: first tick should process 64 pages"
@@ -1049,7 +1051,7 @@ mod tests {
         assert!(r1.pages_budget_exhausted);
 
         // Tick 2: processes the remaining 36 pages.
-        let r2 = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+        let r2 = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
         assert_eq!(
             r2.pages_pruned, 36,
             "bead_id=bd-3t3.10: second tick should process remaining 36 pages"
@@ -1079,12 +1081,11 @@ mod tests {
         let pgno = PageNumber::new(50).unwrap();
 
         // Chain: seq 1, 2, 3, 4, 5 (head=5).
-        let (head, _) = build_chain(&mut arena, pgno, 5);
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, head);
+        let chain_heads = ChainHeadTable::new();
+        build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
 
         // Horizon at 3: keep versions 3,4,5. Free versions 1,2.
-        let result = prune_page_chain(pgno, CommitSeq::new(3), &mut arena, &mut chain_heads);
+        let result = prune_page_chain(pgno, CommitSeq::new(3), &mut arena, &chain_heads);
 
         assert_eq!(result.freed, 2);
         assert_eq!(
@@ -1113,19 +1114,18 @@ mod tests {
     fn test_gc_tick_pruned_keys_aggregated() {
         // bead_id=bd-3t3.10: gc_tick aggregates pruned_keys from all pages.
         let mut arena = VersionArena::new();
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let chain_heads = ChainHeadTable::new();
         let mut todo = GcTodo::new();
 
         // 3 pages, each with 5 versions.
         for i in 1..=3 {
             let pgno = PageNumber::new(i).unwrap();
-            let (head, _) = build_chain(&mut arena, pgno, 5);
-            chain_heads.insert(pgno, head);
+            build_chain_in_table(&mut arena, &chain_heads, pgno, 5);
             todo.enqueue(pgno);
         }
 
         // Horizon at 3: free versions 1,2 per page = 6 total pruned keys.
-        let result = gc_tick(&mut todo, CommitSeq::new(3), &mut arena, &mut chain_heads);
+        let result = gc_tick(&mut todo, CommitSeq::new(3), &mut arena, &chain_heads);
 
         assert_eq!(result.versions_freed, 6);
         assert_eq!(
@@ -1149,13 +1149,12 @@ mod tests {
         // After pruning at horizon=5, version 5 must still be present.
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(33).unwrap();
-        let (head, indices) = build_chain(&mut arena, pgno, 10);
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, head);
+        let chain_heads = ChainHeadTable::new();
+        let (_head, indices) = build_chain_in_table(&mut arena, &chain_heads, pgno, 10);
 
         // Active transaction started at begin_seq=5 → horizon cannot go past 5.
         let horizon = CommitSeq::new(5);
-        let _ = prune_page_chain(pgno, horizon, &mut arena, &mut chain_heads);
+        let _ = prune_page_chain(pgno, horizon, &mut arena, &chain_heads);
 
         // The version at seq=5 (index 4) must still be accessible.
         let v5 = arena
@@ -1177,12 +1176,11 @@ mod tests {
     fn test_gc_memory_bounded() {
         // bd-bca.2: sustained history is bounded by active horizon after pruning.
         let mut arena = VersionArena::new();
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let chain_heads = ChainHeadTable::new();
 
         for page in 1_u32..=64 {
             let pgno = PageNumber::new(page).expect("page number in range");
-            let (head, _) = build_chain(&mut arena, pgno, 1_000);
-            chain_heads.insert(pgno, head);
+            build_chain_in_table(&mut arena, &chain_heads, pgno, 1_000);
         }
 
         let mut todo = GcTodo::new();
@@ -1195,7 +1193,7 @@ mod tests {
         let horizon = CommitSeq::new(1_000 - active_window + 1);
         let mut total_freed = 0_u32;
         while !todo.is_empty() {
-            let result = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+            let result = gc_tick(&mut todo, horizon, &mut arena, &chain_heads);
             total_freed = total_freed.saturating_add(result.versions_freed);
         }
 
@@ -1213,14 +1211,13 @@ mod tests {
         // bd-bca.2: chain length should be bounded by active transactions + 1 after prune.
         let mut arena = VersionArena::new();
         let pgno = PageNumber::new(777).unwrap();
-        let (head, _) = build_chain(&mut arena, pgno, 40);
-        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-        chain_heads.insert(pgno, head);
+        let chain_heads = ChainHeadTable::new();
+        build_chain_in_table(&mut arena, &chain_heads, pgno, 40);
 
         let active_txns = 7_u64;
         let keep = active_txns + 1;
         let horizon = CommitSeq::new(40 - keep + 1);
-        let result = prune_page_chain(pgno, horizon, &mut arena, &mut chain_heads);
+        let result = prune_page_chain(pgno, horizon, &mut arena, &chain_heads);
         let retained_len =
             40usize.saturating_sub(usize::try_from(result.freed).expect("u32 fits usize"));
         assert!(
@@ -1248,11 +1245,10 @@ mod tests {
         ) {
             let mut arena = VersionArena::new();
             let pgno = PageNumber::new(900).expect("fixed test pgno should be valid");
-            let (head, _) = build_chain(&mut arena, pgno, n);
-            let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-            chain_heads.insert(pgno, head);
+            let chain_heads = ChainHeadTable::new();
+            build_chain_in_table(&mut arena, &chain_heads, pgno, n);
 
-            let result = prune_page_chain(pgno, CommitSeq::new(horizon), &mut arena, &mut chain_heads);
+            let result = prune_page_chain(pgno, CommitSeq::new(horizon), &mut arena, &chain_heads);
 
             let n_u64 = u64::from(n);
             let expected_freed_u64 = if horizon == 0 {
@@ -1299,35 +1295,33 @@ mod tests {
 
             let pgno_step = PageNumber::new(901).expect("fixed test pgno should be valid");
             let mut arena_step = VersionArena::new();
-            let (head_step, _) = build_chain(&mut arena_step, pgno_step, n);
-            let mut chain_heads_step = HashMap::with_hasher(PageNumberBuildHasher::default());
-            chain_heads_step.insert(pgno_step, head_step);
+            let chain_heads_step = ChainHeadTable::new();
+            build_chain_in_table(&mut arena_step, &chain_heads_step, pgno_step, n);
 
             let r_low = prune_page_chain(
                 pgno_step,
                 CommitSeq::new(low),
                 &mut arena_step,
-                &mut chain_heads_step,
+                &chain_heads_step,
             );
             let r_high = prune_page_chain(
                 pgno_step,
                 CommitSeq::new(high),
                 &mut arena_step,
-                &mut chain_heads_step,
+                &chain_heads_step,
             );
             let retained_step = collect_chain_commit_seqs(pgno_step, &arena_step, &chain_heads_step);
 
             let pgno_direct = PageNumber::new(902).expect("fixed test pgno should be valid");
             let mut arena_direct = VersionArena::new();
-            let (head_direct, _) = build_chain(&mut arena_direct, pgno_direct, n);
-            let mut chain_heads_direct = HashMap::with_hasher(PageNumberBuildHasher::default());
-            chain_heads_direct.insert(pgno_direct, head_direct);
+            let chain_heads_direct = ChainHeadTable::new();
+            build_chain_in_table(&mut arena_direct, &chain_heads_direct, pgno_direct, n);
 
             let r_direct = prune_page_chain(
                 pgno_direct,
                 CommitSeq::new(high),
                 &mut arena_direct,
-                &mut chain_heads_direct,
+                &chain_heads_direct,
             );
             let retained_direct =
                 collect_chain_commit_seqs(pgno_direct, &arena_direct, &chain_heads_direct);
@@ -1350,9 +1344,8 @@ mod tests {
         ) {
             let mut arena = VersionArena::new();
             let pgno = PageNumber::new(903).expect("fixed test pgno should be valid");
-            let (head, _) = build_chain(&mut arena, pgno, n);
-            let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
-            chain_heads.insert(pgno, head);
+            let chain_heads = ChainHeadTable::new();
+            build_chain_in_table(&mut arena, &chain_heads, pgno, n);
 
             let keep_u64 = u64::from(active_txns) + 1;
             let n_u64 = u64::from(n);
@@ -1362,7 +1355,7 @@ mod tests {
                 CommitSeq::new(0)
             };
 
-            let _ = prune_page_chain(pgno, horizon, &mut arena, &mut chain_heads);
+            let _ = prune_page_chain(pgno, horizon, &mut arena, &chain_heads);
             let retained = collect_chain_commit_seqs(pgno, &arena, &chain_heads);
             let keep_usize = usize::try_from(keep_u64).expect("bounded");
             prop_assert!(retained.len() <= keep_usize);

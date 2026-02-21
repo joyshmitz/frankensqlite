@@ -19,9 +19,11 @@ use fsqlite_types::{
     VersionPointer,
 };
 
+use crate::cache_aligned::CacheAligned;
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
 use crate::ebr::VersionGuardRegistry;
 use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry};
+use crate::observability::record_cas_attempt;
 
 // ---------------------------------------------------------------------------
 // TxnManager — INV-1 (Monotonicity)
@@ -224,6 +226,272 @@ pub struct SnapshotResolveTrace {
 }
 
 // ---------------------------------------------------------------------------
+// ChainHeadTable — latch-free MVCC version chain heads (bd-688.3)
+// ---------------------------------------------------------------------------
+
+/// Number of shards in the chain head table (power of 2 for fast modular indexing).
+pub const CHAIN_HEAD_SHARDS: usize = 64;
+
+/// Sentinel value stored in an `AtomicU64` slot to indicate "no version" (empty chain).
+pub const CHAIN_HEAD_EMPTY: u64 = u64::MAX;
+
+/// Result of a CAS-based chain head installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasInstallResult {
+    /// Successfully installed. Contains the previous head (or `None` if this was the first version).
+    Installed { previous: Option<VersionIdx> },
+    /// CAS failed because the current head changed between read and write.
+    /// The caller should retry.
+    Retry,
+}
+
+/// A single shard of the chain head table.
+///
+/// Contains:
+/// - A directory mapping `PageNumber` to a slot index (locked only on first-time registration).
+/// - A vector of atomic head pointer slots (read-locked for CAS, write-locked only when growing).
+struct ChainHeadShard {
+    /// Maps page numbers to slot indices within `slots`.
+    directory: Mutex<HashMap<PageNumber, usize, PageNumberBuildHasher>>,
+    /// Atomic head pointer slots. Each slot stores a packed `VersionIdx` as u64,
+    /// or `CHAIN_HEAD_EMPTY` for an empty chain.
+    slots: RwLock<Vec<CacheAligned<AtomicU64>>>,
+}
+
+impl ChainHeadShard {
+    fn new() -> Self {
+        Self {
+            directory: Mutex::new(HashMap::with_hasher(PageNumberBuildHasher::default())),
+            slots: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Get or create the slot index for a page. Returns the slot index.
+    fn ensure_slot(&self, pgno: PageNumber) -> usize {
+        // Fast path: check if already registered.
+        {
+            let dir = self.directory.lock();
+            if let Some(&idx) = dir.get(&pgno) {
+                return idx;
+            }
+        }
+
+        // Slow path: register a new slot.
+        let mut dir = self.directory.lock();
+        // Double-check after acquiring lock.
+        if let Some(&idx) = dir.get(&pgno) {
+            return idx;
+        }
+
+        let mut slots = self.slots.write();
+        let slot_idx = slots.len();
+        slots.push(CacheAligned::new(AtomicU64::new(CHAIN_HEAD_EMPTY)));
+        dir.insert(pgno, slot_idx);
+        slot_idx
+    }
+
+    /// Get the slot index for a page, if registered.
+    fn slot_index(&self, pgno: PageNumber) -> Option<usize> {
+        let dir = self.directory.lock();
+        dir.get(&pgno).copied()
+    }
+}
+
+/// Sharded, CAS-based atomic chain head table for lock-free head pointer updates.
+///
+/// Each page's version chain head is stored as an `AtomicU64` that packs a `VersionIdx`.
+/// Updates use compare-and-swap instead of taking a global write lock, enabling concurrent
+/// writers to install new chain heads without contention on the table itself.
+pub struct ChainHeadTable {
+    shards: Box<[ChainHeadShard; CHAIN_HEAD_SHARDS]>,
+}
+
+impl ChainHeadTable {
+    /// Create a new empty chain head table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            shards: Box::new(std::array::from_fn(|_| ChainHeadShard::new())),
+        }
+    }
+
+    /// Compute the shard index for a page number.
+    #[inline]
+    fn shard_index(pgno: PageNumber) -> usize {
+        (pgno.get() as usize) & (CHAIN_HEAD_SHARDS - 1)
+    }
+
+    /// Pack a `VersionIdx` into a u64 for atomic storage.
+    #[inline]
+    fn pack_idx(idx: VersionIdx) -> u64 {
+        let chunk = u64::from(idx.chunk());
+        let offset = u64::from(idx.offset());
+        let generation = u64::from(idx.generation());
+        (generation << 32) | (chunk << 12) | offset
+    }
+
+    /// Unpack a u64 into a `VersionIdx`. Returns `None` for `CHAIN_HEAD_EMPTY`.
+    #[inline]
+    fn unpack_idx(raw: u64) -> Option<VersionIdx> {
+        if raw == CHAIN_HEAD_EMPTY {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let offset = (raw & 0xFFF) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let chunk = ((raw >> 12) & 0xF_FFFF) as u32;
+        #[allow(clippy::cast_possible_truncation)]
+        let generation = (raw >> 32) as u32;
+        Some(VersionIdx::new(chunk, offset, generation))
+    }
+
+    /// Get the current chain head for a page, if any.
+    #[must_use]
+    pub fn get_head(&self, pgno: PageNumber) -> Option<VersionIdx> {
+        let shard = &self.shards[Self::shard_index(pgno)];
+        let slot_idx = shard.slot_index(pgno)?;
+        let slots = shard.slots.read();
+        let raw = slots[slot_idx].load(Ordering::Acquire);
+        Self::unpack_idx(raw)
+    }
+
+    /// Install a new chain head for a page using CAS.
+    ///
+    /// `expected_prev` is what the caller believes the current head is (packed u64).
+    /// If the current head matches, it is atomically replaced with `new_head`.
+    ///
+    /// Returns `CasInstallResult::Installed` on success, or `CasInstallResult::Retry` on failure.
+    pub fn install(
+        &self,
+        pgno: PageNumber,
+        new_head: VersionIdx,
+        expected_prev: Option<VersionIdx>,
+    ) -> CasInstallResult {
+        let shard = &self.shards[Self::shard_index(pgno)];
+        let slot_idx = shard.ensure_slot(pgno);
+        let slots = shard.slots.read();
+        let expected_raw = expected_prev.map_or(CHAIN_HEAD_EMPTY, Self::pack_idx);
+        let new_raw = Self::pack_idx(new_head);
+
+        match slots[slot_idx].compare_exchange(
+            expected_raw,
+            new_raw,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => CasInstallResult::Installed {
+                previous: expected_prev,
+            },
+            Err(_) => CasInstallResult::Retry,
+        }
+    }
+
+    /// Install a new chain head using a CAS loop. Retries until successful.
+    ///
+    /// Returns the previous head (if any) and the number of CAS attempts.
+    pub fn install_with_retry(
+        &self,
+        pgno: PageNumber,
+        new_head: VersionIdx,
+    ) -> (Option<VersionIdx>, u32) {
+        let shard = &self.shards[Self::shard_index(pgno)];
+        let slot_idx = shard.ensure_slot(pgno);
+        let slots = shard.slots.read();
+        let new_raw = Self::pack_idx(new_head);
+        let mut attempts = 0_u32;
+
+        loop {
+            attempts += 1;
+            let current_raw = slots[slot_idx].load(Ordering::Acquire);
+            match slots[slot_idx].compare_exchange_weak(
+                current_raw,
+                new_raw,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let previous = Self::unpack_idx(current_raw);
+                    return (previous, attempts);
+                }
+                Err(_) => {
+                    // CAS failed, loop will retry.
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    /// Remove a chain head by CAS-ing it to `CHAIN_HEAD_EMPTY`.
+    ///
+    /// Returns `true` if the head was successfully removed (matched expected).
+    pub fn remove(&self, pgno: PageNumber, expected: VersionIdx) -> bool {
+        let shard = &self.shards[Self::shard_index(pgno)];
+        let Some(slot_idx) = shard.slot_index(pgno) else {
+            return false;
+        };
+        let slots = shard.slots.read();
+        let expected_raw = Self::pack_idx(expected);
+        slots[slot_idx]
+            .compare_exchange(
+                expected_raw,
+                CHAIN_HEAD_EMPTY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Iterate over all registered pages and their current heads.
+    ///
+    /// This acquires directory locks shard-by-shard and is intended for
+    /// diagnostics/sampling, not hot paths.
+    pub fn for_each_head(&self, mut f: impl FnMut(PageNumber, VersionIdx)) {
+        for shard in self.shards.iter() {
+            let dir = shard.directory.lock();
+            let slots = shard.slots.read();
+            for (&pgno, &slot_idx) in dir.iter() {
+                let raw = slots[slot_idx].load(Ordering::Acquire);
+                if let Some(idx) = Self::unpack_idx(raw) {
+                    f(pgno, idx);
+                }
+            }
+        }
+    }
+
+    /// Count the number of pages with non-empty chain heads.
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        let mut count = 0;
+        for shard in self.shards.iter() {
+            let dir = shard.directory.lock();
+            let slots = shard.slots.read();
+            for &slot_idx in dir.values() {
+                let raw = slots[slot_idx].load(Ordering::Relaxed);
+                if raw != CHAIN_HEAD_EMPTY {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+}
+
+impl Default for ChainHeadTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for ChainHeadTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainHeadTable")
+            .field("shards", &CHAIN_HEAD_SHARDS)
+            .field("page_count", &self.page_count())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // VersionStore — version chain management
 // ---------------------------------------------------------------------------
 
@@ -233,8 +501,8 @@ pub struct SnapshotResolveTrace {
 /// maintains a mapping from each page to the head of its version chain.
 pub struct VersionStore {
     arena: RwLock<VersionArena>,
-    /// Maps each page to the head of its version chain (most recent committed version).
-    chain_heads: RwLock<HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>>,
+    /// Sharded, CAS-based chain head table (bd-688.3: latch-free).
+    chain_heads: ChainHeadTable,
     /// Visibility intervals keyed by arena index.
     visibility_ranges: RwLock<HashMap<VersionIdx, VersionVisibilityRange>>,
     page_size: PageSize,
@@ -256,7 +524,7 @@ impl VersionStore {
     ) -> Self {
         Self {
             arena: RwLock::new(VersionArena::new()),
-            chain_heads: RwLock::new(HashMap::with_hasher(PageNumberBuildHasher::default())),
+            chain_heads: ChainHeadTable::new(),
             visibility_ranges: RwLock::new(HashMap::new()),
             page_size,
             guard_registry,
@@ -279,14 +547,29 @@ impl VersionStore {
     pub fn publish(&self, version: PageVersion) -> VersionIdx {
         let pgno = version.pgno;
         let begin_ts = version.commit_seq;
+
+        // Step 1: Arena alloc (brief write lock).
         let mut arena = self.arena.write();
         let idx = arena.alloc(version);
         drop(arena);
 
-        let mut heads = self.chain_heads.write();
-        let previous_head = heads.insert(pgno, idx);
-        drop(heads);
+        // Step 2: CAS-based chain head install (lock-free).
+        let _span = tracing::info_span!(
+            "latchfree_install",
+            pgno = pgno.get(),
+            cas_attempts = tracing::field::Empty,
+            succeeded = tracing::field::Empty,
+        )
+        .entered();
 
+        let (previous_head, cas_attempts) = self.chain_heads.install_with_retry(pgno, idx);
+        record_cas_attempt(cas_attempts);
+
+        tracing::Span::current()
+            .record("cas_attempts", cas_attempts)
+            .record("succeeded", true);
+
+        // Step 3: Visibility ranges update (brief write lock).
         let mut ranges = self.visibility_ranges.write();
         ranges.insert(
             idx,
@@ -328,14 +611,12 @@ impl VersionStore {
         snapshot: &Snapshot,
     ) -> SnapshotResolveTrace {
         'retry: loop {
-            let heads = self.chain_heads.read();
-            let Some(&head_idx) = heads.get(&page) else {
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
                 return SnapshotResolveTrace {
                     version_idx: None,
                     versions_traversed: 0,
                 };
             };
-            drop(heads);
 
             let arena = self.arena.read();
             let ranges = self.visibility_ranges.read();
@@ -419,8 +700,7 @@ impl VersionStore {
     /// Get the chain head index for a page, if any.
     #[must_use]
     pub fn chain_head(&self, page: PageNumber) -> Option<VersionIdx> {
-        let heads = self.chain_heads.read();
-        heads.get(&page).copied()
+        self.chain_heads.get_head(page)
     }
 
     /// Look up the stored begin/end visibility range for a version index.
@@ -436,11 +716,9 @@ impl VersionStore {
     #[allow(clippy::significant_drop_tightening)]
     pub fn walk_chain(&self, page: PageNumber) -> Vec<PageVersion> {
         loop {
-            let heads = self.chain_heads.read();
-            let Some(&head_idx) = heads.get(&page) else {
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
                 return Vec::new();
             };
-            drop(heads);
 
             let arena = self.arena.read();
             let mut result = Vec::new();
@@ -510,12 +788,11 @@ impl VersionStore {
     #[allow(clippy::significant_drop_tightening)]
     pub fn gc_tick(&self, todo: &mut GcTodo, horizon: CommitSeq) -> GcTickResult {
         let mut arena = self.arena.write();
-        let mut chain_heads = self.chain_heads.write();
         let result = gc_tick_with_registry(
             todo,
             horizon,
             &mut arena,
-            &mut chain_heads,
+            &self.chain_heads,
             self.guard_registry(),
         );
         drop(arena);
@@ -534,18 +811,17 @@ impl VersionStore {
     ///
     /// Returns 0.0 if no pages exist.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn sample_chain_pressure(&self, sample_limit: usize) -> f64 {
         let arena = self.arena.read();
-        let heads = self.chain_heads.read();
-
-        if heads.is_empty() {
-            return 0.0;
-        }
 
         let mut total_length = 0_usize;
         let mut sampled = 0_usize;
 
-        for (&_pgno, &head_idx) in heads.iter().take(sample_limit) {
+        self.chain_heads.for_each_head(|_pgno, head_idx| {
+            if sampled >= sample_limit {
+                return;
+            }
             let mut current_idx = head_idx;
             let mut chain_len = 0_usize;
 
@@ -559,8 +835,7 @@ impl VersionStore {
 
             total_length += chain_len;
             sampled += 1;
-        }
-        drop(heads);
+        });
 
         if sampled == 0 {
             0.0
@@ -573,11 +848,10 @@ impl VersionStore {
 impl std::fmt::Debug for VersionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let arena = self.arena.read();
-        let heads = self.chain_heads.read();
         let ranges = self.visibility_ranges.read();
         f.debug_struct("VersionStore")
             .field("page_size", &self.page_size.get())
-            .field("page_count", &heads.len())
+            .field("page_count", &self.chain_heads.page_count())
             .field("visibility_range_count", &ranges.len())
             .field("arena_high_water", &arena.high_water())
             .field("guard_registry", &self.guard_registry)

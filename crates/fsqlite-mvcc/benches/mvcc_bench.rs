@@ -9,7 +9,6 @@
 //! - GC prune_page_chain (version chain garbage collection)
 //! - SSI edge discovery
 
-use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -18,14 +17,14 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use fsqlite_mvcc::{
-    ActiveTxnView, BeginKind, CommitIndex, CommittedWriterInfo, ConcurrentRegistry, DiscoveredEdge,
-    GcTodo, InProcessPageLockTable, TransactionManager, VersionArena, VersionIdx,
-    discover_incoming_edges, discover_outgoing_edges, gc_tick, prune_page_chain,
-    validate_first_committer_wins,
+    ActiveTxnView, BeginKind, ChainHeadTable, CommitIndex, CommittedWriterInfo,
+    ConcurrentRegistry, DiscoveredEdge, GcTodo, InProcessPageLockTable, TransactionManager,
+    VersionArena, discover_incoming_edges, discover_outgoing_edges, gc_tick,
+    prune_page_chain, validate_first_committer_wins,
 };
 use fsqlite_observability::{ConflictObserver, MetricsObserver};
 use fsqlite_types::{
-    CommitSeq, PageData, PageNumber, PageNumberBuildHasher, PageSize, PageVersion, SchemaEpoch,
+    CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch,
     Snapshot, TxnEpoch, TxnId, TxnToken, VersionPointer, WitnessKey,
 };
 
@@ -431,7 +430,7 @@ fn bench_fcw_conflict(c: &mut Criterion) {
 /// with commit sequences from `depth` down to 1.
 fn build_version_chain(
     arena: &mut VersionArena,
-    chain_heads: &mut HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>,
+    chain_heads: &ChainHeadTable,
     pgno: PageNumber,
     depth: u32,
 ) {
@@ -450,7 +449,7 @@ fn build_version_chain(
             (u64::from(idx.chunk()) << 32) | u64::from(idx.offset()),
         ));
         // The last insertion is the chain head.
-        chain_heads.insert(pgno, idx);
+        chain_heads.install_with_retry(pgno, idx);
     }
 }
 
@@ -469,19 +468,18 @@ fn bench_gc_prune(c: &mut Criterion) {
                 b.iter_batched(
                     || {
                         let mut arena = VersionArena::new();
-                        let mut chain_heads =
-                            HashMap::with_hasher(PageNumberBuildHasher::default());
-                        build_version_chain(&mut arena, &mut chain_heads, page(1), depth);
+                        let chain_heads = ChainHeadTable::new();
+                        build_version_chain(&mut arena, &chain_heads, page(1), depth);
                         (arena, chain_heads)
                     },
-                    |(mut arena, mut chain_heads)| {
+                    |(mut arena, chain_heads)| {
                         // Prune everything below horizon (keep only the newest).
                         let horizon = CommitSeq::new(u64::from(depth) - 1);
                         black_box(prune_page_chain(
                             page(1),
                             horizon,
                             &mut arena,
-                            &mut chain_heads,
+                            &chain_heads,
                         ));
                     },
                     BatchSize::SmallInput,
@@ -506,17 +504,17 @@ fn bench_gc_tick(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let mut arena = VersionArena::new();
-                    let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+                    let chain_heads = ChainHeadTable::new();
                     let mut todo = GcTodo::new();
                     for i in 1..=count {
-                        build_version_chain(&mut arena, &mut chain_heads, page(i), chain_depth);
+                        build_version_chain(&mut arena, &chain_heads, page(i), chain_depth);
                         todo.enqueue(page(i));
                     }
                     (todo, arena, chain_heads)
                 },
-                |(mut todo, mut arena, mut chain_heads)| {
+                |(mut todo, mut arena, chain_heads)| {
                     let horizon = CommitSeq::new(u64::from(chain_depth) - 1);
-                    black_box(gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads));
+                    black_box(gc_tick(&mut todo, horizon, &mut arena, &chain_heads));
                 },
                 BatchSize::SmallInput,
             );

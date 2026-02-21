@@ -859,6 +859,16 @@ pub fn evaluate_merge_ladder(
     base_row_reader: Option<&dyn BaseRowReader>,
     schema_lookup: Option<&dyn RebaseSchemaLookup>,
 ) -> Result<MergeLadderResult, MergeError> {
+    // Level 1: No conflict — base unchanged
+    if base_page == committed_page {
+        info!(
+            ladder_step = "level1",
+            result = "no_conflict",
+            "merge_ladder: base unchanged since snapshot"
+        );
+        return Ok(MergeLadderResult::NoConflict);
+    }
+
     // Policy OFF → always abort
     if policy == WriteMergePolicy::Off {
         info!(
@@ -868,16 +878,6 @@ pub fn evaluate_merge_ladder(
             "merge_ladder: policy OFF — skipping all merge attempts"
         );
         return Ok(MergeLadderResult::AbortBusySnapshot);
-    }
-
-    // Level 1: No conflict — base unchanged
-    if base_page == committed_page {
-        info!(
-            ladder_step = "level1",
-            result = "no_conflict",
-            "merge_ladder: base unchanged since snapshot"
-        );
-        return Ok(MergeLadderResult::NoConflict);
     }
 
     // Schema epoch check (required before any merge attempt)

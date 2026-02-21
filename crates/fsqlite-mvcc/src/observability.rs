@@ -141,6 +141,69 @@ pub fn reset_mvcc_snapshot_metrics() {
 }
 
 // ---------------------------------------------------------------------------
+// CAS Metrics (bd-688.3)
+// ---------------------------------------------------------------------------
+
+static FSQLITE_MVCC_CAS_ATTEMPTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_MVCC_CAS_RETRIES_LE_1: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_MVCC_CAS_RETRIES_LE_2: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_MVCC_CAS_RETRIES_LE_4: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_MVCC_CAS_RETRIES_GT_4: AtomicU64 = AtomicU64::new(0);
+
+/// Histogram buckets for CAS retry counts during chain head installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct CasRetriesHistogram {
+    pub le_1: u64,
+    pub le_2: u64,
+    pub le_4: u64,
+    pub gt_4: u64,
+}
+
+/// Point-in-time snapshot of CAS chain head installation metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct CasMetricsSnapshot {
+    /// Total number of CAS install operations attempted.
+    pub attempts_total: u64,
+    /// Histogram of CAS attempt counts per install operation.
+    pub retries: CasRetriesHistogram,
+}
+
+/// Record one CAS install operation with the given number of CAS attempts.
+pub fn record_cas_attempt(attempts: u32) {
+    FSQLITE_MVCC_CAS_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let bucket = match attempts {
+        0 | 1 => &FSQLITE_MVCC_CAS_RETRIES_LE_1,
+        2 => &FSQLITE_MVCC_CAS_RETRIES_LE_2,
+        3 | 4 => &FSQLITE_MVCC_CAS_RETRIES_LE_4,
+        _ => &FSQLITE_MVCC_CAS_RETRIES_GT_4,
+    };
+    bucket.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Take a point-in-time snapshot of CAS metrics.
+#[must_use]
+pub fn cas_metrics_snapshot() -> CasMetricsSnapshot {
+    CasMetricsSnapshot {
+        attempts_total: FSQLITE_MVCC_CAS_ATTEMPTS_TOTAL.load(Ordering::Relaxed),
+        retries: CasRetriesHistogram {
+            le_1: FSQLITE_MVCC_CAS_RETRIES_LE_1.load(Ordering::Relaxed),
+            le_2: FSQLITE_MVCC_CAS_RETRIES_LE_2.load(Ordering::Relaxed),
+            le_4: FSQLITE_MVCC_CAS_RETRIES_LE_4.load(Ordering::Relaxed),
+            gt_4: FSQLITE_MVCC_CAS_RETRIES_GT_4.load(Ordering::Relaxed),
+        },
+    }
+}
+
+/// Reset CAS metrics to zero (tests/diagnostics).
+pub fn reset_cas_metrics() {
+    FSQLITE_MVCC_CAS_ATTEMPTS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_MVCC_CAS_RETRIES_LE_1.store(0, Ordering::Relaxed);
+    FSQLITE_MVCC_CAS_RETRIES_LE_2.store(0, Ordering::Relaxed);
+    FSQLITE_MVCC_CAS_RETRIES_LE_4.store(0, Ordering::Relaxed);
+    FSQLITE_MVCC_CAS_RETRIES_GT_4.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
 // SSI Metrics (bd-688.2)
 // ---------------------------------------------------------------------------
 
