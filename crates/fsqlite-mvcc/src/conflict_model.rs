@@ -270,11 +270,6 @@ impl NitroSketch {
             return m * (m / zero_count).ln();
         }
 
-        let two_pow_32 = 4_294_967_296_f64;
-        if raw_estimate > two_pow_32 / 30.0 {
-            return -two_pow_32 * (1.0 - raw_estimate / two_pow_32).ln();
-        }
-
         raw_estimate
     }
 

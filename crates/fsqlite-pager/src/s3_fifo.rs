@@ -510,9 +510,7 @@ impl S3Fifo {
 
         match self.index.get(&page_id).copied() {
             Some(EntryState::Resident(state)) => {
-                if let Some(EntryState::Resident(meta)) = self.index.get_mut(&page_id) {
-                    meta.accessed = true;
-                }
+                self.access(page_id);
                 events.push(S3FifoEvent::AlreadyResident {
                     page_id,
                     queue: state.queue,
