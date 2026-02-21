@@ -1943,11 +1943,9 @@ impl Connection {
                 let update_cols: Vec<String> = update
                     .assignments
                     .iter()
-                    .map(|a| match &a.target {
-                        fsqlite_ast::AssignmentTarget::Column(c) => c.clone(),
-                        fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
-                            cols.first().cloned().unwrap_or_default()
-                        }
+                    .flat_map(|a| match &a.target {
+                        fsqlite_ast::AssignmentTarget::Column(c) => vec![c.clone()],
+                        fsqlite_ast::AssignmentTarget::ColumnList(cols) => cols.clone(),
                     })
                     .collect();
                 let update_event = fsqlite_ast::TriggerEvent::Update(update_cols);

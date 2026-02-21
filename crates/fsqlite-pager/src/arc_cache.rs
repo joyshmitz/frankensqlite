@@ -1068,6 +1068,7 @@ impl ArcCacheInner {
             self.directory.remove(&key);
             let ghost_idx = self.b1.push_back(key);
             self.directory.insert(key, Location::B1(ghost_idx));
+            self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
             return true;
         }
         if let Some(idx) = self.find_superseded_victim(&self.t2) {
@@ -1078,6 +1079,7 @@ impl ArcCacheInner {
             self.directory.remove(&key);
             let ghost_idx = self.b2.push_back(key);
             self.directory.insert(key, Location::B2(ghost_idx));
+            self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
             return true;
         }
         // Fallback: standard REPLACE with pinned-page fallback.
@@ -1163,6 +1165,7 @@ impl ArcCacheInner {
             self.directory.remove(&key);
             let ghost_idx = self.b1.push_back(key);
             self.directory.insert(key, Location::B1(ghost_idx));
+            self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
             return true;
         }
         if let Some(idx) = self.find_superseded_victim(&self.t2) {
@@ -1173,6 +1176,7 @@ impl ArcCacheInner {
             self.directory.remove(&key);
             let ghost_idx = self.b2.push_back(key);
             self.directory.insert(key, Location::B2(ghost_idx));
+            self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
             return true;
         }
         false
