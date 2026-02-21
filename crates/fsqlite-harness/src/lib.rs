@@ -7,6 +7,7 @@
 pub mod adversarial_search;
 pub mod backlog_quality_gate;
 pub mod benchmark_corpus;
+pub mod bloodstream;
 pub mod ci_coverage_gate;
 pub mod ci_gate_matrix;
 pub mod closure_wave;
