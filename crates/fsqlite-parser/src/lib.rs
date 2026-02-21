@@ -6,11 +6,19 @@
 pub mod expr;
 pub mod lexer;
 pub mod parser;
+pub mod semantic;
 pub mod token;
 
 pub use lexer::{
     Lexer, TokenizeDurationSecondsHistogram, TokenizeMetricsSnapshot, reset_tokenize_metrics,
     tokenize_metrics_snapshot,
 };
-pub use parser::{ParseError, Parser};
+pub use parser::{
+    ParseError, ParseMetricsSnapshot, Parser, parse_metrics_snapshot, reset_parse_metrics,
+};
+pub use semantic::{
+    ColumnDef as SemanticColumnDef, FunctionArity, ResolveResult, Resolver, Schema, Scope,
+    SemanticError, SemanticErrorKind, SemanticMetricsSnapshot, TableDef as SemanticTableDef,
+    reset_semantic_metrics, semantic_metrics_snapshot,
+};
 pub use token::{Token, TokenKind};

@@ -4,6 +4,7 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_ast::{
     AlterTableAction, AlterTableStatement, Assignment, AssignmentTarget, AttachStatement,
@@ -23,6 +24,33 @@ use fsqlite_ast::{
 
 use crate::lexer::Lexer;
 use crate::token::{Token, TokenKind};
+
+// ---------------------------------------------------------------------------
+// Parse metrics
+// ---------------------------------------------------------------------------
+
+/// Monotonic counter of successfully parsed statements.
+static FSQLITE_PARSE_STATEMENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Point-in-time parse metrics snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParseMetricsSnapshot {
+    /// Total statements successfully parsed.
+    pub fsqlite_parse_statements_total: u64,
+}
+
+/// Take a point-in-time snapshot of parse metrics.
+#[must_use]
+pub fn parse_metrics_snapshot() -> ParseMetricsSnapshot {
+    ParseMetricsSnapshot {
+        fsqlite_parse_statements_total: FSQLITE_PARSE_STATEMENTS_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset parse metrics (used by tests/diagnostics).
+pub fn reset_parse_metrics() {
+    FSQLITE_PARSE_STATEMENTS_TOTAL.store(0, Ordering::Relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -91,6 +119,14 @@ impl Parser {
     }
 
     pub fn parse_all(&mut self) -> (Vec<Statement>, Vec<ParseError>) {
+        let span = tracing::debug_span!(
+            target: "fsqlite.parse",
+            "parse",
+            ast_node_count = tracing::field::Empty,
+            parse_errors = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+
         let mut stmts = Vec::new();
         while !self.at_eof() {
             if self.check(&TokenKind::Semicolon) {
@@ -99,16 +135,27 @@ impl Parser {
             }
             match self.parse_statement() {
                 Ok(s) => {
+                    FSQLITE_PARSE_STATEMENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
                     stmts.push(s);
                     let _ = self.eat(&TokenKind::Semicolon);
                 }
                 Err(e) => {
+                    tracing::warn!(
+                        target: "fsqlite.parse",
+                        error = %e,
+                        "parse recovery: skipping malformed statement"
+                    );
                     self.errors.push(e);
                     self.synchronize();
                 }
             }
         }
-        (stmts, std::mem::take(&mut self.errors))
+
+        let errors = std::mem::take(&mut self.errors);
+        span.record("ast_node_count", stmts.len() as u64);
+        span.record("parse_errors", errors.len() as u64);
+
+        (stmts, errors)
     }
 
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
@@ -1958,7 +2005,7 @@ fn is_alias_terminator_kw(k: &TokenKind) -> bool {
 
 pub(crate) fn kw_to_str(k: &TokenKind) -> String {
     let dbg = format!("{k:?}");
-    dbg.strip_prefix("Kw").unwrap_or(&dbg).to_ascii_uppercase()
+    dbg.strip_prefix("Kw").unwrap_or(&dbg).to_ascii_lowercase()
 }
 
 // ---------------------------------------------------------------------------

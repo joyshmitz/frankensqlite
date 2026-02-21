@@ -383,16 +383,11 @@ impl<'a> Lexer<'a> {
             if self.src[self.pos] == b'/' && self.peek_at(1) == Some(b'*') {
                 self.advance(); // skip /
                 self.advance(); // skip *
-                let mut depth = 1u32;
-                while self.pos < self.src.len() && depth > 0 {
-                    if self.src[self.pos] == b'/' && self.peek_at(1) == Some(b'*') {
+                while self.pos < self.src.len() {
+                    if self.src[self.pos] == b'*' && self.peek_at(1) == Some(b'/') {
                         self.advance();
                         self.advance();
-                        depth += 1;
-                    } else if self.src[self.pos] == b'*' && self.peek_at(1) == Some(b'/') {
-                        self.advance();
-                        self.advance();
-                        depth -= 1;
+                        break;
                     } else {
                         self.advance();
                     }
@@ -679,7 +674,13 @@ impl<'a> Lexer<'a> {
         } else {
             match text.parse::<i64>() {
                 Ok(v) => TokenKind::Integer(v),
-                Err(_) => TokenKind::Error(format!("integer out of range: {text}")),
+                Err(_) => {
+                    // SQLite promotes oversized integers to REAL.
+                    match text.parse::<f64>() {
+                        Ok(v) => TokenKind::Float(v),
+                        Err(_) => TokenKind::Error(format!("integer out of range: {text}")),
+                    }
+                }
             }
         }
     }
