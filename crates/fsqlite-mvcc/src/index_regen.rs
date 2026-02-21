@@ -293,18 +293,9 @@ fn sqlite_concat(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     if matches!(a, SqliteValue::Null) || matches!(b, SqliteValue::Null) {
         return SqliteValue::Null;
     }
-    let sa = sqlite_value_to_text(a);
-    let sb = sqlite_value_to_text(b);
+    let sa = a.to_text();
+    let sb = b.to_text();
     SqliteValue::Text(format!("{sa}{sb}"))
-}
-
-fn sqlite_value_to_text(v: &SqliteValue) -> String {
-    match v {
-        SqliteValue::Null | SqliteValue::Blob(_) => String::new(),
-        SqliteValue::Integer(i) => i.to_string(),
-        SqliteValue::Float(f) => format!("{f}"),
-        SqliteValue::Text(s) => s.clone(),
-    }
 }
 
 use fsqlite_types::glossary::{RebaseBinaryOp, RebaseUnaryOp};
@@ -470,9 +461,8 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
                     SqliteValue::Null => SqliteValue::Null,
                     SqliteValue::Text(s) => SqliteValue::Integer(s.chars().count() as i64),
                     SqliteValue::Blob(b) => SqliteValue::Integer(b.len() as i64),
-                    other => {
-                        SqliteValue::Integer(sqlite_value_to_text(other).chars().count() as i64)
-                    }
+                    SqliteValue::Integer(n) => SqliteValue::Integer(n.to_string().len() as i64),
+                    SqliteValue::Float(f) => SqliteValue::Integer(f.to_string().len() as i64),
                 })
             } else {
                 Ok(SqliteValue::Null)

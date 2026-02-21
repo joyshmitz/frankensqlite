@@ -242,18 +242,20 @@ pub fn json_error_position(input: &str) -> usize {
 
             let mut current_line = 1usize;
             let mut current_col = 1usize;
-            for (idx, ch) in input.char_indices() {
+            let mut char_pos = 1usize;
+            for (_idx, ch) in input.char_indices() {
                 if current_line == line && current_col == column {
-                    return idx + 1;
+                    return char_pos;
                 }
                 if ch == '\n' {
                     current_line += 1;
                     current_col = 1;
                 } else {
-                    current_col += 1;
+                    current_col += ch.len_utf8();
                 }
+                char_pos += 1;
             }
-            input.len().saturating_add(1)
+            char_pos
         }
     }
 }

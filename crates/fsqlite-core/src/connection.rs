@@ -2312,8 +2312,8 @@ impl Connection {
                 ordered_values[target_idx] = row.values()[source_idx].clone();
             }
             match self.execute_with_params(&insert_sql, &ordered_values) {
-                Ok(_) => {
-                    statement_result = statement_result.map(|count| count.saturating_add(1));
+                Ok(affected) => {
+                    statement_result = statement_result.map(|count| count.saturating_add(affected));
                 }
                 Err(error) => {
                     statement_result = Err(error);
