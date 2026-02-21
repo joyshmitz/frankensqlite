@@ -9375,7 +9375,10 @@ fn format_expr_as_default(expr: &Expr) -> String {
             Literal::Integer(n) => n.to_string(),
             Literal::Float(f) => f.to_string(),
             Literal::String(s) => format!("'{s}'"),
-            Literal::Blob(b) => format!("X'{b}'"),
+            Literal::Blob(b) => {
+                let hex: String = b.iter().map(|byte| format!("{byte:02X}")).collect();
+                format!("X'{hex}'")
+            }
             Literal::Null => "NULL".to_string(),
             Literal::CurrentTime => "CURRENT_TIME".to_string(),
             Literal::CurrentDate => "CURRENT_DATE".to_string(),
@@ -9383,13 +9386,13 @@ fn format_expr_as_default(expr: &Expr) -> String {
             Literal::True => "1".to_string(),
             Literal::False => "0".to_string(),
         },
-        Expr::UnaryOp { op, operand, .. } => {
-            let inner = format_expr_as_default(operand);
+        Expr::UnaryOp { op, expr: inner, .. } => {
+            let inner_str = format_expr_as_default(inner);
             match op {
-                UnaryOp::Negate => format!("-{inner}"),
-                UnaryOp::Not => format!("NOT {inner}"),
-                UnaryOp::BitwiseNot => format!("~{inner}"),
-                UnaryOp::Plus => format!("+{inner}"),
+                UnaryOp::Negate => format!("-{inner_str}"),
+                UnaryOp::Not => format!("NOT {inner_str}"),
+                UnaryOp::BitNot => format!("~{inner_str}"),
+                UnaryOp::Plus => format!("+{inner_str}"),
             }
         }
         _ => format!("{expr:?}"),
