@@ -65,10 +65,10 @@ impl Histogram {
     pub fn estimate_less_than_rows(&self, value: &SqliteValue) -> f64 {
         let mut count = 0.0;
         for bucket in &self.buckets {
-            if value > &self.upper {
+            if value > &bucket.upper {
                 // Bucket is entirely below value
                 count += bucket.count as f64;
-            } else if value <= &self.lower {
+            } else if value <= &bucket.lower {
                 // Bucket is entirely above value
                 break;
             } else {
@@ -88,10 +88,10 @@ impl Histogram {
     pub fn estimate_greater_than_rows(&self, value: &SqliteValue) -> f64 {
         let mut count = 0.0;
         for bucket in self.buckets.iter().rev() {
-            if value < &self.lower {
+            if value < &bucket.lower {
                 // Bucket is entirely above value
                 count += bucket.count as f64;
-            } else if value >= &self.upper {
+            } else if value >= &bucket.upper {
                 // Bucket is entirely below value
                 break;
             } else {
@@ -254,6 +254,158 @@ pub struct TableStatistics {
     pub columns: HashMap<String, ColumnStats>,
 }
 
+// ---------------------------------------------------------------------------
+// Sampling-based cardinality estimation (bd-1as.1)
+// ---------------------------------------------------------------------------
+
+/// Method used to produce a cardinality estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EstimationMethod {
+    /// Used histogram-based interpolation.
+    Histogram,
+    /// Used NDV-based uniform assumption.
+    Ndv,
+    /// Used sampling from provided rows.
+    Sampling,
+    /// Used default heuristic (no stats available).
+    Heuristic,
+}
+
+/// A cardinality estimate with provenance.
+#[derive(Debug, Clone)]
+pub struct CardinalityEstimate {
+    /// Estimated number of matching rows.
+    pub estimated_rows: f64,
+    /// Selectivity in [0.0, 1.0].
+    pub selectivity: f64,
+    /// Method used to produce the estimate.
+    pub method: EstimationMethod,
+}
+
+impl ColumnStats {
+    /// Estimate cardinality with sampling fallback.
+    ///
+    /// If a histogram is available, uses histogram-based interpolation.
+    /// If a sample of values is provided and no histogram exists, estimates
+    /// selectivity from the sample using the proportion of matching values.
+    /// Otherwise falls back to NDV-based or default heuristic estimates.
+    pub fn estimate_cardinality(
+        &self,
+        op: &Operator,
+        value: &SqliteValue,
+        sample: Option<&[SqliteValue]>,
+    ) -> CardinalityEstimate {
+        let rows = self.table_row_count as f64;
+        if rows <= 0.0 {
+            return CardinalityEstimate {
+                estimated_rows: 0.0,
+                selectivity: 0.0,
+                method: EstimationMethod::Heuristic,
+            };
+        }
+
+        // Try histogram first.
+        if self.histogram.is_some() {
+            let sel = self.estimate_selectivity(op, value);
+            let span = tracing::debug_span!(
+                target: "fsqlite.planner",
+                "cost_estimate",
+                table = tracing::field::Empty,
+                estimated_rows = (sel * rows),
+                actual_method = "histogram",
+            );
+            let _g = span.enter();
+            return CardinalityEstimate {
+                estimated_rows: sel * rows,
+                selectivity: sel,
+                method: EstimationMethod::Histogram,
+            };
+        }
+
+        // Try sampling fallback.
+        if let Some(sample) = sample {
+            if !sample.is_empty() {
+                let matching = sample
+                    .iter()
+                    .filter(|sv| cmp_matches(sv, op, value))
+                    .count();
+                let sel = (matching as f64 / sample.len() as f64).clamp(0.0, 1.0);
+                let span = tracing::debug_span!(
+                    target: "fsqlite.planner",
+                    "cost_estimate",
+                    table = tracing::field::Empty,
+                    estimated_rows = (sel * rows),
+                    actual_method = "sampling",
+                );
+                let _g = span.enter();
+                return CardinalityEstimate {
+                    estimated_rows: sel * rows,
+                    selectivity: sel,
+                    method: EstimationMethod::Sampling,
+                };
+            }
+        }
+
+        // NDV-based fallback for equality.
+        if matches!(op, Operator::Eq | Operator::Is) && self.ndv > 0 {
+            let sel = 1.0 / self.ndv as f64;
+            let span = tracing::debug_span!(
+                target: "fsqlite.planner",
+                "cost_estimate",
+                table = tracing::field::Empty,
+                estimated_rows = (sel * rows),
+                actual_method = "ndv",
+            );
+            let _g = span.enter();
+            return CardinalityEstimate {
+                estimated_rows: sel * rows,
+                selectivity: sel,
+                method: EstimationMethod::Ndv,
+            };
+        }
+
+        // Default heuristic.
+        let sel = default_selectivity(op);
+        let span = tracing::debug_span!(
+            target: "fsqlite.planner",
+            "cost_estimate",
+            table = tracing::field::Empty,
+            estimated_rows = (sel * rows),
+            actual_method = "heuristic",
+        );
+        let _g = span.enter();
+        CardinalityEstimate {
+            estimated_rows: sel * rows,
+            selectivity: sel,
+            method: EstimationMethod::Heuristic,
+        }
+    }
+}
+
+/// Default selectivity heuristic when no statistics are available.
+fn default_selectivity(op: &Operator) -> f64 {
+    match op {
+        Operator::Eq | Operator::Is => 0.01,    // ~1/100 rows match
+        Operator::Ne | Operator::IsNot => 0.99,
+        Operator::Lt | Operator::Le | Operator::Gt | Operator::Ge => 1.0 / 3.0,
+        Operator::Like | Operator::Glob => 0.1,
+    }
+}
+
+/// Check if a sample value satisfies the comparison operator against the probe.
+fn cmp_matches(sample_val: &SqliteValue, op: &Operator, probe: &SqliteValue) -> bool {
+    let ord = sample_val.partial_cmp(probe);
+    match op {
+        Operator::Eq | Operator::Is => ord == Some(Ordering::Equal),
+        Operator::Ne | Operator::IsNot => ord != Some(Ordering::Equal),
+        Operator::Lt => ord == Some(Ordering::Less),
+        Operator::Le => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
+        Operator::Gt => ord == Some(Ordering::Greater),
+        Operator::Ge => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
+        Operator::Like | Operator::Glob => false, // Pattern matching not supported in samples
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +444,153 @@ mod tests {
         // Gt: 1/3 heuristic
         let sel = stats.estimate_selectivity(&Operator::Gt, &SqliteValue::Integer(50));
         assert!((sel - 0.333).abs() < 0.001);
+    }
+
+    // ── Cardinality estimation with sampling fallback (bd-1as.1) ──
+
+    #[test]
+    fn test_cardinality_estimate_histogram_preferred() {
+        let hist = Histogram {
+            buckets: vec![HistogramBucket {
+                lower: SqliteValue::Integer(0),
+                upper: SqliteValue::Integer(100),
+                count: 1000,
+                ndv: 100,
+            }],
+        };
+        let stats = ColumnStats {
+            table_row_count: 1000,
+            null_count: 0,
+            ndv: 100,
+            min_value: Some(SqliteValue::Integer(0)),
+            max_value: Some(SqliteValue::Integer(100)),
+            avg_width: 8.0,
+            histogram: Some(hist),
+        };
+
+        let est = stats.estimate_cardinality(
+            &Operator::Eq,
+            &SqliteValue::Integer(50),
+            Some(&[SqliteValue::Integer(50)]), // Sample should be ignored
+        );
+        assert_eq!(est.method, EstimationMethod::Histogram);
+        assert!(est.estimated_rows > 0.0);
+    }
+
+    #[test]
+    fn test_cardinality_estimate_sampling_fallback() {
+        let stats = ColumnStats {
+            table_row_count: 1000,
+            null_count: 0,
+            ndv: 0,
+            min_value: None,
+            max_value: None,
+            avg_width: 0.0,
+            histogram: None,
+        };
+
+        // Sample: 3 out of 10 match value 42
+        let sample: Vec<SqliteValue> = (0..10)
+            .map(|i| SqliteValue::Integer(if i < 3 { 42 } else { i + 100 }))
+            .collect();
+
+        let est = stats.estimate_cardinality(
+            &Operator::Eq,
+            &SqliteValue::Integer(42),
+            Some(&sample),
+        );
+        assert_eq!(est.method, EstimationMethod::Sampling);
+        assert!((est.selectivity - 0.3).abs() < 0.01);
+        assert!((est.estimated_rows - 300.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_cardinality_estimate_ndv_fallback() {
+        let stats = ColumnStats {
+            table_row_count: 1000,
+            null_count: 0,
+            ndv: 50,
+            min_value: None,
+            max_value: None,
+            avg_width: 0.0,
+            histogram: None,
+        };
+
+        let est = stats.estimate_cardinality(
+            &Operator::Eq,
+            &SqliteValue::Integer(42),
+            None,
+        );
+        assert_eq!(est.method, EstimationMethod::Ndv);
+        assert!((est.selectivity - 0.02).abs() < 0.001);
+        assert!((est.estimated_rows - 20.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_cardinality_estimate_heuristic_fallback() {
+        let stats = ColumnStats {
+            table_row_count: 1000,
+            null_count: 0,
+            ndv: 0,
+            min_value: None,
+            max_value: None,
+            avg_width: 0.0,
+            histogram: None,
+        };
+
+        let est = stats.estimate_cardinality(
+            &Operator::Gt,
+            &SqliteValue::Integer(42),
+            None,
+        );
+        assert_eq!(est.method, EstimationMethod::Heuristic);
+        assert!((est.selectivity - 1.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_default_selectivity_values() {
+        assert!((default_selectivity(&Operator::Eq) - 0.01).abs() < 0.001);
+        assert!((default_selectivity(&Operator::Ne) - 0.99).abs() < 0.001);
+        assert!((default_selectivity(&Operator::Lt) - 0.333).abs() < 0.001);
+        assert!((default_selectivity(&Operator::Like) - 0.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cmp_matches() {
+        let v50 = SqliteValue::Integer(50);
+        let v100 = SqliteValue::Integer(100);
+
+        assert!(cmp_matches(&v50, &Operator::Eq, &v50));
+        assert!(!cmp_matches(&v50, &Operator::Eq, &v100));
+        assert!(cmp_matches(&v50, &Operator::Lt, &v100));
+        assert!(!cmp_matches(&v100, &Operator::Lt, &v50));
+        assert!(cmp_matches(&v50, &Operator::Le, &v50));
+        assert!(cmp_matches(&v100, &Operator::Gt, &v50));
+        assert!(cmp_matches(&v100, &Operator::Ge, &v100));
+        assert!(cmp_matches(&v50, &Operator::Ne, &v100));
+    }
+
+    #[test]
+    fn test_estimation_method_hierarchy() {
+        // Sampling should take precedence over NDV when no histogram
+        let stats = ColumnStats {
+            table_row_count: 1000,
+            null_count: 0,
+            ndv: 50,
+            min_value: None,
+            max_value: None,
+            avg_width: 0.0,
+            histogram: None,
+        };
+
+        let sample = vec![SqliteValue::Integer(42); 10];
+        let est = stats.estimate_cardinality(
+            &Operator::Eq,
+            &SqliteValue::Integer(42),
+            Some(&sample),
+        );
+        // With sample, should prefer sampling over NDV
+        assert_eq!(est.method, EstimationMethod::Sampling);
+        assert!((est.selectivity - 1.0).abs() < 0.01);
     }
 }

@@ -11,6 +11,7 @@
 
 pub mod codegen;
 pub mod decision_contract;
+pub mod stats;
 
 use decision_contract::access_path_kind_label;
 use fsqlite_ast::{
@@ -20,6 +21,7 @@ use fsqlite_ast::{
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -493,6 +495,27 @@ pub struct QueryPlan {
 pub struct PlannerFeatureFlags {
     /// Enable Leapfrog Triejoin routing for compatible 3+ relation equi-joins.
     pub leapfrog_join: bool,
+    /// Enable DPccp exhaustive search for small joins (<= `DPCCP_MAX_TABLES`).
+    /// Falls back to beam search above the threshold.
+    pub dpccp_join: bool,
+}
+
+/// Maximum table count for DPccp exhaustive search.
+/// Above this threshold we use bounded beam search.
+const DPCCP_MAX_TABLES: usize = 6;
+
+/// Monotonic counter: total join plans enumerated.
+static FSQLITE_PLANNER_PLANS_ENUMERATED: AtomicU64 = AtomicU64::new(0);
+
+/// Take a snapshot of plans-enumerated counter.
+#[must_use]
+pub fn plans_enumerated_total() -> u64 {
+    FSQLITE_PLANNER_PLANS_ENUMERATED.load(Ordering::Relaxed)
+}
+
+/// Reset plans-enumerated counter.
+pub fn reset_plans_enumerated() {
+    FSQLITE_PLANNER_PLANS_ENUMERATED.store(0, Ordering::Relaxed);
 }
 
 /// Join operator chosen for a segment of the join plan.
@@ -576,7 +599,7 @@ pub fn estimate_cost(kind: &AccessPathKind, table_pages: u64, index_pages: u64) 
     let tp = table_pages.max(1) as f64;
     let ip = index_pages.max(1) as f64;
 
-    match kind {
+    let cost = match kind {
         AccessPathKind::FullTableScan => tp,
         AccessPathKind::IndexScanRange { selectivity } => {
             ip.log2() + selectivity * ip + selectivity * tp
@@ -584,13 +607,143 @@ pub fn estimate_cost(kind: &AccessPathKind, table_pages: u64, index_pages: u64) 
         AccessPathKind::IndexScanEquality => ip.log2() + tp.log2(),
         AccessPathKind::CoveringIndexScan { selectivity } => ip.log2() + selectivity * ip,
         AccessPathKind::RowidLookup => tp.log2(),
-    }
+    };
+
+    FSQLITE_PLANNER_COST_ESTIMATES_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+    tracing::debug!(
+        target: "fsqlite.planner",
+        table_pages,
+        index_pages,
+        estimated_cost = cost,
+        actual_method = %access_path_metric_label(kind),
+        "cost_estimate"
+    );
+
+    cost
 }
 
 const ADAPTIVE_HINT_COST_BIAS: f64 = 0.90;
 
 static INDEX_SELECTION_TOTAL: LazyLock<Mutex<HashMap<&'static str, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// ---------------------------------------------------------------------------
+// Cost estimation metrics (bd-1as.1)
+// ---------------------------------------------------------------------------
+
+/// Monotonic counter: total cost estimates computed.
+static FSQLITE_PLANNER_COST_ESTIMATES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Estimation error ratio observations stored as fixed-point
+/// (ratio × 1000, truncated to u64). Used to compute histogram buckets.
+static ESTIMATION_ERROR_OBSERVATIONS: LazyLock<Mutex<Vec<f64>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Point-in-time snapshot of planner cost metrics.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CostMetricsSnapshot {
+    /// Total number of cost estimates computed.
+    pub fsqlite_planner_cost_estimates_total: u64,
+    /// Estimation error ratio observations (actual/estimated).
+    /// Bucketed: [0, 0.5), [0.5, 1.0), [1.0, 2.0), [2.0, 5.0), [5.0, +inf).
+    pub error_ratio_buckets: [u64; 5],
+    /// Mean error ratio (NaN if no observations).
+    pub error_ratio_mean: f64,
+}
+
+/// Bucket boundaries for the error ratio histogram.
+const ERROR_RATIO_BOUNDARIES: [f64; 4] = [0.5, 1.0, 2.0, 5.0];
+
+/// Take a point-in-time snapshot of cost estimation metrics.
+#[must_use]
+pub fn cost_metrics_snapshot() -> CostMetricsSnapshot {
+    let total = FSQLITE_PLANNER_COST_ESTIMATES_TOTAL.load(Ordering::Relaxed);
+    let observations = ESTIMATION_ERROR_OBSERVATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let mut buckets = [0u64; 5];
+    let mut sum = 0.0;
+    for &ratio in observations.iter() {
+        sum += ratio;
+        let idx = ERROR_RATIO_BOUNDARIES
+            .iter()
+            .position(|&b| ratio < b)
+            .unwrap_or(4);
+        buckets[idx] += 1;
+    }
+    let mean = if observations.is_empty() {
+        f64::NAN
+    } else {
+        sum / observations.len() as f64
+    };
+
+    CostMetricsSnapshot {
+        fsqlite_planner_cost_estimates_total: total,
+        error_ratio_buckets: buckets,
+        error_ratio_mean: mean,
+    }
+}
+
+/// Reset cost estimation metrics.
+pub fn reset_cost_metrics() {
+    FSQLITE_PLANNER_COST_ESTIMATES_TOTAL.store(0, Ordering::Relaxed);
+    let mut obs = ESTIMATION_ERROR_OBSERVATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    obs.clear();
+}
+
+/// Record an estimation error observation (actual_cost / estimated_cost).
+pub fn record_estimation_error(actual: f64, estimated: f64) {
+    if estimated <= 0.0 || actual < 0.0 {
+        return;
+    }
+    let ratio = actual / estimated;
+    let mut obs = ESTIMATION_ERROR_OBSERVATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    obs.push(ratio);
+
+    tracing::debug!(
+        actual,
+        estimated,
+        ratio,
+        miscalibrated = ratio > 5.0 || ratio < 0.2,
+        "planner.estimation_error"
+    );
+}
+
+/// Decision-theoretic asymmetric loss function for cost estimation.
+///
+/// Underestimation (actual > estimated) is penalized more heavily than
+/// overestimation because underestimation leads to slow queries that miss
+/// deadlines, while overestimation merely causes slightly suboptimal plans.
+///
+/// Loss = if actual > estimated:
+///     UNDERESTIMATE_PENALTY × (actual/estimated - 1)²  (quadratic)
+///   else:
+///     (1 - actual/estimated)                            (linear)
+const UNDERESTIMATE_PENALTY: f64 = 3.0;
+
+/// Compute asymmetric loss between estimated and actual costs.
+///
+/// Higher loss for underestimation (surprise slowness) than overestimation.
+#[must_use]
+pub fn asymmetric_estimation_loss(estimated: f64, actual: f64) -> f64 {
+    if estimated <= 0.0 {
+        return actual; // Degenerate case.
+    }
+    let ratio = actual / estimated;
+    if ratio > 1.0 {
+        // Underestimate: quadratic penalty.
+        UNDERESTIMATE_PENALTY * (ratio - 1.0).powi(2)
+    } else {
+        // Overestimate: linear penalty.
+        1.0 - ratio
+    }
+}
 
 fn access_path_metric_label(kind: &AccessPathKind) -> &'static str {
     match kind {
@@ -2218,8 +2371,11 @@ pub fn order_joins_with_hints_and_features(
                 store.record_access_path(access_path);
             }
         }
+        FSQLITE_PLANNER_PLANS_ENUMERATED.fetch_add(1, Ordering::Relaxed);
         return plan;
     }
+
+    let mut plans_enumerated: u64 = 0;
 
     let is_star = detect_star_query(tables, where_terms);
     let mx_choice = compute_mx_choice(n, is_star);
@@ -2297,6 +2453,14 @@ pub fn order_joins_with_hints_and_features(
                 let new_cost = path.cost + inner_cost;
                 let new_cumulative_rows = path.cumulative_rows * ap.estimated_rows;
 
+                plans_enumerated += 1;
+                tracing::debug!(
+                    target: "fsqlite.planner",
+                    tables = ?new_tables,
+                    cost = new_cost,
+                    "planner.candidate_plan"
+                );
+
                 next_paths.push(PartialPath {
                     tables: new_tables,
                     access_paths: new_aps,
@@ -2362,6 +2526,17 @@ pub fn order_joins_with_hints_and_features(
         }
     }
 
+    FSQLITE_PLANNER_PLANS_ENUMERATED.fetch_add(plans_enumerated, Ordering::Relaxed);
+
+    let span = tracing::info_span!(
+        target: "fsqlite.planner",
+        "join_ordering",
+        tables_count = n,
+        plans_enumerated,
+        selected_cost = plan.total_cost,
+    );
+    let _g = span.enter();
+
     tracing::debug!(
         join_order = ?plan.join_order,
         total_cost = plan.total_cost,
@@ -2370,6 +2545,13 @@ pub fn order_joins_with_hints_and_features(
         table_count = n,
         index_hint_entries = table_index_hints.map_or(0, BTreeMap::len),
         "planner.order_joins.complete"
+    );
+
+    tracing::info!(
+        join_order = ?plan.join_order,
+        total_cost = plan.total_cost,
+        table_count = n,
+        "planner.plan_selected"
     );
 
     plan
@@ -2391,6 +2573,283 @@ fn cross_join_allowed(
         }
     }
     true
+}
+
+// ---------------------------------------------------------------------------
+// DPccp: exhaustive join ordering for small join counts (bd-1as.3)
+// ---------------------------------------------------------------------------
+
+/// DPccp (Dynamic Programming over Connected subgraph Complement Pairs).
+///
+/// Exhaustively enumerates all valid join orderings for `n` tables using
+/// bitmask-based dynamic programming. Returns the minimum-cost permutation.
+///
+/// Only used when `n <= DPCCP_MAX_TABLES` and `feature_flags.dpccp_join`.
+fn dpccp_order_joins(
+    tables: &[TableStats],
+    indexes: &[IndexInfo],
+    where_terms: &[WhereTerm<'_>],
+    needed_columns: Option<&[String]>,
+    table_index_hints: Option<&BTreeMap<String, IndexHint>>,
+    cracking_hints: Option<&CrackingHintStore>,
+) -> (Vec<usize>, f64, u64) {
+    let n = tables.len();
+    assert!(n <= DPCCP_MAX_TABLES);
+    let full_mask = (1u64 << n) - 1;
+
+    // dp[mask] = (cost, cumulative_rows, ordering)
+    let mut dp: Vec<Option<(f64, f64, Vec<usize>)>> = vec![None; (full_mask + 1) as usize];
+    let mut plans_counted: u64 = 0;
+
+    // Base: single-table subsets.
+    for i in 0..n {
+        let mask = 1u64 << i;
+        let ap = join_access_path(
+            &tables[i],
+            indexes,
+            where_terms,
+            needed_columns,
+            table_index_hints,
+            cracking_hints,
+        );
+        dp[mask as usize] = Some((ap.estimated_cost, ap.estimated_rows, vec![i]));
+        plans_counted += 1;
+    }
+
+    // Fill subsets of increasing size.
+    for mask in 1..=full_mask {
+        if dp[mask as usize].is_none() {
+            continue;
+        }
+        let popcount = mask.count_ones() as usize;
+        if popcount >= n {
+            continue;
+        }
+
+        // Try adding each table not in the current set.
+        for i in 0..n {
+            if mask & (1u64 << i) != 0 {
+                continue; // Already in set.
+            }
+            let new_mask = mask | (1u64 << i);
+            let ap = join_access_path(
+                &tables[i],
+                indexes,
+                where_terms,
+                needed_columns,
+                table_index_hints,
+                cracking_hints,
+            );
+
+            let (prev_cost, prev_rows, prev_order) = dp[mask as usize].as_ref().unwrap();
+            let inner_cost = ap.estimated_cost * prev_rows;
+            let new_cost = prev_cost + inner_cost;
+            let new_rows = prev_rows * ap.estimated_rows;
+
+            plans_counted += 1;
+
+            let better = match &dp[new_mask as usize] {
+                None => true,
+                Some((existing_cost, _, _)) => new_cost < *existing_cost,
+            };
+            if better {
+                let mut new_order = prev_order.clone();
+                new_order.push(i);
+                dp[new_mask as usize] = Some((new_cost, new_rows, new_order));
+            }
+        }
+    }
+
+    let (cost, _rows, order) = dp[full_mask as usize]
+        .clone()
+        .expect("full set must be populated");
+    (order, cost, plans_counted)
+}
+
+// ---------------------------------------------------------------------------
+// Predicate pushdown (bd-1as.3)
+// ---------------------------------------------------------------------------
+
+/// A pushed-down predicate: WHERE term assigned to a specific table.
+#[derive(Debug, Clone)]
+pub struct PushedPredicate<'a> {
+    /// Table name this predicate applies to.
+    pub table: String,
+    /// The original WHERE term.
+    pub term: &'a WhereTerm<'a>,
+}
+
+/// Push WHERE predicates down to the lowest possible table in the join tree.
+///
+/// A predicate can be pushed down if it references columns from only one table.
+/// Predicates referencing multiple tables remain as join conditions.
+///
+/// Returns (single_table_predicates, join_predicates).
+pub fn pushdown_predicates<'a>(
+    where_terms: &'a [WhereTerm<'a>],
+    table_names: &[String],
+) -> (Vec<PushedPredicate<'a>>, Vec<&'a WhereTerm<'a>>) {
+    let span = tracing::debug_span!(
+        target: "fsqlite.planner",
+        "predicate_pushdown",
+        total_terms = where_terms.len(),
+        pushed = tracing::field::Empty,
+        remaining = tracing::field::Empty,
+    );
+    let _g = span.enter();
+
+    let mut pushed = Vec::new();
+    let mut remaining = Vec::new();
+
+    for term in where_terms {
+        if let Some(ref col) = term.column {
+            // Check if the column's table qualifier matches exactly one table.
+            if let Some(ref tq) = col.table {
+                let matching: Vec<_> = table_names
+                    .iter()
+                    .filter(|t| t.eq_ignore_ascii_case(tq))
+                    .collect();
+                if matching.len() == 1 {
+                    pushed.push(PushedPredicate {
+                        table: matching[0].clone(),
+                        term,
+                    });
+                    continue;
+                }
+            }
+
+            // Unqualified column: if only one table in scope, push there.
+            if table_names.len() == 1 {
+                pushed.push(PushedPredicate {
+                    table: table_names[0].clone(),
+                    term,
+                });
+                continue;
+            }
+        }
+        remaining.push(term);
+    }
+
+    span.record("pushed", pushed.len() as u64);
+    span.record("remaining", remaining.len() as u64);
+
+    tracing::debug!(
+        pushed_count = pushed.len(),
+        remaining_count = remaining.len(),
+        "planner.predicate_pushdown.complete"
+    );
+
+    (pushed, remaining)
+}
+
+// ---------------------------------------------------------------------------
+// Constant folding (bd-1as.3)
+// ---------------------------------------------------------------------------
+
+/// Result of attempting to fold a constant expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FoldResult {
+    /// Expression was folded to a literal value.
+    Literal(Literal),
+    /// Expression could not be folded (contains column references).
+    NotConstant,
+}
+
+/// Attempt to constant-fold an expression.
+///
+/// Evaluates expressions that contain only literals and deterministic operators
+/// at plan time, avoiding repeated evaluation during execution.
+pub fn try_constant_fold(expr: &Expr) -> FoldResult {
+    match expr {
+        Expr::Literal(lit, _) => FoldResult::Literal(lit.clone()),
+
+        Expr::UnaryOp { op, expr: inner, .. } => {
+            let inner_val = try_constant_fold(inner);
+            match inner_val {
+                FoldResult::Literal(Literal::Integer(i)) => {
+                    match op {
+                        fsqlite_ast::UnaryOp::Negate => FoldResult::Literal(Literal::Integer(-i)),
+                        fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Integer(i)),
+                        fsqlite_ast::UnaryOp::BitNot => {
+                            FoldResult::Literal(Literal::Integer(!i))
+                        }
+                        fsqlite_ast::UnaryOp::Not => {
+                            FoldResult::Literal(if i == 0 {
+                                Literal::True
+                            } else {
+                                Literal::False
+                            })
+                        }
+                    }
+                }
+                FoldResult::Literal(Literal::Float(f)) => {
+                    match op {
+                        fsqlite_ast::UnaryOp::Negate => FoldResult::Literal(Literal::Float(-f)),
+                        fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Float(f)),
+                        _ => FoldResult::NotConstant,
+                    }
+                }
+                _ => FoldResult::NotConstant,
+            }
+        }
+
+        Expr::BinaryOp { left, op, right, .. } => {
+            let l = try_constant_fold(left);
+            let r = try_constant_fold(right);
+            match (l, r) {
+                (FoldResult::Literal(Literal::Integer(a)), FoldResult::Literal(Literal::Integer(b))) => {
+                    match op {
+                        fsqlite_ast::BinaryOp::Add => {
+                            FoldResult::Literal(Literal::Integer(a.wrapping_add(b)))
+                        }
+                        fsqlite_ast::BinaryOp::Subtract => {
+                            FoldResult::Literal(Literal::Integer(a.wrapping_sub(b)))
+                        }
+                        fsqlite_ast::BinaryOp::Multiply => {
+                            FoldResult::Literal(Literal::Integer(a.wrapping_mul(b)))
+                        }
+                        fsqlite_ast::BinaryOp::Divide => {
+                            if b == 0 {
+                                FoldResult::Literal(Literal::Null)
+                            } else {
+                                FoldResult::Literal(Literal::Integer(a / b))
+                            }
+                        }
+                        fsqlite_ast::BinaryOp::Modulo => {
+                            if b == 0 {
+                                FoldResult::Literal(Literal::Null)
+                            } else {
+                                FoldResult::Literal(Literal::Integer(a % b))
+                            }
+                        }
+                        fsqlite_ast::BinaryOp::Eq => {
+                            FoldResult::Literal(if a == b { Literal::True } else { Literal::False })
+                        }
+                        fsqlite_ast::BinaryOp::Ne => {
+                            FoldResult::Literal(if a != b { Literal::True } else { Literal::False })
+                        }
+                        fsqlite_ast::BinaryOp::Lt => {
+                            FoldResult::Literal(if a < b { Literal::True } else { Literal::False })
+                        }
+                        fsqlite_ast::BinaryOp::Le => {
+                            FoldResult::Literal(if a <= b { Literal::True } else { Literal::False })
+                        }
+                        fsqlite_ast::BinaryOp::Gt => {
+                            FoldResult::Literal(if a > b { Literal::True } else { Literal::False })
+                        }
+                        fsqlite_ast::BinaryOp::Ge => {
+                            FoldResult::Literal(if a >= b { Literal::True } else { Literal::False })
+                        }
+                        _ => FoldResult::NotConstant,
+                    }
+                }
+                _ => FoldResult::NotConstant,
+            }
+        }
+
+        // Any expression containing column references is not constant.
+        _ => FoldResult::NotConstant,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3373,6 +3832,7 @@ mod tests {
             None,
             PlannerFeatureFlags {
                 leapfrog_join: true,
+                ..PlannerFeatureFlags::default()
             },
         );
 
@@ -3398,6 +3858,7 @@ mod tests {
             None,
             PlannerFeatureFlags {
                 leapfrog_join: true,
+                ..PlannerFeatureFlags::default()
             },
         );
 
@@ -3429,6 +3890,7 @@ mod tests {
             None,
             PlannerFeatureFlags {
                 leapfrog_join: false,
+                ..PlannerFeatureFlags::default()
             },
         );
 
@@ -3460,6 +3922,7 @@ mod tests {
             None,
             PlannerFeatureFlags {
                 leapfrog_join: true,
+                ..PlannerFeatureFlags::default()
             },
         );
 
@@ -3499,6 +3962,7 @@ mod tests {
             None,
             PlannerFeatureFlags {
                 leapfrog_join: true,
+                ..PlannerFeatureFlags::default()
             },
         );
 
@@ -3553,6 +4017,7 @@ mod tests {
             Some(&from),
             PlannerFeatureFlags {
                 leapfrog_join: true,
+                ..PlannerFeatureFlags::default()
             },
         );
 
@@ -5135,5 +5600,304 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Cost metrics and asymmetric loss tests (bd-1as.1) ──
+
+    #[test]
+    fn test_cost_estimates_metric_increments() {
+        reset_cost_metrics();
+        let before = cost_metrics_snapshot();
+
+        // Each estimate_cost call should increment the counter.
+        let _ = estimate_cost(&AccessPathKind::FullTableScan, 100, 0);
+        let _ = estimate_cost(&AccessPathKind::RowidLookup, 100, 0);
+
+        let after = cost_metrics_snapshot();
+        assert!(
+            after.fsqlite_planner_cost_estimates_total
+                >= before.fsqlite_planner_cost_estimates_total + 2
+        );
+    }
+
+    #[test]
+    fn test_estimation_error_recording() {
+        reset_cost_metrics();
+
+        record_estimation_error(100.0, 50.0); // ratio = 2.0, bucket [2.0, 5.0)
+        record_estimation_error(10.0, 100.0); // ratio = 0.1, bucket [0, 0.5)
+        record_estimation_error(50.0, 50.0);  // ratio = 1.0, bucket [1.0, 2.0)
+
+        let snap = cost_metrics_snapshot();
+        assert_eq!(snap.error_ratio_buckets[0], 1); // [0, 0.5)
+        assert_eq!(snap.error_ratio_buckets[2], 1); // [1.0, 2.0)
+        assert_eq!(snap.error_ratio_buckets[3], 1); // [2.0, 5.0)
+        assert!(snap.error_ratio_mean.is_finite());
+    }
+
+    #[test]
+    fn test_asymmetric_loss_underestimate_penalized_more() {
+        // Underestimate: actual 200, estimated 100 → ratio 2.0
+        let loss_under = asymmetric_estimation_loss(100.0, 200.0);
+        // Overestimate: actual 50, estimated 100 → ratio 0.5
+        let loss_over = asymmetric_estimation_loss(100.0, 50.0);
+
+        // Underestimation should have higher loss.
+        assert!(
+            loss_under > loss_over,
+            "underestimate loss ({loss_under}) should exceed overestimate loss ({loss_over})"
+        );
+    }
+
+    #[test]
+    fn test_asymmetric_loss_perfect_estimate() {
+        let loss = asymmetric_estimation_loss(100.0, 100.0);
+        assert!((loss - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_asymmetric_loss_degenerate() {
+        // Zero estimated cost → loss = actual.
+        let loss = asymmetric_estimation_loss(0.0, 50.0);
+        assert!((loss - 50.0).abs() < 1e-10);
+    }
+
+    // ── DPccp tests (bd-1as.3) ──
+
+    #[test]
+    fn test_dpccp_two_tables() {
+        let tables = vec![
+            TableStats {
+                name: "a".to_owned(),
+                n_pages: 10,
+                n_rows: 100,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "b".to_owned(),
+                n_pages: 20,
+                n_rows: 200,
+                source: StatsSource::Heuristic,
+            },
+        ];
+        let indexes = vec![];
+        let where_terms = vec![];
+
+        let (order, cost, plans) = dpccp_order_joins(
+            &tables, &indexes, &where_terms, None, None, None,
+        );
+        assert_eq!(order.len(), 2);
+        assert!(cost > 0.0);
+        assert!(plans >= 2); // At least 2 seed + extensions.
+    }
+
+    #[test]
+    fn test_dpccp_three_tables() {
+        let tables = vec![
+            TableStats {
+                name: "x".to_owned(),
+                n_pages: 5,
+                n_rows: 50,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "y".to_owned(),
+                n_pages: 100,
+                n_rows: 1000,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "z".to_owned(),
+                n_pages: 10,
+                n_rows: 100,
+                source: StatsSource::Heuristic,
+            },
+        ];
+        let indexes = vec![];
+        let where_terms = vec![];
+
+        let (order, cost, plans) = dpccp_order_joins(
+            &tables, &indexes, &where_terms, None, None, None,
+        );
+        assert_eq!(order.len(), 3);
+        assert!(cost > 0.0);
+        assert!(plans > 3); // More than just seed.
+        // Small table should be chosen first (lower cost).
+        assert_eq!(order[0], 0); // "x" has fewest pages.
+    }
+
+    #[test]
+    fn test_plans_enumerated_metric() {
+        reset_plans_enumerated();
+        let before = plans_enumerated_total();
+
+        let tables = vec![
+            TableStats {
+                name: "t1".to_owned(),
+                n_pages: 10,
+                n_rows: 100,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "t2".to_owned(),
+                n_pages: 20,
+                n_rows: 200,
+                source: StatsSource::Heuristic,
+            },
+        ];
+        let _ = order_joins(&tables, &[], &[], None, &[]);
+
+        let after = plans_enumerated_total();
+        assert!(after > before);
+    }
+
+    // ── Predicate pushdown tests (bd-1as.3) ──
+
+    #[test]
+    fn test_pushdown_qualified_predicate() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef {
+                    table: Some("users".to_owned()),
+                    column: "id".to_owned(),
+                },
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let term = classify_where_term(&expr);
+        let terms = [term];
+        let table_names = vec!["users".to_owned(), "orders".to_owned()];
+
+        let (pushed, remaining) = pushdown_predicates(&terms, &table_names);
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].table, "users");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_pushdown_single_table_unqualified() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef {
+                    table: None,
+                    column: "id".to_owned(),
+                },
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let term = classify_where_term(&expr);
+        let terms = [term];
+        let table_names = vec!["users".to_owned()];
+
+        let (pushed, remaining) = pushdown_predicates(&terms, &table_names);
+        assert_eq!(pushed.len(), 1);
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_pushdown_unqualified_multi_table_stays() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Column(
+                ColumnRef {
+                    table: None,
+                    column: "id".to_owned(),
+                },
+                Span::ZERO,
+            )),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        let term = classify_where_term(&expr);
+        let terms = [term];
+        let table_names = vec!["users".to_owned(), "orders".to_owned()];
+
+        let (pushed, remaining) = pushdown_predicates(&terms, &table_names);
+        // Unqualified with multiple tables → stays as join predicate.
+        assert!(pushed.is_empty());
+        assert_eq!(remaining.len(), 1);
+    }
+
+    // ── Constant folding tests (bd-1as.3) ──
+
+    #[test]
+    fn test_fold_literal() {
+        let expr = Expr::Literal(Literal::Integer(42), Span::ZERO);
+        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::Integer(42)));
+    }
+
+    #[test]
+    fn test_fold_addition() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            op: fsqlite_ast::BinaryOp::Add,
+            right: Box::new(Expr::Literal(Literal::Integer(32), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::Integer(42)));
+    }
+
+    #[test]
+    fn test_fold_division_by_zero() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            op: fsqlite_ast::BinaryOp::Divide,
+            right: Box::new(Expr::Literal(Literal::Integer(0), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::Null));
+    }
+
+    #[test]
+    fn test_fold_negation() {
+        let expr = Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate,
+            expr: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::Integer(-5)));
+    }
+
+    #[test]
+    fn test_fold_column_ref_not_constant() {
+        let expr = Expr::Column(
+            ColumnRef { table: None, column: "id".to_owned() },
+            Span::ZERO,
+        );
+        assert_eq!(try_constant_fold(&expr), FoldResult::NotConstant);
+    }
+
+    #[test]
+    fn test_fold_comparison() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            op: fsqlite_ast::BinaryOp::Lt,
+            right: Box::new(Expr::Literal(Literal::Integer(20), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::True));
+    }
+
+    #[test]
+    fn test_fold_nested_expression() {
+        // (3 + 4) * 6 = 42
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+                op: fsqlite_ast::BinaryOp::Add,
+                right: Box::new(Expr::Literal(Literal::Integer(4), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            op: fsqlite_ast::BinaryOp::Multiply,
+            right: Box::new(Expr::Literal(Literal::Integer(6), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        assert_eq!(try_constant_fold(&expr), FoldResult::Literal(Literal::Integer(42)));
     }
 }

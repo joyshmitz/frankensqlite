@@ -465,6 +465,7 @@ fn codegen_insert_values(
     // Use first row to determine column count.
     let n_cols = rows[0].len();
     let val_regs = b.alloc_regs(n_cols as i32);
+    let mut param_idx = 1_i32;
 
     for row_values in rows {
         b.emit_op(
@@ -478,7 +479,25 @@ fn codegen_insert_values(
 
         for (i, val_expr) in row_values.iter().enumerate() {
             let reg = val_regs + i as i32;
-            emit_expr(b, val_expr, reg)?;
+            match val_expr {
+                Expr::Placeholder(pt, _) => {
+                    let idx = match pt {
+                        fsqlite_ast::PlaceholderType::Numbered(n) => *n as i32,
+                        _ => {
+                            let p = param_idx;
+                            param_idx += 1;
+                            p
+                        }
+                    };
+                    b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);
+                }
+                Expr::Literal(_, _) => {
+                    emit_expr(b, val_expr, reg)?;
+                }
+                _ => {
+                    return Err(CodegenError::Unsupported("INSERT currently supports only literal and placeholder values".to_owned()));
+                }
+            }
         }
 
         let rec_reg = b.alloc_reg();
@@ -686,10 +705,28 @@ pub fn codegen_update(
         })
         .collect::<Result<Vec<_>, CodegenError>>()?;
 
-    // Emit Variable ops for new values.
-    for (_col_idx, reg) in &new_val_regs {
-        emit_expr_or_variable(b, param_idx, *reg);
-        param_idx += 1;
+    // Emit ops for new values.
+    for (i, assign) in stmt.assignments.iter().enumerate() {
+        let (_col_idx, reg) = new_val_regs[i];
+        match &assign.value {
+            Expr::Placeholder(pt, _) => {
+                let idx = match pt {
+                    fsqlite_ast::PlaceholderType::Numbered(n) => *n as i32,
+                    _ => {
+                        let p = param_idx;
+                        param_idx += 1;
+                        p
+                    }
+                };
+                b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);
+            }
+            Expr::Literal(_, _) => {
+                emit_expr(b, &assign.value, reg)?;
+            }
+            _ => {
+                return Err(CodegenError::Unsupported("UPDATE currently supports only literal and placeholder assignments".to_owned()));
+            }
+        }
     }
 
     // Rowid bind parameter (required).
@@ -1074,10 +1111,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
     }
 }
 
-/// Emit a Variable instruction for a bind parameter.
-fn emit_expr_or_variable(b: &mut ProgramBuilder, param_idx: i32, reg: i32) {
-    b.emit_op(Opcode::Variable, param_idx, reg, 0, P4::None, 0);
-}
+
 
 // ---------------------------------------------------------------------------
 // Tests

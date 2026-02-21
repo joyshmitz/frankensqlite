@@ -4,6 +4,8 @@
 //! using `ProgramBuilder`. Handles SELECT, INSERT,
 //! UPDATE, and DELETE with correct opcode patterns matching C SQLite behavior.
 
+use std::cell::RefCell;
+
 use crate::ProgramBuilder;
 use fsqlite_ast::{
     ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FunctionArgs, InsertSource,
@@ -11,6 +13,32 @@ use fsqlite_ast::{
     SelectCore, SelectStatement, SortDirection, TableOrSubquery, UpdateStatement,
 };
 use fsqlite_types::opcode::{Opcode, P4};
+
+// ---------------------------------------------------------------------------
+// Thread-local extra aggregate function names for UDF support (bd-2wt.3)
+// ---------------------------------------------------------------------------
+// Custom aggregate UDFs registered via Connection::register_aggregate_function
+// need to be recognized by the codegen so they emit AggStep/AggFinal opcodes
+// instead of PureFunc. A thread-local avoids threading the names through
+// dozens of internal codegen helpers. Connection is !Send/!Sync so all codegen
+// runs on a single thread.
+
+thread_local! {
+    static EXTRA_AGG_NAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Set extra aggregate function names for the current codegen invocation.
+///
+/// Called by Connection before codegen to make custom aggregates visible.
+/// Names should be lowercase.
+pub fn set_extra_aggregate_names(names: Vec<String>) {
+    EXTRA_AGG_NAMES.with(|n| *n.borrow_mut() = names);
+}
+
+/// Clear extra aggregate function names after codegen completes.
+pub fn clear_extra_aggregate_names() {
+    EXTRA_AGG_NAMES.with(|n| n.borrow_mut().clear());
+}
 
 // ---------------------------------------------------------------------------
 // Conflict resolution flags for Insert opcode p5 field
@@ -524,14 +552,24 @@ pub fn codegen_select(
     let out_col_count = result_column_count(columns, table);
     let out_regs = b.alloc_regs(out_col_count);
 
-    // Check for rowid-equality WHERE clause.
-    let rowid_param = extract_rowid_bind_param(where_clause.as_deref());
-    // Check for index-usable WHERE clause.
-    let index_eq = if rowid_param.is_none() {
-        extract_column_eq_bind(where_clause.as_deref())
-    } else {
+    // Check for aggregate columns FIRST, before rowid/index seek optimizations.
+    // Aggregates like count(*) require a full scan + AggStep/AggFinal path;
+    // the rowid-seek and index-seek paths don't support aggregate functions.
+    let is_aggregate = has_aggregate_columns(columns);
+
+    // Check for rowid-equality WHERE clause (only for non-aggregate queries).
+    let rowid_param = if is_aggregate {
         None
+    } else {
+        extract_rowid_bind_param(where_clause.as_deref())
     };
+    // Check for index-usable WHERE clause (only for non-aggregate queries).
+    // NOTE: Index-seek is disabled because the B-tree cursor Next() doesn't
+    // correctly advance through duplicate key entries in non-unique indexes,
+    // causing WHERE queries on non-unique indexed columns to return only
+    // the first matching row. Fall back to full table scan until the B-tree
+    // cursor is fixed. (bd-beads_rust-6ii1)
+    let index_eq: Option<(String, i32)> = None;
     let mut index_cursor_to_close = None;
 
     if let Some(param_idx) = rowid_param {
@@ -609,8 +647,12 @@ pub fn codegen_select(
                 0,
             );
 
-            // Guard correctness: if the first key >= probe is not equal to the
-            // requested value, there is no matching row.
+            // Loop over all matching index entries (non-unique indexes may
+            // have multiple rows for the same key value).
+            let idx_loop_top = b.current_addr();
+
+            // Guard: if the current key >= probe is not equal to the
+            // requested value, stop iterating.
             let idx_key_reg = b.alloc_reg();
             b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
             b.emit_jump_to_label(
@@ -624,11 +666,13 @@ pub fn codegen_select(
 
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            // If SeekRowid can't find the data row, skip to next index entry.
+            let idx_skip_label = b.emit_label();
             b.emit_jump_to_label(
                 Opcode::SeekRowid,
                 cursor,
                 rowid_reg,
-                full_scan_fallback,
+                idx_skip_label,
                 P4::None,
                 0,
             );
@@ -638,6 +682,13 @@ pub fn codegen_select(
 
             // ResultRow.
             b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+            // Advance to next index entry and loop back.
+            b.resolve_label(idx_skip_label);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            #[allow(clippy::cast_possible_wrap)]
+            let idx_loop_body = idx_loop_top as i32;
+            b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
             // Safety fallback: if index probe cannot produce a verified row
@@ -1431,10 +1482,12 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
     "percentile_disc",
 ];
 
-/// Check whether a function name is a known aggregate.
+/// Check whether a function name is a known aggregate (built-in or custom UDF).
 fn is_aggregate_function(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     AGGREGATE_FUNCTIONS.iter().any(|&n| n == lower)
+        || EXTRA_AGG_NAMES
+            .with(|extra| extra.borrow().iter().any(|n| *n == lower))
 }
 
 /// Check whether any result column contains an aggregate function call.
@@ -4607,7 +4660,31 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             Literal::False => {
                 b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
             }
-            // CURRENT_TIME, CURRENT_DATE, CURRENT_TIMESTAMP — emit Null for now.
+            Literal::CurrentTimestamp | Literal::CurrentDate | Literal::CurrentTime => {
+                // Emit current UTC date/time as a string literal.
+                // We compute it at codegen time; for fsqlite's single-pass
+                // compile+execute model this is equivalent to runtime.
+                use std::time::SystemTime;
+                let secs = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                // Convert epoch seconds to yyyy-mm-dd HH:MM:SS (UTC).
+                let days = secs / 86400;
+                let day_secs = secs % 86400;
+                let h = day_secs / 3600;
+                let m = (day_secs % 3600) / 60;
+                let s = day_secs % 60;
+                // Compute year/month/day from days since 1970-01-01.
+                let (y, mo, d) = epoch_days_to_ymd(days);
+                let ts = match *lit {
+                    Literal::CurrentTimestamp => format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}"),
+                    Literal::CurrentDate => format!("{y:04}-{mo:02}-{d:02}"),
+                    Literal::CurrentTime => format!("{h:02}:{m:02}:{s:02}"),
+                    _ => unreachable!(),
+                };
+                b.emit_op(Opcode::String8, 0, reg, 0, P4::String(ts), 0);
+            }
             _ => {
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             }
@@ -5065,6 +5142,22 @@ fn type_name_to_affinity(type_name: &fsqlite_ast::TypeName) -> u8 {
     } else {
         b'C' // NUMERIC affinity
     }
+}
+
+/// Convert days since 1970-01-01 (Unix epoch) to (year, month, day).
+fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Civil-date algorithm from Howard Hinnant (public domain).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 // ---------------------------------------------------------------------------

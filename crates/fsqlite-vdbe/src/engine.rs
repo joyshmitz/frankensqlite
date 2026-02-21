@@ -2634,8 +2634,8 @@ impl VdbeEngine {
                                     4 => {
                                         // OE_IGNORE: Skip insert for conflicting row
                                     }
-                                    5 => {
-                                        // OE_REPLACE: Delete old, insert new (UPSERT)
+                                    5 | 8 => {
+                                        // OE_REPLACE (5) or OPFLAG_ISUPDATE (8): Delete old, insert new (UPSERT/UPDATE)
                                         sc.cursor.delete(&sc.cx)?;
                                         sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
                                     }
@@ -2663,8 +2663,8 @@ impl VdbeEngine {
                                     4 => {
                                         // OE_IGNORE: Skip insert for conflicting row
                                     }
-                                    5 => {
-                                        // OE_REPLACE: UPSERT semantics
+                                    5 | 8 => {
+                                        // OE_REPLACE / OPFLAG_ISUPDATE: UPSERT semantics
                                         db.upsert_row(root, rowid, values);
                                     }
                                     _ => {
@@ -3589,16 +3589,25 @@ impl VdbeEngine {
                 return true;
             }
 
-            // If a transaction-backed page exists but isn't a valid B-tree
-            // root (or a zero page we can initialize), refuse to open.
-            tracing::warn!(
-                root_page,
-                writable,
-                first_byte = page_data.first().copied().unwrap_or_default(),
-                is_zero_page,
-                "refusing storage cursor open on invalid transaction-backed root page"
-            );
-            return false;
+            // If the page is zero/invalid but MemDatabase has this table
+            // (e.g., materialized sqlite_master virtual table), fall through
+            // to the MemDatabase path below instead of refusing.
+            let has_mem_table = self
+                .db
+                .as_ref()
+                .map_or(false, |db| db.get_table(root_page).is_some());
+            if !has_mem_table {
+                // No MemDatabase fallback available — refuse to open.
+                tracing::warn!(
+                    root_page,
+                    writable,
+                    first_byte = page_data.first().copied().unwrap_or_default(),
+                    is_zero_page,
+                    "refusing storage cursor open on invalid transaction-backed root page"
+                );
+                return false;
+            }
+            // else: fall through to MemDatabase path
         }
 
         // Fallback: build a transient B-tree snapshot (Phase 4 path used by
@@ -3926,7 +3935,7 @@ fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
 /// SQL shift left (SQLite semantics: negative shift = shift right).
 fn sql_shift_left(val: i64, amount: i64) -> SqliteValue {
     if amount < 0 {
-        return sql_shift_right(val, -amount);
+        return sql_shift_right(val, amount.saturating_neg());
     }
     if amount >= 64 {
         return SqliteValue::Integer(0);
@@ -3940,7 +3949,7 @@ fn sql_shift_left(val: i64, amount: i64) -> SqliteValue {
 /// SQL shift right (SQLite semantics: negative shift = shift left).
 fn sql_shift_right(val: i64, amount: i64) -> SqliteValue {
     if amount < 0 {
-        return sql_shift_left(val, -amount);
+        return sql_shift_left(val, amount.saturating_neg());
     }
     if amount >= 64 {
         return SqliteValue::Integer(if val < 0 { -1 } else { 0 });
