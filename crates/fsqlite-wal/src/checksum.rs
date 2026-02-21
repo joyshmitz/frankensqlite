@@ -1310,10 +1310,7 @@ pub fn sqlite_wal_checksum(
         let x1 = decode_u32_words(&chunk[4..], big_endian_checksum_words);
 
         s1 = s1.wrapping_add(x0).wrapping_add(s2);
-        s2 = s2.wrapping_add(s1);
-
-        s1 = s1.wrapping_add(x1).wrapping_add(s2);
-        s2 = s2.wrapping_add(s1);
+        s2 = s2.wrapping_add(x1).wrapping_add(s1);
     }
 
     Ok(SqliteWalChecksum { s1, s2 })
