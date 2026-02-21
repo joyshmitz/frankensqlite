@@ -1499,8 +1499,12 @@ impl ArcCache {
             Ok(Ok(page)) => {
                 {
                     let mut inner = self.inner.lock();
-                    let post_lookup = inner.request(&key);
-                    if !matches!(post_lookup, CacheLookup::Hit) {
+                    if inner.get(&key).is_some() {
+                        // Someone else synchronously loaded it. Update LRU.
+                        let _ = inner.request(&key);
+                    } else {
+                        // Not resident. We already accounted for the miss/ghost hit in `lookup`.
+                        // Do not call `request` again to avoid double-counting misses.
                         debug_assert_eq!(page.key, key, "request_async loader returned wrong key");
                         inner.admit(key, page, lookup);
                     }
