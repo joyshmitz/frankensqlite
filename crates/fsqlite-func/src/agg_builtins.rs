@@ -175,8 +175,9 @@ impl AggregateFunction for GroupConcatFunc {
         if args[0].is_null() {
             return Ok(());
         }
-        // Set separator from second arg on first call if provided.
-        if args.len() > 1 && state.values.is_empty() && !args[1].is_null() {
+        // Set separator from second arg on EVERY call if provided, since it's an expression
+        // that could conceptually change, though usually it's a constant.
+        if args.len() > 1 && !args[1].is_null() {
             state.separator = args[1].to_text();
         }
         state.values.push(args[0].to_text());

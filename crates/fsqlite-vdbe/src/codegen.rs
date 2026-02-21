@@ -84,6 +84,27 @@ pub struct ColumnInfo {
     /// Column reads for IPK columns must emit `Rowid` instead of `Column`
     /// because the value is stored as the B-tree key, not in the data record.
     pub is_ipk: bool,
+    /// Type name as written in the CREATE TABLE statement (e.g. "TEXT", "INTEGER").
+    pub type_name: Option<String>,
+    /// True if the column has a NOT NULL constraint.
+    pub notnull: bool,
+    /// Default value expression as SQL text (e.g. "'open'", "0", "CURRENT_TIMESTAMP").
+    pub default_value: Option<String>,
+}
+
+impl ColumnInfo {
+    /// Create a basic `ColumnInfo` without type/notnull/default metadata.
+    #[must_use]
+    pub fn basic(name: impl Into<String>, affinity: char, is_ipk: bool) -> Self {
+        Self {
+            name: name.into(),
+            affinity,
+            is_ipk,
+            type_name: None,
+            notnull: false,
+            default_value: None,
+        }
+    }
 }
 
 /// Index metadata needed for codegen (index-scan SELECT).
@@ -5181,16 +5202,8 @@ mod tests {
             name: "t".to_owned(),
             root_page: 2,
             columns: vec![
-                ColumnInfo {
-                    name: "a".to_owned(),
-                    affinity: 'd',
-                    is_ipk: false,
-                },
-                ColumnInfo {
-                    name: "b".to_owned(),
-                    affinity: 'C',
-                    is_ipk: false,
-                },
+                ColumnInfo::basic("a", 'd', false),
+                ColumnInfo::basic("b", 'C', false),
             ],
             indexes: vec![],
         }]
