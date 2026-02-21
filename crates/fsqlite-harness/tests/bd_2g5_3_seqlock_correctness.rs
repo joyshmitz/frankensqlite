@@ -385,7 +385,7 @@ fn test_conformance_summary() {
         let sl = Arc::new(SeqLockPair::new(0, 0));
         let stop = Arc::new(AtomicBool::new(false));
         let torn = Arc::new(AtomicBool::new(false));
-        let barrier = Arc::new(Barrier::new(3));
+        let barrier = Arc::new(Barrier::new(2));
 
         let ws = Arc::clone(&sl);
         let wst = Arc::clone(&stop);

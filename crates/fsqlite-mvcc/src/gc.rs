@@ -215,6 +215,8 @@ pub struct PruneResult {
     /// When ARC is integrated (§6.5-6.7), the caller MUST remove these keys from
     /// ARC indexes and ghost lists to prevent memory leaks.
     pub pruned_keys: Vec<(PageNumber, CommitSeq)>,
+    /// `VersionIdx` of pruned versions, for visibility_ranges cleanup.
+    pub pruned_indices: Vec<VersionIdx>,
 }
 
 /// Prune the version chain for a single page, freeing versions older than the
@@ -258,6 +260,7 @@ pub fn prune_page_chain_with_registry(
             freed: 0,
             head_removed: false,
             pruned_keys: Vec::new(),
+            pruned_indices: Vec::new(),
         };
     };
 
@@ -286,6 +289,7 @@ pub fn prune_page_chain_with_registry(
             freed: 0,
             head_removed: false,
             pruned_keys: Vec::new(),
+            pruned_indices: Vec::new(),
         };
     };
 
@@ -306,11 +310,13 @@ pub fn prune_page_chain_with_registry(
     let retire_guard = VersionGuard::pin(Arc::clone(guard_registry));
     let mut freed = 0_u32;
     let mut pruned_keys = Vec::new();
+    let mut pruned_indices = Vec::new();
     let mut current = tail_idx;
     while let Some(idx) = current {
         let retired = arena.take(idx);
         let next = retired.prev.map(ptr_to_idx);
         pruned_keys.push((pgno, retired.commit_seq));
+        pruned_indices.push(idx);
         retire_guard.defer_retire(retired);
         freed += 1;
         current = next;
@@ -328,6 +334,7 @@ pub fn prune_page_chain_with_registry(
         freed,
         head_removed: false,
         pruned_keys,
+        pruned_indices,
     }
 }
 
@@ -353,6 +360,8 @@ pub struct GcTickResult {
     /// The caller MUST pass these to the ARC cache (when available) to remove
     /// stale entries from indexes and ghost lists (§6.7 normative rule).
     pub pruned_keys: Vec<(PageNumber, CommitSeq)>,
+    /// `VersionIdx` of pruned versions for visibility range cleanup.
+    pub pruned_indices: Vec<VersionIdx>,
 }
 
 /// Run one incremental GC pass: pop pages from the todo queue and prune their
@@ -400,6 +409,7 @@ pub fn gc_tick_with_registry(
     let mut pages_pruned = 0_u32;
     let mut versions_freed = 0_u32;
     let mut all_pruned_keys = Vec::new();
+    let mut all_pruned_indices = Vec::new();
 
     while pages_budget > 0 && versions_budget > 0 && !todo.is_empty() {
         let pgno = todo.pop().expect("queue is not empty");
@@ -407,6 +417,7 @@ pub fn gc_tick_with_registry(
             prune_page_chain_with_registry(pgno, horizon, arena, chain_heads, guard_registry);
         versions_freed += result.freed;
         all_pruned_keys.extend(result.pruned_keys);
+        all_pruned_indices.extend(result.pruned_indices);
         pages_pruned += 1;
         pages_budget -= 1;
         versions_budget = versions_budget.saturating_sub(result.freed);
@@ -445,6 +456,7 @@ pub fn gc_tick_with_registry(
         pages_budget_exhausted,
         queue_remaining: todo.len(),
         pruned_keys: all_pruned_keys,
+        pruned_indices: all_pruned_indices,
     }
 }
 

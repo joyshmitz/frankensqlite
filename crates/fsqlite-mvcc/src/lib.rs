@@ -15,14 +15,17 @@ pub mod coordinator_ipc;
 pub mod core_types;
 pub mod deterministic_rebase;
 pub mod ebr;
+pub mod flat_combining;
 pub mod gc;
 pub mod history_compression;
 pub mod hot_witness_index;
 pub mod index_regen;
 pub mod invariants;
+pub mod left_right;
 pub mod lifecycle;
 pub mod observability;
 pub mod physical_merge;
+pub mod rcu;
 pub mod retry_policy;
 pub mod rowid_alloc;
 pub mod seqlock;
@@ -92,6 +95,10 @@ pub use deterministic_rebase::{
 pub use ebr::{
     ReaderPinSnapshot, StaleReaderConfig, VersionGuard, VersionGuardRegistry, VersionGuardTicket,
 };
+pub use flat_combining::{
+    FcHandle, FlatCombiner, FlatCombiningMetrics, MAX_FC_THREADS, OP_ADD, OP_READ,
+    flat_combining_metrics, reset_flat_combining_metrics,
+};
 pub use gc::{
     GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GC_VERSIONS_BUDGET,
     GcScheduler, GcTickResult, GcTodo, PruneResult, gc_tick, prune_page_chain,
@@ -117,6 +124,10 @@ pub use invariants::{
     SerializedWriteMutex, SnapshotResolveTrace, TxnManager, VersionStore, VersionVisibilityRange,
     idx_to_version_pointer, visible,
 };
+pub use left_right::{
+    LeftRight, LeftRightMetrics, LeftRightPair, LeftRightTriple, leftright_metrics,
+    reset_leftright_metrics,
+};
 pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
 pub use observability::{
     SharedObserver, SnapshotReadMetricsSnapshot, SsiMetricsSnapshot, VersionsTraversedHistogram,
@@ -124,6 +135,10 @@ pub use observability::{
     mvcc_snapshot_established, mvcc_snapshot_metrics_snapshot, mvcc_snapshot_released,
     record_snapshot_read_versions_traversed, record_ssi_abort, record_ssi_commit,
     reset_mvcc_snapshot_metrics, reset_ssi_metrics, ssi_metrics_snapshot,
+};
+pub use rcu::{
+    MAX_RCU_THREADS, QsbrHandle, QsbrRegistry, RcuCell, RcuMetrics, RcuPair, RcuTriple,
+    record_rcu_reclaimed, reset_rcu_metrics, rcu_metrics,
 };
 pub use physical_merge::{
     CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,

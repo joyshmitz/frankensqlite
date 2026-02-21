@@ -509,13 +509,18 @@ impl VersionStore {
     pub fn gc_tick(&self, todo: &mut GcTodo, horizon: CommitSeq) -> GcTickResult {
         let mut arena = self.arena.write();
         let mut chain_heads = self.chain_heads.write();
-        gc_tick_with_registry(
+        let result = gc_tick_with_registry(
             todo,
             horizon,
             &mut arena,
             &mut chain_heads,
             self.guard_registry(),
-        )
+        );
+        let mut ranges = self.visibility_ranges.write();
+        for idx in &result.pruned_indices {
+            ranges.remove(idx);
+        }
+        result
     }
 
     /// Compute the average version chain length for GC pressure estimation.

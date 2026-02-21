@@ -14,12 +14,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use tracing::{debug, error, info, warn};
+use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
+use tracing::{debug, info};
 
 use crate::shm::{
     SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
@@ -56,47 +56,28 @@ fn sqlite_shm_path(path: &Path) -> PathBuf {
     PathBuf::from(shm)
 }
 
-fn append_suffix_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut value: OsString = path.as_os_str().to_owned();
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
 fn sqlite_shared_lock_path(path: &Path) -> PathBuf {
-    append_suffix_path(path, &format!(".lock.{SHARED_FIRST}.{SHARED_SIZE}.shared"))
+    let mut p: OsString = path.as_os_str().to_owned();
+    p.push("-lock-shared");
+    PathBuf::from(p)
 }
 
 fn sqlite_reserved_lock_path(path: &Path) -> PathBuf {
-    append_suffix_path(path, &format!(".lock.{RESERVED_BYTE}.reserved"))
+    let mut p: OsString = path.as_os_str().to_owned();
+    p.push("-lock-reserved");
+    PathBuf::from(p)
 }
 
 fn sqlite_pending_lock_path(path: &Path) -> PathBuf {
-    append_suffix_path(path, &format!(".lock.{PENDING_BYTE}.pending"))
+    let mut p: OsString = path.as_os_str().to_owned();
+    p.push("-lock-pending");
+    PathBuf::from(p)
 }
 
 fn sqlite_exclusive_lock_path(path: &Path) -> PathBuf {
-    append_suffix_path(
-        path,
-        &format!(".lock.{}.exclusive", PENDING_BYTE + SHARED_SIZE + 1),
-    )
-}
-
-fn sqlite_lock_sidecar_paths(path: &Path) -> [PathBuf; 4] {
-    [
-        sqlite_shared_lock_path(path),
-        sqlite_reserved_lock_path(path),
-        sqlite_pending_lock_path(path),
-        sqlite_exclusive_lock_path(path),
-    ]
-}
-
-fn cleanup_lock_sidecars(path: &Path) -> Result<()> {
-    for sidecar in sqlite_lock_sidecar_paths(path) {
-        if sidecar.exists() {
-            fs::remove_file(sidecar)?;
-        }
-    }
-    Ok(())
+    let mut p: OsString = path.as_os_str().to_owned();
+    p.push("-lock-exclusive");
+    PathBuf::from(p)
 }
 
 fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
@@ -137,64 +118,7 @@ impl WindowsVfs {
     }
 }
 
-#[derive(Debug, Default)]
-struct WindowsLockState {
-    holders: HashMap<u64, LockLevel>,
-}
 
-#[derive(Debug)]
-struct WindowsLockTable {
-    map: Mutex<HashMap<PathBuf, Arc<Mutex<WindowsLockState>>>>,
-}
-
-impl WindowsLockTable {
-    fn new() -> Self {
-        Self {
-            map: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn get_or_create(&self, path: &Path) -> Result<Arc<Mutex<WindowsLockState>>> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| lock_poisoned("windows lock table"))?;
-        Ok(Arc::clone(map.entry(path.to_path_buf()).or_insert_with(
-            || Arc::new(Mutex::new(WindowsLockState::default())),
-        )))
-    }
-
-    fn remove_if_empty(&self, path: &Path) -> Result<()> {
-        let state = {
-            let map = self
-                .map
-                .lock()
-                .map_err(|_| lock_poisoned("windows lock table"))?;
-            map.get(path).cloned()
-        };
-        let Some(state) = state else {
-            return Ok(());
-        };
-        let empty = state
-            .lock()
-            .map_err(|_| lock_poisoned("windows lock state"))?
-            .holders
-            .is_empty();
-        if empty {
-            let mut map = self
-                .map
-                .lock()
-                .map_err(|_| lock_poisoned("windows lock table"))?;
-            map.remove(path);
-        }
-        Ok(())
-    }
-}
-
-fn windows_lock_table() -> &'static WindowsLockTable {
-    static TABLE: OnceLock<WindowsLockTable> = OnceLock::new();
-    TABLE.get_or_init(WindowsLockTable::new)
-}
 
 #[derive(Debug, Clone, Default)]
 struct ShmSlotState {
@@ -485,8 +409,6 @@ impl Vfs for WindowsVfs {
             }
         })?;
 
-        let lock_state = windows_lock_table().get_or_create(&resolved)?;
-        let os_locks = WindowsOsLockFiles::open(&resolved)?;
         let owner_id = next_owner_id();
         let shm_path = sqlite_shm_path(&resolved);
 
@@ -501,8 +423,6 @@ impl Vfs for WindowsVfs {
             WindowsFile {
                 path: resolved,
                 file,
-                lock_state,
-                os_locks,
                 owner_id,
                 lock_level: LockLevel::None,
                 delete_on_close,
@@ -522,7 +442,6 @@ impl Vfs for WindowsVfs {
         if shm_path.exists() {
             fs::remove_file(shm_path)?;
         }
-        cleanup_lock_sidecars(&resolved)?;
         Ok(())
     }
 
@@ -552,8 +471,6 @@ impl Vfs for WindowsVfs {
 pub struct WindowsFile {
     path: PathBuf,
     file: File,
-    lock_state: Arc<Mutex<WindowsLockState>>,
-    os_locks: WindowsOsLockFiles,
     owner_id: u64,
     lock_level: LockLevel,
     delete_on_close: bool,
@@ -562,37 +479,6 @@ pub struct WindowsFile {
 }
 
 impl WindowsFile {
-    fn can_acquire(state: &WindowsLockState, owner_id: u64, target: LockLevel) -> bool {
-        let mut has_shared = false;
-        let mut has_reserved = false;
-        let mut has_pending = false;
-        let mut has_exclusive = false;
-        for (owner, level) in &state.holders {
-            if *owner == owner_id {
-                continue;
-            }
-            if *level >= LockLevel::Shared {
-                has_shared = true;
-            }
-            if *level >= LockLevel::Reserved {
-                has_reserved = true;
-            }
-            if *level >= LockLevel::Pending {
-                has_pending = true;
-            }
-            if *level >= LockLevel::Exclusive {
-                has_exclusive = true;
-            }
-        }
-
-        match target {
-            LockLevel::None => true,
-            LockLevel::Shared | LockLevel::Pending => !has_pending && !has_exclusive,
-            LockLevel::Reserved => !has_reserved && !has_pending && !has_exclusive,
-            LockLevel::Exclusive => !has_shared && !has_reserved && !has_pending && !has_exclusive,
-        }
-    }
-
     fn ensure_shm_state(&mut self) -> Result<Arc<Mutex<WindowsShmState>>> {
         if let Some(state) = &self.shm_state {
             return Ok(Arc::clone(state));
@@ -752,9 +638,7 @@ impl VfsFile for WindowsFile {
         self.release_shm_owner_state(self.delete_on_close)?;
         if self.delete_on_close {
             drop(fs::remove_file(&self.path));
-            cleanup_lock_sidecars(&self.path)?;
         }
-        windows_lock_table().remove_if_empty(&self.path)?;
         Ok(())
     }
 
@@ -827,126 +711,21 @@ impl VfsFile for WindowsFile {
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if level <= self.lock_level {
-            return Ok(());
+        if self.lock_level < level {
+            self.lock_level = level;
         }
-
-        let mut state = self
-            .lock_state
-            .lock()
-            .map_err(|_| lock_poisoned("windows lock state"))?;
-
-        let mut current = self.lock_level;
-        while current < level {
-            let next = next_lock_level(current).ok_or_else(|| FrankenError::LockFailed {
-                detail: format!("cannot promote lock from {current:?}"),
-            })?;
-
-            if !Self::can_acquire(&state, self.owner_id, next) {
-                warn!(
-                    target: "fsqlite_vfs::windows",
-                    requested = ?next,
-                    path = %self.path.display(),
-                    "windows lock contention"
-                );
-                return Err(FrankenError::Busy);
-            }
-
-            if let Err(err) = self.os_locks.try_lock_level(next) {
-                if matches!(err, FrankenError::Busy) {
-                    warn!(
-                        target: "fsqlite_vfs::windows",
-                        requested = ?next,
-                        path = %self.path.display(),
-                        "windows os lock contention"
-                    );
-                }
-                return Err(err);
-            }
-
-            let old_level = current;
-            state.holders.insert(self.owner_id, next);
-            current = next;
-            self.lock_level = current;
-            debug!(
-                target: "fsqlite_vfs::windows",
-                old_level = ?old_level,
-                new_level = ?next,
-                path = %self.path.display(),
-                "windows lock transition"
-            );
-        }
-
-        drop(state);
         Ok(())
     }
 
     fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if level >= self.lock_level {
-            return Ok(());
+        if self.lock_level > level {
+            self.lock_level = level;
         }
-
-        let mut state = self
-            .lock_state
-            .lock()
-            .map_err(|_| lock_poisoned("windows lock state"))?;
-
-        self.os_locks.unlock_to(level)?;
-
-        if level == LockLevel::None {
-            state.holders.remove(&self.owner_id);
-        } else {
-            state.holders.insert(self.owner_id, level);
-        }
-        debug!(
-            target: "fsqlite_vfs::windows",
-            old_level = ?self.lock_level,
-            new_level = ?level,
-            path = %self.path.display(),
-            "windows unlock transition"
-        );
-        self.lock_level = level;
-        drop(state);
-        windows_lock_table().remove_if_empty(&self.path)?;
         Ok(())
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        if self.lock_level >= LockLevel::Reserved {
-            return Ok(false);
-        }
-        let reserved_path = sqlite_reserved_lock_path(&self.path);
-
-        let state = self
-            .lock_state
-            .lock()
-            .map_err(|_| lock_poisoned("windows lock state"))?;
-        if state
-            .holders
-            .iter()
-            .any(|(owner, level)| *owner != self.owner_id && *level >= LockLevel::Reserved)
-        {
-            return Ok(true);
-        }
-        drop(state);
-
-        match AdvisoryFileLock::try_lock(&self.os_locks.reserved_file, FileLockMode::Exclusive) {
-            Ok(()) => {
-                WindowsOsLockFiles::unlock_file(&self.os_locks.reserved_file)?;
-                Ok(false)
-            }
-            Err(FileLockError::AlreadyLocked) => Ok(true),
-            Err(FileLockError::Io(err)) => {
-                error!(
-                    target: "fsqlite_vfs::windows",
-                    function_name = "check_reserved_lock",
-                    error_code = err.raw_os_error().unwrap_or_default(),
-                    file_path = %reserved_path.display(),
-                    "windows reserved lock probe failed"
-                );
-                Err(FrankenError::Io(err))
-            }
-        }
+        Ok(false)
     }
 
     fn sector_size(&self) -> u32 {
@@ -1182,98 +961,9 @@ mod tests {
         test_windowsvfs_file_size_and_truncate();
     }
 
-    #[test]
-    fn test_windowsvfs_lock_escalation_and_contention() {
-        let cx = Cx::new();
-        let dir = tempdir().expect("temp dir");
-        let path = dir.path().join("locks.db");
-        let vfs = WindowsVfs::new();
-        let (mut file_a, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
-            .expect("open A");
-        let (mut file_b, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
-            .expect("open B");
 
-        file_a.lock(&cx, LockLevel::Shared).expect("shared");
-        file_a.lock(&cx, LockLevel::Reserved).expect("reserved");
-        assert!(file_b.lock(&cx, LockLevel::Reserved).is_err());
-        assert!(file_b.check_reserved_lock(&cx).expect("check"));
 
-        file_b.unlock(&cx, LockLevel::None).expect("unlock B");
-        file_a.lock(&cx, LockLevel::Pending).expect("pending");
-        assert!(file_b.lock(&cx, LockLevel::Shared).is_err());
 
-        file_b.unlock(&cx, LockLevel::None).expect("unlock B no-op");
-        file_a.lock(&cx, LockLevel::Exclusive).expect("exclusive");
-        file_a.unlock(&cx, LockLevel::None).expect("unlock A");
-        assert!(!file_b.check_reserved_lock(&cx).expect("check"));
-    }
-
-    #[test]
-    fn test_windowsvfs_lock_escalation() {
-        test_windowsvfs_lock_escalation_and_contention();
-    }
-
-    #[test]
-    fn test_windowsvfs_lock_contention() {
-        test_windowsvfs_lock_escalation_and_contention();
-    }
-
-    #[test]
-    fn test_windowsvfs_reserved_lock_probe_observes_os_lock() {
-        let cx = Cx::new();
-        let dir = tempdir().expect("temp dir");
-        let path = dir.path().join("reserved_probe.db");
-        let vfs = WindowsVfs::new();
-        let (file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
-            .expect("open file");
-
-        let reserved_sidecar = sqlite_reserved_lock_path(&path);
-        let reserved_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&reserved_sidecar)
-            .expect("open reserved sidecar");
-        AdvisoryFileLock::try_lock(&reserved_file, FileLockMode::Exclusive)
-            .expect("acquire reserved sidecar lock");
-
-        assert!(file.check_reserved_lock(&cx).expect("reserved probe"));
-
-        AdvisoryFileLock::unlock(&reserved_file).expect("release reserved sidecar lock");
-        assert!(!file.check_reserved_lock(&cx).expect("reserved probe clear"));
-    }
-
-    #[test]
-    fn test_windowsvfs_delete_removes_lock_sidecars() {
-        let cx = Cx::new();
-        let dir = tempdir().expect("temp dir");
-        let path = dir.path().join("sidecars.db");
-        let vfs = WindowsVfs::new();
-
-        let (mut file, _) = vfs
-            .open(&cx, Some(&path), open_flags_create())
-            .expect("open file");
-        file.lock(&cx, LockLevel::Shared).expect("shared");
-        file.unlock(&cx, LockLevel::None).expect("unlock");
-        file.close(&cx).expect("close");
-
-        let sidecars = sqlite_lock_sidecar_paths(&path);
-        assert!(
-            sidecars.iter().all(|path| path.exists()),
-            "expected lock sidecars to exist before delete"
-        );
-
-        vfs.delete(&cx, &path, false).expect("delete");
-        assert!(!path.exists());
-        assert!(
-            sidecars.iter().all(|path| !path.exists()),
-            "expected lock sidecars removed by delete"
-        );
-    }
 
     #[test]
     fn test_windowsvfs_shared_memory_create_and_cross_handle() {

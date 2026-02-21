@@ -5154,6 +5154,7 @@ impl Connection {
                 pages_budget_exhausted: false,
                 queue_remaining: 0,
                 pruned_keys: Vec::new(),
+                pruned_indices: Vec::new(),
             };
         }
 

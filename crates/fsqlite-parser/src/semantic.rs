@@ -852,13 +852,14 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
 
         // Scalar functions
         "abs" | "hex" | "length" | "lower" | "upper" | "typeof" | "unicode" | "quote"
-        | "zeroblob" | "trim" | "ltrim" | "rtrim" | "soundex" | "char" | "likelihood" => {
+        | "zeroblob" | "soundex" | "likelihood" => {
             Some(FunctionArity::Exact(1))
         }
-        "ifnull" | "nullif" | "instr" | "like" | "glob" => Some(FunctionArity::Exact(2)),
+        "trim" | "ltrim" | "rtrim" => Some(FunctionArity::Range(1, 2)),
+        "ifnull" | "nullif" | "instr" | "glob" => Some(FunctionArity::Exact(2)),
         "iif" | "replace" => Some(FunctionArity::Exact(3)),
-        "substr" | "substring" => Some(FunctionArity::Range(2, 3)),
-        "coalesce" | "printf" | "format" => Some(FunctionArity::Variadic),
+        "substr" | "substring" | "like" => Some(FunctionArity::Range(2, 3)),
+        "coalesce" | "printf" | "format" | "char" => Some(FunctionArity::Variadic),
         "random" | "changes" | "last_insert_rowid" | "total_changes" => {
             Some(FunctionArity::Exact(0))
         }
