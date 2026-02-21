@@ -13,6 +13,7 @@ pub mod compat;
 pub mod conflict_model;
 pub mod coordinator_ipc;
 pub mod core_types;
+pub mod differential_privacy;
 pub mod deterministic_rebase;
 pub mod ebr;
 pub mod flat_combining;
@@ -25,6 +26,7 @@ pub mod left_right;
 pub mod lifecycle;
 pub mod observability;
 pub mod physical_merge;
+pub mod provenance;
 pub mod rcu;
 pub mod retry_policy;
 pub mod rowid_alloc;
@@ -32,6 +34,7 @@ pub mod seqlock;
 pub mod shared_lock_table;
 pub mod sheaf_conformal;
 pub mod shm;
+pub mod sketch_telemetry;
 pub mod ssi_abort_policy;
 pub mod ssi_validation;
 pub mod time_travel;
@@ -86,6 +89,10 @@ pub use core_types::{
     RebuildResult, SlotCleanupResult, Transaction, TransactionMode, TransactionState, VersionArena,
     VersionIdx, cleanup_and_raise_gc_horizon, cleanup_orphaned_slots, raise_gc_horizon,
     try_cleanup_orphaned_slot, try_cleanup_sentinel_slot,
+};
+pub use differential_privacy::{
+    DpEngine, DpError, DpMetrics, DpQueryResult, NoiseMechanism, PrivacyBudget, dp_metrics,
+    reset_dp_metrics, sensitivity,
 };
 pub use deterministic_rebase::{
     BaseRowReader, RebaseEligibility, RebaseError, RebaseResult, RebaseSchemaLookup, ReplayResult,
@@ -145,6 +152,10 @@ pub use physical_merge::{
     ParsedPage, RangeXorPatch, StructuredPagePatch, apply_patch, diff_parsed_pages,
     evaluate_merge_ladder, merge_structured_patches, parse_btree_page, repack_btree_page,
 };
+pub use provenance::{
+    ProvenanceAnnotation, ProvenanceMetrics, ProvenanceMode, ProvenanceReport, ProvenanceToken,
+    ProvenanceTracker, TupleId, WhyNotResult, provenance_metrics, reset_provenance_metrics, why_not,
+};
 pub use seqlock::{
     SeqLock, SeqLockPair, SeqLockTriple, SeqlockMetrics, reset_seqlock_metrics, seqlock_metrics,
 };
@@ -168,6 +179,14 @@ pub use sheaf_conformal::{
     check_sheaf_consistency, check_sheaf_consistency_with_chains,
 };
 pub use shm::{SharedMemoryLayout, ShmSnapshot};
+pub use sketch_telemetry::{
+    CMS_VERSION, CountMinSketch, CountMinSketchConfig, DEFAULT_ALLOC_SIZE_BUCKETS,
+    DEFAULT_CMS_DEPTH, DEFAULT_CMS_WIDTH, DEFAULT_LATENCY_BUCKETS_US, HISTOGRAM_VERSION,
+    HistogramSnapshot, MemoryAllocationTracker, MemoryTrackerSnapshot,
+    NITROSKETCH_STREAMING_VERSION, SketchTelemetryMetrics, SlidingWindowCms, SlidingWindowConfig,
+    SlidingWindowHistogram, SlidingWindowHistogramSnapshot, StreamingHistogram,
+    reset_sketch_telemetry_metrics, sketch_telemetry_metrics,
+};
 pub use ssi_abort_policy::{
     AbortDecision, AbortDecisionEnvelope, ConformalCalibrator, ConformalConfig, CycleStatus,
     LossMatrix, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType,
