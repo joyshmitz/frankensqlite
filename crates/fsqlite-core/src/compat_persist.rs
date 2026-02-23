@@ -419,9 +419,9 @@ const fn affinity_char_to_type(affinity: char) -> &'static str {
     match affinity {
         'd' | 'D' => "INTEGER",
         'e' | 'E' => "REAL",
-        'B' => "BLOB",
-        'A' => "NUMERIC",
-        // 'C' and everything else → TEXT
+        'a' | 'A' => "BLOB",
+        'c' | 'C' => "NUMERIC",
+        // 'b'/'B' (TEXT affinity) and all unknowns default to TEXT.
         _ => "TEXT",
     }
 }
@@ -650,15 +650,15 @@ fn extract_type_declaration(tokens: &[&str]) -> String {
 fn type_to_affinity(type_str: &str) -> char {
     let upper = type_str.to_uppercase();
     if upper.contains("INT") {
-        'd'
+        'D' // INTEGER affinity
     } else if upper.contains("REAL") || upper.contains("FLOAT") || upper.contains("DOUB") {
-        'e'
+        'E' // REAL affinity
     } else if upper.contains("BLOB") || upper.is_empty() {
-        'B'
+        'A' // BLOB (none) affinity
     } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
-        'C'
+        'B' // TEXT affinity
     } else {
-        'A' // NUMERIC
+        'C' // NUMERIC affinity
     }
 }
 
@@ -894,11 +894,11 @@ mod tests {
         let cols = parse_columns_from_create_sql(sql);
         assert_eq!(cols.len(), 3);
         assert_eq!(cols[0].name, "id");
-        assert_eq!(cols[0].affinity, 'd');
+        assert_eq!(cols[0].affinity, 'D');
         assert_eq!(cols[1].name, "name");
-        assert_eq!(cols[1].affinity, 'C');
+        assert_eq!(cols[1].affinity, 'B');
         assert_eq!(cols[2].name, "data");
-        assert_eq!(cols[2].affinity, 'B');
+        assert_eq!(cols[2].affinity, 'A');
     }
 
     #[test]
@@ -912,12 +912,12 @@ mod tests {
         let cols = parse_columns_from_create_sql(sql);
         assert_eq!(cols.len(), 3);
         assert_eq!(cols[0].name, "id");
-        assert_eq!(cols[0].affinity, 'd');
+        assert_eq!(cols[0].affinity, 'D');
         assert!(cols[0].is_ipk);
         assert_eq!(cols[1].name, "amount");
-        assert_eq!(cols[1].affinity, 'A');
+        assert_eq!(cols[1].affinity, 'C');
         assert_eq!(cols[2].name, "status");
-        assert_eq!(cols[2].affinity, 'C');
+        assert_eq!(cols[2].affinity, 'B');
     }
 
     #[test]
@@ -926,9 +926,9 @@ mod tests {
         let cols = parse_columns_from_create_sql(sql);
         assert_eq!(cols.len(), 2);
         assert_eq!(cols[0].name, "primary");
-        assert_eq!(cols[0].affinity, 'C');
+        assert_eq!(cols[0].affinity, 'B');
         assert_eq!(cols[1].name, "value");
-        assert_eq!(cols[1].affinity, 'd');
+        assert_eq!(cols[1].affinity, 'D');
     }
 
     #[test]
@@ -937,23 +937,23 @@ mod tests {
         let cols = parse_columns_from_create_sql(sql);
         assert_eq!(cols.len(), 3);
         assert_eq!(cols[0].name, "first name");
-        assert_eq!(cols[0].affinity, 'C');
+        assert_eq!(cols[0].affinity, 'B');
         assert_eq!(cols[1].name, "last name");
-        assert_eq!(cols[1].affinity, 'd');
+        assert_eq!(cols[1].affinity, 'D');
         assert_eq!(cols[2].name, "role name");
-        assert_eq!(cols[2].affinity, 'A');
+        assert_eq!(cols[2].affinity, 'C');
     }
 
     #[test]
     fn test_type_to_affinity_mapping() {
-        assert_eq!(type_to_affinity("INTEGER"), 'd');
-        assert_eq!(type_to_affinity("INT"), 'd');
-        assert_eq!(type_to_affinity("REAL"), 'e');
-        assert_eq!(type_to_affinity("FLOAT"), 'e');
-        assert_eq!(type_to_affinity("TEXT"), 'C');
-        assert_eq!(type_to_affinity("VARCHAR"), 'C');
-        assert_eq!(type_to_affinity("BLOB"), 'B');
-        assert_eq!(type_to_affinity("NUMERIC"), 'A');
+        assert_eq!(type_to_affinity("INTEGER"), 'D');
+        assert_eq!(type_to_affinity("INT"), 'D');
+        assert_eq!(type_to_affinity("REAL"), 'E');
+        assert_eq!(type_to_affinity("FLOAT"), 'E');
+        assert_eq!(type_to_affinity("TEXT"), 'B');
+        assert_eq!(type_to_affinity("VARCHAR"), 'B');
+        assert_eq!(type_to_affinity("BLOB"), 'A');
+        assert_eq!(type_to_affinity("NUMERIC"), 'C');
     }
 
     #[test]

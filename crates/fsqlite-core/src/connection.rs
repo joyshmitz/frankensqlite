@@ -3588,17 +3588,34 @@ impl Connection {
                     },
                     |r| r.values().len(),
                 );
+                // Infer column affinity from the first non-NULL value in
+                // each column.  When every value is NULL (or the result set
+                // is empty) fall back to BLOB affinity ('A') which stores
+                // values without coercion — matching SQLite's behaviour for
+                // columns with no declared type.
                 let col_infos: Vec<ColumnInfo> = (0..width)
-                    .map(|i| ColumnInfo {
-                        name: col_names
-                            .get(i)
-                            .cloned()
-                            .unwrap_or_else(|| format!("_c{i}")),
-                        affinity: 'B',
-                        is_ipk: false,
-                        type_name: None,
-                        notnull: false,
-                        default_value: None,
+                    .map(|i| {
+                        let affinity = rows
+                            .iter()
+                            .map(|r| r.values().get(i).cloned().unwrap_or(SqliteValue::Null))
+                            .find(|v| !matches!(v, SqliteValue::Null))
+                            .map_or('A', |v| match v {
+                                SqliteValue::Integer(_) => 'D',
+                                SqliteValue::Float(_) => 'E',
+                                SqliteValue::Text(_) => 'B',
+                                SqliteValue::Blob(_) | SqliteValue::Null => 'A',
+                            });
+                        ColumnInfo {
+                            name: col_names
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| format!("_c{i}")),
+                            affinity,
+                            is_ipk: false,
+                            type_name: None,
+                            notnull: false,
+                            default_value: None,
+                        }
                     })
                     .collect();
                 let root_page = self.allocate_root_page()?;
