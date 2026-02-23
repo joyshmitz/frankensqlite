@@ -949,37 +949,53 @@ impl TransactionManager {
             let decision =
                 merge_decision(self.write_merge_policy, page_kind, cfg!(debug_assertions));
 
-            if decision == MergeDecision::AbortRetry {
-                tracing::info!(
-                    txn_id = %txn.txn_id,
-                    pgno = pgno.get(),
-                    ?decision,
-                    "FCW conflict: merge policy is Off, aborting"
-                );
-                self.abort(txn);
-                return Err(MvccError::BusySnapshot);
-            }
-
-            // Attempt deterministic rebase (§5.10).
-            if self.try_rebase_page(txn, pgno) {
-                tracing::info!(
-                    txn_id = %txn.txn_id,
-                    pgno = pgno.get(),
-                    ?page_kind,
-                    ?decision,
-                    "FCW conflict resolved via disjoint rebase"
-                );
-                rebased = true;
-            } else {
-                tracing::info!(
-                    txn_id = %txn.txn_id,
-                    pgno = pgno.get(),
-                    ?page_kind,
-                    ?decision,
-                    "FCW conflict: rebase failed, aborting"
-                );
-                self.abort(txn);
-                return Err(MvccError::BusySnapshot);
+            match decision {
+                MergeDecision::AbortRetry => {
+                    tracing::info!(
+                        txn_id = %txn.txn_id,
+                        pgno = pgno.get(),
+                        ?decision,
+                        "FCW conflict: merge policy is Off, aborting"
+                    );
+                    self.abort(txn);
+                    return Err(MvccError::BusySnapshot);
+                }
+                MergeDecision::IntentReplay => {
+                    // Intent replay is currently handled at a higher layer. At this
+                    // storage layer, we must abort because raw XOR merging is forbidden
+                    // for structured pages.
+                    tracing::info!(
+                        txn_id = %txn.txn_id,
+                        pgno = pgno.get(),
+                        ?decision,
+                        "FCW conflict: intent replay required but unavailable at storage layer, aborting"
+                    );
+                    self.abort(txn);
+                    return Err(MvccError::BusySnapshot);
+                }
+                MergeDecision::StructuredPatch | MergeDecision::RawXorLab => {
+                    // Attempt deterministic rebase (§5.10) using physical page patch.
+                    if self.try_rebase_page(txn, pgno) {
+                        tracing::info!(
+                            txn_id = %txn.txn_id,
+                            pgno = pgno.get(),
+                            ?page_kind,
+                            ?decision,
+                            "FCW conflict resolved via disjoint rebase"
+                        );
+                        rebased = true;
+                    } else {
+                        tracing::info!(
+                            txn_id = %txn.txn_id,
+                            pgno = pgno.get(),
+                            ?page_kind,
+                            ?decision,
+                            "FCW conflict: rebase failed, aborting"
+                        );
+                        self.abort(txn);
+                        return Err(MvccError::BusySnapshot);
+                    }
+                }
             }
         }
 

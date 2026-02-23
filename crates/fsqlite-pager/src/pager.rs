@@ -955,11 +955,26 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             return;
         }
         if let Ok(mut inner) = self.inner.lock() {
+            // Restore pages allocated from the freelist.
+            for page in self.allocated_from_freelist.drain(..) {
+                inner.freelist.push(page);
+            }
+
             if self.is_writer {
+                inner.db_size = self.original_db_size;
+
+                // Reset next_page to avoid holes if we allocated pages that are now discarded.
+                // Logic matches SimplePager::open and SimpleTransaction::rollback.
+                let db_size = inner.db_size;
+                inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
+
                 inner.writer_active = false;
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
         }
+        // We cannot easily delete the journal file here because Drop doesn't
+        // take a Context or return a Result. It's best effort cleanup.
+        // Hot journal recovery will handle any leftover files on next open.
         self.finished = true;
     }
 }
