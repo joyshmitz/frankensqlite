@@ -15,9 +15,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use fsqlite_mvcc::{
-    QsbrRegistry, RcuCell, RcuPair, RcuTriple, rcu_metrics, record_rcu_reclaimed, reset_rcu_metrics,
-};
+use fsqlite_mvcc::{QsbrRegistry, RcuCell, RcuPair, RcuTriple, rcu_metrics, record_rcu_reclaimed};
 
 // ---------------------------------------------------------------------------
 // Test 1: Registry lifecycle
@@ -155,7 +153,8 @@ fn test_grace_period_waits_for_reader() {
 
 #[test]
 fn test_metrics_integration() {
-    reset_rcu_metrics();
+    // Delta-based: snapshot before, act, snapshot after.
+    let before = rcu_metrics();
 
     let reg = QsbrRegistry::new();
     let h = reg.register().unwrap();
@@ -167,9 +166,11 @@ fn test_metrics_integration() {
     record_rcu_reclaimed(5);
 
     let m = rcu_metrics();
-    assert_eq!(
-        m.fsqlite_rcu_grace_periods_total, 3,
-        "expected 3 grace periods"
+    let grace_delta = m.fsqlite_rcu_grace_periods_total - before.fsqlite_rcu_grace_periods_total;
+    let reclaim_delta = m.fsqlite_rcu_reclaimed_total - before.fsqlite_rcu_reclaimed_total;
+    assert!(
+        grace_delta >= 3,
+        "expected at least 3 grace periods, got {grace_delta}"
     );
     assert!(
         m.fsqlite_rcu_grace_period_duration_ns_total > 0,
@@ -179,7 +180,10 @@ fn test_metrics_integration() {
         m.fsqlite_rcu_grace_period_duration_ns_max > 0,
         "expected non-zero max duration"
     );
-    assert_eq!(m.fsqlite_rcu_reclaimed_total, 5, "expected 5 reclaimed");
+    assert!(
+        reclaim_delta >= 5,
+        "expected at least 5 reclaimed, got {reclaim_delta}"
+    );
 
     // Verify serialization.
     let json = serde_json::to_string(&m).unwrap();
@@ -351,18 +355,19 @@ fn test_conformance_summary() {
         drop(h);
     }
 
-    // 5. Grace period metrics
+    // 5. Grace period metrics (delta-based)
     {
-        reset_rcu_metrics();
+        let before = rcu_metrics();
         let reg = QsbrRegistry::new();
         let h = reg.register().unwrap();
         h.synchronize_as_writer();
-        let m = rcu_metrics();
-        let pass = m.fsqlite_rcu_grace_periods_total == 1;
+        let after = rcu_metrics();
+        let delta = after.fsqlite_rcu_grace_periods_total - before.fsqlite_rcu_grace_periods_total;
+        let pass = delta >= 1;
         results.push(TestResult {
             name: "grace_period_metrics",
             pass,
-            detail: format!("grace_periods={}", m.fsqlite_rcu_grace_periods_total),
+            detail: format!("grace_period_delta={delta}"),
         });
         drop(h);
     }

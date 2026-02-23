@@ -557,14 +557,18 @@ mod tests {
 
     #[test]
     fn metrics_increment() {
-        reset_seqlock_metrics();
+        let before = seqlock_metrics();
         let sl = SeqLock::new(1);
         sl.read("m1");
         sl.read("m2");
         sl.read("m3");
 
-        let m = seqlock_metrics();
-        assert_eq!(m.fsqlite_seqlock_reads_total, 3);
+        let after = seqlock_metrics();
+        let reads_delta = after.fsqlite_seqlock_reads_total - before.fsqlite_seqlock_reads_total;
+        assert!(
+            reads_delta >= 3,
+            "expected at least 3 reads, got {reads_delta}"
+        );
     }
 
     /// Sequence counter is always even after all writes complete.

@@ -659,26 +659,30 @@ mod tests {
 
     #[test]
     fn metrics_increment() {
-        reset_leftright_metrics();
+        // Delta-based: snapshot before, act, snapshot after.
+        let before = leftright_metrics();
         let lr = LeftRight::new(1);
         lr.read("m1");
         lr.read("m2");
         lr.read("m3");
 
-        let m = leftright_metrics();
-        assert_eq!(m.fsqlite_leftright_reads_total, 3);
+        let after = leftright_metrics();
+        let delta = after.fsqlite_leftright_reads_total - before.fsqlite_leftright_reads_total;
+        assert_eq!(delta, 3);
     }
 
     #[test]
     fn swap_count_increments() {
-        reset_leftright_metrics();
+        // Delta-based: snapshot before, act, snapshot after.
+        let before = leftright_metrics();
         let lr = LeftRight::new(0);
         lr.write(1);
         lr.write(2);
         lr.write(3);
 
-        let m = leftright_metrics();
-        assert_eq!(m.fsqlite_leftright_swaps_total, 3);
+        let after = leftright_metrics();
+        let delta = after.fsqlite_leftright_swaps_total - before.fsqlite_leftright_swaps_total;
+        assert!(delta >= 3, "expected at least 3 swaps, got {delta}");
     }
 
     /// Debug formatting works without deadlock.

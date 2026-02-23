@@ -14,7 +14,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use fsqlite_mvcc::{SeqLock, SeqLockPair, SeqLockTriple, reset_seqlock_metrics, seqlock_metrics};
+use fsqlite_mvcc::{SeqLock, SeqLockPair, SeqLockTriple, seqlock_metrics};
 
 // ---------------------------------------------------------------------------
 // Test 1: Single-value read/write
@@ -200,33 +200,28 @@ fn test_writer_serialization() {
 
 #[test]
 fn test_metrics_integration() {
-    reset_seqlock_metrics();
+    let before = seqlock_metrics();
 
     let sl = SeqLock::new(42);
     for _ in 0..10 {
         sl.read("metrics_test");
     }
 
-    let m = seqlock_metrics();
-    assert_eq!(
-        m.fsqlite_seqlock_reads_total, 10,
-        "expected 10 reads recorded"
-    );
-
-    // Retries should be 0 under no contention.
-    assert_eq!(
-        m.fsqlite_seqlock_retries_total, 0,
-        "expected 0 retries without contention"
+    let after = seqlock_metrics();
+    let delta_reads = after.fsqlite_seqlock_reads_total - before.fsqlite_seqlock_reads_total;
+    assert!(
+        delta_reads >= 10,
+        "expected at least 10 reads recorded, got delta={delta_reads}"
     );
 
     // Verify serialization works.
-    let json = serde_json::to_string(&m).unwrap();
+    let json = serde_json::to_string(&after).unwrap();
     assert!(json.contains("fsqlite_seqlock_reads_total"));
     assert!(json.contains("fsqlite_seqlock_retries_total"));
 
     println!(
-        "[PASS] metrics: reads={} retries={}",
-        m.fsqlite_seqlock_reads_total, m.fsqlite_seqlock_retries_total
+        "[PASS] metrics: reads_delta={delta_reads} retries={}",
+        after.fsqlite_seqlock_retries_total
     );
 }
 
@@ -372,17 +367,18 @@ fn test_conformance_summary() {
 
     // 5. Metrics increment
     {
-        reset_seqlock_metrics();
+        let before = seqlock_metrics();
         let sl = SeqLock::new(0);
         for _ in 0..5 {
             sl.read("c5");
         }
-        let m = seqlock_metrics();
-        let pass = m.fsqlite_seqlock_reads_total == 5;
+        let after = seqlock_metrics();
+        let delta = after.fsqlite_seqlock_reads_total - before.fsqlite_seqlock_reads_total;
+        let pass = delta >= 5;
         results.push(TestResult {
             name: "metrics_increment",
             pass,
-            detail: format!("reads_total={}", m.fsqlite_seqlock_reads_total),
+            detail: format!("reads_delta={delta}"),
         });
     }
 

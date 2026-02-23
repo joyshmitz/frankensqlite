@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn metrics_track_grace_periods() {
-        reset_rcu_metrics();
+        let before = rcu_metrics();
         let reg = QsbrRegistry::new();
         let h = reg.register().unwrap();
 
@@ -733,10 +733,19 @@ mod tests {
         h.synchronize_as_writer();
         h.synchronize_as_writer();
 
-        let m = rcu_metrics();
-        assert_eq!(m.fsqlite_rcu_grace_periods_total, 3);
-        assert!(m.fsqlite_rcu_grace_period_duration_ns_total > 0);
-        assert!(m.fsqlite_rcu_grace_period_duration_ns_max > 0);
+        let after = rcu_metrics();
+        let grace_delta =
+            after.fsqlite_rcu_grace_periods_total - before.fsqlite_rcu_grace_periods_total;
+        let duration_delta = after.fsqlite_rcu_grace_period_duration_ns_total
+            - before.fsqlite_rcu_grace_period_duration_ns_total;
+        assert!(
+            grace_delta >= 3,
+            "expected at least 3 grace periods, got {grace_delta}"
+        );
+        assert!(
+            duration_delta > 0,
+            "expected duration delta > 0, got {duration_delta}"
+        );
 
         drop(h);
     }

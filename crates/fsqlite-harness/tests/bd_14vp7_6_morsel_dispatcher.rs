@@ -14,7 +14,6 @@ use fsqlite_vdbe::vectorized_dispatch::{
     PipelineId, PipelineKind, WorkStealingDispatcher, auto_tuned_pages_per_morsel,
     broadcast_exchange, build_exchange_task_ids, build_pipeline_tasks, hash_partition_exchange,
     morsel_dispatch_metrics_snapshot, partition_page_morsels, partition_page_morsels_auto_tuned,
-    reset_morsel_dispatch_metrics,
 };
 
 const BEAD_ID: &str = "bd-14vp7.6";
@@ -363,7 +362,6 @@ fn test_broadcast_exchange_replication() {
 
 #[test]
 fn test_metrics_gauge_updates() {
-    reset_morsel_dispatch_metrics();
     let before = morsel_dispatch_metrics_snapshot();
 
     let config = DispatcherConfig {

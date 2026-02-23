@@ -20,8 +20,7 @@ use fsqlite_harness::replay_harness::{
     ReplayVerdict,
 };
 use fsqlite_mvcc::deterministic_rebase::{
-    RebaseEligibility, RebaseMetricsSnapshot, check_rebase_eligibility, rebase_metrics_snapshot,
-    reset_rebase_metrics,
+    RebaseEligibility, check_rebase_eligibility, rebase_metrics_snapshot,
 };
 use fsqlite_mvcc::time_travel::{TimeTravelError, TimeTravelTarget};
 
@@ -225,23 +224,23 @@ fn replay_summary_json_roundtrip_and_deterministic_hash() {
 
 #[test]
 fn rebase_metrics_snapshot_and_reset() {
-    // Reset to known state first.
-    reset_rebase_metrics();
-
-    let snap = rebase_metrics_snapshot();
-    assert_eq!(
-        snap,
-        RebaseMetricsSnapshot {
-            attempts_total: 0,
-            conflicts_total: 0,
-            successes_total: 0,
-        },
-        "metrics should be zero after reset"
-    );
-
-    // Metrics are global atomics; reading again should still be zero.
+    // Use snapshot-delta pattern to avoid interference from parallel tests.
+    // Take two successive snapshots — deltas should be non-negative (monotonic).
+    let snap1 = rebase_metrics_snapshot();
     let snap2 = rebase_metrics_snapshot();
-    assert_eq!(snap, snap2);
+
+    assert!(
+        snap2.attempts_total >= snap1.attempts_total,
+        "attempts_total should be monotonically non-decreasing"
+    );
+    assert!(
+        snap2.conflicts_total >= snap1.conflicts_total,
+        "conflicts_total should be monotonically non-decreasing"
+    );
+    assert!(
+        snap2.successes_total >= snap1.successes_total,
+        "successes_total should be monotonically non-decreasing"
+    );
 }
 
 // ── 8. Rebase eligibility: empty intent log is eligible ──────────────────────

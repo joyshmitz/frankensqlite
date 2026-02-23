@@ -4,7 +4,7 @@
 //! buffers, delete correctness, write amplification characteristics, and
 //! metrics fidelity.
 
-use fsqlite_btree::be_tree::{BeTree, BeTreeConfig, betree_metrics_snapshot, reset_betree_metrics};
+use fsqlite_btree::be_tree::{BeTree, BeTreeConfig, betree_metrics_snapshot};
 
 const BEAD_ID: &str = "bd-3ta.4";
 
@@ -41,7 +41,7 @@ fn test_basic_insert_and_lookup() {
 
 #[test]
 fn test_buffer_flush_triggers() {
-    reset_betree_metrics();
+    let before = betree_metrics_snapshot();
     let config = BeTreeConfig {
         buffer_capacity: 3,
         leaf_capacity: 4,
@@ -54,16 +54,16 @@ fn test_buffer_flush_triggers() {
         tree.insert(i, i * 100);
     }
 
-    let snap = betree_metrics_snapshot();
+    let after = betree_metrics_snapshot();
+    let delta_flushes = after.buffer_flushes_total - before.buffer_flushes_total;
+    let delta_msgs = after.messages_buffered_total - before.messages_buffered_total;
     assert!(
-        snap.buffer_flushes_total > 0,
-        "bead_id={BEAD_ID} case=flush_triggered flushes={}",
-        snap.buffer_flushes_total
+        delta_flushes > 0,
+        "bead_id={BEAD_ID} case=flush_triggered delta_flushes={delta_flushes}",
     );
     assert!(
-        snap.messages_buffered_total >= 30,
-        "bead_id={BEAD_ID} case=messages_buffered got={}",
-        snap.messages_buffered_total
+        delta_msgs >= 30,
+        "bead_id={BEAD_ID} case=messages_buffered delta_msgs={delta_msgs}",
     );
 
     // All values should still be accessible.
@@ -248,9 +248,8 @@ fn test_large_scale_correctness() {
 
 #[test]
 fn test_write_amplification_characteristics() {
-    reset_betree_metrics();
-
     // Small buffer → more flushes.
+    let before_small = betree_metrics_snapshot();
     let small_buf_config = BeTreeConfig {
         buffer_capacity: 2,
         leaf_capacity: 4,
@@ -260,11 +259,11 @@ fn test_write_amplification_characteristics() {
     for i in 0..50 {
         small_tree.insert(i, i);
     }
-    let small_snap = betree_metrics_snapshot();
-
-    reset_betree_metrics();
+    let after_small = betree_metrics_snapshot();
+    let small_flushes = after_small.buffer_flushes_total - before_small.buffer_flushes_total;
 
     // Large buffer → fewer flushes.
+    let before_big = betree_metrics_snapshot();
     let big_buf_config = BeTreeConfig {
         buffer_capacity: 32,
         leaf_capacity: 64,
@@ -274,21 +273,19 @@ fn test_write_amplification_characteristics() {
     for i in 0..50 {
         big_tree.insert(i, i);
     }
-    let big_snap = betree_metrics_snapshot();
+    let after_big = betree_metrics_snapshot();
+    let big_flushes = after_big.buffer_flushes_total - before_big.buffer_flushes_total;
 
     // Larger buffers should cause fewer or equal flushes.
     assert!(
-        big_snap.buffer_flushes_total <= small_snap.buffer_flushes_total,
-        "bead_id={BEAD_ID} case=larger_buffer_fewer_flushes small={} big={}",
-        small_snap.buffer_flushes_total,
-        big_snap.buffer_flushes_total,
+        big_flushes <= small_flushes,
+        "bead_id={BEAD_ID} case=larger_buffer_fewer_flushes small={small_flushes} big={big_flushes}",
     );
 
     // The big tree should have pending messages in buffers.
     let buffered = big_tree.total_buffered_messages();
     println!(
-        "[{BEAD_ID}] small_flushes={} big_flushes={} big_buffered_msgs={}",
-        small_snap.buffer_flushes_total, big_snap.buffer_flushes_total, buffered,
+        "[{BEAD_ID}] small_flushes={small_flushes} big_flushes={big_flushes} big_buffered_msgs={buffered}",
     );
 }
 

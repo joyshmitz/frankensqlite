@@ -12,9 +12,7 @@
 //! - Error display and serialization
 //! - Conformance summary
 
-use fsqlite_mvcc::{
-    DpEngine, DpError, NoiseMechanism, PrivacyBudget, dp_metrics, reset_dp_metrics, sensitivity,
-};
+use fsqlite_mvcc::{DpEngine, DpError, NoiseMechanism, PrivacyBudget, dp_metrics, sensitivity};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -338,19 +336,25 @@ fn noise_mechanism_display() {
 
 #[test]
 fn dp_metrics_serialization() {
-    reset_dp_metrics();
+    let before = dp_metrics();
     let mut engine = DpEngine::new(5.0, 42).unwrap();
     engine.laplace(100.0, 1.0, 0.5).unwrap();
 
-    let m = dp_metrics();
-    let json = serde_json::to_string(&m).unwrap();
+    let after = dp_metrics();
+    let json = serde_json::to_string(&after).unwrap();
     assert!(json.contains("fsqlite_dp_queries_total"));
     assert!(json.contains("fsqlite_dp_epsilon_spent_micros"));
     assert!(json.contains("fsqlite_dp_budget_exhausted_total"));
 
-    // Deserialize back.
+    // Deserialize back and verify delta.
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert!(parsed["fsqlite_dp_queries_total"].as_u64().unwrap() >= 1);
+    let before_json = serde_json::to_value(before).unwrap();
+    let delta_queries = parsed["fsqlite_dp_queries_total"].as_u64().unwrap()
+        - before_json["fsqlite_dp_queries_total"].as_u64().unwrap();
+    assert!(
+        delta_queries >= 1,
+        "expected at least 1 new query, got delta {delta_queries}"
+    );
 }
 
 // ── 13. Invalid parameter rejection ──────────────────────────────────────────

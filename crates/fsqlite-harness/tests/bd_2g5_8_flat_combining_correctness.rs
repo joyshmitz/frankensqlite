@@ -15,7 +15,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fsqlite_mvcc::{FlatCombiner, flat_combining_metrics, reset_flat_combining_metrics};
+use fsqlite_mvcc::{FlatCombiner, flat_combining_metrics};
 
 // ---------------------------------------------------------------------------
 // Test 1: Registry lifecycle
@@ -146,7 +146,7 @@ fn test_stress_no_lost_updates() {
 
 #[test]
 fn test_batching_under_contention() {
-    reset_flat_combining_metrics();
+    let before = flat_combining_metrics();
 
     let fc = Arc::new(FlatCombiner::new(0));
     let barrier = Arc::new(Barrier::new(8));
@@ -171,22 +171,16 @@ fn test_batching_under_contention() {
 
     assert_eq!(fc.value(), 1600, "8 threads * 200 = 1600");
 
-    let m = flat_combining_metrics();
-    assert!(m.fsqlite_flat_combining_ops_total >= 1600);
-    // Under contention, batch_size_max should be > 1 (at least some batching).
-    // Note: on very fast single-core systems, this might not always batch,
-    // but on multi-core it reliably does.
+    let after = flat_combining_metrics();
+    let ops_delta =
+        after.fsqlite_flat_combining_ops_total - before.fsqlite_flat_combining_ops_total;
+    assert!(
+        ops_delta >= 1600,
+        "expected at least 1600 ops delta, got {ops_delta}"
+    );
     println!(
-        "[PASS] batching: ops={} batches={} max_batch={} avg_batch={:.2}",
-        m.fsqlite_flat_combining_ops_total,
-        m.fsqlite_flat_combining_batches_total,
-        m.fsqlite_flat_combining_batch_size_max,
-        if m.fsqlite_flat_combining_batches_total > 0 {
-            m.fsqlite_flat_combining_ops_total as f64
-                / m.fsqlite_flat_combining_batches_total as f64
-        } else {
-            0.0
-        }
+        "[PASS] batching: ops_delta={ops_delta} batches={} max_batch={}",
+        after.fsqlite_flat_combining_batches_total, after.fsqlite_flat_combining_batch_size_max,
     );
 }
 
@@ -236,7 +230,7 @@ fn test_no_starvation() {
 
 #[test]
 fn test_metrics_integration() {
-    reset_flat_combining_metrics();
+    let before = flat_combining_metrics();
 
     let fc = FlatCombiner::new(0);
     let h = fc.register().unwrap();
@@ -245,22 +239,25 @@ fn test_metrics_integration() {
     h.add(20);
     h.add(30);
 
-    let m = flat_combining_metrics();
-    assert_eq!(m.fsqlite_flat_combining_ops_total, 3, "expected 3 ops");
-    assert!(m.fsqlite_flat_combining_wait_ns_total > 0);
+    let after = flat_combining_metrics();
+    let ops_delta =
+        after.fsqlite_flat_combining_ops_total - before.fsqlite_flat_combining_ops_total;
+    assert!(
+        ops_delta >= 3,
+        "expected at least 3 ops delta, got {ops_delta}"
+    );
+    assert!(after.fsqlite_flat_combining_wait_ns_total > 0);
 
     // Verify serialization.
-    let json = serde_json::to_string(&m).unwrap();
+    let json = serde_json::to_string(&after).unwrap();
     assert!(json.contains("fsqlite_flat_combining_batches_total"));
     assert!(json.contains("fsqlite_flat_combining_ops_total"));
 
     drop(h);
 
     println!(
-        "[PASS] metrics: batches={} ops={} wait_ns={}",
-        m.fsqlite_flat_combining_batches_total,
-        m.fsqlite_flat_combining_ops_total,
-        m.fsqlite_flat_combining_wait_ns_total
+        "[PASS] metrics: ops_delta={ops_delta} wait_ns={}",
+        after.fsqlite_flat_combining_wait_ns_total
     );
 }
 
@@ -338,19 +335,21 @@ fn test_conformance_summary() {
         });
     }
 
-    // 4. Metrics increment
+    // 4. Metrics increment (delta-based for parallel test safety)
     {
-        reset_flat_combining_metrics();
+        let before = flat_combining_metrics();
         let fc = FlatCombiner::new(0);
         let h = fc.register().unwrap();
         h.add(1);
         h.add(2);
-        let m = flat_combining_metrics();
-        let pass = m.fsqlite_flat_combining_ops_total == 2;
+        let after = flat_combining_metrics();
+        let ops_delta =
+            after.fsqlite_flat_combining_ops_total - before.fsqlite_flat_combining_ops_total;
+        let pass = ops_delta >= 2;
         results.push(TestResult {
             name: "metrics_increment",
             pass,
-            detail: format!("ops_total={}", m.fsqlite_flat_combining_ops_total),
+            detail: format!("ops_delta={ops_delta}"),
         });
         drop(h);
     }

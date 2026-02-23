@@ -11,7 +11,7 @@ use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::vectorized::{Batch, ColumnSpec, ColumnVectorType};
 use fsqlite_vdbe::vectorized_hash_join::{JoinType, hash_join_build, hash_join_probe};
 use fsqlite_vdbe::vectorized_join::{
-    TrieRelation, TrieRow, leapfrog_join, leapfrog_metrics_snapshot, reset_leapfrog_metrics,
+    TrieRelation, TrieRow, leapfrog_join, leapfrog_metrics_snapshot,
 };
 
 const BEAD_ID: &str = "bd-2qr3a.4";
@@ -247,7 +247,7 @@ fn test_scaling_by_relation_size() {
 
 #[test]
 fn test_seek_metrics() {
-    reset_leapfrog_metrics();
+    let before = leapfrog_metrics_snapshot();
 
     let keys_a: Vec<i64> = (0..1000).collect();
     let keys_b: Vec<i64> = (0..1000).step_by(2).collect(); // even only
@@ -258,8 +258,12 @@ fn test_seek_metrics() {
     let tc = build_trie(&keys_c);
     let matches = leapfrog_join(&[&ta, &tb, &tc]).unwrap();
 
-    let metrics = leapfrog_metrics_snapshot();
+    let after = leapfrog_metrics_snapshot();
     let match_count: u64 = matches.iter().map(|m| m.tuple_multiplicity()).sum();
+    let delta_seeks = after.fsqlite_leapfrog_seeks_total - before.fsqlite_leapfrog_seeks_total;
+    let delta_comparisons = after.fsqlite_leapfrog_seek_comparisons_total
+        - before.fsqlite_leapfrog_seek_comparisons_total;
+    let delta_tuples = after.fsqlite_leapfrog_tuples_total - before.fsqlite_leapfrog_tuples_total;
 
     // Intersection of all, multiples of 2 and 3 = multiples of 6 in [0,1000).
     // Expected: 0, 6, 12, ..., 996 = 167 matches.
@@ -269,21 +273,15 @@ fn test_seek_metrics() {
     );
 
     println!(
-        "[{BEAD_ID}] seek metrics: tuples={} seeks={} comparisons={} matches={match_count}",
-        metrics.fsqlite_leapfrog_tuples_total,
-        metrics.fsqlite_leapfrog_seeks_total,
-        metrics.fsqlite_leapfrog_seek_comparisons_total,
+        "[{BEAD_ID}] seek metrics: tuples={delta_tuples} seeks={delta_seeks} comparisons={delta_comparisons} matches={match_count}",
     );
 
     // Seeks should be sublinear relative to total input size.
     let total_input = 1000 + 500 + 334;
-    assert!(
-        metrics.fsqlite_leapfrog_seeks_total > 0,
-        "bead_id={BEAD_ID} case=seeks_nonzero"
-    );
+    assert!(delta_seeks > 0, "bead_id={BEAD_ID} case=seeks_nonzero");
     println!(
         "[{BEAD_ID}] seeks/input_row ratio: {:.2}",
-        metrics.fsqlite_leapfrog_seeks_total as f64 / total_input as f64
+        delta_seeks as f64 / total_input as f64
     );
 }
 
@@ -424,7 +422,7 @@ fn test_zero_intermediate_blowup() {
     let keys_c: Vec<i64> = (0..n).step_by(100).collect(); // Only every 100th.
 
     // Leapfrog: should find matches directly without intermediate blowup.
-    reset_leapfrog_metrics();
+    let lf_before = leapfrog_metrics_snapshot();
     let ta = build_trie(&keys_a);
     let tb = build_trie(&keys_b);
     let tc = build_trie(&keys_c);
@@ -432,7 +430,11 @@ fn test_zero_intermediate_blowup() {
     let matches = leapfrog_join(&[&ta, &tb, &tc]).unwrap();
     let lf_ms = lf_start.elapsed().as_secs_f64() * 1000.0;
     let lf_count: u64 = matches.iter().map(|m| m.tuple_multiplicity()).sum();
-    let lf_metrics = leapfrog_metrics_snapshot();
+    let lf_after = leapfrog_metrics_snapshot();
+    let lf_delta_seeks =
+        lf_after.fsqlite_leapfrog_seeks_total - lf_before.fsqlite_leapfrog_seeks_total;
+    let lf_delta_comparisons = lf_after.fsqlite_leapfrog_seek_comparisons_total
+        - lf_before.fsqlite_leapfrog_seek_comparisons_total;
 
     // Pairwise: A ⋈ B produces n rows (full overlap), then filter by C.
     let hj_start = Instant::now();
@@ -448,8 +450,7 @@ fn test_zero_intermediate_blowup() {
         "[{BEAD_ID}] zero-blowup: leapfrog={lf_ms:.3}ms hashjoin={hj_ms:.3}ms speedup={speedup:.2}x"
     );
     println!(
-        "[{BEAD_ID}]   intermediate: hash-join builds {n}-row intermediate, leapfrog seeks={} comparisons={}",
-        lf_metrics.fsqlite_leapfrog_seeks_total, lf_metrics.fsqlite_leapfrog_seek_comparisons_total,
+        "[{BEAD_ID}]   intermediate: hash-join builds {n}-row intermediate, leapfrog seeks={lf_delta_seeks} comparisons={lf_delta_comparisons}",
     );
 }
 
@@ -478,10 +479,12 @@ fn test_conformance_summary() {
     let pass_3way = lf3_count == 25; // [75, 100)
 
     // 3. Metrics reporting.
-    reset_leapfrog_metrics();
+    let metrics_before = leapfrog_metrics_snapshot();
     let _ = leapfrog_join(&[&ta, &tb]).unwrap();
-    let metrics = leapfrog_metrics_snapshot();
-    let pass_metrics = metrics.fsqlite_leapfrog_seeks_total > 0;
+    let metrics_after = leapfrog_metrics_snapshot();
+    let delta_seeks =
+        metrics_after.fsqlite_leapfrog_seeks_total - metrics_before.fsqlite_leapfrog_seeks_total;
+    let pass_metrics = delta_seeks > 0;
 
     // 4. Composite keys.
     let ck_a: Vec<(i64, i64)> = vec![(1, 1), (1, 2), (2, 1)];

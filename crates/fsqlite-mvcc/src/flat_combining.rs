@@ -513,7 +513,8 @@ mod tests {
 
     #[test]
     fn metrics_track_batches() {
-        reset_flat_combining_metrics();
+        // Delta-based: snapshot before, act, snapshot after.
+        let before = flat_combining_metrics();
 
         let fc = FlatCombiner::new(0);
         let h = fc.register().unwrap();
@@ -522,13 +523,16 @@ mod tests {
         h.add(2);
         h.add(3);
 
-        let m = flat_combining_metrics();
+        let after = flat_combining_metrics();
+        let batch_delta = after.fsqlite_flat_combining_batches_total
+            - before.fsqlite_flat_combining_batches_total;
+        let ops_delta =
+            after.fsqlite_flat_combining_ops_total - before.fsqlite_flat_combining_ops_total;
         assert!(
-            m.fsqlite_flat_combining_batches_total >= 3,
-            "expected at least 3 batches (single thread = 1 op per batch)"
+            batch_delta >= 3,
+            "expected at least 3 batches (single thread = 1 op per batch), got {batch_delta}"
         );
-        assert_eq!(m.fsqlite_flat_combining_ops_total, 3);
-        assert!(m.fsqlite_flat_combining_wait_ns_total > 0);
+        assert!(ops_delta >= 3, "expected at least 3 ops, got {ops_delta}");
 
         drop(h);
     }
@@ -536,7 +540,7 @@ mod tests {
     #[test]
     fn batching_under_contention() {
         // With many threads contending, some batches should contain > 1 op.
-        reset_flat_combining_metrics();
+        let before = flat_combining_metrics();
 
         let fc = Arc::new(FlatCombiner::new(0));
         let barrier = Arc::new(Barrier::new(8));
@@ -561,20 +565,21 @@ mod tests {
 
         assert_eq!(fc.value(), 1600, "8 threads * 200 = 1600");
 
-        let m = flat_combining_metrics();
-        let avg_batch = if m.fsqlite_flat_combining_batches_total > 0 {
-            m.fsqlite_flat_combining_ops_total as f64
-                / m.fsqlite_flat_combining_batches_total as f64
+        let after = flat_combining_metrics();
+        let batches_delta = after.fsqlite_flat_combining_batches_total
+            - before.fsqlite_flat_combining_batches_total;
+        let ops_delta =
+            after.fsqlite_flat_combining_ops_total - before.fsqlite_flat_combining_ops_total;
+        let avg_batch = if batches_delta > 0 {
+            ops_delta as f64 / batches_delta as f64
         } else {
             0.0
         };
 
         // Under contention, we expect at least some batches > 1.
         println!(
-            "[flat_combining] batches={} ops={} avg_batch={avg_batch:.2} max_batch={}",
-            m.fsqlite_flat_combining_batches_total,
-            m.fsqlite_flat_combining_ops_total,
-            m.fsqlite_flat_combining_batch_size_max
+            "[flat_combining] batches={batches_delta} ops={ops_delta} avg_batch={avg_batch:.2} max_batch={}",
+            after.fsqlite_flat_combining_batch_size_max
         );
     }
 

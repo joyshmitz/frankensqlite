@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn test_metrics_integration() {
-        reset_provenance_metrics();
+        let before = provenance_metrics();
 
         let mut tracker = ProvenanceTracker::new(ProvenanceMode::How, 42, 5);
         tracker.annotate_base(0, 1, 10);
@@ -724,19 +724,21 @@ mod tests {
         tracker.propagate_binary(2, 0, 1);
         tracker.record_result_row(&[0, 2]);
 
-        let m = provenance_metrics();
-        assert!(m.fsqlite_provenance_annotations_total > 0);
-        assert!(m.fsqlite_provenance_rows_emitted > 0);
+        let after = provenance_metrics();
+        let annotations_delta = after.fsqlite_provenance_annotations_total
+            - before.fsqlite_provenance_annotations_total;
+        let rows_delta =
+            after.fsqlite_provenance_rows_emitted - before.fsqlite_provenance_rows_emitted;
+        assert!(
+            annotations_delta > 0,
+            "expected annotations delta > 0, got {annotations_delta}"
+        );
+        assert!(rows_delta > 0, "expected rows delta > 0, got {rows_delta}");
 
-        let json = serde_json::to_string(&m).unwrap();
+        let json = serde_json::to_string(&after).unwrap();
         assert!(json.contains("fsqlite_provenance_annotations_total"));
 
-        println!(
-            "[PASS] metrics: annotations={} rows={} queries={}",
-            m.fsqlite_provenance_annotations_total,
-            m.fsqlite_provenance_rows_emitted,
-            m.fsqlite_provenance_queries_total
-        );
+        println!("[PASS] metrics: annotations_delta={annotations_delta} rows_delta={rows_delta}");
     }
 
     #[test]

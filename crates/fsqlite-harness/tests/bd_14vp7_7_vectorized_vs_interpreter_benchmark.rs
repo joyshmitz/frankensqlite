@@ -22,13 +22,11 @@ use std::time::Instant;
 
 use fsqlite_types::PageNumber;
 use fsqlite_types::value::SqliteValue;
-use fsqlite_vdbe::vectorized::{
-    Batch, ColumnSpec, ColumnVectorType, reset_vectorized_metrics, vectorized_metrics_snapshot,
-};
+use fsqlite_vdbe::vectorized::{Batch, ColumnSpec, ColumnVectorType, vectorized_metrics_snapshot};
 use fsqlite_vdbe::vectorized_agg::{AggregateOp, AggregateSpec, aggregate_batch_hash};
 use fsqlite_vdbe::vectorized_dispatch::{
     DispatcherConfig, PipelineId, PipelineKind, WorkStealingDispatcher, build_pipeline_tasks,
-    morsel_dispatch_metrics_snapshot, partition_page_morsels, reset_morsel_dispatch_metrics,
+    morsel_dispatch_metrics_snapshot, partition_page_morsels,
 };
 use fsqlite_vdbe::vectorized_ops::{CompareOp, filter_batch_float64, filter_batch_int64};
 use fsqlite_vdbe::vectorized_sort::{NullOrdering, SortDirection, SortKeySpec, sort_batch};
@@ -587,8 +585,8 @@ fn test_hash_join_benchmark() {
 
 #[test]
 fn test_metrics_reporting() {
-    reset_vectorized_metrics();
-    reset_morsel_dispatch_metrics();
+    let vec_before = vectorized_metrics_snapshot();
+    let dispatch_before = morsel_dispatch_metrics_snapshot();
 
     let rows = generate_lineitem_rows(5_000, 42);
     let specs = lineitem_specs();
@@ -596,15 +594,18 @@ fn test_metrics_reporting() {
 
     vectorized_q1(&batch);
 
-    let vec_metrics = vectorized_metrics_snapshot();
-    let dispatch_metrics = morsel_dispatch_metrics_snapshot();
+    let vec_after = vectorized_metrics_snapshot();
+    let dispatch_after = morsel_dispatch_metrics_snapshot();
+
+    let delta_rows = vec_after.vectorized_rows_total - vec_before.vectorized_rows_total;
+    let delta_simd = vec_after.simd_utilization_milli - vec_before.simd_utilization_milli;
+    let delta_throughput = dispatch_after.fsqlite_morsel_throughput_rows_per_sec
+        - dispatch_before.fsqlite_morsel_throughput_rows_per_sec;
+    let delta_workers = dispatch_after.fsqlite_morsel_workers_active
+        - dispatch_before.fsqlite_morsel_workers_active;
 
     println!(
-        "[{BEAD_ID}] metrics: vectorized_rows={} simd_util_milli={} morsel_throughput={} morsel_workers={}",
-        vec_metrics.vectorized_rows_total,
-        vec_metrics.simd_utilization_milli,
-        dispatch_metrics.fsqlite_morsel_throughput_rows_per_sec,
-        dispatch_metrics.fsqlite_morsel_workers_active,
+        "[{BEAD_ID}] metrics: vectorized_rows={delta_rows} simd_util_milli={delta_simd} morsel_throughput={delta_throughput} morsel_workers={delta_workers}",
     );
 
     // Vectorized metrics should show non-zero rows processed.

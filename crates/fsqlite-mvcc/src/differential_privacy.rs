@@ -671,31 +671,30 @@ mod tests {
 
     #[test]
     fn test_metrics_integration() {
-        reset_dp_metrics();
-
-        let m0 = dp_metrics();
-        assert_eq!(m0.fsqlite_dp_queries_total, 0);
-        assert_eq!(m0.fsqlite_dp_epsilon_spent_micros, 0);
+        let before = dp_metrics();
 
         let mut engine = DpEngine::new(5.0, 42).unwrap();
         engine.laplace(100.0, 1.0, 0.5).unwrap();
         engine.gaussian(100.0, 1.0, 0.3, 1e-5).unwrap();
 
-        let m1 = dp_metrics();
-        assert!(m1.fsqlite_dp_queries_total >= 2, "at least 2 queries");
+        let after = dp_metrics();
+        let queries_delta = after.fsqlite_dp_queries_total - before.fsqlite_dp_queries_total;
+        let epsilon_delta =
+            after.fsqlite_dp_epsilon_spent_micros - before.fsqlite_dp_epsilon_spent_micros;
         assert!(
-            m1.fsqlite_dp_epsilon_spent_micros >= 800_000,
-            "at least 0.8ε in micros"
+            queries_delta >= 2,
+            "at least 2 queries, got {queries_delta}"
+        );
+        assert!(
+            epsilon_delta >= 800_000,
+            "at least 0.8ε in micros, got {epsilon_delta}"
         );
 
-        let json = serde_json::to_string(&m1).unwrap();
+        let json = serde_json::to_string(&after).unwrap();
         assert!(json.contains("fsqlite_dp_queries_total"));
         assert!(json.contains("fsqlite_dp_epsilon_spent_micros"));
 
-        println!(
-            "[PASS] metrics: queries={} epsilon_micros={}",
-            m1.fsqlite_dp_queries_total, m1.fsqlite_dp_epsilon_spent_micros
-        );
+        println!("[PASS] metrics: queries_delta={queries_delta} epsilon_delta={epsilon_delta}");
     }
 
     #[test]

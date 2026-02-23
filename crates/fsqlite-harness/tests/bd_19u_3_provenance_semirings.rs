@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 use fsqlite_mvcc::{
     ProvenanceAnnotation, ProvenanceMode, ProvenanceToken, ProvenanceTracker, TupleId,
-    provenance_metrics, reset_provenance_metrics, why_not,
+    provenance_metrics, why_not,
 };
 
 // ---------------------------------------------------------------------------
@@ -211,12 +211,7 @@ fn test_why_not_provenance() {
 
 #[test]
 fn test_metrics_lifecycle() {
-    reset_provenance_metrics();
-
-    let m0 = provenance_metrics();
-    assert_eq!(m0.fsqlite_provenance_annotations_total, 0);
-    assert_eq!(m0.fsqlite_provenance_rows_emitted, 0);
-    assert_eq!(m0.fsqlite_provenance_queries_total, 0);
+    let before = provenance_metrics();
 
     // Create tokens (each base() and plus()/times() call records an annotation).
     let t1 = ProvenanceToken::base(1, 10);
@@ -224,26 +219,37 @@ fn test_metrics_lifecycle() {
     let _join = t1.times(t2);
 
     let m1 = provenance_metrics();
+    let delta_annotations =
+        m1.fsqlite_provenance_annotations_total - before.fsqlite_provenance_annotations_total;
     assert!(
-        m1.fsqlite_provenance_annotations_total >= 3,
-        "2 base + 1 times = at least 3 annotations"
+        delta_annotations >= 3,
+        "2 base + 1 times = at least 3 annotations, got delta={delta_annotations}"
     );
 
     // Create a result row.
+    let before_rows = provenance_metrics();
     let _ = ProvenanceAnnotation::new(0, ProvenanceToken::One);
 
     let m2 = provenance_metrics();
-    assert!(m2.fsqlite_provenance_rows_emitted >= 1, "1 row emitted");
+    let delta_rows =
+        m2.fsqlite_provenance_rows_emitted - before_rows.fsqlite_provenance_rows_emitted;
+    assert!(
+        delta_rows >= 1,
+        "expected at least 1 row emitted, got delta={delta_rows}"
+    );
 
     // Query provenance (why/how).
+    let before_queries = provenance_metrics();
     let t3 = ProvenanceToken::base(1, 30);
     let _ = t3.why_provenance();
     let _ = ProvenanceToken::base(1, 40).how_provenance();
 
     let m3 = provenance_metrics();
+    let delta_queries =
+        m3.fsqlite_provenance_queries_total - before_queries.fsqlite_provenance_queries_total;
     assert!(
-        m3.fsqlite_provenance_queries_total >= 2,
-        "at least 2 queries"
+        delta_queries >= 2,
+        "expected at least 2 queries, got delta={delta_queries}"
     );
 
     // Serializable.
@@ -253,10 +259,7 @@ fn test_metrics_lifecycle() {
     assert!(json.contains("fsqlite_provenance_queries_total"));
 
     println!(
-        "[PASS] metrics: annotations={} rows={} queries={}",
-        m3.fsqlite_provenance_annotations_total,
-        m3.fsqlite_provenance_rows_emitted,
-        m3.fsqlite_provenance_queries_total
+        "[PASS] metrics: annotations_delta={delta_annotations} rows_delta={delta_rows} queries_delta={delta_queries}"
     );
 }
 
@@ -370,14 +373,16 @@ fn test_conformance_summary() {
 
     // 6. Metrics.
     {
-        reset_provenance_metrics();
+        let before = provenance_metrics();
         let _ = ProvenanceToken::base(1, 1);
-        let m = provenance_metrics();
-        let pass = m.fsqlite_provenance_annotations_total >= 1;
+        let after = provenance_metrics();
+        let delta = after.fsqlite_provenance_annotations_total
+            - before.fsqlite_provenance_annotations_total;
+        let pass = delta >= 1;
         results.push(TestResult {
             name: "metrics",
             pass,
-            detail: format!("annotations={}", m.fsqlite_provenance_annotations_total),
+            detail: format!("annotations_delta={delta}"),
         });
     }
 

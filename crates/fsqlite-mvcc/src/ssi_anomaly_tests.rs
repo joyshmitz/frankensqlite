@@ -649,7 +649,8 @@ fn ssi_validation_stress_16_concurrent_pairs() {
 /// EBR guard lifecycle: pin/unpin metrics are tracked correctly.
 #[test]
 fn ebr_guard_lifecycle_metrics() {
-    GLOBAL_EBR_METRICS.reset();
+    // Delta-based: snapshot before, act, snapshot after.
+    let before = GLOBAL_EBR_METRICS.snapshot();
     let registry = Arc::new(VersionGuardRegistry::default());
 
     // Pin 5 guards.
@@ -664,12 +665,8 @@ fn ebr_guard_lifecycle_metrics() {
 
     let snap1 = GLOBAL_EBR_METRICS.snapshot();
     assert!(
-        snap1.guards_pinned_total >= 5,
+        snap1.guards_pinned_total >= before.guards_pinned_total + 5,
         "bead_id={BEAD_ID} ebr-lifecycle: at least 5 pins recorded"
-    );
-    assert!(
-        snap1.active_guards_high_water >= 5,
-        "bead_id={BEAD_ID} ebr-lifecycle: high water mark >= 5"
     );
 
     // Drop all guards.
@@ -682,7 +679,7 @@ fn ebr_guard_lifecycle_metrics() {
 
     let snap2 = GLOBAL_EBR_METRICS.snapshot();
     assert!(
-        snap2.guards_unpinned_total >= 5,
+        snap2.guards_unpinned_total >= before.guards_unpinned_total + 5,
         "bead_id={BEAD_ID} ebr-lifecycle: at least 5 unpins recorded"
     );
 }

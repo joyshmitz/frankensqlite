@@ -12,9 +12,7 @@
 //!   9. Global metrics lifecycle
 //!  10. Machine-readable conformance output
 
-use fsqlite_mvcc::{
-    DpEngine, DpError, NoiseMechanism, PrivacyBudget, dp_metrics, reset_dp_metrics, sensitivity,
-};
+use fsqlite_mvcc::{DpEngine, DpError, NoiseMechanism, PrivacyBudget, dp_metrics, sensitivity};
 
 // ---------------------------------------------------------------------------
 // Test 1: Privacy budget creation and enforcement
@@ -285,45 +283,48 @@ fn test_sensitivity_helpers() {
 
 #[test]
 fn test_metrics_lifecycle() {
-    reset_dp_metrics();
-
-    let m0 = dp_metrics();
-    assert_eq!(m0.fsqlite_dp_queries_total, 0);
-    assert_eq!(m0.fsqlite_dp_epsilon_spent_micros, 0);
-    assert_eq!(m0.fsqlite_dp_budget_exhausted_total, 0);
+    let before = dp_metrics();
 
     // Run some queries.
     let mut engine = DpEngine::new(5.0, 42).unwrap();
     engine.laplace(100.0, 1.0, 0.5).unwrap();
     engine.gaussian(200.0, 1.0, 0.3, 1e-5).unwrap();
 
-    let m1 = dp_metrics();
-    assert!(m1.fsqlite_dp_queries_total >= 2);
+    let after_queries = dp_metrics();
+    let delta_queries = after_queries.fsqlite_dp_queries_total - before.fsqlite_dp_queries_total;
+    let delta_epsilon =
+        after_queries.fsqlite_dp_epsilon_spent_micros - before.fsqlite_dp_epsilon_spent_micros;
+    assert!(
+        delta_queries >= 2,
+        "expected at least 2 new queries, got delta {delta_queries}"
+    );
     // 0.5 + 0.3 = 0.8ε → 800000 micros.
-    assert!(m1.fsqlite_dp_epsilon_spent_micros >= 800_000);
-    assert_eq!(m1.fsqlite_dp_budget_exhausted_total, 0);
+    assert!(
+        delta_epsilon >= 800_000,
+        "expected at least 800000 epsilon micros delta, got {delta_epsilon}"
+    );
 
     // Trigger budget exhaustion.
+    let before_exhaust = dp_metrics();
     let mut engine2 = DpEngine::new(0.1, 42).unwrap();
     let _ = engine2.laplace(100.0, 1.0, 0.5); // should fail
 
-    let m2 = dp_metrics();
+    let after_exhaust = dp_metrics();
+    let delta_exhausted = after_exhaust.fsqlite_dp_budget_exhausted_total
+        - before_exhaust.fsqlite_dp_budget_exhausted_total;
     assert!(
-        m2.fsqlite_dp_budget_exhausted_total >= 1,
-        "exhaustion should be counted"
+        delta_exhausted >= 1,
+        "exhaustion should be counted, got delta {delta_exhausted}"
     );
 
     // Serialization.
-    let json = serde_json::to_string(&m2).unwrap();
+    let json = serde_json::to_string(&after_exhaust).unwrap();
     assert!(json.contains("fsqlite_dp_queries_total"));
     assert!(json.contains("fsqlite_dp_epsilon_spent_micros"));
     assert!(json.contains("fsqlite_dp_budget_exhausted_total"));
 
     println!(
-        "[PASS] metrics: queries={} ε_micros={} exhausted={}",
-        m2.fsqlite_dp_queries_total,
-        m2.fsqlite_dp_epsilon_spent_micros,
-        m2.fsqlite_dp_budget_exhausted_total
+        "[PASS] metrics: queries_delta={delta_queries} ε_micros_delta={delta_epsilon} exhausted_delta={delta_exhausted}"
     );
 }
 
@@ -405,19 +406,18 @@ fn test_conformance_summary() {
 
     // 6. Metrics.
     {
-        reset_dp_metrics();
+        let before = dp_metrics();
         let mut e = DpEngine::new(10.0, 42).unwrap();
         e.laplace(100.0, 1.0, 1.0).unwrap();
-        let m = dp_metrics();
-        let pass =
-            m.fsqlite_dp_queries_total >= 1 && m.fsqlite_dp_epsilon_spent_micros >= 1_000_000;
+        let after = dp_metrics();
+        let delta_queries = after.fsqlite_dp_queries_total - before.fsqlite_dp_queries_total;
+        let delta_epsilon =
+            after.fsqlite_dp_epsilon_spent_micros - before.fsqlite_dp_epsilon_spent_micros;
+        let pass = delta_queries >= 1 && delta_epsilon >= 1_000_000;
         results.push(TestResult {
             name: "metrics",
             pass,
-            detail: format!(
-                "queries={} ε_micros={}",
-                m.fsqlite_dp_queries_total, m.fsqlite_dp_epsilon_spent_micros
-            ),
+            detail: format!("queries_delta={delta_queries} ε_micros_delta={delta_epsilon}"),
         });
     }
 

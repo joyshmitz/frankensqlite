@@ -1290,7 +1290,8 @@ mod tests {
 
     #[test]
     fn test_global_metrics() {
-        reset_sketch_telemetry_metrics();
+        // Delta-based: snapshot before, act, snapshot after.
+        let before = sketch_telemetry_metrics();
 
         let mut cms = CountMinSketch::new(&CountMinSketchConfig {
             width: 64,
@@ -1301,25 +1302,35 @@ mod tests {
         cms.observe(2);
         _ = cms.estimate(1);
 
-        let m = sketch_telemetry_metrics();
+        let after = sketch_telemetry_metrics();
         assert!(
-            m.fsqlite_sketch_memory_bytes > 0,
+            after.fsqlite_sketch_memory_bytes > 0,
             "memory gauge should be > 0"
         );
-        assert_eq!(m.fsqlite_sketch_observations_total, 2);
-        assert_eq!(m.fsqlite_sketch_estimates_total, 1);
+        let obs_delta =
+            after.fsqlite_sketch_observations_total - before.fsqlite_sketch_observations_total;
+        let est_delta =
+            after.fsqlite_sketch_estimates_total - before.fsqlite_sketch_estimates_total;
+        assert!(
+            obs_delta >= 2,
+            "expected at least 2 observations, got {obs_delta}"
+        );
+        assert!(
+            est_delta >= 1,
+            "expected at least 1 estimate, got {est_delta}"
+        );
 
         println!(
-            "[PASS] global metrics: mem={} obs={} est={}",
-            m.fsqlite_sketch_memory_bytes,
-            m.fsqlite_sketch_observations_total,
-            m.fsqlite_sketch_estimates_total
+            "[PASS] global metrics: mem={} obs_delta={} est_delta={}",
+            after.fsqlite_sketch_memory_bytes, obs_delta, est_delta
         );
     }
 
     #[test]
     fn test_memory_tracking_on_drop() {
-        reset_sketch_telemetry_metrics();
+        // Delta-based: snapshot before, create sketch, verify increase, drop,
+        // verify gauge returns to the previous level.
+        let before = sketch_telemetry_metrics();
 
         {
             let _cms = CountMinSketch::new(&CountMinSketchConfig {
@@ -1327,18 +1338,21 @@ mod tests {
                 depth: 2,
                 seed: 0,
             });
-            let m = sketch_telemetry_metrics();
-            assert!(m.fsqlite_sketch_memory_bytes > 0);
+            let during = sketch_telemetry_metrics();
+            assert!(
+                during.fsqlite_sketch_memory_bytes > before.fsqlite_sketch_memory_bytes,
+                "memory gauge should increase after allocation"
+            );
         }
 
-        // After drop, memory should be decremented.
-        let m = sketch_telemetry_metrics();
+        // After drop, memory gauge should return to the level before allocation.
+        let after = sketch_telemetry_metrics();
         assert_eq!(
-            m.fsqlite_sketch_memory_bytes, 0,
-            "memory gauge should return to 0 after drop"
+            after.fsqlite_sketch_memory_bytes, before.fsqlite_sketch_memory_bytes,
+            "memory gauge should return to pre-allocation level after drop"
         );
 
-        println!("[PASS] memory tracking on drop: gauge returns to 0");
+        println!("[PASS] memory tracking on drop: gauge returns to pre-allocation level");
     }
 
     // -- Sliding Window Histogram tests --

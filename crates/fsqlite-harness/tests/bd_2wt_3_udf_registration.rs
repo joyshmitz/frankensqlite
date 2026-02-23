@@ -472,39 +472,46 @@ fn test_udf_overwrite() {
 
 #[test]
 fn test_udf_metrics() {
-    fsqlite_func::reset_udf_metrics();
-
     let before = fsqlite_func::udf_registered_count();
-    assert_eq!(before, 0, "metrics start at 0 after reset");
 
     let conn = open_mem();
     conn.register_scalar_function(DoubleFunc);
-    assert_eq!(
-        fsqlite_func::udf_registered_count(),
-        1,
-        "1 registration after scalar UDF"
+    let delta = fsqlite_func::udf_registered_count() - before;
+    assert!(
+        delta >= 1,
+        "expected at least 1 registration after scalar UDF, got delta={delta}"
     );
 
+    let before2 = fsqlite_func::udf_registered_count();
     conn.register_aggregate_function(ProductAgg);
-    assert_eq!(
-        fsqlite_func::udf_registered_count(),
-        2,
-        "2 registrations after aggregate UDF"
+    let delta2 = fsqlite_func::udf_registered_count() - before2;
+    assert!(
+        delta2 >= 1,
+        "expected at least 1 registration after aggregate UDF, got delta={delta2}"
     );
 
+    let before3 = fsqlite_func::udf_registered_count();
     conn.register_window_function(RunningSumWindow);
-    assert_eq!(
-        fsqlite_func::udf_registered_count(),
-        3,
-        "3 registrations after window UDF"
+    let delta3 = fsqlite_func::udf_registered_count() - before3;
+    assert!(
+        delta3 >= 1,
+        "expected at least 1 registration after window UDF, got delta={delta3}"
     );
 
     // Overwrite counts as another registration
+    let before4 = fsqlite_func::udf_registered_count();
     conn.register_scalar_function(TripleFunc);
-    assert_eq!(
-        fsqlite_func::udf_registered_count(),
-        4,
-        "4 registrations (overwrite counts)"
+    let delta4 = fsqlite_func::udf_registered_count() - before4;
+    assert!(
+        delta4 >= 1,
+        "expected at least 1 registration (overwrite counts), got delta={delta4}"
+    );
+
+    // Overall: 4 registrations in this test
+    let total_delta = fsqlite_func::udf_registered_count() - before;
+    assert!(
+        total_delta >= 4,
+        "expected at least 4 total registrations, got delta={total_delta}"
     );
 
     println!("[PASS] UDF metrics");

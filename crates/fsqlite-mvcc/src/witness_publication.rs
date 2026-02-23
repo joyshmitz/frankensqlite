@@ -789,9 +789,7 @@ impl ProofCarryingValidator for DefaultProofValidator {
                     return ValidationVerdict::Invalid;
                 }
                 // Check for 3-node cycle: T1 →rw T2 →rw T3 →rw T1
-                if e1.to == e2.from
-                    && edges.iter().any(|e3| e3.from == e2.to && e3.to == e1.from)
-                {
+                if e1.to == e2.from && edges.iter().any(|e3| e3.from == e2.to && e3.to == e1.from) {
                     error!("dangerous 3-node cycle detected in proof-carrying commit");
                     return ValidationVerdict::Invalid;
                 }

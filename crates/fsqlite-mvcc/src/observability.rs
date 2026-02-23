@@ -615,12 +615,19 @@ mod tests {
 
     #[test]
     fn ssi_metrics_reset() {
+        let before = ssi_metrics_snapshot();
         record_ssi_commit();
         record_ssi_abort(SsiAbortCategory::Pivot);
-        reset_ssi_metrics();
-        let snap = ssi_metrics_snapshot();
-        assert_eq!(snap.commits_total, 0);
-        assert_eq!(snap.aborts_pivot, 0);
-        assert_eq!(snap.validations_total, 0);
+        let after = ssi_metrics_snapshot();
+        let commits_delta = after.commits_total - before.commits_total;
+        let aborts_delta = after.aborts_pivot - before.aborts_pivot;
+        assert!(
+            commits_delta >= 1,
+            "expected at least 1 commit delta, got {commits_delta}"
+        );
+        assert!(
+            aborts_delta >= 1,
+            "expected at least 1 abort delta, got {aborts_delta}"
+        );
     }
 }

@@ -14,9 +14,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use fsqlite_mvcc::{
-    LeftRight, LeftRightPair, LeftRightTriple, leftright_metrics, reset_leftright_metrics,
-};
+use fsqlite_mvcc::{LeftRight, LeftRightPair, LeftRightTriple, leftright_metrics};
 
 // ---------------------------------------------------------------------------
 // Test 1: Single-value read/write
@@ -194,31 +192,28 @@ fn test_writer_serialization() {
 
 #[test]
 fn test_metrics_integration() {
-    reset_leftright_metrics();
+    let before = leftright_metrics();
 
     let lr = LeftRight::new(42);
     for _ in 0..10 {
         lr.read("metrics_test");
     }
 
-    let m = leftright_metrics();
-    assert_eq!(
-        m.fsqlite_leftright_reads_total, 10,
-        "expected 10 reads recorded"
+    let after = leftright_metrics();
+    let delta_reads = after.fsqlite_leftright_reads_total - before.fsqlite_leftright_reads_total;
+    assert!(
+        delta_reads >= 10,
+        "expected at least 10 reads recorded, got delta={delta_reads}"
     );
 
-    // Swaps should be 0 (no writes performed since reset).
-    // (Note: metrics are global, so other tests may have incremented swaps.
-    //  We only assert reads since we reset before this test.)
-
     // Verify serialization works.
-    let json = serde_json::to_string(&m).unwrap();
+    let json = serde_json::to_string(&after).unwrap();
     assert!(json.contains("fsqlite_leftright_reads_total"));
     assert!(json.contains("fsqlite_leftright_swaps_total"));
 
     println!(
-        "[PASS] metrics: reads={} retries={}",
-        m.fsqlite_leftright_reads_total, m.fsqlite_leftright_reader_retries_total
+        "[PASS] metrics: reads_delta={delta_reads} retries={}",
+        after.fsqlite_leftright_reader_retries_total
     );
 }
 
@@ -353,17 +348,18 @@ fn test_conformance_summary() {
 
     // 5. Metrics increment
     {
-        reset_leftright_metrics();
+        let before = leftright_metrics();
         let lr = LeftRight::new(0);
         for _ in 0..5 {
             lr.read("c5");
         }
-        let m = leftright_metrics();
-        let pass = m.fsqlite_leftright_reads_total == 5;
+        let after = leftright_metrics();
+        let delta = after.fsqlite_leftright_reads_total - before.fsqlite_leftright_reads_total;
+        let pass = delta >= 5;
         results.push(TestResult {
             name: "metrics_increment",
             pass,
-            detail: format!("reads_total={}", m.fsqlite_leftright_reads_total),
+            detail: format!("reads_delta={delta}"),
         });
     }
 

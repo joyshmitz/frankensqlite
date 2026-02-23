@@ -6,8 +6,7 @@
 use std::sync::Arc;
 
 use fsqlite_mvcc::{
-    CHAIN_HEAD_EMPTY, CHAIN_HEAD_SHARDS, CasMetricsSnapshot, VersionStore, cas_metrics_snapshot,
-    idx_to_version_pointer, reset_cas_metrics,
+    CHAIN_HEAD_EMPTY, CHAIN_HEAD_SHARDS, VersionStore, cas_metrics_snapshot, idx_to_version_pointer,
 };
 use fsqlite_types::{
     CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot, TxnEpoch, TxnId,
@@ -361,43 +360,26 @@ fn aba_protection_interleave_gc_and_publish() {
 
 #[test]
 fn cas_metrics_reset_and_increment() {
-    // Combined into a single test to avoid races on global metric statics.
-    // Part 1: reset clears counters.
-    {
-        let store = VersionStore::new(PageSize::DEFAULT);
-        store.publish(make_version(1, 1, None));
+    // Use snapshot-delta pattern to avoid interference from parallel tests.
+    let store = VersionStore::new(PageSize::DEFAULT);
+    let before = cas_metrics_snapshot();
 
-        reset_cas_metrics();
-        let after = cas_metrics_snapshot();
-        assert_eq!(
-            after,
-            CasMetricsSnapshot::default(),
-            "bead_id={BEAD} reset should zero all CAS metrics"
-        );
+    for i in 1..=10_u32 {
+        let version = make_version(i, u64::from(i), None);
+        store.publish(version);
     }
 
-    // Part 2: publish increments counters (measured right after reset).
-    {
-        let store = VersionStore::new(PageSize::DEFAULT);
-        let before = cas_metrics_snapshot();
-
-        for i in 1..=10_u32 {
-            let version = make_version(i, u64::from(i), None);
-            store.publish(version);
-        }
-
-        let after = cas_metrics_snapshot();
-        let delta_attempts = after.attempts_total - before.attempts_total;
-        let delta_le_1 = after.retries.le_1 - before.retries.le_1;
-        assert!(
-            delta_attempts >= 10,
-            "bead_id={BEAD} CAS attempt delta {delta_attempts} should be >= 10"
-        );
-        assert!(
-            delta_le_1 >= 10,
-            "bead_id={BEAD} uncontended publishes should all be first-attempt (delta_le_1={delta_le_1})"
-        );
-    }
+    let after = cas_metrics_snapshot();
+    let delta_attempts = after.attempts_total - before.attempts_total;
+    let delta_le_1 = after.retries.le_1 - before.retries.le_1;
+    assert!(
+        delta_attempts >= 10,
+        "bead_id={BEAD} CAS attempt delta {delta_attempts} should be >= 10"
+    );
+    assert!(
+        delta_le_1 >= 10,
+        "bead_id={BEAD} uncontended publishes should all be first-attempt (delta_le_1={delta_le_1})"
+    );
 }
 
 // ---------------------------------------------------------------------------

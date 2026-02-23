@@ -173,12 +173,17 @@ struct WorkloadSummary {
 }
 
 fn configured_ci_writers() -> usize {
-    env_usize("FSQLITE_SSI_CI_WRITERS")
-        .unwrap_or_else(|| if cfg!(debug_assertions) { CI_WRITERS_DEBUG } else { CI_WRITERS_RELEASE })
+    env_usize("FSQLITE_SSI_CI_WRITERS").unwrap_or({
+        if cfg!(debug_assertions) {
+            CI_WRITERS_DEBUG
+        } else {
+            CI_WRITERS_RELEASE
+        }
+    })
 }
 
 fn configured_ci_txns_per_writer() -> usize {
-    env_usize("FSQLITE_SSI_CI_TXNS_PER_WRITER").unwrap_or_else(|| {
+    env_usize("FSQLITE_SSI_CI_TXNS_PER_WRITER").unwrap_or({
         if cfg!(debug_assertions) {
             CI_TXNS_PER_WRITER_DEBUG
         } else {
@@ -188,7 +193,7 @@ fn configured_ci_txns_per_writer() -> usize {
 }
 
 fn configured_single_writer_txns() -> usize {
-    env_usize("FSQLITE_SSI_SINGLE_WRITER_TXNS").unwrap_or_else(|| {
+    env_usize("FSQLITE_SSI_SINGLE_WRITER_TXNS").unwrap_or({
         if cfg!(debug_assertions) {
             SINGLE_WRITER_TXNS_DEBUG
         } else {
@@ -198,7 +203,7 @@ fn configured_single_writer_txns() -> usize {
 }
 
 fn configured_ci_min_throughput() -> f64 {
-    env_f64("FSQLITE_SSI_MIN_CI_THROUGHPUT").unwrap_or_else(|| {
+    env_f64("FSQLITE_SSI_MIN_CI_THROUGHPUT").unwrap_or({
         if cfg!(debug_assertions) {
             MIN_CI_THROUGHPUT_TXN_PER_SEC_DEBUG
         } else {
@@ -208,7 +213,7 @@ fn configured_ci_min_throughput() -> f64 {
 }
 
 fn configured_ci_max_elapsed_seconds() -> f64 {
-    env_f64("FSQLITE_SSI_MAX_CI_ELAPSED_SECS").unwrap_or_else(|| {
+    env_f64("FSQLITE_SSI_MAX_CI_ELAPSED_SECS").unwrap_or({
         if cfg!(debug_assertions) {
             MAX_CI_ELAPSED_SECS_DEBUG
         } else {
@@ -218,7 +223,7 @@ fn configured_ci_max_elapsed_seconds() -> f64 {
 }
 
 fn configured_single_writer_max_elapsed_seconds() -> f64 {
-    env_f64("FSQLITE_SSI_MAX_SINGLE_WRITER_ELAPSED_SECS").unwrap_or_else(|| {
+    env_f64("FSQLITE_SSI_MAX_SINGLE_WRITER_ELAPSED_SECS").unwrap_or({
         if cfg!(debug_assertions) {
             MAX_SINGLE_WRITER_ELAPSED_SECS_DEBUG
         } else {
@@ -228,7 +233,7 @@ fn configured_single_writer_max_elapsed_seconds() -> f64 {
 }
 
 fn configured_account_count() -> i64 {
-    env_i64("FSQLITE_SSI_ACCOUNT_COUNT").unwrap_or_else(|| {
+    env_i64("FSQLITE_SSI_ACCOUNT_COUNT").unwrap_or({
         if cfg!(debug_assertions) {
             ACCOUNT_COUNT_DEBUG
         } else {
@@ -238,15 +243,27 @@ fn configured_account_count() -> i64 {
 }
 
 fn env_usize(var: &str) -> Option<usize> {
-    std::env::var(var).ok()?.parse::<usize>().ok().filter(|v| *v > 0)
+    std::env::var(var)
+        .ok()?
+        .parse::<usize>()
+        .ok()
+        .filter(|v| *v > 0)
 }
 
 fn env_f64(var: &str) -> Option<f64> {
-    std::env::var(var).ok()?.parse::<f64>().ok().filter(|v| *v > 0.0)
+    std::env::var(var)
+        .ok()?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| *v > 0.0)
 }
 
 fn env_i64(var: &str) -> Option<i64> {
-    std::env::var(var).ok()?.parse::<i64>().ok().filter(|v| *v > 0)
+    std::env::var(var)
+        .ok()?
+        .parse::<i64>()
+        .ok()
+        .filter(|v| *v > 0)
 }
 
 fn run_ssi_workload(
@@ -266,7 +283,13 @@ fn run_ssi_workload(
         let path = db_path.clone();
         let worker_seed = derive_worker_seed(seed, worker_id);
         handles.push(thread::spawn(move || {
-            run_worker(&path, worker_id, txns_per_writer, worker_seed, account_count)
+            run_worker(
+                &path,
+                worker_id,
+                txns_per_writer,
+                worker_seed,
+                account_count,
+            )
         }));
     }
 
