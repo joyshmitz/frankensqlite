@@ -874,6 +874,19 @@ fn compute_interior_distribution(
             }
         }
 
+        if cursor + count < total_cells && total_cells - (cursor + count) == 1 {
+            // A single trailing interior cell would be consumed as a divider with no
+            // payload cell left for the right page. Backtrack one cell so we leave
+            // two cells: divider + right-page payload.
+            if count <= 1 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "balance: interior distribution cannot leave a solitary divider"
+                        .to_owned(),
+                });
+            }
+            count -= 1;
+        }
+
         if count == 0 {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2083,7 +2096,7 @@ mod tests {
             })
             .collect();
 
-        let dist = compute_distribution(&cells, USABLE, 8, true).unwrap();
+        let dist = compute_distribution(&cells, USABLE, 8, BtreePageType::LeafTable).unwrap();
         assert_eq!(dist, vec![5]);
     }
 
@@ -2099,7 +2112,7 @@ mod tests {
             })
             .collect();
 
-        let dist = compute_distribution(&cells, USABLE, 8, true).unwrap();
+        let dist = compute_distribution(&cells, USABLE, 8, BtreePageType::LeafTable).unwrap();
         assert!(dist.len() >= 3, "should need at least 3 pages");
         assert_eq!(dist.iter().sum::<usize>(), 6);
         // All pages should have cells.
@@ -2108,7 +2121,7 @@ mod tests {
 
     #[test]
     fn test_distribution_empty() {
-        let dist = compute_distribution(&[], USABLE, 8, true).unwrap();
+        let dist = compute_distribution(&[], USABLE, 8, BtreePageType::LeafTable).unwrap();
         assert_eq!(dist, vec![0]);
     }
 
@@ -2121,12 +2134,38 @@ mod tests {
             })
             .collect();
 
-        let dist = compute_distribution(&cells, USABLE, 12, false).unwrap();
+        let dist = compute_distribution(&cells, USABLE, 12, BtreePageType::InteriorTable).unwrap();
         assert!(
             dist.len() > 1,
             "interior distribution should split across pages"
         );
         assert!(dist.iter().all(|&c| c > 0));
+        assert_eq!(
+            dist.iter().sum::<usize>() + dist.len() - 1,
+            cells.len(),
+            "interior distribution must account for promoted divider cells"
+        );
+    }
+
+    #[test]
+    fn test_distribution_interior_avoids_trailing_orphan_divider() {
+        let cells = vec![
+            GatheredCell {
+                data: vec![0; 1_500],
+                size: 1_500,
+            },
+            GatheredCell {
+                data: vec![0; 1_500],
+                size: 1_500,
+            },
+            GatheredCell {
+                data: vec![0; 3_000],
+                size: 3_000,
+            },
+        ];
+
+        let dist = compute_distribution(&cells, USABLE, 12, BtreePageType::InteriorIndex).unwrap();
+        assert_eq!(dist, vec![1, 1]);
         assert_eq!(
             dist.iter().sum::<usize>() + dist.len() - 1,
             cells.len(),

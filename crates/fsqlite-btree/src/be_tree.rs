@@ -179,7 +179,7 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
     pub fn len(&self) -> usize {
         let mut pending: BTreeMap<K, Option<V>> = BTreeMap::new();
         self.collect_all(&self.root, &mut pending);
-        pending.into_values().filter(|v| v.is_some()).count()
+        pending.into_values().flatten().count()
     }
 
     /// Return whether the tree is empty.

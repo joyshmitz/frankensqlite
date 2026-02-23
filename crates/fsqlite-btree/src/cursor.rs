@@ -809,7 +809,9 @@ impl<P: PageReader> BtCursor<P> {
             let search_result = self.binary_search_index_interior(cx, &entry, target_key)?;
             let child_idx = match search_result {
                 BinarySearchResult::NotFound(idx) => idx,
-                BinarySearchResult::Found(_) => unreachable!("binary_search_index_interior should not return Found"),
+                BinarySearchResult::Found(_) => {
+                    unreachable!("binary_search_index_interior should not return Found")
+                }
             };
             let child = self.child_page_at(&entry, child_idx)?;
             let mut entry = entry;
