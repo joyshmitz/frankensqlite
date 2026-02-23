@@ -12596,29 +12596,51 @@ fn literal_to_join_value(lit: &Literal) -> SqliteValue {
 /// Evaluate a binary operator on two `SqliteValue`s (for JOIN expression evaluation).
 fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) -> SqliteValue {
     match op {
-        BinaryOp::Eq => SqliteValue::Integer(i64::from(
-            cmp_values(left, right) == std::cmp::Ordering::Equal,
-        )),
-        BinaryOp::Ne => SqliteValue::Integer(i64::from(
-            cmp_values(left, right) != std::cmp::Ordering::Equal,
-        )),
-        BinaryOp::Gt => SqliteValue::Integer(i64::from(
-            cmp_values(left, right) == std::cmp::Ordering::Greater,
-        )),
-        BinaryOp::Lt => SqliteValue::Integer(i64::from(
-            cmp_values(left, right) == std::cmp::Ordering::Less,
-        )),
-        BinaryOp::Ge => SqliteValue::Integer(i64::from(
-            cmp_values(left, right) != std::cmp::Ordering::Less,
-        )),
-        BinaryOp::Le => SqliteValue::Integer(i64::from(
-            cmp_values(left, right) != std::cmp::Ordering::Greater,
-        )),
-        BinaryOp::And => {
-            SqliteValue::Integer(i64::from(is_sqlite_truthy(left) && is_sqlite_truthy(right)))
+        // SQL comparisons: NULL compared to anything is NULL (UNKNOWN).
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Gt | BinaryOp::Lt | BinaryOp::Ge
+        | BinaryOp::Le => {
+            if left.is_null() || right.is_null() {
+                return SqliteValue::Null;
+            }
+            let cmp = cmp_values(left, right);
+            let result = match op {
+                BinaryOp::Eq => cmp == std::cmp::Ordering::Equal,
+                BinaryOp::Ne => cmp != std::cmp::Ordering::Equal,
+                BinaryOp::Gt => cmp == std::cmp::Ordering::Greater,
+                BinaryOp::Lt => cmp == std::cmp::Ordering::Less,
+                BinaryOp::Ge => cmp != std::cmp::Ordering::Less,
+                BinaryOp::Le => cmp != std::cmp::Ordering::Greater,
+                _ => unreachable!(),
+            };
+            SqliteValue::Integer(i64::from(result))
         }
+        // Three-valued AND: FALSE AND NULL = FALSE, TRUE AND NULL = NULL.
+        BinaryOp::And => {
+            let l_null = left.is_null();
+            let r_null = right.is_null();
+            let l_truthy = is_sqlite_truthy(left);
+            let r_truthy = is_sqlite_truthy(right);
+            if (!l_truthy && !l_null) || (!r_truthy && !r_null) {
+                SqliteValue::Integer(0)
+            } else if l_null || r_null {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Integer(1)
+            }
+        }
+        // Three-valued OR: TRUE OR NULL = TRUE, FALSE OR NULL = NULL.
         BinaryOp::Or => {
-            SqliteValue::Integer(i64::from(is_sqlite_truthy(left) || is_sqlite_truthy(right)))
+            let l_null = left.is_null();
+            let r_null = right.is_null();
+            let l_truthy = is_sqlite_truthy(left);
+            let r_truthy = is_sqlite_truthy(right);
+            if l_truthy || r_truthy {
+                SqliteValue::Integer(1)
+            } else if l_null || r_null {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Integer(0)
+            }
         }
         BinaryOp::Add => left.sql_add(right),
         BinaryOp::Subtract => left.sql_sub(right),

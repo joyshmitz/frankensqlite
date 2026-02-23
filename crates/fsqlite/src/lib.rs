@@ -2383,6 +2383,61 @@ mod tests {
     }
 
     #[test]
+    fn null_comparison_returns_null_in_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE nc (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO nc VALUES (1, NULL), (2, 5), (3, NULL);")
+            .unwrap();
+        // NULL = 5 should be NULL (not truthy), so row 1 excluded.
+        // NULL = NULL should be NULL (not truthy), so row 3 excluded.
+        let rows = conn
+            .query("SELECT id FROM nc WHERE val = 5 ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn null_and_true_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        // NULL AND 1 should be NULL, not 0.
+        let rows = conn.query("SELECT NULL AND 1;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn null_or_false_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        // NULL OR 0 should be NULL, not 0.
+        let rows = conn.query("SELECT NULL OR 0;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn false_and_null_returns_false() {
+        let conn = Connection::open(":memory:").unwrap();
+        // 0 AND NULL should be 0 (FALSE short-circuits).
+        let rows = conn.query("SELECT 0 AND NULL;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn null_ne_in_where_excludes_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE nne (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO nne VALUES (1, NULL), (2, 5), (3, 10);")
+            .unwrap();
+        // NULL != 5 is NULL (not truthy), so id=1 excluded. 5 != 5 is false, so id=2 excluded.
+        let rows = conn
+            .query("SELECT id FROM nne WHERE val != 5 ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
     fn probe_update_where_column_cmp() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);")
