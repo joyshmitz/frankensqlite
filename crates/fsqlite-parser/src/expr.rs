@@ -62,6 +62,13 @@ impl Parser {
     // ── Pratt core ──────────────────────────────────────────────────────
 
     fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_expr_bp_inner(min_bp);
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_expr_bp_inner(&mut self, min_bp: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_prefix()?;
 
         loop {

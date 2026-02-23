@@ -780,12 +780,13 @@ impl std::fmt::Debug for RcriEntry {
 fn bloom_hash(pgno: u32, probe: u32) -> u32 {
     use xxhash_rust::xxh3::xxh3_64;
 
-    let mut buf = Vec::with_capacity(rcri_bloom::DOMAIN_PREFIX.len() + 4 + 4);
-    buf.extend_from_slice(rcri_bloom::DOMAIN_PREFIX);
-    buf.extend_from_slice(&pgno.to_be_bytes());
-    buf.extend_from_slice(&probe.to_be_bytes());
+    let mut buf = [0u8; 32];
+    let prefix_len = rcri_bloom::DOMAIN_PREFIX.len();
+    buf[..prefix_len].copy_from_slice(rcri_bloom::DOMAIN_PREFIX);
+    buf[prefix_len..prefix_len + 4].copy_from_slice(&pgno.to_be_bytes());
+    buf[prefix_len + 4..prefix_len + 8].copy_from_slice(&probe.to_be_bytes());
 
-    let h = xxh3_64(&buf);
+    let h = xxh3_64(&buf[..prefix_len + 8]);
     #[allow(clippy::cast_possible_truncation)]
     let bit_index = (h as u32) % rcri_bloom::BITS;
     bit_index

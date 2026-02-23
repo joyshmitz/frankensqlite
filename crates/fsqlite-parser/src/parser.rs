@@ -97,10 +97,13 @@ impl Error for ParseError {}
 // Parser
 // ---------------------------------------------------------------------------
 
+pub const MAX_PARSE_DEPTH: u32 = 1000;
+
 pub struct Parser {
     pub(crate) tokens: Vec<Token>,
     pub(crate) pos: usize,
     pub(crate) errors: Vec<ParseError>,
+    pub(crate) depth: u32,
 }
 
 impl Parser {
@@ -110,7 +113,20 @@ impl Parser {
             tokens,
             pos: 0,
             errors: Vec::new(),
+            depth: 0,
         }
+    }
+
+    pub(crate) fn enter_recursion(&mut self) -> Result<(), ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            return Err(self.err_msg(format!("expression tree is too deep (maximum depth {MAX_PARSE_DEPTH})")));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn leave_recursion(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
     }
 
     #[must_use]
