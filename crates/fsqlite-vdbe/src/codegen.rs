@@ -4823,7 +4823,6 @@ fn emit_in_probe_expr(
     b.resolve_label(no_match_label);
     // No match.  If any subquery value was NULL → result is NULL.
     b.emit_jump_to_label(Opcode::If, r_saw_null, 0, null_label, P4::None, 0);
-    b.free_temp(r_saw_null);
     b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
@@ -4837,6 +4836,7 @@ fn emit_in_probe_expr(
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
 
+    b.free_temp(r_saw_null);
     b.free_temp(r_probe);
     b.free_temp(r_operand);
 }

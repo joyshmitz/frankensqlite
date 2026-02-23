@@ -4,9 +4,9 @@
 //! `fsqlite-wal`:
 //!
 //! - [`WalBackendAdapter`] wraps `WalFile` to satisfy the pager's
-//!   [`WalBackend`] trait (pager → WAL direction).
+//!   [`WalBackend`] trait (pager -> WAL direction).
 //! - [`CheckpointTargetAdapterRef`] wraps `CheckpointPageWriter` to satisfy the
-//!   WAL executor's [`CheckpointTarget`] trait (WAL → pager direction).
+//!   WAL executor's [`CheckpointTarget`] trait (WAL -> pager direction).
 
 use std::collections::HashMap;
 
@@ -16,17 +16,17 @@ use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
+use fsqlite_wal::checksum::WalSalts;
 use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget, WalFile,
     execute_checkpoint,
 };
-use fsqlite_wal::checksum::WalSalts;
 use tracing::{debug, warn};
 
 use crate::wal_fec_adapter::{FecCommitHook, FecCommitResult};
 
 // ---------------------------------------------------------------------------
-// WalBackendAdapter: WalFile → WalBackend
+// WalBackendAdapter: WalFile -> WalBackend
 // ---------------------------------------------------------------------------
 
 /// Adapter wrapping [`WalFile`] to implement the pager's [`WalBackend`] trait.
@@ -53,6 +53,15 @@ pub struct WalBackendAdapter<F: VfsFile> {
     index_built_to: Option<usize>,
     /// WAL generation salts at the time the index was built, used to detect resets.
     index_salts: Option<WalSalts>,
+    /// `true` when the page index hit the capacity cap and some pages were not
+    /// indexed.  When this is set, a miss in the HashMap cannot be trusted ---
+    /// the page may exist in the WAL but simply wasn't indexed.  In that case,
+    /// `read_page` falls back to a backwards linear scan.
+    index_is_partial: bool,
+    /// Maximum number of unique pages the index will track.  Defaults to
+    /// [`PAGE_INDEX_MAX_ENTRIES`].  Overridable in tests to exercise the
+    /// partial-index fallback path without writing 64K+ frames.
+    page_index_cap: usize,
 }
 
 impl<F: VfsFile> WalBackendAdapter<F> {
@@ -67,6 +76,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             page_index: HashMap::new(),
             index_built_to: None,
             index_salts: None,
+            index_is_partial: false,
+            page_index_cap: PAGE_INDEX_MAX_ENTRIES,
         }
     }
 
@@ -81,6 +92,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             page_index: HashMap::new(),
             index_built_to: None,
             index_salts: None,
+            index_is_partial: false,
+            page_index_cap: PAGE_INDEX_MAX_ENTRIES,
         }
     }
 
@@ -109,6 +122,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         self.page_index.clear();
         self.index_built_to = None;
         self.index_salts = None;
+        self.index_is_partial = false;
     }
 
     /// Ensure the page index covers all committed frames up to `last_commit_frame`.
@@ -118,7 +132,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     fn ensure_page_index(&mut self, cx: &Cx, last_commit_frame: usize) -> Result<()> {
         let current_salts = self.wal.header().salts;
 
-        // Detect WAL generation change (salts differ → full rebuild).
+        // Detect WAL generation change (salts differ -> full rebuild).
         let needs_full_rebuild = match self.index_salts {
             Some(saved) => saved != current_salts,
             None => true,
@@ -127,6 +141,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         if needs_full_rebuild {
             self.page_index.clear();
             self.index_built_to = None;
+            self.index_is_partial = false;
             self.index_salts = Some(current_salts);
             self.build_index_range(cx, 0, last_commit_frame)?;
             self.index_built_to = Some(last_commit_frame);
@@ -145,8 +160,9 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 Ok(())
             }
             Some(_) => {
-                // WAL shrank (e.g., after checkpoint reset) → full rebuild.
+                // WAL shrank (e.g., after checkpoint reset) -> full rebuild.
                 self.page_index.clear();
+                self.index_is_partial = false;
                 self.build_index_range(cx, 0, last_commit_frame)?;
                 self.index_built_to = Some(last_commit_frame);
                 Ok(())
@@ -169,13 +185,39 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             let header = self.wal.read_frame_header(cx, frame_index)?;
             // Only insert if we haven't hit the capacity cap, or if this page
             // is already tracked (update is free).
-            if self.page_index.len() < PAGE_INDEX_MAX_ENTRIES
+            if self.page_index.len() < self.page_index_cap
                 || self.page_index.contains_key(&header.page_number)
             {
                 self.page_index.insert(header.page_number, frame_index);
+            } else {
+                // A page was dropped because the index is full -- mark it as
+                // partial so that `read_page` knows a HashMap miss cannot be
+                // trusted and must fall back to a linear scan.
+                self.index_is_partial = true;
             }
         }
         Ok(())
+    }
+
+    /// Backwards linear scan of committed frames to find a page that was not
+    /// captured by the capped page index.
+    ///
+    /// Scans from `last_commit_frame` down to frame 0 and returns the index
+    /// of the first (i.e., most recent) frame containing `page_number`, or
+    /// `None` if the page is not in the WAL at all.
+    fn scan_backwards_for_page(
+        &mut self,
+        cx: &Cx,
+        page_number: u32,
+        last_commit_frame: usize,
+    ) -> Result<Option<usize>> {
+        for frame_index in (0..=last_commit_frame).rev() {
+            let header = self.wal.read_frame_header(cx, frame_index)?;
+            if header.page_number == page_number {
+                return Ok(Some(frame_index));
+            }
+        }
+        Ok(None)
     }
 
     /// Take any pending FEC commit results for sidecar persistence.
@@ -196,6 +238,14 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         if let Some(hook) = &mut self.fec_hook {
             hook.discard_buffered();
         }
+    }
+
+    /// Override the page index capacity (for testing only).
+    #[cfg(test)]
+    fn set_page_index_cap(&mut self, cap: usize) {
+        self.page_index_cap = cap;
+        // Invalidate so the next read rebuilds with the new cap.
+        self.invalidate_page_index();
     }
 }
 
@@ -249,7 +299,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    // FEC encoding failure is non-fatal — log and continue.
+                    // FEC encoding failure is non-fatal -- log and continue.
                     warn!(error = %e, "FEC encoding failed; commit proceeds without repair symbols");
                 }
             }
@@ -267,12 +317,30 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         // Build or extend the O(1) page index covering all committed frames.
         self.ensure_page_index(cx, last_commit_frame)?;
 
-        // O(1) lookup: page_number → most recent frame index.
-        let Some(&frame_index) = self.page_index.get(&page_number) else {
-            return Ok(None);
+        // O(1) lookup: page_number -> most recent frame index.
+        let frame_index = match self.page_index.get(&page_number) {
+            Some(&idx) => idx,
+            None if !self.index_is_partial => {
+                // The index covers every page in the WAL -- a miss here means
+                // the page genuinely isn't in the WAL.
+                return Ok(None);
+            }
+            None => {
+                // The index is partial (capacity cap was hit).  A HashMap miss
+                // might be a false negative -- fall back to a backwards linear
+                // scan of committed frames to be safe.
+                debug!(
+                    page_number,
+                    "WAL adapter: index miss with partial index, falling back to linear scan"
+                );
+                match self.scan_backwards_for_page(cx, page_number, last_commit_frame)? {
+                    Some(idx) => idx,
+                    None => return Ok(None),
+                }
+            }
         };
 
-        // Read the frame data at the indexed position.
+        // Read the frame data at the resolved position.
         let mut frame_buf = vec![0u8; self.wal.frame_size()];
         let header = self.wal.read_frame_into(cx, frame_index, &mut frame_buf)?;
 
@@ -291,8 +359,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         let data = frame_buf[fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE..].to_vec();
         debug!(
             page_number,
-            frame_index,
-            "WAL adapter: page found in WAL via index"
+            frame_index, "WAL adapter: page found in WAL via index"
         );
         Ok(Some(data))
     }
@@ -502,7 +569,7 @@ mod tests {
         let old_data = sample_page(0xAA);
         let new_data = sample_page(0xBB);
 
-        // Write page 5 twice — the adapter should return the latest.
+        // Write page 5 twice -- the adapter should return the latest.
         adapter
             .append_frame(&cx, 5, &old_data, 0)
             .expect("append old");
@@ -731,10 +798,7 @@ mod tests {
             .expect("append commit");
 
         // Read page 1 to populate the index.
-        assert_eq!(
-            adapter.read_page(&cx, 1).expect("read old"),
-            Some(old_data)
-        );
+        assert_eq!(adapter.read_page(&cx, 1).expect("read old"), Some(old_data));
 
         // Reset WAL with new salts (simulates checkpoint reset).
         let new_salts = WalSalts {
@@ -785,7 +849,10 @@ mod tests {
             .expect("append commit 1");
 
         // First read builds the index.
-        assert_eq!(adapter.read_page(&cx, 1).expect("read"), Some(page1.clone()));
+        assert_eq!(
+            adapter.read_page(&cx, 1).expect("read"),
+            Some(page1.clone())
+        );
 
         // Append more committed frames.
         let page2 = sample_page(0x20);
@@ -803,9 +870,117 @@ mod tests {
             Some(page1_v2),
             "incremental index extend should pick up the updated page"
         );
+        assert_eq!(adapter.read_page(&cx, 2).expect("read page 2"), Some(page2));
+    }
+
+    // -- Partial index fallback tests --
+
+    #[test]
+    fn test_partial_index_falls_back_to_linear_scan() {
+        // Verify that when the page index cap is hit, pages that weren't
+        // indexed are still found via the backwards linear scan fallback.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        // Set a very small cap so we can trigger the partial-index path
+        // with just a handful of frames.
+        adapter.set_page_index_cap(2);
+
+        // Write 5 distinct pages.  With a cap of 2, only the first 2 unique
+        // pages will be indexed; pages 3-5 will be dropped from the index.
+        let p1 = sample_page(0x01);
+        let p2 = sample_page(0x02);
+        let p3 = sample_page(0x03);
+        let p4 = sample_page(0x04);
+        let p5 = sample_page(0x05);
+
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter.append_frame(&cx, 2, &p2, 0).expect("append p2");
+        adapter.append_frame(&cx, 3, &p3, 0).expect("append p3");
+        adapter.append_frame(&cx, 4, &p4, 0).expect("append p4");
+        adapter
+            .append_frame(&cx, 5, &p5, 5)
+            .expect("append p5 (commit)");
+
+        // Pages 1 and 2 should be in the index (fast path).
         assert_eq!(
-            adapter.read_page(&cx, 2).expect("read page 2"),
-            Some(page2)
+            adapter.read_page(&cx, 1).expect("read p1"),
+            Some(p1),
+            "indexed page should be found via HashMap"
+        );
+        assert_eq!(
+            adapter.read_page(&cx, 2).expect("read p2"),
+            Some(p2),
+            "indexed page should be found via HashMap"
+        );
+
+        // Pages 3-5 were NOT indexed, but must still be found via the
+        // backwards linear scan fallback.
+        assert_eq!(
+            adapter.read_page(&cx, 3).expect("read p3"),
+            Some(p3),
+            "non-indexed page must be found via linear scan fallback"
+        );
+        assert_eq!(
+            adapter.read_page(&cx, 4).expect("read p4"),
+            Some(p4),
+            "non-indexed page must be found via linear scan fallback"
+        );
+        assert_eq!(
+            adapter.read_page(&cx, 5).expect("read p5"),
+            Some(p5),
+            "non-indexed page must be found via linear scan fallback"
+        );
+
+        // A page that was never written should still return None.
+        assert_eq!(
+            adapter.read_page(&cx, 99).expect("read non-existent"),
+            None,
+            "non-existent page must return None even with partial index"
+        );
+
+        // Verify the index was indeed marked partial.
+        assert!(
+            adapter.index_is_partial,
+            "index_is_partial should be true when cap is exceeded"
+        );
+    }
+
+    #[test]
+    fn test_partial_index_returns_latest_version_via_fallback() {
+        // When the same page appears multiple times and overflows the index,
+        // the backwards scan must return the LATEST (highest frame index)
+        // version, not the first one it encounters in a forward scan.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        // Cap at 1 so only page 1 fits in the index.
+        adapter.set_page_index_cap(1);
+
+        let old_p2 = sample_page(0xAA);
+        let new_p2 = sample_page(0xBB);
+
+        // Frame 0: page 1 (indexed)
+        adapter
+            .append_frame(&cx, 1, &sample_page(0x01), 0)
+            .expect("append p1");
+        // Frame 1: page 2 old version (NOT indexed -- cap exceeded)
+        adapter
+            .append_frame(&cx, 2, &old_p2, 0)
+            .expect("append p2 old");
+        // Frame 2: page 2 new version (NOT indexed -- cap exceeded, and
+        // page 2 is not already in the index so it won't be updated)
+        adapter
+            .append_frame(&cx, 2, &new_p2, 3)
+            .expect("append p2 new (commit)");
+
+        // The backwards scan from frame 2 should find the newest version first.
+        assert_eq!(
+            adapter.read_page(&cx, 2).expect("read p2"),
+            Some(new_p2),
+            "backwards scan must return the most recent frame for the page"
         );
     }
 
