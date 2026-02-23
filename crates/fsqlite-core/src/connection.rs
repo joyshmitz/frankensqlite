@@ -9178,6 +9178,31 @@ fn evaluate_having_value(
             }
         }
 
+        Expr::Like {
+            expr: inner,
+            pattern,
+            op,
+            not,
+            ..
+        } => {
+            let val =
+                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+            let pat =
+                evaluate_having_value(pattern, values, descriptors, columns, group_rows, col_names);
+            if val.is_null() || pat.is_null() {
+                return SqliteValue::Null;
+            }
+            let s = val.to_text();
+            let p = pat.to_text();
+            let matched = match op {
+                LikeOp::Like => simple_like_match(&p, &s),
+                LikeOp::Glob => simple_glob_match(&p, &s),
+                LikeOp::Match => simple_match_query(&p, &s),
+                LikeOp::Regexp => false,
+            };
+            SqliteValue::Integer(i64::from(if *not { !matched } else { matched }))
+        }
+
         _ => SqliteValue::Null,
     }
 }
@@ -12368,14 +12393,16 @@ fn eval_join_expr(
         } => {
             let val = eval_join_expr(inner, row, col_map)?;
             let pat = eval_join_expr(pattern, row, col_map)?;
-            let matched = match (&val, &pat) {
-                (SqliteValue::Text(s), SqliteValue::Text(p)) => match op {
-                    LikeOp::Like => simple_like_match(p, s),
-                    LikeOp::Glob => simple_glob_match(p, s),
-                    LikeOp::Match => simple_match_query(p, s),
-                    LikeOp::Regexp => false,
-                },
-                _ => false,
+            if val.is_null() || pat.is_null() {
+                return Ok(SqliteValue::Null);
+            }
+            let s = val.to_text();
+            let p = pat.to_text();
+            let matched = match op {
+                LikeOp::Like => simple_like_match(&p, &s),
+                LikeOp::Glob => simple_glob_match(&p, &s),
+                LikeOp::Match => simple_match_query(&p, &s),
+                LikeOp::Regexp => false,
             };
             Ok(SqliteValue::Integer(i64::from(if *not {
                 !matched

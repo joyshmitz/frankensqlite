@@ -2109,6 +2109,75 @@ mod tests {
     }
 
     #[test]
+    fn like_null_operand_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT NULL LIKE 'abc';").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn like_null_pattern_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 'abc' LIKE NULL;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn like_null_both_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT NULL LIKE NULL;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn not_like_null_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 'abc' NOT LIKE NULL;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn like_integer_coercion() {
+        let conn = Connection::open(":memory:").unwrap();
+        // SQLite coerces non-text to text for LIKE comparison.
+        let rows = conn.query("SELECT 123 LIKE '123';").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn like_null_in_join_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE lnj (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO lnj VALUES (1, 'alice'), (2, NULL), (3, 'bob');")
+            .unwrap();
+        // NULL name LIKE '%' should not match (NULL result, not truthy).
+        let rows = conn
+            .query("SELECT id FROM lnj WHERE name LIKE '%' ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn having_like_filters_groups() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE hlk (grp TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO hlk VALUES ('apple', 1), ('banana', 2), ('apricot', 3);")
+            .unwrap();
+        // HAVING grp LIKE 'ap%' keeps only 'apple' and 'apricot'.
+        let rows = conn
+            .query("SELECT grp, SUM(val) FROM hlk GROUP BY grp HAVING grp LIKE 'ap%';")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let grps: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert!(grps.contains(&SqliteValue::Text("apple".to_owned())));
+        assert!(grps.contains(&SqliteValue::Text("apricot".to_owned())));
+    }
+
+    #[test]
     fn probe_nested_functions() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
