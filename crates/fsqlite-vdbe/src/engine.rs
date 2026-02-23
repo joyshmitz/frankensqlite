@@ -1821,7 +1821,7 @@ impl VdbeEngine {
                     let result = if a.is_null() {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(i64::from(a.to_integer() == 0))
+                        SqliteValue::Integer(i64::from(a.to_float() == 0.0))
                     };
                     self.set_reg(op.p2, result);
                     pc += 1;
@@ -1831,7 +1831,7 @@ impl VdbeEngine {
                 Opcode::If => {
                     // Jump to p2 if p1 is true (non-zero, non-NULL).
                     let val = self.get_reg(op.p1);
-                    if !val.is_null() && val.to_integer() != 0 {
+                    if !val.is_null() && val.to_float() != 0.0 {
                         pc = op.p2 as usize;
                     } else {
                         pc += 1;
@@ -1841,7 +1841,7 @@ impl VdbeEngine {
                 Opcode::IfNot => {
                     // Jump to p2 if p1 is false (zero) or NULL.
                     let val = self.get_reg(op.p1);
-                    if val.is_null() || val.to_integer() == 0 {
+                    if val.is_null() || val.to_float() == 0.0 {
                         pc = op.p2 as usize;
                     } else {
                         pc += 1;
@@ -3990,12 +3990,12 @@ fn sql_and(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     let a_val = if a.is_null() {
         None
     } else {
-        Some(a.to_integer() != 0)
+        Some(a.to_float() != 0.0)
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(b.to_integer() != 0)
+        Some(b.to_float() != 0.0)
     };
 
     match (a_val, b_val) {
@@ -4010,12 +4010,12 @@ fn sql_or(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     let a_val = if a.is_null() {
         None
     } else {
-        Some(a.to_integer() != 0)
+        Some(a.to_float() != 0.0)
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(b.to_integer() != 0)
+        Some(b.to_float() != 0.0)
     };
 
     match (a_val, b_val) {
