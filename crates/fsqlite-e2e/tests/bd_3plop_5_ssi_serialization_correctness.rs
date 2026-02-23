@@ -19,9 +19,14 @@ use fsqlite_error::FrankenError;
 use fsqlite_mvcc::{RetryAction, RetryController, RetryCostParams};
 use fsqlite_types::value::SqliteValue;
 
-const CI_WRITERS: usize = 10;
-const CI_TXNS_PER_WRITER: usize = 1_000;
-const SINGLE_WRITER_TXNS: usize = 1_000;
+// Keep default test-profile workload bounded for practical local/CI wall-clock.
+// Full stress envelope remains in the ignored `stress_profile` test.
+const CI_WRITERS_DEBUG: usize = 4;
+const CI_WRITERS_RELEASE: usize = 10;
+const CI_TXNS_PER_WRITER_DEBUG: usize = 120;
+const CI_TXNS_PER_WRITER_RELEASE: usize = 1_000;
+const SINGLE_WRITER_TXNS_DEBUG: usize = 80;
+const SINGLE_WRITER_TXNS_RELEASE: usize = 1_000;
 const STRESS_WRITERS: usize = 100;
 const STRESS_TXNS_PER_WRITER: usize = 10_000;
 // Keep the logical workload hot, but not pathologically single-page hot.
@@ -36,8 +41,13 @@ const RETRY_CONTROLLER_FALLBACK_SLEEP_MS: u64 = 20;
 const MIX_TRANSFER_PCT: u8 = 70;
 const MIX_DEPOSIT_PCT: u8 = 20;
 const MIX_BALANCE_CHECK_PCT: u8 = 10;
-const MIN_CI_THROUGHPUT_TXN_PER_SEC: f64 = 1_000.0;
+const MIN_CI_THROUGHPUT_TXN_PER_SEC_DEBUG: f64 = 80.0;
+const MIN_CI_THROUGHPUT_TXN_PER_SEC_RELEASE: f64 = 1_000.0;
 const MAX_ABORT_RATE: f64 = 0.20;
+const MAX_CI_ELAPSED_SECS_DEBUG: f64 = 180.0;
+const MAX_CI_ELAPSED_SECS_RELEASE: f64 = 300.0;
+const MAX_SINGLE_WRITER_ELAPSED_SECS_DEBUG: f64 = 120.0;
+const MAX_SINGLE_WRITER_ELAPSED_SECS_RELEASE: f64 = 180.0;
 const TEST_SEED: u64 = 0xBDBD_3010_05AA_55EE;
 
 #[derive(Clone, Copy)]
@@ -67,7 +77,12 @@ struct WorkerResult {
 
 #[test]
 fn ssi_serialization_correctness_ci_scale() {
-    let summary = run_ssi_workload(CI_WRITERS, CI_TXNS_PER_WRITER, TEST_SEED, "ci-scale");
+    let summary = run_ssi_workload(
+        configured_ci_writers(),
+        configured_ci_txns_per_writer(),
+        TEST_SEED,
+        "ci-scale",
+    );
 
     let attempted = summary.committed + summary.aborted;
     assert!(attempted > 0, "expected at least one attempted transaction");
@@ -76,6 +91,8 @@ fn ssi_serialization_correctness_ci_scale() {
     let abort_rate = summary.aborted as f64 / attempted as f64;
     #[allow(clippy::cast_precision_loss)]
     let throughput = summary.committed as f64 / summary.elapsed_seconds;
+    let min_ci_throughput = configured_ci_min_throughput();
+    let max_ci_elapsed = configured_ci_max_elapsed_seconds();
 
     assert!(
         abort_rate < MAX_ABORT_RATE,
@@ -87,18 +104,29 @@ fn ssi_serialization_correctness_ci_scale() {
         summary.retry_conflicts
     );
     assert!(
-        throughput > MIN_CI_THROUGHPUT_TXN_PER_SEC,
+        throughput > min_ci_throughput,
         "throughput too low: {:.1} txn/s (min {:.1} txn/s); committed={} elapsed={:.3}s",
         throughput,
-        MIN_CI_THROUGHPUT_TXN_PER_SEC,
+        min_ci_throughput,
         summary.committed,
         summary.elapsed_seconds
+    );
+    assert!(
+        summary.elapsed_seconds <= max_ci_elapsed,
+        "ci-scale workload exceeded elapsed-time budget: elapsed={:.3}s max={:.3}s",
+        summary.elapsed_seconds,
+        max_ci_elapsed
     );
 }
 
 #[test]
 fn ssi_serialization_correctness_single_writer_smoke() {
-    let summary = run_ssi_workload(1, SINGLE_WRITER_TXNS, TEST_SEED, "single-writer");
+    let summary = run_ssi_workload(
+        1,
+        configured_single_writer_txns(),
+        TEST_SEED,
+        "single-writer",
+    );
     let attempted = summary.committed + summary.aborted;
     assert!(
         attempted > 0,
@@ -107,6 +135,13 @@ fn ssi_serialization_correctness_single_writer_smoke() {
     assert_eq!(
         summary.aborted, 0,
         "single-writer run should not abort under page-level FCW"
+    );
+    let max_single_elapsed = configured_single_writer_max_elapsed_seconds();
+    assert!(
+        summary.elapsed_seconds <= max_single_elapsed,
+        "single-writer workload exceeded elapsed-time budget: elapsed={:.3}s max={:.3}s",
+        summary.elapsed_seconds,
+        max_single_elapsed
     );
 }
 
@@ -134,6 +169,69 @@ struct WorkloadSummary {
     aborted: u64,
     retry_conflicts: u64,
     elapsed_seconds: f64,
+}
+
+fn configured_ci_writers() -> usize {
+    env_usize("FSQLITE_SSI_CI_WRITERS")
+        .unwrap_or_else(|| if cfg!(debug_assertions) { CI_WRITERS_DEBUG } else { CI_WRITERS_RELEASE })
+}
+
+fn configured_ci_txns_per_writer() -> usize {
+    env_usize("FSQLITE_SSI_CI_TXNS_PER_WRITER").unwrap_or_else(|| {
+        if cfg!(debug_assertions) {
+            CI_TXNS_PER_WRITER_DEBUG
+        } else {
+            CI_TXNS_PER_WRITER_RELEASE
+        }
+    })
+}
+
+fn configured_single_writer_txns() -> usize {
+    env_usize("FSQLITE_SSI_SINGLE_WRITER_TXNS").unwrap_or_else(|| {
+        if cfg!(debug_assertions) {
+            SINGLE_WRITER_TXNS_DEBUG
+        } else {
+            SINGLE_WRITER_TXNS_RELEASE
+        }
+    })
+}
+
+fn configured_ci_min_throughput() -> f64 {
+    env_f64("FSQLITE_SSI_MIN_CI_THROUGHPUT").unwrap_or_else(|| {
+        if cfg!(debug_assertions) {
+            MIN_CI_THROUGHPUT_TXN_PER_SEC_DEBUG
+        } else {
+            MIN_CI_THROUGHPUT_TXN_PER_SEC_RELEASE
+        }
+    })
+}
+
+fn configured_ci_max_elapsed_seconds() -> f64 {
+    env_f64("FSQLITE_SSI_MAX_CI_ELAPSED_SECS").unwrap_or_else(|| {
+        if cfg!(debug_assertions) {
+            MAX_CI_ELAPSED_SECS_DEBUG
+        } else {
+            MAX_CI_ELAPSED_SECS_RELEASE
+        }
+    })
+}
+
+fn configured_single_writer_max_elapsed_seconds() -> f64 {
+    env_f64("FSQLITE_SSI_MAX_SINGLE_WRITER_ELAPSED_SECS").unwrap_or_else(|| {
+        if cfg!(debug_assertions) {
+            MAX_SINGLE_WRITER_ELAPSED_SECS_DEBUG
+        } else {
+            MAX_SINGLE_WRITER_ELAPSED_SECS_RELEASE
+        }
+    })
+}
+
+fn env_usize(var: &str) -> Option<usize> {
+    std::env::var(var).ok()?.parse::<usize>().ok().filter(|v| *v > 0)
+}
+
+fn env_f64(var: &str) -> Option<f64> {
+    std::env::var(var).ok()?.parse::<f64>().ok().filter(|v| *v > 0.0)
 }
 
 fn run_ssi_workload(

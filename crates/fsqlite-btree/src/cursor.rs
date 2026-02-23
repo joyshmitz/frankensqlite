@@ -1499,15 +1499,34 @@ impl<P: PageWriter> BtCursor<P> {
         let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
         ptrs.remove(delete_idx);
 
+        // Defragment the page to reclaim the space used by the deleted cell.
+        // This avoids maintaining a complex freeblock list and keeps fragmented_free_bytes at 0.
+        let mut new_content_offset = self.usable_size as usize;
+        let old_page_data = page_data.clone();
+        
+        for ptr_mut in &mut ptrs {
+            let ptr = *ptr_mut as usize;
+            let cell = CellRef::parse(&old_page_data, ptr, header.page_type, self.usable_size)?;
+            let size = cell.on_page_size();
+            new_content_offset -= size;
+            page_data[new_content_offset..new_content_offset + size].copy_from_slice(&old_page_data[ptr..ptr + size]);
+            *ptr_mut = new_content_offset as u16;
+        }
+
+        // Fill the now-unused space with zeros for cleanliness (optional, but good for reproducibility/debugging).
+        let ptr_array_end = header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
+        if new_content_offset > ptr_array_end {
+            page_data[ptr_array_end..new_content_offset].fill(0);
+        }
+
         #[allow(clippy::cast_possible_truncation)]
         {
             header.cell_count = ptrs.len() as u16;
+            header.cell_content_offset = new_content_offset as u32;
         }
-        header.cell_content_offset = if let Some(min_ptr) = ptrs.iter().copied().min() {
-            u32::from(min_ptr)
-        } else {
-            self.usable_size
-        };
+        header.fragmented_free_bytes = 0;
+        header.first_freeblock = 0;
+
         header.write(&mut page_data, header_offset);
         cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
         self.pager.write_page(cx, leaf_page_no, &page_data)?;
