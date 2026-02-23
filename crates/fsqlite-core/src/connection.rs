@@ -753,13 +753,28 @@ fn trigger_when_matches(when_clause: Option<&Expr>, frame: Option<&TriggerFrame>
 /// For `UPDATE OF col1, col2` triggers, ensure at least one listed column
 /// actually changed between OLD and NEW snapshots.
 fn trigger_update_of_columns_changed(
-    _trigger_event: &fsqlite_ast::TriggerEvent,
-    _frame: &TriggerFrame,
+    trigger_event: &fsqlite_ast::TriggerEvent,
+    frame: &TriggerFrame,
 ) -> bool {
-    // In SQLite, UPDATE OF triggers fire if the column is in the SET clause,
-    // regardless of whether the value actually changed.
-    // The SET clause inclusion is already checked by trigger_event_matches.
-    true
+    let fsqlite_ast::TriggerEvent::Update(trigger_cols) = trigger_event else {
+        return true;
+    };
+    if trigger_cols.is_empty() {
+        return true;
+    }
+
+    trigger_cols.iter().any(|column| {
+        let Some(column_index) = frame.column_index(column) else {
+            // Keep historical behavior when we cannot resolve the column.
+            return true;
+        };
+        let old_value = frame.old_row.as_ref().and_then(|row| row.get(column_index));
+        let new_value = frame.new_row.as_ref().and_then(|row| row.get(column_index));
+        match (old_value, new_value) {
+            (Some(old), Some(new)) => old != new,
+            _ => true,
+        }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -4844,18 +4859,18 @@ impl Connection {
                                 &snapshot.write_pages,
                             ),
                         ),
-                        FcwResult::Clean if snapshot.marked_for_abort => (
-                            SsiDecisionType::AbortCycle,
-                            "marked_for_abort_by_pivot_rule".to_owned(),
+                        FcwResult::Clean if snapshot.has_in_rw && snapshot.has_out_rw => (
+                            SsiDecisionType::AbortWriteSkew,
+                            "dangerous_structure_in_and_out_rw".to_owned(),
                             Self::merge_conflict_pages(
                                 Vec::new(),
                                 active_conflicts.conflict_pages.clone(),
                                 &snapshot.write_pages,
                             ),
                         ),
-                        FcwResult::Clean if snapshot.has_in_rw && snapshot.has_out_rw => (
-                            SsiDecisionType::AbortWriteSkew,
-                            "dangerous_structure_in_and_out_rw".to_owned(),
+                        FcwResult::Clean if snapshot.marked_for_abort => (
+                            SsiDecisionType::AbortCycle,
+                            "marked_for_abort_by_pivot_rule".to_owned(),
                             Self::merge_conflict_pages(
                                 Vec::new(),
                                 active_conflicts.conflict_pages.clone(),
@@ -18727,6 +18742,7 @@ mod tests {
                 .expect("session handle should exist");
             fsqlite_mvcc::ActiveTxnView::set_has_in_rw(handle, true);
             fsqlite_mvcc::ActiveTxnView::set_has_out_rw(handle, true);
+            fsqlite_mvcc::ActiveTxnView::set_marked_for_abort(handle, true);
             drop(registry);
         }
         let err = conn.execute("COMMIT;").expect_err("SSI pivot must abort");
@@ -18823,6 +18839,7 @@ mod tests {
                 .expect("session handle should exist");
             fsqlite_mvcc::ActiveTxnView::set_has_in_rw(handle, true);
             fsqlite_mvcc::ActiveTxnView::set_has_out_rw(handle, true);
+            fsqlite_mvcc::ActiveTxnView::set_marked_for_abort(handle, true);
             drop(registry);
         }
         let _ = conn.execute("COMMIT;");
