@@ -1477,6 +1477,17 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
         return analyze_expression_index_usability(index, terms);
     }
 
+    // Helper: check if a WHERE column matches an index column, respecting
+    // the table qualifier when present.  Unqualified columns (table = None)
+    // are conservatively considered matching.
+    let col_matches = |wc: &WhereColumn, idx_col: &str| -> bool {
+        wc.column.eq_ignore_ascii_case(idx_col)
+            && wc
+                .table
+                .as_ref()
+                .is_none_or(|t| t.eq_ignore_ascii_case(&index.table))
+    };
+
     let leftmost = &index.columns[0];
 
     // --- Multi-column equality prefix ---
@@ -1485,7 +1496,7 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
     for idx_col in &index.columns {
         let has_eq = terms.iter().any(|t| {
             t.column.as_ref().is_some_and(|wc| {
-                wc.column.eq_ignore_ascii_case(idx_col) && matches!(t.kind, WhereTermKind::Equality)
+                col_matches(wc, idx_col) && matches!(t.kind, WhereTermKind::Equality)
             })
         });
         if has_eq {
@@ -1502,7 +1513,7 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
             let next_col = &index.columns[eq_columns];
             terms.iter().any(|t| {
                 t.column.as_ref().is_some_and(|wc| {
-                    wc.column.eq_ignore_ascii_case(next_col)
+                    col_matches(wc, next_col)
                         && matches!(t.kind, WhereTermKind::Range | WhereTermKind::Between)
                 })
             })
@@ -1519,7 +1530,7 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
     // Check for equality on the leftmost column.
     for term in terms {
         if let Some(ref wc) = term.column {
-            if wc.column.eq_ignore_ascii_case(leftmost) {
+            if col_matches(wc, leftmost) {
                 match &term.kind {
                     WhereTermKind::Equality => return IndexUsability::Equality,
                     WhereTermKind::InList { count } => {
@@ -1541,7 +1552,7 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
     // Check for range on the leftmost column.
     for term in terms {
         if let Some(ref wc) = term.column {
-            if wc.column.eq_ignore_ascii_case(leftmost)
+            if col_matches(wc, leftmost)
                 && matches!(term.kind, WhereTermKind::Range | WhereTermKind::Between)
             {
                 return IndexUsability::Range {
@@ -3537,6 +3548,43 @@ mod tests {
         assert!(matches!(
             analyze_index_usability(&idx, &terms),
             IndexUsability::NotUsable
+        ));
+    }
+
+    #[test]
+    fn test_index_usability_qualified_column_rejects_wrong_table() {
+        // Index on t1.a — a WHERE term on t2.a should NOT match.
+        let idx = index_info("idx_a", "t1", &["a"], false, 50);
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("t2", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let terms = [classify_where_term(expr)];
+        assert!(matches!(
+            analyze_index_usability(&idx, &terms),
+            IndexUsability::NotUsable
+        ));
+
+        // Same column name but qualified to the correct table → usable.
+        let expr2: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified("t1", "a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let terms2 = [classify_where_term(expr2)];
+        assert!(matches!(
+            analyze_index_usability(&idx, &terms2),
+            IndexUsability::Equality
+        ));
+
+        // Unqualified column → conservatively considered usable.
+        let terms3 = [eq_term("a")];
+        assert!(matches!(
+            analyze_index_usability(&idx, &terms3),
+            IndexUsability::Equality
         ));
     }
 
