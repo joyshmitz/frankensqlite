@@ -335,8 +335,11 @@ impl ScalarFunction for InstrFunc {
         }
         match (&args[0], &args[1]) {
             (SqliteValue::Blob(haystack), SqliteValue::Blob(needle)) => {
-                // SQLite returns 0 when either haystack or needle is empty.
-                if haystack.is_empty() || needle.is_empty() {
+                // SQLite: empty needle returns 1, empty haystack with non-empty needle returns 0.
+                if needle.is_empty() {
+                    return Ok(SqliteValue::Integer(1));
+                }
+                if haystack.is_empty() {
                     return Ok(SqliteValue::Integer(0));
                 }
                 let pos = find_bytes(haystack, needle).map_or(0, |p| p + 1);
@@ -344,10 +347,13 @@ impl ScalarFunction for InstrFunc {
             }
             _ => {
                 // Text: character-level search.
-                // SQLite returns 0 when either string is empty.
+                // SQLite: empty needle returns 1, empty haystack with non-empty needle returns 0.
                 let haystack = args[0].to_text();
                 let needle = args[1].to_text();
-                if haystack.is_empty() || needle.is_empty() {
+                if needle.is_empty() {
+                    return Ok(SqliteValue::Integer(1));
+                }
+                if haystack.is_empty() {
                     return Ok(SqliteValue::Integer(0));
                 }
                 let pos = haystack
@@ -978,7 +984,7 @@ pub struct SubstrFunc;
 impl ScalarFunction for SubstrFunc {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args[0].is_null() {
+        if args[0].is_null() || args[1].is_null() {
             return Ok(SqliteValue::Null);
         }
         let is_blob = matches!(&args[0], SqliteValue::Blob(_));
@@ -1339,6 +1345,9 @@ pub struct SqliteCompileoptionGetFunc;
 
 impl ScalarFunction for SqliteCompileoptionGetFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args[0].is_null() {
+            return Ok(SqliteValue::Null);
+        }
         let n = args[0].to_integer();
         let options = [
             "THREADSAFE=1",
@@ -2328,8 +2337,8 @@ mod tests {
     }
 
     #[test]
-    fn test_instr_empty_needle_returns_zero() {
-        // SQLite returns 0 for empty needle (not 1).
+    fn test_instr_empty_needle_returns_one() {
+        // SQLite: instr(X, '') returns 1 (empty string found at position 1).
         assert_eq!(
             invoke2(
                 &InstrFunc,
@@ -2337,7 +2346,7 @@ mod tests {
                 SqliteValue::Text(String::new())
             )
             .unwrap(),
-            SqliteValue::Integer(0)
+            SqliteValue::Integer(1)
         );
     }
 
@@ -2355,7 +2364,8 @@ mod tests {
     }
 
     #[test]
-    fn test_instr_blob_empty_needle_returns_zero() {
+    fn test_instr_blob_empty_needle_returns_one() {
+        // SQLite: instr(X, x'') returns 1 (empty blob found at position 1).
         assert_eq!(
             invoke2(
                 &InstrFunc,
@@ -2363,7 +2373,7 @@ mod tests {
                 SqliteValue::Blob(vec![])
             )
             .unwrap(),
-            SqliteValue::Integer(0)
+            SqliteValue::Integer(1)
         );
     }
 
