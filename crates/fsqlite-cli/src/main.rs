@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, ErrorKind, Write};
 
 use fsqlite::{Connection, Row};
 use fsqlite_core::decode_proofs::{
@@ -354,6 +354,12 @@ where
         line_buffer.clear();
         let bytes_read = match input.read_line(&mut line_buffer) {
             Ok(bytes_read) => bytes_read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {
+                // Keep the shell alive on Ctrl-C style interrupts.
+                pending_sql.clear();
+                let _ = writeln!(out);
+                continue;
+            }
             Err(error) => {
                 let _ = writeln!(err, "error: {error}");
                 return 1;
@@ -678,7 +684,7 @@ where
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, BufRead, Cursor, Read};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use fsqlite_core::decode_proofs::{
@@ -692,6 +698,48 @@ mod tests {
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
         let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
         parse_args(os_args)
+    }
+
+    #[derive(Debug)]
+    struct InterruptOnceBufRead {
+        interrupted_once: bool,
+        inner: Cursor<Vec<u8>>,
+    }
+
+    impl InterruptOnceBufRead {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                interrupted_once: false,
+                inner: Cursor::new(bytes),
+            }
+        }
+    }
+
+    impl Read for InterruptOnceBufRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl BufRead for InterruptOnceBufRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            self.inner.fill_buf()
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.inner.consume(amt);
+        }
+
+        fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
+            if !self.interrupted_once {
+                self.interrupted_once = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "simulated interrupt",
+                ));
+            }
+            self.inner.read_line(buf)
+        }
     }
 
     #[test]
@@ -834,6 +882,18 @@ mod tests {
 
         let stdout = String::from_utf8(out).expect("output should be utf-8");
         assert!(stdout.contains('7'), "expected query result in output");
+    }
+
+    #[test]
+    fn test_repl_read_line_interrupted_keeps_shell_running() {
+        let mut input = InterruptOnceBufRead::new(b".quit\n".to_vec());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
     }
 
     #[test]

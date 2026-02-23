@@ -1468,6 +1468,11 @@ fn resolve_workload(preset: &str, fixture_id: &str, concurrency: u16) -> Result<
 }
 
 /// Execute a workload against C SQLite via rusqlite and print JSON results.
+fn report_has_failure(report: &fsqlite_e2e::report::EngineRunReport) -> bool {
+    report.error.is_some() || report.correctness.integrity_check_ok == Some(false)
+}
+
+/// Execute a workload against C SQLite via rusqlite and print JSON results.
 #[allow(clippy::too_many_lines)]
 fn run_sqlite3_engine(
     db_name: &str,
@@ -1563,7 +1568,7 @@ fn run_sqlite3_engine(
                 }
             };
             agg.record(&report);
-            any_error |= report.error.is_some();
+            any_error |= report_has_failure(&report);
 
             let recorded_unix_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1698,7 +1703,7 @@ fn run_fsqlite_engine(
                 }
             };
             agg.record(&report);
-            any_error |= report.error.is_some();
+            any_error |= report_has_failure(&report);
 
             let recorded_unix_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -3324,10 +3329,46 @@ fn cmd_compare(argv: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_e2e::report::{CorrectnessReport, EngineRunReport};
 
     fn run_with(args: &[&str]) -> i32 {
         let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
         run_cli(os_args)
+    }
+
+    fn sample_engine_report() -> EngineRunReport {
+        EngineRunReport {
+            wall_time_ms: 0,
+            ops_total: 0,
+            ops_per_sec: 0.0,
+            retries: 0,
+            aborts: 0,
+            correctness: CorrectnessReport {
+                raw_sha256_match: None,
+                dump_match: None,
+                canonical_sha256_match: None,
+                integrity_check_ok: Some(true),
+                raw_sha256: None,
+                canonical_sha256: None,
+                logical_sha256: None,
+                notes: None,
+            },
+            latency_ms: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn test_report_has_failure_flags_integrity_failures() {
+        let mut report = sample_engine_report();
+        assert!(!report_has_failure(&report));
+
+        report.correctness.integrity_check_ok = Some(false);
+        assert!(report_has_failure(&report));
+
+        report.correctness.integrity_check_ok = Some(true);
+        report.error = Some("boom".to_owned());
+        assert!(report_has_failure(&report));
     }
 
     #[test]

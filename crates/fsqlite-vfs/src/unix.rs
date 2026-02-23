@@ -777,14 +777,18 @@ impl UnixFile {
                     let Some(lock_byte) = wal_lock_byte(slot) else {
                         continue;
                     };
+                    slot_state.exclusive_owner = None;
                     if slot_state.shared_holders.is_empty() {
                         if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
                             if first_error.is_none() {
                                 first_error = Some(err);
                             }
                         }
+                    } else if let Err(err) = posix_lock(&*shm_file, libc::F_RDLCK, lock_byte, 1) {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
                     }
-                    slot_state.exclusive_owner = None;
                 }
 
                 if slot_state
@@ -813,14 +817,18 @@ impl UnixFile {
                 let lock_byte = sqlite_shm_dms_lock_byte();
 
                 if slot_state.exclusive_owner == Some(self.shm_owner_id) {
+                    slot_state.exclusive_owner = None;
                     if slot_state.shared_holders.is_empty() {
                         if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
                             if first_error.is_none() {
                                 first_error = Some(err);
                             }
                         }
+                    } else if let Err(err) = posix_lock(&*shm_file, libc::F_RDLCK, lock_byte, 1) {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
                     }
-                    slot_state.exclusive_owner = None;
                 }
 
                 if slot_state

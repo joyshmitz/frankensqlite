@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
@@ -2247,6 +2247,7 @@ impl Connection {
                 insert.table.name
             )));
         }
+        let default_row = self.collect_insert_default_row(&insert.table.name)?;
 
         let source_column_count = source_target_indices.len();
         for (row_idx, row) in source_rows.iter().enumerate() {
@@ -2326,7 +2327,7 @@ impl Connection {
 
         let mut statement_result: Result<usize> = Ok(0);
         for row in &source_rows {
-            let mut ordered_values = vec![SqliteValue::Null; table_columns.len()];
+            let mut ordered_values = default_row.clone();
             for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
                 ordered_values[target_idx] = row.values()[source_idx].clone();
             }
@@ -2658,7 +2659,14 @@ impl Connection {
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let (table_columns, source_target_indices) =
             self.resolve_insert_select_target_layout(insert)?;
+        let default_row = self.collect_insert_default_row(&insert.table.name)?;
         let table_column_count = table_columns.len();
+        if default_row.len() != table_column_count {
+            return Err(FrankenError::Internal(format!(
+                "INSERT trigger snapshot: default row width {} does not match table width {table_column_count}",
+                default_row.len()
+            )));
+        }
         match &insert.source {
             fsqlite_ast::InsertSource::Values(rows) => rows
                 .iter()
@@ -2666,7 +2674,7 @@ impl Connection {
                 .map(|(row_idx, row_exprs)| {
                     let source_values = self.evaluate_insert_source_row(row_exprs, params)?;
                     self.map_insert_source_row_to_table_row(
-                        table_column_count,
+                        &default_row,
                         &source_target_indices,
                         &source_values,
                         &format!("INSERT VALUES row {}", row_idx + 1),
@@ -2681,7 +2689,7 @@ impl Connection {
                     .enumerate()
                     .map(|(row_idx, row)| {
                         self.map_insert_source_row_to_table_row(
-                            table_column_count,
+                            &default_row,
                             &source_target_indices,
                             row.values(),
                             &format!("INSERT SELECT row {}", row_idx + 1),
@@ -2689,9 +2697,7 @@ impl Connection {
                     })
                     .collect()
             }
-            fsqlite_ast::InsertSource::DefaultValues => {
-                Ok(vec![vec![SqliteValue::Null; table_column_count]])
-            }
+            fsqlite_ast::InsertSource::DefaultValues => Ok(vec![default_row]),
         }
     }
 
@@ -2720,7 +2726,7 @@ impl Connection {
     #[allow(clippy::unused_self)]
     fn map_insert_source_row_to_table_row(
         &self,
-        table_column_count: usize,
+        default_row: &[SqliteValue],
         source_target_indices: &[usize],
         source_values: &[SqliteValue],
         context: &str,
@@ -2733,11 +2739,24 @@ impl Connection {
             )));
         }
 
-        let mut row = vec![SqliteValue::Null; table_column_count];
+        let mut row = default_row.to_vec();
         for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
             row[target_idx] = source_values[source_idx].clone();
         }
         Ok(row)
+    }
+
+    fn collect_insert_default_row(&self, table_name: &str) -> Result<Vec<SqliteValue>> {
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|tbl| tbl.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
+        Ok(table
+            .columns
+            .iter()
+            .map(|column| parse_column_default_value(column.default_value.as_deref()))
+            .collect())
     }
 
     fn collect_update_trigger_rows(
@@ -9719,6 +9738,82 @@ fn format_expr_as_default(expr: &Expr) -> String {
     }
 }
 
+/// Parse a column DEFAULT SQL fragment into a runtime value.
+///
+/// This mirrors the fallback behavior used by VDBE codegen for omitted INSERT
+/// columns so trigger snapshots and INSERT ... SELECT fallback agree with the
+/// primary execution path.
+fn parse_column_default_value(default_sql: Option<&str>) -> SqliteValue {
+    let Some(default_sql) = default_sql else {
+        return SqliteValue::Null;
+    };
+    let trimmed = default_sql.trim();
+
+    if let Ok(value) = trimmed.parse::<i64>() {
+        return SqliteValue::Integer(value);
+    }
+    if let Ok(value) = trimmed.parse::<f64>() {
+        return SqliteValue::Float(value);
+    }
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        return SqliteValue::Text(trimmed[1..trimmed.len() - 1].replace("''", "'"));
+    }
+    if trimmed.eq_ignore_ascii_case("null") {
+        return SqliteValue::Null;
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    if upper == "CURRENT_TIMESTAMP" || upper == "CURRENT_DATE" || upper == "CURRENT_TIME" {
+        return current_default_time_value(&upper);
+    }
+    if upper == "TRUE" {
+        return SqliteValue::Integer(1);
+    }
+    if upper == "FALSE" {
+        return SqliteValue::Integer(0);
+    }
+
+    SqliteValue::Text(trimmed.to_owned())
+}
+
+fn current_default_time_value(keyword: &str) -> SqliteValue {
+    let seconds_since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let epoch_days = seconds_since_epoch / 86_400;
+    let day_seconds = seconds_since_epoch % 86_400;
+    let hours = day_seconds / 3_600;
+    let minutes = (day_seconds % 3_600) / 60;
+    let seconds = day_seconds % 60;
+    let (year, month, day) = epoch_days_to_ymd(epoch_days);
+
+    let text = if keyword == "CURRENT_DATE" {
+        format!("{year:04}-{month:02}-{day:02}")
+    } else if keyword == "CURRENT_TIME" {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02}")
+    };
+    SqliteValue::Text(text)
+}
+
+/// Convert days since 1970-01-01 (Unix epoch) to (year, month, day).
+fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Civil-date algorithm from Howard Hinnant (public domain).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 /// Convert a `CodegenError` to a `FrankenError`.
 fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
     match e {
@@ -15318,6 +15413,69 @@ mod tests {
                 SqliteValue::Text("twenty".to_owned()),
                 SqliteValue::Integer(20),
             ]
+        );
+    }
+
+    #[test]
+    fn test_insert_select_uses_defaults_for_omitted_target_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (v INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TABLE dst (a INTEGER DEFAULT 7, b TEXT DEFAULT 'fallback', c INTEGER);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO src VALUES (11);").unwrap();
+        conn.execute("INSERT INTO src VALUES (22);").unwrap();
+
+        let inserted = conn
+            .execute("INSERT INTO dst (c) SELECT v FROM src ORDER BY v;")
+            .unwrap();
+        assert_eq!(inserted, 2);
+
+        let rows = conn.query("SELECT a, b, c FROM dst ORDER BY c;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Text("fallback".to_owned()),
+                SqliteValue::Integer(11),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Text("fallback".to_owned()),
+                SqliteValue::Integer(22),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_before_insert_trigger_new_values_use_defaults_for_omitted_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER DEFAULT 9, b INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (seen_a INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_before_insert BEFORE INSERT ON t \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.a); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t (b) VALUES (5);").unwrap();
+
+        let log_rows = conn.query("SELECT seen_a FROM trigger_log;").unwrap();
+        assert_eq!(log_rows.len(), 1);
+        assert_eq!(row_values(&log_rows[0]), vec![SqliteValue::Integer(9)]);
+
+        let table_rows = conn.query("SELECT a, b FROM t;").unwrap();
+        assert_eq!(table_rows.len(), 1);
+        assert_eq!(
+            row_values(&table_rows[0]),
+            vec![SqliteValue::Integer(9), SqliteValue::Integer(5)]
         );
     }
 

@@ -359,10 +359,12 @@ fn apply_modifiers(jdn: f64, modifiers: &[String]) -> Option<(f64, bool)> {
         }
         // Month/year modifiers need special handling for exact date math.
         if is_month_year_modifier(&m_lower) {
-            j = apply_month_year_exact(j, &m_lower)?;
-        } else {
-            j = apply_modifier(j, m)?;
+            if let Some(exact_jdn) = apply_month_year_exact(j, &m_lower) {
+                j = exact_jdn;
+                continue;
+            }
         }
+        j = apply_modifier(j, m)?;
     }
     Some((j, subsec))
 }

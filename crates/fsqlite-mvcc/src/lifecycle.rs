@@ -1091,14 +1091,8 @@ impl TransactionManager {
         let pages: Vec<PageNumber> = txn.write_set.iter().copied().collect();
         for pgno in pages {
             if let Some(data) = txn.write_set_data.get(&pgno).cloned() {
-                // Look up existing chain head for prev pointer and retire the
-                // superseded committed version through the transaction guard.
+                // Look up existing chain head for prev pointer.
                 let prev_idx = self.version_store.chain_head(pgno);
-                if let Some(old_idx) = prev_idx
-                    && let Some(old_version) = self.version_store.get_version(old_idx)
-                {
-                    let _ = txn.defer_retire_version(old_version);
-                }
                 let prev = prev_idx.map(crate::invariants::idx_to_version_pointer);
 
                 let version = PageVersion {
