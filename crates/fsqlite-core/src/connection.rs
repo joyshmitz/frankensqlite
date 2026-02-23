@@ -8989,9 +8989,9 @@ fn evaluate_having_value(
                         SqliteValue::Integer(0)
                     }
                 }
-                fsqlite_ast::BinaryOp::Add => numeric_add(&lv, &rv),
-                fsqlite_ast::BinaryOp::Subtract => numeric_sub(&lv, &rv),
-                fsqlite_ast::BinaryOp::Multiply => numeric_mul(&lv, &rv),
+                fsqlite_ast::BinaryOp::Add => lv.sql_add(&rv),
+                fsqlite_ast::BinaryOp::Subtract => lv.sql_sub(&rv),
+                fsqlite_ast::BinaryOp::Multiply => lv.sql_mul(&rv),
                 fsqlite_ast::BinaryOp::Divide => numeric_div(&lv, &rv),
                 fsqlite_ast::BinaryOp::Modulo => numeric_mod(&lv, &rv),
                 fsqlite_ast::BinaryOp::Concat => {
@@ -9082,68 +9082,52 @@ fn compute_having_aggregate(
     compute_aggregate(func, &agg_values)
 }
 
-/// Numeric addition for HAVING expression evaluation.
-fn numeric_add(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
-    match (a, b) {
-        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
-            SqliteValue::Integer(ai.wrapping_add(*bi))
-        }
-        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af + bf),
-        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 + bf),
-        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af + *bi as f64),
-        _ => SqliteValue::Null,
-    }
-}
-
-/// Numeric subtraction for HAVING expression evaluation.
-fn numeric_sub(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
-    match (a, b) {
-        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
-            SqliteValue::Integer(ai.wrapping_sub(*bi))
-        }
-        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af - bf),
-        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 - bf),
-        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af - *bi as f64),
-        _ => SqliteValue::Null,
-    }
-}
-
-/// Numeric multiplication for HAVING expression evaluation.
-fn numeric_mul(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
-    match (a, b) {
-        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
-            SqliteValue::Integer(ai.wrapping_mul(*bi))
-        }
-        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af * bf),
-        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 * bf),
-        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af * *bi as f64),
-        _ => SqliteValue::Null,
-    }
-}
-
+/// SQL division with NULL propagation, division-by-zero → NULL, and overflow
+/// promotion to REAL (matching VDBE `sql_div` semantics).
+#[allow(clippy::cast_precision_loss)]
 fn numeric_div(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
-    match (a, b) {
-        (SqliteValue::Integer(_), SqliteValue::Integer(0)) => SqliteValue::Null,
-        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
-            SqliteValue::Integer(ai.wrapping_div(*bi))
+    if a.is_null() || b.is_null() {
+        return SqliteValue::Null;
+    }
+    if let (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) = (a, b) {
+        if *bi == 0 {
+            SqliteValue::Null
+        } else {
+            match ai.checked_div(*bi) {
+                Some(result) => SqliteValue::Integer(result),
+                None => SqliteValue::Float(*ai as f64 / *bi as f64),
+            }
         }
-        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af / bf),
-        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 / bf),
-        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af / *bi as f64),
-        _ => SqliteValue::Null,
+    } else {
+        let bf = b.to_float();
+        if bf == 0.0 {
+            SqliteValue::Null
+        } else {
+            let result = a.to_float() / bf;
+            if result.is_nan() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Float(result)
+            }
+        }
     }
 }
 
+/// SQL remainder with NULL propagation and division-by-zero → NULL (matching
+/// VDBE `sql_rem` semantics).
 fn numeric_mod(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
-    match (a, b) {
-        (SqliteValue::Integer(_), SqliteValue::Integer(0)) => SqliteValue::Null,
-        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
-            SqliteValue::Integer(ai.wrapping_rem(*bi))
+    if a.is_null() || b.is_null() {
+        return SqliteValue::Null;
+    }
+    let ai = a.to_integer();
+    let bi = b.to_integer();
+    if bi == 0 {
+        SqliteValue::Null
+    } else {
+        match ai.checked_rem(bi) {
+            Some(result) => SqliteValue::Integer(result),
+            None => SqliteValue::Integer(0),
         }
-        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af % bf),
-        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 % bf),
-        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af % *bi as f64),
-        _ => SqliteValue::Null,
     }
 }
 
@@ -12352,15 +12336,19 @@ fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) ->
         BinaryOp::Or => {
             SqliteValue::Integer(i64::from(is_sqlite_truthy(left) || is_sqlite_truthy(right)))
         }
-        BinaryOp::Add => numeric_add(left, right),
-        BinaryOp::Subtract => numeric_sub(left, right),
-        BinaryOp::Multiply => numeric_mul(left, right),
+        BinaryOp::Add => left.sql_add(right),
+        BinaryOp::Subtract => left.sql_sub(right),
+        BinaryOp::Multiply => left.sql_mul(right),
         BinaryOp::Divide => numeric_div(left, right),
         BinaryOp::Modulo => numeric_mod(left, right),
         BinaryOp::Concat => {
-            let l = sqlite_value_to_text(left);
-            let r = sqlite_value_to_text(right);
-            SqliteValue::Text(format!("{l}{r}"))
+            if left.is_null() || right.is_null() {
+                SqliteValue::Null
+            } else {
+                let l = sqlite_value_to_text(left);
+                let r = sqlite_value_to_text(right);
+                SqliteValue::Text(format!("{l}{r}"))
+            }
         }
         _ => SqliteValue::Null,
     }
