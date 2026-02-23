@@ -11835,6 +11835,10 @@ fn emit_case_expr(
         if let Some(r_op) = r_operand {
             let r_when = builder.alloc_temp();
             emit_expr(builder, when_expr, r_when, bind_state)?;
+            // NULL in either operand or WHEN value means no match
+            // (NULL = x is UNKNOWN in SQL, which is falsy for CASE).
+            builder.emit_jump_to_label(Opcode::IsNull, r_op, 0, next_when, P4::None, 0);
+            builder.emit_jump_to_label(Opcode::IsNull, r_when, 0, next_when, P4::None, 0);
             builder.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, 0);
             builder.free_temp(r_when);
         } else {
@@ -12423,7 +12427,10 @@ fn eval_join_expr(
             for (when_expr, then_expr) in whens {
                 let when_val = eval_join_expr(when_expr, row, col_map)?;
                 let matches = if let Some(ref b) = base {
-                    cmp_values(b, &when_val) == std::cmp::Ordering::Equal
+                    // Simple CASE: NULL base never matches (NULL = x is UNKNOWN).
+                    !b.is_null()
+                        && !when_val.is_null()
+                        && cmp_values(b, &when_val) == std::cmp::Ordering::Equal
                 } else {
                     is_sqlite_truthy(&when_val)
                 };
@@ -12443,8 +12450,12 @@ fn eval_join_expr(
             ..
         } => {
             let val = eval_join_expr(inner, row, col_map)?;
+            if val.is_null() {
+                return Ok(SqliteValue::Null);
+            }
             Ok(apply_cast(val, &type_name.name))
         }
+        Expr::Collate { expr: inner, .. } => eval_join_expr(inner, row, col_map),
         _ => Ok(SqliteValue::Null),
     }
 }
@@ -12716,6 +12727,9 @@ fn glob_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
 /// Apply a CAST to a value based on the target type name.
 #[allow(clippy::cast_possible_truncation)]
 fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
+    if val.is_null() {
+        return SqliteValue::Null;
+    }
     let lower = type_name.to_ascii_lowercase();
     match lower.as_str() {
         "integer" | "int" | "bigint" | "smallint" | "tinyint" => match val {

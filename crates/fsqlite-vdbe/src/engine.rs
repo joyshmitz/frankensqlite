@@ -2451,7 +2451,10 @@ impl VdbeEngine {
                                         match op.opcode {
                                             Opcode::SeekGE => {
                                                 // Find first row with rowid >= key.
-                                                let pos = table.rows.binary_search_by_key(&key, |r| r.rowid).unwrap_or_else(|e| e);
+                                                let pos = table
+                                                    .rows
+                                                    .binary_search_by_key(&key, |r| r.rowid)
+                                                    .unwrap_or_else(|e| e);
                                                 if pos < table.rows.len() {
                                                     cursor.position = Some(pos);
                                                     true
@@ -2461,7 +2464,10 @@ impl VdbeEngine {
                                             }
                                             Opcode::SeekGT => {
                                                 // Find first row with rowid > key.
-                                                let pos = match table.rows.binary_search_by_key(&key, |r| r.rowid) {
+                                                let pos = match table
+                                                    .rows
+                                                    .binary_search_by_key(&key, |r| r.rowid)
+                                                {
                                                     Ok(idx) => idx + 1,
                                                     Err(idx) => idx,
                                                 };
@@ -2474,7 +2480,10 @@ impl VdbeEngine {
                                             }
                                             Opcode::SeekLE => {
                                                 // Find last row with rowid <= key.
-                                                let pos = match table.rows.binary_search_by_key(&key, |r| r.rowid) {
+                                                let pos = match table
+                                                    .rows
+                                                    .binary_search_by_key(&key, |r| r.rowid)
+                                                {
                                                     Ok(idx) => Some(idx),
                                                     Err(idx) => idx.checked_sub(1),
                                                 };
@@ -2487,7 +2496,11 @@ impl VdbeEngine {
                                             }
                                             Opcode::SeekLT => {
                                                 // Find last row with rowid < key.
-                                                let pos = table.rows.binary_search_by_key(&key, |r| r.rowid).unwrap_or_else(|e| e).checked_sub(1);
+                                                let pos = table
+                                                    .rows
+                                                    .binary_search_by_key(&key, |r| r.rowid)
+                                                    .unwrap_or_else(|e| e)
+                                                    .checked_sub(1);
                                                 if let Some(idx) = pos {
                                                     cursor.position = Some(idx);
                                                     true
@@ -4038,6 +4051,9 @@ fn sql_or(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
 
 /// SQL CAST operation (p2 encodes target type).
 fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
+    if val.is_null() {
+        return SqliteValue::Null;
+    }
     // Target type encoding matches SQLite:
     // 'A' (65) = BLOB, 'B' (66) = TEXT, 'C' (67) = NUMERIC,
     // 'D' (68) = INTEGER, 'E' (69) = REAL

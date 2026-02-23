@@ -2178,6 +2178,115 @@ mod tests {
     }
 
     #[test]
+    fn case_null_base_does_not_match_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        // NULL = NULL is UNKNOWN, not TRUE — CASE should go to ELSE.
+        let rows = conn
+            .query("SELECT CASE NULL WHEN NULL THEN 'match' ELSE 'no match' END;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("no match".to_owned())
+        );
+    }
+
+    #[test]
+    fn case_null_base_skips_all_whens() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT CASE NULL WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'none' END;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("none".to_owned())
+        );
+    }
+
+    #[test]
+    fn case_null_when_value_skipped() {
+        let conn = Connection::open(":memory:").unwrap();
+        // CASE 1 WHEN NULL should skip because 1 = NULL is UNKNOWN.
+        let rows = conn
+            .query("SELECT CASE 1 WHEN NULL THEN 'bad' WHEN 1 THEN 'ok' ELSE 'miss' END;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("ok".to_owned()));
+    }
+
+    #[test]
+    fn case_null_in_join_filter() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cj (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO cj VALUES (1, NULL), (2, 'x'), (3, 'y');")
+            .unwrap();
+        // CASE val WHEN NULL: should never match, so id=1 gets 'other'.
+        let rows = conn
+            .query(
+                "SELECT id, CASE val WHEN 'x' THEN 'found' ELSE 'other' END AS r FROM cj ORDER BY id;",
+            )
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("other".to_owned())
+        );
+        assert_eq!(
+            row_values(&rows[1])[1],
+            SqliteValue::Text("found".to_owned())
+        );
+    }
+
+    #[test]
+    fn cast_null_as_integer_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT CAST(NULL AS INTEGER);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn cast_null_as_real_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT CAST(NULL AS REAL);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn cast_null_as_text_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT CAST(NULL AS TEXT);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn cast_null_from_table_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cn (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO cn VALUES (1, NULL), (2, '5');")
+            .unwrap();
+        // CAST(NULL AS INTEGER) should be NULL, not 0.
+        let rows = conn
+            .query("SELECT id, CAST(val AS INTEGER) FROM cn ORDER BY id;")
+            .unwrap();
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Null);
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Integer(5));
+    }
+
+    #[test]
+    fn collate_in_join_does_not_return_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cl (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO cl VALUES (1, 'Alice'), (2, 'bob');")
+            .unwrap();
+        // COLLATE should not silently return NULL — it should evaluate the inner expr.
+        let rows = conn
+            .query("SELECT id FROM cl WHERE name COLLATE NOCASE = 'alice' ORDER BY id;")
+            .unwrap();
+        // At minimum, id=1 should match (exact case match with 'Alice' compared via nocase).
+        assert!(!rows.is_empty());
+    }
+
+    #[test]
     fn probe_nested_functions() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")

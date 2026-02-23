@@ -5252,6 +5252,10 @@ fn emit_case_expr(
             // Simple CASE: compare operand to each WHEN value.
             let r_when = b.alloc_temp();
             emit_expr(b, when_expr, r_when, ctx);
+            // NULL in either operand or WHEN value means no match
+            // (NULL = x is UNKNOWN in SQL, which is falsy for CASE).
+            b.emit_jump_to_label(Opcode::IsNull, r_op, 0, next_when, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IsNull, r_when, 0, next_when, P4::None, 0);
             // If operand != when_value, skip to next WHEN.
             b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, 0);
             b.free_temp(r_when);
