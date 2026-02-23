@@ -2438,6 +2438,63 @@ mod tests {
     }
 
     #[test]
+    fn mixed_type_comparison_uses_type_ordering() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE mt (id INTEGER PRIMARY KEY, val);")
+            .unwrap();
+        // Integer 5 < Text 'hello' in SQLite type ordering (numeric < text).
+        conn.execute("INSERT INTO mt VALUES (1, 5), (2, 'hello'), (3, 10);")
+            .unwrap();
+        // 5 = 'hello' should be FALSE (different type classes).
+        let rows = conn
+            .query("SELECT id FROM mt WHERE val = 'hello';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn integer_less_than_text_in_type_ordering() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ilt (id INTEGER PRIMARY KEY, val);")
+            .unwrap();
+        conn.execute("INSERT INTO ilt VALUES (1, 42), (2, 'abc');")
+            .unwrap();
+        // Integer 42 < Text 'abc' in SQLite type ordering.
+        let rows = conn.query("SELECT id FROM ilt WHERE val < 'abc';").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn blob_greater_than_text_in_type_ordering() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE bgt (id INTEGER PRIMARY KEY, val);")
+            .unwrap();
+        conn.execute("INSERT INTO bgt VALUES (1, 'text'), (2, X'DEADBEEF');")
+            .unwrap();
+        // Blob > Text in SQLite type ordering.
+        let rows = conn
+            .query("SELECT id FROM bgt WHERE val > 'text';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn large_integer_float_precision_comparison() {
+        let conn = Connection::open(":memory:").unwrap();
+        // 2^53 + 1 = 9007199254740993 cannot be exactly represented as f64.
+        // 9007199254740993 > 9007199254740992.0 should be true.
+        conn.execute("CREATE TABLE lip (id INTEGER PRIMARY KEY, ival INTEGER, fval REAL);")
+            .unwrap();
+        conn.execute("INSERT INTO lip VALUES (1, 9007199254740993, 9007199254740992.0);")
+            .unwrap();
+        let rows = conn.query("SELECT id FROM lip WHERE ival > fval;").unwrap();
+        assert_eq!(rows.len(), 1, "large integer should be greater than float");
+    }
+
+    #[test]
     fn probe_update_where_column_cmp() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);")

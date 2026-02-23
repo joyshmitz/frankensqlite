@@ -9296,24 +9296,62 @@ fn numeric_mod(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     }
 }
 
-/// Compare two `SqliteValue`s for ordering (used by HAVING comparisons).
+/// Compare two `SqliteValue`s for ordering.
+///
+/// SQLite type ordering: NULL < INTEGER/REAL < TEXT < BLOB.
+/// Within the same type class, values compare naturally.
+/// Integer-float comparisons use precision-preserving algorithm.
 fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
-    match (a, b) {
-        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => ai.cmp(bi),
-        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => (*ai as f64)
-            .partial_cmp(bf)
-            .unwrap_or(std::cmp::Ordering::Equal),
-        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => af
-            .partial_cmp(&(*bi as f64))
-            .unwrap_or(std::cmp::Ordering::Equal),
-        (SqliteValue::Float(af), SqliteValue::Float(bf)) => {
-            af.partial_cmp(bf).unwrap_or(std::cmp::Ordering::Equal)
+    use std::cmp::Ordering;
+
+    /// Return a numeric rank for the SQLite type affinity ordering.
+    fn type_rank(v: &SqliteValue) -> u8 {
+        match v {
+            SqliteValue::Null => 0,
+            SqliteValue::Integer(_) | SqliteValue::Float(_) => 1,
+            SqliteValue::Text(_) => 2,
+            SqliteValue::Blob(_) => 3,
         }
+    }
+
+    /// Precision-preserving integer-float comparison (avoids lossy `as f64`).
+    fn int_float_cmp(i: i64, r: f64) -> Ordering {
+        if r.is_nan() {
+            return Ordering::Greater;
+        }
+        if r < -9_223_372_036_854_775_808.0 {
+            return Ordering::Greater;
+        }
+        if r >= 9_223_372_036_854_775_808.0 {
+            return Ordering::Less;
+        }
+        let y = r as i64;
+        match i.cmp(&y) {
+            Ordering::Equal => {
+                let s = i as f64;
+                s.partial_cmp(&r).unwrap_or(Ordering::Equal)
+            }
+            other => other,
+        }
+    }
+
+    let rank_a = type_rank(a);
+    let rank_b = type_rank(b);
+    if rank_a != rank_b {
+        return rank_a.cmp(&rank_b);
+    }
+
+    match (a, b) {
+        (SqliteValue::Null, SqliteValue::Null) => Ordering::Equal,
+        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => ai.cmp(bi),
+        (SqliteValue::Float(af), SqliteValue::Float(bf)) => {
+            af.partial_cmp(bf).unwrap_or(Ordering::Equal)
+        }
+        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => int_float_cmp(*ai, *bf),
+        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => int_float_cmp(*bi, *af).reverse(),
         (SqliteValue::Text(at), SqliteValue::Text(bt)) => at.cmp(bt),
-        (SqliteValue::Null, SqliteValue::Null) => std::cmp::Ordering::Equal,
-        (SqliteValue::Null, _) => std::cmp::Ordering::Less,
-        (_, SqliteValue::Null) => std::cmp::Ordering::Greater,
-        _ => std::cmp::Ordering::Equal,
+        (SqliteValue::Blob(ab), SqliteValue::Blob(bb)) => ab.cmp(bb),
+        _ => unreachable!("same rank guarantees same type class"),
     }
 }
 
@@ -9483,6 +9521,27 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
         return rank_a.cmp(&rank_b);
     }
 
+    /// Precision-preserving integer-float comparison.
+    fn int_float_cmp(i: i64, r: f64) -> Ordering {
+        if r.is_nan() {
+            return Ordering::Greater;
+        }
+        if r < -9_223_372_036_854_775_808.0 {
+            return Ordering::Greater;
+        }
+        if r >= 9_223_372_036_854_775_808.0 {
+            return Ordering::Less;
+        }
+        let y = r as i64;
+        match i.cmp(&y) {
+            Ordering::Equal => {
+                let s = i as f64;
+                s.partial_cmp(&r).unwrap_or(Ordering::Equal)
+            }
+            other => other,
+        }
+    }
+
     // Same type class — compare within class.
     match (a, b) {
         (SqliteValue::Null, SqliteValue::Null) => Ordering::Equal,
@@ -9490,12 +9549,8 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
         (SqliteValue::Float(a), SqliteValue::Float(b)) => {
             a.partial_cmp(b).unwrap_or(Ordering::Equal)
         }
-        (SqliteValue::Integer(a), SqliteValue::Float(b)) => {
-            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
-        (SqliteValue::Float(a), SqliteValue::Integer(b)) => {
-            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
-        }
+        (SqliteValue::Integer(a), SqliteValue::Float(b)) => int_float_cmp(*a, *b),
+        (SqliteValue::Float(a), SqliteValue::Integer(b)) => int_float_cmp(*b, *a).reverse(),
         (SqliteValue::Text(a), SqliteValue::Text(b)) => a.cmp(b),
         (SqliteValue::Blob(a), SqliteValue::Blob(b)) => a.cmp(b),
         _ => unreachable!("unreachable given rank check above"),
@@ -12597,8 +12652,7 @@ fn literal_to_join_value(lit: &Literal) -> SqliteValue {
 fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) -> SqliteValue {
     match op {
         // SQL comparisons: NULL compared to anything is NULL (UNKNOWN).
-        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Gt | BinaryOp::Lt | BinaryOp::Ge
-        | BinaryOp::Le => {
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Gt | BinaryOp::Lt | BinaryOp::Ge | BinaryOp::Le => {
             if left.is_null() || right.is_null() {
                 return SqliteValue::Null;
             }
