@@ -132,9 +132,9 @@
     },
     {
       "fixture_id": "core_sql_edge_cases",
-      "parser_blake3": "502be4870060134d00815808d6d5d11c80157fcb498e3061d1ff5e6df87391ac",
+      "parser_blake3": "d2839cb4c2c2325c33bdbde7d340c4a68fb3962b07be802f517eee465abd9957",
       "planner_blake3": "3b18ad82f6a6ea08ed6ed6c3f7e190b829429ad4df90a6fb44bdc8c605fa7c12",
-      "execution_blake3": "c0db2857789525325459599f245e1e38e9ef3e21cd5e66c3f74353d528606745",
+      "execution_blake3": "e68bb4d6cdbc75244f192da4833c2e5558c31001fd3e5d1252b8801674ae61bc",
       "statement_count": 4,
       "query_count": 4
     },
@@ -172,7 +172,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/00584a81af68755ecdeb35fef62662a301876d7d",
-      "parser_blake3": "6ebec1c83e55d986086dd6ec09a0a6ae448cfd6d7e8cca0a28ddca24394c27d0",
+      "parser_blake3": "5aee454f5f772619a23aa3eec458295f26ba5d4b8dd217fa297f53522a58ecf7",
       "planner_blake3": "4cbe4704a93b003be95e3fd13ff22adad8c0e6939ad2daf00578cd20a2c6ba4a",
       "execution_blake3": "5f7c9d0a9c115df68538b8252c8bcc2946a1847f012ffabf4cfd4a211aaf0834",
       "statement_count": 1,
@@ -188,7 +188,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0099627eb2903d6f865b1bc995e94420bb835339",
-      "parser_blake3": "60616a3a8d83429b8950848ae74df355b69e6179e22efe54271d8e24ca17d922",
+      "parser_blake3": "4b500db8c96d7906c6f2cc5d99d3cc94e7ff9c5bcedaa1e96c07c3967d53fe18",
       "planner_blake3": "9eacd6d49a0a23bf55b165edf2fd0249bfb2986294c80fdf280e7a027fa1eea5",
       "execution_blake3": "3f0c352b3d96307c06f49b4ecd93ce8fa397875de9b2578808b34a15c4e47a37",
       "statement_count": 1,
@@ -236,7 +236,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/01d0c04931fbd0a85de1d61983928433cb1e6e1b",
-      "parser_blake3": "6ce29d2cfb82a900758a8a87ee254645dbcc12db67ed2bed7ae3827751937404",
+      "parser_blake3": "0656c86dccbd5bb212fa63c01c88a6ee81a76836116c9740c8a3a41d8db4a04a",
       "planner_blake3": "93c3af1e5d1cdb16967bb07a350858979b33d1ab63c2100e7d371dbafb81727d",
       "execution_blake3": "257e925ac16500c65f217f7ef58bf409ffbca1091ef0e8739b50441f35e7c0a3",
       "statement_count": 1,
@@ -252,7 +252,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/024d626e665e8a944b7b78eba1a5c19bb25d2589",
-      "parser_blake3": "0dbfec8a012f20b62e16dda9fbb07ce048d7556060da1b701e59b8e713c78d54",
+      "parser_blake3": "4424e1819bcf4378849ed5f6a8661eb3fc96ffd94a7476f314abb576503f3313",
       "planner_blake3": "6c5d5ceab83780a11f098243c28ef6019fcedf220600e363e14e436583ab7d79",
       "execution_blake3": "86f134d80a5842e529d9a6349ddc3c65a4ac80c4f6a4f2dc4d976b0c3e119fc6",
       "statement_count": 1,
@@ -308,7 +308,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/02c7b57ba6f64849e8555b18cdb308f4277c741e",
-      "parser_blake3": "eaa5e57cb479aab7c1b097ca69834ed65aedbacbef8cdb32593cd4b21089c7b6",
+      "parser_blake3": "81c0ecaea1fd0a37b8a9a794dda3c3acef4d91023d795ba1d8855f02fbacd10f",
       "planner_blake3": "87ac9e508b744912a23ea9f0849282c2f81d4738b6b23553ecb445c72ebf1033",
       "execution_blake3": "8002ea5f5d6bd814769905bca896b6d769b58888d74ad99e055a1722abdadc76",
       "statement_count": 1,
@@ -332,7 +332,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/02f584d25cd3b91aed76d58409a07fb950a99e2f",
-      "parser_blake3": "c753fa71368de201a1694d0ed660459bfcdc0e6f593a4cd0fdb05ce861918356",
+      "parser_blake3": "7978d36858ea46ecebb868f067adadc1111a2accc5a8a70140607786b255245d",
       "planner_blake3": "f457d1f4da30d74cc3296379f9c24b80236f9e9e9ea8fe78fea1715111650287",
       "execution_blake3": "be38a5b64b517294eb9df2233f0c8685f2bc663e03bb6d04f06e60a7c29cd1fb",
       "statement_count": 1,
@@ -484,7 +484,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/060221edc9f0d78f921abdc002868d5ffb18200f",
-      "parser_blake3": "99e1ae95aae8c2b04d03c9452e8a9b5ccebbabb2dd43dcd92167a09f37107f0e",
+      "parser_blake3": "dfad75350095edf35d234ae214d7168ede9589e79c531b3392e06cbb3c459a1b",
       "planner_blake3": "98fef33b30f8de95ef0893e4ca4adb15743a4dd9b6ba5babea8020a7556c3257",
       "execution_blake3": "0f61aec39198d77d119e8fd32cd0d0a53a6f384eade7ad7f76c02a31795980d9",
       "statement_count": 1,
@@ -548,7 +548,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/06a40ad97bb2f7b81776a06995e15834e2063947",
-      "parser_blake3": "3ba8a8aa8b169d0f8d07e98af687b8c98234b5178bd8b7f435db89bf47af7546",
+      "parser_blake3": "8f330d68084cc87038548d480ece79128d834c92ca0e37ae8856bb8f311f37af",
       "planner_blake3": "96ca9a695876e470160862fc7d28e2fe0ecdd98c5ecc90cba9318b673f1435f2",
       "execution_blake3": "4e7914fdbc4597a57037798c493c98f93917ff8fcc8f1e79aa94886795bb98c1",
       "statement_count": 1,
@@ -772,7 +772,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0a7052dfa9f525afcdf3095fbe4b96fd98c6d7aa",
-      "parser_blake3": "601b250da209b4701443dcf46806354f8cd7271076f1b551ba75978a8e0f5590",
+      "parser_blake3": "01c7bc87cdb348c9e4e02fe84c3bcb39cf561d77251f31b0be36d05aba09be78",
       "planner_blake3": "c90e7d592f06f5e06a5bfa6290480c258dfe1a97bbf8407a306d45c4b1143df9",
       "execution_blake3": "83b9cd8c2abbca9f97e209a2ed2f73dfba6fe68c5befa121ef92da3abd911d45",
       "statement_count": 1,
@@ -828,9 +828,9 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0afabd34ba3ae55eb953a42a9e366d502c97f544",
-      "parser_blake3": "922a9b671669b283d6435bcc48634946279767d5344012bf3beaddebdb533561",
+      "parser_blake3": "277077a37e2749f0a23d4044d1e8a2d2daf81ee0ce4dfd6659d2256b4c88e322",
       "planner_blake3": "8d7c9e71ddda435fc8d73e42f3bed5c8277885b13129d5b062dcdb2cdfd87b18",
-      "execution_blake3": "58b83c1776a5f9f21a3f66d57035c7213ea6f4575bd862118ca02a9f413713a0",
+      "execution_blake3": "7ad8a42ec49c24b62744ffcf548c2305f2c9064cfb25d31d0e15e4bd8a1c5ac8",
       "statement_count": 1,
       "query_count": 1
     },
@@ -852,7 +852,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0b90604046e9c046e68670c26baa8f301241750e",
-      "parser_blake3": "7b4d605b16c6d706cac68b4747dbfc8d3377d76a7e6483509528f94fb9d14271",
+      "parser_blake3": "e6327bb99193584f2e4a09f2142cdb4b4a84496c677827008b3d19e9374cf0e1",
       "planner_blake3": "922631f763363148ae0be1bbf844ab2453b488bee0d407dc7dc0d48e3b455faf",
       "execution_blake3": "02ff4210d1493f1e7d76967247b774b6c09e6be328e8c3dcb191cba5c8f5f311",
       "statement_count": 1,
@@ -908,7 +908,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0befdf324d87514c8876eb2904e730950c6f5023",
-      "parser_blake3": "584f027a9e5e2785874689885eac65d4dd078128d3000584a357db2d7beeff45",
+      "parser_blake3": "2ee8c3f82b40e243308672e8ec3b74bbf1a0b93ef6727a39f806c7ec7fd98642",
       "planner_blake3": "aefd5b08a44f2d7ecb98c940e389083b64180f674a77020603a8b77fcd6c129c",
       "execution_blake3": "9541fd1b7633c42088667de1280983ab4c6e261c809f2cc6ae162d083c354182",
       "statement_count": 1,
@@ -1036,7 +1036,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0d8d25183be6e373cbe24a5fa7e2d1aaec7e95fa",
-      "parser_blake3": "c4c6200ebed1ec8230dc09c2f73cb8b952219b34f8b8ae1d4c9725e544bb3cff",
+      "parser_blake3": "028b1476343a18b795607f5f1f5e5ff7009dccb5f652afe0d9717a6a19291e60",
       "planner_blake3": "15326e01cf422bfa057ad99d7043a998a2d26c6182d9eddd9ce9da18effca000",
       "execution_blake3": "c41515277823ee31a07eb1cb559853b3b586db7d28d5060fc39ddd786ba28288",
       "statement_count": 1,
@@ -1116,7 +1116,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0e89e8646bbb301ec5493716a9e657677b2f6c69",
-      "parser_blake3": "957a2ee71ad93f5ac437166687f9b8b897686bd7c7318dabbc37986295044aee",
+      "parser_blake3": "951c5fbfa4ed886795d885c6bf19497179c5c312070a0fd24ec2d49ee4a00778",
       "planner_blake3": "5006af5f1c835a21bb70894a5eb3297511495ea6cf016d634639f2ebdd7e63f2",
       "execution_blake3": "ae737296a941ebde76e1a5e742a39b6ea578a514b49b25f43627eb47bc9f999b",
       "statement_count": 1,
@@ -1180,7 +1180,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0f3234510cbbc8671d6d9cd0cef138b51878c04e",
-      "parser_blake3": "00d3427304bfecf01ed53ade18e554d79825fbddaa573568a4df82365aedfb83",
+      "parser_blake3": "44062c9815e88a60605020fe6a6f129c3452d3c4f469bb77d805a171a0fba77f",
       "planner_blake3": "bd31f7dc0c42c93ae03831eff61c226b288e983897644f861197cdc62c7634fb",
       "execution_blake3": "adc6a651d93729ead598f79b1a53602fa07c7cc94af4b4ac2a25384634310695",
       "statement_count": 1,
@@ -1204,7 +1204,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0f682cbdaaa1ddefe9c30a6ff7a630cac7092dfe",
-      "parser_blake3": "966436af5ff323f47d310eba3772990d14baeb5d0f947d88d99f49d4fee03733",
+      "parser_blake3": "fcdaefafd42b800de7f0aef25496705ed137e7cc38f49b7817de8854ff39ed49",
       "planner_blake3": "b6b0cc880c943e30ff8adcca75737b5d8a1bfd89cc7d9a5542222cd244e2b3d7",
       "execution_blake3": "91f80169764d9d4bcf189cdfb3c0ea822894ef0c8d4b834edccd162a40c11afe",
       "statement_count": 1,
@@ -1260,7 +1260,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1003cda7e3b0472121d6e0cd7449bbea6714551a",
-      "parser_blake3": "0ac7907679b9b2d5d52c7bdeaf5b643331c21fd2d907bebcb3cfa81f5ae9156b",
+      "parser_blake3": "86fe0d69ae0481306978154210919ea0854269030b6af49577c452452dc3caac",
       "planner_blake3": "8c51041eb7583f44698b5a966ad2c819460caee3e0d2171a1726ac1c4cfed950",
       "execution_blake3": "4adad884c8cbdb222ea088086c6c899f061e029044f3fa923496db0d02c76912",
       "statement_count": 1,
@@ -1364,7 +1364,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/11402fb5ace706de596acad23d2f09b5174bd47e",
-      "parser_blake3": "584279f45a4890dfbd8b77e512e1fdf80d850eda9ed6451a75b9c19e3a2f24cb",
+      "parser_blake3": "678b987c8e178335463c7df4a5c9943308b53b000e113a0ce9ef95378ba7ab57",
       "planner_blake3": "c283ad222b9934dbd8c35ffa9c4668731a262fa95a7161341c98a9a990c1e40e",
       "execution_blake3": "eebcbeafcfa9afd44b6b0e5a5a209edaf6372098cd30ef410730ef3ca8420c3f",
       "statement_count": 1,
@@ -1372,7 +1372,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1164010118018687c95bc0f054dd2d8f03ad2be6",
-      "parser_blake3": "7228cefc4bdf97c30b5e6fe0a4cd9d0caa380c1828ccee8924113866dfe36add",
+      "parser_blake3": "1f32c16f2bb63dc17a4fc58eadd9c9a3888ef978892d055419eb0e996114e895",
       "planner_blake3": "03852733ac9c85d4cc39f50e65d5e4e9c0096c874e8c7af7da5e3934c063dad6",
       "execution_blake3": "30dcfd3fdb95c2dc513a84011da8a2154e14e52f1e389735f65495338a6fe7c5",
       "statement_count": 1,
@@ -1380,7 +1380,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/116c80f668da9b1d01e04d8259b6bb9ed838f885",
-      "parser_blake3": "c7d359687b6e8e83bec3b22f17b6a51c7e60bd8ca0fc2b77ff6a61d775c406f7",
+      "parser_blake3": "b0d44be0f65b3aaf5f3db09023b876ec9f3b9c3b21a80e9c83016c51da30785a",
       "planner_blake3": "a60034aa73a7383fc96e5f9ff2f48d1f178797817ce6d740e2437cec56c9ab07",
       "execution_blake3": "26c94d9f0aea0778a152097509d400311ad806b8285ac0766f0a410e74814c5a",
       "statement_count": 1,
@@ -1404,7 +1404,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/11d930b320d9f948619f3784190959e2af62cd86",
-      "parser_blake3": "2f37fc40e9dd4efd7e380c929cc3f762e6484204ee3daf569fe4ccc34e34991b",
+      "parser_blake3": "0b6afef3d8e903a1b9f73eb424612faef9bf6c096c314b8d192927c450b45c8c",
       "planner_blake3": "234d68d87f5d06f41d482c6e624036d29e41907577154e6017c7b7a4155e238c",
       "execution_blake3": "d0ae6815c51a633b55d4a433c7254ad437ff719ef42153640fedbf42dbda4ab3",
       "statement_count": 1,
@@ -1476,7 +1476,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/139144c9f41098b41557bc51f14df1bda5044eb4",
-      "parser_blake3": "54d8b3508f8e03ca022ad1136e061ca004d9fe2dd0e3285b1134c72e0931e3c6",
+      "parser_blake3": "155def28ed58e5a379f57f548c120f7edf3b0fa413329e3f10160fc01b70c243",
       "planner_blake3": "8ece8bcb41701fb702e7ffe4639f69d3f55af3cef9746be9a3d09507148c5f0b",
       "execution_blake3": "6ad03b6fdaed9eb945f8b6aa914bf4e574cfdbdc0f5bb473954a68b19cb08761",
       "statement_count": 1,
@@ -1492,7 +1492,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/13b3ceee848d88618a63527034839e628265a304",
-      "parser_blake3": "47dfe9e5be1413ac0cfcffa742723dbe15d7f05b2851a6d05b7d8515b5ebc9d3",
+      "parser_blake3": "6d2d8e6b15168e72a33ac3a80789476ffcc71567bd0a0d325e19cee98beb8070",
       "planner_blake3": "fce3060015162a465d35f855a3c814179fd3aa10d46f2a96cdd890ab442f1a05",
       "execution_blake3": "1a68a71afcf258d63dc360fecd6d49c2356e89c79add6d4958d911abbf599f15",
       "statement_count": 1,
@@ -1532,7 +1532,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/148ddfec722203ab96819f36d06fc8240eddb6e3",
-      "parser_blake3": "0f727573c1f2e322daf954e552417f1b4ada1954de84822ffe61f5dc80fffe4a",
+      "parser_blake3": "7e80a507f3eb37f5f25ad4b6c7abb210c068dc3698e5e8d9b72a12fad9678178",
       "planner_blake3": "8d223c5c4297c60f62354449ed788632891b6bee4e22ce55c8874fdd6207246f",
       "execution_blake3": "512f92267fa8aefbb522ad34bf307bcb989bf116f06203c0477ee78c90fb4ced",
       "statement_count": 1,
@@ -1540,7 +1540,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/149cc64c6fa57d205418c61a0256260644663bd1",
-      "parser_blake3": "725ee94b6fa3954f0d78e9f5ed0e688d6613d283e61f87d1699099acfb32d61b",
+      "parser_blake3": "26b0a1a8d7c8f07d3404cb00edd7d6a070c83acd120bc5c8ec70d1fc8f7f5fc0",
       "planner_blake3": "ad76a015e22650bdf92ecd54c4d8bfd7c25fb669c05b3b5e2fc5f40090032ac8",
       "execution_blake3": "b182b18dd3dfd0d94bc4e4f761b8206b78bd267ee7e34efe3c8dc4193fffec0a",
       "statement_count": 1,
@@ -1548,7 +1548,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/14c28f6317ee356fed126c2374dc793040cf391f",
-      "parser_blake3": "a47d6867b88795e2de1306bee576e9f02b699f5e564f6d3e7177eb95812ad2dd",
+      "parser_blake3": "21b77c49ed12f63302fc7e495ee0f3611b918e7d18b2ca05358e530be0545751",
       "planner_blake3": "7e34f94116da0844785a1bc884964d64c550d651f0dd33cef2be06e295318f68",
       "execution_blake3": "0b2d7497527ec75a3b3d9b34d35ba97ce3ed368e91fe62e7e3f429d2d0826af0",
       "statement_count": 1,
@@ -1596,7 +1596,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/156b889bdc97caded99c57ddfdce7eaef0ece5de",
-      "parser_blake3": "5310a2e5d22bcb5837ef08cccd17603d8cc77611e18fe3fbfdce7e3c7c91b920",
+      "parser_blake3": "0c01b6ec3a2dfa92f9a217dbb1d07cc776eaf5080e940f4c88bfc854fc463a6c",
       "planner_blake3": "da426f064efb25edd8168d2fbc1e6b77b81d4810b3da745bd251cf56e47380d7",
       "execution_blake3": "29c26c91cbc9d211420ece669861e845124d783be09622fd1d7b31b06533dba3",
       "statement_count": 1,
@@ -1628,7 +1628,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/15bab15631cd4d4ca95e65ba755bcaedfcf5aa33",
-      "parser_blake3": "1d816fd01d26e06114780e8e17b016691b3957290ef86afa004b81c56653c0f8",
+      "parser_blake3": "ef53f2cfd658b6dd16df42ed183bbe1ea809cc4d3417094a5c095f35ea159263",
       "planner_blake3": "f16d9c2cbda037b5f33ac1eba8061bffa23f8baf8e886ea7c596299eb1521cf1",
       "execution_blake3": "4f8719818352f18a9edb9787f15e1d6d8552dbe8e5d26e886c182299e5400e35",
       "statement_count": 1,
@@ -1700,7 +1700,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/179d4c6dfe9fb610745b1bca2c275a9d7ca1c67d",
-      "parser_blake3": "383d56151782916452cd52fa1732417d47459296fdbbdf2fbe3f929fd96c18e2",
+      "parser_blake3": "c63ec3fc12325eafe524c8fc2f82c77542c5ad4f72f2133ead589c11a1e012e4",
       "planner_blake3": "0dde9c30b5e68395b8f76587f7523028a2567a6c0ea311dc6bb98e57bb13d01c",
       "execution_blake3": "0b6f6382b7e3f63171370a0a5123419c00b6e3a532a4229ef8e83faccb45ec8d",
       "statement_count": 1,
@@ -1716,7 +1716,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/17bd1de3aa2260afd82e610e878db71405ba3390",
-      "parser_blake3": "34ba6ae001d08c2173f030f8812092b396b95a11f217858f7e984565417fd36c",
+      "parser_blake3": "ce04e4c90a252967354ef667872e8bad1686c95ed94cd6ae7205858e3b91ad58",
       "planner_blake3": "a6567cfb594a34fca97a134ccafaf0264b9b161c177b2e3b7ee7d7f7024ea296",
       "execution_blake3": "4d92be02cec36efe060c9a5cd21d1abc09cd6ccb435ba5f59a6e7e9cec2db455",
       "statement_count": 1,
@@ -1724,7 +1724,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/17ccb7d8a969f16dfcec16673c144a4ef65ab935",
-      "parser_blake3": "65e4ba7a1d647807eb22380359bf38c1d84b4995f676d90ba8d7e90194c8fa50",
+      "parser_blake3": "7ea836ca89cedc412f08a355c68126e4a6f0a0bb2a078b2d39763f324e8b0998",
       "planner_blake3": "b2d0c48d818bbb6172c206eaed8fa08aee1818136a966766a5a2658f106c9c1e",
       "execution_blake3": "9fb4eb3b2983a79af81adc1def6d73297f46ae9a448ba2748c015e857155ab31",
       "statement_count": 1,
@@ -1796,7 +1796,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/191a24600918218dbbcf7ac1e551bada4b8cad54",
-      "parser_blake3": "42fcb5fd54c7d2587432cfe213b36920d04d077f1d7febcc60478c60ed102078",
+      "parser_blake3": "152dce18c71e3f0417b7b0cc16d77262cb6b91488b46daaa37e4023cb01d023d",
       "planner_blake3": "772e03fc2e7dea1a14f456afa6b6a1bf14d2e58a38a8ac6e232c9a32763d307a",
       "execution_blake3": "e42a24ef01bd9709e306c4168ef5cc72fe71228208f8b0087e34ea22b313230a",
       "statement_count": 1,
@@ -1948,7 +1948,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1baf731567ac1d716170aae0d125cf7611afa7bd",
-      "parser_blake3": "31cd28eb04bd81e0e91844495cef281fe9612f3623c98936986758985e1347a6",
+      "parser_blake3": "8ec8936f37b2eac228ab5ecd01c7f6e882d64b9e02d847ca190e3b0ee8bb0861",
       "planner_blake3": "f20d8ed20077bff0676fe3116c77bb2b1814b19f5f9ff6b2a889a8d93a522e8f",
       "execution_blake3": "d896d363e7cac26ac891f2e47a5d371405480a471e2031f968d1aef09d78e001",
       "statement_count": 1,
@@ -1956,7 +1956,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1bb3ba1781a300981c4623dc7322827df5091a1a",
-      "parser_blake3": "6565675e000e146f3c99a6d4c7af7c0a2aa00e2c74bb5aa9752d124eb889c714",
+      "parser_blake3": "10ec5976756067f36cef7cfb25450000f16fb31dd0c82e793a4095fb5a284132",
       "planner_blake3": "dcb676da7f1931e5b33ae14855a57b0bacc67b940f2772f51a17c10b68d848a9",
       "execution_blake3": "1100f380842534ab79f773d9f9c83a0df39701ded8bf4f781ea28c393a5be2a2",
       "statement_count": 1,
@@ -1964,7 +1964,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1bf7590292f1ddc878b8a0efaa49a55caaaa4a85",
-      "parser_blake3": "9bc166c2188996dbe5fe878b5784ee04925b4309f22a7008196431fec599f45e",
+      "parser_blake3": "e91e30c6f96fc57ec949a0d5e2cb41389778dc393157c584b8431cc8b2553368",
       "planner_blake3": "74c0fd46529afed758139dbcee35bda69098f77265ed4e280e2523a8707b1fd0",
       "execution_blake3": "bd289a91b0bb2c5f60a014266a3e716bf51091f7e6f58912cf109e398c0fc138",
       "statement_count": 1,
@@ -2004,7 +2004,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1c5561c5799c03ab2eb6f9069642eb42e5ea66c6",
-      "parser_blake3": "eb6c005dcacd0b9d30b2498cdc83036dc3344318bd6cdaf713937b063484ff96",
+      "parser_blake3": "04a1faa71ab515dba5219b6762ce15e2793fa6697a4a323aab18c9bd08144ff4",
       "planner_blake3": "18baed9193fdb227055fee9c783d259f2b8d8fdba89efb10a592c87ec9da74c5",
       "execution_blake3": "d0731be3c90fe6498003529d50913401c214a152139cf4e2c0a4171d1aa5e64f",
       "statement_count": 1,
@@ -2020,7 +2020,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1ca101bd44135fa625a929ad1a8ccc1c9a1b9ea2",
-      "parser_blake3": "06ddba8f049772bd29fd5fbed336d59b91c02d664125773ca99f2d861e0ba714",
+      "parser_blake3": "db1eb3d66c563eded34a171f836300ec6b175a0de0fdc322ebf1a2271d535ac7",
       "planner_blake3": "199d0d7be43d1104a6319f722cfb4a44de596519dcc37ae4184b9375005fe334",
       "execution_blake3": "1a34a0c2f28181d9de4097c973821f0fdb20182c62728aa3b4c88141f9452104",
       "statement_count": 1,
@@ -2028,7 +2028,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1cd2a783fc1b8bad3a11f6f09afaa2d34e343c9a",
-      "parser_blake3": "f29ec5bac6c28ed4dddf7b91029052e48c91034a12060884e82d697348f622fe",
+      "parser_blake3": "e3b6e711ad9a14b3e668ca26a6dc80db29e8bfc431621eb5e65ab7cdff632373",
       "planner_blake3": "b8a3eafa07b14747a90fac0f6bb2f830f788a0a85ffe776553e272dc85b55c64",
       "execution_blake3": "77725f25a33673b86e40d62cef25007a4d4fa1f20cfb9e719652cd6a38368e4b",
       "statement_count": 1,
@@ -2062,7 +2062,7 @@
       "fixture_id": "fuzz_sql_parser/1d5e27fee2e4bc9c4b1575730a521a9aaa34b87b",
       "parser_blake3": "14076d69c882417ae032fa8d0d82b0d77964d25297c93a5fe4c4ab77eb0997a1",
       "planner_blake3": "de24d847f971f42ff97932f5a9ddedcb0ba8a4e30b2db049a483f2e935953195",
-      "execution_blake3": "085c1b654a459699058b4509fc0299108abb78529d3376b6176eb7f07354243c",
+      "execution_blake3": "230a7978128cc5650fc34c0aeccd583308c43b1e8240d3a21cdf405f25d2479c",
       "statement_count": 1,
       "query_count": 1
     },
@@ -2092,7 +2092,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1dee76a5d30e6715b87aad8cb05790a0a17d8c13",
-      "parser_blake3": "4a6bae00f32c001d80cdaeeb68c49e17eec1938632d451dd902960cce67a77bf",
+      "parser_blake3": "2df5d048afbc45c5eab1c021ddb633f9d8181fe3e64c600eb13199f817d7b396",
       "planner_blake3": "07e282b6feb67cb306fc92d87856ccd503868e07fdc0840906bcd0b244891b68",
       "execution_blake3": "2c3981b00b5c5e202b688a2a7bb78eac65a1aff6f35717bbdde22337f4194c24",
       "statement_count": 1,
@@ -2140,7 +2140,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1f71ae54a66e9f8ae91edce74ab22590b60a1b37",
-      "parser_blake3": "b78d12c699c7f4514218834bbec821026ddfb69f032cbe1b0ef1bf57eb86c1de",
+      "parser_blake3": "6f22a42c9a2d6707201af25278370b44d90924d81798729ae0ff7f5da93a79e6",
       "planner_blake3": "9dc1a6a7c1e2742840b57c9c3a12a13019ef9757f24a664e50c67f13c9a0794a",
       "execution_blake3": "3f9b880a3f1323db4dc8ba12af6c4bd497c741c65cd59df51d0c21abe8b5a6b1",
       "statement_count": 1,
@@ -2164,7 +2164,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/1fc503e804861dec98fc469f2b349be75b488e66",
-      "parser_blake3": "766a3685db40a15e6fb3d6bd029f526642079c0a5b98f1678c402d46f235d059",
+      "parser_blake3": "eb6c05bdb1f10fd72b126780a21ff85b531d1d0f8d72b68fc3e0a6058c293636",
       "planner_blake3": "5ca25a86bc888033e83841ad2fc83b97ff0665e57366ee026a0a78cf2eb0c300",
       "execution_blake3": "53dd7bc95f4392003db8be78ea8a8f3d1d9c8e7b9eda4e0794175d13c2aacac1",
       "statement_count": 1,
@@ -2220,7 +2220,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2097ccf7d179d1e72a24a24ea0a562923cb3d179",
-      "parser_blake3": "cad2a39af292807bd7443c9691c4228f991207fd9ea99826e8ca3595ff66f494",
+      "parser_blake3": "6044866bb71e5857aefef38a44c61526a7affd9d7e371bed3ffa35e77432c803",
       "planner_blake3": "2ad2ca671d632a8bdab5eef315547688dcec77f600aa8ce266a2d36165e3023e",
       "execution_blake3": "e56c7bcefc7095bb4b87e1b4070b9d3e7223bb53e5e3673dda7b31fb65096613",
       "statement_count": 1,
@@ -2372,7 +2372,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/22c53afe270584e6cfa81c5f074df0012c7a1b37",
-      "parser_blake3": "45790a68a944b1454e805effba87cb5cb594cbad9fccebf5e1147a4856135f56",
+      "parser_blake3": "2e08bf5d7f0f62a0e5f8d69b02e8d8c502f5bf78e1fdc54a7f97680d06e2aed0",
       "planner_blake3": "4f4c7657e5d6e5403628a076c264e5039fc7832d4223b4bb3be26cc57b463ee6",
       "execution_blake3": "775bc5e141a8bc8da7adec2ad2f17643597dc1ce744044446ca8c54a690b5833",
       "statement_count": 1,
@@ -2452,7 +2452,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/23d10ca394635fe918d8b39b99f29df8ce935888",
-      "parser_blake3": "9610ca34f30cac5d6c14256d93ee35e0a24f43a30946b960c39fe09ad0797706",
+      "parser_blake3": "84d4a07a3dde4fee3a66ed73343b20d55a5c234df1f2b69797b919cd294f3596",
       "planner_blake3": "6c003f0ebe601863cf5171da2c919d36f5b46e80670db46b78482917808a65e0",
       "execution_blake3": "9536f41bd593d14c9f35aaa35092430994ffbcf45d59da11fd374a09c7585405",
       "statement_count": 1,
@@ -2588,7 +2588,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/25e961d78c5696b1ab596903d26007e83baa2d57",
-      "parser_blake3": "d4ec5bc4af6569559f9c9e89da16b235102c38d122fa8429f9d4a55b50907553",
+      "parser_blake3": "5b9752d07d05d7f06e8e3ed5f3505bd5edf1ba42e1261ad5155ab0c406428887",
       "planner_blake3": "15c2b86270730864c7270eb7c1f6ac2946f0e5f74ae589ebd84148d7518c669d",
       "execution_blake3": "246a911f2897f66fe769f90eb71355de909aa06ae624b799d8550fb3cf25ae85",
       "statement_count": 1,
@@ -2748,7 +2748,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2899b3762d34a5f06ae68df700e7dd243b43840d",
-      "parser_blake3": "0cfeaffd314d5d4bc349d065cbab482ebec4e6f5facc97b9ab19a34f9abde662",
+      "parser_blake3": "e5d81c97b1f05634414e750786654027df2d9ee71160c7ce30737c68e9181082",
       "planner_blake3": "b36a22df6366147fda035fb96ea8c23c0b88dfcb7bed4a35d26660e264c1e6e8",
       "execution_blake3": "47156bb9e9f3faec537a1801a0e334bcd86f1bd2b2c0c520258767e5faa0c248",
       "statement_count": 1,
@@ -2804,7 +2804,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/29781afb08735091bcbda6277a53ebbf7e6633de",
-      "parser_blake3": "c94901549fdbc13156bda3a04e238a524ad385e04491b335d275ef4be25de85f",
+      "parser_blake3": "6abb1fed70d40abbc0eccf15b675a6d613ba7f49dde845caf644e2de5959b8d1",
       "planner_blake3": "017885e0b4c8ad658ab5f28f14a6da6dee1b6187fa82ca24c28c77c23b665697",
       "execution_blake3": "50879f15eda71658c93f21bac7dd3bf8a25b5164fd20f09fedf8083c04071183",
       "statement_count": 1,
@@ -2940,7 +2940,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2bada32748907fe5fc1027b4cb06113b9b24f957",
-      "parser_blake3": "eb5d2cae1aa4ca3063bae8efc0bc47f5fbe979391880fe29f4354de61db05767",
+      "parser_blake3": "83696fd705d2fbaad4ca5e2ea6fb9687541a73d326534f6979476d84d12f54bf",
       "planner_blake3": "79da715b3129c2bc12c3b863f87629f8042aa106a7222eae4ec0d4fa79863f19",
       "execution_blake3": "9cc0fe243d65587d33090e759a5a35900ee9ba303175a11f28c665249740e169",
       "statement_count": 1,
@@ -2956,7 +2956,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2c04a186c5f8c37fb68766e3b06ca9b703a9e4d3",
-      "parser_blake3": "9ee0fc7c6da0f59ef1b074c9fcf63a91b16c9ac47600a2adbbc60a13ad986246",
+      "parser_blake3": "1578931c963918aec08527c2b6dbbb45010504bfdf939450bc307789c714e9c6",
       "planner_blake3": "29d4ed42bf4f20e8847c1257475f778b3f7d0bbe07304d6af7e3730b8cb8dd9f",
       "execution_blake3": "b1d9fa6f799cce11534922a83b90b0087f7cec3d17bbf2e13244cea70e1610cb",
       "statement_count": 1,
@@ -3012,7 +3012,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2c91f12014ffdfd1184660575dc0dc229bf43e5b",
-      "parser_blake3": "4a27fb4e8fc8e4418c2a41e6a9899bd4a90897c649c6421d343519a2be75a9b4",
+      "parser_blake3": "ba56d422fb54bcad3bc84eba2a3f453422f29e9df32603248d4039ae1e50e5de",
       "planner_blake3": "c09205a02c485af94541f745b94d0266a255657e75cb74534f925506539d78fa",
       "execution_blake3": "8f7909ab7041c2f01f8f4fb83a1c07b1ca205472148609c0c7068219c1203b00",
       "statement_count": 1,
@@ -3028,7 +3028,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2cc1596ff42d82777ef6f68bc0667c2cf4882881",
-      "parser_blake3": "28a7a30f10fffdd06fc7ba3d2b96fee4d6fae3cbadd4ca17ad0b91d7ca85f040",
+      "parser_blake3": "0085a08463efeb884d97c75b5498cf31d1b8bdd635ed3ffab2c0a8f1376f5998",
       "planner_blake3": "5b0002bc3155dfdd585c33f9dd60857b17324e9993243802fc447ec7077cdd2a",
       "execution_blake3": "04c3c1075ad58b69355915d2b77eaf1d6562fe485c2966fbe633b6f241802ae7",
       "statement_count": 1,
@@ -3038,7 +3038,7 @@
       "fixture_id": "fuzz_sql_parser/2d0041c155a3c90f617edf48c003c2811db64b0d",
       "parser_blake3": "8bf9eb3001ed9cc3e479159b6bcbb364f99b6f05758e3808f30bcfc43ab946cb",
       "planner_blake3": "0a2c3ea08fa34b7579acccc90c9c118d062da49cc2ec4d28bb14cdb60a4e9585",
-      "execution_blake3": "2930c95b82a1df8cd35d2605e7f43483a5288b9236a3b1f70f9c4deaff9db179",
+      "execution_blake3": "0e8cc93a345baaed6b619082517c0496ba7989c995b3ebb51180ffabc15f68fa",
       "statement_count": 1,
       "query_count": 1
     },
@@ -3068,7 +3068,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2d8d12e965ad3ba1d8767fd8f5f88e5abdbcb0ef",
-      "parser_blake3": "dda4b61624b4ba3505dbe04089111025abe55d5b556ce0f1dae285482f0da8f8",
+      "parser_blake3": "5033ea36b8cbf2ca90781e3931c6d2278a4a27f8b6a91e2bec46aedf1840db26",
       "planner_blake3": "1fb41f1344057c49f38c6c70300f411d8b3f197fe0061fbeb821d59ee8268270",
       "execution_blake3": "55a8c58a9f02943be68a289a43232bdfdfb50781f717b39d4d532d3862e98bf9",
       "statement_count": 1,
@@ -3100,7 +3100,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2e0ec59c8d46ae44492db37a1f5450b8a5722a93",
-      "parser_blake3": "dc2ef2e0827e0f76638ec9afbb5dfbfa1daea8bdbd69cf3a27b689d44c6bcab0",
+      "parser_blake3": "bae68f8032239960f71caa8b60c137146482e2f6b6c486ac655cc0b9ef6fbca9",
       "planner_blake3": "5d5122dfec91a73572e177cf72db5e08477346ddee8a3a5dc484fba5f9ad9fa9",
       "execution_blake3": "edf313af77d2a3c16c17205faf38d44d4aa20f7a0546506cd52822c9d02eb748",
       "statement_count": 1,
@@ -3132,7 +3132,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2e78034ec1aaa0cd06e6add01ce41719e28f38a9",
-      "parser_blake3": "9775defe988aca0351bfc3f2b1bb96cced75cf470ca8abf2ee3f3d4fced391e7",
+      "parser_blake3": "46084845445ad0ec8484b0ac876fb557f4bf21f8a01094f80c620c679442fbde",
       "planner_blake3": "31d77dc08651e2770dd9bc320182e17195584146d3df61b3ffa2188bd64ee804",
       "execution_blake3": "f7c7626104e69b609f7fb1d81c5310cd4545b59d5dca678b576e3d9a1a0b89ad",
       "statement_count": 1,
@@ -3156,7 +3156,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2eb4b69eb1c53246a3e0809d7b568ac1685483a5",
-      "parser_blake3": "5e908e4ff054c5f64875beafa35fdf73e9732932ff8af90fff5b8fc570ab4efc",
+      "parser_blake3": "57ce3236d470386701f1c4ea3c00f8a6ccbed9adfbe6dcb422eee4bccbd57338",
       "planner_blake3": "acc7fa3a292c070907413c637a863038a241fb6f7cece6df42de4cb5be05ed8a",
       "execution_blake3": "51e9b0481c2cf2cd91a8d42e1b75f24ad65888a64bb944df16db55a6b3caaf54",
       "statement_count": 1,
@@ -3172,7 +3172,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/2f57122ce61693ffd3e5f788afc0da09914e4f52",
-      "parser_blake3": "781771afbde9023b679779a5f0501e3c4ff2505e0babad39c532b1160fd43f68",
+      "parser_blake3": "dcab10612830f7e780be03d2c0cbeb571d2e1cae32108f31aa5e2e971f29f9bd",
       "planner_blake3": "b0c743a0c93d01cfe68d192c0bc80c2425ae6f3d76c3854425daee5ff5ca39ea",
       "execution_blake3": "ae876c9252da95eec9923594e17d756a9ceacd49bd8a9c2cb395182a96d5cc30",
       "statement_count": 1,
@@ -3372,7 +3372,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/31c3de87ae7e5fae556916d88b7b187aac26a1a9",
-      "parser_blake3": "96a2813b3d835549c7d0718882999494926090de68e47ec49d33f08b926bf98e",
+      "parser_blake3": "5856b189b6c051537c4605d6f89dc2e5a693e2e75dbf0d9fc1a6ff13d22add30",
       "planner_blake3": "7807b4a1c289f1f26906a47f442f144475359dc5fcc97f5f0f2d8c2abc768506",
       "execution_blake3": "a9a9877c4814132c14e84c0a043a75b13a9c041004d67dee79d21a28add0cab6",
       "statement_count": 1,
@@ -3380,7 +3380,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/31c4d06546bf9daa3ac1ee9cb48da40b37f8c5e5",
-      "parser_blake3": "0d08b11272e90006ea7052934f66f3bc56eae800d97933eb43f66f36f8980d2c",
+      "parser_blake3": "38e2029eb58e81d432ea3d4ba8de4c2489d00b49c246c0cdd7ad4af939f261e8",
       "planner_blake3": "c2df17f3542b52deeffccedf77a0440415b6661b244b1957b0fc95f2857161d4",
       "execution_blake3": "50b9add23a7ee3175ed103d9cf9d1bd5230727566aa352f34b250451c7625823",
       "statement_count": 1,
@@ -3436,7 +3436,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/328b9bd48a982f336caf331083dcc9d5862c58f4",
-      "parser_blake3": "24a91856958f82d7b96dd534936802490918f5ab7445e1fce874bf2220cf3fb4",
+      "parser_blake3": "08d170e6fae3a9e1437efc68c4782ef956f4c97c3a323ab011b84bdd3e8a64b2",
       "planner_blake3": "2922d32596fdf91a3fe791c854f9a08e276b090d48119098ba803bb94c6b8a8c",
       "execution_blake3": "54de5e62f796e6fcdf6363c68aab2459f1992a93f0062f7889eb2928fcff1570",
       "statement_count": 1,
@@ -3460,7 +3460,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/3326353a20da406038404bd04eac7f6b5ec4da3a",
-      "parser_blake3": "41f20f96c9687a14ca35869c57363615291ac17a6872694fd637d98700ebd7c3",
+      "parser_blake3": "c3d00fed8d34376c42b89fe419eb80c4308fc0ed3f046a20b8ede4206207cfb1",
       "planner_blake3": "81a7d47e997ab955468045e00a1eba914f4cc44a9e4a3610de0f9310f9a4c23a",
       "execution_blake3": "dc398971319d2a405a7c85e835538644a88a0181abe93111c02608cadfde7ff6",
       "statement_count": 1,
@@ -3524,7 +3524,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/33d543e5efe1476b1c33ea81a0801ae395dd96e4",
-      "parser_blake3": "4e6a86adbf38b7a944a61b24a16afe81d0f0e18adb263d46fc641d1f41a19b8c",
+      "parser_blake3": "709433d4a52eab9da008596c2827cd2f0f8f64bb638a8728c84afb868ce2aefa",
       "planner_blake3": "4fad84c29a7da3129e6873c1d695fd90dcda6f3a1bbc1098e7c2cf3dd979aff2",
       "execution_blake3": "37b2781a85a6f55575082fba2652bc223987e7bbae22b938e390e75020f2189f",
       "statement_count": 1,
@@ -3532,7 +3532,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/33f4d1081f382a5970f4c2c30d33f08a2643b364",
-      "parser_blake3": "4ffc03b1284c8f51fdee40a62834c52fd327c121ae32210c52e2be138a6531c1",
+      "parser_blake3": "97253f1c4827c00596f0f172ed97bfeca06b4e76854dd8346187f6c647d4554d",
       "planner_blake3": "e367f162eae0286f4f53dde3b5eb6e5bbe555c4bf88c6270d5013e05dd9e16ab",
       "execution_blake3": "c00dcac92633b23eea3c97a8aaba866ea6a51a89cce9a16fe1a99fa5c47e3e15",
       "statement_count": 1,
@@ -3564,7 +3564,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/345bb6c76d94c222a0aa8bb16dc4e65a2c1bccf8",
-      "parser_blake3": "eedbfc2e96fecdec18e63833a752cdc478d57d82cde6fe42791fdcf47c1ddd39",
+      "parser_blake3": "ebcf5ec9c2c5b8f078251a9e0c05bb59e93d0d47e5f78719221da83261b67b13",
       "planner_blake3": "bd7a2485a433aefb436949796ef77229cd8ba18ee91b3e756fee472b1e255b50",
       "execution_blake3": "8111975c669770924acf664cee67f9e4921b9fbbee3931fcee1531384f42d97e",
       "statement_count": 1,
@@ -3604,7 +3604,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/354026dfc65921234896428a6123de0e9c48a57f",
-      "parser_blake3": "4c3b2e175d0734a899897f864fe00e76440f17db24460e3d080c1eed7e0e2cec",
+      "parser_blake3": "7d6be695db7c9e7366b3c91b8c0a3aee1657802ca6d0c5e5f6d8f2180f3e3abd",
       "planner_blake3": "1cffa4c5dfc07b69e98d72686b7ea89b78aa67889d811d53884a0a2566e2d601",
       "execution_blake3": "ebb21c456cb4664e174b246f51c8f3e7b7f67b40569174e9dcc1d1473d7960ab",
       "statement_count": 1,
@@ -3628,7 +3628,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/354e6000120bed0d6d7d02b42c3c05e6cc18b2e4",
-      "parser_blake3": "b371a0a6a5be214ff2a3fbbdcfaf58535e87f70751e9726ee29ab9af4a0fad9c",
+      "parser_blake3": "b0bc745cdd71088968f077ef9387078da7cc9edf52717f7b96e268c157837ccb",
       "planner_blake3": "2fbaffc3aa5e8778484f202cd2071bb03a2d24a27aab47435902c4953b7dd9fc",
       "execution_blake3": "e99fbc5d05ec9727e388f6ee717ee5ba9240eb59dd14c39b241af92af1c61f73",
       "statement_count": 1,
@@ -3636,7 +3636,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/3589931ac3f86f1e7171e9a5404f38890d7b20e4",
-      "parser_blake3": "647404f630d20708892df17d79f29be5d26c0d89d6bb64de27d601435657338e",
+      "parser_blake3": "c7528dcc5b45e96f3f3028e9729dacda5c55031278d23dcb4bcaa07841c12d2c",
       "planner_blake3": "548de0ab43ff45773ea6b7f787e3584ace1b9e9a1c6dbd148b2817a19321fa1b",
       "execution_blake3": "49108d350e75c9020fd4e779c36fe2f9548ee1a32bad0bab68956d19a57edacf",
       "statement_count": 1,
@@ -3652,7 +3652,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/35a31eb2487a66e1e6b0477b1a2351fb56712f6c",
-      "parser_blake3": "bcf6b95a4fcdf1e9d3b736d7f6b26a0b262fbade98c9051db238aa021c2d761f",
+      "parser_blake3": "25a76fbdb592d7ab1fc5069cbb2e9502bddc290a5945088a4da4aaf621368ceb",
       "planner_blake3": "92ad4a1221f8666c0c598222d0d5c4433840d672b2492f21c0731784731134bc",
       "execution_blake3": "a4088fabb921a58c4a5e3f77a26d8266daa1a0958fce153d38a5a9334fd0fa7b",
       "statement_count": 1,
@@ -3812,9 +3812,9 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/37c45f555151aca59517f0ebef109191532a5f96",
-      "parser_blake3": "ed4ef80ecfaeac88e943634064c574f496488f13aea2143ba8a19a5f42c2b19f",
+      "parser_blake3": "744a416a0f23bbac7dbfff185af03dc9d83c01d702142472d33e60134ab9089b",
       "planner_blake3": "9c42af2e14aeab8ea3a0dfc3b1867876c927e4f9d48e96dbc4614f0142cfb578",
-      "execution_blake3": "705194fa64be53f70955ab3299e8390bf6378a0677f24551906c6b0cfa62e556",
+      "execution_blake3": "6fc087fac3f9998af4aa0e0fbc86dce2e71c6c0ba5660b7d09cffe10682617b1",
       "statement_count": 1,
       "query_count": 1
     },
@@ -4100,7 +4100,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/3c4593c10180f357b34df10d3b4884d5df4c5f29",
-      "parser_blake3": "6754d2e1601492c24beac8809d4fd2260eeee6a6cfa6994f4179ca62d0c72aec",
+      "parser_blake3": "b9ff639c540486cf30a80f7de585cddf28efa9a7079dd3d71006a401a30c9c4b",
       "planner_blake3": "53220fec94535463d5046e4c231115e0ac3abea9bb01781587df79c4e93f4152",
       "execution_blake3": "e71470d3b7e6979dd89938354e6fdd6e158558b2e3f3d5db109317f2f25bbda3",
       "statement_count": 1,
