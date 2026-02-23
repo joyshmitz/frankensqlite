@@ -888,6 +888,15 @@ pub fn ssi_validate_and_publish(
 
     // Keep outgoing edges deterministic for proof/evidence generation.
     // (Incoming edges are already deterministic by construction.)
+    let mut out_edges = out_edges;
+    out_edges.sort_by(|a, b| {
+        a.to.id
+            .get()
+            .cmp(&b.to.id.get())
+            .then_with(|| a.to.epoch.get().cmp(&b.to.epoch.get()))
+            .then_with(|| witness_key_page(&a.overlap_key).cmp(&witness_key_page(&b.overlap_key)))
+    });
+    
     if !out_edges.is_empty() {
         debug!(
             bead_id = "bd-31bo",
@@ -1067,9 +1076,8 @@ fn estimate_evidence_size_bytes(
         let words = read_pages.len()
             + write_pages.len()
             + conflict_pages.len()
-            + conflicting_txns.len() * 2
-            + rationale.len();
-        (words * std::mem::size_of::<u64>()) as u64
+            + conflicting_txns.len() * 2;
+        ((words * std::mem::size_of::<u64>()) + rationale.len()) as u64
     }
 }
 

@@ -482,18 +482,18 @@ impl CellRef {
         &page[self.payload_offset..self.payload_offset + self.local_size as usize]
     }
 
-    /// Total size of this cell on the page in bytes (including left child,
-    /// varints, local payload, and overflow pointer).
+    /// Size of the **payload portion** of this cell on the page: local payload
+    /// bytes plus the 4-byte overflow pointer (if any).
+    ///
+    /// **Does NOT include** the cell header (left-child pointer, payload-size
+    /// varint, rowid varint).  For the full on-page cell size use
+    /// [`crate::payload::cell_on_page_size`], which requires `cell_start`.
     #[must_use]
-    pub fn on_page_size(&self) -> usize {
+    pub fn payload_on_page_size(&self) -> usize {
         let mut size = self.local_size as usize;
-        // Overflow pointer (4 bytes) if present.
         if self.overflow_page.is_some() {
             size += 4;
         }
-        // The payload_offset already accounts for left_child + varints.
-        // Total cell bytes = (payload_offset - cell_start) + local_size + optional 4.
-        // But we don't store cell_start, so callers should compute from context.
         size
     }
 }

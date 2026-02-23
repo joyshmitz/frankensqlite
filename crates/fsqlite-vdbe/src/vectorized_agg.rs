@@ -182,6 +182,12 @@ pub fn aggregate_batch_hash(
     let mut group_keys_ordered: Vec<Vec<GroupKeyValue>> = Vec::new();
     let mut all_accumulators: Vec<Vec<Accumulator>> = Vec::new();
 
+    // SQLite semantics: aggregation without GROUP BY always returns 1 row, even if input is empty.
+    if group_by_columns.is_empty() && sel.is_empty() {
+        group_keys_ordered.push(vec![]);
+        all_accumulators.push(agg_specs.iter().map(|s| Accumulator::new(s.op)).collect());
+    }
+
     for (sel_idx, &row_idx) in sel.as_slice().iter().enumerate() {
         let row = usize::from(row_idx);
         let hash = group_hashes[sel_idx];
@@ -293,6 +299,12 @@ pub fn aggregate_batch_ordered(
     let mut group_keys_ordered: Vec<Vec<GroupKeyValue>> = Vec::new();
     let mut all_accumulators: Vec<Vec<Accumulator>> = Vec::new();
     let mut current_key: Option<Vec<GroupKeyValue>> = None;
+
+    // SQLite semantics: aggregation without GROUP BY always returns 1 row, even if input is empty.
+    if group_by_columns.is_empty() && sel.is_empty() {
+        group_keys_ordered.push(vec![]);
+        all_accumulators.push(agg_specs.iter().map(|s| Accumulator::new(s.op)).collect());
+    }
 
     for &row_idx in sel.as_slice() {
         let row = usize::from(row_idx);
@@ -853,8 +865,15 @@ mod tests {
         )
         .unwrap();
 
-        // No rows, no groups.
-        assert_eq!(result.row_count(), 0, "bead_id={BEAD_AGG} case=total_empty");
+        // 1 row should be returned for a scalar aggregate on an empty set.
+        assert_eq!(result.row_count(), 1, "bead_id={BEAD_AGG} case=total_empty");
+        
+        let col = &result.columns()[0];
+        if let ColumnData::Float64(v) = &col.data {
+            assert_eq!(v.as_slice()[0], 0.0, "TOTAL() on empty set should return 0.0");
+        } else {
+            panic!("Expected Float64 column");
+        }
     }
 
     #[test]

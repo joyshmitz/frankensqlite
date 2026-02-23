@@ -783,16 +783,17 @@ impl ProofCarryingValidator for DefaultProofValidator {
         let edges = &commit.edges;
         for (i, e1) in edges.iter().enumerate() {
             for e2 in edges.iter().skip(i + 1) {
-                // Dangerous: T1 →rw T2 →rw T3 where T1 committed before T3.
-                if e1.to == e2.from && e1.from != e2.to {
-                    // This is a potential dangerous structure, but since the
-                    // commit was accepted, the validator should have verified
-                    // it's safe (no cycle). We trust the proof unless the edges
-                    // form a 3-node cycle.
-                    if edges.iter().any(|e3| e3.from == e2.to && e3.to == e1.from) {
-                        error!("dangerous cycle detected in proof-carrying commit");
-                        return ValidationVerdict::Invalid;
-                    }
+                // Check for 2-node cycle: T1 →rw T2 and T2 →rw T1
+                if e1.to == e2.from && e1.from == e2.to {
+                    error!("dangerous 2-node cycle detected in proof-carrying commit");
+                    return ValidationVerdict::Invalid;
+                }
+                // Check for 3-node cycle: T1 →rw T2 →rw T3 →rw T1
+                if e1.to == e2.from
+                    && edges.iter().any(|e3| e3.from == e2.to && e3.to == e1.from)
+                {
+                    error!("dangerous 3-node cycle detected in proof-carrying commit");
+                    return ValidationVerdict::Invalid;
                 }
             }
         }

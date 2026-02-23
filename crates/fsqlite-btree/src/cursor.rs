@@ -1503,18 +1503,28 @@ impl<P: PageWriter> BtCursor<P> {
         // This avoids maintaining a complex freeblock list and keeps fragmented_free_bytes at 0.
         let mut new_content_offset = self.usable_size as usize;
         let old_page_data = page_data.clone();
+        let ptr_array_end = header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
         
         for ptr_mut in &mut ptrs {
             let ptr = *ptr_mut as usize;
             let cell = CellRef::parse(&old_page_data, ptr, header.page_type, self.usable_size)?;
-            let size = cell.on_page_size();
-            new_content_offset -= size;
+            // Full on-page size: header varints (payload_offset - ptr) + local payload + overflow ptr.
+            let size = crate::payload::cell_on_page_size(&cell, ptr);
+            new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "cell size overflow during defragmentation".to_owned(),
+                }
+            })?;
+            if new_content_offset < ptr_array_end {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "cell content overlaps pointer array during defragmentation".to_owned(),
+                });
+            }
             page_data[new_content_offset..new_content_offset + size].copy_from_slice(&old_page_data[ptr..ptr + size]);
             *ptr_mut = new_content_offset as u16;
         }
 
         // Fill the now-unused space with zeros for cleanliness (optional, but good for reproducibility/debugging).
-        let ptr_array_end = header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
         if new_content_offset > ptr_array_end {
             page_data[ptr_array_end..new_content_offset].fill(0);
         }

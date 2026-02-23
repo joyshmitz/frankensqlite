@@ -251,42 +251,61 @@ impl IoUringFile {
             ))
         })?;
 
-        let requested = u32::try_from(buf.len()).map_err(|_| {
-            FrankenError::Io(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("read size too large for io_uring: {}", buf.len()),
-            ))
-        })?;
+        self.inner.with_inode_io_file(|file| {
+            let mut total = 0_usize;
+            while total < buf.len() {
+                let off = offset
+                    .checked_add(u64::try_from(total).expect("usize must fit into u64"))
+                    .ok_or_else(|| {
+                        FrankenError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "offset overflow during io_uring read",
+                        ))
+                    })?;
+                
+                let requested = u32::try_from(buf.len() - total).map_err(|_| {
+                    FrankenError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("read size too large for io_uring: {}", buf.len() - total),
+                    ))
+                })?;
 
-        let data = self.inner.with_inode_io_file(|file| {
-            seek_to(file, offset)?;
-            let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let ring = lock_mutex_or_io(ring_mutex)?;
-                pollster::block_on(ring.read(file, requested))
-            }));
-            match read_result {
-                Ok(Ok(data)) => Ok(data),
-                Ok(Err(err)) => {
-                    if is_lock_poison_error(&err) {
-                        self.runtime.disable(IO_URING_LOCK_POISONED_MSG);
+                seek_to(file, off)?;
+                let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let ring = lock_mutex_or_io(ring_mutex)?;
+                    pollster::block_on(ring.read(file, requested))
+                }));
+
+                let data = match read_result {
+                    Ok(Ok(data)) => data,
+                    Ok(Err(err)) => {
+                        if is_lock_poison_error(&err) {
+                            self.runtime.disable(IO_URING_LOCK_POISONED_MSG);
+                        }
+                        return Err(FrankenError::Io(err));
                     }
-                    Err(FrankenError::Io(err))
-                }
-                Err(_) => {
-                    self.runtime.disable(IO_URING_READ_PANICKED_MSG);
-                    Err(FrankenError::Io(io::Error::other(
-                        IO_URING_READ_PANICKED_MSG,
-                    )))
-                }
-            }
-        })?;
+                    Err(_) => {
+                        self.runtime.disable(IO_URING_READ_PANICKED_MSG);
+                        return Err(FrankenError::Io(io::Error::other(
+                            IO_URING_READ_PANICKED_MSG,
+                        )));
+                    }
+                };
 
-        let total = data.len();
-        buf[..total].copy_from_slice(&data);
-        if total < buf.len() {
-            buf[total..].fill(0);
-        }
-        Ok(total)
+                if data.is_empty() {
+                    break; // EOF
+                }
+
+                let bytes_read = data.len();
+                buf[total..total + bytes_read].copy_from_slice(&data);
+                total += bytes_read;
+            }
+
+            if total < buf.len() {
+                buf[total..].fill(0);
+            }
+            Ok(total)
+        })
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
@@ -298,19 +317,37 @@ impl IoUringFile {
             ))
         })?;
 
-        let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pollster::block_on(backend.read_at(buf, offset))
-        }));
-        let total = match read_result {
-            Ok(Ok(total)) => total,
-            Ok(Err(err)) => return Err(FrankenError::Io(err)),
-            Err(_) => {
-                self.runtime.disable(IO_URING_READ_PANICKED_MSG);
-                return Err(FrankenError::Io(io::Error::other(
-                    IO_URING_READ_PANICKED_MSG,
-                )));
+        let mut total = 0_usize;
+        while total < buf.len() {
+            let off = offset
+                .checked_add(u64::try_from(total).expect("usize must fit into u64"))
+                .ok_or_else(|| {
+                    FrankenError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "offset overflow during io_uring read",
+                    ))
+                })?;
+
+            let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pollster::block_on(backend.read_at(&mut buf[total..], off))
+            }));
+
+            let bytes_read = match read_result {
+                Ok(Ok(n)) => n,
+                Ok(Err(err)) => return Err(FrankenError::Io(err)),
+                Err(_) => {
+                    self.runtime.disable(IO_URING_READ_PANICKED_MSG);
+                    return Err(FrankenError::Io(io::Error::other(
+                        IO_URING_READ_PANICKED_MSG,
+                    )));
+                }
+            };
+
+            if bytes_read == 0 {
+                break; // EOF
             }
-        };
+            total += bytes_read;
+        }
 
         if total < buf.len() {
             buf[total..].fill(0);

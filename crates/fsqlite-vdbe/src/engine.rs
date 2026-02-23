@@ -82,16 +82,19 @@ impl MemTable {
             self.next_rowid = rowid + 1;
         }
         // Replace if rowid already exists (UPSERT semantics).
-        if let Some(existing) = self.rows.iter_mut().find(|r| r.rowid == rowid) {
-            existing.values = values;
-        } else {
-            self.rows.push(MemRow { rowid, values });
+        match self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
+            Ok(idx) => {
+                self.rows[idx].values = values;
+            }
+            Err(idx) => {
+                self.rows.insert(idx, MemRow { rowid, values });
+            }
         }
     }
 
     /// Delete a row by rowid. Returns true if a row was found and deleted.
     pub fn delete_by_rowid(&mut self, rowid: i64) -> bool {
-        if let Some(idx) = self.rows.iter().position(|r| r.rowid == rowid) {
+        if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
             self.rows.remove(idx);
             true
         } else {
@@ -106,7 +109,7 @@ impl MemTable {
 
     /// Find a row by rowid. Returns the index.
     pub fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
-        self.rows.iter().position(|r| r.rowid == rowid)
+        self.rows.binary_search_by_key(&rowid, |r| r.rowid).ok()
     }
 
     /// Iterate all rows as `(rowid, values)` pairs.
@@ -898,14 +901,13 @@ impl MemDbUndoOp {
                 if let Some(table) = db.tables.get_mut(&root_page) {
                     match old_values {
                         Some(values) => {
-                            if let Some(row) = table.rows.iter_mut().find(|r| r.rowid == rowid) {
-                                row.values = values;
-                            } else {
-                                table.rows.push(MemRow { rowid, values });
+                            match table.rows.binary_search_by_key(&rowid, |r| r.rowid) {
+                                Ok(idx) => table.rows[idx].values = values,
+                                Err(idx) => table.rows.insert(idx, MemRow { rowid, values }),
                             }
                         }
                         None => {
-                            if let Some(idx) = table.rows.iter().position(|r| r.rowid == rowid) {
+                            if let Ok(idx) = table.rows.binary_search_by_key(&rowid, |r| r.rowid) {
                                 table.rows.remove(idx);
                             }
                         }
@@ -2449,10 +2451,9 @@ impl VdbeEngine {
                                         match op.opcode {
                                             Opcode::SeekGE => {
                                                 // Find first row with rowid >= key.
-                                                let pos =
-                                                    table.rows.iter().position(|r| r.rowid >= key);
-                                                if let Some(idx) = pos {
-                                                    cursor.position = Some(idx);
+                                                let pos = table.rows.binary_search_by_key(&key, |r| r.rowid).unwrap_or_else(|e| e);
+                                                if pos < table.rows.len() {
+                                                    cursor.position = Some(pos);
                                                     true
                                                 } else {
                                                     false
@@ -2460,10 +2461,12 @@ impl VdbeEngine {
                                             }
                                             Opcode::SeekGT => {
                                                 // Find first row with rowid > key.
-                                                let pos =
-                                                    table.rows.iter().position(|r| r.rowid > key);
-                                                if let Some(idx) = pos {
-                                                    cursor.position = Some(idx);
+                                                let pos = match table.rows.binary_search_by_key(&key, |r| r.rowid) {
+                                                    Ok(idx) => idx + 1,
+                                                    Err(idx) => idx,
+                                                };
+                                                if pos < table.rows.len() {
+                                                    cursor.position = Some(pos);
                                                     true
                                                 } else {
                                                     false
@@ -2471,8 +2474,10 @@ impl VdbeEngine {
                                             }
                                             Opcode::SeekLE => {
                                                 // Find last row with rowid <= key.
-                                                let pos =
-                                                    table.rows.iter().rposition(|r| r.rowid <= key);
+                                                let pos = match table.rows.binary_search_by_key(&key, |r| r.rowid) {
+                                                    Ok(idx) => Some(idx),
+                                                    Err(idx) => idx.checked_sub(1),
+                                                };
                                                 if let Some(idx) = pos {
                                                     cursor.position = Some(idx);
                                                     true
@@ -2482,8 +2487,7 @@ impl VdbeEngine {
                                             }
                                             Opcode::SeekLT => {
                                                 // Find last row with rowid < key.
-                                                let pos =
-                                                    table.rows.iter().rposition(|r| r.rowid < key);
+                                                let pos = table.rows.binary_search_by_key(&key, |r| r.rowid).unwrap_or_else(|e| e).checked_sub(1);
                                                 if let Some(idx) = pos {
                                                     cursor.position = Some(idx);
                                                     true
