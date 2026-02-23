@@ -9562,15 +9562,35 @@ fn sort_rows_by_order_terms(
 /// Apply LIMIT and OFFSET to a result set (GROUP BY post-processing).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn apply_limit_offset_postprocess(rows: &mut Vec<Row>, limit_clause: &LimitClause) {
-    let limit_val = match &limit_clause.limit {
-        Expr::Literal(Literal::Integer(n), _) => *n as usize,
+    let limit_raw = match &limit_clause.limit {
+        Expr::Literal(Literal::Integer(n), _) => *n,
         _ => return,
     };
+    // SQLite: negative LIMIT means unlimited.
+    if limit_raw < 0 {
+        // Still apply offset if present.
+        let offset_val = limit_clause
+            .offset
+            .as_ref()
+            .and_then(|off| match off {
+                Expr::Literal(Literal::Integer(n), _) if *n > 0 => Some(*n as usize),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if offset_val > 0 {
+            let start = offset_val.min(rows.len());
+            *rows = rows[start..].to_vec();
+        }
+        return;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let limit_val = limit_raw as usize;
+    // SQLite: negative OFFSET is treated as 0.
     let offset_val = limit_clause
         .offset
         .as_ref()
         .and_then(|off| match off {
-            Expr::Literal(Literal::Integer(n), _) => Some(*n as usize),
+            Expr::Literal(Literal::Integer(n), _) if *n > 0 => Some(*n as usize),
             _ => None,
         })
         .unwrap_or(0);
@@ -12887,12 +12907,10 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                     .map_or(1, fsqlite_types::SqliteValue::to_integer);
                 // SQLite: negative start counts from right (-1 = last char).
                 // Zero is treated as 1.
-                let one_based = if raw_start < 0 {
-                    n + 1 + raw_start // -1 → n, -2 → n-1, etc.
-                } else if raw_start == 0 {
-                    1
-                } else {
-                    raw_start
+                let one_based = match raw_start.cmp(&0) {
+                    std::cmp::Ordering::Less => n + 1 + raw_start, // -1 → n, -2 → n-1, etc.
+                    std::cmp::Ordering::Equal => 1,
+                    std::cmp::Ordering::Greater => raw_start,
                 };
                 if let Some(len_val) = args.get(2) {
                     let raw_len = len_val.to_integer();

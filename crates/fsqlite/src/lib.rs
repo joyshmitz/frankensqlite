@@ -2354,6 +2354,35 @@ mod tests {
     }
 
     #[test]
+    fn limit_negative_returns_all_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ln (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("INSERT INTO ln VALUES (1), (2), (3), (4), (5);")
+            .unwrap();
+        // LIMIT -1 means unlimited in SQLite.
+        let rows = conn
+            .query("SELECT id FROM ln ORDER BY id LIMIT -1;")
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn offset_negative_treated_as_zero() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE on_ (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("INSERT INTO on_ VALUES (1), (2), (3);")
+            .unwrap();
+        // Negative OFFSET should be treated as 0.
+        let rows = conn
+            .query("SELECT id FROM on_ ORDER BY id LIMIT 2 OFFSET -5;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
     fn probe_update_where_column_cmp() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);")
