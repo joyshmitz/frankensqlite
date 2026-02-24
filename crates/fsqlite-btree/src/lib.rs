@@ -51,15 +51,7 @@ pub use traits::{BtreeCursorOps, MockBtreeCursor, SeekResult};
 /// sequential byte access with no pointer chasing or virtual dispatch.
 #[must_use]
 pub fn compare_key_bytes_contiguous(left: &[u8], right: &[u8]) -> Ordering {
-    let common = left.len().min(right.len());
-    for idx in 0..common {
-        let l = left[idx];
-        let r = right[idx];
-        if l != r {
-            return l.cmp(&r);
-        }
-    }
-    left.len().cmp(&right.len())
+    left.cmp(right)
 }
 
 #[cfg(test)]

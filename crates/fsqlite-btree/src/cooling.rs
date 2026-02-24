@@ -238,8 +238,8 @@ impl CoolingStateMachine {
     pub fn run_cooling_scan(&self) -> CoolingScanResult {
         COOLING_SCANS_TOTAL.fetch_add(1, Ordering::Relaxed);
 
-        let pinned = self.pinned_roots.lock().expect("pinned lock").clone();
         let mut pages = self.pages.lock().expect("cooling lock");
+        let pinned = self.pinned_roots.lock().expect("pinned lock");
 
         let mut scanned = 0u32;
         let mut cooled = 0u32;

@@ -684,7 +684,20 @@ where
 
         match self.mode {
             TransactionMode::ReadOnly => Err(FrankenError::ReadOnly),
-            TransactionMode::Deferred | TransactionMode::Concurrent => {
+            TransactionMode::Concurrent => {
+                let inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+                if inner.checkpoint_active {
+                    return Err(FrankenError::Busy);
+                }
+                // Concurrent writers don't acquire the global writer_active lock.
+                drop(inner);
+                self.is_writer = true;
+                Ok(())
+            }
+            TransactionMode::Deferred => {
                 let mut inner = self
                     .inner
                     .lock()
@@ -822,7 +835,9 @@ where
         if commit_result.is_ok() {
             inner.commit_seq = inner.commit_seq.next();
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            inner.writer_active = false;
+            if self.mode != TransactionMode::Concurrent {
+                inner.writer_active = false;
+            }
             drop(inner);
             self.write_set.clear();
             self.committed = true;
@@ -853,14 +868,16 @@ where
         }
 
         if self.is_writer {
-            inner.db_size = self.original_db_size;
+            if self.mode != TransactionMode::Concurrent {
+                inner.db_size = self.original_db_size;
 
-            // Reset next_page to avoid holes if we allocated pages that are now discarded.
-            // Logic matches SimplePager::open.
-            let db_size = inner.db_size;
-            inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
+                // Reset next_page to avoid holes if we allocated pages that are now discarded.
+                // Logic matches SimplePager::open.
+                let db_size = inner.db_size;
+                inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
 
-            inner.writer_active = false;
+                inner.writer_active = false;
+            }
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
         drop(inner);
@@ -961,14 +978,16 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             }
 
             if self.is_writer {
-                inner.db_size = self.original_db_size;
+                if self.mode != TransactionMode::Concurrent {
+                    inner.db_size = self.original_db_size;
 
-                // Reset next_page to avoid holes if we allocated pages that are now discarded.
-                // Logic matches SimplePager::open and SimpleTransaction::rollback.
-                let db_size = inner.db_size;
-                inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
+                    // Reset next_page to avoid holes if we allocated pages that are now discarded.
+                    // Logic matches SimplePager::open and SimpleTransaction::rollback.
+                    let db_size = inner.db_size;
+                    inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
 
-                inner.writer_active = false;
+                    inner.writer_active = false;
+                }
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
         }

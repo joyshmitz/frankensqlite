@@ -197,10 +197,11 @@ pub fn balance_quick<W: PageWriter>(
     // Let's assume max divider size (4 + 9 = 13) + 2 byte pointer = 15 bytes.
     // If parent has < 15 bytes free, abort.
 
-    let free_space = parent_header.cell_content_offset as usize
-        - (parent_offset
-            + usize::from(parent_header.page_type.header_size())
-            + (usize::from(parent_header.cell_count) * 2));
+    let parent_used = parent_offset
+        + usize::from(parent_header.page_type.header_size())
+        + (usize::from(parent_header.cell_count) * 2);
+
+    let free_space = (parent_header.cell_content_offset as usize).saturating_sub(parent_used);
 
     // We need space for:
     // 1. The new cell pointer (2 bytes)
