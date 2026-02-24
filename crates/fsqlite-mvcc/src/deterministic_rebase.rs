@@ -459,6 +459,15 @@ pub fn deterministic_rebase(
         }
     }
 
+    let mut stale_indexes = std::collections::HashSet::new();
+    for op in intent_log {
+        if let IntentOpKind::UpdateExpression { table, key, .. } = &op.op {
+            for index_def in schema.table_indexes(*table) {
+                stale_indexes.insert((index_def.index_id, *key));
+            }
+        }
+    }
+
     let mut rebased_ops = Vec::with_capacity(intent_log.len());
     let mut replayed_count = 0;
 
@@ -516,9 +525,15 @@ pub fn deterministic_rebase(
                     "replayed UpdateExpression"
                 );
             }
+            IntentOpKind::IndexInsert { index, rowid, .. }
+            | IntentOpKind::IndexDelete { index, rowid, .. } => {
+                if stale_indexes.contains(&(*index, *rowid)) {
+                    continue; // discard stale op
+                }
+                rebased_ops.push(op.op.clone());
+            }
             other => {
-                // Non-UpdateExpression ops pass through. We still need to
-                // discard stale index ops for any UpdateExpression's (table, rowid).
+                // Non-UpdateExpression ops pass through.
                 rebased_ops.push(other.clone());
             }
         }

@@ -11,6 +11,7 @@ pub mod bocpd;
 pub mod cache_aligned;
 pub mod compat;
 pub mod conflict_model;
+pub mod conformal_martingale;
 pub mod coordinator_ipc;
 pub mod core_types;
 pub mod deterministic_rebase;
@@ -28,6 +29,7 @@ pub mod observability;
 pub mod physical_merge;
 pub mod provenance;
 pub mod rcu;
+pub mod regime_monitor;
 pub mod retry_policy;
 pub mod rowid_alloc;
 pub mod seqlock;
@@ -83,6 +85,7 @@ pub use conflict_model::{
     tps_estimate, validate_ams_r, validate_heavy_hitter_k, validate_nitro_precision,
     zipf_mle_from_ranked_counts,
 };
+pub use conformal_martingale::{ConformalMartingaleConfig, ConformalMartingaleMonitor};
 pub use core_types::{
     CommitIndex, CommitLog, CommitRecord, DrainProgress, DrainResult, GcHorizonResult,
     InProcessPageLockTable, LOCK_TABLE_SHARDS, OrphanedSlotCleanupStats, RebuildError,
@@ -159,6 +162,7 @@ pub use rcu::{
     MAX_RCU_THREADS, QsbrHandle, QsbrRegistry, RcuCell, RcuMetrics, RcuPair, RcuTriple,
     rcu_metrics, record_rcu_reclaimed, reset_rcu_metrics,
 };
+pub use regime_monitor::{RegimeMonitor, RegimeMonitorConfig};
 pub use retry_policy::{
     BetaPosterior, ContentionBucketKey, DEFAULT_CANDIDATE_WAITS_MS, DEFAULT_STARVATION_THRESHOLD,
     HazardModelParams, MAX_CONTENTION_BUCKETS, RetryAction, RetryController, RetryCostParams,

@@ -13,7 +13,7 @@
 //! - Maximum load factor: 0.70 (Knuth Vol. 3 analysis for linear probing)
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::{debug, info, warn};
 
@@ -331,11 +331,22 @@ impl SharedPageLockTable {
         }
 
         // Step 2: Probe active table.
-        let active = &self.tables[active_idx as usize];
+        let mut active = &self.tables[active_idx as usize];
 
         // Load-factor guard: reject new key insertion if beyond 70%.
-        let occupied = active.occupied_count();
-        let at_capacity = f64::from(occupied) / f64::from(self.capacity) > MAX_LOAD_FACTOR;
+        let mut occupied = active.occupied_count();
+        let mut at_capacity = f64::from(occupied) / f64::from(self.capacity) > MAX_LOAD_FACTOR;
+
+        // If historical key accumulation pushed us past capacity while no
+        // locks are currently held, trigger a best-effort rebuild so released
+        // locks don't permanently block future acquisitions.
+        if at_capacity && active.locked_count() == 0 {
+            self.try_start_best_effort_rebuild();
+            let refreshed_active_idx = self.active_table.load(Ordering::Acquire);
+            active = &self.tables[refreshed_active_idx as usize];
+            occupied = active.occupied_count();
+            at_capacity = f64::from(occupied) / f64::from(self.capacity) > MAX_LOAD_FACTOR;
+        }
 
         let mut idx = self.hash_index(page_number);
         let mut probes = 0_u32;
@@ -419,6 +430,19 @@ impl SharedPageLockTable {
             idx = (idx + 1) & self.mask;
             probes += 1;
         }
+    }
+
+    fn try_start_best_effort_rebuild(&self) {
+        if self.draining_table.load(Ordering::Acquire) != DRAINING_NONE {
+            return;
+        }
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let pid = std::process::id();
+
+        let _ = self.full_rebuild(pid, now_secs, now_secs, |_txn_id| true, Duration::ZERO);
     }
 
     /// Probe a table for an existing lock on `page_number`.
@@ -1406,6 +1430,26 @@ mod tests {
             result.is_ok(),
             "re-acquiring existing key slot must succeed even at capacity"
         );
+    }
+
+    #[test]
+    fn test_released_locks_do_not_permanently_exhaust_capacity() {
+        let table = SharedPageLockTable::new(256);
+
+        // Fill historical key slots past the 70% threshold, but release each
+        // lock immediately so the table is quiescent at the end.
+        for page in 1..=180_u32 {
+            assert_eq!(table.try_acquire(page, 1), AcquireResult::Acquired);
+            assert!(table.release(page, 1));
+        }
+
+        // Regression guard: a fresh page must still be acquirable.
+        let result = table.try_acquire(9_999, 2);
+        assert!(
+            result.is_ok(),
+            "released historical keys should not cause permanent capacity exhaustion (got {result:?})"
+        );
+        assert_eq!(table.holder(9_999), Some(2));
     }
 
     // -- bd-3t3.8 test 7: crash cleanup via release_all_for_txn --

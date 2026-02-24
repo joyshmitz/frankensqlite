@@ -674,16 +674,48 @@ pub fn apply_patch(
     }
 
     // Return cells sorted by rowid (table) or key bytes (index) for canonical order
+    let usable = base.page_size.usable(base.reserved_per_page) as u32;
     let mut cells: Vec<ParsedCell> = cell_map.into_values().collect();
     cells.sort_by(|a, b| {
         if let (Some(ra), Some(rb)) = (a.rowid, b.rowid) {
             ra.cmp(&rb)
         } else {
-            a.cell_key_digest.cmp(&b.cell_key_digest)
+            let key_a = extract_index_key_from_cell(&a.cell_bytes, base.page_type, usable);
+            let key_b = extract_index_key_from_cell(&b.cell_bytes, base.page_type, usable);
+            key_a.cmp(key_b)
         }
     });
 
     Ok(cells)
+}
+
+/// Extract the index key bytes (payload) from an index cell.
+fn extract_index_key_from_cell(cell_bytes: &[u8], page_type: BTreePageType, usable: u32) -> &[u8] {
+    match page_type {
+        BTreePageType::LeafIndex => {
+            if let Some((payload_size, n1)) = fsqlite_types::serial_type::read_varint(cell_bytes) {
+                let local_payload = compute_local_payload_size(payload_size, usable, false);
+                let payload_start = n1;
+                let payload_end = (n1 + local_payload as usize).min(cell_bytes.len());
+                return &cell_bytes[payload_start..payload_end];
+            }
+        }
+        BTreePageType::InteriorIndex => {
+            if cell_bytes.len() >= 4 {
+                if let Some((payload_size, n1)) =
+                    fsqlite_types::serial_type::read_varint(&cell_bytes[4..])
+                {
+                    let local_payload = compute_local_payload_size(payload_size, usable, false);
+                    let payload_start = 4 + n1;
+                    let payload_end =
+                        (payload_start + local_payload as usize).min(cell_bytes.len());
+                    return &cell_bytes[payload_start..payload_end];
+                }
+            }
+        }
+        _ => {}
+    }
+    &[]
 }
 
 /// Extract rowid from raw cell bytes.
