@@ -293,7 +293,8 @@ impl SharedPageLockTable {
     fn hash_index(&self, page_number: u32) -> u32 {
         // Fibonacci hashing: multiply by golden ratio constant, take high bits.
         let h = page_number.wrapping_mul(2_654_435_769);
-        h & self.mask
+        let shift = 32 - self.capacity.trailing_zeros();
+        h >> shift
     }
 
     // -----------------------------------------------------------------------
@@ -1377,12 +1378,13 @@ mod tests {
     fn test_linear_probing_collision_handling() {
         let table = SharedPageLockTable::new(TEST_CAP);
 
-        // With capacity=64 (mask=63) and fibonacci hash: h = page * 2654435769.
-        // Since 2654435769 is coprime to 64 (odd number, power-of-2 modulus),
-        // pages p and (p + 64) always hash to the same index.
-        // So pages 1 and 65 collide → exercises linear probing.
+        // Find two pages that hash to the same bucket to exercise linear probing.
         let page_a = 1_u32;
-        let page_b = 65_u32; // page_a + 64
+        let bucket_a = table.hash_index(page_a);
+        let mut page_b = 2_u32;
+        while table.hash_index(page_b) != bucket_a {
+            page_b += 1;
+        }
 
         // Both must be lockable by different txns despite collision.
         assert_eq!(table.try_acquire(page_a, 100), AcquireResult::Acquired);
