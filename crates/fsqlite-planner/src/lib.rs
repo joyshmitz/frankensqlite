@@ -1212,8 +1212,9 @@ pub enum IndexUsability {
     Range { selectivity: f64 },
     /// `IN (...)` expanded to multiple equality probes.
     InExpansion { probe_count: usize },
-    /// `LIKE 'prefix%'` with constant prefix.
-    LikePrefix { prefix: String },
+    /// `LIKE 'prefix%'` with constant prefix and derived upper bound.
+    /// Represents the range: `column >= low` and optionally `column < high`.
+    LikePrefix { low: String, high: Option<String> },
     /// The term cannot use this index.
     NotUsable,
 }
@@ -1249,8 +1250,11 @@ pub enum WhereTermKind {
     Between,
     /// `col IN (...)`
     InList { count: usize },
-    /// `col LIKE 'prefix%'`
-    LikePrefix { prefix: String },
+    /// `col LIKE 'prefix%'`, rewritten as `col >= prefix AND col < upper_bound`.
+    LikePrefix {
+        prefix: String,
+        upper_bound: Option<String>,
+    },
     /// Rowid equality: `rowid = expr` or `_rowid_ = expr` or `oid = expr`
     RowidEquality,
     /// Any other expression (not directly usable for index lookup).
@@ -1386,7 +1390,10 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
                 WhereTerm {
                     expr,
                     column,
-                    kind: WhereTermKind::LikePrefix { prefix: pfx },
+                    kind: WhereTermKind::LikePrefix {
+                        upper_bound: like_prefix_upper_bound(&pfx),
+                        prefix: pfx,
+                    },
                 }
             } else {
                 WhereTerm {
@@ -1451,6 +1458,27 @@ fn extract_like_prefix(pattern: &Expr) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Compute the exclusive upper bound for a LIKE prefix range.
+///
+/// Example: `"abc"` becomes `"abd"` so the planner can model:
+/// `column >= "abc"` and `column < "abd"`.
+/// Returns `None` when no valid successor exists.
+fn like_prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    for idx in (0..chars.len()).rev() {
+        let codepoint = u32::from(chars[idx]);
+        if codepoint == u32::from(char::MAX) {
+            continue;
+        }
+        if let Some(next) = char::from_u32(codepoint + 1) {
+            chars[idx] = next;
+            chars.truncate(idx + 1);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 /// Determine the usability of an index for a set of WHERE terms.
@@ -1538,9 +1566,13 @@ pub fn analyze_index_usability(index: &IndexInfo, terms: &[WhereTerm<'_>]) -> In
                             probe_count: *count,
                         };
                     }
-                    WhereTermKind::LikePrefix { prefix } => {
+                    WhereTermKind::LikePrefix {
+                        prefix,
+                        upper_bound,
+                    } => {
                         return IndexUsability::LikePrefix {
-                            prefix: prefix.clone(),
+                            low: prefix.clone(),
+                            high: upper_bound.clone(),
                         };
                     }
                     _ => {}
@@ -3645,7 +3677,13 @@ mod tests {
         // LIKE 'Jo%' → usable (constant prefix)
         let terms = [like_term("name", "Jo%")];
         let result = analyze_index_usability(&idx, &terms);
-        assert!(matches!(result, IndexUsability::LikePrefix { ref prefix } if prefix == "Jo"));
+        assert!(matches!(
+            result,
+            IndexUsability::LikePrefix {
+                ref low,
+                high: Some(ref high)
+            } if low == "Jo" && high == "Jp"
+        ));
 
         // LIKE '%Jo%' → not usable (no constant prefix)
         let terms = [like_term("name", "%Jo%")];
@@ -4610,7 +4648,10 @@ mod tests {
         let term = like_term("name", "abc%");
         assert!(matches!(
             term.kind,
-            WhereTermKind::LikePrefix { ref prefix } if prefix == "abc"
+            WhereTermKind::LikePrefix {
+                ref prefix,
+                upper_bound: Some(ref upper_bound),
+            } if prefix == "abc" && upper_bound == "abd"
         ));
         assert_eq!(term.column.as_ref().unwrap().column, "name");
     }
@@ -5246,10 +5287,12 @@ mod tests {
         );
         assert_eq!(
             WhereTermKind::LikePrefix {
-                prefix: "abc".to_owned()
+                prefix: "abc".to_owned(),
+                upper_bound: Some("abd".to_owned()),
             },
             WhereTermKind::LikePrefix {
-                prefix: "abc".to_owned()
+                prefix: "abc".to_owned(),
+                upper_bound: Some("abd".to_owned()),
             }
         );
         assert_ne!(WhereTermKind::Equality, WhereTermKind::Range);
