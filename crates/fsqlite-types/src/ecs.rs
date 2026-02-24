@@ -9,7 +9,7 @@
 use std::fmt;
 
 use crate::encoding::{append_u32_le, append_u64_le, read_u32_le, read_u64_le, write_u64_le};
-use crate::glossary::{OTI_WIRE_SIZE, Oti};
+use crate::glossary::{Oti, OTI_WIRE_SIZE};
 
 /// Domain separation prefix for ECS ObjectIds (spec: `"fsqlite:ecs:v1"`).
 const ECS_OBJECT_ID_DOMAIN_SEPARATOR: &[u8] = b"fsqlite:ecs:v1";
@@ -1510,11 +1510,9 @@ mod tests {
             })
             .collect();
 
-        assert!(
-            records[0]
-                .flags
-                .contains(SymbolRecordFlags::SYSTEMATIC_RUN_START)
-        );
+        assert!(records[0]
+            .flags
+            .contains(SymbolRecordFlags::SYSTEMATIC_RUN_START));
         for rec in &records[1..] {
             assert!(!rec.flags.contains(SymbolRecordFlags::SYSTEMATIC_RUN_START));
         }
@@ -1579,11 +1577,9 @@ mod tests {
             ordered.iter().skip(100).all(|record| record.esi >= 100_u32),
             "repair symbols must follow source run"
         );
-        assert!(
-            ordered[0]
-                .flags
-                .contains(SymbolRecordFlags::SYSTEMATIC_RUN_START)
-        );
+        assert!(ordered[0]
+            .flags
+            .contains(SymbolRecordFlags::SYSTEMATIC_RUN_START));
         assert!(ordered[1..].iter().all(|record| {
             !record
                 .flags

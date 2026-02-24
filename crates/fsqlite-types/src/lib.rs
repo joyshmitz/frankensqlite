@@ -1,6 +1,7 @@
 pub mod cx;
 pub mod ecs;
 pub mod encoding;
+pub mod eprocess;
 pub mod flags;
 pub mod glossary;
 pub mod limits;
@@ -12,20 +13,21 @@ pub mod value;
 
 pub use cx::Cx;
 pub use ecs::{
-    ObjectId, PayloadHash, SYMBOL_RECORD_MAGIC, SYMBOL_RECORD_VERSION, SymbolReadPath,
-    SymbolRecord, SymbolRecordError, SymbolRecordFlags, SystematicLayoutError,
     layout_systematic_run, reconstruct_systematic_happy_path, recover_object_with_fallback,
-    source_symbol_count, validate_systematic_run,
+    source_symbol_count, validate_systematic_run, ObjectId, PayloadHash, SymbolReadPath,
+    SymbolRecord, SymbolRecordError, SymbolRecordFlags, SystematicLayoutError, SYMBOL_RECORD_MAGIC,
+    SYMBOL_RECORD_VERSION,
 };
+pub use eprocess::{EProcessConfig, EProcessOracle, EProcessSnapshot};
 pub use glossary::{
-    ArcCache, BtreeRef, Budget, COMMIT_MARKER_RECORD_V1_SIZE, ColumnIdx, CommitCapsule,
-    CommitMarker, CommitProof, CommitSeq, DecodeProof, DependencyEdge, EpochId, IdempotencyKey,
-    IndexId, IntentFootprint, IntentLog, IntentOp, IntentOpKind, OTI_WIRE_SIZE, OperatingMode, Oti,
-    Outcome, PageHistory, PageVersion, RangeKey, ReadWitness, RebaseBinaryOp, RebaseExpr,
-    RebaseUnaryOp, Region, RemoteCap, RootManifest, RowId, RowIdAllocator, RowIdExhausted,
-    RowIdMode, Saga, SchemaEpoch, SemanticKeyKind, SemanticKeyRef, Snapshot, StructuralEffects,
-    SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId, TxnEpoch, TxnId, TxnSlot, TxnToken,
-    VersionPointer, WitnessIndexSegment, WitnessKey, WriteWitness,
+    ArcCache, BtreeRef, Budget, ColumnIdx, CommitCapsule, CommitMarker, CommitProof, CommitSeq,
+    DecodeProof, DependencyEdge, EpochId, IdempotencyKey, IndexId, IntentFootprint, IntentLog,
+    IntentOp, IntentOpKind, OperatingMode, Oti, Outcome, PageHistory, PageVersion, RangeKey,
+    ReadWitness, RebaseBinaryOp, RebaseExpr, RebaseUnaryOp, Region, RemoteCap, RootManifest, RowId,
+    RowIdAllocator, RowIdExhausted, RowIdMode, Saga, SchemaEpoch, SemanticKeyKind, SemanticKeyRef,
+    Snapshot, StructuralEffects, SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId, TxnEpoch,
+    TxnId, TxnSlot, TxnToken, VersionPointer, WitnessIndexSegment, WitnessKey, WriteWitness,
+    COMMIT_MARKER_RECORD_V1_SIZE, OTI_WIRE_SIZE,
 };
 pub use value::SqliteValue;
 
@@ -1109,7 +1111,11 @@ pub struct BTreePageHeader {
 impl BTreePageHeader {
     /// Size of the B-tree page header in bytes (8 for leaf, 12 for interior).
     pub const fn header_size(self) -> usize {
-        if self.page_type.is_leaf() { 8 } else { 12 }
+        if self.page_type.is_leaf() {
+            8
+        } else {
+            12
+        }
     }
 
     /// Parse a B-tree page header from a page buffer.
@@ -1340,7 +1346,7 @@ impl BTreePageHeader {
     #[allow(clippy::cast_possible_truncation)]
     pub fn write_empty_leaf_table(page: &mut [u8], header_offset: usize, usable_size: u32) {
         page[header_offset] = BTreePageType::LeafTable as u8; // 0x0D
-        // first_freeblock = 0 (no freeblocks)
+                                                              // first_freeblock = 0 (no freeblocks)
         page[header_offset + 1] = 0;
         page[header_offset + 2] = 0;
         // cell_count = 0
@@ -1367,7 +1373,7 @@ impl BTreePageHeader {
     #[allow(clippy::cast_possible_truncation)]
     pub fn write_empty_leaf_index(page: &mut [u8], header_offset: usize, usable_size: u32) {
         page[header_offset] = BTreePageType::LeafIndex as u8; // 0x0A
-        // first_freeblock = 0 (no freeblocks)
+                                                              // first_freeblock = 0 (no freeblocks)
         page[header_offset + 1] = 0;
         page[header_offset + 2] = 0;
         // cell_count = 0
@@ -1978,7 +1984,7 @@ mod tests {
         page[0] = 0x0D;
         page[1..3].copy_from_slice(&400u16.to_be_bytes()); // first freeblock
         page[3..5].copy_from_slice(&0u16.to_be_bytes()); // 0 cells
-        // cell_content_start must be <= 400 so freeblocks are valid
+                                                         // cell_content_start must be <= 400 so freeblocks are valid
         page[5..7].copy_from_slice(&300u16.to_be_bytes());
         page[7] = 0;
 
@@ -2063,7 +2069,7 @@ mod tests {
         page[..16].copy_from_slice(b"SQLite format 3\0");
         page[16..18].copy_from_slice(&4096u16.to_be_bytes()); // page size
         page[100] = 0x0D; // leaf table page type at header offset
-        // cell count = 0 at offset 103
+                          // cell count = 0 at offset 103
         page[103..105].copy_from_slice(&0u16.to_be_bytes());
         // cell content area start = page_size at offset 105
         page[105..107].copy_from_slice(&4096u16.to_be_bytes()); // cell content area at end of page

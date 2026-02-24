@@ -30,6 +30,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use crate::eprocess::EProcessOracle;
+
 /// SQLite error code for `SQLITE_INTERRUPT`.
 pub const SQLITE_INTERRUPT: i32 = 9;
 
@@ -93,12 +95,12 @@ pub mod cap {
     >;
 
     impl<
-        const SPAWN: bool,
-        const TIME: bool,
-        const RANDOM: bool,
-        const IO: bool,
-        const REMOTE: bool,
-    > sealed::Sealed for CapSet<SPAWN, TIME, RANDOM, IO, REMOTE>
+            const SPAWN: bool,
+            const TIME: bool,
+            const RANDOM: bool,
+            const IO: bool,
+            const REMOTE: bool,
+        > sealed::Sealed for CapSet<SPAWN, TIME, RANDOM, IO, REMOTE>
     {
     }
 
@@ -114,17 +116,17 @@ pub mod cap {
     pub trait SubsetOf<Super>: sealed::Sealed {}
 
     impl<
-        const S_SPAWN: bool,
-        const S_TIME: bool,
-        const S_RANDOM: bool,
-        const S_IO: bool,
-        const S_REMOTE: bool,
-        const P_SPAWN: bool,
-        const P_TIME: bool,
-        const P_RANDOM: bool,
-        const P_IO: bool,
-        const P_REMOTE: bool,
-    > SubsetOf<CapSet<P_SPAWN, P_TIME, P_RANDOM, P_IO, P_REMOTE>>
+            const S_SPAWN: bool,
+            const S_TIME: bool,
+            const S_RANDOM: bool,
+            const S_IO: bool,
+            const S_REMOTE: bool,
+            const P_SPAWN: bool,
+            const P_TIME: bool,
+            const P_RANDOM: bool,
+            const P_IO: bool,
+            const P_REMOTE: bool,
+        > SubsetOf<CapSet<P_SPAWN, P_TIME, P_RANDOM, P_IO, P_REMOTE>>
         for CapSet<S_SPAWN, S_TIME, S_RANDOM, S_IO, S_REMOTE>
     where
         (sealed::Bit<S_SPAWN>, sealed::Bit<P_SPAWN>): sealed::Le,
@@ -292,6 +294,7 @@ struct CxInner {
     mask_depth: AtomicU32,
     children: Mutex<Vec<Weak<Self>>>,
     last_checkpoint_msg: Mutex<Option<String>>,
+    eprocess_oracle: Mutex<Option<Arc<EProcessOracle>>>,
     // Deterministic clock: milliseconds since epoch for tests.
     unix_millis: AtomicU64,
 }
@@ -305,6 +308,7 @@ impl CxInner {
             mask_depth: AtomicU32::new(0),
             children: Mutex::new(Vec::new()),
             last_checkpoint_msg: Mutex::new(None),
+            eprocess_oracle: Mutex::new(None),
             unix_millis: AtomicU64::new(0),
         }
     }
@@ -596,6 +600,44 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         }
     }
 
+    /// Attach an e-process oracle used by [`Self::checkpoint`].
+    pub fn set_eprocess_oracle(&self, oracle: Arc<EProcessOracle>) {
+        let mut guard = self
+            .inner
+            .eprocess_oracle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(oracle);
+    }
+
+    /// Remove the currently attached e-process oracle.
+    pub fn clear_eprocess_oracle(&self) {
+        let mut guard = self
+            .inner
+            .eprocess_oracle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = None;
+    }
+
+    #[must_use]
+    fn maybe_cancel_via_eprocess(&self) -> bool {
+        let oracle = self
+            .inner
+            .eprocess_oracle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(oracle) = oracle else {
+            return false;
+        };
+        if oracle.should_shed(self.budget.priority) {
+            self.cancel_with_reason(CancelReason::Abort);
+            return true;
+        }
+        false
+    }
+
     // -----------------------------------------------------------------------
     // Checkpoints (§4.12.1)
     // -----------------------------------------------------------------------
@@ -606,8 +648,9 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// When cancellation is observed, transitions state from `CancelRequested`
     /// to `Cancelling`.
     pub fn checkpoint(&self) -> Result<()> {
-        // Fast path: not cancelled at all.
-        if !self.inner.cancel_requested.load(Ordering::Acquire) {
+        // Fast path: not cancelled and no oracle-based shedding signal.
+        if !self.inner.cancel_requested.load(Ordering::Acquire) && !self.maybe_cancel_via_eprocess()
+        {
             return Ok(());
         }
         // Masked: defer cancellation observation.
@@ -814,8 +857,9 @@ impl CommitCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eprocess::EProcessConfig;
     use std::path::{Path, PathBuf};
-    use std::sync::Weak;
+    use std::sync::{Arc, Weak};
 
     #[test]
     fn test_cx_checkpoint_observes_cancellation() {
@@ -1009,6 +1053,70 @@ mod tests {
         cx.cancel();
         let err = cx.checkpoint().unwrap_err();
         assert_eq!(err.sqlite_error_code(), SQLITE_INTERRUPT);
+    }
+
+    #[test]
+    fn test_cx_checkpoint_eprocess_sheds_low_priority_context() {
+        let cx = Cx::<FullCaps>::with_budget(Budget::INFINITE.with_priority(3));
+        let oracle = Arc::new(EProcessOracle::new(
+            EProcessConfig {
+                p0: 0.1,
+                lambda: 5.0,
+                alpha: 0.05,
+                max_evalue: 1e12,
+            },
+            1,
+        ));
+        oracle.observe_sample(true);
+        oracle.observe_sample(true);
+        cx.set_eprocess_oracle(oracle);
+        let err = cx.checkpoint().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+        assert_eq!(cx.cancel_reason(), Some(CancelReason::Abort));
+    }
+
+    #[test]
+    fn test_cx_checkpoint_eprocess_respects_priority_threshold() {
+        let cx = Cx::<FullCaps>::with_budget(Budget::INFINITE.with_priority(1));
+        let oracle = Arc::new(EProcessOracle::new(
+            EProcessConfig {
+                p0: 0.1,
+                lambda: 5.0,
+                alpha: 0.05,
+                max_evalue: 1e12,
+            },
+            1,
+        ));
+        oracle.observe_sample(true);
+        oracle.observe_sample(true);
+        cx.set_eprocess_oracle(oracle);
+        assert!(cx.checkpoint().is_ok());
+        assert!(!cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn test_cx_checkpoint_eprocess_preserves_masking_semantics() {
+        let cx = Cx::<FullCaps>::with_budget(Budget::INFINITE.with_priority(3));
+        let oracle = Arc::new(EProcessOracle::new(
+            EProcessConfig {
+                p0: 0.1,
+                lambda: 5.0,
+                alpha: 0.05,
+                max_evalue: 1e12,
+            },
+            1,
+        ));
+        oracle.observe_sample(true);
+        oracle.observe_sample(true);
+        cx.set_eprocess_oracle(oracle);
+        {
+            let _mask = cx.masked();
+            assert!(cx.checkpoint().is_ok());
+            assert!(cx.is_cancel_requested());
+            assert_eq!(cx.cancel_state(), CancelState::CancelRequested);
+        }
+        let err = cx.checkpoint().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
     }
 
     #[test]

@@ -8,8 +8,8 @@
 //! See: <https://www.sqlite.org/fileformat.html#record_format>
 
 use crate::serial_type::{
-    SerialTypeClass, classify_serial_type, read_varint, serial_type_for_blob,
-    serial_type_for_integer, serial_type_for_text, serial_type_len, varint_len, write_varint,
+    classify_serial_type, read_varint, serial_type_for_blob, serial_type_for_integer,
+    serial_type_for_text, serial_type_len, varint_len, write_varint, SerialTypeClass,
 };
 use crate::value::SqliteValue;
 
