@@ -1318,10 +1318,12 @@ impl Connection {
             self.db.borrow_mut().commit_undo();
         }
 
-        if best_effort {
-            let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive);
-        } else {
-            let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive)?;
+        if self.pager.journal_mode() == JournalMode::Wal {
+            if best_effort {
+                let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive);
+            } else {
+                let _ = self.pager.checkpoint(&cx, CheckpointMode::Passive)?;
+            }
         }
 
         *self.closed.get_mut() = true;
@@ -1438,7 +1440,7 @@ impl Connection {
             );
             record_trace_span_created();
             let _parse_guard = parse_span.enter();
-            self.rewrite_subquery_statement(statement)?
+            self.rewrite_subquery_statement(statement, None)?
         };
         let plan_span = tracing::span!(
             target: "fsqlite.plan",
@@ -1621,7 +1623,7 @@ impl Connection {
             );
             record_trace_span_created();
             let _parse_guard = parse_span.enter();
-            self.rewrite_subquery_statement(statement)?
+            self.rewrite_subquery_statement(statement, params)?
         };
         // 5B.5 + 5B.2 (bd-1yi8): autocommit wrapping — ensure a pager
         // transaction is active for data/DDL operations outside an
@@ -1729,7 +1731,7 @@ impl Connection {
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
                     // Fallback codegen: eagerly rewrite IN subqueries.
-                    let rewritten = self.rewrite_in_subqueries_select(select)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
                         tracing::Level::TRACE,
@@ -1753,7 +1755,7 @@ impl Connection {
                 } else if has_group_by(select) && (has_joins(select) || has_subquery_source(select)) {
                     // GROUP BY + JOIN: materialize the join as a temp table,
                     // then GROUP BY on that temp table.
-                    let rewritten = self.rewrite_in_subqueries_select(select)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let mut rows = self.execute_group_by_join_select(&bound, None)?;
                     if distinct {
@@ -1762,7 +1764,7 @@ impl Connection {
                     Ok(rows)
                 } else if has_group_by(select) {
                     // Fallback path: eagerly rewrite IN subqueries.
-                    let rewritten = self.rewrite_in_subqueries_select(select)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let mut rows = self.execute_group_by_select(&bound, None)?;
                     if distinct {
@@ -1772,7 +1774,7 @@ impl Connection {
                 } else if select_contains_match_operator(select) {
                     // The VDBE path does not yet support MATCH/REGEXP in this
                     // connection path. Route through fallback evaluation.
-                    let rewritten = self.rewrite_in_subqueries_select(select)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let mut rows = self.execute_join_select(&bound, None)?;
                     if distinct {
@@ -1783,7 +1785,7 @@ impl Connection {
                     // Fallback path: eagerly rewrite IN subqueries.
                     // Also handles subquery in FROM (derived tables) even
                     // without explicit JOINs.
-                    let rewritten = self.rewrite_in_subqueries_select(select)?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let mut rows = self.execute_join_select(&bound, None)?;
                     if distinct {
@@ -2194,26 +2196,30 @@ impl Connection {
     /// go through VDBE codegen (UPDATE, DELETE, simple SELECT) so the
     /// runtime probe mechanism handles them.  Fallback paths (GROUP BY,
     /// JOIN, expression-only SELECT) apply the IN rewrite separately.
-    fn rewrite_subquery_statement(&self, statement: Statement) -> Result<Statement> {
+    fn rewrite_subquery_statement(
+        &self,
+        statement: Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Statement> {
         match statement {
             Statement::Select(select) => {
-                let rewritten = self.rewrite_subqueries(&select)?;
+                let rewritten = self.rewrite_subqueries(&select, params)?;
                 Ok(Statement::Select(rewritten))
             }
             Statement::Update(mut update) => {
                 // Only rewrite EXISTS / scalar subqueries; leave IN for VDBE probe.
                 for assignment in &mut update.assignments {
-                    rewrite_in_expr(&mut assignment.value, self, false)?;
+                    rewrite_in_expr(&mut assignment.value, self, false, params)?;
                 }
                 if let Some(where_expr) = update.where_clause.as_mut() {
-                    rewrite_in_expr(where_expr, self, false)?;
+                    rewrite_in_expr(where_expr, self, false, params)?;
                 }
                 Ok(Statement::Update(update))
             }
             Statement::Delete(mut delete) => {
                 // Only rewrite EXISTS / scalar subqueries; leave IN for VDBE probe.
                 if let Some(where_expr) = delete.where_clause.as_mut() {
-                    rewrite_in_expr(where_expr, self, false)?;
+                    rewrite_in_expr(where_expr, self, false, params)?;
                 }
                 Ok(Statement::Delete(delete))
             }
@@ -7156,12 +7162,16 @@ impl Connection {
     /// Pre-process a SELECT statement, eagerly evaluating EXISTS and scalar
     /// subqueries.  `IN (SELECT ...)` is left intact so the VDBE codegen
     /// can handle it via runtime probe scans.
-    fn rewrite_subqueries(&self, select: &SelectStatement) -> Result<SelectStatement> {
+    fn rewrite_subqueries(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<SelectStatement> {
         let mut result = select.clone();
-        rewrite_in_select_core(&mut result.body.select, self, false)?;
+        rewrite_in_select_core(&mut result.body.select, self, false, params)?;
         // Also rewrite any compound arms.
         for (_op, core) in &mut result.body.compounds {
-            rewrite_in_select_core(core, self, false)?;
+            rewrite_in_select_core(core, self, false, params)?;
         }
         Ok(result)
     }
@@ -7169,11 +7179,15 @@ impl Connection {
     /// Eagerly rewrite `IN (SELECT ...)` subqueries into literal lists
     /// for fallback execution paths that cannot handle them natively
     /// (expression-only SELECT, GROUP BY, JOINs).
-    fn rewrite_in_subqueries_select(&self, select: &SelectStatement) -> Result<SelectStatement> {
+    fn rewrite_in_subqueries_select(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<SelectStatement> {
         let mut result = select.clone();
-        rewrite_in_select_core(&mut result.body.select, self, true)?;
+        rewrite_in_select_core(&mut result.body.select, self, true, params)?;
         for (_op, core) in &mut result.body.compounds {
-            rewrite_in_select_core(core, self, true)?;
+            rewrite_in_select_core(core, self, true, params)?;
         }
         Ok(result)
     }
@@ -8387,6 +8401,7 @@ fn rewrite_in_select_core(
     core: &mut SelectCore,
     conn: &Connection,
     rewrite_in: bool,
+    params: Option<&[SqliteValue]>,
 ) -> Result<()> {
     if let SelectCore::Select {
         columns,
@@ -8397,14 +8412,14 @@ fn rewrite_in_select_core(
     {
         for col in columns.iter_mut() {
             if let ResultColumn::Expr { expr, .. } = col {
-                rewrite_in_expr(expr, conn, rewrite_in)?;
+                rewrite_in_expr(expr, conn, rewrite_in, params)?;
             }
         }
         if let Some(wh) = where_clause.as_mut() {
-            rewrite_in_expr(wh, conn, rewrite_in)?;
+            rewrite_in_expr(wh, conn, rewrite_in, params)?;
         }
         if let Some(hv) = having.as_mut() {
-            rewrite_in_expr(hv, conn, rewrite_in)?;
+            rewrite_in_expr(hv, conn, rewrite_in, params)?;
         }
     }
     Ok(())
@@ -8476,16 +8491,20 @@ fn shared_mvcc_state_for_path(path: &str) -> Arc<SharedMvccState> {
 /// leave those forms intact so the VDBE codegen can handle them via
 /// runtime probe scans.
 #[allow(clippy::too_many_lines)]
-fn rewrite_in_expr(expr: &mut Expr, conn: &Connection, rewrite_in_subqueries: bool) -> Result<()> {
+fn rewrite_in_expr(
+    expr: &mut Expr,
+    conn: &Connection,
+    rewrite_in_subqueries: bool,
+    params: Option<&[SqliteValue]>,
+) -> Result<()> {
     match expr {
         Expr::In {
             set, expr: inner, ..
         } => {
-            rewrite_in_expr(inner, conn, rewrite_in_subqueries)?;
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
             if rewrite_in_subqueries {
                 if let InSet::Subquery(sub) = set {
-                    let rows =
-                        conn.execute_statement(Statement::Select(*sub.clone()), Some(&[]))?;
+                    let rows = conn.execute_statement(Statement::Select(*sub.clone()), params)?;
                     let literals: Vec<Expr> = rows
                         .into_iter()
                         .filter_map(|row| row.values.into_iter().next())
@@ -8496,7 +8515,7 @@ fn rewrite_in_expr(expr: &mut Expr, conn: &Connection, rewrite_in_subqueries: bo
             }
             if let InSet::List(exprs) = set {
                 for e in exprs.iter_mut() {
-                    rewrite_in_expr(e, conn, rewrite_in_subqueries)?;
+                    rewrite_in_expr(e, conn, rewrite_in_subqueries, params)?;
                 }
             }
         }
@@ -8505,13 +8524,13 @@ fn rewrite_in_expr(expr: &mut Expr, conn: &Connection, rewrite_in_subqueries: bo
             not,
             span,
         } => {
-            let rows = conn.execute_statement(Statement::Select(*subquery.clone()), Some(&[]))?;
+            let rows = conn.execute_statement(Statement::Select(*subquery.clone()), params)?;
             let exists = !rows.is_empty();
             let result = if *not { !exists } else { exists };
             *expr = Expr::Literal(Literal::Integer(i64::from(result)), *span);
         }
         Expr::Subquery(sub, span) => {
-            let rows = conn.execute_statement(Statement::Select(*sub.clone()), Some(&[]))?;
+            let rows = conn.execute_statement(Statement::Select(*sub.clone()), params)?;
             let val = rows
                 .into_iter()
                 .next()
@@ -8529,13 +8548,13 @@ fn rewrite_in_expr(expr: &mut Expr, conn: &Connection, rewrite_in_subqueries: bo
             );
         }
         Expr::BinaryOp { left, right, .. } => {
-            rewrite_in_expr(left, conn, rewrite_in_subqueries)?;
-            rewrite_in_expr(right, conn, rewrite_in_subqueries)?;
+            rewrite_in_expr(left, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(right, conn, rewrite_in_subqueries, params)?;
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
         | Expr::Cast { expr: inner, .. } => {
-            rewrite_in_expr(inner, conn, rewrite_in_subqueries)?;
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
         }
         Expr::Between {
             expr: inner,
@@ -8543,9 +8562,9 @@ fn rewrite_in_expr(expr: &mut Expr, conn: &Connection, rewrite_in_subqueries: bo
             high,
             ..
         } => {
-            rewrite_in_expr(inner, conn, rewrite_in_subqueries)?;
-            rewrite_in_expr(low, conn, rewrite_in_subqueries)?;
-            rewrite_in_expr(high, conn, rewrite_in_subqueries)?;
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(low, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(high, conn, rewrite_in_subqueries, params)?;
         }
         Expr::Case {
             operand,
@@ -8554,14 +8573,14 @@ fn rewrite_in_expr(expr: &mut Expr, conn: &Connection, rewrite_in_subqueries: bo
             ..
         } => {
             if let Some(op) = operand.as_mut() {
-                rewrite_in_expr(op, conn, rewrite_in_subqueries)?;
+                rewrite_in_expr(op, conn, rewrite_in_subqueries, params)?;
             }
             for (cond, then) in whens.iter_mut() {
-                rewrite_in_expr(cond, conn, rewrite_in_subqueries)?;
-                rewrite_in_expr(then, conn, rewrite_in_subqueries)?;
+                rewrite_in_expr(cond, conn, rewrite_in_subqueries, params)?;
+                rewrite_in_expr(then, conn, rewrite_in_subqueries, params)?;
             }
             if let Some(el) = else_expr.as_mut() {
-                rewrite_in_expr(el, conn, rewrite_in_subqueries)?;
+                rewrite_in_expr(el, conn, rewrite_in_subqueries, params)?;
             }
         }
         Expr::FunctionCall {
@@ -8569,7 +8588,7 @@ fn rewrite_in_expr(expr: &mut Expr, conn: &Connection, rewrite_in_subqueries: bo
             ..
         } => {
             for e in exprs.iter_mut() {
-                rewrite_in_expr(e, conn, rewrite_in_subqueries)?;
+                rewrite_in_expr(e, conn, rewrite_in_subqueries, params)?;
             }
         }
         Expr::Like {
@@ -8577,8 +8596,8 @@ fn rewrite_in_expr(expr: &mut Expr, conn: &Connection, rewrite_in_subqueries: bo
             pattern,
             ..
         } => {
-            rewrite_in_expr(inner, conn, rewrite_in_subqueries)?;
-            rewrite_in_expr(pattern, conn, rewrite_in_subqueries)?;
+            rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
+            rewrite_in_expr(pattern, conn, rewrite_in_subqueries, params)?;
         }
         // Leaf nodes that contain no sub-expressions.
         _ => {}
@@ -16880,6 +16899,18 @@ mod tests {
     }
 
     #[test]
+    fn test_expression_select_in_subquery_uses_bound_parameter() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let rows = conn
+            .query_with_params("SELECT 5 IN (SELECT ?1);", &[SqliteValue::Integer(5)])
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
     fn test_prepared_select_in_subquery() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
@@ -20493,6 +20524,18 @@ mod transaction_lifecycle_tests {
             rows[0].get(0).unwrap(),
             &fsqlite_types::value::SqliteValue::Integer(123)
         );
+    }
+
+    #[test]
+    fn test_close_skips_wal_checkpoint_in_delete_mode() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA journal_mode='delete';").unwrap();
+        assert_eq!(
+            conn.pager.journal_mode(),
+            fsqlite_pager::JournalMode::Delete
+        );
+
+        conn.close().unwrap();
     }
 
     #[test]
