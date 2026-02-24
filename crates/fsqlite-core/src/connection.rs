@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
@@ -752,31 +752,6 @@ fn trigger_when_matches(when_clause: Option<&Expr>, frame: Option<&TriggerFrame>
 
 /// For `UPDATE OF col1, col2` triggers, ensure at least one listed column
 /// actually changed between OLD and NEW snapshots.
-fn trigger_update_of_columns_changed(
-    trigger_event: &fsqlite_ast::TriggerEvent,
-    frame: &TriggerFrame,
-) -> bool {
-    let fsqlite_ast::TriggerEvent::Update(trigger_cols) = trigger_event else {
-        return true;
-    };
-    if trigger_cols.is_empty() {
-        return true;
-    }
-
-    trigger_cols.iter().any(|column| {
-        let Some(column_index) = frame.column_index(column) else {
-            // Keep historical behavior when we cannot resolve the column.
-            return true;
-        };
-        let old_value = frame.old_row.as_ref().and_then(|row| row.get(column_index));
-        let new_value = frame.new_row.as_ref().and_then(|row| row.get(column_index));
-        match (old_value, new_value) {
-            (Some(old), Some(new)) => old != new,
-            _ => true,
-        }
-    })
-}
-
 #[derive(Debug, Clone)]
 struct TriggerRaiseDirective {
     action: fsqlite_ast::RaiseAction,
@@ -2009,7 +1984,15 @@ impl Connection {
                 let affected = if has_before_update || has_after_update {
                     trigger_rows.len()
                 } else {
-                    self.count_matching_rows(&update.table, update.where_clause.as_ref(), params)?
+                    // VDBE UPDATE execution currently ignores ORDER BY/LIMIT.
+                    // Keep affected-row bookkeeping aligned with executed rows.
+                    self.count_matching_rows(
+                        &update.table,
+                        update.where_clause.as_ref(),
+                        &[],
+                        None,
+                        params,
+                    )?
                 };
                 let program = {
                     let plan_span = tracing::span!(
@@ -2091,7 +2074,15 @@ impl Connection {
                 let affected = if has_before_delete || has_after_delete {
                     trigger_old_rows.len()
                 } else {
-                    self.count_matching_rows(&delete.table, delete.where_clause.as_ref(), params)?
+                    // VDBE DELETE execution currently ignores ORDER BY/LIMIT.
+                    // Keep affected-row bookkeeping aligned with executed rows.
+                    self.count_matching_rows(
+                        &delete.table,
+                        delete.where_clause.as_ref(),
+                        &[],
+                        None,
+                        params,
+                    )?
                 };
                 let program = {
                     let plan_span = tracing::span!(
@@ -2253,7 +2244,14 @@ impl Connection {
                 insert.table.name
             )));
         }
-        let default_row = self.collect_insert_default_row(&insert.table.name)?;
+        let default_sqls = self.collect_insert_default_sqls(&insert.table.name)?;
+        if default_sqls.len() != table_columns.len() {
+            return Err(FrankenError::Internal(format!(
+                "INSERT ... SELECT default column width {} does not match table width {}",
+                default_sqls.len(),
+                table_columns.len()
+            )));
+        }
 
         let source_column_count = source_target_indices.len();
         for (row_idx, row) in source_rows.iter().enumerate() {
@@ -2333,7 +2331,7 @@ impl Connection {
 
         let mut statement_result: Result<usize> = Ok(0);
         for row in &source_rows {
-            let mut ordered_values = default_row.clone();
+            let mut ordered_values = self.evaluate_default_row_from_sqls(&default_sqls)?;
             for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
                 ordered_values[target_idx] = row.values()[source_idx].clone();
             }
@@ -2636,20 +2634,32 @@ impl Connection {
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
+        order_by: &[fsqlite_ast::OrderingTerm],
+        limit: Option<&fsqlite_ast::LimitClause>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         let alias_clause = table_ref
             .alias
             .as_ref()
             .map_or(String::new(), |alias| format!(" AS {alias}"));
-        let sql = if let Some(cond) = where_clause {
+        let mut sql = if let Some(cond) = where_clause {
             format!(
                 "SELECT * FROM {}{alias_clause} WHERE {cond}",
                 table_ref.name
             )
         } else {
-            format!("SELECT * FROM {}", table_ref.name)
+            format!("SELECT * FROM {}{alias_clause}", table_ref.name)
         };
+
+        if !order_by.is_empty() {
+            let order_strs: Vec<String> = order_by.iter().map(|o| format!("{o}")).collect();
+            sql.push_str(" ORDER BY ");
+            sql.push_str(&order_strs.join(", "));
+        }
+
+        if let Some(l) = limit {
+            sql.push_str(&format!(" {}", l));
+        }
 
         if let Some(params) = params {
             self.query_with_params(&sql, params)
@@ -2665,12 +2675,12 @@ impl Connection {
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let (table_columns, source_target_indices) =
             self.resolve_insert_select_target_layout(insert)?;
-        let default_row = self.collect_insert_default_row(&insert.table.name)?;
+        let default_sqls = self.collect_insert_default_sqls(&insert.table.name)?;
         let table_column_count = table_columns.len();
-        if default_row.len() != table_column_count {
+        if default_sqls.len() != table_column_count {
             return Err(FrankenError::Internal(format!(
                 "INSERT trigger snapshot: default row width {} does not match table width {table_column_count}",
-                default_row.len()
+                default_sqls.len()
             )));
         }
         match &insert.source {
@@ -2679,6 +2689,7 @@ impl Connection {
                 .enumerate()
                 .map(|(row_idx, row_exprs)| {
                     let source_values = self.evaluate_insert_source_row(row_exprs, params)?;
+                    let default_row = self.evaluate_default_row_from_sqls(&default_sqls)?;
                     self.map_insert_source_row_to_table_row(
                         &default_row,
                         &source_target_indices,
@@ -2694,6 +2705,7 @@ impl Connection {
                     .iter()
                     .enumerate()
                     .map(|(row_idx, row)| {
+                        let default_row = self.evaluate_default_row_from_sqls(&default_sqls)?;
                         self.map_insert_source_row_to_table_row(
                             &default_row,
                             &source_target_indices,
@@ -2703,7 +2715,9 @@ impl Connection {
                     })
                     .collect()
             }
-            fsqlite_ast::InsertSource::DefaultValues => Ok(vec![default_row]),
+            fsqlite_ast::InsertSource::DefaultValues => {
+                Ok(vec![self.evaluate_default_row_from_sqls(&default_sqls)?])
+            }
         }
     }
 
@@ -2752,17 +2766,55 @@ impl Connection {
         Ok(row)
     }
 
-    fn collect_insert_default_row(&self, table_name: &str) -> Result<Vec<SqliteValue>> {
-        let schema = self.schema.borrow();
-        let table = schema
+    fn collect_insert_default_sqls(&self, table_name: &str) -> Result<Vec<Option<String>>> {
+        let default_sqls: Vec<Option<String>> = {
+            let schema = self.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|tbl| tbl.name.eq_ignore_ascii_case(table_name))
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
+            table
+                .columns
+                .iter()
+                .map(|column| column.default_value.clone())
+                .collect()
+        };
+
+        Ok(default_sqls)
+    }
+
+    fn evaluate_default_row_from_sqls(
+        &self,
+        default_sqls: &[Option<String>],
+    ) -> Result<Vec<SqliteValue>> {
+        default_sqls
             .iter()
-            .find(|tbl| tbl.name.eq_ignore_ascii_case(table_name))
-            .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
-        Ok(table
-            .columns
-            .iter()
-            .map(|column| parse_column_default_value(column.default_value.as_deref()))
-            .collect())
+            .map(|default_sql| self.evaluate_column_default_value(default_sql.as_deref()))
+            .collect()
+    }
+
+    fn evaluate_column_default_value(&self, default_sql: Option<&str>) -> Result<SqliteValue> {
+        let Some(default_sql) = default_sql else {
+            return Ok(SqliteValue::Null);
+        };
+        let trimmed = default_sql.trim();
+        if trimmed.is_empty() {
+            return Ok(SqliteValue::Null);
+        }
+
+        let sql = format!("SELECT {trimmed}");
+        let statement = parse_single_statement(&sql)?;
+        let rows = self.execute_statement(statement, None).map_err(|error| {
+            FrankenError::Internal(format!(
+                "failed to evaluate DEFAULT expression `{trimmed}`: {error}"
+            ))
+        })?;
+
+        Ok(rows
+            .first()
+            .and_then(|row| row.values().first())
+            .cloned()
+            .unwrap_or(SqliteValue::Null))
     }
 
     fn collect_update_trigger_rows(
@@ -2770,8 +2822,13 @@ impl Connection {
         update: &fsqlite_ast::UpdateStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<(Vec<SqliteValue>, Vec<SqliteValue>)>> {
-        let matched_rows =
-            self.select_matching_rows(&update.table, update.where_clause.as_ref(), params)?;
+        let matched_rows = self.select_matching_rows(
+            &update.table,
+            update.where_clause.as_ref(),
+            &[],
+            None,
+            params,
+        )?;
         if matched_rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -2868,8 +2925,13 @@ impl Connection {
         delete: &fsqlite_ast::DeleteStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Vec<SqliteValue>>> {
-        let matched_rows =
-            self.select_matching_rows(&delete.table, delete.where_clause.as_ref(), params)?;
+        let matched_rows = self.select_matching_rows(
+            &delete.table,
+            delete.where_clause.as_ref(),
+            &[],
+            None,
+            params,
+        )?;
         Ok(matched_rows
             .into_iter()
             .map(|row| row.values().to_vec())
@@ -2880,9 +2942,11 @@ impl Connection {
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
+        order_by: &[fsqlite_ast::OrderingTerm],
+        limit: Option<&fsqlite_ast::LimitClause>,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
-        let rows = self.select_matching_rows(table_ref, where_clause, params)?;
+        let rows = self.select_matching_rows(table_ref, where_clause, order_by, limit, params)?;
         Ok(rows.len())
     }
 
@@ -4244,9 +4308,6 @@ impl Connection {
         let frame = self.make_trigger_frame(table_name, old_values, new_values)?;
         for trigger in matching {
             let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_update_of_columns_changed(&trigger.event, &frame) {
-                continue;
-            }
             // Evaluate constant WHEN expressions now; unresolved OLD/NEW-based
             // clauses still fall back to firing until pseudo-tables are wired.
             if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame)) {
@@ -4294,9 +4355,6 @@ impl Connection {
         let frame = self.make_trigger_frame(table_name, old_values, new_values)?;
         for trigger in matching {
             let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_update_of_columns_changed(&trigger.event, &frame) {
-                continue;
-            }
             if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame)) {
                 continue;
             }
@@ -9719,118 +9777,8 @@ fn type_name_to_affinity_char(name: &str) -> char {
 /// Format a `DefaultValue` AST node as SQL text for PRAGMA table_info output.
 fn format_default_value(dv: &DefaultValue) -> String {
     match dv {
-        DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr) => format_expr_as_default(expr),
+        DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr) => expr.to_string(),
     }
-}
-
-/// Minimal expression formatter for DEFAULT values.
-fn format_expr_as_default(expr: &Expr) -> String {
-    match expr {
-        Expr::Literal(lit, _) => match lit {
-            Literal::Integer(n) => n.to_string(),
-            Literal::Float(f) => f.to_string(),
-            Literal::String(s) => format!("'{s}'"),
-            Literal::Blob(b) => {
-                #[allow(clippy::format_collect)]
-                let hex: String = b.iter().map(|byte| format!("{byte:02X}")).collect();
-                format!("X'{hex}'")
-            }
-            Literal::Null => "NULL".to_string(),
-            Literal::CurrentTime => "CURRENT_TIME".to_string(),
-            Literal::CurrentDate => "CURRENT_DATE".to_string(),
-            Literal::CurrentTimestamp => "CURRENT_TIMESTAMP".to_string(),
-            Literal::True => "1".to_string(),
-            Literal::False => "0".to_string(),
-        },
-        Expr::UnaryOp {
-            op, expr: inner, ..
-        } => {
-            let inner_str = format_expr_as_default(inner);
-            match op {
-                UnaryOp::Negate => format!("-{inner_str}"),
-                UnaryOp::Not => format!("NOT {inner_str}"),
-                UnaryOp::BitNot => format!("~{inner_str}"),
-                UnaryOp::Plus => format!("+{inner_str}"),
-            }
-        }
-        _ => format!("{expr:?}"),
-    }
-}
-
-/// Parse a column DEFAULT SQL fragment into a runtime value.
-///
-/// This mirrors the fallback behavior used by VDBE codegen for omitted INSERT
-/// columns so trigger snapshots and INSERT ... SELECT fallback agree with the
-/// primary execution path.
-fn parse_column_default_value(default_sql: Option<&str>) -> SqliteValue {
-    let Some(default_sql) = default_sql else {
-        return SqliteValue::Null;
-    };
-    let trimmed = default_sql.trim();
-
-    if let Ok(value) = trimmed.parse::<i64>() {
-        return SqliteValue::Integer(value);
-    }
-    if let Ok(value) = trimmed.parse::<f64>() {
-        return SqliteValue::Float(value);
-    }
-    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-        return SqliteValue::Text(trimmed[1..trimmed.len() - 1].replace("''", "'"));
-    }
-    if trimmed.eq_ignore_ascii_case("null") {
-        return SqliteValue::Null;
-    }
-
-    let upper = trimmed.to_ascii_uppercase();
-    if upper == "CURRENT_TIMESTAMP" || upper == "CURRENT_DATE" || upper == "CURRENT_TIME" {
-        return current_default_time_value(&upper);
-    }
-    if upper == "TRUE" {
-        return SqliteValue::Integer(1);
-    }
-    if upper == "FALSE" {
-        return SqliteValue::Integer(0);
-    }
-
-    SqliteValue::Text(trimmed.to_owned())
-}
-
-fn current_default_time_value(keyword: &str) -> SqliteValue {
-    let seconds_since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let epoch_days = seconds_since_epoch / 86_400;
-    let day_seconds = seconds_since_epoch % 86_400;
-    let hours = day_seconds / 3_600;
-    let minutes = (day_seconds % 3_600) / 60;
-    let seconds = day_seconds % 60;
-    let (year, month, day) = epoch_days_to_ymd(epoch_days);
-
-    let text = if keyword == "CURRENT_DATE" {
-        format!("{year:04}-{month:02}-{day:02}")
-    } else if keyword == "CURRENT_TIME" {
-        format!("{hours:02}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}:{seconds:02}")
-    };
-    SqliteValue::Text(text)
-}
-
-/// Convert days since 1970-01-01 (Unix epoch) to (year, month, day).
-fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Civil-date algorithm from Howard Hinnant (public domain).
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
 }
 
 /// Convert a `CodegenError` to a `FrankenError`.
@@ -13349,6 +13297,7 @@ mod tests {
     use fsqlite_types::PageNumber;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
@@ -14726,7 +14675,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute("UPDATE t SET name = name WHERE id = 1;")
+        conn.execute("UPDATE t SET id = id WHERE id = 1;")
             .unwrap();
 
         let rows = conn.query("SELECT msg FROM log;").unwrap();
@@ -15472,6 +15421,74 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_select_uses_expression_defaults_for_omitted_target_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (v INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TABLE dst (a INTEGER DEFAULT (1 + 2), b TEXT DEFAULT ('x' || 'y'), c INTEGER);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO src VALUES (11);").unwrap();
+        conn.execute("INSERT INTO src VALUES (22);").unwrap();
+
+        let inserted = conn
+            .execute("INSERT INTO dst (c) SELECT v FROM src ORDER BY v;")
+            .unwrap();
+        assert_eq!(inserted, 2);
+
+        let rows = conn.query("SELECT a, b, c FROM dst ORDER BY c;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(3),
+                SqliteValue::Text("xy".to_owned()),
+                SqliteValue::Integer(11),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(3),
+                SqliteValue::Text("xy".to_owned()),
+                SqliteValue::Integer(22),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_select_recomputes_nondeterministic_defaults_per_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (v INTEGER);").unwrap();
+        conn.execute("CREATE TABLE dst (a INTEGER DEFAULT (random()), b INTEGER);")
+            .unwrap();
+        for value in [10_i64, 20, 30, 40, 50] {
+            conn.execute(&format!("INSERT INTO src VALUES ({value});"))
+                .unwrap();
+        }
+
+        let inserted = conn
+            .execute("INSERT INTO dst (b) SELECT v FROM src ORDER BY v;")
+            .unwrap();
+        assert_eq!(inserted, 5);
+
+        let rows = conn.query("SELECT a FROM dst ORDER BY b;").unwrap();
+        assert_eq!(rows.len(), 5);
+        let defaults: Vec<i64> = rows
+            .iter()
+            .map(|row| match row.get(0) {
+                Some(SqliteValue::Integer(value)) => *value,
+                other => panic!("expected INTEGER default value, got {other:?}"),
+            })
+            .collect();
+        let unique: HashSet<i64> = defaults.iter().copied().collect();
+        assert!(
+            unique.len() > 1,
+            "DEFAULT(random()) should be evaluated per row in INSERT ... SELECT fallback, got {defaults:?}"
+        );
+    }
+
+    #[test]
     fn test_before_insert_trigger_new_values_use_defaults_for_omitted_columns() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (a INTEGER DEFAULT 9, b INTEGER);")
@@ -15495,6 +15512,121 @@ mod tests {
         assert_eq!(
             row_values(&table_rows[0]),
             vec![SqliteValue::Integer(9), SqliteValue::Integer(5)]
+        );
+    }
+
+    #[test]
+    fn test_before_insert_trigger_new_values_use_expression_defaults_for_omitted_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a TEXT DEFAULT ('x' || 'y'), b INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (seen_a TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_before_insert_expr BEFORE INSERT ON t \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.a); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t (b) VALUES (5);").unwrap();
+
+        let log_rows = conn.query("SELECT seen_a FROM trigger_log;").unwrap();
+        assert_eq!(log_rows.len(), 1);
+        assert_eq!(
+            row_values(&log_rows[0]),
+            vec![SqliteValue::Text("xy".to_owned())]
+        );
+
+        let table_rows = conn.query("SELECT a, b FROM t;").unwrap();
+        assert_eq!(table_rows.len(), 1);
+        assert_eq!(
+            row_values(&table_rows[0]),
+            vec![SqliteValue::Text("xy".to_owned()), SqliteValue::Integer(5)]
+        );
+    }
+
+    #[test]
+    fn test_before_insert_trigger_recomputes_nondeterministic_defaults_per_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER DEFAULT (random()), b INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (seen_a INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_before_insert_random BEFORE INSERT ON t \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.a); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t (b) VALUES (1), (2), (3), (4), (5);")
+            .unwrap();
+
+        let log_rows = conn.query("SELECT seen_a FROM trigger_log;").unwrap();
+        assert_eq!(log_rows.len(), 5);
+        let logged_defaults: Vec<i64> = log_rows
+            .iter()
+            .map(|row| match row.get(0) {
+                Some(SqliteValue::Integer(value)) => *value,
+                other => panic!("expected INTEGER default value in trigger log, got {other:?}"),
+            })
+            .collect();
+        let unique_logged: HashSet<i64> = logged_defaults.iter().copied().collect();
+        assert!(
+            unique_logged.len() > 1,
+            "DEFAULT(random()) should be re-evaluated per inserted row for BEFORE trigger snapshots, got {logged_defaults:?}"
+        );
+    }
+
+    #[test]
+    fn test_update_alias_order_by_limit_without_where_uses_alias_in_internal_count_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+
+        let affected = conn
+            .execute("UPDATE t AS x SET v = v + 100 ORDER BY x.id ASC LIMIT 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 3);
+        let expected_bases = [10_i64, 20, 30];
+        let mut updated_rows = 0usize;
+        for (row, base) in rows.iter().zip(expected_bases) {
+            let values = row_values(row);
+            let SqliteValue::Integer(actual) = values[1] else {
+                panic!("expected INTEGER value column, got {:?}", values[1]);
+            };
+            if actual == base + 100 {
+                updated_rows = updated_rows.saturating_add(1);
+            } else {
+                assert_eq!(actual, base);
+            }
+        }
+        assert_eq!(
+            affected, updated_rows,
+            "reported affected-row count must match actual updated rows"
+        );
+    }
+
+    #[test]
+    fn test_delete_alias_order_by_limit_without_where_uses_alias_in_internal_count_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+
+        let deleted = conn
+            .execute("DELETE FROM t AS x ORDER BY x.id ASC LIMIT 2;")
+            .unwrap();
+
+        let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
+        let actual_deleted = 3usize.saturating_sub(rows.len());
+        assert_eq!(
+            deleted, actual_deleted,
+            "reported affected-row count must match actual deleted rows"
         );
     }
 

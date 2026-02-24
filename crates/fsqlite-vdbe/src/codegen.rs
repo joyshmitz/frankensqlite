@@ -10,8 +10,9 @@ use crate::ProgramBuilder;
 use fsqlite_ast::{
     ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FunctionArgs, InsertSource,
     InsertStatement, LimitClause, Literal, OrderingTerm, QualifiedTableRef, ResultColumn,
-    SelectCore, SelectStatement, SortDirection, TableOrSubquery, UpdateStatement,
+    SelectCore, SelectStatement, SortDirection, Statement, TableOrSubquery, UpdateStatement,
 };
+use fsqlite_parser::Parser as SqlParser;
 use fsqlite_types::opcode::{Opcode, P4};
 
 // ---------------------------------------------------------------------------
@@ -3329,32 +3330,8 @@ fn default_value_to_expr(col: &ColumnInfo) -> Expr {
     let Some(dv) = col.default_value.as_deref() else {
         return Expr::Literal(Literal::Null, span);
     };
-    let trimmed = dv.trim();
-    // Integer literal.
-    if let Ok(n) = trimmed.parse::<i64>() {
-        return Expr::Literal(Literal::Integer(n), span);
-    }
-    // Float literal.
-    if let Ok(f) = trimmed.parse::<f64>() {
-        return Expr::Literal(Literal::Float(f), span);
-    }
-    // String literal: 'value'.
-    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-        let inner = trimmed[1..trimmed.len() - 1].replace("''", "'");
-        return Expr::Literal(Literal::String(inner), span);
-    }
-    // Special keywords.
-    let upper = trimmed.to_ascii_uppercase();
-    match upper.as_str() {
-        "NULL" => Expr::Literal(Literal::Null, span),
-        "CURRENT_TIMESTAMP" => Expr::Literal(Literal::CurrentTimestamp, span),
-        "CURRENT_DATE" => Expr::Literal(Literal::CurrentDate, span),
-        "CURRENT_TIME" => Expr::Literal(Literal::CurrentTime, span),
-        "TRUE" => Expr::Literal(Literal::True, span),
-        "FALSE" => Expr::Literal(Literal::False, span),
-        // Fallback: emit as string.
-        _ => Expr::Literal(Literal::String(trimmed.to_owned()), span),
-    }
+    parse_default_expr(dv)
+        .unwrap_or_else(|| Expr::Literal(Literal::String(dv.trim().to_owned()), span))
 }
 
 /// Emit a column's DEFAULT value into a register.
@@ -3367,68 +3344,52 @@ fn emit_default_value(b: &mut ProgramBuilder, col: &ColumnInfo, reg: i32) {
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         }
         Some(dv) => {
-            let trimmed = dv.trim();
-            // Try integer literal.
-            if let Ok(n) = trimmed.parse::<i64>() {
-                if let Ok(as_i32) = i32::try_from(n) {
-                    b.emit_op(Opcode::Integer, as_i32, reg, 0, P4::None, 0);
-                } else {
-                    b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(n), 0);
-                }
-                return;
+            if let Some(expr) = parse_default_expr(dv) {
+                emit_expr(b, &expr, reg, None);
+            } else {
+                b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(dv.trim().to_owned()), 0);
             }
-            // Try float literal.
-            if let Ok(f) = trimmed.parse::<f64>() {
-                b.emit_op(Opcode::Real, 0, reg, 0, P4::Real(f), 0);
-                return;
-            }
-            // String literal: 'value' (strip surrounding quotes).
-            if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-                let inner = trimmed[1..trimmed.len() - 1].replace("''", "'");
-                b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(inner), 0);
-                return;
-            }
-            // NULL literal.
-            if trimmed.eq_ignore_ascii_case("null") {
-                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
-                return;
-            }
-            // CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME.
-            let upper = trimmed.to_ascii_uppercase();
-            if upper == "CURRENT_TIMESTAMP" || upper == "CURRENT_DATE" || upper == "CURRENT_TIME" {
-                use std::time::SystemTime;
-                let secs = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let days = secs / 86400;
-                let day_secs = secs % 86400;
-                let h = day_secs / 3600;
-                let m = (day_secs % 3600) / 60;
-                let s = day_secs % 60;
-                let (y, mo, d) = epoch_days_to_ymd(days);
-                let ts = if upper == "CURRENT_TIMESTAMP" {
-                    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
-                } else if upper == "CURRENT_DATE" {
-                    format!("{y:04}-{mo:02}-{d:02}")
-                } else {
-                    format!("{h:02}:{m:02}:{s:02}")
-                };
-                b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(ts), 0);
-                return;
-            }
-            // TRUE / FALSE.
-            if upper == "TRUE" || upper == "1" {
-                b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
-                return;
-            }
-            if upper == "FALSE" || upper == "0" {
-                b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
-                return;
-            }
-            // Fallback: emit the default text as a string value.
-            b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(trimmed.to_owned()), 0);
         }
+    }
+}
+
+/// Parse column DEFAULT SQL text into an expression AST.
+///
+/// Returns `None` if parsing fails or if the text does not map to a single
+/// expression-only `SELECT`.
+fn parse_default_expr(default_sql: &str) -> Option<Expr> {
+    let trimmed = default_sql.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut parser = SqlParser::from_sql(&format!("SELECT {trimmed}"));
+    let (stmts, errs) = parser.parse_all();
+    if !errs.is_empty() || stmts.len() != 1 {
+        return None;
+    }
+
+    let stmt = stmts.into_iter().next()?;
+    let Statement::Select(select_stmt) = stmt else {
+        return None;
+    };
+    if !select_stmt.order_by.is_empty()
+        || select_stmt.limit.is_some()
+        || !select_stmt.body.compounds.is_empty()
+    {
+        return None;
+    }
+
+    let SelectCore::Select { columns, from, .. } = select_stmt.body.select else {
+        return None;
+    };
+    if from.is_some() || columns.len() != 1 {
+        return None;
+    }
+
+    match columns.into_iter().next()? {
+        ResultColumn::Expr { expr, .. } => Some(expr),
+        _ => None,
     }
 }
 
@@ -3873,26 +3834,10 @@ fn emit_having_expr(
                     b.resolve_label(done_label);
                 }
                 fsqlite_ast::BinaryOp::And => {
-                    let false_label = b.emit_label();
-                    let done_label = b.emit_label();
-                    b.emit_jump_to_label(Opcode::IfNot, left_reg, 0, false_label, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::IfNot, right_reg, 0, false_label, P4::None, 0);
-                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(false_label);
-                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
-                    b.resolve_label(done_label);
+                    b.emit_op(Opcode::And, left_reg, right_reg, dest_reg, P4::None, 0);
                 }
                 fsqlite_ast::BinaryOp::Or => {
-                    let true_label = b.emit_label();
-                    let done_label = b.emit_label();
-                    b.emit_jump_to_label(Opcode::IfPos, left_reg, 0, true_label, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::IfPos, right_reg, 0, true_label, P4::None, 0);
-                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(true_label);
-                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
-                    b.resolve_label(done_label);
+                    b.emit_op(Opcode::Or, left_reg, right_reg, dest_reg, P4::None, 0);
                 }
                 _ => {
                     emit_expr(b, expr, dest_reg, None);
