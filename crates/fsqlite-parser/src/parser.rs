@@ -120,7 +120,9 @@ impl Parser {
     pub(crate) fn enter_recursion(&mut self) -> Result<(), ParseError> {
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
-            return Err(self.err_msg(format!("expression tree is too deep (maximum depth {MAX_PARSE_DEPTH})")));
+            return Err(self.err_msg(format!(
+                "expression tree is too deep (maximum depth {MAX_PARSE_DEPTH})"
+            )));
         }
         Ok(())
     }
@@ -374,7 +376,8 @@ impl Parser {
     // -----------------------------------------------------------------------
 
     fn parse_statement_inner(&mut self) -> Result<Statement, ParseError> {
-        match self.peek().clone() {
+        self.enter_recursion()?;
+        let result = match self.peek().clone() {
             TokenKind::KwSelect | TokenKind::KwValues => {
                 Ok(Statement::Select(self.parse_select_stmt(None)?))
             }
@@ -429,7 +432,9 @@ impl Parser {
             }
             TokenKind::KwExplain => self.parse_explain(),
             _ => Err(self.err_msg("unexpected token at start of statement")),
-        }
+        };
+        self.leave_recursion();
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -492,6 +497,16 @@ impl Parser {
     // -----------------------------------------------------------------------
 
     pub(crate) fn parse_select_stmt(
+        &mut self,
+        with: Option<WithClause>,
+    ) -> Result<SelectStatement, ParseError> {
+        self.enter_recursion()?;
+        let result = self.parse_select_stmt_inner(with);
+        self.leave_recursion();
+        result
+    }
+
+    fn parse_select_stmt_inner(
         &mut self,
         with: Option<WithClause>,
     ) -> Result<SelectStatement, ParseError> {

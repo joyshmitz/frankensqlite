@@ -206,6 +206,13 @@ impl Scope {
         self.parent.as_ref().is_some_and(|p| p.has_alias(alias))
     }
 
+    /// Check if an alias is defined locally in this scope.
+    #[must_use]
+    pub fn has_alias_local(&self, alias: &str) -> bool {
+        let key = alias.to_ascii_lowercase();
+        self.aliases.contains_key(&key) || self.ctes.contains(&key)
+    }
+
     /// Resolve a column reference: find which alias provides it.
     ///
     /// If `table_qualifier` is Some, checks only that alias.
