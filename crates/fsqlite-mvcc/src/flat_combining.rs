@@ -220,9 +220,8 @@ impl FlatCombiner {
     }
 
     /// Process all pending requests in a single batch.
-    fn combine(&self) {
-        let _guard = self.combiner_lock.lock();
-
+    /// The caller MUST hold the `combiner_lock`.
+    fn combine_locked(&self) {
         let mut batch_size = 0u64;
         let mut current = self.value.load(Ordering::Acquire);
 
@@ -308,20 +307,15 @@ impl FcHandle<'_> {
             .state
             .store(op, Ordering::Release);
 
-        // Try to become the combiner.
-        if self.combiner.combiner_lock.try_lock().is_some() {
-            // We acquired the lock — but combine() will re-acquire it.
-            // Since we already hold it via try_lock, we need a different approach.
-            // Instead, drop the try_lock guard and let combine() acquire normally.
-            // Actually, try_lock returns a MutexGuard that we'd need to hold.
-            // Let's use a simpler approach: just call combine directly.
+        // ALIEN ARTIFACT: True Flat Combining.
+        // We attempt to become the combiner. If we fail, we MUST NOT block on an OS mutex
+        // (which would defeat the entire purpose of flat combining by forcing context switches).
+        // Instead, we spin on our own cache-line-isolated slot until the active combiner
+        // writes our result. This converts global lock contention into read-only local spinning.
+        if let Some(_guard) = self.combiner.combiner_lock.try_lock() {
+            self.combiner.combine_locked();
         }
 
-        // Call combine — if another thread is already combining, this blocks
-        // until the batch (which includes our request) is done.
-        self.combiner.combine();
-
-        // At this point either we processed the batch or another combiner did.
         // Check if our request has been serviced.
         let mut spins = 0u32;
         loop {
@@ -342,13 +336,19 @@ impl FcHandle<'_> {
 
                 return result;
             }
-            // Our request wasn't in this batch — retry combine.
+
+            // Still waiting. Spin or yield.
             spins += 1;
             if spins < SPIN_BEFORE_YIELD {
                 std::hint::spin_loop();
             } else {
-                // Another combiner might be running — try again.
-                self.combiner.combine();
+                // If the combiner died or is extremely slow, we attempt to take over.
+                // If we can't take over, yield the thread to avoid burning CPU unnecessarily.
+                if let Some(_guard) = self.combiner.combiner_lock.try_lock() {
+                    self.combiner.combine_locked();
+                } else {
+                    std::thread::yield_now();
+                }
                 spins = 0;
             }
         }

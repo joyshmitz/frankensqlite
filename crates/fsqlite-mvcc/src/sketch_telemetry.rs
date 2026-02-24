@@ -177,11 +177,29 @@ impl CountMinSketch {
     /// Observe an item with a given count increment.
     #[allow(clippy::cast_possible_truncation)]
     pub fn observe_n(&mut self, item: u64, count: u64) {
+        // ALIEN ARTIFACT: Count-Min Sketch with Conservative Update (CU).
+        // Instead of unconditionally adding `count` to every hashed bucket,
+        // we first find the current minimum estimate across all rows. We then
+        // only increase a counter if it is less than `min_estimate + count`.
+        // This mathematically bounds the overestimation error far more tightly
+        // than standard CMS, providing strictly superior accuracy at zero memory cost.
+        let mut min_count = u64::MAX;
+        let mut indices = Vec::with_capacity(self.depth);
+
         for (row, seed) in self.seeds.iter().enumerate() {
             let hash = mix64(item ^ *seed);
             let col = (hash as usize) % self.width;
-            self.counters[row * self.width + col] =
-                self.counters[row * self.width + col].saturating_add(count);
+            let idx = row * self.width + col;
+            indices.push(idx);
+            min_count = min_count.min(self.counters[idx]);
+        }
+
+        let target_count = min_count.saturating_add(count);
+
+        for &idx in &indices {
+            if self.counters[idx] < target_count {
+                self.counters[idx] = target_count;
+            }
         }
         self.total_count = self.total_count.saturating_add(count);
 

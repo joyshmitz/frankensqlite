@@ -362,6 +362,11 @@ impl ConcurrentRowIdAllocator {
         let r = explicit_rowid.get();
         let before = state.next_rowid;
 
+        // If the allocator is exhausted (wrapped past MAX), do not revive it.
+        if state.next_rowid < 1 {
+            return Err(RowIdAllocError::Exhausted);
+        }
+
         if r >= state.next_rowid {
             // wrapping_add(1) at MAX → i64::MIN, caught by `start < 1` guard
             // in reserve_range.

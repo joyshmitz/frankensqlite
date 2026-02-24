@@ -434,7 +434,39 @@ impl SharedPageLockTable {
     }
 
     fn try_start_best_effort_rebuild(&self) {
-        if self.draining_table.load(Ordering::Acquire) != DRAINING_NONE {
+        let draining_idx = self.draining_table.load(Ordering::Acquire);
+        if draining_idx != DRAINING_NONE {
+            // A previous rebuild may have timed out while draining.  If the
+            // draining table has since reached quiescence, finalize it now so
+            // the table can accept fresh acquisitions again.
+            let draining = &self.tables[draining_idx as usize];
+            if !draining.is_quiescent() {
+                return;
+            }
+
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            let pid = std::process::id();
+            let pid_birth = now_secs;
+
+            if self
+                .acquire_rebuild_lease(pid, pid_birth, now_secs)
+                .is_err()
+            {
+                return;
+            }
+
+            if let Err(error) = self.finalize_rebuild(pid) {
+                warn!(
+                    error = %error,
+                    "SharedPageLockTable: failed to finalize quiescent draining rebuild"
+                );
+                // Release lease on failed finalize.
+                self.rebuild_pid.store(0, Ordering::Release);
+                self.rebuild_pid_birth.store(0, Ordering::Release);
+                self.rebuild_lease_expiry.store(0, Ordering::Release);
+            }
             return;
         }
 
@@ -442,8 +474,17 @@ impl SharedPageLockTable {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let pid = std::process::id();
+        let pid_birth = now_secs;
 
-        let _ = self.full_rebuild(pid, now_secs, now_secs, |_txn_id| true, Duration::ZERO);
+        // Use a tiny non-zero timeout so we can still yield once if needed,
+        // while keeping this helper effectively best-effort.
+        let _ = self.full_rebuild(
+            pid,
+            pid_birth,
+            now_secs,
+            |_txn_id| true,
+            Duration::from_millis(1),
+        );
     }
 
     /// Probe a table for an existing lock on `page_number`.
@@ -1452,6 +1493,37 @@ mod tests {
             "released historical keys should not cause permanent capacity exhaustion (got {result:?})"
         );
         assert_eq!(table.holder(9_999), Some(2));
+    }
+
+    #[test]
+    fn test_best_effort_rebuild_finalizes_after_timeout_once_quiescent() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        // Hold a lock so the initial zero-budget rebuild path times out with
+        // a draining table still in progress.
+        assert_eq!(table.try_acquire(11, 77), AcquireResult::Acquired);
+        let timed_out = table
+            .full_rebuild(1001, 0, 1_000, |_txn_id| true, Duration::ZERO)
+            .expect("full rebuild should return timeout result");
+        assert!(
+            timed_out.timed_out,
+            "rebuild should time out with active lock"
+        );
+        assert!(
+            table.is_rebuild_in_progress(),
+            "draining state should remain after timed-out rebuild"
+        );
+
+        // Once the lock is released, a later best-effort attempt must finish
+        // the pending drain instead of bailing forever.
+        assert!(table.release(11, 77), "lock release should succeed");
+        table.try_start_best_effort_rebuild();
+
+        assert!(
+            !table.is_rebuild_in_progress(),
+            "quiescent drain must be finalized"
+        );
+        assert_eq!(table.rebuild_epoch(), 1, "finalize should advance epoch");
     }
 
     // -- bd-3t3.8 test 7: crash cleanup via release_all_for_txn --

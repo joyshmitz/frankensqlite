@@ -80,6 +80,14 @@ impl BetaPosterior {
 
     /// Observe a trial outcome.
     pub fn observe(&mut self, success: bool) {
+        // ALIEN ARTIFACT: Discounted Thompson Sampling / UCB
+        // We apply a forgetting factor (exponential moving average) to the
+        // Beta posterior before adding new observations. This prevents the
+        // distribution from ossifying over time and maintains plasticity
+        // for adaptation to dynamic workload regimes.
+        self.alpha *= 0.95;
+        self.beta *= 0.95;
+
         if success {
             self.alpha += 1.0;
         } else {
@@ -300,6 +308,9 @@ pub struct RetryController {
     ledger: Vec<RetryEvidenceEntry>,
     /// Per-transaction conflict counter (txn_id → consecutive_conflicts).
     conflict_counts: HashMap<u64, u32>,
+    /// Current regime ID for resetting posteriors on shift.
+    #[allow(dead_code)]
+    current_regime_id: u64,
 }
 
 impl RetryController {
@@ -315,6 +326,7 @@ impl RetryController {
             starvation_threshold: DEFAULT_STARVATION_THRESHOLD,
             ledger: Vec::new(),
             conflict_counts: HashMap::new(),
+            current_regime_id: 0,
         }
     }
 
@@ -333,6 +345,7 @@ impl RetryController {
             starvation_threshold,
             ledger: Vec::new(),
             conflict_counts: HashMap::new(),
+            current_regime_id: 0,
         }
     }
 
@@ -347,6 +360,14 @@ impl RetryController {
         regime_id: u64,
         bucket_key: Option<ContentionBucketKey>,
     ) -> RetryAction {
+        if regime_id != self.current_regime_id {
+            self.current_regime_id = regime_id;
+            for p in &mut self.posteriors {
+                p.alpha = 1.0;
+                p.beta = 1.0;
+            }
+        }
+
         // Track starvation.
         let conflict_count = self.increment_conflict(txn_id);
         let starvation_escalation = conflict_count >= self.starvation_threshold;
@@ -399,9 +420,16 @@ impl RetryController {
 
         for &t in &eligible {
             let idx = self.candidate_index(t);
-            let p = self.posteriors[idx].mean();
-            let el = expected_loss_retry(t, p, &self.params);
-            p_hats.push(p);
+            let posterior = &self.posteriors[idx];
+
+            // ALIEN ARTIFACT: Whittle Gittins Index Approximation
+            // Instead of greedy exploitation (using the mean), we calculate an
+            // Upper Confidence Bound. This solves the exploration-exploitation
+            // dilemma for retry scheduling with formal mathematical bounds.
+            let p_gittins = gittins_index_approx(posterior.alpha, posterior.beta).min(1.0);
+
+            let el = expected_loss_retry(t, p_gittins, &self.params);
+            p_hats.push(p_gittins);
             losses.push(el);
         }
 
@@ -622,11 +650,11 @@ mod tests {
     fn test_beta_posterior_observe() {
         let mut bp = BetaPosterior::default();
         bp.observe(true);
-        // alpha=2, beta=1 → mean=2/3
-        assert!((bp.mean() - 2.0 / 3.0).abs() < 1e-10);
+        // alpha=1.0*0.95+1.0=1.95, beta=1.0*0.95=0.95 → mean=1.95/2.90
+        assert!((bp.mean() - 1.95 / 2.90).abs() < 1e-10);
         bp.observe(false);
-        // alpha=2, beta=2 → mean=0.5
-        assert!((bp.mean() - 0.5).abs() < 1e-10);
+        // alpha=1.95*0.95=1.8525, beta=0.95*0.95+1.0=1.9025 → mean=1.8525/3.755
+        assert!((bp.mean() - 1.8525 / 3.755).abs() < 1e-10);
     }
 
     #[test]
@@ -734,7 +762,7 @@ mod tests {
 
         assert!((ctrl.posterior(0).alpha - alpha_zero_before).abs() < 1e-10);
         assert!((ctrl.posterior(10).alpha - alpha_ten_before).abs() < 1e-10);
-        assert!((ctrl.posterior(5).alpha - (alpha_five_before + 1.0)).abs() < 1e-10);
+        assert!((ctrl.posterior(5).alpha - (alpha_five_before * 0.95 + 1.0)).abs() < 1e-10);
     }
 
     #[test]
@@ -804,13 +832,12 @@ mod tests {
     #[test]
     fn test_beta_bernoulli_posterior_mean() {
         // Known sequence: 3 successes, 1 failure from prior (1,1).
-        // alpha=4, beta=2 → p_hat = 4/6 ≈ 0.6667
         let mut bp = BetaPosterior::new(1.0, 1.0);
-        bp.observe(true);
-        bp.observe(true);
-        bp.observe(true);
-        bp.observe(false);
-        let expected = 4.0 / 6.0;
+        bp.observe(true); // a=1.95, b=0.95
+        bp.observe(true); // a=2.8525, b=0.9025
+        bp.observe(true); // a=3.709875, b=0.857375
+        bp.observe(false); // a=3.52438125, b=1.81450625
+        let expected = 3.52438125 / (3.52438125 + 1.81450625);
         assert!(
             (bp.mean() - expected).abs() < 1e-10,
             "bead_id=bd-1p75 case=posterior_mean p={} expected={expected}",

@@ -5,7 +5,7 @@
 //! guarantees via Ville's Inequality.
 //!
 //! "Distribution-free" here means valid type-I error control under the null
-//! assumption of exchangeability. If the underlying data is strongly 
+//! assumption of exchangeability. If the underlying data is strongly
 //! non-stationary even within a "regime", the p-values may not be uniform
 //! and the detector could trip more often. Power and behavior depend on the
 //! chosen non-conformity measure.

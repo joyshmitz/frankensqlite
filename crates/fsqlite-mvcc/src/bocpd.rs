@@ -365,10 +365,6 @@ impl BocpdMonitor {
     pub fn observe(&mut self, x: f64) {
         self.observation_count += 1;
 
-        let h = self.config.hazard.evaluate(0);
-        let log_h = h.ln();
-        let log_1mh = (1.0 - h).ln();
-
         // Step 1: compute predictive probability for each run-length hypothesis.
         let n = self.entries.len();
         let mut log_preds = Vec::with_capacity(n);
@@ -388,6 +384,8 @@ impl BocpdMonitor {
         // P(x_t | r_{t-1}) * H(r_{t-1}) * P(r_{t-1}).
         let mut log_cp_terms: Vec<f64> = Vec::with_capacity(n);
         for (i, entry) in self.entries.iter().enumerate() {
+            let h_i = self.config.hazard.evaluate(i);
+            let log_h = h_i.ln();
             log_cp_terms.push(entry.log_prob + log_preds[i] + log_h);
         }
         let log_cp_prob = log_sum_exp(&log_cp_terms);
@@ -408,6 +406,8 @@ impl BocpdMonitor {
 
         // Growth entries (r_t = r_{t-1} + 1).
         for (i, entry) in self.entries.iter().enumerate() {
+            let h_i = self.config.hazard.evaluate(i);
+            let log_1mh = (1.0 - h_i).ln();
             let log_prob = entry.log_prob + log_preds[i] + log_1mh;
             let ng_stats = entry.ng_stats.map(|ng| ng.update(x));
             let bb_stats = entry.bb_stats.map(|bb| bb.update(x));
