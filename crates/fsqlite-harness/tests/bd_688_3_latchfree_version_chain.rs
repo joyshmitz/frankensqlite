@@ -223,7 +223,7 @@ fn stress_concurrent_resolve_while_publishing() {
     let num_writer_threads = 8;
     let num_reader_threads = 16;
 
-    let handles: Vec<_> = (0..num_writer_threads)
+    let mut handles: Vec<_> = (0..num_writer_threads)
         .map(|t| {
             let store = Arc::clone(&store);
             std::thread::spawn(move || {
@@ -238,7 +238,10 @@ fn stress_concurrent_resolve_while_publishing() {
                 }
             })
         })
-        .chain((0..num_reader_threads).map(|t| {
+        .collect();
+
+    let reader_handles: Vec<_> = (0..num_reader_threads)
+        .map(|t| {
             let store = Arc::clone(&store);
             std::thread::spawn(move || {
                 let snap = make_snapshot(u64::MAX);
@@ -249,8 +252,10 @@ fn stress_concurrent_resolve_while_publishing() {
                     let _ = store.resolve(pgno, &snap);
                 }
             })
-        }))
+        })
         .collect();
+
+    handles.extend(reader_handles);
 
     for h in handles {
         h.join().unwrap();

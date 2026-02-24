@@ -256,7 +256,7 @@ fn test_concurrent_access_and_cooling() {
     }
 
     // Spawn access threads and a cooling thread concurrently.
-    let handles: Vec<_> = (0..4)
+    let mut handles: Vec<_> = (0..4)
         .map(|t| {
             let csm = Arc::clone(&csm);
             std::thread::spawn(move || {
@@ -267,15 +267,14 @@ fn test_concurrent_access_and_cooling() {
                 }
             })
         })
-        .chain(std::iter::once({
-            let csm = Arc::clone(&csm);
-            std::thread::spawn(move || {
-                for _ in 0..5 {
-                    csm.run_cooling_scan();
-                }
-            })
-        }))
         .collect();
+
+    let csm_cooling = Arc::clone(&csm);
+    handles.push(std::thread::spawn(move || {
+        for _ in 0..5 {
+            csm_cooling.run_cooling_scan();
+        }
+    }));
 
     for h in handles {
         h.join().expect("thread should not panic");
