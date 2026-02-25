@@ -41,7 +41,9 @@ use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::{BTreePageHeader, DatabaseHeader, PageNumber, PageSize, TextEncoding};
+use fsqlite_types::{
+    BTreePageHeader, DatabaseHeader, PageNumber, PageSize, StrictColumnType, TextEncoding,
+};
 use fsqlite_vdbe::codegen::{
     CodegenContext, CodegenError, ColumnInfo, IndexSchema, TableSchema, codegen_delete,
     codegen_insert, codegen_select, codegen_update,
@@ -70,8 +72,9 @@ use fsqlite_mvcc::{
 };
 // MVCC conflict observability (bd-t6sv2.1)
 use fsqlite_observability::{
-    MetricsObserver, next_decision_id, next_trace_id, record_compat_trace_callback,
-    record_trace_export, record_trace_export_error, record_trace_span_created, reset_trace_metrics,
+    MetricsObserver, io_uring_latency_snapshot, next_decision_id, next_trace_id,
+    record_compat_trace_callback, record_trace_export, record_trace_export_error,
+    record_trace_span_created, reset_io_uring_latency_metrics, reset_trace_metrics,
     trace_metrics_snapshot,
 };
 use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
@@ -3666,16 +3669,33 @@ impl Connection {
                             ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
                             _ => None,
                         });
-                        ColumnInfo {
+                        let strict_type = if create.strict {
+                            let type_decl = type_name.as_deref().ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "STRICT table {} column {} must declare a type",
+                                    table_name, col.name
+                                ))
+                            })?;
+                            Some(StrictColumnType::from_type_name(type_decl).ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "STRICT table {} column {} has invalid type {}",
+                                    table_name, col.name, type_decl
+                                ))
+                            })?)
+                        } else {
+                            None
+                        };
+                        Ok(ColumnInfo {
                             name: col.name.clone(),
                             affinity,
                             is_ipk: rowid_col_idx.is_some_and(|idx| idx == i),
                             type_name,
                             notnull,
                             default_value,
-                        }
+                            strict_type,
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 if let Some(idx) = rowid_col_idx {
                     self.rowid_alias_columns
                         .borrow_mut()
@@ -3689,6 +3709,7 @@ impl Connection {
                     root_page,
                     columns: col_infos,
                     indexes: Vec::new(),
+                    strict: create.strict,
                 };
                 let create_sql = crate::compat_persist::build_create_table_sql(&table_schema);
                 let rp = table_schema.root_page;
@@ -3697,6 +3718,11 @@ impl Connection {
                 self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
             }
             CreateTableBody::AsSelect(select_stmt) => {
+                if create.strict {
+                    return Err(FrankenError::NotImplemented(
+                        "CREATE TABLE ... AS SELECT ... STRICT is not yet supported".to_owned(),
+                    ));
+                }
                 // Execute the SELECT to get result rows.
                 let rows = self.execute_statement(Statement::Select(*select_stmt.clone()), None)?;
                 // Infer column names from the SELECT columns.
@@ -3736,6 +3762,7 @@ impl Connection {
                             type_name: None,
                             notnull: false,
                             default_value: None,
+                            strict_type: None,
                         }
                     })
                     .collect();
@@ -3746,6 +3773,7 @@ impl Connection {
                     root_page,
                     columns: col_infos,
                     indexes: Vec::new(),
+                    strict: false,
                 };
                 let create_sql = crate::compat_persist::build_create_table_sql(&table_schema);
                 let rp = table_schema.root_page;
@@ -3813,6 +3841,7 @@ impl Connection {
             root_page,
             columns: col_infos,
             indexes: Vec::new(),
+            strict: false,
         });
 
         self.insert_sqlite_master_row(
@@ -3856,7 +3885,7 @@ impl Connection {
                     self.rowid_alias_columns
                         .borrow_mut()
                         .remove(&obj_name.to_ascii_lowercase());
-                    
+
                     let mut triggers_to_drop = Vec::new();
                     {
                         let mut triggers = self.triggers.borrow_mut();
@@ -4054,6 +4083,22 @@ impl Connection {
                     ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
                     _ => None,
                 });
+                let strict_type = if table.strict {
+                    let type_decl = type_name.as_deref().ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "STRICT table {} column {} must declare a type",
+                            table.name, col_def.name
+                        ))
+                    })?;
+                    Some(StrictColumnType::from_type_name(type_decl).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "STRICT table {} column {} has invalid type {}",
+                            table.name, col_def.name, type_decl
+                        ))
+                    })?)
+                } else {
+                    None
+                };
                 table.columns.push(ColumnInfo {
                     name: col_def.name.clone(),
                     affinity,
@@ -4061,6 +4106,7 @@ impl Connection {
                     type_name,
                     notnull,
                     default_value,
+                    strict_type,
                 });
                 table.clone()
             }
@@ -4217,22 +4263,16 @@ impl Connection {
             )));
         }
         drop(views);
-        
+
         let create_sql = stmt.to_string();
         self.views.borrow_mut().push(ViewDef {
             name: view_name.clone(),
             columns: stmt.columns.clone(),
             query: stmt.query.clone(),
         });
-        
-        self.insert_sqlite_master_row(
-            "view",
-            view_name,
-            view_name,
-            0,
-            &create_sql,
-        )?;
-        
+
+        self.insert_sqlite_master_row("view", view_name, view_name, 0, &create_sql)?;
+
         self.increment_schema_cookie();
         Ok(())
     }
@@ -4559,6 +4599,7 @@ impl Connection {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     })
                     .collect()
             } else {
@@ -4571,6 +4612,7 @@ impl Connection {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     })
                     .collect()
             };
@@ -4581,6 +4623,7 @@ impl Connection {
                 root_page,
                 columns: col_infos,
                 indexes: Vec::new(),
+                strict: false,
             });
             materialized.push(view.name.clone());
 
@@ -4672,6 +4715,7 @@ impl Connection {
                 root_page,
                 columns: virtual_columns.clone(),
                 indexes: Vec::new(),
+                strict: false,
             });
 
             if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
@@ -5746,6 +5790,85 @@ impl Connection {
             }
             "fsqlite.trace_reset" | "trace_reset" => {
                 reset_trace_metrics();
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Text("ok".into())],
+                }])
+            }
+            "fsqlite.io_uring_stats" | "io_uring_stats" | "fsqlite_io_uring_stats" => {
+                let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                let usize_to_i64 = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+                let snapshot = io_uring_latency_snapshot();
+                Ok(vec![
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("read_samples_total".into()),
+                            SqliteValue::Integer(to_i64(snapshot.read_samples_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("write_samples_total".into()),
+                            SqliteValue::Integer(to_i64(snapshot.write_samples_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("unix_fallbacks_total".into()),
+                            SqliteValue::Integer(to_i64(snapshot.unix_fallbacks_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("read_tail_violations_total".into()),
+                            SqliteValue::Integer(to_i64(snapshot.read_tail_violations_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("write_tail_violations_total".into()),
+                            SqliteValue::Integer(to_i64(snapshot.write_tail_violations_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("read_window_size".into()),
+                            SqliteValue::Integer(usize_to_i64(snapshot.read_window_len)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("write_window_size".into()),
+                            SqliteValue::Integer(usize_to_i64(snapshot.write_window_len)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("read_p99_latency_us".into()),
+                            SqliteValue::Integer(to_i64(snapshot.read_p99_latency_us)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("write_p99_latency_us".into()),
+                            SqliteValue::Integer(to_i64(snapshot.write_p99_latency_us)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("read_conformal_upper_bound_us".into()),
+                            SqliteValue::Integer(to_i64(snapshot.read_conformal_upper_bound_us)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("write_conformal_upper_bound_us".into()),
+                            SqliteValue::Integer(to_i64(snapshot.write_conformal_upper_bound_us)),
+                        ],
+                    },
+                ])
+            }
+            "fsqlite.io_uring_reset" | "io_uring_reset" | "fsqlite_io_uring_reset" => {
+                reset_io_uring_latency_metrics();
                 Ok(vec![Row {
                     values: vec![SqliteValue::Text("ok".into())],
                 }])
@@ -7106,6 +7229,7 @@ impl Connection {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     })
                     .collect();
                 let num_columns = col_infos.len();
@@ -7115,6 +7239,7 @@ impl Connection {
                     root_page,
                     columns: col_infos,
                     indexes: Vec::new(),
+                    strict: false,
                 });
                 temp_names.push(cte_name.clone());
                 for (i, row) in cte_rows.iter().enumerate() {
@@ -7177,6 +7302,7 @@ impl Connection {
                 type_name: None,
                 notnull: false,
                 default_value: None,
+                strict_type: None,
             })
             .collect();
         let num_columns = col_infos.len();
@@ -7186,6 +7312,7 @@ impl Connection {
             root_page,
             columns: col_infos,
             indexes: Vec::new(),
+            strict: false,
         });
         temp_names.push(cte_name.clone());
 
@@ -7910,6 +8037,7 @@ impl Connection {
                 root_page: real_root_page,
                 columns,
                 indexes: Vec::new(),
+                strict: crate::compat_persist::is_strict_table_sql(&create_sql),
             });
 
             // Read all rows from this table's B-tree.
@@ -8344,6 +8472,7 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             type_name: None,
             notnull: false,
             default_value: None,
+            strict_type: None,
         });
     }
 
@@ -8355,6 +8484,7 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             type_name: None,
             notnull: false,
             default_value: None,
+            strict_type: None,
         });
     }
 
@@ -8405,6 +8535,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             type_name: None,
             notnull: false,
             default_value: None,
+            strict_type: None,
         },
         ColumnInfo {
             name: "name".to_owned(),
@@ -8413,6 +8544,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             type_name: None,
             notnull: false,
             default_value: None,
+            strict_type: None,
         },
         ColumnInfo {
             name: "tbl_name".to_owned(),
@@ -8421,6 +8553,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             type_name: None,
             notnull: false,
             default_value: None,
+            strict_type: None,
         },
         ColumnInfo {
             name: "rootpage".to_owned(),
@@ -8429,6 +8562,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             type_name: None,
             notnull: false,
             default_value: None,
+            strict_type: None,
         },
         ColumnInfo {
             name: "sql".to_owned(),
@@ -8437,6 +8571,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             type_name: None,
             notnull: false,
             default_value: None,
+            strict_type: None,
         },
     ]
 }
@@ -8454,7 +8589,8 @@ fn render_create_table_sql(table: &TableSchema) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("CREATE TABLE {} ({column_defs})", table.name)
+    let strict_suffix = if table.strict { " STRICT" } else { "" };
+    format!("CREATE TABLE {} ({column_defs}){strict_suffix}", table.name)
 }
 
 fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
@@ -14188,6 +14324,70 @@ mod tests {
     }
 
     #[test]
+    fn test_create_table_strict_requires_supported_declared_types() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE strict_ok (id INTEGER, body TEXT, payload ANY) STRICT;")
+            .expect("valid STRICT type set should be accepted");
+
+        let missing_type = conn
+            .execute("CREATE TABLE strict_missing (id) STRICT;")
+            .expect_err("STRICT column without declared type must fail");
+        assert!(
+            matches!(missing_type, FrankenError::Internal(msg) if msg.contains("must declare a type"))
+        );
+
+        let invalid_type = conn
+            .execute("CREATE TABLE strict_invalid (id VARCHAR) STRICT;")
+            .expect_err("unsupported STRICT type must fail");
+        assert!(
+            matches!(invalid_type, FrankenError::Internal(msg) if msg.contains("invalid type"))
+        );
+    }
+
+    #[test]
+    fn test_insert_enforces_strict_column_types() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE strict_types (i INTEGER, r REAL, t TEXT, b BLOB, a ANY) STRICT;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO strict_types VALUES (1, 2.5, 'ok', X'AA', 99);")
+            .expect("matching STRICT storage classes should succeed");
+        conn.execute("INSERT INTO strict_types VALUES (2, 7, 'coerce', X'BB', 'any text');")
+            .expect("INTEGER input should be accepted for REAL in STRICT mode");
+
+        let rows = conn
+            .query("SELECT r FROM strict_types WHERE i = 2;")
+            .expect("query should succeed");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Float(7.0)]);
+
+        let err = conn
+            .execute("INSERT INTO strict_types VALUES ('bad', 1.0, 'oops', X'CC', 1);")
+            .expect_err("TEXT value in INTEGER STRICT column must fail");
+        assert!(
+            matches!(err, FrankenError::Internal(msg) if msg.contains("STRICT type check failed"))
+        );
+    }
+
+    #[test]
+    fn test_alter_table_add_column_honors_strict_types() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE strict_alter (id INTEGER) STRICT;")
+            .unwrap();
+
+        conn.execute("ALTER TABLE strict_alter ADD COLUMN note TEXT;")
+            .expect("supported STRICT type should succeed");
+
+        let err = conn
+            .execute("ALTER TABLE strict_alter ADD COLUMN bad NUMERIC;")
+            .expect_err("unsupported STRICT type must fail");
+        assert!(matches!(err, FrankenError::Internal(msg) if msg.contains("invalid type")));
+    }
+
+    #[test]
     fn test_drop_table_removes_table_and_allows_recreate() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t_drop (x INTEGER);").unwrap();
@@ -14756,8 +14956,7 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute("UPDATE t SET id = id WHERE id = 1;")
-            .unwrap();
+        conn.execute("UPDATE t SET id = id WHERE id = 1;").unwrap();
 
         let rows = conn.query("SELECT msg FROM log;").unwrap();
         assert!(
@@ -23462,6 +23661,75 @@ mod schema_loading_tests {
             snapshot.fsqlite_trace_export_errors_total, 0,
             "trace_reset should clear export error counter"
         );
+    }
+
+    #[test]
+    fn test_pragma_io_uring_stats_and_reset() {
+        let conn = Connection::open(":memory:").unwrap();
+        fsqlite_observability::reset_io_uring_latency_metrics();
+
+        let _ = fsqlite_observability::record_io_uring_read_latency(
+            std::time::Duration::from_micros(40),
+        );
+        let _ = fsqlite_observability::record_io_uring_write_latency(
+            std::time::Duration::from_micros(85),
+        );
+        fsqlite_observability::record_io_uring_unix_fallback();
+
+        let stats = txn_metrics_map(&conn.query("PRAGMA fsqlite.io_uring_stats;").unwrap());
+        assert_eq!(stats.get("read_samples_total"), Some(&1));
+        assert_eq!(stats.get("write_samples_total"), Some(&1));
+        assert_eq!(stats.get("unix_fallbacks_total"), Some(&1));
+        assert!(
+            stats
+                .get("read_p99_latency_us")
+                .copied()
+                .unwrap_or_default()
+                >= 40,
+            "read p99 should include recorded latency"
+        );
+        assert!(
+            stats
+                .get("write_p99_latency_us")
+                .copied()
+                .unwrap_or_default()
+                >= 85,
+            "write p99 should include recorded latency"
+        );
+        assert!(
+            stats
+                .get("read_conformal_upper_bound_us")
+                .copied()
+                .unwrap_or_default()
+                >= stats
+                    .get("read_p99_latency_us")
+                    .copied()
+                    .unwrap_or_default()
+        );
+        assert!(
+            stats
+                .get("write_conformal_upper_bound_us")
+                .copied()
+                .unwrap_or_default()
+                >= stats
+                    .get("write_p99_latency_us")
+                    .copied()
+                    .unwrap_or_default()
+        );
+
+        let reset_rows = conn.query("PRAGMA io_uring_reset;").unwrap();
+        assert_eq!(reset_rows.len(), 1);
+        assert_eq!(
+            *reset_rows[0].get(0).unwrap(),
+            SqliteValue::Text("ok".to_owned())
+        );
+
+        let after_reset = txn_metrics_map(&conn.query("PRAGMA io_uring_stats;").unwrap());
+        assert_eq!(after_reset.get("read_samples_total"), Some(&0));
+        assert_eq!(after_reset.get("write_samples_total"), Some(&0));
+        assert_eq!(after_reset.get("unix_fallbacks_total"), Some(&0));
+        assert_eq!(after_reset.get("read_tail_violations_total"), Some(&0));
+        assert_eq!(after_reset.get("write_tail_violations_total"), Some(&0));
     }
 
     #[test]

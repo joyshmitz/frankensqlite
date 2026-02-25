@@ -428,7 +428,10 @@ impl<'a> Resolver<'a> {
                         }
                     }
                     match &upsert.action {
-                        fsqlite_ast::UpsertAction::Update { assignments, where_clause } => {
+                        fsqlite_ast::UpsertAction::Update {
+                            assignments,
+                            where_clause,
+                        } => {
                             for assignment in assignments {
                                 self.resolve_expr(&assignment.value, scope);
                             }
@@ -647,7 +650,9 @@ impl<'a> Resolver<'a> {
 
                 scope.add_alias(alias_name, "<subquery>", None);
             }
-            TableOrSubquery::TableFunction { name, args, alias, .. } => {
+            TableOrSubquery::TableFunction {
+                name, args, alias, ..
+            } => {
                 for arg in args {
                     self.resolve_expr(arg, scope);
                 }
@@ -772,7 +777,11 @@ impl<'a> Resolver<'a> {
                 self.resolve_select(select, &mut child);
             }
             Expr::FunctionCall {
-                name, args, filter, over, ..
+                name,
+                args,
+                filter,
+                over,
+                ..
             } => {
                 let arg_slice: &[Expr] = match args {
                     FunctionArgs::Star => &[],

@@ -13,9 +13,10 @@
 //! - **Shared foundation:** Types defined here are reused by downstream
 //!   observability beads (bd-t6sv2.2, .3, .5, .6, .8, .12).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fsqlite_types::{CommitSeq, PageNumber, TxnId, TxnToken};
 use parking_lot::Mutex;
@@ -96,6 +97,254 @@ pub fn reset_trace_metrics() {
     FSQLITE_TRACE_SPANS_TOTAL.store(0, Ordering::Relaxed);
     FSQLITE_TRACE_EXPORT_ERRORS_TOTAL.store(0, Ordering::Relaxed);
     FSQLITE_COMPAT_TRACE_CALLBACKS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// io_uring latency telemetry + conformal bound signal (bd-al1)
+// ---------------------------------------------------------------------------
+
+const IO_URING_LATENCY_WINDOW_CAPACITY: usize = 1024;
+const P99_NUMERATOR: usize = 99;
+const P99_DENOMINATOR: usize = 100;
+
+/// Global io_uring latency metrics singleton.
+pub static GLOBAL_IO_URING_LATENCY_METRICS: LazyLock<IoUringLatencyMetrics> =
+    LazyLock::new(|| IoUringLatencyMetrics::new(IO_URING_LATENCY_WINDOW_CAPACITY));
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IoUringLatencySnapshot {
+    pub read_samples_total: u64,
+    pub write_samples_total: u64,
+    pub unix_fallbacks_total: u64,
+    pub read_tail_violations_total: u64,
+    pub write_tail_violations_total: u64,
+    pub window_capacity: usize,
+    pub read_window_len: usize,
+    pub write_window_len: usize,
+    pub read_p99_latency_us: u64,
+    pub write_p99_latency_us: u64,
+    pub read_conformal_upper_bound_us: u64,
+    pub write_conformal_upper_bound_us: u64,
+}
+
+#[derive(Default)]
+struct IoLatencySeries {
+    latencies_ns: VecDeque<u64>,
+    nonconformity_ns: VecDeque<u64>,
+}
+
+impl IoLatencySeries {
+    fn push(&mut self, sample_ns: u64, sample_capacity: usize) {
+        let baseline = self.p99_latency_ns().unwrap_or(sample_ns);
+        let score = sample_ns.saturating_sub(baseline);
+        push_bounded(&mut self.latencies_ns, sample_ns, sample_capacity);
+        push_bounded(&mut self.nonconformity_ns, score, sample_capacity);
+    }
+
+    fn p99_latency_ns(&self) -> Option<u64> {
+        quantile_from_deque(&self.latencies_ns, P99_NUMERATOR, P99_DENOMINATOR)
+    }
+
+    fn conformal_upper_bound_ns(&self) -> Option<u64> {
+        let baseline = self.p99_latency_ns()?;
+        let q = conformal_quantile(&self.nonconformity_ns)?;
+        Some(baseline.saturating_add(q))
+    }
+
+    fn reset(&mut self) {
+        self.latencies_ns.clear();
+        self.nonconformity_ns.clear();
+    }
+}
+
+#[derive(Default)]
+struct IoUringLatencyWindow {
+    read: IoLatencySeries,
+    write: IoLatencySeries,
+}
+
+pub struct IoUringLatencyMetrics {
+    pub read_samples_total: AtomicU64,
+    pub write_samples_total: AtomicU64,
+    pub unix_fallbacks_total: AtomicU64,
+    pub read_tail_violations_total: AtomicU64,
+    pub write_tail_violations_total: AtomicU64,
+    sample_capacity: usize,
+    window: Mutex<IoUringLatencyWindow>,
+}
+
+impl IoUringLatencyMetrics {
+    #[must_use]
+    pub const fn new(sample_capacity: usize) -> Self {
+        Self {
+            read_samples_total: AtomicU64::new(0),
+            write_samples_total: AtomicU64::new(0),
+            unix_fallbacks_total: AtomicU64::new(0),
+            read_tail_violations_total: AtomicU64::new(0),
+            write_tail_violations_total: AtomicU64::new(0),
+            sample_capacity,
+            window: Mutex::new(IoUringLatencyWindow {
+                read: IoLatencySeries {
+                    latencies_ns: VecDeque::new(),
+                    nonconformity_ns: VecDeque::new(),
+                },
+                write: IoLatencySeries {
+                    latencies_ns: VecDeque::new(),
+                    nonconformity_ns: VecDeque::new(),
+                },
+            }),
+        }
+    }
+
+    pub fn record_read_latency(&self, latency: Duration) -> bool {
+        self.read_samples_total.fetch_add(1, Ordering::Relaxed);
+        let sample_ns = duration_to_nanos_saturated(latency);
+        let mut window = self.window.lock();
+        let prior_bound = window.read.conformal_upper_bound_ns();
+        window.read.push(sample_ns, self.sample_capacity);
+        let is_tail_violation = prior_bound.is_some_and(|bound| sample_ns > bound);
+        if is_tail_violation {
+            self.read_tail_violations_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        is_tail_violation
+    }
+
+    pub fn record_write_latency(&self, latency: Duration) -> bool {
+        self.write_samples_total.fetch_add(1, Ordering::Relaxed);
+        let sample_ns = duration_to_nanos_saturated(latency);
+        let mut window = self.window.lock();
+        let prior_bound = window.write.conformal_upper_bound_ns();
+        window.write.push(sample_ns, self.sample_capacity);
+        let is_tail_violation = prior_bound.is_some_and(|bound| sample_ns > bound);
+        if is_tail_violation {
+            self.write_tail_violations_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        is_tail_violation
+    }
+
+    pub fn record_unix_fallback(&self) {
+        self.unix_fallbacks_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> IoUringLatencySnapshot {
+        let window = self.window.lock();
+
+        IoUringLatencySnapshot {
+            read_samples_total: self.read_samples_total.load(Ordering::Relaxed),
+            write_samples_total: self.write_samples_total.load(Ordering::Relaxed),
+            unix_fallbacks_total: self.unix_fallbacks_total.load(Ordering::Relaxed),
+            read_tail_violations_total: self.read_tail_violations_total.load(Ordering::Relaxed),
+            write_tail_violations_total: self.write_tail_violations_total.load(Ordering::Relaxed),
+            window_capacity: self.sample_capacity,
+            read_window_len: window.read.latencies_ns.len(),
+            write_window_len: window.write.latencies_ns.len(),
+            read_p99_latency_us: nanos_to_micros(window.read.p99_latency_ns().unwrap_or(0)),
+            write_p99_latency_us: nanos_to_micros(window.write.p99_latency_ns().unwrap_or(0)),
+            read_conformal_upper_bound_us: nanos_to_micros(
+                window.read.conformal_upper_bound_ns().unwrap_or(0),
+            ),
+            write_conformal_upper_bound_us: nanos_to_micros(
+                window.write.conformal_upper_bound_ns().unwrap_or(0),
+            ),
+        }
+    }
+
+    pub fn reset(&self) {
+        self.read_samples_total.store(0, Ordering::Relaxed);
+        self.write_samples_total.store(0, Ordering::Relaxed);
+        self.unix_fallbacks_total.store(0, Ordering::Relaxed);
+        self.read_tail_violations_total.store(0, Ordering::Relaxed);
+        self.write_tail_violations_total.store(0, Ordering::Relaxed);
+        let mut window = self.window.lock();
+        window.read.reset();
+        window.write.reset();
+    }
+}
+
+impl Default for IoUringLatencyMetrics {
+    fn default() -> Self {
+        Self::new(IO_URING_LATENCY_WINDOW_CAPACITY)
+    }
+}
+
+pub fn record_io_uring_read_latency(latency: Duration) -> bool {
+    GLOBAL_IO_URING_LATENCY_METRICS.record_read_latency(latency)
+}
+
+pub fn record_io_uring_write_latency(latency: Duration) -> bool {
+    GLOBAL_IO_URING_LATENCY_METRICS.record_write_latency(latency)
+}
+
+pub fn record_io_uring_unix_fallback() {
+    GLOBAL_IO_URING_LATENCY_METRICS.record_unix_fallback();
+}
+
+#[must_use]
+pub fn io_uring_latency_snapshot() -> IoUringLatencySnapshot {
+    GLOBAL_IO_URING_LATENCY_METRICS.snapshot()
+}
+
+pub fn reset_io_uring_latency_metrics() {
+    GLOBAL_IO_URING_LATENCY_METRICS.reset();
+}
+
+fn push_bounded(buffer: &mut VecDeque<u64>, value: u64, sample_capacity: usize) {
+    if sample_capacity == 0 {
+        return;
+    }
+    if buffer.len() == sample_capacity {
+        let _ = buffer.pop_front();
+    }
+    buffer.push_back(value);
+}
+
+fn quantile_from_deque(
+    values: &VecDeque<u64>,
+    numerator: usize,
+    denominator: usize,
+) -> Option<u64> {
+    if values.is_empty() || denominator == 0 {
+        return None;
+    }
+
+    let mut sorted: Vec<u64> = values.iter().copied().collect();
+    sorted.sort_unstable();
+
+    let n = sorted.len();
+    let rank = numerator
+        .saturating_mul(n)
+        .div_ceil(denominator)
+        .saturating_sub(1)
+        .min(n.saturating_sub(1));
+    sorted.get(rank).copied()
+}
+
+fn conformal_quantile(nonconformity: &VecDeque<u64>) -> Option<u64> {
+    if nonconformity.is_empty() {
+        return None;
+    }
+
+    let mut sorted: Vec<u64> = nonconformity.iter().copied().collect();
+    sorted.sort_unstable();
+
+    let n = sorted.len();
+    let rank = P99_NUMERATOR
+        .saturating_mul(n.saturating_add(1))
+        .div_ceil(P99_DENOMINATOR)
+        .saturating_sub(1)
+        .min(n.saturating_sub(1));
+    sorted.get(rank).copied()
+}
+
+fn nanos_to_micros(nanos: u64) -> u64 {
+    nanos / 1_000
+}
+
+fn duration_to_nanos_saturated(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,6 +1480,54 @@ mod tests {
         assert_eq!(reset.fsqlite_trace_spans_total, 0);
         assert_eq!(reset.fsqlite_trace_export_errors_total, 0);
         assert_eq!(reset.fsqlite_compat_trace_callbacks_total, 0);
+    }
+
+    #[test]
+    fn io_uring_latency_snapshot_and_reset() {
+        reset_io_uring_latency_metrics();
+
+        record_io_uring_read_latency(Duration::from_micros(40));
+        record_io_uring_read_latency(Duration::from_micros(125));
+        record_io_uring_write_latency(Duration::from_micros(55));
+        record_io_uring_unix_fallback();
+
+        let snapshot = io_uring_latency_snapshot();
+        assert_eq!(snapshot.read_samples_total, 2);
+        assert_eq!(snapshot.write_samples_total, 1);
+        assert_eq!(snapshot.unix_fallbacks_total, 1);
+        assert!(snapshot.read_tail_violations_total <= snapshot.read_samples_total);
+        assert!(snapshot.write_tail_violations_total <= snapshot.write_samples_total);
+        assert!(snapshot.read_p99_latency_us >= 125);
+        assert!(snapshot.write_p99_latency_us >= 55);
+        assert!(snapshot.read_conformal_upper_bound_us >= snapshot.read_p99_latency_us);
+        assert!(snapshot.write_conformal_upper_bound_us >= snapshot.write_p99_latency_us);
+
+        reset_io_uring_latency_metrics();
+        let reset = io_uring_latency_snapshot();
+        assert_eq!(reset.read_samples_total, 0);
+        assert_eq!(reset.write_samples_total, 0);
+        assert_eq!(reset.unix_fallbacks_total, 0);
+        assert_eq!(reset.read_tail_violations_total, 0);
+        assert_eq!(reset.write_tail_violations_total, 0);
+        assert_eq!(reset.read_window_len, 0);
+        assert_eq!(reset.write_window_len, 0);
+    }
+
+    #[test]
+    fn io_uring_latency_conformal_upper_bound_is_tail_safe() {
+        let metrics = IoUringLatencyMetrics::new(16);
+        let mut saw_violation = false;
+        for latency in [20_u64, 22, 21, 23, 20, 24, 26, 200] {
+            if metrics.record_read_latency(Duration::from_micros(latency)) {
+                saw_violation = true;
+            }
+        }
+
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.read_p99_latency_us >= 200);
+        assert!(snapshot.read_conformal_upper_bound_us >= snapshot.read_p99_latency_us);
+        assert!(saw_violation);
+        assert!(snapshot.read_tail_violations_total >= 1);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::{PageNumber, PageSize};
+use fsqlite_types::{PageNumber, PageSize, StrictColumnType};
 use fsqlite_vdbe::codegen::{ColumnInfo, TableSchema};
 use fsqlite_vdbe::engine::MemDatabase;
 #[cfg(unix)]
@@ -277,6 +277,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
             root_page: real_root_page,
             columns,
             indexes: Vec::new(),
+            strict: is_strict_table_sql(&create_sql),
         });
 
         // Read all rows from this table's B-tree.
@@ -369,6 +370,9 @@ pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
         }
     }
     sql.push(')');
+    if table.strict {
+        sql.push_str(" STRICT");
+    }
     sql
 }
 
@@ -433,6 +437,7 @@ const fn affinity_char_to_type(affinity: char) -> &'static str {
 /// Extracts column names and affinities from the column definitions.
 /// Used by `load_from_sqlite` and `reload_memdb_from_pager` (bd-1ene).
 pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
+    let is_strict = is_strict_table_sql(sql);
     // Find the parenthesized column list.
     let Some(open) = sql.find('(') else {
         return Vec::new();
@@ -458,21 +463,51 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
             let affinity = type_to_affinity(&type_decl);
             let upper = col_def.to_ascii_uppercase();
             let is_ipk = upper.contains("PRIMARY KEY") && type_decl.eq_ignore_ascii_case("INTEGER");
+            let type_name = if type_decl.is_empty() {
+                None
+            } else {
+                Some(type_decl)
+            };
+            let strict_type = if is_strict {
+                type_name
+                    .as_deref()
+                    .and_then(StrictColumnType::from_type_name)
+            } else {
+                None
+            };
 
             Some(ColumnInfo {
                 name,
                 affinity,
                 is_ipk,
-                type_name: if type_decl.is_empty() {
-                    None
-                } else {
-                    Some(type_decl)
-                },
+                type_name,
                 notnull: upper.contains("NOT NULL"),
                 default_value: None,
+                strict_type,
             })
         })
         .collect()
+}
+
+/// Return true when CREATE TABLE SQL declares the table as STRICT.
+#[must_use]
+pub fn is_strict_table_sql(sql: &str) -> bool {
+    let Some(close_paren) = sql.rfind(')') else {
+        return false;
+    };
+    let tail = &sql[close_paren + 1..];
+    let mut token = String::new();
+    for ch in tail.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch.to_ascii_uppercase());
+        } else if !token.is_empty() {
+            if token == "STRICT" {
+                return true;
+            }
+            token.clear();
+        }
+    }
+    token == "STRICT"
 }
 
 fn parse_column_name_and_remainder(def: &str) -> Option<(String, &str)> {
@@ -698,6 +733,7 @@ mod tests {
                     type_name: None,
                     notnull: false,
                     default_value: None,
+                    strict_type: None,
                 },
                 ColumnInfo {
                     name: "name".to_owned(),
@@ -706,9 +742,11 @@ mod tests {
                     type_name: None,
                     notnull: false,
                     default_value: None,
+                    strict_type: None,
                 },
             ],
             indexes: Vec::new(),
+            strict: false,
         }];
 
         (schema, db)
@@ -854,8 +892,10 @@ mod tests {
                     type_name: None,
                     notnull: false,
                     default_value: None,
+                    strict_type: None,
                 }],
                 indexes: Vec::new(),
+                strict: false,
             },
             TableSchema {
                 name: "beta".to_owned(),
@@ -867,8 +907,10 @@ mod tests {
                     type_name: None,
                     notnull: false,
                     default_value: None,
+                    strict_type: None,
                 }],
                 indexes: Vec::new(),
+                strict: false,
             },
         ];
 
@@ -942,6 +984,56 @@ mod tests {
         assert_eq!(cols[1].affinity, 'D');
         assert_eq!(cols[2].name, "role name");
         assert_eq!(cols[2].affinity, 'C');
+    }
+
+    #[test]
+    fn test_build_create_table_sql_appends_strict_keyword() {
+        let table = TableSchema {
+            name: "strict_table".to_owned(),
+            root_page: 2,
+            columns: vec![ColumnInfo {
+                name: "id".to_owned(),
+                affinity: 'D',
+                is_ipk: false,
+                type_name: Some("INTEGER".to_owned()),
+                notnull: false,
+                default_value: None,
+                strict_type: Some(StrictColumnType::Integer),
+            }],
+            indexes: Vec::new(),
+            strict: true,
+        };
+
+        let sql = build_create_table_sql(&table);
+        assert!(
+            sql.ends_with(" STRICT"),
+            "STRICT tables must round-trip with STRICT suffix: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_is_strict_table_sql_detects_strict_options() {
+        assert!(is_strict_table_sql(
+            "CREATE TABLE s (id INTEGER, body TEXT) STRICT"
+        ));
+        assert!(is_strict_table_sql(
+            "CREATE TABLE s (id INTEGER) WITHOUT ROWID, STRICT;"
+        ));
+        assert!(!is_strict_table_sql(
+            "CREATE TABLE s (id INTEGER, body TEXT) WITHOUT ROWID"
+        ));
+    }
+
+    #[test]
+    fn test_parse_columns_from_create_sql_populates_strict_types() {
+        let sql = "CREATE TABLE strict_cols (id INTEGER, score REAL, body TEXT, payload BLOB, any_col ANY) STRICT";
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols.len(), 5);
+        assert_eq!(cols[0].strict_type, Some(StrictColumnType::Integer));
+        assert_eq!(cols[1].strict_type, Some(StrictColumnType::Real));
+        assert_eq!(cols[2].strict_type, Some(StrictColumnType::Text));
+        assert_eq!(cols[3].strict_type, Some(StrictColumnType::Blob));
+        assert_eq!(cols[4].strict_type, Some(StrictColumnType::Any));
     }
 
     #[test]

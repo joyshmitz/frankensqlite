@@ -95,12 +95,12 @@ pub mod cap {
     >;
 
     impl<
-            const SPAWN: bool,
-            const TIME: bool,
-            const RANDOM: bool,
-            const IO: bool,
-            const REMOTE: bool,
-        > sealed::Sealed for CapSet<SPAWN, TIME, RANDOM, IO, REMOTE>
+        const SPAWN: bool,
+        const TIME: bool,
+        const RANDOM: bool,
+        const IO: bool,
+        const REMOTE: bool,
+    > sealed::Sealed for CapSet<SPAWN, TIME, RANDOM, IO, REMOTE>
     {
     }
 
@@ -116,17 +116,17 @@ pub mod cap {
     pub trait SubsetOf<Super>: sealed::Sealed {}
 
     impl<
-            const S_SPAWN: bool,
-            const S_TIME: bool,
-            const S_RANDOM: bool,
-            const S_IO: bool,
-            const S_REMOTE: bool,
-            const P_SPAWN: bool,
-            const P_TIME: bool,
-            const P_RANDOM: bool,
-            const P_IO: bool,
-            const P_REMOTE: bool,
-        > SubsetOf<CapSet<P_SPAWN, P_TIME, P_RANDOM, P_IO, P_REMOTE>>
+        const S_SPAWN: bool,
+        const S_TIME: bool,
+        const S_RANDOM: bool,
+        const S_IO: bool,
+        const S_REMOTE: bool,
+        const P_SPAWN: bool,
+        const P_TIME: bool,
+        const P_RANDOM: bool,
+        const P_IO: bool,
+        const P_REMOTE: bool,
+    > SubsetOf<CapSet<P_SPAWN, P_TIME, P_RANDOM, P_IO, P_REMOTE>>
         for CapSet<S_SPAWN, S_TIME, S_RANDOM, S_IO, S_REMOTE>
     where
         (sealed::Bit<S_SPAWN>, sealed::Bit<P_SPAWN>): sealed::Le,

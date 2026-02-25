@@ -8,8 +8,8 @@
 //! **Invariant:** All functions in this module are non-blocking. They must
 //! never acquire page locks or block writers.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use fsqlite_observability::{ConflictEvent, ConflictObserver, SsiAbortCategory};

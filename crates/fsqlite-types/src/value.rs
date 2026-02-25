@@ -1036,12 +1036,16 @@ mod tests {
         assert!(val.validate_strict(StrictColumnType::Blob).is_ok());
 
         // NULL into any STRICT column: ok (nullability enforced separately).
-        assert!(SqliteValue::Null
-            .validate_strict(StrictColumnType::Integer)
-            .is_ok());
-        assert!(SqliteValue::Null
-            .validate_strict(StrictColumnType::Text)
-            .is_ok());
+        assert!(
+            SqliteValue::Null
+                .validate_strict(StrictColumnType::Integer)
+                .is_ok()
+        );
+        assert!(
+            SqliteValue::Null
+                .validate_strict(StrictColumnType::Text)
+                .is_ok()
+        );
 
         // ANY accepts everything.
         let val = SqliteValue::Integer(42);
@@ -1061,24 +1065,32 @@ mod tests {
     #[test]
     fn test_strict_rejects_wrong_storage_classes() {
         // REAL into INTEGER column: rejected.
-        assert!(SqliteValue::Float(3.14)
-            .validate_strict(StrictColumnType::Integer)
-            .is_err());
+        assert!(
+            SqliteValue::Float(3.14)
+                .validate_strict(StrictColumnType::Integer)
+                .is_err()
+        );
 
         // BLOB into TEXT column: rejected.
-        assert!(SqliteValue::Blob(vec![1])
-            .validate_strict(StrictColumnType::Text)
-            .is_err());
+        assert!(
+            SqliteValue::Blob(vec![1])
+                .validate_strict(StrictColumnType::Text)
+                .is_err()
+        );
 
         // INTEGER into TEXT column: rejected.
-        assert!(SqliteValue::Integer(1)
-            .validate_strict(StrictColumnType::Text)
-            .is_err());
+        assert!(
+            SqliteValue::Integer(1)
+                .validate_strict(StrictColumnType::Text)
+                .is_err()
+        );
 
         // TEXT into BLOB column: rejected.
-        assert!(SqliteValue::Text("x".into())
-            .validate_strict(StrictColumnType::Blob)
-            .is_err());
+        assert!(
+            SqliteValue::Text("x".into())
+                .validate_strict(StrictColumnType::Blob)
+                .is_err()
+        );
     }
 
     #[test]

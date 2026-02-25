@@ -63,7 +63,7 @@ file.close(&cx).unwrap();
 - `fsqlite-types` -- Shared type definitions (`LockLevel`, `VfsOpenFlags`, `SyncFlags`, `Cx`).
 - `fsqlite-error` -- Unified error/result types.
 - `nix`, `libc` -- POSIX syscall bindings (Unix builds).
-- `uring-fs`, `pollster` -- io_uring support (Linux builds).
+- `asupersync`, `pollster` -- homegrown io_uring runtime integration (Linux builds).
 - `advisory-lock` -- File locking (Windows builds).
 
 ## License

@@ -13,6 +13,7 @@ use fsqlite_ast::{
     SelectCore, SelectStatement, SortDirection, Statement, TableOrSubquery, UpdateStatement,
 };
 use fsqlite_parser::Parser as SqlParser;
+use fsqlite_types::StrictColumnType;
 use fsqlite_types::opcode::{Opcode, P4};
 
 // ---------------------------------------------------------------------------
@@ -91,6 +92,8 @@ pub struct ColumnInfo {
     pub notnull: bool,
     /// Default value expression as SQL text (e.g. "'open'", "0", "CURRENT_TIMESTAMP").
     pub default_value: Option<String>,
+    /// Strict type for STRICT tables; `None` for non-STRICT tables.
+    pub strict_type: Option<StrictColumnType>,
 }
 
 impl ColumnInfo {
@@ -104,6 +107,7 @@ impl ColumnInfo {
             type_name: None,
             notnull: false,
             default_value: None,
+            strict_type: None,
         }
     }
 }
@@ -130,6 +134,8 @@ pub struct TableSchema {
     pub columns: Vec<ColumnInfo>,
     /// Available indexes.
     pub indexes: Vec<IndexSchema>,
+    /// Whether this table uses SQLite STRICT typing rules.
+    pub strict: bool,
 }
 
 impl TableSchema {
@@ -156,6 +162,45 @@ impl TableSchema {
                 .first()
                 .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
         })
+    }
+
+    /// STRICT type-check pattern for `Opcode::TypeCheck` (`I`,`R`,`T`,`L`,`A`).
+    #[must_use]
+    pub fn strict_type_pattern(&self) -> Option<String> {
+        if !self.strict {
+            return None;
+        }
+        Some(
+            self.columns
+                .iter()
+                .map(|col| strict_type_code(col.strict_type))
+                .collect(),
+        )
+    }
+}
+
+fn strict_type_code(strict_type: Option<StrictColumnType>) -> char {
+    match strict_type.unwrap_or(StrictColumnType::Any) {
+        StrictColumnType::Integer => 'I',
+        StrictColumnType::Real => 'R',
+        StrictColumnType::Text => 'T',
+        StrictColumnType::Blob => 'L',
+        StrictColumnType::Any => 'A',
+    }
+}
+
+fn emit_strict_type_check(b: &mut ProgramBuilder, table: &TableSchema, first_reg: i32) {
+    if let Some(pattern) = table.strict_type_pattern() {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let n_cols = table.columns.len() as i32;
+        b.emit_op(
+            Opcode::TypeCheck,
+            first_reg,
+            n_cols,
+            0,
+            P4::Affinity(pattern),
+            0,
+        );
     }
 }
 
@@ -786,7 +831,39 @@ pub fn codegen_select(
             end_label,
         );
     } else if !stmt.order_by.is_empty() {
-        // --- Full table scan with ORDER BY ---
+        if let Some(index_plan) = resolve_order_by_index_plan(
+            table,
+            table_alias,
+            columns,
+            where_clause.as_deref(),
+            &stmt.order_by,
+            distinct,
+        ) {
+            tracing::info!(
+                table = %table.name,
+                index = %index_plan.index_name,
+                covering = index_plan.covering_output.is_some(),
+                descending = index_plan.descending,
+                "vdbe.order_by.index_bypass"
+            );
+            return codegen_select_index_ordered_scan(
+                b,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                columns,
+                where_clause.as_deref(),
+                stmt.limit.as_ref(),
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+                &index_plan,
+            );
+        }
+
+        // --- Full table scan with ORDER BY (sorter path) ---
         return codegen_select_ordered_scan(
             b,
             cursor,
@@ -940,6 +1017,149 @@ fn codegen_select_full_scan(
     // End target for Init jump.
     b.resolve_label(end_label);
 
+    Ok(())
+}
+
+fn emit_covering_output_reads(
+    b: &mut ProgramBuilder,
+    index_cursor: i32,
+    rowid_reg: i32,
+    sources: &[CoveringOutputSource],
+    out_regs: i32,
+) {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (offset, source) in sources.iter().enumerate() {
+        let target_reg = out_regs + offset as i32;
+        match source {
+            CoveringOutputSource::IndexColumn(index_col) => {
+                b.emit_op(
+                    Opcode::Column,
+                    index_cursor,
+                    *index_col,
+                    target_reg,
+                    P4::None,
+                    0,
+                );
+            }
+            CoveringOutputSource::Rowid => {
+                b.emit_op(Opcode::Copy, rowid_reg, target_reg, 0, P4::None, 0);
+            }
+        }
+    }
+}
+
+/// Generate VDBE bytecode for an ORDER BY scan that can stream rows directly
+/// from an index in sorted order (no sorter temp B-tree).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_index_ordered_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    index_plan: &OrderByIndexPlan,
+) -> Result<(), CodegenError> {
+    let index_cursor = cursor + 1;
+    let needs_table_lookup = index_plan.covering_output.is_none() || where_clause.is_some();
+
+    // Allocate LIMIT/OFFSET counter registers (if present).
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+
+    if needs_table_lookup {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
+
+    b.emit_op(
+        Opcode::OpenRead,
+        index_cursor,
+        index_plan.index_root_page,
+        0,
+        P4::Index(index_plan.index_name.clone()),
+        0,
+    );
+
+    // Position index cursor at first/last entry depending on ORDER BY direction.
+    let loop_start = b.current_addr();
+    if index_plan.descending {
+        b.emit_jump_to_label(Opcode::Last, index_cursor, 0, done_label, P4::None, 0);
+    } else {
+        b.emit_jump_to_label(Opcode::Rewind, index_cursor, 0, done_label, P4::None, 0);
+    }
+
+    let skip_row = b.emit_label();
+    let rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::IdxRowid, index_cursor, rowid_reg, 0, P4::None, 0);
+
+    if needs_table_lookup {
+        b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+    }
+
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
+    }
+
+    if let Some(covering_output) = &index_plan.covering_output {
+        emit_covering_output_reads(b, index_cursor, rowid_reg, covering_output, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
+
+    // OFFSET: if offset counter > 0, decrement by 1 and skip this row.
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_row, P4::None, 0);
+    }
+
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    // LIMIT: decrement limit counter; jump to done when zero.
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    b.resolve_label(skip_row);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = (loop_start + 1) as i32;
+    if index_plan.descending {
+        b.emit_op(Opcode::Prev, index_cursor, loop_body, 0, P4::None, 0);
+    } else {
+        b.emit_op(Opcode::Next, index_cursor, loop_body, 0, P4::None, 0);
+    }
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, index_cursor, 0, 0, P4::None, 0);
+    if needs_table_lookup {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
     Ok(())
 }
 
@@ -2535,6 +2755,7 @@ pub fn codegen_insert(
                 b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
             }
             let rec_reg = b.alloc_reg();
+            emit_strict_type_check(b, table, col_regs);
             b.emit_op(
                 Opcode::MakeRecord,
                 col_regs,
@@ -2696,6 +2917,7 @@ fn codegen_insert_values(
         }
 
         // MakeRecord: pack columns into a record.
+        emit_strict_type_check(b, table, val_regs);
         let n_cols_i32 = n_cols as i32;
         b.emit_op(
             Opcode::MakeRecord,
@@ -2875,6 +3097,7 @@ fn codegen_insert_select(
     }
 
     // MakeRecord from the read column values.
+    emit_strict_type_check(b, target_table, val_regs);
     b.emit_op(
         Opcode::MakeRecord,
         val_regs,
@@ -3128,6 +3351,7 @@ pub fn codegen_update(
     }
 
     // MakeRecord with ALL columns.
+    emit_strict_type_check(b, table, col_regs);
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let n_cols_i32 = n_cols as i32;
@@ -3978,6 +4202,24 @@ enum SortKeySource {
     Expression(Expr),
 }
 
+/// Output source for a covering-index ordered scan.
+enum CoveringOutputSource {
+    /// Read value from index key column at this position.
+    IndexColumn(i32),
+    /// Read value from the rowid already extracted via `IdxRowid`.
+    Rowid,
+}
+
+/// Plan for ORDER BY execution that can bypass the sorter.
+struct OrderByIndexPlan {
+    index_name: String,
+    index_root_page: i32,
+    descending: bool,
+    /// When present, all output columns can be read from index payload/rowid
+    /// and no table row lookup is required.
+    covering_output: Option<Vec<CoveringOutputSource>>,
+}
+
 /// Resolve an ORDER BY expression to a `SortKeySource`.
 ///
 /// Returns `Column` or `Rowid` for simple column references; falls back to
@@ -4038,6 +4280,106 @@ fn resolve_column_index(expr: &Expr, table: &TableSchema) -> Option<usize> {
         Some(SortKeySource::Column(idx)) => Some(idx),
         _ => None,
     }
+}
+
+fn index_column_position(index: &IndexSchema, column_name: &str) -> Option<usize> {
+    index
+        .columns
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case(column_name))
+}
+
+fn resolve_covering_output_sources(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+) -> Option<Vec<CoveringOutputSource>> {
+    let mut output = Vec::with_capacity(columns.len());
+
+    for col in columns {
+        match col {
+            ResultColumn::Expr { expr, .. } => {
+                match resolve_column_ref(expr, table, table_alias)? {
+                    SortKeySource::Column(col_idx) => {
+                        let column_name = &table.columns.get(col_idx)?.name;
+                        let index_pos = index_column_position(index, column_name)?;
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        output.push(CoveringOutputSource::IndexColumn(index_pos as i32));
+                    }
+                    SortKeySource::Rowid => output.push(CoveringOutputSource::Rowid),
+                    SortKeySource::Expression(_) => return None,
+                }
+            }
+            ResultColumn::Star | ResultColumn::TableStar(_) => return None,
+        }
+    }
+
+    Some(output)
+}
+
+fn resolve_order_by_index_plan(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    order_by: &[OrderingTerm],
+    distinct: Distinctness,
+) -> Option<OrderByIndexPlan> {
+    if order_by.is_empty() || distinct == Distinctness::Distinct {
+        return None;
+    }
+
+    let mut direction: Option<SortDirection> = None;
+    let mut order_columns = Vec::with_capacity(order_by.len());
+
+    for term in order_by {
+        if term.nulls.is_some() {
+            return None;
+        }
+        let term_direction = term.direction.unwrap_or(SortDirection::Asc);
+        if let Some(existing) = direction {
+            if existing != term_direction {
+                return None;
+            }
+        } else {
+            direction = Some(term_direction);
+        }
+
+        let Expr::Column(col_ref, _) = &term.expr else {
+            return None;
+        };
+        if let Some(qualifier) = &col_ref.table
+            && !matches_table_or_alias(qualifier, table, table_alias)
+        {
+            return None;
+        }
+        if is_rowid_alias(&col_ref.column) {
+            return None;
+        }
+        order_columns.push(col_ref.column.clone());
+    }
+
+    let index = table.indexes.iter().find(|idx| {
+        idx.columns.len() >= order_columns.len()
+            && order_columns
+                .iter()
+                .zip(&idx.columns)
+                .all(|(order_col, idx_col)| order_col.eq_ignore_ascii_case(idx_col))
+    })?;
+
+    let covering_output = if where_clause.is_none() {
+        resolve_covering_output_sources(columns, table, table_alias, index)
+    } else {
+        None
+    };
+
+    Some(OrderByIndexPlan {
+        index_name: index.name.clone(),
+        index_root_page: index.root_page,
+        descending: direction == Some(SortDirection::Desc),
+        covering_output,
+    })
 }
 
 /// Resolve result columns to table column indices.
@@ -5405,6 +5747,7 @@ mod tests {
                 ColumnInfo::basic("b", 'C', false),
             ],
             indexes: vec![],
+            strict: false,
         }]
     }
 
@@ -5421,6 +5764,7 @@ mod tests {
                 root_page: 3,
                 columns: vec!["b".to_owned()],
             }],
+            strict: false,
         }]
     }
 
@@ -5437,6 +5781,7 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -5445,15 +5790,18 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                 ],
                 indexes: vec![],
+                strict: false,
             },
             TableSchema {
                 name: "s".to_owned(),
                 root_page: 3,
                 columns: vec![ColumnInfo::basic("b", 'd', false)],
                 indexes: vec![],
+                strict: false,
             },
         ]
     }
@@ -5612,6 +5960,7 @@ mod tests {
                 ColumnInfo::basic("b", 'C', false),
             ],
             indexes: vec![],
+            strict: false,
         }]
     }
 
@@ -5856,6 +6205,7 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -5864,9 +6214,11 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                 ],
                 indexes: vec![],
+                strict: false,
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -5879,6 +6231,7 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
@@ -5887,9 +6240,11 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                 ],
                 indexes: vec![],
+                strict: false,
             },
         ];
 
@@ -6000,6 +6355,7 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -6008,9 +6364,11 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                 ],
                 indexes: vec![],
+                strict: false,
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -6023,6 +6381,7 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
@@ -6031,10 +6390,12 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                     ColumnInfo::basic("z", 'e', false),
                 ],
                 indexes: vec![],
+                strict: false,
             },
         ];
 
@@ -7161,6 +7522,42 @@ mod tests {
         }
     }
 
+    fn select_col_order_by(
+        table: &str,
+        select_col: &str,
+        order_col: &str,
+        desc: bool,
+    ) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare(select_col), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare(order_col), Span::ZERO),
+                direction: if desc {
+                    Some(SortDirection::Desc)
+                } else {
+                    None
+                },
+                nulls: None,
+            }],
+            limit: None,
+        }
+    }
+
     fn star_select_order_by_with_limit(table: &str, col: &str, limit: i64) -> SelectStatement {
         SelectStatement {
             with: None,
@@ -7275,6 +7672,136 @@ mod tests {
             matches!(&so.p4, P4::Str(s) if s == "-"),
             "SorterOpen P4 should be '-' for DESC, got {:?}",
             so.p4
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_order_by_uses_index_without_sorter() {
+        let stmt = star_select_order_by("t", "b", false);
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // ORDER BY on indexed column should stream via index cursor.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::OpenRead, // table
+                Opcode::OpenRead, // index
+                Opcode::Rewind,
+                Opcode::IdxRowid,
+                Opcode::SeekRowid,
+                Opcode::ResultRow,
+                Opcode::Next,
+                Opcode::Halt,
+            ]
+        ));
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")),
+            "expected index cursor open for ORDER BY optimization"
+        );
+
+        let sorter_count = prog
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                        | Opcode::SorterNext
+                )
+            })
+            .count();
+        assert_eq!(
+            sorter_count, 0,
+            "index-assisted ORDER BY should bypass sorter"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_order_by_desc_uses_index_reverse_scan_without_sorter() {
+        let stmt = star_select_order_by("t", "b", true);
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::OpenRead, // table
+                Opcode::OpenRead, // index
+                Opcode::Last,
+                Opcode::IdxRowid,
+                Opcode::SeekRowid,
+                Opcode::ResultRow,
+                Opcode::Prev,
+                Opcode::Halt,
+            ]
+        ));
+        assert!(
+            !prog.ops().iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                        | Opcode::SorterNext
+                )
+            }),
+            "descending index-assisted ORDER BY should bypass sorter"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_covering_order_by_skips_table_lookup() {
+        let stmt = select_col_order_by("t", "b", "b", false);
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let table_open_count = prog
+            .ops()
+            .iter()
+            .filter(|op| {
+                op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(name) if name == "t")
+            })
+            .count();
+        assert_eq!(
+            table_open_count, 0,
+            "covering ORDER BY path should not open table cursor"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")),
+            "covering ORDER BY path should open index cursor"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "covering ORDER BY path should not perform table rowid lookups"
+        );
+        assert!(
+            !prog.ops().iter().any(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                        | Opcode::SorterNext
+                )
+            }),
+            "covering ORDER BY path should bypass sorter"
         );
     }
 

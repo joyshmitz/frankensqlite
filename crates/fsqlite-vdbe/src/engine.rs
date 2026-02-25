@@ -29,7 +29,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::{PageData, PageNumber};
+use fsqlite_types::{PageData, PageNumber, StrictColumnType};
 
 use crate::VdbeProgram;
 
@@ -3056,11 +3056,46 @@ impl VdbeEngine {
                     pc = target as usize;
                 }
 
-                Opcode::TypeCheck
-                | Opcode::Permutation
-                | Opcode::CollSeq
-                | Opcode::ElseEq
-                | Opcode::FkCheck => {
+                Opcode::TypeCheck => {
+                    let pattern = match &op.p4 {
+                        P4::Affinity(pattern) => pattern.as_bytes(),
+                        _ => &[],
+                    };
+
+                    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                    let count = op.p2.max(0) as usize;
+                    for offset in 0..count {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let reg = op.p1 + offset as i32;
+                        let value = self.get_reg(reg);
+                        let strict_type = match pattern.get(offset).copied().unwrap_or(b'A') {
+                            b'A' | b'a' => None,
+                            b'I' | b'i' => Some(StrictColumnType::Integer),
+                            b'R' | b'r' => Some(StrictColumnType::Real),
+                            b'T' | b't' => Some(StrictColumnType::Text),
+                            b'L' | b'l' => Some(StrictColumnType::Blob),
+                            other => {
+                                return Err(FrankenError::Internal(format!(
+                                    "unknown STRICT type code '{}' in OP_TypeCheck",
+                                    char::from(other)
+                                )));
+                            }
+                        };
+
+                        if let Some(expected) = strict_type {
+                            let checked =
+                                value.clone().validate_strict(expected).map_err(|err| {
+                                    FrankenError::Internal(format!(
+                                        "STRICT type check failed at register {reg}: {err}"
+                                    ))
+                                })?;
+                            self.set_reg(reg, checked);
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Opcode::Permutation | Opcode::CollSeq | Opcode::ElseEq | Opcode::FkCheck => {
                     pc += 1;
                 }
 
@@ -4817,6 +4852,7 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -4825,9 +4861,11 @@ mod tests {
                         type_name: None,
                         notnull: false,
                         default_value: None,
+                        strict_type: None,
                     },
                 ],
                 indexes: vec![],
+                strict: false,
             }]
         }
 

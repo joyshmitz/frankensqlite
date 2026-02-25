@@ -63,7 +63,9 @@ impl EProcessOracle {
         //   E_{t+1} = E_t * (lambda * (x_t / p0) + (1 - lambda))
         // where x_t = 1 for anomaly, 0 for normal.
         let factor = if anomaly {
-            self.config.lambda * (1.0 / self.config.p0) + (1.0 - self.config.lambda)
+            self.config
+                .lambda
+                .mul_add(1.0 / self.config.p0, 1.0 - self.config.lambda)
         } else {
             // Under normal observation: multiply by (1 - lambda + lambda * 0/p0) = 1 - lambda
             // But this would make e-value shrink to zero. Correct GROW:

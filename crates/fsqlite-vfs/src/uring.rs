@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
 use std::sync::Mutex;
@@ -22,6 +23,10 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_observability::{
+    io_uring_latency_snapshot, record_io_uring_read_latency, record_io_uring_unix_fallback,
+    record_io_uring_write_latency,
+};
 use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
@@ -33,15 +38,20 @@ use crate::shm::ShmRegion;
 use crate::traits::{Vfs, VfsFile};
 use crate::unix::{UnixFile, UnixVfs};
 
-#[cfg(not(any(feature = "linux-uring-fs", feature = "linux-asupersync-uring")))]
+#[cfg(feature = "linux-uring-fs")]
 compile_error!(
-    "fsqlite-vfs on Linux requires one io_uring backend feature: `linux-uring-fs` or `linux-asupersync-uring`"
+    "legacy `linux-uring-fs` backend is disabled; use `linux-asupersync-uring` (homegrown runtime path)"
 );
+#[cfg(not(feature = "linux-asupersync-uring"))]
+compile_error!("fsqlite-vfs on Linux requires `linux-asupersync-uring`");
 
 #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
 const IO_URING_LOCK_POISONED_MSG: &str = "io_uring runtime lock poisoned";
 const IO_URING_READ_PANICKED_MSG: &str = "io_uring read panicked";
 const IO_URING_WRITE_PANICKED_MSG: &str = "io_uring write panicked";
+const IO_URING_READ_CONFORMAL_BREACH_MSG: &str = "io_uring read conformal tail breach";
+const IO_URING_WRITE_CONFORMAL_BREACH_MSG: &str = "io_uring write conformal tail breach";
+const IO_URING_MAX_RW_CHUNK_BYTES: usize = 64 * 1024;
 #[cfg(feature = "linux-asupersync-uring")]
 const IO_URING_ASUPERSYNC_INIT_FAILED_MSG: &str = "asupersync io_uring backend init failed";
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
@@ -49,6 +59,34 @@ static FORCE_ASUPERSYNC_INIT_FAIL: AtomicBool = AtomicBool::new(false);
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
+}
+
+fn duration_to_micros_saturated(duration: std::time::Duration) -> u64 {
+    #[allow(clippy::cast_possible_truncation)] // clamped to u64::MAX first
+    {
+        duration.as_micros().min(u128::from(u64::MAX)) as u64
+    }
+}
+
+fn next_chunk_end(total: usize, len: usize) -> usize {
+    let remaining = len - total;
+    total + remaining.min(IO_URING_MAX_RW_CHUNK_BYTES)
+}
+
+fn enforce_conformal_breach_policy(
+    runtime: &IoUringRuntime,
+    operation: &'static str,
+    observed: Duration,
+    conformal_upper_bound_us: u64,
+    disable_reason: &'static str,
+) {
+    runtime.disable(disable_reason);
+    warn!(
+        operation,
+        observed_latency_us = duration_to_micros_saturated(observed),
+        conformal_upper_bound_us,
+        "io_uring latency exceeded conformal upper bound; backend disabled and unix path will be used"
+    );
 }
 
 #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
@@ -263,10 +301,11 @@ impl IoUringFile {
                         ))
                     })?;
 
-                let requested = u32::try_from(buf.len() - total).map_err(|_| {
+                let chunk_end = next_chunk_end(total, buf.len());
+                let requested = u32::try_from(chunk_end - total).map_err(|_| {
                     FrankenError::Io(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("read size too large for io_uring: {}", buf.len() - total),
+                        format!("read size too large for io_uring: {}", chunk_end - total),
                     ))
                 })?;
 
@@ -319,6 +358,7 @@ impl IoUringFile {
 
         let mut total = 0_usize;
         while total < buf.len() {
+            let chunk_end = next_chunk_end(total, buf.len());
             let off = offset
                 .checked_add(u64::try_from(total).expect("usize must fit into u64"))
                 .ok_or_else(|| {
@@ -329,7 +369,7 @@ impl IoUringFile {
                 })?;
 
             let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pollster::block_on(backend.read_at(&mut buf[total..], off))
+                pollster::block_on(backend.read_at(&mut buf[total..chunk_end], off))
             }));
 
             let bytes_read = match read_result {
@@ -367,6 +407,7 @@ impl IoUringFile {
         self.inner.with_inode_io_file(|file| {
             let mut total = 0_usize;
             while total < buf.len() {
+                let chunk_end = next_chunk_end(total, buf.len());
                 let off = offset
                     .checked_add(u64::try_from(total).expect("usize must fit into u64"))
                     .ok_or_else(|| {
@@ -377,7 +418,9 @@ impl IoUringFile {
                     })?;
                 seek_to(file, off)?;
                 let before = current_offset(file)?;
-                let payload = buf[total..].to_vec();
+                // uring-fs currently requires owning the payload for submission; chunking
+                // bounds this copy size while preserving forward progress semantics.
+                let payload = buf[total..chunk_end].to_vec();
                 let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let ring = lock_mutex_or_io(ring_mutex)?;
                     pollster::block_on(ring.write(file, payload))
@@ -418,7 +461,7 @@ impl IoUringFile {
                         "io_uring write advanced by 0 bytes",
                     )));
                 }
-                let remaining = buf.len() - total;
+                let remaining = chunk_end - total;
                 total += advanced.min(remaining);
             }
             Ok(())
@@ -436,6 +479,7 @@ impl IoUringFile {
 
         let mut total = 0_usize;
         while total < buf.len() {
+            let chunk_end = next_chunk_end(total, buf.len());
             let off = offset
                 .checked_add(u64::try_from(total).expect("usize must fit into u64"))
                 .ok_or_else(|| {
@@ -445,9 +489,9 @@ impl IoUringFile {
                     ))
                 })?;
             let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pollster::block_on(backend.write_at(&buf[total..], off))
+                pollster::block_on(backend.write_at(&buf[total..chunk_end], off))
             }));
-            let advanced = match write_result {
+            let advanced: usize = match write_result {
                 Ok(Ok(advanced)) => advanced,
                 Ok(Err(err)) => return Err(FrankenError::Io(err)),
                 Err(_) => {
@@ -463,7 +507,7 @@ impl IoUringFile {
                     "io_uring write advanced by 0 bytes",
                 )));
             }
-            let remaining = buf.len() - total;
+            let remaining = chunk_end - total;
             total += advanced.min(remaining);
         }
         Ok(())
@@ -487,17 +531,22 @@ impl Vfs for IoUringVfs {
 
         #[cfg(feature = "linux-asupersync-uring")]
         let asupersync_backend = if self.runtime.is_available() {
-            match open_asupersync_backend(file.path(), out_flags) {
-                Ok(backend) => Some(backend),
-                Err(err) => {
-                    self.runtime.disable(IO_URING_ASUPERSYNC_INIT_FAILED_MSG);
-                    warn!(
-                        path = %file.path().display(),
-                        error = %err,
-                        "asupersync io_uring backend init failed; falling back to unix path"
-                    );
-                    None
+            if let Some(requested_path) = path {
+                let full_path = self.unix.full_pathname(cx, requested_path)?;
+                match open_asupersync_backend(&full_path, out_flags) {
+                    Ok(backend) => Some(backend),
+                    Err(err) => {
+                        self.runtime.disable(IO_URING_ASUPERSYNC_INIT_FAILED_MSG);
+                        warn!(
+                            path = %full_path.display(),
+                            error = %err,
+                            "asupersync io_uring backend init failed; falling back to unix path"
+                        );
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
             None
@@ -543,8 +592,25 @@ impl VfsFile for IoUringFile {
     fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
-            if let Ok(bytes) = self.read_via_uring(buf, offset) {
-                return Ok(bytes);
+            let start = Instant::now();
+            match self.read_via_uring(buf, offset) {
+                Ok(bytes) => {
+                    let elapsed = start.elapsed();
+                    if record_io_uring_read_latency(elapsed) {
+                        let snapshot = io_uring_latency_snapshot();
+                        enforce_conformal_breach_policy(
+                            &self.runtime,
+                            "read",
+                            elapsed,
+                            snapshot.read_conformal_upper_bound_us,
+                            IO_URING_READ_CONFORMAL_BREACH_MSG,
+                        );
+                    }
+                    return Ok(bytes);
+                }
+                Err(_) => {
+                    record_io_uring_unix_fallback();
+                }
             }
         }
         self.inner.read(cx, buf, offset)
@@ -552,8 +618,27 @@ impl VfsFile for IoUringFile {
 
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
-        if self.runtime.is_available() && self.write_via_uring(buf, offset).is_ok() {
-            return Ok(());
+        if self.runtime.is_available() {
+            let start = Instant::now();
+            match self.write_via_uring(buf, offset) {
+                Ok(()) => {
+                    let elapsed = start.elapsed();
+                    if record_io_uring_write_latency(elapsed) {
+                        let snapshot = io_uring_latency_snapshot();
+                        enforce_conformal_breach_policy(
+                            &self.runtime,
+                            "write",
+                            elapsed,
+                            snapshot.write_conformal_upper_bound_us,
+                            IO_URING_WRITE_CONFORMAL_BREACH_MSG,
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(_) => {
+                    record_io_uring_unix_fallback();
+                }
+            }
         }
         self.inner.write(cx, buf, offset)
     }
@@ -611,6 +696,7 @@ impl VfsFile for IoUringFile {
 mod tests {
     use super::*;
 
+    use fsqlite_observability::{io_uring_latency_snapshot, reset_io_uring_latency_metrics};
     use fsqlite_types::flags::VfsOpenFlags;
 
     fn open_flags_create() -> VfsOpenFlags {
@@ -645,12 +731,59 @@ mod tests {
     }
 
     #[test]
+    fn test_io_uring_paths_emit_latency_or_fallback_metrics() {
+        reset_io_uring_latency_metrics();
+
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("uring_metrics.db");
+
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open should succeed");
+        file.write(&cx, b"metrics", 0)
+            .expect("write should succeed");
+
+        let mut buf = [0_u8; 7];
+        let _ = file.read(&cx, &mut buf, 0).expect("read should succeed");
+
+        let snapshot = io_uring_latency_snapshot();
+        if vfs.is_available() {
+            assert!(
+                snapshot.write_samples_total >= 1 || snapshot.unix_fallbacks_total >= 1,
+                "write path should either record io_uring latency or fallback"
+            );
+            assert!(
+                snapshot.read_samples_total >= 1 || snapshot.unix_fallbacks_total >= 1,
+                "read path should either record io_uring latency or fallback"
+            );
+        }
+    }
+
+    #[test]
     fn test_runtime_disable_is_sticky() {
         let runtime = IoUringRuntime::new();
         assert!(!runtime.is_disabled());
         runtime.disable("test disable");
         assert!(runtime.is_disabled());
         runtime.disable("test disable again");
+        assert!(runtime.is_disabled());
+    }
+
+    #[test]
+    fn test_conformal_breach_policy_disables_runtime() {
+        let runtime = IoUringRuntime::new();
+        assert!(!runtime.is_disabled());
+
+        enforce_conformal_breach_policy(
+            &runtime,
+            "read",
+            Duration::from_micros(250),
+            100,
+            IO_URING_READ_CONFORMAL_BREACH_MSG,
+        );
+
         assert!(runtime.is_disabled());
     }
 

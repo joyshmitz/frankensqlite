@@ -1235,7 +1235,7 @@ pub enum IndexUsability {
     Range { selectivity: f64 },
     /// `IN (...)` expanded to multiple equality probes.
     InExpansion { probe_count: usize },
-    /// `LIKE 'prefix%'` with constant prefix and derived upper bound.
+    /// `LIKE`/`GLOB` with a constant prefix and derived upper bound.
     /// Represents the range: `column >= low` and optionally `column < high`.
     LikePrefix { low: String, high: Option<String> },
     /// The term cannot use this index.
@@ -1280,7 +1280,8 @@ pub enum WhereTermKind {
     Between,
     /// `col IN (...)`
     InList { count: usize },
-    /// `col LIKE 'prefix%'`, rewritten as `col >= prefix AND col < upper_bound`.
+    /// `col LIKE 'prefix%'` or `col GLOB 'prefix*'`, rewritten as
+    /// `col >= prefix AND col < upper_bound`.
     LikePrefix {
         prefix: String,
         upper_bound: Option<String>,
@@ -1359,8 +1360,7 @@ fn classify_or_disjunction_as_in_list(expr: &Expr) -> Option<(WhereColumn, usize
         };
 
         let column = match (extract_where_column(left), extract_where_column(right)) {
-            (Some(column), None) => column,
-            (None, Some(column)) => column,
+            (Some(column), None) | (None, Some(column)) => column,
             _ => return None,
         };
 
@@ -1391,6 +1391,13 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
             ..
         } => {
             if let Some((column, probe_count)) = classify_or_disjunction_as_in_list(expr) {
+                tracing::debug!(
+                    target: "fsqlite.planner",
+                    rewrite = "or_disjunction_to_in_list",
+                    column = ?column,
+                    probe_count,
+                    "planner.where_term.rewrite"
+                );
                 return WhereTerm {
                     expr,
                     column: Some(column),
@@ -1492,22 +1499,36 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
             }
         }
 
-        // col LIKE 'prefix%'
+        // col LIKE 'prefix%' or col GLOB 'prefix*'
         Expr::Like {
             expr: inner,
             pattern,
-            op: LikeOp::Like,
+            op,
             not,
             ..
-        } if !not => {
+        } if !not && matches!(op, LikeOp::Like | LikeOp::Glob) => {
             let column = extract_where_column(inner);
-            let prefix = extract_like_prefix(pattern);
+            let (prefix, operator) = match op {
+                LikeOp::Like => (extract_like_prefix(pattern), "LIKE"),
+                LikeOp::Glob => (extract_glob_prefix(pattern), "GLOB"),
+                _ => unreachable!("guard restricts to LIKE/GLOB"),
+            };
             if let Some(pfx) = prefix {
+                let upper_bound = like_prefix_upper_bound(&pfx);
+                tracing::debug!(
+                    target: "fsqlite.planner",
+                    rewrite = "pattern_prefix_to_range",
+                    operator,
+                    column = ?column,
+                    prefix = %pfx,
+                    upper_bound = ?upper_bound,
+                    "planner.where_term.rewrite"
+                );
                 WhereTerm {
                     expr,
                     column,
                     kind: WhereTermKind::LikePrefix {
-                        upper_bound: like_prefix_upper_bound(&pfx),
+                        upper_bound,
                         prefix: pfx,
                     },
                 }
@@ -1562,6 +1583,29 @@ fn extract_like_prefix(pattern: &Expr) -> Option<String> {
         let mut prefix = String::new();
         for ch in s.chars() {
             if ch == '%' || ch == '_' {
+                break;
+            }
+            prefix.push(ch);
+        }
+        if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix)
+        }
+    } else {
+        None
+    }
+}
+
+/// Extract a constant prefix from a GLOB pattern (e.g. `'abc*'` → `"abc"`).
+///
+/// Returns `None` if the pattern has no constant prefix (starts with `*`, `?`,
+/// or `[`), or is not a string literal.
+fn extract_glob_prefix(pattern: &Expr) -> Option<String> {
+    if let Expr::Literal(Literal::String(s), _) = pattern {
+        let mut prefix = String::new();
+        for ch in s.chars() {
+            if matches!(ch, '*' | '?' | '[') {
                 break;
             }
             prefix.push(ch);
@@ -2618,7 +2662,7 @@ pub fn order_joins_with_hints_and_features(
     }
 
     if n <= DPCCP_MAX_TABLES {
-        if let Some((order_indices, total_cost, plans_counted)) = dpccp_order_joins(
+        if let Some((order_indices, total_cost, plans_counted, branches_pruned)) = dpccp_order_joins(
             tables,
             indexes,
             where_terms,
@@ -2666,6 +2710,8 @@ pub fn order_joins_with_hints_and_features(
                 total_cost = plan.total_cost,
                 table_count = n,
                 plans_enumerated = plans_counted,
+                branches_pruned,
+                threshold = DPCCP_MAX_TABLES,
                 algorithm = "dpccp_exhaustive",
                 "planner.order_joins.complete"
             );
@@ -2674,12 +2720,20 @@ pub fn order_joins_with_hints_and_features(
                 join_order = ?plan.join_order,
                 total_cost = plan.total_cost,
                 table_count = n,
+                plans_enumerated = plans_counted,
+                branches_pruned,
                 algorithm = "dpccp_exhaustive",
                 "planner.plan_selected"
             );
 
             return plan;
         }
+
+        tracing::debug!(
+            table_count = n,
+            threshold = DPCCP_MAX_TABLES,
+            "planner.dpccp.no_plan_fallback_greedy"
+        );
     }
 
     let mut plans_enumerated: u64 = 0;
@@ -2856,6 +2910,8 @@ pub fn order_joins_with_hints_and_features(
         star_query = is_star,
         table_count = n,
         index_hint_entries = table_index_hints.map_or(0, BTreeMap::len),
+        algorithm = "greedy_width",
+        threshold = DPCCP_MAX_TABLES,
         "planner.order_joins.complete"
     );
 
@@ -2863,6 +2919,8 @@ pub fn order_joins_with_hints_and_features(
         join_order = ?plan.join_order,
         total_cost = plan.total_cost,
         table_count = n,
+        plans_enumerated,
+        algorithm = "greedy_width",
         "planner.plan_selected"
     );
 
@@ -2909,12 +2967,12 @@ fn cross_join_allowed_indices(
 // DPccp: exhaustive join ordering for small join counts (bd-1as.3)
 // ---------------------------------------------------------------------------
 
-/// DPccp (Dynamic Programming over Connected subgraph Complement Pairs).
+/// Exhaustive join-order search for small joins (`n <= DPCCP_MAX_TABLES`).
 ///
-/// Exhaustively enumerates all valid join orderings for `n` tables using
-/// bitmask-based dynamic programming. Returns the minimum-cost permutation.
-///
-/// Used for exhaustive small-join planning when `n <= DPCCP_MAX_TABLES`.
+/// Enumerates permutations with branch-and-bound pruning:
+/// - explores candidate next tables in deterministic cost order
+/// - prunes any partial branch whose cost already exceeds best complete plan
+/// - returns the best order, total cost, enumerated candidates, pruned branches
 #[allow(dead_code, clippy::cast_possible_truncation)]
 fn dpccp_order_joins(
     tables: &[TableStats],
@@ -2924,87 +2982,170 @@ fn dpccp_order_joins(
     table_index_hints: Option<&BTreeMap<String, IndexHint>>,
     cross_join_pairs: &[(String, String)],
     cracking_hints: Option<&CrackingHintStore>,
-) -> Option<(Vec<usize>, f64, u64)> {
+) -> Option<(Vec<usize>, f64, u64, u64)> {
     let n = tables.len();
     assert!(n <= DPCCP_MAX_TABLES);
-    let full_mask = (1u64 << n) - 1;
 
-    // dp[mask] = (cost, cumulative_rows, ordering)
-    let mut dp: Vec<Option<(f64, f64, Vec<usize>)>> = vec![None; (full_mask + 1) as usize];
-    let mut plans_counted: u64 = 0;
-
-    // Base: single-table subsets.
-    for (i, table) in tables.iter().enumerate() {
-        if !cross_join_allowed(&[], &table.name, cross_join_pairs) {
-            continue;
-        }
-        let mask = 1u64 << i;
-        let ap = join_access_path(
-            table,
-            indexes,
-            where_terms,
-            needed_columns,
-            table_index_hints,
-            cracking_hints,
-        );
-        dp[mask as usize] = Some((ap.estimated_cost, ap.estimated_rows, vec![i]));
-        plans_counted += 1;
-    }
-
-    // Fill subsets of increasing size.
-    for mask in 1..=full_mask {
-        if dp[mask as usize].is_none() {
-            continue;
-        }
-        let popcount = mask.count_ones() as usize;
-        if popcount >= n {
-            continue;
-        }
-
-        // Try adding each table not in the current set.
-        for (i, table) in tables.iter().enumerate() {
-            if mask & (1u64 << i) != 0 {
-                continue; // Already in set.
-            }
-            let (_prev_cost, _prev_rows, prev_order) = dp[mask as usize]
-                .as_ref()
-                .expect("mask with entry must be populated");
-            if !cross_join_allowed_indices(prev_order, &table.name, tables, cross_join_pairs) {
-                continue;
-            }
-            let new_mask = mask | (1u64 << i);
-            let ap = join_access_path(
+    let access_paths = tables
+        .iter()
+        .map(|table| {
+            join_access_path(
                 table,
                 indexes,
                 where_terms,
                 needed_columns,
                 table_index_hints,
                 cracking_hints,
-            );
+            )
+        })
+        .collect::<Vec<_>>();
 
-            let (prev_cost, prev_rows, prev_order) = dp[mask as usize].as_ref().unwrap();
-            let inner_cost = ap.estimated_cost * prev_rows;
-            let new_cost = prev_cost + inner_cost;
-            let new_rows = prev_rows * ap.estimated_rows;
+    let mut visit_order = (0..n).collect::<Vec<_>>();
+    visit_order.sort_by(|lhs, rhs| {
+        access_paths[*lhs]
+            .estimated_cost
+            .partial_cmp(&access_paths[*rhs].estimated_cost)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| lhs.cmp(rhs))
+    });
 
-            plans_counted += 1;
+    let mut state =
+        ExhaustiveJoinSearchState::new(tables, &access_paths, &visit_order, cross_join_pairs);
+    state.search();
 
-            let better = match &dp[new_mask as usize] {
-                None => true,
-                Some((existing_cost, _, _)) => new_cost < *existing_cost,
-            };
-            if better {
-                let mut new_order = prev_order.clone();
-                new_order.push(i);
-                dp[new_mask as usize] = Some((new_cost, new_rows, new_order));
-            }
+    let order = state.best_order?;
+
+    Some((
+        order,
+        state.best_cost,
+        state.plans_enumerated,
+        state.branches_pruned,
+    ))
+}
+
+struct ExhaustiveJoinSearchState<'a> {
+    tables: &'a [TableStats],
+    access_paths: &'a [AccessPath],
+    visit_order: &'a [usize],
+    cross_join_pairs: &'a [(String, String)],
+    best_order: Option<Vec<usize>>,
+    best_cost: f64,
+    plans_enumerated: u64,
+    branches_pruned: u64,
+}
+
+impl<'a> ExhaustiveJoinSearchState<'a> {
+    fn new(
+        tables: &'a [TableStats],
+        access_paths: &'a [AccessPath],
+        visit_order: &'a [usize],
+        cross_join_pairs: &'a [(String, String)],
+    ) -> Self {
+        Self {
+            tables,
+            access_paths,
+            visit_order,
+            cross_join_pairs,
+            best_order: None,
+            best_cost: f64::INFINITY,
+            plans_enumerated: 0,
+            branches_pruned: 0,
         }
     }
 
-    let Some((cost, _rows, order)) = dp[full_mask as usize].clone() else {
-        return None;
-    };
-    Some((order, cost, plans_counted))
+    fn search(&mut self) {
+        let mut current_order = Vec::with_capacity(self.tables.len());
+        self.search_dfs(&mut current_order, 0, 0.0, 1.0);
+    }
+
+    fn search_dfs(
+        &mut self,
+        current_order: &mut Vec<usize>,
+        used_mask: u64,
+        current_cost: f64,
+        current_rows: f64,
+    ) {
+        if current_order.len() == self.tables.len() {
+            if current_cost < self.best_cost {
+                self.best_cost = current_cost;
+                self.best_order = Some(current_order.clone());
+                tracing::debug!(
+                    target: "fsqlite.planner",
+                    algorithm = "dpccp_exhaustive",
+                    join_order = ?order_indices_to_names(current_order, self.tables),
+                    total_cost = current_cost,
+                    "planner.best_plan_updated"
+                );
+            }
+            return;
+        }
+
+        for &candidate_idx in self.visit_order {
+            if used_mask & (1u64 << candidate_idx) != 0 {
+                continue;
+            }
+
+            let candidate = &self.tables[candidate_idx];
+            if !cross_join_allowed_indices(
+                current_order,
+                &candidate.name,
+                self.tables,
+                self.cross_join_pairs,
+            ) {
+                continue;
+            }
+
+            let ap = &self.access_paths[candidate_idx];
+            let (new_cost, new_rows) = if current_order.is_empty() {
+                (ap.estimated_cost, ap.estimated_rows)
+            } else {
+                let inner_cost = ap.estimated_cost * current_rows;
+                (current_cost + inner_cost, current_rows * ap.estimated_rows)
+            };
+
+            self.plans_enumerated += 1;
+            let should_prune = self.best_cost.is_finite() && new_cost >= self.best_cost;
+
+            let mut candidate_order = current_order
+                .iter()
+                .map(|idx| self.tables[*idx].name.as_str())
+                .collect::<Vec<_>>();
+            candidate_order.push(candidate.name.as_str());
+
+            tracing::debug!(
+                target: "fsqlite.planner",
+                algorithm = "dpccp_exhaustive",
+                depth = candidate_order.len(),
+                candidate_order = ?candidate_order,
+                cost = new_cost,
+                best_complete_cost = if self.best_cost.is_finite() {
+                    Some(self.best_cost)
+                } else {
+                    None::<f64>
+                },
+                pruned = should_prune,
+                "planner.candidate_plan"
+            );
+
+            if should_prune {
+                self.branches_pruned += 1;
+                continue;
+            }
+
+            current_order.push(candidate_idx);
+            self.search_dfs(
+                current_order,
+                used_mask | (1u64 << candidate_idx),
+                new_cost,
+                new_rows,
+            );
+            current_order.pop();
+        }
+    }
+}
+
+fn order_indices_to_names(order: &[usize], tables: &[TableStats]) -> Vec<String> {
+    order.iter().map(|idx| tables[*idx].name.clone()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3764,6 +3905,21 @@ mod tests {
         classify_where_term(expr)
     }
 
+    fn glob_term(col: &str, pattern: &str) -> WhereTerm<'static> {
+        let expr: &'static Expr = Box::leak(Box::new(Expr::Like {
+            expr: Box::new(Expr::Column(ColumnRef::bare(col), Span::ZERO)),
+            pattern: Box::new(Expr::Literal(
+                Literal::String(pattern.to_owned()),
+                Span::ZERO,
+            )),
+            escape: None,
+            op: LikeOp::Glob,
+            not: false,
+            span: Span::ZERO,
+        }));
+        classify_where_term(expr)
+    }
+
     fn or_eq_term(col: &str, values: &[i64]) -> WhereTerm<'static> {
         assert!(
             values.len() >= 2,
@@ -4030,6 +4186,28 @@ mod tests {
     }
 
     #[test]
+    fn test_index_usability_glob_prefix() {
+        let idx = index_info("idx_name", "t1", &["name"], false, 50);
+        // GLOB 'Jo*' → usable (constant prefix)
+        let terms = [glob_term("name", "Jo*")];
+        let result = analyze_index_usability(&idx, &terms);
+        assert!(matches!(
+            result,
+            IndexUsability::LikePrefix {
+                ref low,
+                high: Some(ref high)
+            } if low == "Jo" && high == "Jp"
+        ));
+
+        // GLOB '*Jo*' → not usable (no constant prefix)
+        let terms = [glob_term("name", "*Jo*")];
+        assert!(matches!(
+            analyze_index_usability(&idx, &terms),
+            IndexUsability::NotUsable
+        ));
+    }
+
+    #[test]
     fn test_classify_where_term_equality() {
         let term = eq_term("x");
         assert!(matches!(term.kind, WhereTermKind::Equality));
@@ -4170,8 +4348,8 @@ mod tests {
         let cost_if_only_last = 1.0_f64 // small full scan cost
             + 10.0 * 10.0 // medium scanned 10 times
             + 100.0 * 100.0; // BUG cost: large scanned only 100 times (medium.rows)
-                             // The plan's total cost should be larger than this naive estimate
-                             // because large is actually scanned 10*100=1000 times.
+        // The plan's total cost should be larger than this naive estimate
+        // because large is actually scanned 10*100=1000 times.
         assert!(
             plan_sml.total_cost > cost_if_only_last,
             "3-way join cost should scale by cumulative rows, not just last table: plan_cost={} bug_cost={}",
@@ -4999,6 +5177,25 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_where_term_glob_prefix() {
+        let term = glob_term("name", "abc*");
+        assert!(matches!(
+            term.kind,
+            WhereTermKind::LikePrefix {
+                ref prefix,
+                upper_bound: Some(ref upper_bound),
+            } if prefix == "abc" && upper_bound == "abd"
+        ));
+        assert_eq!(term.column.as_ref().unwrap().column, "name");
+    }
+
+    #[test]
+    fn test_classify_where_term_glob_no_prefix_is_other() {
+        let term = glob_term("name", "*wildcard");
+        assert!(matches!(term.kind, WhereTermKind::Other));
+    }
+
+    #[test]
     fn test_classify_where_term_rowid_aliases() {
         // _rowid_ and oid are also rowid aliases
         for alias in &["_rowid_", "oid", "ROWID", "OID"] {
@@ -5198,6 +5395,27 @@ mod tests {
         assert_eq!(extract_like_prefix(&pat), None);
     }
 
+    #[test]
+    fn test_extract_glob_prefix_star_wildcard() {
+        // "abc*def" → prefix = "abc" (star is wildcard)
+        let pat = Expr::Literal(Literal::String("abc*def".to_owned()), Span::ZERO);
+        assert_eq!(extract_glob_prefix(&pat), Some("abc".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_glob_prefix_char_class_wildcard() {
+        // "abc[0-9]" → prefix = "abc" (char class starts wildcard region)
+        let pat = Expr::Literal(Literal::String("abc[0-9]".to_owned()), Span::ZERO);
+        assert_eq!(extract_glob_prefix(&pat), Some("abc".to_owned()));
+    }
+
+    #[test]
+    fn test_extract_glob_prefix_non_string_expr() {
+        // Non-string expression → None
+        let pat = Expr::Literal(Literal::Integer(42), Span::ZERO);
+        assert_eq!(extract_glob_prefix(&pat), None);
+    }
+
     // ===================================================================
     // Join ordering / star query edge cases
     // ===================================================================
@@ -5255,6 +5473,23 @@ mod tests {
                 AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
             ),
             "LIKE prefix should use index scan, got {:?}",
+            ap.kind
+        );
+    }
+
+    #[test]
+    fn test_best_access_path_glob_prefix() {
+        let table = table_stats("t1", 100, 1000);
+        let idx = index_info("idx_name", "t1", &["name"], false, 20);
+        let terms = [glob_term("name", "Jo*")];
+        let ap = best_access_path(&table, &[idx], &terms, None);
+        // GLOB prefix should use index range scan
+        assert!(
+            matches!(
+                ap.kind,
+                AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
+            ),
+            "GLOB prefix should use index scan, got {:?}",
             ap.kind
         );
     }
@@ -6223,7 +6458,7 @@ mod tests {
         let indexes = vec![];
         let where_terms = vec![];
 
-        let (order, cost, plans) =
+        let (order, cost, plans, _pruned) =
             dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
                 .expect("2-table exhaustive plan should exist");
         assert_eq!(order.len(), 2);
@@ -6256,13 +6491,13 @@ mod tests {
         let indexes = vec![];
         let where_terms = vec![];
 
-        let (order, cost, plans) =
+        let (order, cost, plans, _pruned) =
             dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
                 .expect("3-table exhaustive plan should exist");
         assert_eq!(order.len(), 3);
         assert!(cost > 0.0);
         assert!(plans > 3); // More than just seed.
-                            // Small table should be chosen first (lower cost).
+        // Small table should be chosen first (lower cost).
         assert_eq!(order[0], 0); // "x" has fewest pages.
     }
 
@@ -6283,7 +6518,7 @@ mod tests {
             },
         ];
 
-        let (order, _cost, _plans) = dpccp_order_joins(
+        let (order, _cost, _plans, _pruned) = dpccp_order_joins(
             &tables,
             &[],
             &[],
@@ -6298,9 +6533,73 @@ mod tests {
     }
 
     #[test]
+    fn test_order_joins_five_tables_uses_exhaustive_search() {
+        reset_plans_enumerated();
+        let tables = (0..5)
+            .map(|i| TableStats {
+                name: format!("t{i}"),
+                n_pages: 10,
+                n_rows: 100,
+                source: StatsSource::Heuristic,
+            })
+            .collect::<Vec<_>>();
+
+        let plan = order_joins(&tables, &[], &[], None, &[]);
+        assert_eq!(plan.join_order.len(), 5);
+
+        let enumerated = plans_enumerated_total();
+        assert!(
+            enumerated > 120,
+            "5-table exhaustive search should enumerate well beyond greedy-width bounds, got {enumerated}"
+        );
+    }
+
+    #[test]
+    fn test_dpccp_branch_and_bound_prunes_high_cost_branches() {
+        let tables = vec![
+            TableStats {
+                name: "tiny".to_owned(),
+                n_pages: 1,
+                n_rows: 1,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "small".to_owned(),
+                n_pages: 2,
+                n_rows: 2,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "huge_a".to_owned(),
+                n_pages: 10_000,
+                n_rows: 10_000,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "huge_b".to_owned(),
+                n_pages: 20_000,
+                n_rows: 20_000,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "huge_c".to_owned(),
+                n_pages: 30_000,
+                n_rows: 30_000,
+                source: StatsSource::Heuristic,
+            },
+        ];
+
+        let (_order, _cost, _plans, pruned) =
+            dpccp_order_joins(&tables, &[], &[], None, None, &[], None)
+                .expect("5-table exhaustive plan should exist");
+
+        assert!(pruned > 0, "expected branch-and-bound pruning to occur");
+    }
+
+    #[test]
     fn test_order_joins_large_join_uses_greedy_width() {
         reset_plans_enumerated();
-        let tables = (0..9)
+        let tables = (0..10)
             .map(|i| TableStats {
                 name: format!("t{i}"),
                 n_pages: (i as u64 + 1) * 10,
@@ -6310,12 +6609,12 @@ mod tests {
             .collect::<Vec<_>>();
 
         let plan = order_joins(&tables, &[], &[], None, &[]);
-        assert_eq!(plan.join_order.len(), 9);
+        assert_eq!(plan.join_order.len(), 10);
 
         let enumerated = plans_enumerated_total();
         assert!(
-            enumerated <= 120,
-            "greedy-width search should keep enumeration bounded, got {enumerated}"
+            enumerated <= 800,
+            "greedy-width search should keep enumeration bounded for 10-table joins, got {enumerated}"
         );
     }
 
