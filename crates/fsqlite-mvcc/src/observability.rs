@@ -8,8 +8,8 @@
 //! **Invariant:** All functions in this module are non-blocking. They must
 //! never acquire page locks or block writers.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use fsqlite_observability::{ConflictEvent, ConflictObserver, SsiAbortCategory};
@@ -166,6 +166,26 @@ pub struct CasMetricsSnapshot {
     pub attempts_total: u64,
     /// Histogram of CAS attempt counts per install operation.
     pub retries: CasRetriesHistogram,
+}
+
+impl CasMetricsSnapshot {
+    /// Number of installs that succeeded on the first CAS attempt.
+    #[must_use]
+    pub fn first_attempt_count(&self) -> u64 {
+        self.retries.le_1
+    }
+
+    /// Fraction of installs that succeeded on the first attempt.
+    ///
+    /// Returns `0.0` when no samples have been recorded.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn first_attempt_ratio(&self) -> f64 {
+        if self.attempts_total == 0 {
+            return 0.0;
+        }
+        self.first_attempt_count() as f64 / self.attempts_total as f64
+    }
 }
 
 /// Record one CAS install operation with the given number of CAS attempts.
@@ -548,6 +568,61 @@ mod tests {
     fn snapshot_gauge_release_saturates() {
         // Saturating release must never underflow/panic, even when gauge is zero.
         mvcc_snapshot_released();
+    }
+
+    #[test]
+    fn cas_metrics_recording_buckets_progress() {
+        let before = cas_metrics_snapshot();
+        record_cas_attempt(1);
+        record_cas_attempt(2);
+        record_cas_attempt(4);
+        record_cas_attempt(6);
+        let after = cas_metrics_snapshot();
+
+        let total_delta = after.attempts_total.saturating_sub(before.attempts_total);
+        let le_1_delta = after.retries.le_1.saturating_sub(before.retries.le_1);
+        let le_2_delta = after.retries.le_2.saturating_sub(before.retries.le_2);
+        let le_4_delta = after.retries.le_4.saturating_sub(before.retries.le_4);
+        let gt_4_delta = after.retries.gt_4.saturating_sub(before.retries.gt_4);
+
+        assert!(
+            total_delta >= 4,
+            "expected >=4 new samples, got {total_delta}"
+        );
+        assert!(
+            le_1_delta >= 1,
+            "expected >=1 le_1 sample, got {le_1_delta}"
+        );
+        assert!(
+            le_2_delta >= 1,
+            "expected >=1 le_2 sample, got {le_2_delta}"
+        );
+        assert!(
+            le_4_delta >= 1,
+            "expected >=1 le_4 sample, got {le_4_delta}"
+        );
+        assert!(
+            gt_4_delta >= 1,
+            "expected >=1 gt_4 sample, got {gt_4_delta}"
+        );
+    }
+
+    #[test]
+    fn cas_metrics_first_attempt_ratio_helper() {
+        let empty = CasMetricsSnapshot::default();
+        assert!((empty.first_attempt_ratio() - 0.0).abs() < f64::EPSILON);
+
+        let snapshot = CasMetricsSnapshot {
+            attempts_total: 20,
+            retries: CasRetriesHistogram {
+                le_1: 19,
+                le_2: 1,
+                le_4: 0,
+                gt_4: 0,
+            },
+        };
+        assert_eq!(snapshot.first_attempt_count(), 19);
+        assert!((snapshot.first_attempt_ratio() - 0.95).abs() < 1e-12);
     }
 
     // -----------------------------------------------------------------------

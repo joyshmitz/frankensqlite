@@ -8,7 +8,7 @@ use fsqlite_ast::{
     ColumnRef, DeleteStatement, Expr, InsertSource, InsertStatement, Literal, PlaceholderType,
     QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, UpdateStatement,
 };
-use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
+use fsqlite_types::opcode::{Label, Opcode, ProgramBuilder, P4};
 
 // ---------------------------------------------------------------------------
 // Schema metadata (minimal info needed for codegen)

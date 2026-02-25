@@ -503,7 +503,7 @@ pub struct PlannerFeatureFlags {
 /// Maximum table count for DPccp exhaustive search.
 /// Above this threshold we use bounded beam search.
 #[allow(dead_code)]
-const DPCCP_MAX_TABLES: usize = 6;
+const DPCCP_MAX_TABLES: usize = 8;
 
 /// Monotonic counter: total join plans enumerated.
 static FSQLITE_PLANNER_PLANS_ENUMERATED: AtomicU64 = AtomicU64::new(0);
@@ -937,6 +937,7 @@ fn best_access_path_internal(
     let mut candidates_considered: usize = 0;
     let mut partial_indexes_pruned: usize = 0;
     let mut hint_filtered_indexes: usize = 0;
+    let mut skip_scan_candidates: usize = 0;
     let mut adaptive_hint_applied = false;
     let mut explicit_hint_applied = false;
     let mut explicit_hint_missing = explicit_indexed_by.is_some();
@@ -968,7 +969,21 @@ fn best_access_path_internal(
             }
         }
 
-        let usability = analyze_index_usability(idx, where_terms);
+        let mut skip_scan_candidate = None;
+        let usability = match analyze_index_usability(idx, where_terms) {
+            IndexUsability::NotUsable => {
+                if let Some(candidate) = analyze_skip_scan_candidate(table, idx, where_terms) {
+                    skip_scan_candidates += 1;
+                    skip_scan_candidate = Some(candidate);
+                    IndexUsability::Range {
+                        selectivity: candidate.per_probe_selectivity,
+                    }
+                } else {
+                    IndexUsability::NotUsable
+                }
+            }
+            usable => usable,
+        };
 
         if matches!(usability, IndexUsability::NotUsable) {
             continue;
@@ -983,7 +998,7 @@ fn best_access_path_internal(
         });
 
         let mut cost_multiplier: f64 = 1.0;
-        let (kind, est_rows) = match usability {
+        let (kind, mut est_rows) = match usability {
             IndexUsability::Equality => {
                 let rows = if idx.unique {
                     1.0
@@ -1060,6 +1075,13 @@ fn best_access_path_internal(
             }
             IndexUsability::NotUsable => unreachable!(),
         };
+
+        if let Some(candidate) = skip_scan_candidate {
+            let probe_multiplier =
+                (candidate.leading_probes * candidate.trailing_probe_count) as f64;
+            cost_multiplier *= probe_multiplier;
+            est_rows = (est_rows * probe_multiplier).min(table.n_rows.max(1) as f64);
+        }
 
         let mut cost = estimate_cost(&kind, table.n_pages, idx.n_pages) * cost_multiplier;
 
@@ -1147,7 +1169,8 @@ fn best_access_path_internal(
         adaptive_hint = %adaptive_hint,
         candidates = candidates_considered,
         partial_pruned = partial_indexes_pruned,
-        hint_filtered = hint_filtered_indexes
+        hint_filtered = hint_filtered_indexes,
+        skip_scan_candidates
     );
     let _span_guard = span.enter();
 
@@ -1219,6 +1242,13 @@ pub enum IndexUsability {
     NotUsable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SkipScanCandidate {
+    leading_probes: usize,
+    trailing_probe_count: usize,
+    per_probe_selectivity: f64,
+}
+
 /// A decomposed WHERE term with the column it references (if any).
 #[derive(Debug, Clone)]
 pub struct WhereTerm<'a> {
@@ -1284,11 +1314,97 @@ fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+fn collect_disjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryOp {
+        left,
+        op: AstBinaryOp::Or,
+        right,
+        ..
+    } = expr
+    {
+        collect_disjuncts(left, out);
+        collect_disjuncts(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+fn where_columns_equivalent(left: &WhereColumn, right: &WhereColumn) -> bool {
+    left.column.eq_ignore_ascii_case(&right.column)
+        && match (&left.table, &right.table) {
+            (Some(l), Some(r)) => l.eq_ignore_ascii_case(r),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn classify_or_disjunction_as_in_list(expr: &Expr) -> Option<(WhereColumn, usize)> {
+    let mut disjuncts = Vec::new();
+    collect_disjuncts(expr, &mut disjuncts);
+    if disjuncts.len() < 2 {
+        return None;
+    }
+
+    let mut shared_column: Option<WhereColumn> = None;
+
+    for disjunct in disjuncts.iter().copied() {
+        let Expr::BinaryOp {
+            left,
+            op: AstBinaryOp::Eq,
+            right,
+            ..
+        } = disjunct
+        else {
+            return None;
+        };
+
+        let column = match (extract_where_column(left), extract_where_column(right)) {
+            (Some(column), None) => column,
+            (None, Some(column)) => column,
+            _ => return None,
+        };
+
+        if is_rowid_column(&column) {
+            return None;
+        }
+
+        if let Some(ref existing) = shared_column {
+            if !where_columns_equivalent(existing, &column) {
+                return None;
+            }
+        } else {
+            shared_column = Some(column);
+        }
+    }
+
+    shared_column.map(|column| (column, disjuncts.len()))
+}
+
 /// Classify a single WHERE expression into a [`WhereTerm`].
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
     match expr {
+        // (col = v1) OR (col = v2) OR ... => treat as IN-list probe expansion.
+        Expr::BinaryOp {
+            op: AstBinaryOp::Or,
+            ..
+        } => {
+            if let Some((column, probe_count)) = classify_or_disjunction_as_in_list(expr) {
+                return WhereTerm {
+                    expr,
+                    column: Some(column),
+                    kind: WhereTermKind::InList { count: probe_count },
+                };
+            }
+
+            WhereTerm {
+                expr,
+                column: None,
+                kind: WhereTermKind::Other,
+            }
+        }
+
         // col = expr or expr = col
         Expr::BinaryOp {
             left,
@@ -1632,6 +1748,86 @@ fn analyze_expression_index_usability(
 
 /// Default selectivity for range constraints when no ANALYZE data is available.
 const DEFAULT_RANGE_SELECTIVITY: f64 = 0.33;
+const SKIP_SCAN_EQ_SELECTIVITY: f64 = 0.01;
+const SKIP_SCAN_RANGE_SELECTIVITY: f64 = 0.20;
+const SKIP_SCAN_MAX_LEADING_DISTINCT: u64 = 16;
+const SKIP_SCAN_PAGES_PER_LEADING_DISTINCT: u64 = 8;
+
+fn estimate_skip_scan_leading_distinct(index: &IndexInfo) -> u64 {
+    (index.n_pages / SKIP_SCAN_PAGES_PER_LEADING_DISTINCT).max(1)
+}
+
+fn analyze_skip_scan_candidate(
+    table: &TableStats,
+    index: &IndexInfo,
+    terms: &[WhereTerm<'_>],
+) -> Option<SkipScanCandidate> {
+    if index.columns.len() < 2
+        || (!matches!(table.source, StatsSource::Analyze)
+            && !matches!(index.source, StatsSource::Analyze))
+    {
+        return None;
+    }
+
+    let col_matches = |wc: &WhereColumn, idx_col: &str| -> bool {
+        wc.column.eq_ignore_ascii_case(idx_col)
+            && wc
+                .table
+                .as_ref()
+                .is_none_or(|t| t.eq_ignore_ascii_case(&index.table))
+    };
+
+    let leading_col = &index.columns[0];
+    let leading_constrained = terms.iter().any(|term| {
+        term.column.as_ref().is_some_and(|wc| {
+            col_matches(wc, leading_col)
+                && matches!(
+                    term.kind,
+                    WhereTermKind::Equality
+                        | WhereTermKind::Range
+                        | WhereTermKind::Between
+                        | WhereTermKind::InList { .. }
+                        | WhereTermKind::LikePrefix { .. }
+                )
+        })
+    });
+    if leading_constrained {
+        return None;
+    }
+
+    let leading_distinct = estimate_skip_scan_leading_distinct(index);
+    if leading_distinct > SKIP_SCAN_MAX_LEADING_DISTINCT {
+        return None;
+    }
+
+    for idx_col in index.columns.iter().skip(1) {
+        for term in terms {
+            let Some(wc) = term.column.as_ref() else {
+                continue;
+            };
+            if !col_matches(wc, idx_col) {
+                continue;
+            }
+
+            let (trailing_probe_count, per_probe_selectivity) = match term.kind {
+                WhereTermKind::Equality => (1, SKIP_SCAN_EQ_SELECTIVITY),
+                WhereTermKind::InList { count } if count > 0 => (count, SKIP_SCAN_EQ_SELECTIVITY),
+                WhereTermKind::Range
+                | WhereTermKind::Between
+                | WhereTermKind::LikePrefix { .. } => (1, SKIP_SCAN_RANGE_SELECTIVITY),
+                _ => continue,
+            };
+
+            return Some(SkipScanCandidate {
+                leading_probes: leading_distinct as usize,
+                trailing_probe_count,
+                per_probe_selectivity,
+            });
+        }
+    }
+
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Join ordering: bounded beam search (§10.5)
@@ -2421,10 +2617,80 @@ pub fn order_joins_with_hints_and_features(
         return plan;
     }
 
+    if n <= DPCCP_MAX_TABLES {
+        if let Some((order_indices, total_cost, plans_counted)) = dpccp_order_joins(
+            tables,
+            indexes,
+            where_terms,
+            needed_columns,
+            table_index_hints,
+            cross_join_pairs,
+            cracking_hints.as_deref(),
+        ) {
+            let join_order = order_indices
+                .iter()
+                .map(|idx| tables[*idx].name.clone())
+                .collect::<Vec<_>>();
+            let access_paths = order_indices
+                .iter()
+                .map(|idx| {
+                    join_access_path(
+                        &tables[*idx],
+                        indexes,
+                        where_terms,
+                        needed_columns,
+                        table_index_hints,
+                        cracking_hints.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let join_segments =
+                choose_join_segments(&join_order, tables, where_terms, None, feature_flags);
+            let plan = QueryPlan {
+                join_order,
+                access_paths,
+                join_segments,
+                total_cost,
+            };
+
+            if let Some(store) = cracking_hints {
+                for access_path in &plan.access_paths {
+                    store.record_access_path(access_path);
+                }
+            }
+
+            FSQLITE_PLANNER_PLANS_ENUMERATED.fetch_add(plans_counted, Ordering::Relaxed);
+
+            tracing::debug!(
+                join_order = ?plan.join_order,
+                total_cost = plan.total_cost,
+                table_count = n,
+                plans_enumerated = plans_counted,
+                algorithm = "dpccp_exhaustive",
+                "planner.order_joins.complete"
+            );
+
+            tracing::info!(
+                join_order = ?plan.join_order,
+                total_cost = plan.total_cost,
+                table_count = n,
+                algorithm = "dpccp_exhaustive",
+                "planner.plan_selected"
+            );
+
+            return plan;
+        }
+    }
+
     let mut plans_enumerated: u64 = 0;
 
     let is_star = detect_star_query(tables, where_terms);
-    let mx_choice = compute_mx_choice(n, is_star);
+    let mx_choice = if n > DPCCP_MAX_TABLES {
+        // For large joins, use a greedy-width search (single best partial path).
+        1
+    } else {
+        compute_mx_choice(n, is_star)
+    };
 
     // Seed: start with each table as a single-element path.
     // Skip tables that are blocked by CROSS JOIN constraints (right side of a
@@ -2621,6 +2887,24 @@ fn cross_join_allowed(
     true
 }
 
+fn cross_join_allowed_indices(
+    current_path: &[usize],
+    candidate: &str,
+    tables: &[TableStats],
+    cross_join_pairs: &[(String, String)],
+) -> bool {
+    for (left, right) in cross_join_pairs {
+        if right.eq_ignore_ascii_case(candidate)
+            && !current_path
+                .iter()
+                .any(|idx| tables[*idx].name.eq_ignore_ascii_case(left))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // DPccp: exhaustive join ordering for small join counts (bd-1as.3)
 // ---------------------------------------------------------------------------
@@ -2630,7 +2914,7 @@ fn cross_join_allowed(
 /// Exhaustively enumerates all valid join orderings for `n` tables using
 /// bitmask-based dynamic programming. Returns the minimum-cost permutation.
 ///
-/// Only used when `n <= DPCCP_MAX_TABLES` and `feature_flags.dpccp_join`.
+/// Used for exhaustive small-join planning when `n <= DPCCP_MAX_TABLES`.
 #[allow(dead_code, clippy::cast_possible_truncation)]
 fn dpccp_order_joins(
     tables: &[TableStats],
@@ -2638,8 +2922,9 @@ fn dpccp_order_joins(
     where_terms: &[WhereTerm<'_>],
     needed_columns: Option<&[String]>,
     table_index_hints: Option<&BTreeMap<String, IndexHint>>,
+    cross_join_pairs: &[(String, String)],
     cracking_hints: Option<&CrackingHintStore>,
-) -> (Vec<usize>, f64, u64) {
+) -> Option<(Vec<usize>, f64, u64)> {
     let n = tables.len();
     assert!(n <= DPCCP_MAX_TABLES);
     let full_mask = (1u64 << n) - 1;
@@ -2650,6 +2935,9 @@ fn dpccp_order_joins(
 
     // Base: single-table subsets.
     for (i, table) in tables.iter().enumerate() {
+        if !cross_join_allowed(&[], &table.name, cross_join_pairs) {
+            continue;
+        }
         let mask = 1u64 << i;
         let ap = join_access_path(
             table,
@@ -2677,6 +2965,12 @@ fn dpccp_order_joins(
         for (i, table) in tables.iter().enumerate() {
             if mask & (1u64 << i) != 0 {
                 continue; // Already in set.
+            }
+            let (_prev_cost, _prev_rows, prev_order) = dp[mask as usize]
+                .as_ref()
+                .expect("mask with entry must be populated");
+            if !cross_join_allowed_indices(prev_order, &table.name, tables, cross_join_pairs) {
+                continue;
             }
             let new_mask = mask | (1u64 << i);
             let ap = join_access_path(
@@ -2707,10 +3001,10 @@ fn dpccp_order_joins(
         }
     }
 
-    let (cost, _rows, order) = dp[full_mask as usize]
-        .clone()
-        .expect("full set must be populated");
-    (order, cost, plans_counted)
+    let Some((cost, _rows, order)) = dp[full_mask as usize].clone() else {
+        return None;
+    };
+    Some((order, cost, plans_counted))
 }
 
 // ---------------------------------------------------------------------------
@@ -3470,6 +3764,36 @@ mod tests {
         classify_where_term(expr)
     }
 
+    fn or_eq_term(col: &str, values: &[i64]) -> WhereTerm<'static> {
+        assert!(
+            values.len() >= 2,
+            "or_eq_term requires at least two disjunct values"
+        );
+
+        let mut disjuncts = values
+            .iter()
+            .map(|value| Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare(col), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Literal(Literal::Integer(*value), Span::ZERO)),
+                span: Span::ZERO,
+            })
+            .collect::<Vec<_>>();
+
+        let mut combined = disjuncts.pop().expect("values is non-empty");
+        while let Some(left_disjunct) = disjuncts.pop() {
+            combined = Expr::BinaryOp {
+                left: Box::new(left_disjunct),
+                op: AstBinaryOp::Or,
+                right: Box::new(combined),
+                span: Span::ZERO,
+            };
+        }
+
+        let expr: &'static Expr = Box::leak(Box::new(combined));
+        classify_where_term(expr)
+    }
+
     fn join_term(t1: &str, c1: &str, t2: &str, c2: &str) -> WhereTerm<'static> {
         let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::qualified(t1, c1), Span::ZERO)),
@@ -3672,6 +3996,18 @@ mod tests {
     }
 
     #[test]
+    fn test_best_access_path_or_disjunction_uses_in_expansion_index_probe() {
+        let table = table_stats("t1", 1_000, 100_000);
+        let idx = index_info("idx_a", "t1", &["a"], false, 80);
+        let term = or_eq_term("a", &[1, 2, 3, 4]);
+        assert!(matches!(term.kind, WhereTermKind::InList { count: 4 }));
+
+        let ap = best_access_path(&table, &[idx], &[term], None);
+        assert_eq!(ap.index.as_deref(), Some("idx_a"));
+        assert!(matches!(ap.kind, AccessPathKind::IndexScanEquality));
+    }
+
+    #[test]
     fn test_index_usability_like_prefix() {
         let idx = index_info("idx_name", "t1", &["name"], false, 50);
         // LIKE 'Jo%' → usable (constant prefix)
@@ -3831,11 +4167,11 @@ mod tests {
         // The planner should NOT produce the same cost as it would if
         // outer_rows were only the second table's rows.
         #[allow(clippy::suboptimal_flops)]
-        let cost_if_only_last = 1.0_f64   // small full scan cost
-            + 10.0 * 10.0   // medium scanned 10 times
+        let cost_if_only_last = 1.0_f64 // small full scan cost
+            + 10.0 * 10.0 // medium scanned 10 times
             + 100.0 * 100.0; // BUG cost: large scanned only 100 times (medium.rows)
-        // The plan's total cost should be larger than this naive estimate
-        // because large is actually scanned 10*100=1000 times.
+                             // The plan's total cost should be larger than this naive estimate
+                             // because large is actually scanned 10*100=1000 times.
         assert!(
             plan_sml.total_cost > cost_if_only_last,
             "3-way join cost should scale by cumulative rows, not just last table: plan_cost={} bug_cost={}",
@@ -4734,6 +5070,60 @@ mod tests {
         assert!(matches!(term.kind, WhereTermKind::Other));
     }
 
+    #[test]
+    fn test_classify_where_term_or_same_column_becomes_in_list() {
+        let term = or_eq_term("a", &[1, 2, 3]);
+        assert!(matches!(term.kind, WhereTermKind::InList { count: 3 }));
+        assert_eq!(term.column.as_ref().map(|c| c.column.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn test_classify_where_term_or_reversed_equalities_becomes_in_list() {
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::Or,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            span: Span::ZERO,
+        }));
+
+        let term = classify_where_term(expr);
+        assert!(matches!(term.kind, WhereTermKind::InList { count: 2 }));
+        assert_eq!(term.column.as_ref().map(|c| c.column.as_str()), Some("a"));
+    }
+
+    #[test]
+    fn test_classify_where_term_or_mixed_columns_is_other() {
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            op: AstBinaryOp::Or,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+                span: Span::ZERO,
+            }),
+            span: Span::ZERO,
+        }));
+
+        let term = classify_where_term(expr);
+        assert!(matches!(term.kind, WhereTermKind::Other));
+    }
+
     // ===================================================================
     // decompose_where edge cases
     // ===================================================================
@@ -4911,6 +5301,56 @@ mod tests {
         };
         let terms = [eq_term("a")];
         let ap = best_access_path(&table, &[idx], &terms, None);
+        assert!(matches!(ap.kind, AccessPathKind::FullTableScan));
+    }
+
+    #[test]
+    fn test_best_access_path_skip_scan_on_low_cardinality_leading_column() {
+        let table = TableStats {
+            name: "users".to_owned(),
+            n_pages: 4_096,
+            n_rows: 2_000_000,
+            source: StatsSource::Analyze,
+        };
+        let idx = IndexInfo {
+            name: "idx_tenant_email".to_owned(),
+            table: "users".to_owned(),
+            columns: vec!["tenant_id".to_owned(), "email".to_owned()],
+            unique: false,
+            n_pages: 64,
+            source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
+        };
+
+        let ap = best_access_path(&table, &[idx], &[eq_term("email")], None);
+        assert_eq!(ap.index.as_deref(), Some("idx_tenant_email"));
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_skip_scan_rejects_high_cardinality_leading_column() {
+        let table = TableStats {
+            name: "users".to_owned(),
+            n_pages: 2_000,
+            n_rows: 1_000_000,
+            source: StatsSource::Analyze,
+        };
+        let idx = IndexInfo {
+            name: "idx_region_email".to_owned(),
+            table: "users".to_owned(),
+            columns: vec!["region_code".to_owned(), "email".to_owned()],
+            unique: false,
+            n_pages: SKIP_SCAN_PAGES_PER_LEADING_DISTINCT * (SKIP_SCAN_MAX_LEADING_DISTINCT + 2),
+            source: StatsSource::Analyze,
+            partial_where: None,
+            expression_columns: vec![],
+        };
+
+        let ap = best_access_path(&table, &[idx], &[eq_term("email")], None);
         assert!(matches!(ap.kind, AccessPathKind::FullTableScan));
     }
 
@@ -5784,7 +6224,8 @@ mod tests {
         let where_terms = vec![];
 
         let (order, cost, plans) =
-            dpccp_order_joins(&tables, &indexes, &where_terms, None, None, None);
+            dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
+                .expect("2-table exhaustive plan should exist");
         assert_eq!(order.len(), 2);
         assert!(cost > 0.0);
         assert!(plans >= 2); // At least 2 seed + extensions.
@@ -5816,12 +6257,66 @@ mod tests {
         let where_terms = vec![];
 
         let (order, cost, plans) =
-            dpccp_order_joins(&tables, &indexes, &where_terms, None, None, None);
+            dpccp_order_joins(&tables, &indexes, &where_terms, None, None, &[], None)
+                .expect("3-table exhaustive plan should exist");
         assert_eq!(order.len(), 3);
         assert!(cost > 0.0);
         assert!(plans > 3); // More than just seed.
-        // Small table should be chosen first (lower cost).
+                            // Small table should be chosen first (lower cost).
         assert_eq!(order[0], 0); // "x" has fewest pages.
+    }
+
+    #[test]
+    fn test_dpccp_respects_cross_join_constraint() {
+        let tables = vec![
+            TableStats {
+                name: "t1".to_owned(),
+                n_pages: 100,
+                n_rows: 10_000,
+                source: StatsSource::Heuristic,
+            },
+            TableStats {
+                name: "t2".to_owned(),
+                n_pages: 1,
+                n_rows: 10,
+                source: StatsSource::Heuristic,
+            },
+        ];
+
+        let (order, _cost, _plans) = dpccp_order_joins(
+            &tables,
+            &[],
+            &[],
+            None,
+            None,
+            &[("t1".to_owned(), "t2".to_owned())],
+            None,
+        )
+        .expect("cross-join constrained exhaustive plan should exist");
+
+        assert_eq!(order, vec![0, 1], "CROSS JOIN should force t1 before t2");
+    }
+
+    #[test]
+    fn test_order_joins_large_join_uses_greedy_width() {
+        reset_plans_enumerated();
+        let tables = (0..9)
+            .map(|i| TableStats {
+                name: format!("t{i}"),
+                n_pages: (i as u64 + 1) * 10,
+                n_rows: (i as u64 + 1) * 100,
+                source: StatsSource::Heuristic,
+            })
+            .collect::<Vec<_>>();
+
+        let plan = order_joins(&tables, &[], &[], None, &[]);
+        assert_eq!(plan.join_order.len(), 9);
+
+        let enumerated = plans_enumerated_total();
+        assert!(
+            enumerated <= 120,
+            "greedy-width search should keep enumeration bounded, got {enumerated}"
+        );
     }
 
     #[test]

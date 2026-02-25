@@ -9,8 +9,8 @@
 //! - [`SerializedWriteMutex`]: Global write mutex for Serialized mode (INV-7).
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
@@ -22,7 +22,7 @@ use fsqlite_types::{
 use crate::cache_aligned::CacheAligned;
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
 use crate::ebr::VersionGuardRegistry;
-use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry};
+use crate::gc::{gc_tick_with_registry, GcTickResult, GcTodo};
 use crate::observability::record_cas_attempt;
 
 // ---------------------------------------------------------------------------
@@ -1083,6 +1083,137 @@ mod tests {
                 window[1]
             );
         }
+    }
+
+    #[test]
+    fn test_bd6883_first_attempt_ratio_64_threads_moderate_contention() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        const THREADS: u32 = 64;
+        const INSTALLS_PER_THREAD: u32 = 256;
+        const PAGE_FANOUT: u32 = 512;
+        const BEAD_ID: &str = "bd-688.3";
+        const RUN_ID: &str = "bd6883-cas-ratio-run";
+        const TRACE_ID: &str = "bd6883-cas-ratio-trace";
+        const SCENARIO_ID: &str = "cas_first_attempt_ratio_moderate_contention";
+
+        let chain_heads = Arc::new(ChainHeadTable::new());
+        let next_idx_raw = Arc::new(AtomicU64::new(0));
+        let first_attempts = Arc::new(AtomicU64::new(0));
+        let total_installs = Arc::new(AtomicU64::new(0));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let chain_heads = Arc::clone(&chain_heads);
+                let next_idx_raw = Arc::clone(&next_idx_raw);
+                let first_attempts = Arc::clone(&first_attempts);
+                let total_installs = Arc::clone(&total_installs);
+
+                thread::spawn(move || {
+                    for op in 0..INSTALLS_PER_THREAD {
+                        let global = tid * INSTALLS_PER_THREAD + op;
+                        let pgno = PageNumber::new((global % PAGE_FANOUT) + 1)
+                            .expect("page number must be non-zero");
+                        let raw = next_idx_raw.fetch_add(1, Ordering::Relaxed);
+                        #[allow(clippy::cast_possible_truncation)]
+                        let chunk = (raw / 4096) as u32;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let offset = (raw % 4096) as u32;
+                        let idx = VersionIdx::new(chunk, offset, 1);
+
+                        let (_previous, attempts) = chain_heads.install_with_retry(pgno, idx);
+                        total_installs.fetch_add(1, Ordering::Relaxed);
+                        if attempts == 1 {
+                            first_attempts.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("stress thread must not panic");
+        }
+
+        let total = total_installs.load(Ordering::Relaxed);
+        let first = first_attempts.load(Ordering::Relaxed);
+        assert_eq!(
+            total,
+            u64::from(THREADS) * u64::from(INSTALLS_PER_THREAD),
+            "all install attempts must be accounted for"
+        );
+
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = first as f64 / total as f64;
+        tracing::info!(
+            bead_id = BEAD_ID,
+            run_id = RUN_ID,
+            trace_id = TRACE_ID,
+            scenario_id = SCENARIO_ID,
+            total_installs = total,
+            first_attempts = first,
+            first_attempt_ratio = ratio,
+            "chain-head CAS first-attempt ratio stress result"
+        );
+
+        assert!(
+            ratio >= 0.95,
+            "bead_id={BEAD_ID} run_id={RUN_ID} trace_id={TRACE_ID} scenario_id={SCENARIO_ID} expected first-attempt ratio >= 0.95, got {ratio:.6}"
+        );
+    }
+
+    #[test]
+    fn loom_chain_head_publication_linearizable() {
+        use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use loom::sync::Arc;
+        use loom::thread;
+
+        loom::model(|| {
+            const EMPTY: u64 = u64::MAX;
+            const HEAD_A: u64 = 0x1001;
+            const HEAD_B: u64 = 0x2002;
+
+            let head = Arc::new(AtomicU64::new(EMPTY));
+            let completions = Arc::new(AtomicUsize::new(0));
+
+            let spawn_installer =
+                |next_head: u64, head: Arc<AtomicU64>, completions: Arc<AtomicUsize>| {
+                    thread::spawn(move || loop {
+                        let current = head.load(Ordering::Acquire);
+                        if head
+                            .compare_exchange(
+                                current,
+                                next_head,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            completions.fetch_add(1, Ordering::Release);
+                            break;
+                        }
+                    })
+                };
+
+            let thread_a = spawn_installer(HEAD_A, Arc::clone(&head), Arc::clone(&completions));
+            let thread_b = spawn_installer(HEAD_B, Arc::clone(&head), Arc::clone(&completions));
+
+            thread_a.join().expect("loom installer A must join");
+            thread_b.join().expect("loom installer B must join");
+
+            let final_head = head.load(Ordering::Acquire);
+            assert!(
+                final_head == HEAD_A || final_head == HEAD_B,
+                "final head must equal one of the published values"
+            );
+            assert_eq!(
+                completions.load(Ordering::Acquire),
+                2,
+                "both installers must eventually complete"
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
