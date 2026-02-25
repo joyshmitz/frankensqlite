@@ -281,7 +281,7 @@ pub struct IoUringFile {
 
 impl IoUringFile {
     #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
-    fn read_via_uring(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read_via_uring(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         let ring_mutex = self.runtime.ring.as_ref().ok_or_else(|| {
             FrankenError::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -292,6 +292,7 @@ impl IoUringFile {
         self.inner.with_inode_io_file(|file| {
             let mut total = 0_usize;
             while total < buf.len() {
+                checkpoint_or_abort(cx)?;
                 let off = offset
                     .checked_add(u64::try_from(total).expect("usize must fit into u64"))
                     .ok_or_else(|| {
@@ -348,7 +349,7 @@ impl IoUringFile {
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
-    fn read_via_uring(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read_via_uring(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         let backend = self.asupersync_backend.as_ref().ok_or_else(|| {
             FrankenError::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -358,6 +359,7 @@ impl IoUringFile {
 
         let mut total = 0_usize;
         while total < buf.len() {
+            checkpoint_or_abort(cx)?;
             let chunk_end = next_chunk_end(total, buf.len());
             let off = offset
                 .checked_add(u64::try_from(total).expect("usize must fit into u64"))
@@ -396,7 +398,7 @@ impl IoUringFile {
     }
 
     #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
-    fn write_via_uring(&self, buf: &[u8], offset: u64) -> Result<()> {
+    fn write_via_uring(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         let ring_mutex = self.runtime.ring.as_ref().ok_or_else(|| {
             FrankenError::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -407,6 +409,7 @@ impl IoUringFile {
         self.inner.with_inode_io_file(|file| {
             let mut total = 0_usize;
             while total < buf.len() {
+                checkpoint_or_abort(cx)?;
                 let chunk_end = next_chunk_end(total, buf.len());
                 let off = offset
                     .checked_add(u64::try_from(total).expect("usize must fit into u64"))
@@ -469,7 +472,7 @@ impl IoUringFile {
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
-    fn write_via_uring(&self, buf: &[u8], offset: u64) -> Result<()> {
+    fn write_via_uring(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         let backend = self.asupersync_backend.as_ref().ok_or_else(|| {
             FrankenError::Io(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -479,6 +482,7 @@ impl IoUringFile {
 
         let mut total = 0_usize;
         while total < buf.len() {
+            checkpoint_or_abort(cx)?;
             let chunk_end = next_chunk_end(total, buf.len());
             let off = offset
                 .checked_add(u64::try_from(total).expect("usize must fit into u64"))
@@ -593,7 +597,7 @@ impl VfsFile for IoUringFile {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
             let start = Instant::now();
-            match self.read_via_uring(buf, offset) {
+            match self.read_via_uring(cx, buf, offset) {
                 Ok(bytes) => {
                     let elapsed = start.elapsed();
                     if record_io_uring_read_latency(elapsed) {
@@ -620,7 +624,7 @@ impl VfsFile for IoUringFile {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
             let start = Instant::now();
-            match self.write_via_uring(buf, offset) {
+            match self.write_via_uring(cx, buf, offset) {
                 Ok(()) => {
                     let elapsed = start.elapsed();
                     if record_io_uring_write_latency(elapsed) {
