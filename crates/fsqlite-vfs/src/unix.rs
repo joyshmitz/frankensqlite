@@ -241,12 +241,17 @@ fn sqlite_wal_shm_header_is_valid(buf: &[u8]) -> Result<bool> {
 /// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if it would
 /// block (another process holds a conflicting lock), and `Err` for real
 /// I/O errors.
+///
+/// The `lock_type` parameter accepts the platform-native lock constant type
+/// (`i32` on Linux, `i16` on macOS) via `Into<i32>`.
 #[allow(clippy::cast_possible_wrap)]
-fn posix_lock(file: &impl AsFd, lock_type: i32, start: u64, len: u64) -> Result<bool> {
-    let lock_type = i16::try_from(lock_type).expect("fcntl lock type must fit in i16");
-    let whence = i16::try_from(libc::SEEK_SET).expect("SEEK_SET must fit in i16");
+fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64) -> Result<bool> {
+    let lock_type_i32: i32 = lock_type.into();
+    #[allow(clippy::cast_possible_truncation)]
+    let lock_type_short = lock_type_i32 as libc::c_short;
+    let whence: libc::c_short = 0; // SEEK_SET
     let flock = libc::flock {
-        l_type: lock_type,
+        l_type: lock_type_short,
         l_whence: whence,
         l_start: start as libc::off_t,
         l_len: len as libc::off_t,
@@ -265,7 +270,7 @@ fn posix_lock(file: &impl AsFd, lock_type: i32, start: u64, len: u64) -> Result<
 
 /// Release a POSIX advisory lock.
 fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
-    let ok = posix_lock(file, libc::F_UNLCK, start, len)?;
+    let ok = posix_lock(file, i32::from(libc::F_UNLCK), start, len)?;
     debug_assert!(ok, "F_UNLCK should never fail with EAGAIN");
     Ok(())
 }
@@ -274,11 +279,13 @@ fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
 ///
 /// Uses `fcntl(F_GETLK)` and returns the kernel-filled `flock`.
 #[allow(clippy::cast_possible_wrap)]
-fn posix_getlk(file: &impl AsFd, lock_type: i32, start: u64, len: u64) -> Result<libc::flock> {
-    let lock_type = i16::try_from(lock_type).expect("fcntl lock type must fit in i16");
-    let whence = i16::try_from(libc::SEEK_SET).expect("SEEK_SET must fit in i16");
+fn posix_getlk(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64) -> Result<libc::flock> {
+    let lock_type_i32: i32 = lock_type.into();
+    #[allow(clippy::cast_possible_truncation)]
+    let lock_type_short = lock_type_i32 as libc::c_short;
+    let whence: libc::c_short = 0; // SEEK_SET
     let mut flock = libc::flock {
-        l_type: lock_type,
+        l_type: lock_type_short,
         l_whence: whence,
         l_start: start as libc::off_t,
         l_len: len as libc::off_t,
