@@ -1523,8 +1523,9 @@ impl VfsFile for UnixFile {
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
         let flock = posix_getlk(&*self.file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
-        let unlocked_type = i16::try_from(libc::F_UNLCK).expect("F_UNLCK must fit in i16");
-        Ok(flock.l_type != unlocked_type)
+        #[allow(clippy::cast_possible_truncation)]
+        let unlocked: libc::c_short = libc::F_UNLCK as libc::c_short;
+        Ok(flock.l_type != unlocked)
     }
 
     fn shm_map(
