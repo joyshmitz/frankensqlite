@@ -3362,14 +3362,25 @@ impl Connection {
         }
         let cx = self.op_cx();
         self.refresh_memdb_if_stale(&cx)?;
-        let mut txn = self.pager.begin(&cx, mode)?;
         let is_concurrent = mode == TransactionMode::Concurrent;
-        let concurrent_session = if is_concurrent {
-            let commit_seq = self.next_commit_seq.load(AtomicOrdering::Acquire);
-            let snapshot = Snapshot::new(
-                CommitSeq::new(commit_seq.saturating_sub(1)),
-                SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+        // Capture MVCC snapshot sequence BEFORE opening pager txn.
+        // This is intentionally conservative: if a writer commits between this
+        // load and `pager.begin`, FCW may over-abort, but it cannot false-clean.
+        let concurrent_snapshot = if is_concurrent {
+            let snapshot_seq = CommitSeq::new(
+                self.next_commit_seq
+                    .load(AtomicOrdering::Acquire)
+                    .saturating_sub(1),
             );
+            Some(Snapshot::new(
+                snapshot_seq,
+                SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+            ))
+        } else {
+            None
+        };
+        let mut txn = self.pager.begin(&cx, mode)?;
+        let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
             let begin_result =
                 lock_unpoisoned(&self.concurrent_registry).begin_concurrent(snapshot);
             match begin_result {
@@ -4870,16 +4881,27 @@ impl Connection {
 
         let cx = self.op_cx();
         self.refresh_memdb_if_stale(&cx)?;
+        // Capture MVCC snapshot sequence BEFORE opening pager txn.
+        // If a writer commits during begin, this can only make the snapshot
+        // older than the pager view (safe over-abort), never newer (unsafe).
+        let concurrent_snapshot = if is_concurrent {
+            let snapshot_seq = CommitSeq::new(
+                self.next_commit_seq
+                    .load(AtomicOrdering::Acquire)
+                    .saturating_sub(1),
+            );
+            Some(Snapshot::new(
+                snapshot_seq,
+                SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+            ))
+        } else {
+            None
+        };
         let mut txn = self.pager.begin(&cx, pager_mode)?;
         // MVCC concurrent-writer session (bd-14zc / 5E.1):
         // When mode is Concurrent, register with ConcurrentRegistry for
         // page-level MVCC locking and first-committer-wins validation.
-        let concurrent_session = if is_concurrent {
-            let commit_seq = self.next_commit_seq.load(AtomicOrdering::Acquire);
-            let snapshot = Snapshot::new(
-                CommitSeq::new(commit_seq.saturating_sub(1)),
-                SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
-            );
+        let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
             let session_id = lock_unpoisoned(&self.concurrent_registry)
                 .begin_concurrent(snapshot)
                 .map_err(|e| match e {
@@ -5469,13 +5491,23 @@ impl Connection {
             } else {
                 TransactionMode::Deferred
             };
-            let mut txn = self.pager.begin(&cx, pager_mode)?;
-            let concurrent_session = if is_concurrent {
-                let commit_seq = self.next_commit_seq.load(AtomicOrdering::Acquire);
-                let snapshot = Snapshot::new(
-                    CommitSeq::new(commit_seq.saturating_sub(1)),
-                    SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+            // Capture MVCC snapshot sequence BEFORE opening pager txn.
+            // This avoids assigning a snapshot newer than the actual read view.
+            let concurrent_snapshot = if is_concurrent {
+                let snapshot_seq = CommitSeq::new(
+                    self.next_commit_seq
+                        .load(AtomicOrdering::Acquire)
+                        .saturating_sub(1),
                 );
+                Some(Snapshot::new(
+                    snapshot_seq,
+                    SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+                ))
+            } else {
+                None
+            };
+            let mut txn = self.pager.begin(&cx, pager_mode)?;
+            let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
                 let session_id = lock_unpoisoned(&self.concurrent_registry)
                     .begin_concurrent(snapshot)
                     .map_err(|error| match error {
@@ -19446,7 +19478,9 @@ mod tests {
         }
 
         let verifier = Connection::open(&db).unwrap();
-        let sum_row = verifier.query_row("SELECT SUM(balance) FROM accounts;").unwrap();
+        let sum_row = verifier
+            .query_row("SELECT SUM(balance) FROM accounts;")
+            .unwrap();
         let final_sum = match sum_row.get(0) {
             Some(SqliteValue::Integer(value)) => *value,
             Some(other) => panic!("expected integer sum row, got {other:?}"),
@@ -19520,7 +19554,8 @@ mod tests {
             conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
                 .unwrap();
-            conn.execute("INSERT INTO t (id, v) VALUES (1, 0);").unwrap();
+            conn.execute("INSERT INTO t (id, v) VALUES (1, 0);")
+                .unwrap();
         }
 
         let start_barrier = Arc::new(std::sync::Barrier::new(WORKERS));

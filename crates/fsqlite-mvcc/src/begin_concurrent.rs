@@ -28,8 +28,8 @@ use fsqlite_types::{
 use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, TransactionState};
 use crate::lifecycle::MvccError;
 use crate::ssi_validation::{
-    ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
-    discover_incoming_edges, discover_outgoing_edges,
+    discover_incoming_edges, discover_outgoing_edges, ActiveTxnView, CommittedReaderInfo,
+    CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
 };
 
 /// Maximum number of concurrent writers that can be active simultaneously.
@@ -938,21 +938,36 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         }
     }
 
-    let Some(handle) = registry.get_mut(prepared.session_id) else {
-        return;
-    };
-    if !handle.is_active() {
-        return;
+    let mut mark_committed = false;
+    if let Some(handle) = registry.get_mut(prepared.session_id) {
+        if handle.is_active() {
+            handle.has_in_rw.set(has_in_rw);
+            handle.has_out_rw.set(has_out_rw);
+            mark_committed = true;
+        } else {
+            tracing::warn!(
+                session_id = prepared.session_id,
+                "finalize_prepared_concurrent_commit_with_ssi: session inactive during finalize; applying commit-index/lock-table side effects"
+            );
+        }
+    } else {
+        tracing::warn!(
+            session_id = prepared.session_id,
+            "finalize_prepared_concurrent_commit_with_ssi: session missing during finalize; applying commit-index/lock-table side effects"
+        );
     }
-
-    handle.has_in_rw.set(has_in_rw);
-    handle.has_out_rw.set(has_out_rw);
 
     for &page in &prepared.write_pages {
         commit_index.update(page, committed_seq);
     }
     lock_table.release_all(txn_id);
-    handle.mark_committed();
+    if mark_committed {
+        if let Some(handle) = registry.get_mut(prepared.session_id) {
+            if handle.is_active() {
+                handle.mark_committed();
+            }
+        }
+    }
 
     if !prepared.read_pages.is_empty() {
         registry.committed_readers.push(CommittedReaderInfo {
@@ -1060,9 +1075,10 @@ mod tests {
     use crate::lifecycle::MvccError;
 
     use super::{
-        ConcurrentRegistry, FcwResult, MAX_CONCURRENT_WRITERS, concurrent_abort, concurrent_commit,
-        concurrent_read_page, concurrent_rollback_to_savepoint, concurrent_savepoint,
-        concurrent_write_page, validate_first_committer_wins,
+        concurrent_abort, concurrent_commit, concurrent_read_page,
+        concurrent_rollback_to_savepoint, concurrent_savepoint, concurrent_write_page,
+        finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
+        validate_first_committer_wins, ConcurrentRegistry, FcwResult, MAX_CONCURRENT_WRITERS,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {
@@ -1421,6 +1437,58 @@ mod tests {
         let removed = registry.remove(s1);
         assert!(removed.is_some());
         assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn test_finalize_releases_locks_and_updates_commit_index_when_session_missing() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session 1");
+        {
+            let h1 = registry.get_mut(s1).expect("handle 1");
+            concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data())
+                .expect("session 1 writes page 5");
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("prepare should succeed");
+
+        let removed = registry.remove(s1);
+        assert!(
+            removed.is_some(),
+            "session should be removable to simulate handle disappearance"
+        );
+
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &prepared,
+            CommitSeq::new(11),
+        );
+
+        assert_eq!(
+            commit_index.latest(test_page(5)),
+            Some(CommitSeq::new(11)),
+            "finalize must update commit index even if handle is missing"
+        );
+
+        let s2 = registry
+            .begin_concurrent(test_snapshot(11))
+            .expect("session 2");
+        let h2 = registry.get_mut(s2).expect("handle 2");
+        concurrent_write_page(h2, &lock_table, s2, test_page(5), test_data())
+            .expect("page lock should be released during finalize");
     }
 
     // -----------------------------------------------------------------------
