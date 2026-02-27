@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "bd-2yqp6.2.5",
+  "run_id": "bd-mblr.7.1.3-smoke-seed-424242-doctor",
+  "trace_id": "trace-75a51ff6414e95c5-doctor",
+  "scenario_id": "DIFF-CI-713-doctor",
+  "seed": 424242,
+  "generated_unix_ms": 1700000000000,
+  "outcome": "yellow",
+  "certifying": false,
+  "timing_ms": 3,
+  "first_failure": {
+    "remediation_class": "version_drift",
+    "summary": "oracle version drift detected",
+    "fix_command": "sqlite3 --version && cargo test -p fsqlite-harness --test bd_2yqp6_1_3_sqlite_version_contract -- --nocapture"
+  },
+  "findings": [
+    {
+      "outcome": "yellow",
+      "remediation_class": "version_drift",
+      "summary": "oracle version drift detected",
+      "details": "expected sqlite3 --version prefix '3.52.0' but observed '3.46.1 2024-08-13 09:16:08 c9c2ab54ba1f5f46360f1b4f35d849cd3f080e6fc2b6c60e91b16c63f69aalt1 (64-bit)'",
+      "fix_command": "sqlite3 --version && cargo test -p fsqlite-harness --test bd_2yqp6_1_3_sqlite_version_contract -- --nocapture"
+    },
+    {
+      "outcome": "yellow",
+      "remediation_class": "stale_manifest",
+      "summary": "fixture ingest skipped one or more fixture files",
+      "details": "skipped examples: core_sql_golden_blake3.json (missing ops array)",
+      "fix_command": "cargo run -p fsqlite-harness --bin differential_manifest_runner -- --workspace-root /data/projects/frankensqlite --fixtures-dir /data/projects/frankensqlite/crates/fsqlite-harness/conformance"
+    },
+    {
+      "outcome": "yellow",
+      "remediation_class": "stale_manifest",
+      "summary": "fixture manifest appears stale relative to fixture corpus",
+      "details": "fixture_manifest_mtime_unix_ms=1772131421794 < latest_fixture_mtime_unix_ms=1772147816249",
+      "fix_command": "cargo run -p fsqlite-harness --bin differential_manifest_runner -- --workspace-root /data/projects/frankensqlite --fixtures-dir /data/projects/frankensqlite/crates/fsqlite-harness/conformance"
+    }
+  ],
+  "checks": {
+    "expected_subject_identity": "frankensqlite",
+    "expected_reference_identity": "csqlite-oracle",
+    "expected_sqlite_version_prefix": "3.52.0",
+    "fixtures_dir": "/data/projects/frankensqlite/crates/fsqlite-harness/conformance",
+    "fixture_manifest_path": "/data/projects/frankensqlite/corpus_manifest.toml",
+    "oracle_binary_path": "/usr/bin/sqlite3",
+    "oracle_version": "3.46.1 2024-08-13 09:16:08 c9c2ab54ba1f5f46360f1b4f35d849cd3f080e6fc2b6c60e91b16c63f69aalt1 (64-bit)",
+    "fixture_json_files_seen": 22,
+    "fixture_entries_ingested": 21,
+    "fixture_sql_statements_ingested": 109,
+    "skipped_fixture_files": 1,
+    "fixture_manifest_mtime_unix_ms": 1772131421794,
+    "latest_fixture_mtime_unix_ms": 1772147816249
+  },
+  "replay_command": "cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner -- --workspace-root /data/projects/frankensqlite --fixtures-dir /data/projects/frankensqlite/crates/fsqlite-harness/conformance --fixture-manifest-path /data/projects/frankensqlite/corpus_manifest.toml --run-id bd-mblr.7.1.3-smoke-seed-424242-doctor --trace-id trace-75a51ff6414e95c5-doctor --scenario-id DIFF-CI-713-doctor --seed 424242 --generated-unix-ms 1700000000000 --min-fixture-json-files 8 --min-fixture-entries 8 --min-fixture-sql-statements 40 --expected-sqlite-version-prefix 3.52.0 --expected-subject-identity frankensqlite --expected-reference-identity csqlite-oracle"
+}

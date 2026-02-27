@@ -1,0 +1,10 @@
+{
+  "trace_id": "trace-bd-2yqp6.7.1-20260227T000150Z-7100",
+  "run_id": "bd-2yqp6.7.1-20260227T000150Z-7100",
+  "scenario_id": "PARITY-RELEASE-THRESHOLD-G1",
+  "seed": 7100,
+  "bead_id": "bd-2yqp6.7.1",
+  "policy_file": "parity_release_threshold_policy.toml",
+  "events_jsonl": "artifacts/bd-2yqp6.7.1/bd-2yqp6.7.1-20260227T000150Z-7100/events.jsonl",
+  "result": "pass"
+}

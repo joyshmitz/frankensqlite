@@ -1,0 +1,23 @@
+{
+  "trace_id": "trace-bd-2yqp6.2.5-20260227T011647Z-4242",
+  "run_id": "bd-2yqp6.2.5-20260227T011647Z-4242",
+  "scenario_id": "DIFF-ORACLE-PREFLIGHT-B5",
+  "seed": 4242,
+  "bead_id": "bd-2yqp6.2.5",
+  "commands": [
+    "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_2_5_oracle_preflight_doctor -- --nocapture",
+    "rch exec -- cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner -- <green args>",
+    "rch exec -- cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner -- <missing-binary args>"
+  ],
+  "artifacts": {
+    "events_jsonl": "artifacts/bd-2yqp6.2.5/bd-2yqp6.2.5-20260227T011647Z-4242/events.jsonl",
+    "events_sha256": "f80efe7da1f8fb956f78a5b3c4654eea0e613d00de95bb3af4174c5a229c403c",
+    "test_log": "artifacts/bd-2yqp6.2.5/bd-2yqp6.2.5-20260227T011647Z-4242/test.log",
+    "test_log_sha256": "c6d9cdf590b4491940d4e8d279d4872af183ef91f6cb276bda6c475d6d39f4d6",
+    "doctor_green_json": "artifacts/bd-2yqp6.2.5/bd-2yqp6.2.5-20260227T011647Z-4242/doctor-green.json",
+    "doctor_green_json_sha256": "85cce85d86e4c81e1ade8ba8d4b07293039fdd33e56c01bceaddf3034cdf6887",
+    "doctor_red_json": "artifacts/bd-2yqp6.2.5/bd-2yqp6.2.5-20260227T011647Z-4242/doctor-red.json",
+    "doctor_red_json_sha256": "21b8429fa0214abf64fc27b06db882f17b4cb825ef2427cb5223db60c130de50"
+  },
+  "result": "fail"
+}

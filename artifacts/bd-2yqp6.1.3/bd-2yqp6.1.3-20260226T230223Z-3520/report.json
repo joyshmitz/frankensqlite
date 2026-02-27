@@ -1,0 +1,10 @@
+{
+  "trace_id": "trace-bd-2yqp6.1.3-20260226T230223Z-3520",
+  "run_id": "bd-2yqp6.1.3-20260226T230223Z-3520",
+  "scenario_id": "PARITY-VERSION-CONTRACT-A3",
+  "seed": 3520,
+  "bead_id": "bd-2yqp6.1.3",
+  "contract_file": "sqlite_version_contract.toml",
+  "events_jsonl": "artifacts/bd-2yqp6.1.3/bd-2yqp6.1.3-20260226T230223Z-3520/events.jsonl",
+  "result": "pass"
+}

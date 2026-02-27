@@ -1,0 +1,23 @@
+{
+  "trace_id": "trace-bd-2yqp6.2.5-20260227T012446Z-4242",
+  "run_id": "bd-2yqp6.2.5-20260227T012446Z-4242",
+  "scenario_id": "DIFF-ORACLE-PREFLIGHT-B5",
+  "seed": 4242,
+  "bead_id": "bd-2yqp6.2.5",
+  "commands": [
+    "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_2_5_oracle_preflight_doctor -- --nocapture",
+    "prebuilt:/data/tmp/cargo-target/debug/oracle_preflight_doctor_runner -- <green args>",
+    "prebuilt:/data/tmp/cargo-target/debug/oracle_preflight_doctor_runner -- <missing-binary args>"
+  ],
+  "artifacts": {
+    "events_jsonl": "/data/projects/frankensqlite/artifacts/bd-2yqp6.2.5/bd-2yqp6.2.5-20260227T012446Z-4242/events.jsonl",
+    "events_sha256": "c4c3593eda91e0e1049fa4c966c9e987fae7623cf7af6449989e8c3480fdb9b3",
+    "test_log": "/data/projects/frankensqlite/artifacts/bd-2yqp6.2.5/bd-2yqp6.2.5-20260227T012446Z-4242/test.log",
+    "test_log_sha256": "694c7c0f5f33a33a46f843f66b9920e6e4920aef6a1b067cb0df0a444fc6235a",
+    "doctor_green_json": "/data/projects/frankensqlite/artifacts/bd-2yqp6.2.5/bd-2yqp6.2.5-20260227T012446Z-4242/doctor-green.json",
+    "doctor_green_json_sha256": "6ab2d2d5dc83ab4ba5178a62849179f9dfc93ac44aa303886b917f744125af09",
+    "doctor_red_json": "/data/projects/frankensqlite/artifacts/bd-2yqp6.2.5/bd-2yqp6.2.5-20260227T012446Z-4242/doctor-red.json",
+    "doctor_red_json_sha256": "4aa83184d42fba81adff50066136699f7791b1177796ad75a3028290bfb67e87"
+  },
+  "result": "pass"
+}

@@ -1,0 +1,87 @@
+{
+  "schema_version": "1.0.0",
+  "gate_id": "bd-mblr.5.5.1",
+  "profile_doc_path": "docs/e2e_shell_script_log_profile.json",
+  "profile_version": "1.0.0",
+  "profile_errors": [],
+  "log_validation": {
+    "bead_id": "bd-1dp9.7.6",
+    "schema_version": "1.0.0",
+    "diagnostics": [
+      {
+        "event_index": 0,
+        "run_id": "bd-2yqp6.2.9-run-fixed",
+        "severity": "Error",
+        "message": "scenario_id 'ARTIFACT-HASH-RATCHET-B9' numeric suffix must contain ASCII digits",
+        "field": "scenario_id"
+      },
+      {
+        "event_index": 1,
+        "run_id": "bd-2yqp6.2.9-run-fixed",
+        "severity": "Error",
+        "message": "scenario_id 'ARTIFACT-HASH-RATCHET-B9' numeric suffix must contain ASCII digits",
+        "field": "scenario_id"
+      },
+      {
+        "event_index": 2,
+        "run_id": "bd-2yqp6.2.9-run-fixed",
+        "severity": "Error",
+        "message": "scenario_id 'ARTIFACT-HASH-RATCHET-B9' numeric suffix must contain ASCII digits",
+        "field": "scenario_id"
+      },
+      {
+        "event_index": 3,
+        "run_id": "bd-2yqp6.2.9-run-fixed",
+        "severity": "Error",
+        "message": "scenario_id 'ARTIFACT-HASH-RATCHET-B9' numeric suffix must contain ASCII digits",
+        "field": "scenario_id"
+      },
+      {
+        "event_index": 4,
+        "run_id": "bd-2yqp6.2.9-run-fixed",
+        "severity": "Error",
+        "message": "scenario_id 'ARTIFACT-HASH-RATCHET-B9' numeric suffix must contain ASCII digits",
+        "field": "scenario_id"
+      },
+      {
+        "event_index": 5,
+        "run_id": "bd-2yqp6.2.9-run-fixed",
+        "severity": "Error",
+        "message": "scenario_id 'ARTIFACT-HASH-RATCHET-B9' numeric suffix must contain ASCII digits",
+        "field": "scenario_id"
+      }
+    ],
+    "stats": {
+      "total_events": 6,
+      "valid_events": 0,
+      "invalid_events": 6,
+      "error_count": 6,
+      "warning_count": 0,
+      "info_count": 0,
+      "unique_run_ids": 1,
+      "phases_observed": [
+        "report",
+        "setup"
+      ],
+      "event_types_observed": [
+        "artifact_generated",
+        "fail",
+        "start"
+      ]
+    },
+    "passed": false
+  },
+  "shell_script_conformance": {
+    "schema_version": "1.0.0",
+    "bead_id": "bd-mblr.5.5",
+    "profile_version": "1.0.0",
+    "total_shell_scripts": 19,
+    "profiled_shell_scripts": 19,
+    "compliant_profiled_scripts": 19,
+    "warning_count": 0,
+    "error_count": 0,
+    "issues": [],
+    "overall_pass": true
+  },
+  "overall_pass": false
+}

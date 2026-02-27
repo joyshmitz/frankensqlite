@@ -1,0 +1,18 @@
+{
+  "trace_id": "trace-bd-2yqp6.3.4-20260226T232251Z-3520",
+  "run_id": "bd-2yqp6.3.4-20260226T232251Z-3520",
+  "scenario_id": "PARITY-CORPUS-C4",
+  "seed": 3520,
+  "bead_id": "bd-2yqp6.3.4",
+  "commands": [
+    "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_3_4_behavioral_quirks_corpus -- --nocapture",
+    "rch exec -- cargo test -p fsqlite-harness --test differential_v2_test -- --nocapture"
+  ],
+  "artifacts": {
+    "events_jsonl": "artifacts/bd-2yqp6.3.4/bd-2yqp6.3.4-20260226T232251Z-3520/events.jsonl",
+    "events_sha256": "2fabbaa2779549f9b9fb9b0e6fcc3b0a4cd8e9333dc51584907905eca1806c72",
+    "test_log": "artifacts/bd-2yqp6.3.4/bd-2yqp6.3.4-20260226T232251Z-3520/test.log",
+    "test_log_sha256": "7064421948da481a4b73a75953ca80a102b15a45ae5d76e0d759127ccdf7363f"
+  },
+  "result": "pass"
+}

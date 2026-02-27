@@ -1,0 +1,11 @@
+{
+  "id": "001_doctor_fixture",
+  "description": "Oracle preflight doctor deterministic fixture",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE t(a INTEGER, b TEXT)" },
+    { "op": "exec", "sql": "INSERT INTO t VALUES(1, 'x')" },
+    { "op": "query", "sql": "SELECT a, b FROM t ORDER BY a", "expect": { "columns": ["a", "b"], "rows": [["1", "x"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility"]
+}

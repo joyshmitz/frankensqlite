@@ -1,0 +1,28 @@
+{
+  "trace_id": "trace-bd-2yqp6.2.9-20260227T004921Z-9209",
+  "run_id": "bd-2yqp6.2.9-20260227T004921Z-9209",
+  "scenario_id": "ARTIFACT-HASH-RATCHET-B9",
+  "seed": 9209,
+  "bead_id": "bd-2yqp6.2.9",
+  "commands": [
+    "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_2_9_artifact_hash_integrity_ratchet -- --nocapture",
+    "rch exec -- cargo run -p fsqlite-harness --bin validation_manifest_runner -- <bootstrap args>",
+    "rch exec -- cargo run -p fsqlite-harness --bin validation_manifest_runner -- <replay args>",
+    "rch exec -- cargo run -p fsqlite-harness --bin validation_manifest_runner -- <drift args>"
+  ],
+  "ratchet": {
+    "baseline_file": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T004921Z-9209/validation_manifest_hash_baseline.json",
+    "baseline_sha256": "missing",
+    "drift_exit_code": 2
+  },
+  "artifacts": {
+    "events_jsonl": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T004921Z-9209/events.jsonl",
+    "events_sha256": "2dd4f4a8faf72543c88b155110746510f10f58883a4fbb99bbd6df6aee0a9731",
+    "test_log": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T004921Z-9209/test.log",
+    "test_log_sha256": "9de21302c469a1c0c28dc35925072b96304b28dc6a91986f8f14092dc60bb1b3",
+    "bootstrap_manifest": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T004921Z-9209/runner-bootstrap/validation_manifest.json",
+    "replay_manifest": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T004921Z-9209/runner-replay/validation_manifest.json",
+    "drift_manifest": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T004921Z-9209/runner-drift/validation_manifest.json"
+  },
+  "result": "fail"
+}

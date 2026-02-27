@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+  echo "3.52.0-test"
+  exit 0
+fi
+echo "unsupported invocation" >&2
+exit 2

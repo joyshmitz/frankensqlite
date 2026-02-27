@@ -1,0 +1,245 @@
+{
+  "bead_id": "bd-2yqp6.3.4",
+  "trace_id": "2c959ab4f4eda935418f0c84437ce9834f29af37f9b8dfd3181df737f5055ea9",
+  "run_id": "bd-2yqp6.3.4-018_collation_ascii_unicode_nocase-3521",
+  "scenario_id": "QUIRK-C4-018_collation_ascii_unicode_nocase",
+  "seed": 3521,
+  "fixture": {
+    "path": "/data/projects/frankensqlite/crates/fsqlite-harness/conformance/018_collation_ascii_unicode_nocase.json",
+    "id": "018_collation_ascii_unicode_nocase",
+    "sha256": "5978c62da0f22d30680cf57bc26ee7a2f4463da6625ac89fb0bac8a9d394167f"
+  },
+  "replay_command": "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_3_4_behavioral_quirks_corpus -- --nocapture",
+  "envelope": {
+    "format_version": 1,
+    "run_id": "bd-2yqp6.3.4-018_collation_ascii_unicode_nocase-3521",
+    "scenario_id": "QUIRK-C4-018_collation_ascii_unicode_nocase",
+    "seed": 3521,
+    "engines": {
+      "fsqlite": "0.1.0",
+      "csqlite": "3.46.0",
+      "subject_identity": "frankensqlite",
+      "reference_identity": "csqlite-oracle"
+    },
+    "pragmas": {
+      "journal_mode": "wal",
+      "synchronous": "NORMAL",
+      "cache_size": -2000,
+      "page_size": 4096
+    },
+    "schema": [],
+    "workload": [
+      "SELECT 'a' = 'A' COLLATE NOCASE, 'æ' = 'Æ' COLLATE NOCASE"
+    ],
+    "canonicalization": {
+      "float_tolerance": "1e-12",
+      "unordered_results_as_multiset": true,
+      "error_match_by_category": true,
+      "normalize_whitespace": true
+    }
+  },
+  "differential_result": {
+    "bead_id": "bd-1dp9.1.2",
+    "target_sqlite_version": "3.52.0",
+    "sqlite_version_contract": "sqlite_version_contract.toml",
+    "envelope": {
+      "format_version": 1,
+      "run_id": "bd-2yqp6.3.4-018_collation_ascii_unicode_nocase-3521",
+      "scenario_id": "QUIRK-C4-018_collation_ascii_unicode_nocase",
+      "seed": 3521,
+      "engines": {
+        "fsqlite": "0.1.0",
+        "csqlite": "3.46.0",
+        "subject_identity": "frankensqlite",
+        "reference_identity": "csqlite-oracle"
+      },
+      "pragmas": {
+        "journal_mode": "wal",
+        "synchronous": "NORMAL",
+        "cache_size": -2000,
+        "page_size": 4096
+      },
+      "schema": [],
+      "workload": [
+        "SELECT 'a' = 'A' COLLATE NOCASE, 'æ' = 'Æ' COLLATE NOCASE"
+      ],
+      "canonicalization": {
+        "float_tolerance": "1e-12",
+        "unordered_results_as_multiset": true,
+        "error_match_by_category": true,
+        "normalize_whitespace": true
+      }
+    },
+    "statements_total": 1,
+    "statements_matched": 0,
+    "statements_mismatched": 1,
+    "first_divergence_index": 0,
+    "divergences": [
+      {
+        "index": 0,
+        "sql": "SELECT 'a' = 'A' COLLATE NOCASE, 'æ' = 'Æ' COLLATE NOCASE",
+        "csqlite_outcome": {
+          "Rows": [
+            [
+              {
+                "Integer": 1
+              },
+              {
+                "Integer": 0
+              }
+            ]
+          ]
+        },
+        "fsqlite_outcome": {
+          "Error": "not implemented: expression form is not supported in this connection path: Collate { expr: Literal(String(\"A\"), 13..16), collation: \"NOCASE\", span: 13..31 }"
+        }
+      }
+    ],
+    "logical_state_hash_fsqlite": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "logical_state_hash_csqlite": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "logical_state_matched": true,
+    "artifact_hashes": {
+      "envelope_id": "2c959ab4f4eda935418f0c84437ce9834f29af37f9b8dfd3181df737f5055ea9",
+      "result_hash": "f342afc9e77079dec959c145cf33a5e960b01d8178020f001a90203c8ca0185a",
+      "workload_hash": "b5da25f97bdb15b5e89ec0c24e656ebd7ca17916884fb42e650d65850cca7c15"
+    },
+    "metadata": {
+      "schema_version": "1.0.0",
+      "trace_id": "2c959ab4f4eda935418f0c84437ce9834f29af37f9b8dfd3181df737f5055ea9",
+      "run_id": "bd-2yqp6.3.4-018_collation_ascii_unicode_nocase-3521",
+      "scenario_id": "QUIRK-C4-018_collation_ascii_unicode_nocase",
+      "seed": 3521,
+      "oracle_identity": "csqlite-oracle",
+      "oracle_version": "3.46.0",
+      "fixture_manifest_hash": "f6001359a6e9398afba854dd3f04fd4e3b48cd4ef7248c3d4a6d3a05a81c708d",
+      "timing": {
+        "total_ms": 0
+      },
+      "normalized_outcome": "divergence",
+      "first_failure": {
+        "statement_index": 0,
+        "sql": "SELECT 'a' = 'A' COLLATE NOCASE, 'æ' = 'Æ' COLLATE NOCASE"
+      }
+    },
+    "outcome": "Divergence"
+  },
+  "minimal_reduction": {
+    "original_workload_len": 1,
+    "minimized_workload_len": 1,
+    "removed_workload_indices": [],
+    "reduction_ratio": 0.0,
+    "minimized_envelope": {
+      "format_version": 1,
+      "run_id": "bd-2yqp6.3.4-018_collation_ascii_unicode_nocase-3521",
+      "scenario_id": "QUIRK-C4-018_collation_ascii_unicode_nocase",
+      "seed": 3521,
+      "engines": {
+        "fsqlite": "0.1.0",
+        "csqlite": "3.46.0",
+        "subject_identity": "frankensqlite",
+        "reference_identity": "csqlite-oracle"
+      },
+      "pragmas": {
+        "journal_mode": "wal",
+        "synchronous": "NORMAL",
+        "cache_size": -2000,
+        "page_size": 4096
+      },
+      "schema": [],
+      "workload": [
+        "SELECT 'a' = 'A' COLLATE NOCASE, 'æ' = 'Æ' COLLATE NOCASE"
+      ],
+      "canonicalization": {
+        "float_tolerance": "1e-12",
+        "unordered_results_as_multiset": true,
+        "error_match_by_category": true,
+        "normalize_whitespace": true
+      }
+    },
+    "minimized_result": {
+      "bead_id": "bd-1dp9.1.2",
+      "target_sqlite_version": "3.52.0",
+      "sqlite_version_contract": "sqlite_version_contract.toml",
+      "envelope": {
+        "format_version": 1,
+        "run_id": "bd-2yqp6.3.4-018_collation_ascii_unicode_nocase-3521",
+        "scenario_id": "QUIRK-C4-018_collation_ascii_unicode_nocase",
+        "seed": 3521,
+        "engines": {
+          "fsqlite": "0.1.0",
+          "csqlite": "3.46.0",
+          "subject_identity": "frankensqlite",
+          "reference_identity": "csqlite-oracle"
+        },
+        "pragmas": {
+          "journal_mode": "wal",
+          "synchronous": "NORMAL",
+          "cache_size": -2000,
+          "page_size": 4096
+        },
+        "schema": [],
+        "workload": [
+          "SELECT 'a' = 'A' COLLATE NOCASE, 'æ' = 'Æ' COLLATE NOCASE"
+        ],
+        "canonicalization": {
+          "float_tolerance": "1e-12",
+          "unordered_results_as_multiset": true,
+          "error_match_by_category": true,
+          "normalize_whitespace": true
+        }
+      },
+      "statements_total": 1,
+      "statements_matched": 0,
+      "statements_mismatched": 1,
+      "first_divergence_index": 0,
+      "divergences": [
+        {
+          "index": 0,
+          "sql": "SELECT 'a' = 'A' COLLATE NOCASE, 'æ' = 'Æ' COLLATE NOCASE",
+          "csqlite_outcome": {
+            "Rows": [
+              [
+                {
+                  "Integer": 1
+                },
+                {
+                  "Integer": 0
+                }
+              ]
+            ]
+          },
+          "fsqlite_outcome": {
+            "Error": "not implemented: expression form is not supported in this connection path: Collate { expr: Literal(String(\"A\"), 13..16), collation: \"NOCASE\", span: 13..31 }"
+          }
+        }
+      ],
+      "logical_state_hash_fsqlite": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "logical_state_hash_csqlite": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "logical_state_matched": true,
+      "artifact_hashes": {
+        "envelope_id": "2c959ab4f4eda935418f0c84437ce9834f29af37f9b8dfd3181df737f5055ea9",
+        "result_hash": "f342afc9e77079dec959c145cf33a5e960b01d8178020f001a90203c8ca0185a",
+        "workload_hash": "b5da25f97bdb15b5e89ec0c24e656ebd7ca17916884fb42e650d65850cca7c15"
+      },
+      "metadata": {
+        "schema_version": "1.0.0",
+        "trace_id": "2c959ab4f4eda935418f0c84437ce9834f29af37f9b8dfd3181df737f5055ea9",
+        "run_id": "bd-2yqp6.3.4-018_collation_ascii_unicode_nocase-3521",
+        "scenario_id": "QUIRK-C4-018_collation_ascii_unicode_nocase",
+        "seed": 3521,
+        "oracle_identity": "csqlite-oracle",
+        "oracle_version": "3.46.0",
+        "fixture_manifest_hash": "f6001359a6e9398afba854dd3f04fd4e3b48cd4ef7248c3d4a6d3a05a81c708d",
+        "timing": {
+          "total_ms": 0
+        },
+        "normalized_outcome": "divergence",
+        "first_failure": {
+          "statement_index": 0,
+          "sql": "SELECT 'a' = 'A' COLLATE NOCASE, 'æ' = 'Æ' COLLATE NOCASE"
+        }
+      },
+      "outcome": "Divergence"
+    }
+  }
+}

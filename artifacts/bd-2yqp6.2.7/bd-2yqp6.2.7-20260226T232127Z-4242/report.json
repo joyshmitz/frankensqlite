@@ -1,0 +1,18 @@
+{
+  "trace_id": "trace-bd-2yqp6.2.7-20260226T232127Z-4242",
+  "run_id": "bd-2yqp6.2.7-20260226T232127Z-4242",
+  "scenario_id": "DIFF-METADATA-SCHEMA-B7",
+  "seed": 4242,
+  "bead_id": "bd-2yqp6.2.7",
+  "commands": [
+    "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_2_7_differential_metadata_schema -- --nocapture",
+    "rch exec -- cargo test -p fsqlite-harness --test differential_v2_test differential_result_metadata_is_populated_and_strictly_valid -- --nocapture"
+  ],
+  "artifacts": {
+    "events_jsonl": "artifacts/bd-2yqp6.2.7/bd-2yqp6.2.7-20260226T232127Z-4242/events.jsonl",
+    "events_sha256": "22bad2c42811e73b79f294c555d9d0a6c403c64224c8bd42d96b1f627d765e92",
+    "test_log": "artifacts/bd-2yqp6.2.7/bd-2yqp6.2.7-20260226T232127Z-4242/test.log",
+    "test_log_sha256": "a6bc9277ed8b331a14f942c7ca1aeff6263150f8dedd61567e0d9a2d1bb02727"
+  },
+  "result": "pass"
+}

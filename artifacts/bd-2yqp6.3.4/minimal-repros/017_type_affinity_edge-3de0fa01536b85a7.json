@@ -1,0 +1,262 @@
+{
+  "bead_id": "bd-2yqp6.3.4",
+  "trace_id": "3de0fa01536b85a75f7f82a8a9637c4f6a62020fe2ce897ed2f79f458a818829",
+  "run_id": "bd-2yqp6.3.4-017_type_affinity_edge-3520",
+  "scenario_id": "QUIRK-C4-017_type_affinity_edge",
+  "seed": 3520,
+  "fixture": {
+    "path": "/data/projects/frankensqlite/crates/fsqlite-harness/conformance/017_type_affinity_edge.json",
+    "id": "017_type_affinity_edge",
+    "sha256": "4175092035dfe28dbf805134f89fbe3f61ed2fd78b57354ee4ae20d55ae4277c"
+  },
+  "replay_command": "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_3_4_behavioral_quirks_corpus -- --nocapture",
+  "envelope": {
+    "format_version": 1,
+    "run_id": "bd-2yqp6.3.4-017_type_affinity_edge-3520",
+    "scenario_id": "QUIRK-C4-017_type_affinity_edge",
+    "seed": 3520,
+    "engines": {
+      "fsqlite": "0.1.0",
+      "csqlite": "3.46.0",
+      "subject_identity": "frankensqlite",
+      "reference_identity": "csqlite-oracle"
+    },
+    "pragmas": {
+      "journal_mode": "wal",
+      "synchronous": "NORMAL",
+      "cache_size": -2000,
+      "page_size": 4096
+    },
+    "schema": [],
+    "workload": [
+      "CREATE TABLE q1(a NUMERIC, b TEXT, c INTEGER)",
+      "INSERT INTO q1 VALUES('3.0e+5', 123, '0042')",
+      "SELECT typeof(a), a, typeof(b), b, typeof(c), c FROM q1"
+    ],
+    "canonicalization": {
+      "float_tolerance": "1e-12",
+      "unordered_results_as_multiset": true,
+      "error_match_by_category": true,
+      "normalize_whitespace": true
+    }
+  },
+  "differential_result": {
+    "bead_id": "bd-1dp9.1.2",
+    "target_sqlite_version": "3.52.0",
+    "sqlite_version_contract": "sqlite_version_contract.toml",
+    "envelope": {
+      "format_version": 1,
+      "run_id": "bd-2yqp6.3.4-017_type_affinity_edge-3520",
+      "scenario_id": "QUIRK-C4-017_type_affinity_edge",
+      "seed": 3520,
+      "engines": {
+        "fsqlite": "0.1.0",
+        "csqlite": "3.46.0",
+        "subject_identity": "frankensqlite",
+        "reference_identity": "csqlite-oracle"
+      },
+      "pragmas": {
+        "journal_mode": "wal",
+        "synchronous": "NORMAL",
+        "cache_size": -2000,
+        "page_size": 4096
+      },
+      "schema": [],
+      "workload": [
+        "CREATE TABLE q1(a NUMERIC, b TEXT, c INTEGER)",
+        "INSERT INTO q1 VALUES('3.0e+5', 123, '0042')",
+        "SELECT typeof(a), a, typeof(b), b, typeof(c), c FROM q1"
+      ],
+      "canonicalization": {
+        "float_tolerance": "1e-12",
+        "unordered_results_as_multiset": true,
+        "error_match_by_category": true,
+        "normalize_whitespace": true
+      }
+    },
+    "statements_total": 3,
+    "statements_matched": 2,
+    "statements_mismatched": 1,
+    "first_divergence_index": 2,
+    "divergences": [
+      {
+        "index": 2,
+        "sql": "SELECT typeof(a), a, typeof(b), b, typeof(c), c FROM q1",
+        "csqlite_outcome": {
+          "Rows": [
+            [
+              {
+                "Text": "integer"
+              },
+              {
+                "Integer": 300000
+              },
+              {
+                "Text": "text"
+              },
+              {
+                "Text": "123"
+              },
+              {
+                "Text": "integer"
+              },
+              {
+                "Integer": 42
+              }
+            ]
+          ]
+        },
+        "fsqlite_outcome": {
+          "Rows": [
+            [
+              {
+                "Text": "text"
+              },
+              {
+                "Text": "3.0e+5"
+              },
+              {
+                "Text": "integer"
+              },
+              {
+                "Integer": 123
+              },
+              {
+                "Text": "text"
+              },
+              {
+                "Text": "0042"
+              }
+            ]
+          ]
+        }
+      }
+    ],
+    "logical_state_hash_fsqlite": "c495ae15a3f3288ac31b3b4df232dd481d5bcfdcf90a0da5741a432d15e55427",
+    "logical_state_hash_csqlite": "92c4a1e658e5e464ea54d151abbcd894802f75d0ba075a6403aee56c4bae12ce",
+    "logical_state_matched": false,
+    "artifact_hashes": {
+      "envelope_id": "3de0fa01536b85a75f7f82a8a9637c4f6a62020fe2ce897ed2f79f458a818829",
+      "result_hash": "4a11aa5e0625e4e57b9f2e5a04be8cc058664b1847f08bd51dc3c2336f8464f2",
+      "workload_hash": "5e8f253b3ad63df745420cec0a4720af38338b1d2d9ab11f6a1cb5b12ff83611"
+    },
+    "metadata": {
+      "schema_version": "1.0.0",
+      "trace_id": "3de0fa01536b85a75f7f82a8a9637c4f6a62020fe2ce897ed2f79f458a818829",
+      "run_id": "bd-2yqp6.3.4-017_type_affinity_edge-3520",
+      "scenario_id": "QUIRK-C4-017_type_affinity_edge",
+      "seed": 3520,
+      "oracle_identity": "csqlite-oracle",
+      "oracle_version": "3.46.0",
+      "fixture_manifest_hash": "9d982934f5c7e30a6768271f7e333245a7b501fd44dfa5ab57e23e9e94712181",
+      "timing": {
+        "total_ms": 0
+      },
+      "normalized_outcome": "divergence",
+      "first_failure": {
+        "statement_index": 2,
+        "sql": "SELECT typeof(a), a, typeof(b), b, typeof(c), c FROM q1"
+      }
+    },
+    "outcome": "Divergence"
+  },
+  "minimal_reduction": {
+    "original_workload_len": 3,
+    "minimized_workload_len": 2,
+    "removed_workload_indices": [
+      2
+    ],
+    "reduction_ratio": 0.3333333333333333,
+    "minimized_envelope": {
+      "format_version": 1,
+      "run_id": "bd-2yqp6.3.4-017_type_affinity_edge-3520",
+      "scenario_id": "QUIRK-C4-017_type_affinity_edge",
+      "seed": 3520,
+      "engines": {
+        "fsqlite": "0.1.0",
+        "csqlite": "3.46.0",
+        "subject_identity": "frankensqlite",
+        "reference_identity": "csqlite-oracle"
+      },
+      "pragmas": {
+        "journal_mode": "wal",
+        "synchronous": "NORMAL",
+        "cache_size": -2000,
+        "page_size": 4096
+      },
+      "schema": [],
+      "workload": [
+        "CREATE TABLE q1(a NUMERIC, b TEXT, c INTEGER)",
+        "INSERT INTO q1 VALUES('3.0e+5', 123, '0042')"
+      ],
+      "canonicalization": {
+        "float_tolerance": "1e-12",
+        "unordered_results_as_multiset": true,
+        "error_match_by_category": true,
+        "normalize_whitespace": true
+      }
+    },
+    "minimized_result": {
+      "bead_id": "bd-1dp9.1.2",
+      "target_sqlite_version": "3.52.0",
+      "sqlite_version_contract": "sqlite_version_contract.toml",
+      "envelope": {
+        "format_version": 1,
+        "run_id": "bd-2yqp6.3.4-017_type_affinity_edge-3520",
+        "scenario_id": "QUIRK-C4-017_type_affinity_edge",
+        "seed": 3520,
+        "engines": {
+          "fsqlite": "0.1.0",
+          "csqlite": "3.46.0",
+          "subject_identity": "frankensqlite",
+          "reference_identity": "csqlite-oracle"
+        },
+        "pragmas": {
+          "journal_mode": "wal",
+          "synchronous": "NORMAL",
+          "cache_size": -2000,
+          "page_size": 4096
+        },
+        "schema": [],
+        "workload": [
+          "CREATE TABLE q1(a NUMERIC, b TEXT, c INTEGER)",
+          "INSERT INTO q1 VALUES('3.0e+5', 123, '0042')"
+        ],
+        "canonicalization": {
+          "float_tolerance": "1e-12",
+          "unordered_results_as_multiset": true,
+          "error_match_by_category": true,
+          "normalize_whitespace": true
+        }
+      },
+      "statements_total": 2,
+      "statements_matched": 2,
+      "statements_mismatched": 0,
+      "first_divergence_index": null,
+      "divergences": [],
+      "logical_state_hash_fsqlite": "c495ae15a3f3288ac31b3b4df232dd481d5bcfdcf90a0da5741a432d15e55427",
+      "logical_state_hash_csqlite": "92c4a1e658e5e464ea54d151abbcd894802f75d0ba075a6403aee56c4bae12ce",
+      "logical_state_matched": false,
+      "artifact_hashes": {
+        "envelope_id": "2e9dd61dfa1c48e34642f41a4c2adaee306eee09f5dcf8b214112b80dea8fa41",
+        "result_hash": "20b4ccbef3cae1e01e27d8b49033362485fa14b25141351d528dd48c858a9f0b",
+        "workload_hash": "c4b118566ea5a1baeabcaa7e6cc3316b908c3568cdb901d9842be1427dacfe48"
+      },
+      "metadata": {
+        "schema_version": "1.0.0",
+        "trace_id": "2e9dd61dfa1c48e34642f41a4c2adaee306eee09f5dcf8b214112b80dea8fa41",
+        "run_id": "bd-2yqp6.3.4-017_type_affinity_edge-3520",
+        "scenario_id": "QUIRK-C4-017_type_affinity_edge",
+        "seed": 3520,
+        "oracle_identity": "csqlite-oracle",
+        "oracle_version": "3.46.0",
+        "fixture_manifest_hash": "2216bd3bc92a6417aea394526159909109161f8d9d5cf10cacbad30d8188f0ed",
+        "timing": {
+          "total_ms": 0
+        },
+        "normalized_outcome": "divergence"
+      },
+      "outcome": "Divergence"
+    }
+  }
+}

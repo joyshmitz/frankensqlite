@@ -1,0 +1,270 @@
+{
+  "bead_id": "bd-2yqp6.3.4",
+  "trace_id": "e20b75797286670ac6d16528d3e6403d65a1b501fefcaf36e794674262ad1cfb",
+  "run_id": "bd-2yqp6.3.4-019_null_unique_edge-3522",
+  "scenario_id": "QUIRK-C4-019_null_unique_edge",
+  "seed": 3522,
+  "fixture": {
+    "path": "/data/projects/frankensqlite/crates/fsqlite-harness/conformance/019_null_unique_edge.json",
+    "id": "019_null_unique_edge",
+    "sha256": "c305e7030fd6fb31366f7a36e66affd9c40fd672d954d1f1800664c9c701ec54"
+  },
+  "replay_command": "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_3_4_behavioral_quirks_corpus -- --nocapture",
+  "envelope": {
+    "format_version": 1,
+    "run_id": "bd-2yqp6.3.4-019_null_unique_edge-3522",
+    "scenario_id": "QUIRK-C4-019_null_unique_edge",
+    "seed": 3522,
+    "engines": {
+      "fsqlite": "0.1.0",
+      "csqlite": "3.46.0",
+      "subject_identity": "frankensqlite",
+      "reference_identity": "csqlite-oracle"
+    },
+    "pragmas": {
+      "journal_mode": "wal",
+      "synchronous": "NORMAL",
+      "cache_size": -2000,
+      "page_size": 4096
+    },
+    "schema": [],
+    "workload": [
+      "CREATE TABLE q3(a INTEGER UNIQUE, note TEXT)",
+      "INSERT INTO q3(a, note) VALUES(NULL, 'first-null')",
+      "INSERT INTO q3(a, note) VALUES(NULL, 'second-null')",
+      "INSERT INTO q3(a, note) VALUES(7, 'first-seven')",
+      "SELECT COUNT(*) FROM q3",
+      "INSERT INTO q3(a, note) VALUES(7, 'duplicate-seven')",
+      "SELECT COUNT(*) FROM q3"
+    ],
+    "canonicalization": {
+      "float_tolerance": "1e-12",
+      "unordered_results_as_multiset": true,
+      "error_match_by_category": true,
+      "normalize_whitespace": true
+    }
+  },
+  "differential_result": {
+    "bead_id": "bd-1dp9.1.2",
+    "target_sqlite_version": "3.52.0",
+    "sqlite_version_contract": "sqlite_version_contract.toml",
+    "envelope": {
+      "format_version": 1,
+      "run_id": "bd-2yqp6.3.4-019_null_unique_edge-3522",
+      "scenario_id": "QUIRK-C4-019_null_unique_edge",
+      "seed": 3522,
+      "engines": {
+        "fsqlite": "0.1.0",
+        "csqlite": "3.46.0",
+        "subject_identity": "frankensqlite",
+        "reference_identity": "csqlite-oracle"
+      },
+      "pragmas": {
+        "journal_mode": "wal",
+        "synchronous": "NORMAL",
+        "cache_size": -2000,
+        "page_size": 4096
+      },
+      "schema": [],
+      "workload": [
+        "CREATE TABLE q3(a INTEGER UNIQUE, note TEXT)",
+        "INSERT INTO q3(a, note) VALUES(NULL, 'first-null')",
+        "INSERT INTO q3(a, note) VALUES(NULL, 'second-null')",
+        "INSERT INTO q3(a, note) VALUES(7, 'first-seven')",
+        "SELECT COUNT(*) FROM q3",
+        "INSERT INTO q3(a, note) VALUES(7, 'duplicate-seven')",
+        "SELECT COUNT(*) FROM q3"
+      ],
+      "canonicalization": {
+        "float_tolerance": "1e-12",
+        "unordered_results_as_multiset": true,
+        "error_match_by_category": true,
+        "normalize_whitespace": true
+      }
+    },
+    "statements_total": 7,
+    "statements_matched": 5,
+    "statements_mismatched": 2,
+    "first_divergence_index": 5,
+    "divergences": [
+      {
+        "index": 5,
+        "sql": "INSERT INTO q3(a, note) VALUES(7, 'duplicate-seven')",
+        "csqlite_outcome": {
+          "Error": "UNIQUE constraint failed: q3.a"
+        },
+        "fsqlite_outcome": {
+          "Execute": 1
+        }
+      },
+      {
+        "index": 6,
+        "sql": "SELECT COUNT(*) FROM q3",
+        "csqlite_outcome": {
+          "Rows": [
+            [
+              {
+                "Integer": 3
+              }
+            ]
+          ]
+        },
+        "fsqlite_outcome": {
+          "Rows": [
+            [
+              {
+                "Integer": 4
+              }
+            ]
+          ]
+        }
+      }
+    ],
+    "logical_state_hash_fsqlite": "d064ab7a6d66c96cbee938865719583152ef718af87fd73bd7ab3eb1e3ac3845",
+    "logical_state_hash_csqlite": "e69afd8aad2d2e62c3769307ba27dd7fdee8815c3dc7041b964e3b7bdbdcc5be",
+    "logical_state_matched": false,
+    "artifact_hashes": {
+      "envelope_id": "e20b75797286670ac6d16528d3e6403d65a1b501fefcaf36e794674262ad1cfb",
+      "result_hash": "2a9f5ad6a50df532028390d25cea6d172d2142569a2b4255abd0c0dee9ebe95d",
+      "workload_hash": "2cdc3c91b49491fbc0d4e65b83c5a40473129c791a7afa0ca4dcb549506f24a2"
+    },
+    "metadata": {
+      "schema_version": "1.0.0",
+      "trace_id": "e20b75797286670ac6d16528d3e6403d65a1b501fefcaf36e794674262ad1cfb",
+      "run_id": "bd-2yqp6.3.4-019_null_unique_edge-3522",
+      "scenario_id": "QUIRK-C4-019_null_unique_edge",
+      "seed": 3522,
+      "oracle_identity": "csqlite-oracle",
+      "oracle_version": "3.46.0",
+      "fixture_manifest_hash": "f70aa8fff09513e87693d8af6351b721c791b9feb9fed872a47faafb96463855",
+      "timing": {
+        "total_ms": 0
+      },
+      "normalized_outcome": "divergence",
+      "first_failure": {
+        "statement_index": 5,
+        "sql": "INSERT INTO q3(a, note) VALUES(7, 'duplicate-seven')"
+      }
+    },
+    "outcome": "Divergence"
+  },
+  "minimal_reduction": {
+    "original_workload_len": 7,
+    "minimized_workload_len": 3,
+    "removed_workload_indices": [
+      1,
+      2,
+      4,
+      6
+    ],
+    "reduction_ratio": 0.5714285714285714,
+    "minimized_envelope": {
+      "format_version": 1,
+      "run_id": "bd-2yqp6.3.4-019_null_unique_edge-3522",
+      "scenario_id": "QUIRK-C4-019_null_unique_edge",
+      "seed": 3522,
+      "engines": {
+        "fsqlite": "0.1.0",
+        "csqlite": "3.46.0",
+        "subject_identity": "frankensqlite",
+        "reference_identity": "csqlite-oracle"
+      },
+      "pragmas": {
+        "journal_mode": "wal",
+        "synchronous": "NORMAL",
+        "cache_size": -2000,
+        "page_size": 4096
+      },
+      "schema": [],
+      "workload": [
+        "CREATE TABLE q3(a INTEGER UNIQUE, note TEXT)",
+        "INSERT INTO q3(a, note) VALUES(7, 'first-seven')",
+        "INSERT INTO q3(a, note) VALUES(7, 'duplicate-seven')"
+      ],
+      "canonicalization": {
+        "float_tolerance": "1e-12",
+        "unordered_results_as_multiset": true,
+        "error_match_by_category": true,
+        "normalize_whitespace": true
+      }
+    },
+    "minimized_result": {
+      "bead_id": "bd-1dp9.1.2",
+      "target_sqlite_version": "3.52.0",
+      "sqlite_version_contract": "sqlite_version_contract.toml",
+      "envelope": {
+        "format_version": 1,
+        "run_id": "bd-2yqp6.3.4-019_null_unique_edge-3522",
+        "scenario_id": "QUIRK-C4-019_null_unique_edge",
+        "seed": 3522,
+        "engines": {
+          "fsqlite": "0.1.0",
+          "csqlite": "3.46.0",
+          "subject_identity": "frankensqlite",
+          "reference_identity": "csqlite-oracle"
+        },
+        "pragmas": {
+          "journal_mode": "wal",
+          "synchronous": "NORMAL",
+          "cache_size": -2000,
+          "page_size": 4096
+        },
+        "schema": [],
+        "workload": [
+          "CREATE TABLE q3(a INTEGER UNIQUE, note TEXT)",
+          "INSERT INTO q3(a, note) VALUES(7, 'first-seven')",
+          "INSERT INTO q3(a, note) VALUES(7, 'duplicate-seven')"
+        ],
+        "canonicalization": {
+          "float_tolerance": "1e-12",
+          "unordered_results_as_multiset": true,
+          "error_match_by_category": true,
+          "normalize_whitespace": true
+        }
+      },
+      "statements_total": 3,
+      "statements_matched": 2,
+      "statements_mismatched": 1,
+      "first_divergence_index": 2,
+      "divergences": [
+        {
+          "index": 2,
+          "sql": "INSERT INTO q3(a, note) VALUES(7, 'duplicate-seven')",
+          "csqlite_outcome": {
+            "Error": "UNIQUE constraint failed: q3.a"
+          },
+          "fsqlite_outcome": {
+            "Execute": 1
+          }
+        }
+      ],
+      "logical_state_hash_fsqlite": "d362df7d6064a899ec417bf906e91c1e8936d9614f67ba0ad0dd8f74968f351e",
+      "logical_state_hash_csqlite": "32d33000876478a4ca319cb2d4e084fd3a84784c147dfc55de1b2a4bf1a3bde7",
+      "logical_state_matched": false,
+      "artifact_hashes": {
+        "envelope_id": "e1dc4ebb2cf39e60dbf78e36b242dc125ed749db3fa4a23e7e63582a78a46e58",
+        "result_hash": "baf1bc0fe38f30cd36afc1fb2956cd7baf4bf25e8769f362d48405f89c9e6538",
+        "workload_hash": "436efe75a29c9a5476df8f0cacfb7a2ec731ca84b8a952fa9cf9abe447495d10"
+      },
+      "metadata": {
+        "schema_version": "1.0.0",
+        "trace_id": "e1dc4ebb2cf39e60dbf78e36b242dc125ed749db3fa4a23e7e63582a78a46e58",
+        "run_id": "bd-2yqp6.3.4-019_null_unique_edge-3522",
+        "scenario_id": "QUIRK-C4-019_null_unique_edge",
+        "seed": 3522,
+        "oracle_identity": "csqlite-oracle",
+        "oracle_version": "3.46.0",
+        "fixture_manifest_hash": "28b7db57df5436a0f6bf34ce898bb79d2cc0cff4073514476f92b387c040a362",
+        "timing": {
+          "total_ms": 0
+        },
+        "normalized_outcome": "divergence",
+        "first_failure": {
+          "statement_index": 2,
+          "sql": "INSERT INTO q3(a, note) VALUES(7, 'duplicate-seven')"
+        }
+      },
+      "outcome": "Divergence"
+    }
+  }
+}

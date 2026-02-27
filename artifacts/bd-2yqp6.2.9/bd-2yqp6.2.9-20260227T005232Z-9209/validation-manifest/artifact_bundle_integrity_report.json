@@ -1,0 +1,36 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "bd-2yqp6.2.9",
+  "manifest_schema_version": "1.0.0",
+  "manifest_bead_id": "bd-mblr.3.5.1",
+  "scenario_id": "ARTIFACT-HASH-RATCHET-B9",
+  "algorithm": "sha256",
+  "artifact_payload_hashes": [
+    {
+      "artifact_uri": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/coverage_gate_report.json",
+      "payload_sha256": "bd81ba5b3a68d7eb5d79208eb3b2e18cd0bfba18279d5660037bc24746498aa4"
+    },
+    {
+      "artifact_uri": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/invariant_drift_report.json",
+      "payload_sha256": "8626e2605a02546c0af8654b3c4b38f0aa825b255d03f613c1612a39dd9d5289"
+    },
+    {
+      "artifact_uri": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/logging_conformance_report.json",
+      "payload_sha256": "69311a00158ec99860b82cc061cc4b9ccb5c2f966f98f943b50bf6e9df46e9b9"
+    },
+    {
+      "artifact_uri": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/no_mock_critical_path_report.json",
+      "payload_sha256": "a0f70e338ff1ab42a949409dc6b21813e0868cc993a9fb72ed777a1edd847da8"
+    },
+    {
+      "artifact_uri": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/scenario_coverage_drift_report.json",
+      "payload_sha256": "4baed05d50a9ccbf05784527a6e03da6b16666a70f72508c753371cae41299d0"
+    },
+    {
+      "artifact_uri": "artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/validation_manifest_events.jsonl",
+      "payload_sha256": "cc93756e793be2587e99abca64e1af5f03d7758e9fdf6361c6a9ded1fc85608f"
+    }
+  ],
+  "canonical_payload": "bundle_schema_version=1.0.0|manifest_schema_version=1.0.0|manifest_bead_id=bd-mblr.3.5.1|scenario_id=ARTIFACT-HASH-RATCHET-B9|root_seed=9209|artifact_hashes=artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/coverage_gate_report.json=bd81ba5b3a68d7eb5d79208eb3b2e18cd0bfba18279d5660037bc24746498aa4,artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/invariant_drift_report.json=8626e2605a02546c0af8654b3c4b38f0aa825b255d03f613c1612a39dd9d5289,artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/logging_conformance_report.json=69311a00158ec99860b82cc061cc4b9ccb5c2f966f98f943b50bf6e9df46e9b9,artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/no_mock_critical_path_report.json=a0f70e338ff1ab42a949409dc6b21813e0868cc993a9fb72ed777a1edd847da8,artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/scenario_coverage_drift_report.json=4baed05d50a9ccbf05784527a6e03da6b16666a70f72508c753371cae41299d0,artifacts/bd-2yqp6.2.9/bd-2yqp6.2.9-20260227T005232Z-9209/validation-manifest/validation_manifest_events.jsonl=cc93756e793be2587e99abca64e1af5f03d7758e9fdf6361c6a9ded1fc85608f",
+  "bundle_hash": "01eca12310c6136ea364e2f2f58f04c8b44cb0c33c9fa2c3bea88df3eee1c457"
+}
