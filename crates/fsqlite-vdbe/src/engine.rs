@@ -1812,6 +1812,40 @@ impl RowSet {
 struct AggregateContext {
     func: Arc<ErasedAggregateFunction>,
     state: Box<dyn Any + Send>,
+    /// When DISTINCT is active, tracks seen argument byte-keys to skip duplicates.
+    distinct_seen: Option<std::collections::HashSet<Vec<u8>>>,
+}
+
+/// Encode aggregate arguments into a canonical byte key for DISTINCT deduplication.
+///
+/// Each value is tagged with a type discriminant followed by its payload so that
+/// values of different types with the same byte representation don't collide.
+fn distinct_key(args: &[SqliteValue]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for val in args {
+        match val {
+            SqliteValue::Null => key.push(0),
+            SqliteValue::Integer(i) => {
+                key.push(1);
+                key.extend_from_slice(&i.to_le_bytes());
+            }
+            SqliteValue::Float(f) => {
+                key.push(2);
+                key.extend_from_slice(&f.to_bits().to_le_bytes());
+            }
+            SqliteValue::Text(s) => {
+                key.push(3);
+                key.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                key.extend_from_slice(s.as_bytes());
+            }
+            SqliteValue::Blob(b) => {
+                key.push(4);
+                key.extend_from_slice(&(b.len() as u64).to_le_bytes());
+                key.extend_from_slice(b);
+            }
+        }
+    }
+    key
 }
 
 impl VdbeEngine {
@@ -4047,7 +4081,8 @@ impl VdbeEngine {
                 // Phase 4 supports single-group aggregation (no GROUP BY) using
                 // AggStep/AggFinal. Aggregate state is stored out-of-band and keyed
                 // by the accumulator register.
-                Opcode::AggStep => {
+                // AggStep1 is a single-argument fast-path with identical semantics.
+                Opcode::AggStep | Opcode::AggStep1 => {
                     let func_name = match &op.p4 {
                         P4::FuncName(name) => name.as_str(),
                         _ => {
@@ -4079,11 +4114,17 @@ impl VdbeEngine {
                     }
 
                     let accum_reg = op.p3;
+                    let is_distinct = op.p1 != 0;
                     let ctx = self.aggregates.entry_or_insert_with(accum_reg, || {
                         let state = func.initial_state();
                         AggregateContext {
                             func: func.clone(),
                             state,
+                            distinct_seen: if is_distinct {
+                                Some(std::collections::HashSet::new())
+                            } else {
+                                None
+                            },
                         }
                     });
 
@@ -4093,7 +4134,22 @@ impl VdbeEngine {
                         ));
                     }
 
-                    ctx.func.step(&mut ctx.state, &args)?;
+                    // For DISTINCT aggregates, skip if we've already seen these args.
+                    // NULL values are always skipped for DISTINCT (SQL semantics).
+                    let should_step = if let Some(ref mut seen) = ctx.distinct_seen {
+                        // Skip NULL arguments for DISTINCT aggregates.
+                        if args.iter().any(|a| matches!(a, SqliteValue::Null)) {
+                            false
+                        } else {
+                            seen.insert(distinct_key(&args))
+                        }
+                    } else {
+                        true
+                    };
+
+                    if should_step {
+                        ctx.func.step(&mut ctx.state, &args)?;
+                    }
                     pc += 1;
                 }
 
@@ -5274,9 +5330,55 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
             SqliteValue::Text(s) => s.into_bytes(),
             other => other.to_text().into_bytes(),
         }),
-        b'B' | b'b' => SqliteValue::Text(val.to_text()),
+        b'B' | b'b' => {
+            // C SQLite: CAST(blob AS TEXT) decodes bytes as UTF-8,
+            // not as hex literal.
+            match val {
+                SqliteValue::Blob(b) => SqliteValue::Text(String::from_utf8_lossy(&b).into_owned()),
+                other => SqliteValue::Text(other.to_text()),
+            }
+        }
         b'C' | b'c' => val.apply_affinity(fsqlite_types::TypeAffinity::Numeric),
-        b'D' | b'd' => SqliteValue::Integer(val.to_integer()),
+        b'D' | b'd' => {
+            // C SQLite: CAST('123abc' AS INTEGER) parses leading numeric prefix.
+            match &val {
+                SqliteValue::Text(s) => {
+                    let trimmed = s.trim();
+                    if let Ok(i) = trimmed.parse::<i64>() {
+                        return SqliteValue::Integer(i);
+                    }
+                    // Parse leading numeric prefix (digits, optional sign, optional decimal).
+                    let bytes = trimmed.as_bytes();
+                    let mut end = 0;
+                    if !bytes.is_empty()
+                        && (bytes[0] == b'+' || bytes[0] == b'-' || bytes[0].is_ascii_digit())
+                    {
+                        end = 1;
+                        while end < bytes.len() && bytes[end].is_ascii_digit() {
+                            end += 1;
+                        }
+                        if end < bytes.len() && bytes[end] == b'.' {
+                            end += 1;
+                            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                                end += 1;
+                            }
+                        }
+                    }
+                    if end > 0 {
+                        let prefix = &trimmed[..end];
+                        if let Ok(i) = prefix.parse::<i64>() {
+                            return SqliteValue::Integer(i);
+                        }
+                        #[allow(clippy::cast_possible_truncation)]
+                        if let Ok(f) = prefix.parse::<f64>() {
+                            return SqliteValue::Integer(f as i64);
+                        }
+                    }
+                    SqliteValue::Integer(0)
+                }
+                _ => SqliteValue::Integer(val.to_integer()),
+            }
+        }
         b'E' | b'e' => SqliteValue::Float(val.to_float()),
         _ => val, // unknown: no-op
     }
