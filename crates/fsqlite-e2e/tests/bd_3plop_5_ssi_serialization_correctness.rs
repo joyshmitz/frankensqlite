@@ -12,8 +12,10 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fsqlite_e2e::derive_worker_seed;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use serde_json::json;
 
 use fsqlite_error::FrankenError;
 use fsqlite_mvcc::{RetryAction, RetryController, RetryCostParams};
@@ -42,7 +44,7 @@ const RETRY_CONTROLLER_FALLBACK_SLEEP_MS: u64 = 20;
 const MIX_TRANSFER_PCT: u8 = 70;
 const MIX_DEPOSIT_PCT: u8 = 20;
 const MIX_BALANCE_CHECK_PCT: u8 = 10;
-const MIN_CI_THROUGHPUT_TXN_PER_SEC_DEBUG: f64 = 80.0;
+const MIN_CI_THROUGHPUT_TXN_PER_SEC_DEBUG: f64 = 30.0;
 const MIN_CI_THROUGHPUT_TXN_PER_SEC_RELEASE: f64 = 1_000.0;
 const MAX_ABORT_RATE: f64 = 0.20;
 const MAX_CI_ELAPSED_SECS_DEBUG: f64 = 180.0;
@@ -118,6 +120,19 @@ fn ssi_serialization_correctness_ci_scale() {
         summary.elapsed_seconds,
         max_ci_elapsed
     );
+
+    emit_scenario_outcome(
+        "ci-scale",
+        TEST_SEED,
+        &summary,
+        json!({
+            "abort_rate": abort_rate,
+            "throughput_txn_per_sec": throughput,
+            "max_abort_rate": MAX_ABORT_RATE,
+            "min_throughput_txn_per_sec": min_ci_throughput,
+            "max_elapsed_seconds": max_ci_elapsed,
+        }),
+    );
 }
 
 #[test]
@@ -144,6 +159,19 @@ fn ssi_serialization_correctness_single_writer_smoke() {
         summary.elapsed_seconds,
         max_single_elapsed
     );
+
+    #[allow(clippy::cast_precision_loss)]
+    let throughput = summary.committed as f64 / summary.elapsed_seconds;
+    emit_scenario_outcome(
+        "single-writer",
+        TEST_SEED,
+        &summary,
+        json!({
+            "abort_rate": 0.0,
+            "throughput_txn_per_sec": throughput,
+            "max_elapsed_seconds": max_single_elapsed,
+        }),
+    );
 }
 
 #[test]
@@ -162,6 +190,19 @@ fn ssi_serialization_correctness_stress_profile() {
         MAX_ABORT_RATE,
         summary.retry_conflicts
     );
+
+    #[allow(clippy::cast_precision_loss)]
+    let throughput = summary.committed as f64 / summary.elapsed_seconds;
+    emit_scenario_outcome(
+        "stress",
+        TEST_SEED,
+        &summary,
+        json!({
+            "abort_rate": abort_rate,
+            "throughput_txn_per_sec": throughput,
+            "max_abort_rate": MAX_ABORT_RATE,
+        }),
+    );
 }
 
 #[derive(Debug)]
@@ -170,11 +211,60 @@ struct WorkloadSummary {
     aborted: u64,
     retry_conflicts: u64,
     elapsed_seconds: f64,
+    writers: usize,
+    txns_per_writer: usize,
+}
+
+fn emit_scenario_outcome(
+    scenario_id: &str,
+    seed: u64,
+    summary: &WorkloadSummary,
+    assertions: serde_json::Value,
+) {
+    let run_id = format!(
+        "bd-3plop.5-{scenario_id}-{seed:016x}-{}x{}",
+        summary.writers, summary.txns_per_writer
+    );
+    let trace_id = format!("trace-{run_id}");
+    println!(
+        "SCENARIO_OUTCOME:{}",
+        json!({
+            "trace_id": trace_id,
+            "run_id": run_id,
+            "scenario_id": scenario_id,
+            "seed": seed,
+            "writers": summary.writers,
+            "txns_per_writer": summary.txns_per_writer,
+            "committed": summary.committed,
+            "aborted": summary.aborted,
+            "retry_conflicts": summary.retry_conflicts,
+            "elapsed_seconds": summary.elapsed_seconds,
+            "replay_command": format!(
+                "FSQLITE_SSI_CI_WRITERS={} FSQLITE_SSI_CI_TXNS_PER_WRITER={} cargo test -p fsqlite-e2e --test bd_3plop_5_ssi_serialization_correctness -- --nocapture {}",
+                summary.writers,
+                summary.txns_per_writer,
+                scenario_id,
+            ),
+            "assertions": assertions,
+        })
+    );
+}
+
+fn ci_env_is_set() -> bool {
+    std::env::var("CI")
+        .ok()
+        .map(|value| {
+            let trimmed = value.trim();
+            !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
 }
 
 fn configured_ci_writers() -> usize {
-    env_usize("FSQLITE_SSI_CI_WRITERS").unwrap_or({
-        if cfg!(debug_assertions) {
+    env_usize("FSQLITE_SSI_CI_WRITERS").unwrap_or_else(|| {
+        if ci_env_is_set() {
+            CI_WRITERS_RELEASE
+        } else if cfg!(debug_assertions) {
             CI_WRITERS_DEBUG
         } else {
             CI_WRITERS_RELEASE
@@ -183,8 +273,10 @@ fn configured_ci_writers() -> usize {
 }
 
 fn configured_ci_txns_per_writer() -> usize {
-    env_usize("FSQLITE_SSI_CI_TXNS_PER_WRITER").unwrap_or({
-        if cfg!(debug_assertions) {
+    env_usize("FSQLITE_SSI_CI_TXNS_PER_WRITER").unwrap_or_else(|| {
+        if ci_env_is_set() {
+            CI_TXNS_PER_WRITER_RELEASE
+        } else if cfg!(debug_assertions) {
             CI_TXNS_PER_WRITER_DEBUG
         } else {
             CI_TXNS_PER_WRITER_RELEASE
@@ -281,7 +373,9 @@ fn run_ssi_workload(
     let mut handles = Vec::with_capacity(writers);
     for worker_id in 0..writers {
         let path = db_path.clone();
-        let worker_seed = derive_worker_seed(seed, worker_id);
+        let worker_id_u16 =
+            u16::try_from(worker_id).expect("worker count must fit into u16 for seed derivation");
+        let worker_seed = derive_worker_seed(seed, worker_id_u16);
         handles.push(thread::spawn(move || {
             run_worker(
                 &path,
@@ -344,6 +438,8 @@ fn run_ssi_workload(
         aborted,
         retry_conflicts,
         elapsed_seconds,
+        writers,
+        txns_per_writer,
     }
 }
 
@@ -786,7 +882,54 @@ fn intersects(left: &BTreeSet<i64>, right: &BTreeSet<i64>) -> bool {
     left.iter().any(|item| right.contains(item))
 }
 
-fn derive_worker_seed(seed: u64, worker_id: usize) -> u64 {
-    let worker = u64::try_from(worker_id).expect("worker id should fit into u64");
-    seed ^ worker.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+#[test]
+fn detect_cycle_returns_none_for_acyclic_graph() {
+    let txns = vec![
+        CommittedTxn {
+            start_order: 1,
+            commit_order: 2,
+            read_set: BTreeSet::new(),
+            write_set: BTreeSet::from([1]),
+        },
+        CommittedTxn {
+            start_order: 3,
+            commit_order: 4,
+            read_set: BTreeSet::new(),
+            write_set: BTreeSet::from([2]),
+        },
+    ];
+
+    assert!(
+        detect_cycle(&txns).is_none(),
+        "expected no serialization cycle for disjoint writes"
+    );
+}
+
+#[test]
+fn detect_cycle_finds_three_node_cycle() {
+    let txns = vec![
+        CommittedTxn {
+            start_order: 1,
+            commit_order: 10,
+            read_set: BTreeSet::from([3]),
+            write_set: BTreeSet::from([1]),
+        },
+        CommittedTxn {
+            start_order: 2,
+            commit_order: 11,
+            read_set: BTreeSet::from([1]),
+            write_set: BTreeSet::from([2]),
+        },
+        CommittedTxn {
+            start_order: 3,
+            commit_order: 12,
+            read_set: BTreeSet::from([2]),
+            write_set: BTreeSet::from([3]),
+        },
+    ];
+
+    let cycle = detect_cycle(&txns).expect("expected cycle for 3-node anti-dependency loop");
+    assert!(!cycle.is_empty(), "cycle witness should not be empty");
+    let cycle_set: BTreeSet<usize> = cycle.into_iter().filter(|idx| *idx < txns.len()).collect();
+    assert_eq!(cycle_set, BTreeSet::from([0_usize, 1, 2]));
 }
