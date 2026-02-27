@@ -36,6 +36,63 @@ use fsqlite_types::SqliteValue;
 
 use crate::{FunctionRegistry, ScalarFunction};
 
+// ── System Timezone Offset ────────────────────────────────────────────────
+//
+// Used by the 'localtime' and 'utc' modifiers.  Since we cannot use unsafe
+// code (libc::localtime_r) and no chrono/time crate is available, we shell
+// out to `date +%z` once and cache the result.
+
+/// Parse a `+HHMM` / `-HHMM` string into seconds.
+fn parse_tz_offset(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() < 5 {
+        return None;
+    }
+    let sign: i64 = if s.starts_with('-') { -1 } else { 1 };
+    let digits = if s.starts_with('+') || s.starts_with('-') {
+        &s[1..]
+    } else {
+        s
+    };
+    if digits.len() < 4 {
+        return None;
+    }
+    let hours: i64 = digits[..2].parse().ok()?;
+    let minutes: i64 = digits[2..4].parse().ok()?;
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+/// Compute the local UTC offset in seconds by running `date +%z`.
+fn compute_utc_offset() -> i64 {
+    // Check TZ env var for explicit UTC.
+    if let Ok(tz) = std::env::var("TZ") {
+        let tz_upper = tz.trim().to_uppercase();
+        if tz_upper == "UTC"
+            || tz_upper == "GMT"
+            || tz_upper == "UTC0"
+            || tz_upper.starts_with("UTC-0")
+            || tz_upper.starts_with("UTC+0")
+        {
+            return 0;
+        }
+    }
+    let output = std::process::Command::new("date").arg("+%z").output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            parse_tz_offset(s.trim()).unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+/// Return the cached system UTC offset in seconds.
+fn utc_offset_seconds() -> i64 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(compute_utc_offset)
+}
+
 // ── Julian Day Number Conversions ─────────────────────────────────────────
 //
 // Algorithms from Meeus, "Astronomical Algorithms" (1991).
@@ -302,10 +359,15 @@ fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
         return None;
     }
 
-    // 'localtime' / 'utc' — timezone conversion stubs.
-    // Full implementation requires system timezone access; stub for now.
-    if m == "localtime" || m == "utc" {
-        return Some(jdn);
+    // 'localtime' — convert UTC to local time by adding the system UTC offset.
+    if m == "localtime" {
+        let offset = utc_offset_seconds();
+        return Some(jdn + offset as f64 / 86400.0);
+    }
+    // 'utc' — convert local time to UTC by subtracting the system UTC offset.
+    if m == "utc" {
+        let offset = utc_offset_seconds();
+        return Some(jdn - offset as f64 / 86400.0);
     }
 
     // 'subsec' / 'subsecond' — this is a flag that affects output formatting,
@@ -429,9 +491,9 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> Option<f64> {
 
     let new_y = new_total.div_euclid(12);
     let new_mo = new_total.rem_euclid(12) + 1;
-    let new_d = d.min(days_in_month(new_y, new_mo));
-
-    Some(ymdhms_to_jdn(new_y, new_mo, new_d, h, mi, s, frac))
+    // Do NOT clamp `d` to the target month's day count.  C SQLite lets
+    // out-of-range days overflow via JDN arithmetic (e.g. Feb 31 → Mar 3).
+    Some(ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac))
 }
 
 // ── Output Formatters ─────────────────────────────────────────────────────
@@ -944,20 +1006,22 @@ mod tests {
 
     #[test]
     fn test_modifier_months() {
-        // 2024-01-31 + 1 month: Feb only has 29 days in 2024 (leap year).
+        // 2024-01-31 + 1 month: C SQLite lets day=31 overflow via JDN
+        // arithmetic → Feb 31 wraps to Mar 2 (2024 is a leap year).
         let r = DateFunc
             .invoke(&[text("2024-01-31"), text("+1 months")])
             .unwrap();
-        assert_text(&r, "2024-02-29");
+        assert_text(&r, "2024-03-02");
     }
 
     #[test]
     fn test_modifier_years() {
-        // 2024-02-29 + 1 year: 2025 is not a leap year.
+        // 2024-02-29 + 1 year: 2025 is not a leap year, day=29 overflows
+        // via JDN arithmetic → Mar 1.
         let r = DateFunc
             .invoke(&[text("2024-02-29"), text("+1 years")])
             .unwrap();
-        assert_text(&r, "2025-02-28");
+        assert_text(&r, "2025-03-01");
     }
 
     #[test]
@@ -1028,15 +1092,28 @@ mod tests {
 
     #[test]
     fn test_modifier_localtime_utc_roundtrip() {
+        // localtime→utc should roundtrip back to the original value.
         let r = DateTimeFunc
-            .invoke(&[
-                text("2024-03-15 14:30:45"),
-                text("utc"),
-                text("localtime"),
-                text("utc"),
-            ])
+            .invoke(&[text("2024-03-15 14:30:45"), text("localtime"), text("utc")])
             .unwrap();
         assert_text(&r, "2024-03-15 14:30:45");
+    }
+
+    #[test]
+    fn test_modifier_localtime_shifts_value() {
+        // When system offset != 0, 'localtime' should actually shift the value.
+        let offset = utc_offset_seconds();
+        if offset != 0 {
+            let r = DateTimeFunc
+                .invoke(&[text("2024-03-15 12:00:00"), text("localtime")])
+                .unwrap();
+            // The shifted value should differ from the input.
+            let shifted = match &r {
+                SqliteValue::Text(s) => s.clone(),
+                _ => panic!("expected text"),
+            };
+            assert_ne!(shifted, "2024-03-15 12:00:00");
+        }
     }
 
     #[test]
