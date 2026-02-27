@@ -1,0 +1,13 @@
+{
+  "id": "018_collation_ascii_unicode_nocase",
+  "description": "NOCASE collation is ASCII-insensitive but Unicode-sensitive",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    {
+      "op": "query",
+      "sql": "SELECT 'a' = 'A' COLLATE NOCASE, 'æ' = 'Æ' COLLATE NOCASE",
+      "expect": { "rows": [["1", "0"]], "ordered": true }
+    }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

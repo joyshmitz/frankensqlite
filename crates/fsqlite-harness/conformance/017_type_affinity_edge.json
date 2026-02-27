@@ -1,0 +1,18 @@
+{
+  "id": "017_type_affinity_edge",
+  "description": "Type affinity edge coercions for NUMERIC/TEXT/INTEGER columns",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE q1(a NUMERIC, b TEXT, c INTEGER)" },
+    { "op": "exec", "sql": "INSERT INTO q1 VALUES('3.0e+5', 123, '0042')" },
+    {
+      "op": "query",
+      "sql": "SELECT typeof(a), a, typeof(b), b, typeof(c), c FROM q1",
+      "expect": {
+        "rows": [["integer", "300000", "text", "123", "integer", "42"]],
+        "ordered": true
+      }
+    }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

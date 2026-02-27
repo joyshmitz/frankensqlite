@@ -1,0 +1,27 @@
+{
+  "id": "019_null_unique_edge",
+  "description": "UNIQUE allows multiple NULL values but rejects duplicate non-NULL values",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE q3(a INTEGER UNIQUE, note TEXT)" },
+    { "op": "exec", "sql": "INSERT INTO q3(a, note) VALUES(NULL, 'first-null')" },
+    { "op": "exec", "sql": "INSERT INTO q3(a, note) VALUES(NULL, 'second-null')" },
+    { "op": "exec", "sql": "INSERT INTO q3(a, note) VALUES(7, 'first-seven')" },
+    {
+      "op": "query",
+      "sql": "SELECT COUNT(*) FROM q3",
+      "expect": { "rows": [["3"]], "ordered": true }
+    },
+    {
+      "op": "exec",
+      "sql": "INSERT INTO q3(a, note) VALUES(7, 'duplicate-seven')",
+      "expect_error": "CONSTRAINT"
+    },
+    {
+      "op": "query",
+      "sql": "SELECT COUNT(*) FROM q3",
+      "expect": { "rows": [["3"]], "ordered": true }
+    }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

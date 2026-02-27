@@ -1,0 +1,13 @@
+{
+  "id": "020_integer_overflow_semantics",
+  "description": "64-bit integer arithmetic overflow promotes expression results to REAL",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    {
+      "op": "query",
+      "sql": "SELECT typeof(9223372036854775807 + 1), typeof(-9223372036854775808 - 1)",
+      "expect": { "rows": [["real", "real"]], "ordered": true }
+    }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}
