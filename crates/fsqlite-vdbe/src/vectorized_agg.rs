@@ -495,15 +495,12 @@ fn build_group_key_column(
             for (group_idx, key) in group_keys.iter().enumerate() {
                 let val = &key[key_idx];
                 match val {
-                    GroupKeyValue::Null => {}
                     GroupKeyValue::Text(t) => {
                         new_data.extend_from_slice(t.as_bytes());
                         set_valid(&mut validity_bytes, group_idx);
                     }
-                    _ => {
-                        // fallback coercion not fully implemented
-                        set_valid(&mut validity_bytes, group_idx);
-                    }
+                    // Null and non-text keys in text column: treat as NULL.
+                    _ => {}
                 }
                 #[allow(clippy::cast_possible_truncation)]
                 new_offsets.push(new_data.len() as u32);
@@ -520,15 +517,12 @@ fn build_group_key_column(
             for (group_idx, key) in group_keys.iter().enumerate() {
                 let val = &key[key_idx];
                 match val {
-                    GroupKeyValue::Null => {}
                     GroupKeyValue::Blob(b) => {
                         new_data.extend_from_slice(b);
                         set_valid(&mut validity_bytes, group_idx);
                     }
-                    _ => {
-                        // fallback coercion not fully implemented
-                        set_valid(&mut validity_bytes, group_idx);
-                    }
+                    // Null and non-blob keys in binary column: treat as NULL.
+                    _ => {}
                 }
                 #[allow(clippy::cast_possible_truncation)]
                 new_offsets.push(new_data.len() as u32);

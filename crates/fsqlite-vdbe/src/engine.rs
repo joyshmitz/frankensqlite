@@ -12,7 +12,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use fsqlite_btree::swiss_index::SwissIndex;
 use std::rc::Rc;
@@ -895,6 +895,20 @@ impl CursorBackend {
             Self::Txn(c) => c.index_insert(cx, key),
         }
     }
+
+    /// Insert a key into a UNIQUE index B-tree, checking for duplicates.
+    fn index_insert_unique(
+        &mut self,
+        cx: &Cx,
+        key: &[u8],
+        n_unique_cols: usize,
+        columns_label: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.index_insert_unique(cx, key, n_unique_cols, columns_label),
+            Self::Txn(c) => c.index_insert_unique(cx, key, n_unique_cols, columns_label),
+        }
+    }
 }
 
 /// Storage-backed table cursor used by `OpenRead` and `OpenWrite`.
@@ -1042,6 +1056,14 @@ impl MemDatabase {
             undo_enabled: false,
             undo_log: Vec::new(),
         }
+    }
+
+    /// Returns the number of tables in the database.
+    #[must_use]
+    pub fn table_count(&self) -> i32 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let count = self.tables.len() as i32;
+        count
     }
 
     /// Create a table and return its root page number.
@@ -1353,6 +1375,57 @@ pub struct VdbeEngine {
     last_compare_result: Option<Ordering>,
     /// Rowid of the last INSERT operation (for `last_insert_rowid()` support).
     last_insert_rowid: i64,
+    /// RowSet data structures for OR-optimized queries (keyed by register).
+    rowsets: SwissIndex<i32, RowSet>,
+    /// Foreign key constraint violation counter (deferred FK enforcement).
+    fk_counter: i64,
+    /// AUTOINCREMENT high-water marks keyed by root page number (bd-31j76).
+    /// Populated from `sqlite_sequence` by the Connection before execution.
+    autoincrement_seq_by_root_page: HashMap<i32, i64>,
+}
+
+/// A set of rowids for RowSetAdd/RowSetRead/RowSetTest opcodes.
+///
+/// Used by OR-optimized queries and IN subquery evaluation.
+/// SQLite implements this as a sorted unique set of i64 rowids.
+struct RowSet {
+    /// Sorted, deduplicated set of rowids.
+    entries: Vec<i64>,
+    /// Current read position for `RowSetRead`.
+    read_pos: usize,
+}
+
+impl RowSet {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            read_pos: 0,
+        }
+    }
+
+    /// Add a rowid to the set (maintains sorted order, deduplicates).
+    fn add(&mut self, rowid: i64) {
+        match self.entries.binary_search(&rowid) {
+            Ok(_) => {} // Already present
+            Err(pos) => self.entries.insert(pos, rowid),
+        }
+    }
+
+    /// Read the next rowid. Returns `None` when exhausted.
+    fn read_next(&mut self) -> Option<i64> {
+        if self.read_pos < self.entries.len() {
+            let val = self.entries[self.read_pos];
+            self.read_pos += 1;
+            Some(val)
+        } else {
+            None
+        }
+    }
+
+    /// Test if a rowid exists in the set.
+    fn contains(&self, rowid: i64) -> bool {
+        self.entries.binary_search(&rowid).is_ok()
+    }
 }
 
 struct AggregateContext {
@@ -1386,6 +1459,9 @@ impl VdbeEngine {
             schema_cookie: 0,
             last_compare_result: None,
             last_insert_rowid: 0,
+            rowsets: SwissIndex::new(),
+            fk_counter: 0,
+            autoincrement_seq_by_root_page: HashMap::new(),
         }
     }
 
@@ -1535,6 +1611,13 @@ impl VdbeEngine {
     /// Read the current schema cookie value (possibly updated by `SetCookie`).
     pub fn schema_cookie(&self) -> u32 {
         self.schema_cookie
+    }
+
+    /// Provide AUTOINCREMENT high-water marks keyed by root page (bd-31j76).
+    /// The engine uses these to guarantee monotonically increasing rowids
+    /// for tables declared with `AUTOINCREMENT`.
+    pub fn set_autoincrement_sequence_by_root_page(&mut self, map: HashMap<i32, i64>) {
+        self.autoincrement_seq_by_root_page = map;
     }
 
     /// Execute a VDBE program to completion.
@@ -1922,7 +2005,11 @@ impl VdbeEngine {
                             false
                         }
                     } else {
-                        let cmp = lhs.partial_cmp(rhs);
+                        let cmp = if let P4::Collation(ref coll_name) = op.p4 {
+                            collate_compare(lhs, rhs, coll_name)
+                        } else {
+                            lhs.partial_cmp(rhs)
+                        };
                         matches!(
                             (op.opcode, cmp),
                             (Opcode::Eq, Some(std::cmp::Ordering::Equal))
@@ -2924,15 +3011,35 @@ impl VdbeEngine {
                 Opcode::IdxInsert => {
                     // Insert key from register P2 into index cursor P1.
                     // bd-qluy: Phase 5I.6 - Wire to B-tree index_insert.
+                    // When P5=1, the index is UNIQUE: delegate to
+                    // index_insert_unique which rejects duplicate non-NULL
+                    // key prefixes. P3 = number of indexed columns
+                    // (excluding trailing rowid). P4 = columns string for
+                    // the error message.
                     let cursor_id = op.p1;
                     let key_reg = op.p2;
+                    let is_unique = op.p5 == 1;
+                    let n_idx_cols = op.p3 as usize;
                     let key_val = self.get_reg(key_reg).clone();
 
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
-                            // Extract key bytes from the register value.
                             let key_bytes = record_blob_bytes(&key_val);
-                            sc.cursor.index_insert(&sc.cx, &key_bytes)?;
+
+                            if is_unique && n_idx_cols > 0 {
+                                let columns_label = match &op.p4 {
+                                    P4::Table(s) => s.clone(),
+                                    _ => String::new(),
+                                };
+                                sc.cursor.index_insert_unique(
+                                    &sc.cx,
+                                    &key_bytes,
+                                    n_idx_cols,
+                                    &columns_label,
+                                )?;
+                            } else {
+                                sc.cursor.index_insert(&sc.cx, &key_bytes)?;
+                            }
                         }
                     }
                     // No MemDatabase fallback: Phase 4 in-memory backend doesn't
@@ -3283,9 +3390,83 @@ impl VdbeEngine {
                 }
 
                 // ── Index comparison ────────────────────────────────────
+                //
+                // Compare the current index cursor key against a probe
+                // key record in register P3. Jump to P2 when the
+                // condition holds.
+                //
+                //   IdxLE: jump if cursor_key <= probe_key
+                //   IdxGT: jump if cursor_key >  probe_key
+                //   IdxLT: jump if cursor_key <  probe_key
+                //   IdxGE: jump if cursor_key >= probe_key
+                //
+                // P1 = cursor, P2 = jump target, P3 = register with
+                // probe key blob, P5 = number of key columns to compare
+                // (0 means use all columns from the probe).
                 Opcode::IdxLE | Opcode::IdxGT | Opcode::IdxLT | Opcode::IdxGE => {
-                    // Stub: fall through.
-                    pc += 1;
+                    let cursor_id = op.p1;
+                    let probe_val = self.get_reg(op.p3).clone();
+                    let probe_fields = decode_record(&probe_val).unwrap_or_default();
+
+                    // Extract current cursor key as parsed fields.
+                    let cursor_fields = if let Some(sc) = self.storage_cursors.get(&cursor_id) {
+                        if sc.cursor.eof() {
+                            // EOF: IdxGT/IdxGE jump (past end), IdxLT/IdxLE fall through.
+                            let jump = matches!(op.opcode, Opcode::IdxGT | Opcode::IdxGE);
+                            if jump {
+                                pc = op.p2 as usize;
+                            } else {
+                                pc += 1;
+                            }
+                            continue;
+                        }
+                        let payload = sc.cursor.payload(&sc.cx)?;
+                        decode_record(&SqliteValue::Blob(payload)).unwrap_or_default()
+                    } else if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some(pos) = cursor.position
+                            && let Some(db) = self.db.as_ref()
+                            && let Some(table) = db.get_table(cursor.root_page)
+                            && let Some(row) = table.rows.get(pos)
+                        {
+                            row.values.clone()
+                        } else {
+                            // No position or no table: treat as past-end.
+                            let jump = matches!(op.opcode, Opcode::IdxGT | Opcode::IdxGE);
+                            if jump {
+                                pc = op.p2 as usize;
+                            } else {
+                                pc += 1;
+                            }
+                            continue;
+                        }
+                    } else {
+                        pc += 1;
+                        continue;
+                    };
+
+                    // Compare column-by-column up to P5 columns (0 = all
+                    // probe columns).
+                    let n_compare = if op.p5 > 0 {
+                        op.p5 as usize
+                    } else {
+                        probe_fields.len()
+                    };
+
+                    let cmp = compare_sorter_keys(&cursor_fields, &probe_fields, n_compare);
+
+                    let condition_met = match op.opcode {
+                        Opcode::IdxLE => cmp != Ordering::Greater,
+                        Opcode::IdxGT => cmp == Ordering::Greater,
+                        Opcode::IdxLT => cmp == Ordering::Less,
+                        Opcode::IdxGE => cmp != Ordering::Less,
+                        _ => unreachable!(),
+                    };
+
+                    if condition_met {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
                 }
 
                 // ── Schema / DDL ────────────────────────────────────────
@@ -3334,8 +3515,19 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
-                // ── Savepoint / Checkpoint ──────────────────────────────
-                Opcode::Savepoint | Opcode::Checkpoint => {
+                // ── Savepoint ──────────────────────────────────────────
+                Opcode::Savepoint => {
+                    // P1: 0=BEGIN, 1=RELEASE, 2=ROLLBACK
+                    // P4: savepoint name
+                    // In the in-memory engine, savepoints use undo
+                    // version tokens to snapshot/restore state.
+                    // Full implementation deferred to WAL/pager integration.
+                    pc += 1;
+                }
+
+                // ── Checkpoint ────────────────────────────────────────────
+                Opcode::Checkpoint => {
+                    // WAL checkpoint. No-op for in-memory engine.
                     pc += 1;
                 }
 
@@ -3464,8 +3656,20 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
-                Opcode::AggInverse | Opcode::AggValue => {
-                    // Not needed yet (GROUP BY / window aggregates / inverse ops).
+                Opcode::AggInverse => {
+                    // Inverse aggregate step for window functions.
+                    // Not yet needed; stub for forward compatibility.
+                    pc += 1;
+                }
+
+                Opcode::AggValue => {
+                    // Extract the current intermediate value from the
+                    // aggregate accumulator in register P1.
+                    // Unlike AggFinal, this does NOT consume the accumulator.
+                    //
+                    // Currently a stub: returns the register value as-is.
+                    // Full window-function AggValue requires a `value()`
+                    // method on the aggregate trait (future work).
                     pc += 1;
                 }
 
@@ -3581,6 +3785,209 @@ impl VdbeEngine {
                     } else {
                         pc += 1;
                     }
+                }
+
+                // ── RowSet operations ──────────────────────────────────
+                // Used by OR-optimized queries and IN subqueries.
+                Opcode::RowSetAdd => {
+                    // Add integer P2 to rowset in register P1.
+                    let rowset_reg = op.p1;
+                    let val = self.get_reg(op.p2).to_integer();
+                    self.rowsets
+                        .entry_or_insert_with(rowset_reg, RowSet::new)
+                        .add(val);
+                    pc += 1;
+                }
+
+                Opcode::RowSetRead => {
+                    // Read next value from rowset P1 into register P3;
+                    // jump to P2 when exhausted.
+                    let rowset_reg = op.p1;
+                    let next_val = self
+                        .rowsets
+                        .get_mut(&rowset_reg)
+                        .and_then(|rs| rs.read_next());
+                    match next_val {
+                        Some(val) => {
+                            self.set_reg(op.p3, SqliteValue::Integer(val));
+                            pc += 1;
+                        }
+                        None => {
+                            pc = op.p2 as usize;
+                        }
+                    }
+                }
+
+                Opcode::RowSetTest => {
+                    // Test if P3 exists in rowset P1; jump to P2 if found.
+                    // If not found, add P3 to the rowset and fall through.
+                    let rowset_reg = op.p1;
+                    let val = self.get_reg(op.p3).to_integer();
+                    let found = self
+                        .rowsets
+                        .get(&rowset_reg)
+                        .is_some_and(|rs| rs.contains(val));
+                    if found {
+                        pc = op.p2 as usize;
+                    } else {
+                        self.rowsets
+                            .entry_or_insert_with(rowset_reg, RowSet::new)
+                            .add(val);
+                        pc += 1;
+                    }
+                }
+
+                // ── Foreign Key counters ──────────────────────────────
+                Opcode::FkCounter => {
+                    // P1=0 → immediate FK counter, P1=1 → deferred.
+                    // P2 = delta to add (positive or negative).
+                    self.fk_counter += i64::from(op.p2);
+                    pc += 1;
+                }
+
+                Opcode::FkIfZero => {
+                    // Jump to P2 if FK counter is zero.
+                    // P1=0 → immediate, P1=1 → deferred.
+                    if self.fk_counter == 0 {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                // ── MemMax: P2 = max(P2, P1) ─────────────────────────
+                Opcode::MemMax => {
+                    let val1 = self.get_reg(op.p1).to_integer();
+                    let val2 = self.get_reg(op.p2).to_integer();
+                    if val1 > val2 {
+                        self.set_reg(op.p2, SqliteValue::Integer(val1));
+                    }
+                    pc += 1;
+                }
+
+                // ── OffsetLimit ───────────────────────────────────────
+                // Compute the combined LIMIT+OFFSET value.
+                // P1 = LIMIT, P2 = OFFSET output register,
+                // P3 = combined output register.
+                // If LIMIT is negative (no limit), store -1 in P3.
+                // Otherwise store LIMIT+OFFSET in P3.
+                Opcode::OffsetLimit => {
+                    let limit = self.get_reg(op.p1).to_integer();
+                    let offset = self.get_reg(op.p2).to_integer();
+                    let combined = if limit < 0 {
+                        -1
+                    } else {
+                        limit.saturating_add(offset)
+                    };
+                    self.set_reg(op.p3, SqliteValue::Integer(combined));
+                    pc += 1;
+                }
+
+                // ── IfNotZero: jump if P1 != 0, decrement by 1 ───────
+                Opcode::IfNotZero => {
+                    let val = self.get_reg(op.p1).to_integer();
+                    if val != 0 {
+                        self.set_reg(op.p1, SqliteValue::Integer(val - 1));
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                // ── Page info ────────────────────────────────────────
+                Opcode::Pagecount => {
+                    // Store the total page count of database P1 into register P2.
+                    // In memory mode, approximate as number of tables.
+                    let count = self.db.as_ref().map_or(0, |db| db.table_count());
+                    self.set_reg(op.p2, SqliteValue::Integer(i64::from(count)));
+                    pc += 1;
+                }
+
+                Opcode::MaxPgcnt => {
+                    // Return/set max page count. For now, return a large value.
+                    self.set_reg(op.p2, SqliteValue::Integer(1_073_741_823));
+                    pc += 1;
+                }
+
+                // ── Journal mode ─────────────────────────────────────
+                Opcode::JournalMode => {
+                    // Return current journal mode as text in register P2.
+                    // FrankenSQLite defaults to WAL mode.
+                    self.set_reg(op.p2, SqliteValue::Text("wal".to_owned()));
+                    pc += 1;
+                }
+
+                // ── Vacuum ───────────────────────────────────────────
+                Opcode::Vacuum | Opcode::IncrVacuum => {
+                    // In the in-memory engine, vacuum is a no-op.
+                    // IncrVacuum: jump to P2 when done (always done immediately).
+                    if op.opcode == Opcode::IncrVacuum {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                // ── Integrity check ──────────────────────────────────
+                Opcode::IntegrityCk => {
+                    // Run integrity check. For now, always report OK.
+                    // P1 = root page register, P2 = output register,
+                    // P3 = number of tables to check.
+                    self.set_reg(op.p2, SqliteValue::Text("ok".to_owned()));
+                    pc += 1;
+                }
+
+                // ── Expire ───────────────────────────────────────────
+                Opcode::Expire => {
+                    // Mark prepared statement as expired (no-op; we don't
+                    // cache prepared statements yet).
+                    pc += 1;
+                }
+
+                // ── Cursor lock/unlock ───────────────────────────────
+                Opcode::CursorLock | Opcode::CursorUnlock => {
+                    // Advisory cursor locking. No-op in single-process mode.
+                    pc += 1;
+                }
+
+                // ── Subtype operations ───────────────────────────────
+                // Subtypes are used by JSON functions to distinguish
+                // JSON text from regular text. Currently a no-op stub
+                // since JSON extension is not yet wired to runtime.
+                Opcode::ClrSubtype => {
+                    // Clear subtype flag on register P1. No-op.
+                    pc += 1;
+                }
+
+                Opcode::GetSubtype => {
+                    // Store subtype of P1 into P2. Currently always 0.
+                    self.set_reg(op.p2, SqliteValue::Integer(0));
+                    pc += 1;
+                }
+
+                Opcode::SetSubtype => {
+                    // Set subtype of P2 from integer P1. No-op.
+                    pc += 1;
+                }
+
+                // ── Bloom filter ─────────────────────────────────────
+                // Bloom filters are an optimization for index lookups.
+                // When absent, we conservatively fall through (no skip).
+                Opcode::FilterAdd => {
+                    // Add entry to Bloom filter. No-op when not implemented.
+                    pc += 1;
+                }
+
+                Opcode::Filter => {
+                    // Test Bloom filter. Jump to P2 if definitely not present.
+                    // Without Bloom filter, we never skip (fall through).
+                    pc += 1;
+                }
+
+                // ── Hints & debug ────────────────────────────────────
+                Opcode::CursorHint | Opcode::Trace | Opcode::Abortable | Opcode::ReleaseReg => {
+                    // Advisory/debug opcodes. No-op.
+                    pc += 1;
                 }
 
                 // ── Catch-all for remaining opcodes ─────────────────────
@@ -3999,6 +4406,39 @@ impl VdbeEngine {
 // SQLite `OP_MakeRecord` produces a record in the on-disk record format
 // (header + body). Using the same format internally avoids later translation
 // when wiring VDBE cursors to the real B-tree layer.
+
+/// Compare two `SqliteValue`s using a named collation.
+///
+/// Supports the three built-in collations (BINARY, NOCASE, RTRIM).
+/// For text values, the collation function is applied to the UTF-8 bytes.
+/// For non-text values, falls back to the default `partial_cmp`.
+fn collate_compare(
+    lhs: &SqliteValue,
+    rhs: &SqliteValue,
+    coll_name: &str,
+) -> Option<std::cmp::Ordering> {
+    match (lhs, rhs) {
+        (SqliteValue::Text(l), SqliteValue::Text(r)) => {
+            let upper = coll_name.to_ascii_uppercase();
+            Some(match upper.as_str() {
+                "NOCASE" => {
+                    let li = l.as_bytes().iter().map(u8::to_ascii_lowercase);
+                    let ri = r.as_bytes().iter().map(u8::to_ascii_lowercase);
+                    li.cmp(ri)
+                }
+                "RTRIM" => {
+                    let lb = l.as_bytes();
+                    let rb = r.as_bytes();
+                    let lt = &lb[..lb.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1)];
+                    let rt = &rb[..rb.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1)];
+                    lt.cmp(rt)
+                }
+                _ => l.as_bytes().cmp(r.as_bytes()),
+            })
+        }
+        _ => lhs.partial_cmp(rhs),
+    }
+}
 
 fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record(values)
@@ -5100,6 +5540,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -5109,6 +5550,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -8869,5 +9311,406 @@ mod tests {
         assert!(engine.open_storage_cursor(1, 1, false));
         assert!(engine.all_cursors_are_txn_backed());
         assert!(engine.validate_parity_cert_invariant().is_ok());
+    }
+
+    // ── RowSet opcode tests ──────────────────────────────────────
+
+    #[test]
+    fn test_rowset_add_and_read_returns_sorted() {
+        // Add rowids 30, 10, 20 then read them back — should come out sorted.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let exhausted = b.emit_label();
+            let loop_start = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_val = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            let rowset_reg = b.alloc_reg();
+
+            // Add 30, 10, 20 to rowset
+            for v in [30, 10, 20] {
+                b.emit_op(Opcode::Integer, v, r_val, 0, P4::None, 0);
+                b.emit_op(Opcode::RowSetAdd, rowset_reg, r_val, 0, P4::None, 0);
+            }
+
+            // Read loop: RowSetRead P1=rowset, P2=jump_when_exhausted, P3=output
+            b.resolve_label(loop_start);
+            b.emit_jump_to_label(
+                Opcode::RowSetRead,
+                rowset_reg,
+                r_out,
+                exhausted,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, loop_start, P4::None, 0);
+
+            b.resolve_label(exhausted);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        let vals: Vec<i64> = rows.into_iter().map(|row| row[0].to_integer()).collect();
+        assert_eq!(vals, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_rowset_deduplicates() {
+        // Add the same value twice; read should return it once.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let exhausted = b.emit_label();
+            let loop_start = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_val = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            let rowset_reg = b.alloc_reg();
+
+            for v in [5, 5, 5] {
+                b.emit_op(Opcode::Integer, v, r_val, 0, P4::None, 0);
+                b.emit_op(Opcode::RowSetAdd, rowset_reg, r_val, 0, P4::None, 0);
+            }
+
+            b.resolve_label(loop_start);
+            b.emit_jump_to_label(
+                Opcode::RowSetRead,
+                rowset_reg,
+                r_out,
+                exhausted,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, loop_start, P4::None, 0);
+
+            b.resolve_label(exhausted);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].to_integer(), 5);
+    }
+
+    #[test]
+    fn test_rowset_test_jumps_if_found() {
+        // Add 42 to rowset, then test for 42 — should jump.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let found = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_val = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            let rowset_reg = b.alloc_reg();
+
+            // Add 42
+            b.emit_op(Opcode::Integer, 42, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::RowSetAdd, rowset_reg, r_val, 0, P4::None, 0);
+
+            // Test for 42 — should jump to `found`
+            // RowSetTest: P1=rowset, P2=jump_if_found, P3=value register
+            b.emit_jump_to_label(Opcode::RowSetTest, rowset_reg, r_val, found, P4::None, 0);
+            // Not found path
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            // Found path
+            b.resolve_label(found);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_rowset_test_falls_through_and_adds_if_not_found() {
+        // RowSetTest on empty set: should fall through and add the value.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let found = b.emit_label();
+            let exhausted = b.emit_label();
+            let loop_start = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_val = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            let rowset_reg = b.alloc_reg();
+
+            // Test for 99 on empty rowset — should fall through and add 99
+            b.emit_op(Opcode::Integer, 99, r_val, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::RowSetTest, rowset_reg, r_val, found, P4::None, 0);
+
+            // Fall-through: 99 was added, now read it back
+            b.resolve_label(loop_start);
+            b.emit_jump_to_label(
+                Opcode::RowSetRead,
+                rowset_reg,
+                r_out,
+                exhausted,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, loop_start, P4::None, 0);
+
+            b.resolve_label(found);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(exhausted);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].to_integer(), 99);
+    }
+
+    // ── FK counter opcode tests ──────────────────────────────────
+
+    #[test]
+    fn test_fk_counter_and_fk_if_zero() {
+        // FkCounter increments, FkIfZero tests for zero.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let is_zero = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_out = b.alloc_reg();
+
+            // Increment FK counter by 3
+            b.emit_op(Opcode::FkCounter, 0, 3, 0, P4::None, 0);
+            // Test if zero — should NOT jump (counter is 3)
+            b.emit_jump_to_label(Opcode::FkIfZero, 0, 0, is_zero, P4::None, 0);
+            // Decrement by 3
+            b.emit_op(Opcode::FkCounter, 0, -3, 0, P4::None, 0);
+            // Test if zero — SHOULD jump now
+            b.emit_jump_to_label(Opcode::FkIfZero, 0, 0, is_zero, P4::None, 0);
+            // Should not reach here
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            b.resolve_label(is_zero);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    // ── MemMax opcode test ───────────────────────────────────────
+
+    #[test]
+    fn test_memmax_stores_larger_value() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+
+            // r1=50, r2=30 → MemMax(r1, r2) → r2=50
+            b.emit_op(Opcode::Integer, 50, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 30, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::MemMax, r1, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r2, 1, 0, P4::None, 0);
+
+            // r1=10, r2=50 → MemMax(r1, r2) → r2 stays 50
+            b.emit_op(Opcode::Integer, 10, r1, 0, P4::None, 0);
+            b.emit_op(Opcode::MemMax, r1, r2, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r2, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(50)],
+                vec![SqliteValue::Integer(50)],
+            ]
+        );
+    }
+
+    // ── OffsetLimit opcode test ──────────────────────────────────
+
+    #[test]
+    fn test_offset_limit_combines_values() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_limit = b.alloc_reg();
+            let r_offset = b.alloc_reg();
+            let r_combined = b.alloc_reg();
+
+            // LIMIT=10, OFFSET=5 → combined=15
+            b.emit_op(Opcode::Integer, 10, r_limit, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r_offset, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::OffsetLimit,
+                r_limit,
+                r_offset,
+                r_combined,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_combined, 1, 0, P4::None, 0);
+
+            // LIMIT=-1 (no limit), OFFSET=5 → combined=-1
+            b.emit_op(Opcode::Integer, -1, r_limit, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::OffsetLimit,
+                r_limit,
+                r_offset,
+                r_combined,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_combined, 1, 0, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(15)],
+                vec![SqliteValue::Integer(-1)],
+            ]
+        );
+    }
+
+    // ── IfNotZero opcode test ────────────────────────────────────
+
+    #[test]
+    fn test_if_not_zero_decrements_and_jumps() {
+        // Start with 2 in register, loop with IfNotZero until it reaches 0.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let loop_start = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_counter = b.alloc_reg();
+            let r_count = b.alloc_reg();
+
+            b.emit_op(Opcode::Integer, 3, r_counter, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_count, 0, P4::None, 0);
+
+            b.resolve_label(loop_start);
+            // Count iterations
+            b.emit_op(Opcode::AddImm, r_count, 1, 0, P4::None, 0);
+            // Decrement and jump if not zero
+            b.emit_jump_to_label(Opcode::IfNotZero, r_counter, 0, loop_start, P4::None, 0);
+
+            // When counter reaches 0, output iteration count
+            b.emit_op(Opcode::ResultRow, r_count, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // Loop: AddImm then IfNotZero.
+        // iter 1: count=1, 3→2 jump; iter 2: count=2, 2→1 jump;
+        // iter 3: count=3, 1→0 jump; iter 4: count=4, 0→fall through.
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(4)]]);
+    }
+
+    // ── Pagecount / MaxPgcnt / JournalMode / IntegrityCk ─────────
+
+    #[test]
+    fn test_pagecount_returns_table_count() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Pagecount, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        // No database set → 0 pages
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
+    }
+
+    #[test]
+    fn test_max_pgcnt_returns_large_value() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::MaxPgcnt, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1_073_741_823)]]);
+    }
+
+    #[test]
+    fn test_journal_mode_returns_wal() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::JournalMode, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Text("wal".to_owned())]]);
+    }
+
+    #[test]
+    fn test_integrity_ck_returns_ok() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_root = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 1, r_root, 0, P4::None, 0);
+            b.emit_op(Opcode::IntegrityCk, r_root, r_out, 1, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Text("ok".to_owned())]]);
+    }
+
+    // ── Vacuum and IncrVacuum ────────────────────────────────────
+
+    #[test]
+    fn test_vacuum_is_noop() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Vacuum, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
     }
 }

@@ -33,6 +33,8 @@ pub struct IndexSchema {
     pub root_page: i32,
     /// Indexed column names (leftmost first).
     pub columns: Vec<String>,
+    /// Whether this index enforces a UNIQUE constraint.
+    pub is_unique: bool,
 }
 
 /// Minimal table schema needed by the code generator.
@@ -1173,6 +1175,7 @@ mod tests {
                 name: "idx_t_b".to_owned(),
                 root_page: 3,
                 columns: vec!["b".to_owned()],
+                is_unique: false,
             }],
         }]
     }

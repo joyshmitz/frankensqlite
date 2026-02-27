@@ -90,6 +90,8 @@ pub struct ColumnInfo {
     pub type_name: Option<String>,
     /// True if the column has a NOT NULL constraint.
     pub notnull: bool,
+    /// True if the column has a UNIQUE constraint.
+    pub unique: bool,
     /// Default value expression as SQL text (e.g. "'open'", "0", "CURRENT_TIMESTAMP").
     pub default_value: Option<String>,
     /// Strict type for STRICT tables; `None` for non-STRICT tables.
@@ -106,6 +108,7 @@ impl ColumnInfo {
             is_ipk,
             type_name: None,
             notnull: false,
+            unique: false,
             default_value: None,
             strict_type: None,
         }
@@ -121,6 +124,8 @@ pub struct IndexSchema {
     pub root_page: i32,
     /// Indexed column names (leftmost first).
     pub columns: Vec<String>,
+    /// Whether this index enforces a UNIQUE constraint.
+    pub is_unique: bool,
 }
 
 /// Minimal table schema needed by the code generator.
@@ -2640,6 +2645,9 @@ pub fn codegen_insert(
         );
     }
 
+    // Conflict behavior applies uniformly across INSERT sources.
+    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+
     match &stmt.source {
         InsertSource::Values(rows) => {
             if rows.is_empty() {
@@ -2650,7 +2658,6 @@ pub fn codegen_insert(
             // row from column-list order to table-schema order, filling
             // unmentioned columns with NULL.  This ensures MakeRecord always
             // packs fields in the order the table schema expects.
-            let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
             if stmt.columns.is_empty() {
                 codegen_insert_values(
                     b,
@@ -2727,6 +2734,7 @@ pub fn codegen_insert(
                 schema,
                 &stmt.returning,
                 &select_ctx,
+                oe_flag,
             )?;
         }
         InsertSource::DefaultValues => {
@@ -2916,6 +2924,17 @@ fn codegen_insert_values(
             );
         }
 
+        // Apply column type affinities before packing the record.
+        let aff_str = table.affinity_string();
+        b.emit_op(
+            Opcode::Affinity,
+            val_regs,
+            n_cols as i32,
+            0,
+            P4::Affinity(aff_str.clone()),
+            0,
+        );
+
         // MakeRecord: pack columns into a record.
         emit_strict_type_check(b, table, val_regs);
         let n_cols_i32 = n_cols as i32;
@@ -2924,7 +2943,7 @@ fn codegen_insert_values(
             val_regs,
             n_cols_i32,
             rec_reg,
-            P4::Affinity(table.affinity_string()),
+            P4::Affinity(aff_str),
             0,
         );
 
@@ -2955,6 +2974,9 @@ fn codegen_insert_values(
 /// Opens the source table for reading (cursor = `write_cursor + 1`), scans
 /// rows with an optional WHERE filter, reads projected columns, and inserts
 /// each row into the target table.
+///
+/// # Arguments
+/// * `oe_flag` - Conflict resolution flag (OE_ABORT, OE_IGNORE, OE_REPLACE, etc.)
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -2969,6 +2991,7 @@ fn codegen_insert_select(
     schema: &[TableSchema],
     returning: &[ResultColumn],
     ctx: &CodegenContext,
+    oe_flag: u16,
 ) -> Result<(), CodegenError> {
     // Extract columns, FROM, and WHERE from the inner SELECT.
     let (columns, from, where_clause) = match &select_stmt.body.select {
@@ -3096,6 +3119,17 @@ fn codegen_insert_select(
         );
     }
 
+    // Apply column type affinities before packing the record.
+    let aff_str = target_table.affinity_string();
+    b.emit_op(
+        Opcode::Affinity,
+        val_regs,
+        n_cols,
+        0,
+        P4::Affinity(aff_str.clone()),
+        0,
+    );
+
     // MakeRecord from the read column values.
     emit_strict_type_check(b, target_table, val_regs);
     b.emit_op(
@@ -3103,7 +3137,7 @@ fn codegen_insert_select(
         val_regs,
         n_cols,
         rec_reg,
-        P4::Affinity(target_table.affinity_string()),
+        P4::Affinity(aff_str),
         0,
     );
 
@@ -3114,8 +3148,11 @@ fn codegen_insert_select(
         rec_reg,
         rowid_reg,
         P4::Table(target_table.name.clone()),
-        0,
+        oe_flag,
     );
+
+    // Index maintenance: insert into each index (bd-so1h).
+    emit_index_inserts(b, target_table, write_cursor, val_regs, rowid_reg);
 
     // RETURNING clause: position cursor on inserted row and read columns.
     if !returning.is_empty() {
@@ -3669,13 +3706,27 @@ fn emit_index_inserts(
         );
 
         // Insert into the index.
+        // For UNIQUE indexes, set P5=1 and P3=number of indexed columns
+        // (excluding the trailing rowid) so the engine can enforce the
+        // uniqueness constraint while allowing multiple NULLs.
+        let (p3_unique, p5_unique) = if index.is_unique {
+            (n_idx_cols as i32, 1)
+        } else {
+            (0, 0)
+        };
+        let p4_name = if index.is_unique {
+            // Include table name for the error message.
+            P4::Table(format!("{}.{}", table.name, index.columns.join(", ")))
+        } else {
+            P4::Table(index.name.clone())
+        };
         b.emit_op(
             Opcode::IdxInsert,
             idx_cursor,
             idx_rec_reg,
-            0,
-            P4::Table(index.name.clone()),
-            0,
+            p3_unique,
+            p4_name,
+            p5_unique,
         );
     }
 }
@@ -5763,6 +5814,7 @@ mod tests {
                 name: "idx_t_b".to_owned(),
                 root_page: 3,
                 columns: vec!["b".to_owned()],
+                is_unique: false,
             }],
             strict: false,
         }]
@@ -5780,6 +5832,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -5789,6 +5842,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -6204,6 +6258,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -6213,6 +6268,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -6230,6 +6286,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -6239,6 +6296,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -6338,6 +6396,166 @@ mod tests {
         assert_eq!(open_read.p2, 3);
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_codegen_insert_select_propagates_or_conflict_to_insert_p5() {
+        let schema = vec![
+            TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("a", 'd', false),
+                    ColumnInfo::basic("b", 'C', false),
+                ],
+                indexes: vec![],
+                strict: false,
+            },
+            TableSchema {
+                name: "s".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("x", 'd', false),
+                    ColumnInfo::basic("y", 'C', false),
+                ],
+                indexes: vec![],
+                strict: false,
+            },
+        ];
+
+        let inner_select = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("s"),
+                            alias: None,
+                            index_hint: None,
+                        },
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: Some(fsqlite_ast::ConflictAction::Ignore),
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Select(Box::new(inner_select)),
+            upsert: vec![],
+            returning: vec![],
+        };
+
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let insert = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Insert)
+            .expect("expected Insert opcode");
+        assert_eq!(insert.p5, OE_IGNORE);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_codegen_insert_select_emits_index_inserts() {
+        // Target has one secondary index; source has none.
+        let schema = vec![
+            TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo::basic("a", 'd', false),
+                    ColumnInfo::basic("b", 'C', false),
+                ],
+                indexes: vec![IndexSchema {
+                    name: "idx_t_a".to_owned(),
+                    root_page: 4,
+                    columns: vec!["a".to_owned()],
+                    is_unique: false,
+                }],
+                strict: false,
+            },
+            TableSchema {
+                name: "s".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo::basic("x", 'd', false),
+                    ColumnInfo::basic("y", 'C', false),
+                ],
+                indexes: vec![],
+                strict: false,
+            },
+        ];
+
+        let inner_select = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("s"),
+                            alias: None,
+                            index_hint: None,
+                        },
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Select(Box::new(inner_select)),
+            upsert: vec![],
+            returning: vec![],
+        };
+
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::OpenWrite && op.p2 == 4),
+            "expected OpenWrite for target secondary index root page"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::IdxInsert),
+            "INSERT ... SELECT should maintain target indexes via IdxInsert"
+        );
+    }
+
     // === Test: INSERT ... SELECT with specific columns ===
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -6354,6 +6572,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -6363,6 +6582,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -6380,6 +6600,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
@@ -6389,6 +6610,7 @@ mod tests {
                         is_ipk: false,
                         type_name: None,
                         notnull: false,
+                        unique: false,
                         default_value: None,
                         strict_type: None,
                     },
