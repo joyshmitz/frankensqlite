@@ -5,8 +5,9 @@
 //! UPDATE, and DELETE with correct opcode patterns matching C SQLite behavior.
 
 use fsqlite_ast::{
-    ColumnRef, DeleteStatement, Expr, InsertSource, InsertStatement, Literal, PlaceholderType,
-    QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, UpdateStatement,
+    BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement, Expr, FunctionArgs, InsertSource,
+    InsertStatement, Literal, PlaceholderType, QualifiedTableRef, ResultColumn, SelectCore,
+    SelectStatement, UnaryOp as AstUnaryOp, UpdateStatement,
 };
 use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
 
@@ -1057,11 +1058,104 @@ fn bind_param_ref(expr: &Expr) -> Option<BindParamRef> {
     }
 }
 
+/// Map AST binary operator to VDBE opcode.
+fn binary_op_to_opcode(op: AstBinaryOp) -> Opcode {
+    match op {
+        AstBinaryOp::Add => Opcode::Add,
+        AstBinaryOp::Subtract => Opcode::Subtract,
+        AstBinaryOp::Multiply => Opcode::Multiply,
+        AstBinaryOp::Divide => Opcode::Divide,
+        AstBinaryOp::Modulo => Opcode::Remainder,
+        AstBinaryOp::Concat => Opcode::Concat,
+        AstBinaryOp::BitAnd => Opcode::BitAnd,
+        AstBinaryOp::BitOr => Opcode::BitOr,
+        AstBinaryOp::ShiftLeft => Opcode::ShiftLeft,
+        AstBinaryOp::ShiftRight => Opcode::ShiftRight,
+        AstBinaryOp::And => Opcode::And,
+        AstBinaryOp::Or => Opcode::Or,
+        AstBinaryOp::Eq | AstBinaryOp::Is | AstBinaryOp::IsNot => Opcode::Eq,
+        AstBinaryOp::Ne => Opcode::Ne,
+        AstBinaryOp::Lt => Opcode::Lt,
+        AstBinaryOp::Le => Opcode::Le,
+        AstBinaryOp::Gt => Opcode::Gt,
+        AstBinaryOp::Ge => Opcode::Ge,
+    }
+}
+
+/// Returns true if `op` is a comparison that produces 1/0 in the result register.
+fn is_comparison_op(op: AstBinaryOp) -> bool {
+    matches!(
+        op,
+        AstBinaryOp::Eq
+            | AstBinaryOp::Ne
+            | AstBinaryOp::Lt
+            | AstBinaryOp::Le
+            | AstBinaryOp::Gt
+            | AstBinaryOp::Ge
+            | AstBinaryOp::Is
+            | AstBinaryOp::IsNot
+    )
+}
+
+/// Emit a comparison that produces 1 (true) or 0 (false) in `dest`.
+fn emit_comparison_expr(
+    b: &mut ProgramBuilder,
+    left: &Expr,
+    op: AstBinaryOp,
+    right: &Expr,
+    dest: i32,
+) -> Result<(), CodegenError> {
+    let lhs = b.alloc_temp();
+    let rhs = b.alloc_temp();
+    emit_expr(b, left, lhs)?;
+    emit_expr(b, right, rhs)?;
+
+    let opcode = binary_op_to_opcode(op);
+    let true_label = b.emit_label();
+    let done_label = b.emit_label();
+
+    // Jump to true_label if comparison holds.
+    b.emit_jump_to_label(opcode, rhs, lhs, true_label, P4::None, 0);
+    b.emit_op(Opcode::Integer, 0, dest, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.resolve_label(true_label);
+    b.emit_op(Opcode::Integer, 1, dest, 0, P4::None, 0);
+    b.resolve_label(done_label);
+
+    b.free_temp(lhs);
+    b.free_temp(rhs);
+    Ok(())
+}
+
+/// Convert a SQL type name to a single-char affinity code for CAST.
+fn type_to_affinity(type_name: &str) -> char {
+    let upper = type_name.to_uppercase();
+    if upper.contains("INT") {
+        'd' // integer
+    } else if upper.contains("CHAR")
+        || upper.contains("CLOB")
+        || upper.contains("TEXT")
+        || upper.contains("VARCHAR")
+    {
+        'C' // text
+    } else if upper.contains("BLOB") || upper.is_empty() {
+        'B' // blob
+    } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+        'E' // real
+    } else {
+        'C' // default: numeric
+    }
+}
+
 /// Emit an expression value into a register.
 ///
-/// For bind parameters, emits a Variable instruction.
-/// For literals, emits the appropriate constant instruction.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+/// Handles bind parameters, literals, binary/unary ops, IS NULL, CAST,
+/// function calls, CASE, and COLLATE expressions.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines
+)]
 fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), CodegenError> {
     match expr {
         Expr::Placeholder(pt, _) => {
@@ -1112,12 +1206,220 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
                 b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
                 Ok(())
             }
-            Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => {
-                // Placeholder: emit NULL for now (datetime functions handle these).
-                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            Literal::CurrentTime => {
+                // Emit PureFunc call to time('now').
+                let arg_reg = b.alloc_temp();
+                b.emit_op(Opcode::String8, 0, arg_reg, 0, P4::Str("now".to_owned()), 0);
+                b.emit_op(
+                    Opcode::PureFunc,
+                    0,
+                    arg_reg,
+                    reg,
+                    P4::FuncName("time".to_owned()),
+                    1,
+                );
+                b.free_temp(arg_reg);
+                Ok(())
+            }
+            Literal::CurrentDate => {
+                let arg_reg = b.alloc_temp();
+                b.emit_op(Opcode::String8, 0, arg_reg, 0, P4::Str("now".to_owned()), 0);
+                b.emit_op(
+                    Opcode::PureFunc,
+                    0,
+                    arg_reg,
+                    reg,
+                    P4::FuncName("date".to_owned()),
+                    1,
+                );
+                b.free_temp(arg_reg);
+                Ok(())
+            }
+            Literal::CurrentTimestamp => {
+                let arg_reg = b.alloc_temp();
+                b.emit_op(Opcode::String8, 0, arg_reg, 0, P4::Str("now".to_owned()), 0);
+                b.emit_op(
+                    Opcode::PureFunc,
+                    0,
+                    arg_reg,
+                    reg,
+                    P4::FuncName("datetime".to_owned()),
+                    1,
+                );
+                b.free_temp(arg_reg);
                 Ok(())
             }
         },
+
+        // Binary operations: arithmetic, comparison, logical, bitwise.
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            if is_comparison_op(*op) {
+                return emit_comparison_expr(b, left, *op, right, reg);
+            }
+            // Arithmetic / logical / bitwise: left→reg, right→tmp, apply op.
+            let tmp = b.alloc_temp();
+            emit_expr(b, left, reg)?;
+            emit_expr(b, right, tmp)?;
+            let opcode = binary_op_to_opcode(*op);
+            // VDBE arithmetic: p1=rhs, p2=lhs, p3=dest
+            b.emit_op(opcode, tmp, reg, reg, P4::None, 0);
+            b.free_temp(tmp);
+            Ok(())
+        }
+
+        // Unary operations: negate, plus, NOT, bit-NOT.
+        Expr::UnaryOp {
+            op, expr: inner, ..
+        } => {
+            emit_expr(b, inner, reg)?;
+            match op {
+                AstUnaryOp::Negate => {
+                    let tmp = b.alloc_temp();
+                    b.emit_op(Opcode::Integer, -1, tmp, 0, P4::None, 0);
+                    b.emit_op(Opcode::Multiply, tmp, reg, reg, P4::None, 0);
+                    b.free_temp(tmp);
+                }
+                AstUnaryOp::Plus => {} // no-op
+                AstUnaryOp::Not => {
+                    b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
+                }
+                AstUnaryOp::BitNot => {
+                    b.emit_op(Opcode::BitNot, reg, reg, 0, P4::None, 0);
+                }
+            }
+            Ok(())
+        }
+
+        // IS [NOT] NULL.
+        Expr::IsNull {
+            expr: inner, not, ..
+        } => {
+            emit_expr(b, inner, reg)?;
+            let true_label = b.emit_label();
+            let done_label = b.emit_label();
+            if *not {
+                b.emit_jump_to_label(Opcode::NotNull, reg, 0, true_label, P4::None, 0);
+            } else {
+                b.emit_jump_to_label(Opcode::IsNull, reg, 0, true_label, P4::None, 0);
+            }
+            b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            b.resolve_label(true_label);
+            b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+            b.resolve_label(done_label);
+            Ok(())
+        }
+
+        // CAST(expr AS type).
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            ..
+        } => {
+            emit_expr(b, inner, reg)?;
+            let affinity = type_to_affinity(&type_name.name);
+            b.emit_op(
+                Opcode::Affinity,
+                reg,
+                1,
+                0,
+                P4::Str(affinity.to_string()),
+                0,
+            );
+            Ok(())
+        }
+
+        // Scalar function call.
+        Expr::FunctionCall { name, args, .. } => {
+            match args {
+                FunctionArgs::Star => {
+                    b.emit_op(
+                        Opcode::PureFunc,
+                        0,
+                        0,
+                        reg,
+                        P4::FuncName(name.to_lowercase()),
+                        0,
+                    );
+                }
+                FunctionArgs::List(arg_list) => {
+                    let n_args = arg_list.len();
+                    if n_args == 0 {
+                        b.emit_op(
+                            Opcode::PureFunc,
+                            0,
+                            0,
+                            reg,
+                            P4::FuncName(name.to_lowercase()),
+                            0,
+                        );
+                    } else {
+                        let first_arg_reg = b.alloc_regs(n_args as i32);
+                        for (i, arg) in arg_list.iter().enumerate() {
+                            emit_expr(b, arg, first_arg_reg + i as i32)?;
+                        }
+                        b.emit_op(
+                            Opcode::PureFunc,
+                            0,
+                            first_arg_reg,
+                            reg,
+                            P4::FuncName(name.to_lowercase()),
+                            n_args as u16,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        // CASE [operand] WHEN ... THEN ... [ELSE ...] END
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let done_label = b.emit_label();
+            if let Some(base_expr) = operand {
+                let base_reg = b.alloc_temp();
+                emit_expr(b, base_expr, base_reg)?;
+                for (when_val, then_val) in whens {
+                    let next_label = b.emit_label();
+                    let when_reg = b.alloc_temp();
+                    emit_expr(b, when_val, when_reg)?;
+                    b.emit_jump_to_label(Opcode::Ne, when_reg, base_reg, next_label, P4::None, 0);
+                    b.free_temp(when_reg);
+                    emit_expr(b, then_val, reg)?;
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(next_label);
+                }
+                b.free_temp(base_reg);
+            } else {
+                for (when_cond, then_val) in whens {
+                    let next_label = b.emit_label();
+                    let cond_reg = b.alloc_temp();
+                    emit_expr(b, when_cond, cond_reg)?;
+                    b.emit_jump_to_label(Opcode::IfNot, cond_reg, 0, next_label, P4::None, 1);
+                    b.free_temp(cond_reg);
+                    emit_expr(b, then_val, reg)?;
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(next_label);
+                }
+            }
+            if let Some(else_val) = else_expr {
+                emit_expr(b, else_val, reg)?;
+            } else {
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            }
+            b.resolve_label(done_label);
+            Ok(())
+        }
+
+        // Collate — just evaluate the inner expression.
+        Expr::Collate { expr: inner, .. } => emit_expr(b, inner, reg),
+
         _ => Err(CodegenError::Unsupported(
             "planner expression codegen for this expression type".to_owned(),
         )),
@@ -1339,7 +1641,8 @@ mod tests {
 
         let prog = b.finish().unwrap();
         let ops = prog.ops();
-        assert_eq!(ops.len(), 8);
+        // 5 simple literals + 3 × (String8 + PureFunc) for current time/date/timestamp = 11
+        assert_eq!(ops.len(), 11);
 
         assert_eq!(ops[0].opcode, Opcode::Real);
         assert_eq!(ops[0].p2, reg_real);
@@ -1364,14 +1667,20 @@ mod tests {
         assert_eq!(ops[4].p2, reg_false);
         assert_eq!(ops[4].p4, P4::None);
 
-        assert_eq!(ops[5].opcode, Opcode::Null);
-        assert_eq!(ops[5].p2, reg_current_time);
+        // CurrentTime → String8("now") + PureFunc("time")
+        assert_eq!(ops[5].opcode, Opcode::String8);
+        assert_eq!(ops[6].opcode, Opcode::PureFunc);
+        assert_eq!(ops[6].p3, reg_current_time);
 
-        assert_eq!(ops[6].opcode, Opcode::Null);
-        assert_eq!(ops[6].p2, reg_current_date);
+        // CurrentDate → String8("now") + PureFunc("date")
+        assert_eq!(ops[7].opcode, Opcode::String8);
+        assert_eq!(ops[8].opcode, Opcode::PureFunc);
+        assert_eq!(ops[8].p3, reg_current_date);
 
-        assert_eq!(ops[7].opcode, Opcode::Null);
-        assert_eq!(ops[7].p2, reg_current_timestamp);
+        // CurrentTimestamp → String8("now") + PureFunc("datetime")
+        assert_eq!(ops[9].opcode, Opcode::String8);
+        assert_eq!(ops[10].opcode, Opcode::PureFunc);
+        assert_eq!(ops[10].p3, reg_current_timestamp);
     }
 
     #[test]
@@ -2307,10 +2616,11 @@ mod tests {
                 select: SelectCore::Select {
                     distinct: Distinctness::All,
                     columns: vec![ResultColumn::Expr {
-                        expr: Expr::BinaryOp {
-                            left: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
-                            op: AstBinaryOp::Add,
-                            right: Box::new(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+                        expr: Expr::Between {
+                            expr: Box::new(Expr::Literal(Literal::Integer(5), Span::ZERO)),
+                            low: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                            high: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+                            not: false,
                             span: Span::ZERO,
                         },
                         alias: None,
