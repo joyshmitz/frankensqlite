@@ -339,3 +339,100 @@ fn sequential_insert_aggregate_verification() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn strict_mode_lossless_coercion_matches_sqlite() {
+    let stmts = vec![
+        "CREATE TABLE strict_e2e (id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, b BLOB, a ANY) STRICT"
+            .to_owned(),
+        "INSERT INTO strict_e2e VALUES (1, 1, 2.5, 'ok', X'AA', 42)".to_owned(),
+        "INSERT INTO strict_e2e VALUES (2, 2, 7, 'coerce', X'BB', 'freeform')".to_owned(),
+        "UPDATE strict_e2e SET r = 9 WHERE id = 1".to_owned(),
+        "SELECT typeof(i), typeof(r), typeof(t), typeof(b), typeof(a) FROM strict_e2e ORDER BY id"
+            .to_owned(),
+        "SELECT r FROM strict_e2e WHERE id = 2".to_owned(),
+    ];
+
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+    let result = runner.run_and_compare(&stmts);
+    assert_eq!(
+        result.operations_mismatched, 0,
+        "STRICT coercion mismatches: {:?}",
+        result.mismatches
+    );
+}
+
+#[test]
+fn strict_mode_rejects_insert_and_update_semantically() {
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+
+    let setup = [
+        "CREATE TABLE strict_fail (id INTEGER PRIMARY KEY, i INTEGER, r REAL) STRICT",
+        "INSERT INTO strict_fail VALUES (1, 10, 1.5)",
+    ];
+    for sql in setup {
+        runner
+            .csqlite()
+            .execute(sql)
+            .unwrap_or_else(|err| panic!("csqlite setup failed for `{sql}`: {err}"));
+        runner
+            .frank()
+            .execute(sql)
+            .unwrap_or_else(|err| panic!("frankensqlite setup failed for `{sql}`: {err}"));
+    }
+
+    let bad_insert = "INSERT INTO strict_fail VALUES (2, 'bad', 2.0)";
+    let c_insert_err = runner
+        .csqlite()
+        .execute(bad_insert)
+        .expect_err("csqlite should reject STRICT insert");
+    let f_insert_err = runner
+        .frank()
+        .execute(bad_insert)
+        .expect_err("frankensqlite should reject STRICT insert");
+
+    assert!(
+        c_insert_err.to_ascii_lowercase().contains("cannot store")
+            || c_insert_err.to_ascii_lowercase().contains("datatype"),
+        "unexpected csqlite STRICT insert error: {c_insert_err}"
+    );
+    assert!(
+        f_insert_err.contains("STRICT type check failed")
+            && f_insert_err.to_ascii_lowercase().contains("cannot store"),
+        "unexpected frankensqlite STRICT insert error: {f_insert_err}"
+    );
+
+    let bad_update = "UPDATE strict_fail SET i = 'bad' WHERE id = 1";
+    let c_update_err = runner
+        .csqlite()
+        .execute(bad_update)
+        .expect_err("csqlite should reject STRICT update");
+    let f_update_err = runner
+        .frank()
+        .execute(bad_update)
+        .expect_err("frankensqlite should reject STRICT update");
+
+    assert!(
+        c_update_err.to_ascii_lowercase().contains("cannot store")
+            || c_update_err.to_ascii_lowercase().contains("datatype"),
+        "unexpected csqlite STRICT update error: {c_update_err}"
+    );
+    assert!(
+        f_update_err.contains("STRICT type check failed")
+            && f_update_err.to_ascii_lowercase().contains("cannot store"),
+        "unexpected frankensqlite STRICT update error: {f_update_err}"
+    );
+
+    let c_rows = runner
+        .csqlite()
+        .query("SELECT i FROM strict_fail WHERE id = 1")
+        .expect("csqlite SELECT after STRICT failures");
+    let f_rows = runner
+        .frank()
+        .query("SELECT i FROM strict_fail WHERE id = 1")
+        .expect("frankensqlite SELECT after STRICT failures");
+    assert_eq!(
+        c_rows, f_rows,
+        "state diverged after STRICT failures:\n  csqlite={c_rows:?}\n  fsqlite={f_rows:?}"
+    );
+}

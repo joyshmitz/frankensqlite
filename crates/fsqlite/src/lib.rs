@@ -2880,7 +2880,7 @@ mod tests {
     fn insert_default_values_uses_column_defaults() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
-            "CREATE TABLE td (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active', count INTEGER DEFAULT 42, ratio REAL DEFAULT 3.14);",
+            "CREATE TABLE td (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active', count INTEGER DEFAULT 42, ratio REAL DEFAULT 2.5);",
         )
         .unwrap();
         conn.execute("INSERT INTO td DEFAULT VALUES;").unwrap();
@@ -2901,8 +2901,8 @@ mod tests {
         );
         assert_eq!(
             row_values(&rows[0])[3],
-            SqliteValue::Float(3.14),
-            "ratio should use DEFAULT 3.14"
+            SqliteValue::Float(2.5),
+            "ratio should use DEFAULT 2.5"
         );
     }
 

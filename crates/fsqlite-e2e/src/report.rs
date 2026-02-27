@@ -446,7 +446,7 @@ mod tests {
             environment: crate::methodology::EnvironmentMeta::capture("test"),
             engine: EngineInfo {
                 name: "sqlite3".to_owned(),
-                sqlite_version: Some("3.45.1".to_owned()),
+                sqlite_version: Some("3.52.0".to_owned()),
                 fsqlite_git: None,
             },
             fixture_id: "fixture-a".to_owned(),

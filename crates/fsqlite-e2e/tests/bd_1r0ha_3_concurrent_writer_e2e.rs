@@ -20,8 +20,7 @@ use serde_json::json;
 use tempfile::tempdir;
 
 const BEAD_ID: &str = "bd-1r0ha.3";
-const REPLAY_COMMAND: &str =
-    "cargo test -p fsqlite-e2e --test bd_1r0ha_3_concurrent_writer_e2e -- --nocapture --test-threads=1";
+const REPLAY_COMMAND: &str = "cargo test -p fsqlite-e2e --test bd_1r0ha_3_concurrent_writer_e2e -- --nocapture --test-threads=1";
 
 const READERS: u16 = 10;
 const WRITERS: u16 = 10;
@@ -81,7 +80,9 @@ fn sqlite_exec_config() -> SqliteExecConfig {
 fn fsqlite_exec_config() -> FsqliteExecConfig {
     let settings = fairness::benchmark_settings();
     let mut config = settings.to_fsqlite_exec_config();
-    config.pragmas.extend(fairness::additional_benchmark_pragmas());
+    config
+        .pragmas
+        .extend(fairness::additional_benchmark_pragmas());
     config
 }
 
@@ -102,19 +103,27 @@ fn benchmark_engine(engine: EngineKind, workload_name: &str, oplog: &OpLog) -> B
     match engine {
         EngineKind::Sqlite => {
             let config = sqlite_exec_config();
-            run_benchmark(&benchmark_config, &meta, |_| -> E2eResult<EngineRunReport> {
-                let temp = tempdir()?;
-                let db_path = temp.path().join("sqlite3.db");
-                run_oplog_sqlite(&db_path, oplog, &config)
-            })
+            run_benchmark(
+                &benchmark_config,
+                &meta,
+                |_| -> E2eResult<EngineRunReport> {
+                    let temp = tempdir()?;
+                    let db_path = temp.path().join("sqlite3.db");
+                    run_oplog_sqlite(&db_path, oplog, &config)
+                },
+            )
         }
         EngineKind::Fsqlite => {
             let config = fsqlite_exec_config();
-            run_benchmark(&benchmark_config, &meta, |_| -> E2eResult<EngineRunReport> {
-                let temp = tempdir()?;
-                let db_path = temp.path().join("fsqlite.db");
-                run_oplog_fsqlite(&db_path, oplog, &config)
-            })
+            run_benchmark(
+                &benchmark_config,
+                &meta,
+                |_| -> E2eResult<EngineRunReport> {
+                    let temp = tempdir()?;
+                    let db_path = temp.path().join("fsqlite.db");
+                    run_oplog_fsqlite(&db_path, oplog, &config)
+                },
+            )
         }
     }
 }
@@ -131,9 +140,8 @@ fn run_once_engine(
         EngineKind::Sqlite => {
             run_oplog_sqlite(&db_path, oplog, &sqlite_exec_config()).expect("run sqlite scenario")
         }
-        EngineKind::Fsqlite => {
-            run_oplog_fsqlite(&db_path, oplog, &fsqlite_exec_config()).expect("run fsqlite scenario")
-        }
+        EngineKind::Fsqlite => run_oplog_fsqlite(&db_path, oplog, &fsqlite_exec_config())
+            .expect("run fsqlite scenario"),
     };
 
     let progress = match engine {
@@ -347,11 +355,19 @@ fn summarize_progress(commits: &[u64]) -> WriterProgress {
 }
 
 fn total_retries(summary: &BenchmarkSummary) -> u64 {
-    summary.iterations.iter().map(|iteration| iteration.retries).sum()
+    summary
+        .iterations
+        .iter()
+        .map(|iteration| iteration.retries)
+        .sum()
 }
 
 fn total_aborts(summary: &BenchmarkSummary) -> u64 {
-    summary.iterations.iter().map(|iteration| iteration.aborts).sum()
+    summary
+        .iterations
+        .iter()
+        .map(|iteration| iteration.aborts)
+        .sum()
 }
 
 fn conflict_like_error(message: &str) -> bool {
@@ -455,7 +471,10 @@ fn unit_scenario_contract_constants_are_stable() {
     assert_eq!(TOTAL_WORKERS, 20);
     assert_eq!(SCENARIO_RW_DISJOINT, "MVCC-E2E-RW10W10-DISJOINT");
     assert_eq!(SCENARIO_HOT_CONTENTION, "MVCC-E2E-HOT-WRITE-CONTENTION");
-    assert_eq!(SCENARIO_NO_SERIALIZATION, "MVCC-E2E-NO-GLOBAL-SERIALIZATION");
+    assert_eq!(
+        SCENARIO_NO_SERIALIZATION,
+        "MVCC-E2E-NO-GLOBAL-SERIALIZATION"
+    );
 }
 
 #[test]
@@ -649,7 +668,8 @@ fn scenario_no_global_writer_serialization_probe() {
 
     let sqlite_summary = benchmark_engine(EngineKind::Sqlite, "writer_fanout", &oplog);
     let fsqlite_summary = benchmark_engine(EngineKind::Fsqlite, "writer_fanout", &oplog);
-    let (fsqlite_once, fsqlite_progress) = run_once_engine(EngineKind::Fsqlite, &oplog, TOTAL_WORKERS);
+    let (fsqlite_once, fsqlite_progress) =
+        run_once_engine(EngineKind::Fsqlite, &oplog, TOTAL_WORKERS);
 
     let sqlite_retry_total = total_retries(&sqlite_summary);
     assert!(

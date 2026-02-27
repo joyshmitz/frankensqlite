@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use fsqlite_e2e::fairness;
-use fsqlite_e2e::fsqlite_executor::{run_oplog_fsqlite, FsqliteExecConfig};
+use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::oplog::preset_commutative_inserts_disjoint_keys;
 use tempfile::tempdir;
 
