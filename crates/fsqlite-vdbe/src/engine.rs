@@ -2070,8 +2070,14 @@ impl VdbeEngine {
                 // ── Conditional Jumps ───────────────────────────────────
                 Opcode::If => {
                     // Jump to p2 if p1 is true (non-zero, non-NULL).
+                    // If p1 is NULL, jump iff p3 != 0 (SQLite semantics).
                     let val = self.get_reg(op.p1);
-                    if !val.is_null() && val.to_float() != 0.0 {
+                    let should_jump = if val.is_null() {
+                        op.p3 != 0
+                    } else {
+                        val.to_float() != 0.0
+                    };
+                    if should_jump {
                         pc = op.p2 as usize;
                     } else {
                         pc += 1;
@@ -2079,9 +2085,15 @@ impl VdbeEngine {
                 }
 
                 Opcode::IfNot => {
-                    // Jump to p2 if p1 is false (zero) or NULL.
+                    // Jump to p2 if p1 is false (zero).
+                    // If p1 is NULL, jump iff p3 != 0 (SQLite semantics).
                     let val = self.get_reg(op.p1);
-                    if val.is_null() || val.to_float() == 0.0 {
+                    let should_jump = if val.is_null() {
+                        op.p3 != 0
+                    } else {
+                        val.to_float() == 0.0
+                    };
+                    if should_jump {
                         pc = op.p2 as usize;
                     } else {
                         pc += 1;

@@ -3941,7 +3941,8 @@ fn emit_having_filter(
         out_regs,
     );
     // If result is falsy (0 or NULL), skip this group's ResultRow.
-    b.emit_jump_to_label(Opcode::IfNot, result_reg, 0, skip_label, P4::None, 0);
+    // p3=1: NULL HAVING → jump (skip row), matching SQLite semantics.
+    b.emit_jump_to_label(Opcode::IfNot, result_reg, 1, skip_label, P4::None, 0);
     b.free_temp(result_reg);
 }
 
