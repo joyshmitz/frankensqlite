@@ -110,6 +110,27 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// If the key already exists, it is replaced.
     fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()>;
 
+    /// Insert a key into a UNIQUE index B-tree.
+    ///
+    /// Before inserting, checks whether a key with the same first
+    /// `n_unique_cols` fields already exists. If such a key is found
+    /// **and** none of those fields are NULL, returns
+    /// `FrankenError::UniqueViolation`. Multiple NULL entries are
+    /// permitted (SQLite semantics).
+    ///
+    /// `columns_label` is used in the error message.
+    fn index_insert_unique(
+        &mut self,
+        cx: &Cx,
+        key: &[u8],
+        n_unique_cols: usize,
+        columns_label: &str,
+    ) -> Result<()> {
+        // Default: fall back to non-unique insert (MockBtreeCursor etc.).
+        let _ = (n_unique_cols, columns_label);
+        self.index_insert(cx, key)
+    }
+
     /// Insert a row into a table B-tree.
     ///
     /// `rowid` is the integer key. `data` is the serialized record payload.

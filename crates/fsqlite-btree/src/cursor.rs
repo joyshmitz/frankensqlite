@@ -867,7 +867,14 @@ impl<P: PageReader> BtCursor<P> {
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
 
-            match key.as_slice().cmp(target) {
+            let ord = match (parse_record(&key), parse_record(target)) {
+                (Some(k_vals), Some(t_vals)) => k_vals
+                    .partial_cmp(&t_vals)
+                    .unwrap_or_else(|| key.as_slice().cmp(target)),
+                _ => key.as_slice().cmp(target),
+            };
+
+            match ord {
                 std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -895,10 +902,18 @@ impl<P: PageReader> BtCursor<P> {
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
 
-            match target.cmp(key.as_slice()) {
+            let ord = match (parse_record(&key), parse_record(target)) {
+                (Some(k_vals), Some(t_vals)) => k_vals
+                    .partial_cmp(&t_vals)
+                    .unwrap_or_else(|| key.as_slice().cmp(target)),
+                _ => key.as_slice().cmp(target),
+            };
+
+            // Note: target vs key comparison direction
+            match ord {
                 std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
-                std::cmp::Ordering::Less => hi = mid,
-                std::cmp::Ordering::Greater => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Less => lo = mid + 1,
             }
         }
         Ok(BinarySearchResult::NotFound(lo))
@@ -1691,6 +1706,87 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 }
             }
         })
+    }
+
+    fn index_insert_unique(
+        &mut self,
+        cx: &Cx,
+        key: &[u8],
+        n_unique_cols: usize,
+        columns_label: &str,
+    ) -> Result<()> {
+        // Parse the new key to extract the indexed column values.
+        let new_fields = match parse_record(key) {
+            Some(f) => f,
+            None => return self.index_insert(cx, key),
+        };
+        // Check that all indexed columns are non-NULL — if any is NULL,
+        // SQLite allows the insert regardless of uniqueness.
+        let any_null = new_fields
+            .iter()
+            .take(n_unique_cols)
+            .any(|v| matches!(v, fsqlite_types::SqliteValue::Null));
+        if any_null {
+            return self.index_insert(cx, key);
+        }
+
+        let new_prefix = &new_fields[..n_unique_cols.min(new_fields.len())];
+
+        // Use index_seek to position cursor, then scan adjacent entries for
+        // prefix matches. The cursor lands on a leaf at or near the insertion
+        // point. We check the current cell and the predecessor because the
+        // full key includes the rowid suffix, so two records with the same
+        // indexed columns but different rowids sort adjacently.
+        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
+            let _seek = cursor.index_seek(cx, key)?;
+
+            // Determine which cell indices to check on the current leaf.
+            let mut check_indices: Vec<u16> = Vec::with_capacity(2);
+            if let Some(top) = cursor.stack.last() {
+                if top.header.page_type.is_leaf() {
+                    // Current cell (successor).
+                    if !cursor.at_eof && top.cell_idx < top.header.cell_count {
+                        check_indices.push(top.cell_idx);
+                    }
+                    // Predecessor cell.
+                    if cursor.at_eof && top.header.cell_count > 0 {
+                        check_indices.push(top.header.cell_count - 1);
+                    } else if !cursor.at_eof && top.cell_idx > 0 {
+                        check_indices.push(top.cell_idx - 1);
+                    }
+                }
+            }
+
+            for cell_idx in check_indices {
+                let top = match cursor.stack.last() {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let cell = match cursor.parse_cell_at(top, cell_idx) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let existing_key = match cursor.read_cell_payload(cx, top, &cell) {
+                    Ok(k) => k,
+                    Err(_) => continue,
+                };
+
+                // Parse the existing key and compare prefixes.
+                if let Some(existing_fields) = parse_record(&existing_key) {
+                    if existing_fields.len() >= n_unique_cols
+                        && new_prefix == &existing_fields[..n_unique_cols]
+                    {
+                        return Err(FrankenError::UniqueViolation {
+                            columns: columns_label.to_owned(),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        })?;
+
+        // No conflict — proceed with normal insert.
+        self.index_insert(cx, key)
     }
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {

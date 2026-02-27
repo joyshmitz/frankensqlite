@@ -431,18 +431,20 @@ impl CellRef {
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "cell payload offset overflow".to_owned(),
             })?;
-        if local_end > page.len() {
+        if local_end > page.len() || local_end > usable_size as usize {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: "cell extends past page (payload bytes)".to_owned(),
+                detail: "cell extends past usable page size (payload bytes)".to_owned(),
             });
         }
 
         // Check for overflow page pointer.
         let overflow_page = if local_size < payload_size {
             let overflow_ptr_offset = local_end;
-            if overflow_ptr_offset + 4 > page.len() {
+            if overflow_ptr_offset + 4 > page.len()
+                || overflow_ptr_offset + 4 > usable_size as usize
+            {
                 return Err(FrankenError::DatabaseCorrupt {
-                    detail: "cell extends past page (overflow pointer)".to_owned(),
+                    detail: "cell extends past usable page size (overflow pointer)".to_owned(),
                 });
             }
             let pgno = u32::from_be_bytes([
@@ -789,7 +791,7 @@ mod tests {
         page[cell_offset] = 10; // payload_size
         page[cell_offset + 1] = 1; // rowid
 
-        let err = CellRef::parse(&page, cell_offset, BtreePageType::LeafTable, 4096).unwrap_err();
+        let err = CellRef::parse(&page, cell_offset, BtreePageType::LeafTable, 64).unwrap_err();
         assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
         assert!(err.to_string().contains("payload bytes"));
     }
