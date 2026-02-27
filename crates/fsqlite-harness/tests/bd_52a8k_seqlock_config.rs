@@ -298,11 +298,7 @@ fn test_seqlock_vs_mutex_latency() {
     // We don't assert strict ordering due to CPU variance, but log for characterization.
     println!(
         "[PASS] Latency comparison: seqlock={seqlock_per_op}ns/op mutex={mutex_per_op}ns/op ({}x)",
-        if seqlock_per_op > 0 {
-            mutex_per_op / seqlock_per_op
-        } else {
-            0
-        }
+        mutex_per_op.checked_div(seqlock_per_op).unwrap_or(0)
     );
 }
 

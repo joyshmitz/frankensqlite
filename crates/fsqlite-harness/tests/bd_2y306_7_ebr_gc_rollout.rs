@@ -387,7 +387,7 @@ fn test_chain_pressure_feedback_loop() {
 
         pressure = (pressure + ingestion - gc_effect).max(0.0);
 
-        if step < 5 || step >= 15 {
+        if !(5..15).contains(&step) {
             println!("  step={step}: pressure={pressure:.2} freq={freq:.1}Hz");
         }
     }

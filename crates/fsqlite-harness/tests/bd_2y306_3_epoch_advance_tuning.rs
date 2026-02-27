@@ -54,7 +54,7 @@ fn test_scheduler_frequency_at_target() {
     // At target chain length → frequency = pressure/target = 1.0 → clamped to f_min or computed
     let freq_at_target = scheduler.compute_frequency(GC_TARGET_CHAIN_LENGTH);
     assert!(
-        freq_at_target >= GC_F_MIN_HZ && freq_at_target <= GC_F_MAX_HZ,
+        (GC_F_MIN_HZ..=GC_F_MAX_HZ).contains(&freq_at_target),
         "bead_id={BEAD_ID} case=freq_at_target freq={freq_at_target}"
     );
 
@@ -365,7 +365,7 @@ fn test_gc_budget_enforcement() {
     let mut todo = GcTodo::new();
 
     // Create more pages than GC_PAGES_BUDGET to test budget capping.
-    let total_pages = GC_PAGES_BUDGET as u32 * 2;
+    let total_pages = GC_PAGES_BUDGET * 2;
     for page in 1..=total_pages {
         let pgno = PageNumber::new(page).unwrap();
         let ver = dummy_version(page, 1);

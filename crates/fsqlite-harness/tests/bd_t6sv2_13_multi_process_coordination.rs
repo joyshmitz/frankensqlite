@@ -508,8 +508,7 @@ fn test_conformance_summary() {
     };
     let pass_permit = {
         let pm = PermitManager::new(2);
-        let p = pm.reserve().is_ok();
-        p
+        pm.reserve().is_ok()
     };
     let pass_canonical = is_canonical_pages(&[1, 2, 3]) && !is_canonical_pages(&[3, 2, 1]);
 

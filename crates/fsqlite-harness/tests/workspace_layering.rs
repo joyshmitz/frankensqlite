@@ -1,10 +1,10 @@
 //! Workspace structure and dependency layer validation (bd-1wwc, §8.1–§8.2).
 //!
-//! These tests enforce the 24-crate workspace layout and the 10-layer
+//! These tests enforce the workspace crate layout and the 10-layer
 //! dependency hierarchy documented in the spec. They run `cargo metadata`
 //! and verify the resolved dependency graph against the documented layering.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -15,8 +15,11 @@ const ARCH_BEAD_ID: &str = "bd-3an";
 const DEP_BUILD_BEAD_ID: &str = "bd-2v8x";
 const DESC_BEAD_ID: &str = "bd-sxm2";
 
-/// The 24 crates in the workspace (23 from §8.1 + fsqlite-e2e).
-const EXPECTED_CRATES: [&str; 24] = [
+/// The 24 crates documented in spec §8.1 (23 listed there + fsqlite-e2e).
+///
+/// Newer workspace crates that are intentionally outside that legacy spec
+/// section are tracked separately in `WORKSPACE_ONLY_CRATES`.
+const SPEC_EXPECTED_CRATES: [&str; 24] = [
     "fsqlite-ast",
     "fsqlite-btree",
     "fsqlite-cli",
@@ -43,6 +46,20 @@ const EXPECTED_CRATES: [&str; 24] = [
     "fsqlite",
 ];
 
+/// Workspace crates present in Cargo metadata but not yet listed in spec §8.1.
+const WORKSPACE_ONLY_CRATES: [&str; 2] = ["fsqlite-observability", "fsqlite-c-api"];
+
+const EXPECTED_WORKSPACE_CRATE_COUNT: usize =
+    SPEC_EXPECTED_CRATES.len() + WORKSPACE_ONLY_CRATES.len();
+
+fn expected_workspace_crates() -> BTreeSet<String> {
+    SPEC_EXPECTED_CRATES
+        .iter()
+        .chain(WORKSPACE_ONLY_CRATES.iter())
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
 /// Supporting directories required by §8.1.
 const SUPPORTING_DIRS: [&str; 5] = [
     "conformance",
@@ -64,6 +81,7 @@ fn layer_assignments() -> HashMap<&'static str, u8> {
     // Layer 1: storage + AST
     m.insert("fsqlite-vfs", 1);
     m.insert("fsqlite-ast", 1);
+    m.insert("fsqlite-observability", 1);
     // Layer 2: cache + parser + func
     m.insert("fsqlite-pager", 2);
     m.insert("fsqlite-parser", 2);
@@ -92,6 +110,7 @@ fn layer_assignments() -> HashMap<&'static str, u8> {
     m.insert("fsqlite-cli", 9);
     m.insert("fsqlite-e2e", 9);
     m.insert("fsqlite-harness", 9);
+    m.insert("fsqlite-c-api", 9);
     m
 }
 
@@ -382,18 +401,19 @@ fn concise_description_allowed(crate_name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_workspace_crate_count_is_24() {
+fn test_workspace_crate_count_is_26() {
     let metadata = cargo_metadata_cached();
     let members = workspace_member_names(metadata);
 
     assert_eq!(
         members.len(),
-        24,
-        "bead_id={BEAD_ID} case=crate_count expected=24 actual={} members={members:?}",
+        EXPECTED_WORKSPACE_CRATE_COUNT,
+        "bead_id={BEAD_ID} case=crate_count expected={} actual={} members={members:?}",
+        EXPECTED_WORKSPACE_CRATE_COUNT,
         members.len()
     );
 
-    let expected: BTreeSet<String> = EXPECTED_CRATES.iter().map(|s| (*s).to_string()).collect();
+    let expected = expected_workspace_crates();
     assert_eq!(
         members, expected,
         "bead_id={BEAD_ID} case=crate_names_match"
@@ -423,11 +443,12 @@ fn test_supporting_directories_present() {
 #[test]
 fn test_layering_document_matches_cargo_metadata() {
     let layers = layer_assignments();
+    let expected = expected_workspace_crates();
 
     // Every expected crate must have a layer assignment.
-    for crate_name in &EXPECTED_CRATES {
+    for crate_name in &expected {
         assert!(
-            layers.contains_key(crate_name),
+            layers.contains_key(crate_name.as_str()),
             "bead_id={BEAD_ID} case=layer_assignment_complete crate={crate_name} has no layer"
         );
     }
@@ -435,7 +456,7 @@ fn test_layering_document_matches_cargo_metadata() {
     // Every layer assignment must refer to a known crate.
     for crate_name in layers.keys() {
         assert!(
-            EXPECTED_CRATES.contains(crate_name),
+            expected.contains(*crate_name),
             "bead_id={BEAD_ID} case=layer_assignment_valid crate={crate_name} not in workspace"
         );
     }
@@ -453,11 +474,12 @@ fn test_layering_document_matches_cargo_metadata() {
         "bead_id={BEAD_ID} case=layer_range expected 0..=9"
     );
 
-    // Total crates across all layers must be 24.
+    // Total crates across all layers must match the workspace crate set.
     let total: usize = by_layer.values().map(Vec::len).sum();
     assert_eq!(
-        total, 24,
-        "bead_id={BEAD_ID} case=layer_total expected=24 actual={total}"
+        total, EXPECTED_WORKSPACE_CRATE_COUNT,
+        "bead_id={BEAD_ID} case=layer_total expected={} actual={total}",
+        EXPECTED_WORKSPACE_CRATE_COUNT
     );
 }
 
@@ -506,18 +528,16 @@ fn test_mvcc_at_layer_3() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_all_24_crates_exist() {
+fn test_all_workspace_crates_exist() {
     let metadata = cargo_metadata_cached();
     let members = workspace_member_names(metadata);
-    let expected: BTreeSet<String> = EXPECTED_CRATES
-        .iter()
-        .map(|name| (*name).to_string())
-        .collect();
+    let expected = expected_workspace_crates();
 
     assert_eq!(
         members.len(),
-        24,
-        "bead_id={ARCH_BEAD_ID} case=all_24_crates_exist expected=24 actual={}",
+        EXPECTED_WORKSPACE_CRATE_COUNT,
+        "bead_id={ARCH_BEAD_ID} case=all_workspace_crates_exist expected={} actual={}",
+        EXPECTED_WORKSPACE_CRATE_COUNT,
         members.len()
     );
     assert_eq!(
@@ -610,10 +630,7 @@ fn test_build_configuration_matches_spec() -> Result<(), String> {
 fn test_workspace_members_match_spec_list() {
     let metadata = cargo_metadata_cached();
     let members = workspace_member_names(metadata);
-    let expected: BTreeSet<String> = EXPECTED_CRATES
-        .iter()
-        .map(|crate_name| (*crate_name).to_string())
-        .collect();
+    let expected = expected_workspace_crates();
 
     assert_eq!(
         members, expected,
@@ -798,7 +815,7 @@ fn test_e2e_bd_2v8x_compliance() {
 #[test]
 fn test_every_workspace_crate_has_description() -> Result<(), String> {
     let section = spec_section_8_3()?;
-    let missing = EXPECTED_CRATES
+    let missing = SPEC_EXPECTED_CRATES
         .iter()
         .copied()
         .filter(|crate_name| crate_description_block(&section, crate_name).is_none())
@@ -816,7 +833,7 @@ fn test_every_workspace_crate_has_description() -> Result<(), String> {
 fn test_description_includes_purpose_and_key_modules() -> Result<(), String> {
     let section = spec_section_8_3()?;
     let dep_section = spec_section_8_4()?;
-    for crate_name in EXPECTED_CRATES {
+    for crate_name in SPEC_EXPECTED_CRATES {
         let Some(block) = crate_description_block(&section, crate_name) else {
             return Err(format!(
                 "bead_id={DESC_BEAD_ID} case=missing_block crate={crate_name}"
@@ -881,7 +898,7 @@ fn prop_bd_sxm2_structure_compliance() -> Result<(), String> {
     let section = spec_section_8_3()?;
     let mut non_unique = Vec::new();
 
-    for crate_name in EXPECTED_CRATES {
+    for crate_name in SPEC_EXPECTED_CRATES {
         let marker = format!("**`{crate_name}`**");
         let count = section.match_indices(&marker).count();
         if count != 1 {
@@ -900,11 +917,11 @@ fn prop_bd_sxm2_structure_compliance() -> Result<(), String> {
 #[test]
 fn test_e2e_bd_sxm2_compliance() -> Result<(), String> {
     let section = spec_section_8_3()?;
-    let described_count = EXPECTED_CRATES
+    let described_count = SPEC_EXPECTED_CRATES
         .iter()
         .filter(|crate_name| crate_description_block(&section, crate_name).is_some())
         .count();
-    let module_listed_count = EXPECTED_CRATES
+    let module_listed_count = SPEC_EXPECTED_CRATES
         .iter()
         .filter_map(|crate_name| crate_description_block(&section, crate_name))
         .filter(|block| block.contains("Modules:"))
@@ -912,7 +929,7 @@ fn test_e2e_bd_sxm2_compliance() -> Result<(), String> {
 
     eprintln!(
         "bead_id={DESC_BEAD_ID} level=DEBUG case=e2e_sxm2 scanned_crates={}",
-        EXPECTED_CRATES.len()
+        SPEC_EXPECTED_CRATES.len()
     );
     eprintln!(
         "bead_id={DESC_BEAD_ID} level=INFO case=e2e_sxm2 described_count={described_count} module_listed_count={module_listed_count}"
@@ -926,7 +943,7 @@ fn test_e2e_bd_sxm2_compliance() -> Result<(), String> {
 
     assert_eq!(
         described_count,
-        EXPECTED_CRATES.len(),
+        SPEC_EXPECTED_CRATES.len(),
         "bead_id={DESC_BEAD_ID} case=e2e_sxm2_described_count_mismatch"
     );
     assert!(
@@ -947,15 +964,17 @@ fn test_e2e_bd_1wwc() {
     let members = workspace_member_names(metadata);
     let graph = internal_dep_graph(metadata);
     let layers = layer_assignments();
+    let expected = expected_workspace_crates();
 
     // 1. Member count
     let member_count = members.len();
-    assert_eq!(member_count, 24, "member_count={member_count}");
+    assert_eq!(
+        member_count, EXPECTED_WORKSPACE_CRATE_COUNT,
+        "member_count={member_count}"
+    );
 
     // 2. Members missing from spec
-    let expected: HashSet<&str> = EXPECTED_CRATES.iter().copied().collect();
-    let actual: HashSet<&str> = members.iter().map(String::as_str).collect();
-    let members_missing: Vec<_> = expected.difference(&actual).collect();
+    let members_missing: Vec<_> = expected.difference(&members).cloned().collect();
     assert!(
         members_missing.is_empty(),
         "members_missing={members_missing:?}"

@@ -2,13 +2,12 @@ use std::path::Path;
 
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
-use fsqlite_vfs::traits::{Vfs, VfsFile};
 use fsqlite_vfs::MemoryVfs;
-use fsqlite_wal::{WalFile, WalSalts, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE};
+use fsqlite_vfs::traits::{Vfs, VfsFile};
+use fsqlite_wal::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalFile, WalSalts};
 
 const PAGE_SIZE: u32 = 4096;
-const REPLAY_COMMAND: &str =
-    "cargo test -p fsqlite-wal --test bd_xfn30_3_fault_injection_matrix -- --nocapture --test-threads=1";
+const REPLAY_COMMAND: &str = "cargo test -p fsqlite-wal --test bd_xfn30_3_fault_injection_matrix -- --nocapture --test-threads=1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FaultKind {

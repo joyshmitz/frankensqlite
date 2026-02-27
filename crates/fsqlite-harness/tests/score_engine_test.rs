@@ -251,8 +251,13 @@ fn release_gating_with_default_threshold() {
     let config = ScoreEngineConfig::default();
     let scorecard = compute_bayesian_scorecard(&universe, &config);
 
-    // With the canonical universe (~73% score), and default threshold of 0.70,
-    // the release decision depends on the lower bound.
+    // Under strict 100% release policy, canonical universe (~73% score)
+    // must not be release-ready at default settings.
+    assert!(
+        !scorecard.release_ready,
+        "[{BEAD_ID}] strict default threshold should block canonical universe; lower bound is {:.4}",
+        scorecard.global_lower_bound
+    );
     eprintln!(
         "bead_id={BEAD_ID} test=release_gating threshold={:.2} lower={:.4} conformal_lower={:.4} release_ready={}",
         config.release_threshold,
@@ -657,6 +662,6 @@ fn default_config_is_sensible() {
     assert!(config.prior.alpha > 0.0);
     assert!(config.prior.beta > 0.0);
     assert!(config.prior.confidence_level > 0.0 && config.prior.confidence_level < 1.0);
-    assert!(config.release_threshold > 0.0 && config.release_threshold < 1.0);
+    assert!((config.release_threshold - 1.0).abs() < f64::EPSILON);
     assert!(config.conformal_coverage > 0.0 && config.conformal_coverage < 1.0);
 }

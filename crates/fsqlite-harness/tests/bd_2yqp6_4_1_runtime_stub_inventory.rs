@@ -193,8 +193,10 @@ fn inventory_entries_are_unique_and_well_formed() {
     );
 
     let surface_ids = load_surface_ids();
-    let allowed_severity: BTreeSet<&str> = ["critical", "high", "medium", "low"].into_iter().collect();
-    let allowed_strategy: BTreeSet<&str> = ["implement", "explicit_exclusion"].into_iter().collect();
+    let allowed_severity: BTreeSet<&str> =
+        ["critical", "high", "medium", "low"].into_iter().collect();
+    let allowed_strategy: BTreeSet<&str> =
+        ["implement", "explicit_exclusion"].into_iter().collect();
 
     let mut seen_stub_ids = BTreeSet::new();
     let mut seen_keys = BTreeSet::new();
@@ -206,10 +208,17 @@ fn inventory_entries_are_unique_and_well_formed() {
             stub.stub_id
         );
         let key = format!("{}:{}:{:?}", stub.file, stub.line, stub.kind);
-        assert!(seen_keys.insert(key.clone()), "duplicate runtime stub key: {key}");
+        assert!(
+            seen_keys.insert(key.clone()),
+            "duplicate runtime stub key: {key}"
+        );
 
         assert!(stub.line > 0, "line must be > 0 for {}", stub.stub_id);
-        assert!(!stub.kind_description.trim().is_empty(), "missing kind_description for {}", stub.stub_id);
+        assert!(
+            !stub.kind_description.trim().is_empty(),
+            "missing kind_description for {}",
+            stub.stub_id
+        );
         assert!(
             allowed_severity.contains(stub.severity.as_str()),
             "invalid severity '{}' for {}",
@@ -222,8 +231,16 @@ fn inventory_entries_are_unique_and_well_formed() {
             stub.closure_strategy,
             stub.stub_id
         );
-        assert!(!stub.owner.trim().is_empty(), "missing owner for {}", stub.stub_id);
-        assert!(!stub.anchor.trim().is_empty(), "missing anchor for {}", stub.stub_id);
+        assert!(
+            !stub.owner.trim().is_empty(),
+            "missing owner for {}",
+            stub.stub_id
+        );
+        assert!(
+            !stub.anchor.trim().is_empty(),
+            "missing anchor for {}",
+            stub.stub_id
+        );
         assert!(
             surface_ids.contains(&stub.feature_id),
             "unknown feature_id '{}' for {}",
@@ -239,19 +256,13 @@ fn runtime_stub_inventory_is_exhaustive_for_runtime_scan() {
     let expected = detect_runtime_stubs();
     let actual = inventory_keys(&doc);
 
-    let missing: Vec<String> = expected
-        .difference(&actual)
-        .map(StubKey::render)
-        .collect();
+    let missing: Vec<String> = expected.difference(&actual).map(StubKey::render).collect();
     assert!(
         missing.is_empty(),
         "uncategorized parity-critical stubs detected: {missing:?}"
     );
 
-    let stale: Vec<String> = actual
-        .difference(&expected)
-        .map(StubKey::render)
-        .collect();
+    let stale: Vec<String> = actual.difference(&expected).map(StubKey::render).collect();
     assert!(
         stale.is_empty(),
         "runtime_stub_inventory.toml has stale entries that no longer match runtime scan: {stale:?}"
@@ -271,15 +282,13 @@ fn inventory_file_line_markers_match_current_source() {
         let line = lines.get(stub.line.saturating_sub(1)).unwrap_or_else(|| {
             panic!(
                 "{} references missing line {} in {}",
-                stub.stub_id,
-                stub.line,
-                stub.file
+                stub.stub_id, stub.line, stub.file
             )
         });
 
         assert!(
             line.contains(stub.kind.marker()),
-            "{} marker mismatch at {}:{}; expected marker '{}'", 
+            "{} marker mismatch at {}:{}; expected marker '{}'",
             stub.stub_id,
             stub.file,
             stub.line,
@@ -306,7 +315,9 @@ fn parity_critical_severities_are_fully_classified() {
     let uncategorized: Vec<&RuntimeStub> = doc
         .runtime_stubs
         .iter()
-        .filter(|stub| critical_levels.contains(stub.severity.as_str()) && stub.feature_id.trim().is_empty())
+        .filter(|stub| {
+            critical_levels.contains(stub.severity.as_str()) && stub.feature_id.trim().is_empty()
+        })
         .collect();
 
     assert!(

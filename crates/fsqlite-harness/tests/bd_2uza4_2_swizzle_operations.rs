@@ -241,7 +241,7 @@ fn test_simulated_btree_traversal() {
 
     // After loading all pages, all should be available.
     for &pid in &page_ids[3..] {
-        let addr = pid as u64 * 0x100;
+        let addr = pid * 0x100;
         reg.try_swizzle(pid, addr);
     }
     assert_eq!(

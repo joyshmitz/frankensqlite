@@ -314,7 +314,7 @@ fn test_access_path_selection() {
     };
 
     // No WHERE -> full table scan
-    let path = best_access_path(&table, &[idx.clone()], &[], None);
+    let path = best_access_path(&table, std::slice::from_ref(&idx), &[], None);
     assert!(
         matches!(path.kind, AccessPathKind::FullTableScan),
         "no WHERE clause should use full table scan"
@@ -323,7 +323,7 @@ fn test_access_path_selection() {
     // WHERE user_id = ? -> index equality
     let expr = dummy_expr();
     let eq = eq_term("orders", "user_id", &expr);
-    let path = best_access_path(&table, &[idx.clone()], &[eq], None);
+    let path = best_access_path(&table, std::slice::from_ref(&idx), &[eq], None);
     assert!(
         matches!(path.kind, AccessPathKind::IndexScanEquality),
         "equality on indexed column should use index equality scan, got {:?}",
@@ -333,7 +333,7 @@ fn test_access_path_selection() {
 
     // WHERE user_id > ? -> index range scan
     let rng = range_term("orders", "user_id", &expr);
-    let path = best_access_path(&table, &[idx.clone()], &[rng], None);
+    let path = best_access_path(&table, std::slice::from_ref(&idx), &[rng], None);
     assert!(
         matches!(path.kind, AccessPathKind::IndexScanRange { .. }),
         "range on indexed column should use index range scan, got {:?}",
@@ -342,7 +342,7 @@ fn test_access_path_selection() {
 
     // Index equality should be cheaper than full scan
     let eq2 = eq_term("orders", "user_id", &expr);
-    let scan_path = best_access_path(&table, &[idx.clone()], &[], None);
+    let scan_path = best_access_path(&table, std::slice::from_ref(&idx), &[], None);
     let idx_path = best_access_path(&table, &[idx], &[eq2], None);
     assert!(
         idx_path.estimated_cost < scan_path.estimated_cost,

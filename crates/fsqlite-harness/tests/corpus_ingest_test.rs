@@ -9,12 +9,14 @@
 //! - Conformance fixture ingestion
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 
 use fsqlite_harness::corpus_ingest::{
     CORPUS_SEED_BASE, CorpusBuilder, CorpusSource, Family, classify_family, derive_entry_seed,
-    generate_seed_corpus, ingest_conformance_fixtures,
+    generate_seed_corpus, ingest_conformance_fixtures_with_report, ingest_slt_files_with_report,
 };
+use tempfile::tempdir;
 
 // ─── Family Classification Tests ─────────────────────────────────────────
 
@@ -408,16 +410,27 @@ fn ingest_conformance_fixtures_from_directory() {
     }
 
     let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
-    let count =
-        ingest_conformance_fixtures(&conformance_dir, &mut builder).expect("ingest fixtures");
+    let report = ingest_conformance_fixtures_with_report(&conformance_dir, &mut builder)
+        .expect("ingest fixtures");
 
     assert!(
-        count > 0,
-        "expected at least 1 conformance fixture, found {count}"
+        report.fixture_json_files_seen >= 8,
+        "expected at least 8 fixture JSON files, found {}",
+        report.fixture_json_files_seen
+    );
+    assert!(
+        report.fixture_entries_ingested >= 8,
+        "expected at least 8 ingested fixtures, found {}",
+        report.fixture_entries_ingested
+    );
+    assert!(
+        report.sql_statements_ingested >= 40,
+        "expected at least 40 SQL statements from fixtures, found {}",
+        report.sql_statements_ingested
     );
 
     let manifest = builder.build();
-    assert_eq!(manifest.entries.len(), count);
+    assert_eq!(manifest.entries.len(), report.fixture_entries_ingested);
 
     // All ingested fixtures should have a Fixture source.
     for entry in &manifest.entries {
@@ -429,13 +442,171 @@ fn ingest_conformance_fixtures_from_directory() {
     }
 
     eprintln!(
-        "bead_id=bd-1dp9.2.1 test=conformance_ingest count={count} families={:?}",
+        "bead_id=bd-1dp9.2.1 test=conformance_ingest files_seen={} entries={} sql={} families={:?}",
+        report.fixture_json_files_seen,
+        report.fixture_entries_ingested,
+        report.sql_statements_ingested,
         manifest
             .entries
             .iter()
             .map(|e| e.family.to_string())
             .collect::<BTreeSet<_>>()
     );
+}
+
+#[test]
+fn ingest_conformance_fixtures_reports_skipped_underspecified_files() {
+    let temp = tempdir().expect("create tempdir");
+    let dir = temp.path();
+
+    let empty_fixture = dir.join("empty.json");
+    fs::write(
+        &empty_fixture,
+        r#"{"id":"empty","description":"no sql","ops":[]}"#,
+    )
+    .expect("write empty fixture");
+
+    let valid_fixture = dir.join("valid.json");
+    fs::write(
+        &valid_fixture,
+        r#"{"id":"valid","description":"single statement","ops":[{"sql":"SELECT 1;"}]}"#,
+    )
+    .expect("write valid fixture");
+
+    let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let report =
+        ingest_conformance_fixtures_with_report(dir, &mut builder).expect("ingest fixtures");
+
+    assert_eq!(report.fixture_json_files_seen, 2);
+    assert_eq!(report.fixture_entries_ingested, 1);
+    assert_eq!(report.sql_statements_ingested, 1);
+    assert_eq!(report.skipped_files.len(), 1);
+    assert_eq!(report.skipped_files[0].file, "empty.json");
+    assert!(
+        report.skipped_files[0]
+            .reason
+            .contains("no ops[].sql statements")
+    );
+
+    let manifest = builder.build();
+    assert_eq!(manifest.entries.len(), 1);
+}
+
+#[test]
+fn ingest_slt_files_from_directory() {
+    let temp = tempdir().expect("create tempdir");
+    let dir = temp.path();
+
+    let slt = dir.join("basic.slt");
+    fs::write(
+        &slt,
+        "\
+statement ok
+CREATE TABLE t1(a INTEGER)
+
+statement ok
+INSERT INTO t1 VALUES(1)
+
+query I nosort
+SELECT a FROM t1
+----
+1
+
+halt
+",
+    )
+    .expect("write slt");
+
+    let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let report = ingest_slt_files_with_report(dir, &mut builder).expect("ingest slt");
+
+    assert_eq!(report.slt_files_seen, 1);
+    assert_eq!(report.slt_entries_ingested, 3);
+    assert_eq!(report.sql_statements_ingested, 3);
+    assert!(report.skipped_files.is_empty());
+
+    let manifest = builder.build();
+    assert_eq!(manifest.entries.len(), 1);
+    let entry = &manifest.entries[0];
+    assert!(matches!(&entry.source, CorpusSource::Slt { .. }));
+    assert_eq!(entry.statements.len(), 3);
+    assert_eq!(entry.statements[0], "CREATE TABLE t1(a INTEGER)");
+    assert_eq!(entry.statements[1], "INSERT INTO t1 VALUES(1)");
+    assert_eq!(entry.statements[2], "SELECT a FROM t1");
+}
+
+#[test]
+fn ingest_slt_files_reports_skipped_files() {
+    let temp = tempdir().expect("create tempdir");
+    let dir = temp.path();
+
+    let skipped = dir.join("empty.test");
+    fs::write(&skipped, "-- comment-only file\n# no slt directives").expect("write skipped slt");
+
+    let valid = dir.join("valid.sqllogictest");
+    fs::write(
+        &valid,
+        "\
+statement ok
+CREATE TABLE t2(v INTEGER)
+",
+    )
+    .expect("write valid slt");
+
+    let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let report = ingest_slt_files_with_report(dir, &mut builder).expect("ingest slt");
+
+    assert_eq!(report.slt_files_seen, 2);
+    assert_eq!(report.slt_entries_ingested, 1);
+    assert_eq!(report.sql_statements_ingested, 1);
+    assert_eq!(report.skipped_files.len(), 1);
+    assert_eq!(report.skipped_files[0].file, "empty.test");
+    assert!(
+        report.skipped_files[0]
+            .reason
+            .contains("no SLT entries parsed")
+    );
+}
+
+#[test]
+fn ingest_slt_files_is_deterministic() {
+    let temp = tempdir().expect("create tempdir");
+    let dir = temp.path();
+
+    fs::write(
+        dir.join("b.slt"),
+        "\
+statement ok
+CREATE TABLE b(v INTEGER)
+",
+    )
+    .expect("write b.slt");
+    fs::write(
+        dir.join("a.slt"),
+        "\
+statement ok
+CREATE TABLE a(v INTEGER)
+",
+    )
+    .expect("write a.slt");
+
+    let mut builder_left = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let left_report = ingest_slt_files_with_report(dir, &mut builder_left).expect("left ingest");
+    let left = builder_left.build();
+
+    let mut builder_right = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let right_report = ingest_slt_files_with_report(dir, &mut builder_right).expect("right ingest");
+    let right = builder_right.build();
+
+    assert_eq!(left_report, right_report);
+    assert_eq!(left.entries.len(), right.entries.len());
+    for (left_entry, right_entry) in left.entries.iter().zip(right.entries.iter()) {
+        assert_eq!(left_entry.id, right_entry.id);
+        assert_eq!(left_entry.seed, right_entry.seed);
+        assert_eq!(left_entry.family, right_entry.family);
+        assert_eq!(left_entry.statements, right_entry.statements);
+        assert_eq!(left_entry.content_hash(), right_entry.content_hash());
+    }
 }
 
 // ─── Manifest Serialization Tests ────────────────────────────────────────

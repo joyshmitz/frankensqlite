@@ -108,7 +108,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT 3.14;",
             expected_opcodes: vec!["Real", "ResultRow"],
-            validate: |_, rows| matches!(rows[0][0], SqliteValue::Float(v) if (v - 3.14).abs() < 1e-10),
+            validate: |_, rows| matches!(rows[0][0], SqliteValue::Float(v) if (v - std::f64::consts::PI).abs() < 1e-10),
         },
         OpcodeTest {
             name: "string_constant",

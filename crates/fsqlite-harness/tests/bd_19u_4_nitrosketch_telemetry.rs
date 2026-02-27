@@ -352,7 +352,7 @@ fn test_conformance_summary() {
         results.push(TestResult {
             name: "cms_no_undercount",
             pass: ok,
-            detail: format!("100 items checked"),
+            detail: "100 items checked".to_string(),
         });
     }
 

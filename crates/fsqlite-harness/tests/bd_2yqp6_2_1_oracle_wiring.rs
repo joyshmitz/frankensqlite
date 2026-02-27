@@ -1,8 +1,8 @@
 //! Oracle wiring contract tests for bd-2yqp6.2.1.
 
 use fsqlite_harness::differential_v2::{
-    run_differential, run_differential_diagnostic, CsqliteExecutor, ExecutionEnvelope,
-    FsqliteExecutor, Outcome,
+    CsqliteExecutor, ExecutionEnvelope, FsqliteExecutor, Outcome, run_differential,
+    run_differential_diagnostic,
 };
 use proptest::prelude::*;
 

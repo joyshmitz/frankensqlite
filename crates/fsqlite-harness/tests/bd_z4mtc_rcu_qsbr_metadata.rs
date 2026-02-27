@@ -462,7 +462,7 @@ fn test_read_dominated_schema_cache() {
     let writes = write_count.load(Ordering::Relaxed);
 
     // Read-dominated: should have >> 100x more reads than writes.
-    let ratio = if writes > 0 { reads / writes } else { reads };
+    let ratio = reads.checked_div(writes).unwrap_or(reads);
     assert!(
         ratio > 100,
         "read/write ratio should be > 100:1, got {ratio}:1 (reads={reads} writes={writes})"

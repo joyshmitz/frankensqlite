@@ -202,7 +202,7 @@ fn test_iterator_consistency() {
     }
 
     // iter() should visit all entries.
-    let mut visited = vec![false; 100];
+    let mut visited = [false; 100];
     for (&k, &v) in map.iter() {
         assert_eq!(v, k * k, "value mismatch for key {k}");
         visited[k as usize] = true;

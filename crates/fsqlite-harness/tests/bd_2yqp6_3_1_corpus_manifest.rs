@@ -12,7 +12,7 @@ use std::path::Path;
 
 use fsqlite::Connection;
 use fsqlite_harness::corpus_ingest::{
-    CORPUS_SEED_BASE, CorpusBuilder, generate_seed_corpus, ingest_conformance_fixtures,
+    CORPUS_SEED_BASE, CorpusBuilder, generate_seed_corpus, ingest_conformance_fixtures_with_report,
 };
 use fsqlite_types::value::SqliteValue;
 use proptest::prelude::*;
@@ -20,6 +20,9 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const BEAD_ID: &str = "bd-2yqp6.3.1";
+const MIN_FIXTURE_FILES: usize = 8;
+const MIN_FIXTURE_ENTRIES: usize = 8;
+const MIN_FIXTURE_SQL_STATEMENTS: usize = 40;
 
 #[derive(Debug, Deserialize)]
 struct CorpusManifestContract {
@@ -147,12 +150,33 @@ fn canonical_shard_hash(manifest: &CorpusManifestContract, shard: &Shard) -> Str
 fn ingest_and_normalize(base_seed: u64) -> fsqlite_harness::corpus_ingest::CorpusManifest {
     let mut builder = CorpusBuilder::new(base_seed);
     let conformance_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance");
-    ingest_conformance_fixtures(&conformance_dir, &mut builder).unwrap_or_else(|error| {
-        panic!(
-            "failed to ingest conformance fixtures from {}: {error}",
-            conformance_dir.display()
-        )
-    });
+    let report = ingest_conformance_fixtures_with_report(&conformance_dir, &mut builder)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to ingest conformance fixtures from {}: {error}",
+                conformance_dir.display()
+            )
+        });
+
+    assert!(
+        report.fixture_json_files_seen >= MIN_FIXTURE_FILES,
+        "fixture corpus too small: files_seen={} min={}",
+        report.fixture_json_files_seen,
+        MIN_FIXTURE_FILES
+    );
+    assert!(
+        report.fixture_entries_ingested >= MIN_FIXTURE_ENTRIES,
+        "fixture corpus too small: entries={} min={}",
+        report.fixture_entries_ingested,
+        MIN_FIXTURE_ENTRIES
+    );
+    assert!(
+        report.sql_statements_ingested >= MIN_FIXTURE_SQL_STATEMENTS,
+        "fixture corpus too small: sql_statements={} min={}",
+        report.sql_statements_ingested,
+        MIN_FIXTURE_SQL_STATEMENTS
+    );
+
     generate_seed_corpus(&mut builder);
     builder.build()
 }

@@ -244,10 +244,10 @@ fn timeline_events_have_replay_commands() {
     let result = query_index(&index, &QueryFilters::default());
 
     for event in &result.timeline {
-        let cmd = event.replay_command.as_ref().expect(&format!(
-            "timeline event {} must have replay command",
-            event.run_id
-        ));
+        let cmd = event
+            .replay_command
+            .as_ref()
+            .unwrap_or_else(|| panic!("timeline event {} must have replay command", event.run_id));
         assert!(
             !cmd.is_empty(),
             "replay command must be non-empty for {}",

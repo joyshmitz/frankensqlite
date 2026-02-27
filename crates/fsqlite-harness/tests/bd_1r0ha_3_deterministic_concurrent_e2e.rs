@@ -86,12 +86,8 @@ fn test_bd_1r0ha_3_unit_compliance_gate() {
     assert!((result.abort_rate() - 0.1).abs() < 1e-10);
     assert!((result.throughput() - 90.0).abs() < 1e-10);
 
-    eprintln!(
-        "DEBUG bead_id={BEAD_ID} case=unit_compliance_gate seed=42 state={state}"
-    );
-    eprintln!(
-        "INFO bead_id={BEAD_ID} case=unit_compliance_gate status=pass"
-    );
+    eprintln!("DEBUG bead_id={BEAD_ID} case=unit_compliance_gate seed=42 state={state}");
+    eprintln!("INFO bead_id={BEAD_ID} case=unit_compliance_gate status=pass");
 }
 
 // ---------------------------------------------------------------------------
@@ -322,9 +318,7 @@ fn test_e2e_10w_10r_hot_row_contention() {
                             break;
                         }
 
-                        match conn
-                            .execute("UPDATE counter SET val = val + 1 WHERE id = 1;")
-                        {
+                        match conn.execute("UPDATE counter SET val = val + 1 WHERE id = 1;") {
                             Ok(_) => {}
                             Err(e) if e.is_transient() && retry_count < MAX_RETRIES => {
                                 rollback_best_effort(&conn);
@@ -468,10 +462,7 @@ fn test_e2e_10w_10r_hot_row_contention() {
 
     // 3) Writer fairness: no writer should be completely starved.
     for (w, r) in results[..num_writers].iter().enumerate() {
-        assert!(
-            r.committed > 0,
-            "writer {w} was starved (zero commits)"
-        );
+        assert!(r.committed > 0, "writer {w} was starved (zero commits)");
     }
 
     // 4) Abort rate should be bounded (< 80% even under extreme hot-row).
@@ -526,7 +517,9 @@ fn test_e2e_deterministic_seed_schedule() {
         setup_conn
             .execute("CREATE TABLE seeded (id INTEGER PRIMARY KEY, val INTEGER);")
             .unwrap();
-        setup_conn.execute("INSERT INTO seeded VALUES (1, 0);").unwrap();
+        setup_conn
+            .execute("INSERT INTO seeded VALUES (1, 0);")
+            .unwrap();
         drop(setup_conn);
 
         let num_writers = 5;
@@ -550,7 +543,7 @@ fn test_e2e_deterministic_seed_schedule() {
                     for _ in 0..ops_per_writer {
                         state = lcg_next(state);
                         // Use deterministic jitter from seed.
-                        let jitter_us = (state % 100) as u64;
+                        let jitter_us = state % 100;
                         thread::sleep(Duration::from_micros(jitter_us));
 
                         let mut retry_count = 0;
@@ -606,7 +599,9 @@ fn test_e2e_deterministic_seed_schedule() {
 
         // Verify consistency: counter == sum of committed.
         let verify_conn = open_conn(&path_str);
-        let rows = verify_conn.query("SELECT val FROM seeded WHERE id = 1;").unwrap();
+        let rows = verify_conn
+            .query("SELECT val FROM seeded WHERE id = 1;")
+            .unwrap();
         let final_val = match rows[0].values()[0] {
             fsqlite_types::value::SqliteValue::Integer(v) => v,
             _ => panic!("expected integer"),
@@ -714,9 +709,7 @@ fn test_e2e_latency_percentile_logging() {
     // Compute and log percentiles per writer.
     for (w, mut lats) in thread_latencies {
         if lats.is_empty() {
-            eprintln!(
-                "WARN bead_id={BEAD_ID} case=latency_percentiles writer={w} no_latencies"
-            );
+            eprintln!("WARN bead_id={BEAD_ID} case=latency_percentiles writer={w} no_latencies");
             continue;
         }
         lats.sort_unstable();
@@ -732,10 +725,7 @@ fn test_e2e_latency_percentile_logging() {
         );
 
         // Latency sanity: p50 should be under 50ms for local DB operations.
-        assert!(
-            p50 < 50_000,
-            "writer {w} p50 latency too high: {p50}us"
-        );
+        assert!(p50 < 50_000, "writer {w} p50 latency too high: {p50}us");
     }
 }
 
@@ -750,8 +740,7 @@ fn test_e2e_bd_1r0ha_3_compliance() {
 
     for marker in ["DEBUG", "INFO", "WARN", "ERROR"] {
         assert!(
-            source.contains(&format!("bead_id={BEAD_ID}"))
-                || source.contains(BEAD_ID),
+            source.contains(&format!("bead_id={BEAD_ID}")) || source.contains(BEAD_ID),
             "source must reference {BEAD_ID}"
         );
         // At least DEBUG, INFO, WARN are emitted by the tests above.
@@ -770,10 +759,6 @@ fn test_e2e_bd_1r0ha_3_compliance() {
         "must have >= 4 test functions, found {test_count}"
     );
 
-    eprintln!(
-        "INFO bead_id={BEAD_ID} case=compliance test_count={test_count} status=pass"
-    );
-    eprintln!(
-        "ERROR bead_id={BEAD_ID} case=compliance_placeholder no_real_errors=true"
-    );
+    eprintln!("INFO bead_id={BEAD_ID} case=compliance test_count={test_count} status=pass");
+    eprintln!("ERROR bead_id={BEAD_ID} case=compliance_placeholder no_real_errors=true");
 }

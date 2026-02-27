@@ -7,8 +7,9 @@
 //! - Reproducibility (two runs with identical envelopes produce identical results)
 
 use fsqlite_harness::differential_v2::{
-    self, CanonicalizationRules, DifferentialResult, EngineIdentity, ExecutionEnvelope,
-    FORMAT_VERSION, FsqliteExecutor, NormalizedValue, Outcome, PragmaConfig, SqlExecutor,
+    self, CanonicalizationRules, DIFFERENTIAL_METADATA_SCHEMA_VERSION, DifferentialResult,
+    EngineIdentity, ExecutionEnvelope, FORMAT_VERSION, FsqliteExecutor, NormalizedValue, Outcome,
+    PragmaConfig, SqlExecutor,
 };
 
 /// Rusqlite executor for the C SQLite oracle.
@@ -90,7 +91,7 @@ impl SqlExecutor for FixedErrorExecutor {
 
 fn make_test_envelope(seed: u64, schema: Vec<&str>, workload: Vec<&str>) -> ExecutionEnvelope {
     ExecutionEnvelope::builder(seed)
-        .engines("0.1.0-test", "3.45.0-test")
+        .engines("0.1.0-test", "3.52.0-test")
         .schema(schema.into_iter().map(String::from))
         .workload(workload.into_iter().map(String::from))
         .build()
@@ -136,12 +137,12 @@ fn envelope_artifact_id_changes_with_schema() {
 fn envelope_artifact_id_ignores_run_id() {
     let e1 = ExecutionEnvelope::builder(42)
         .run_id("run-001")
-        .engines("0.1.0", "3.45.0")
+        .engines("0.1.0", "3.52.0")
         .workload(["SELECT 1".to_owned()])
         .build();
     let e2 = ExecutionEnvelope::builder(42)
         .run_id("run-002")
-        .engines("0.1.0", "3.45.0")
+        .engines("0.1.0", "3.52.0")
         .workload(["SELECT 1".to_owned()])
         .build();
     assert_eq!(
@@ -317,8 +318,11 @@ fn differential_result_serializes_to_json() {
 
     let json = serde_json::to_string_pretty(&result).expect("serialize result");
     assert!(json.contains("\"bead_id\""));
+    assert!(json.contains("\"target_sqlite_version\""));
+    assert!(json.contains("\"sqlite_version_contract\""));
     assert!(json.contains("\"envelope\""));
     assert!(json.contains("\"artifact_hashes\""));
+    assert!(json.contains("\"metadata\""));
     assert!(json.contains("\"outcome\""));
 
     // Verify it round-trips.
@@ -327,6 +331,19 @@ fn differential_result_serializes_to_json() {
     assert_eq!(
         r2.artifact_hashes.envelope_id,
         result.artifact_hashes.envelope_id
+    );
+    assert_eq!(r2.metadata, result.metadata);
+    assert_eq!(
+        r2.metadata.schema_version,
+        DIFFERENTIAL_METADATA_SCHEMA_VERSION
+    );
+    assert_eq!(
+        r2.target_sqlite_version,
+        differential_v2::TARGET_SQLITE_VERSION
+    );
+    assert_eq!(
+        r2.sqlite_version_contract,
+        differential_v2::SQLITE_VERSION_CONTRACT_PATH
     );
 }
 
@@ -375,6 +392,10 @@ fn builder_sets_defaults_correctly() {
     assert!(e.workload.is_empty());
     assert!(e.run_id.is_none());
     assert!(
+        !e.scenario_id.trim().is_empty(),
+        "default scenario_id must be non-empty"
+    );
+    assert!(
         !e.engines.csqlite.trim().is_empty(),
         "default csqlite version metadata must be non-empty"
     );
@@ -394,6 +415,10 @@ fn parity_rejects_empty_subject_identity_metadata() {
 
     let result = differential_v2::run_differential(&envelope, &f, &c);
     assert_eq!(result.outcome, Outcome::Error);
+    assert!(
+        result.metadata.validate().is_empty(),
+        "error metadata must still satisfy schema validator"
+    );
 }
 
 #[test]
@@ -408,6 +433,10 @@ fn parity_rejects_mismatched_reference_identity_metadata() {
 
     let result = differential_v2::run_differential(&envelope, &f, &c);
     assert_eq!(result.outcome, Outcome::Error);
+    assert!(
+        result.metadata.validate().is_empty(),
+        "error metadata must still satisfy schema validator"
+    );
 }
 
 #[test]
@@ -421,6 +450,10 @@ fn parity_rejects_empty_csqlite_version_metadata() {
 
     let result = differential_v2::run_differential(&envelope, &f, &c);
     assert_eq!(result.outcome, Outcome::Error);
+    assert!(
+        result.metadata.validate().is_empty(),
+        "error metadata must still satisfy schema validator"
+    );
 }
 
 #[test]
@@ -450,6 +483,10 @@ fn parity_rejects_non_fsqlite_subject_executor() {
 
     let result = differential_v2::run_differential(&envelope, &not_subject, &oracle);
     assert_eq!(result.outcome, Outcome::Error);
+    assert!(
+        result.metadata.validate().is_empty(),
+        "error metadata must still satisfy schema validator"
+    );
 }
 
 #[test]
@@ -460,6 +497,10 @@ fn parity_rejects_non_csqlite_reference_executor() {
 
     let result = differential_v2::run_differential(&envelope, &f, &not_oracle);
     assert_eq!(result.outcome, Outcome::Error);
+    assert!(
+        result.metadata.validate().is_empty(),
+        "error metadata must still satisfy schema validator"
+    );
 }
 
 #[test]
@@ -470,6 +511,71 @@ fn diagnostic_mode_allows_explicit_self_compare() {
 
     let result = differential_v2::run_differential_diagnostic(&envelope, &left, &right);
     assert_eq!(result.outcome, Outcome::Pass);
+}
+
+#[test]
+fn differential_result_metadata_is_populated_and_strictly_valid() {
+    let envelope = ExecutionEnvelope::builder(4242)
+        .run_id("run-metadata-4242")
+        .scenario_id("DIFF-METADATA-HAPPY-PATH")
+        .engines("0.1.0-test", "3.52.0-test")
+        .schema(["CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)".to_owned()])
+        .workload([
+            "INSERT INTO t VALUES(1, 'a')".to_owned(),
+            "SELECT * FROM t ORDER BY id".to_owned(),
+        ])
+        .build();
+    let result = run_test(&envelope);
+
+    assert_eq!(
+        result.metadata.schema_version,
+        DIFFERENTIAL_METADATA_SCHEMA_VERSION
+    );
+    assert_eq!(result.metadata.trace_id, envelope.artifact_id());
+    assert_eq!(result.metadata.run_id, "run-metadata-4242");
+    assert_eq!(result.metadata.scenario_id, "DIFF-METADATA-HAPPY-PATH");
+    assert_eq!(result.metadata.seed, envelope.seed);
+    assert_eq!(result.metadata.oracle_identity, "csqlite-oracle");
+    assert_eq!(result.metadata.oracle_version, envelope.engines.csqlite);
+    assert_eq!(result.metadata.normalized_outcome, "pass");
+    assert!(
+        result.metadata.validate().is_empty(),
+        "metadata should satisfy strict validator on happy path"
+    );
+
+    let canonical = result.metadata.to_canonical_json();
+    let decoded = differential_v2::DifferentialMetadata::from_json_strict(&canonical)
+        .expect("strict metadata decode should pass");
+    assert_eq!(decoded, result.metadata);
+}
+
+#[test]
+fn metadata_fixture_manifest_hash_is_stable_across_run_ids() {
+    let left = ExecutionEnvelope::builder(555)
+        .run_id("run-left")
+        .engines("0.1.0-test", "3.52.0-test")
+        .schema(["CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)".to_owned()])
+        .workload([
+            "INSERT INTO t VALUES(1, 10)".to_owned(),
+            "SELECT * FROM t ORDER BY id".to_owned(),
+        ])
+        .build();
+    let right = ExecutionEnvelope::builder(555)
+        .run_id("run-right")
+        .engines("0.1.0-test", "3.52.0-test")
+        .schema(["CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)".to_owned()])
+        .workload([
+            "INSERT INTO t VALUES(1, 10)".to_owned(),
+            "SELECT * FROM t ORDER BY id".to_owned(),
+        ])
+        .build();
+
+    let left_result = run_test(&left);
+    let right_result = run_test(&right);
+    assert_eq!(
+        left_result.metadata.fixture_manifest_hash, right_result.metadata.fixture_manifest_hash,
+        "fixture manifest hash should only depend on schema/workload"
+    );
 }
 
 #[test]

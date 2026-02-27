@@ -44,7 +44,7 @@ fn verification_contract_enforcement_types() {
     assert!(!ContractBeadStatus::FailMixed.is_pass());
 
     // Schema version.
-    assert!(CONTRACT_ENFORCEMENT_SCHEMA_VERSION >= 1);
+    const { assert!(CONTRACT_ENFORCEMENT_SCHEMA_VERSION >= 1) };
 
     // EnforcementDisposition variants.
     let _allowed = EnforcementDisposition::Allowed;
@@ -260,7 +260,7 @@ fn gate_config_defaults() {
     assert!(config.loss_asymmetry_ratio > 0.0);
 
     // Schema version.
-    assert!(GATE_SCHEMA_VERSION >= 1);
+    const { assert!(GATE_SCHEMA_VERSION >= 1) };
 }
 
 // ── 9. RatchetPolicy constructors ───────────────────────────────────────────
@@ -281,7 +281,7 @@ fn ratchet_policy_constructors() {
     assert!(relaxed.regression_tolerance > 0.0);
 
     // Schema version.
-    assert!(RATCHET_SCHEMA_VERSION >= 1);
+    const { assert!(RATCHET_SCHEMA_VERSION >= 1) };
 }
 
 // ── 10. RatchetState construction and waiver lifecycle ───────────────────────
