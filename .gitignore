@@ -124,7 +124,7 @@ test_meminfo
 bench_*.db
 
 # One-off test scripts at repo root
-/test_hash.rs
+/test_*.rs
 
 # Agent session ephemeral files
 SESSION_TODO.md
