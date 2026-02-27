@@ -6,6 +6,8 @@
 # 2. Validate reproducibility (byte-for-byte manifest + summary parity).
 # 3. Emit machine-readable report for CI summaries and dashboards.
 # 4. Keep lane in warning mode for semantic mismatches (exit 0/1 both accepted).
+# 5. Run oracle preflight doctor before lane execution (red => hard-fail,
+#    yellow => explicit non-certifying warning).
 #
 # Usage:
 #   ./scripts/verify_differential_ci_lane.sh [--lane smoke|expanded] [--json]
@@ -13,6 +15,7 @@
 # Env overrides:
 #   DIFF_LANE_USE_RCH=1
 #   DIFF_LANE_RUNNER_BIN=target/debug/differential_manifest_runner
+#   DIFF_DOCTOR_RUNNER_BIN=target/debug/oracle_preflight_doctor_runner
 
 set -euo pipefail
 
@@ -89,23 +92,64 @@ SUMMARY_A="${RUN_A}/differential_manifest.md"
 SUMMARY_B="${RUN_B}/differential_manifest.md"
 RUN_A_LOG="${RUN_A}/differential_manifest_runner.log"
 RUN_B_LOG="${RUN_B}/differential_manifest_runner.log"
+DOCTOR_DIR="${RUN_ROOT}/doctor"
+DOCTOR_JSON="${DOCTOR_DIR}/oracle_preflight_doctor.json"
+DOCTOR_MD="${DOCTOR_DIR}/oracle_preflight_doctor.md"
+DOCTOR_LOG="${DOCTOR_DIR}/oracle_preflight_doctor_runner.log"
 
-mkdir -p "${RUN_A}" "${RUN_B}"
+mkdir -p "${RUN_A}" "${RUN_B}" "${DOCTOR_DIR}"
 
 RUN_ID="${BEAD_ID}-${LANE_ID}-seed-${ROOT_SEED}"
 TRACE_ID="trace-$(printf '%s' "${RUN_ID}" | sha256sum | awk '{print $1}' | cut -c1-16)"
 COMMIT_SHA="$(git -C "${WORKSPACE_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
+resolve_runner_path() {
+  local candidate="$1"
+  if [[ -x "${candidate}" ]]; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+  if [[ "${candidate}" != /* ]] && [[ -x "${WORKSPACE_ROOT}/${candidate}" ]]; then
+    printf '%s\n' "${WORKSPACE_ROOT}/${candidate}"
+    return 0
+  fi
+  return 1
+}
+
 RUNNER_BIN="${DIFF_LANE_RUNNER_BIN:-}"
 RUNNER=(cargo run -p fsqlite-harness --bin differential_manifest_runner --)
 if [[ -n "${RUNNER_BIN}" ]]; then
-  if [[ ! -x "${RUNNER_BIN}" ]]; then
+  if ! RUNNER_BIN="$(resolve_runner_path "${RUNNER_BIN}")"; then
     echo "ERROR: DIFF_LANE_RUNNER_BIN is not executable: ${RUNNER_BIN}" >&2
     exit 2
   fi
   RUNNER=("${RUNNER_BIN}")
+elif [[ -n "${CARGO_TARGET_DIR:-}" ]] && RUNNER_BIN="$(resolve_runner_path "${CARGO_TARGET_DIR}/debug/differential_manifest_runner")"; then
+  RUNNER=("${RUNNER_BIN}")
+elif RUNNER_BIN="$(resolve_runner_path "/data/tmp/cargo-target/debug/differential_manifest_runner")"; then
+  RUNNER=("${RUNNER_BIN}")
+elif RUNNER_BIN="$(resolve_runner_path "target/debug/differential_manifest_runner")"; then
+  RUNNER=("${RUNNER_BIN}")
 elif [[ "${DIFF_LANE_USE_RCH:-0}" == "1" ]] && command -v rch >/dev/null 2>&1; then
   RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin differential_manifest_runner --)
+fi
+
+DOCTOR_RUNNER_BIN="${DIFF_DOCTOR_RUNNER_BIN:-}"
+DOCTOR_RUNNER=(cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner --)
+if [[ -n "${DOCTOR_RUNNER_BIN}" ]]; then
+  if ! DOCTOR_RUNNER_BIN="$(resolve_runner_path "${DOCTOR_RUNNER_BIN}")"; then
+    echo "ERROR: DIFF_DOCTOR_RUNNER_BIN is not executable: ${DOCTOR_RUNNER_BIN}" >&2
+    exit 2
+  fi
+  DOCTOR_RUNNER=("${DOCTOR_RUNNER_BIN}")
+elif [[ -n "${CARGO_TARGET_DIR:-}" ]] && DOCTOR_RUNNER_BIN="$(resolve_runner_path "${CARGO_TARGET_DIR}/debug/oracle_preflight_doctor_runner")"; then
+  DOCTOR_RUNNER=("${DOCTOR_RUNNER_BIN}")
+elif DOCTOR_RUNNER_BIN="$(resolve_runner_path "/data/tmp/cargo-target/debug/oracle_preflight_doctor_runner")"; then
+  DOCTOR_RUNNER=("${DOCTOR_RUNNER_BIN}")
+elif DOCTOR_RUNNER_BIN="$(resolve_runner_path "target/debug/oracle_preflight_doctor_runner")"; then
+  DOCTOR_RUNNER=("${DOCTOR_RUNNER_BIN}")
+elif [[ "${DIFF_LANE_USE_RCH:-0}" == "1" ]] && command -v rch >/dev/null 2>&1; then
+  DOCTOR_RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner --)
 fi
 
 COMMON_ARGS=(
@@ -144,6 +188,52 @@ run_manifest() {
 
   printf '%s' "${run_status}"
 }
+
+run_doctor() {
+  local doctor_status
+
+  set +e
+  "${DOCTOR_RUNNER[@]}" \
+    --workspace-root "${WORKSPACE_ROOT}" \
+    --fixtures-dir "${WORKSPACE_ROOT}/crates/fsqlite-harness/conformance" \
+    --fixture-manifest-path "${WORKSPACE_ROOT}/corpus_manifest.toml" \
+    --run-id "${RUN_ID}-doctor" \
+    --trace-id "${TRACE_ID}-doctor" \
+    --scenario-id "${SCENARIO_ID}-doctor" \
+    --seed "${ROOT_SEED}" \
+    --generated-unix-ms "${GENERATED_UNIX_MS}" \
+    --output-json "${DOCTOR_JSON}" \
+    --output-human "${DOCTOR_MD}" \
+    >"${DOCTOR_LOG}" 2>&1
+  doctor_status=$?
+  set -e
+
+  # 0 => green (certifying), 1 => yellow (non-certifying warning), 2 => red (blocking)
+  if [[ ${doctor_status} -eq 2 ]]; then
+    echo "ERROR: oracle preflight doctor reported red (blocking) condition (exit=${doctor_status})" >&2
+    echo "----- doctor log: ${DOCTOR_LOG} -----" >&2
+    cat "${DOCTOR_LOG}" >&2
+    exit 1
+  fi
+
+  if [[ ${doctor_status} -ne 0 && ${doctor_status} -ne 1 ]]; then
+    echo "ERROR: oracle preflight doctor failed unexpectedly (exit=${doctor_status})" >&2
+    echo "----- doctor log: ${DOCTOR_LOG} -----" >&2
+    cat "${DOCTOR_LOG}" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "${DOCTOR_JSON}" ]]; then
+    echo "ERROR: oracle preflight doctor output missing at ${DOCTOR_JSON}" >&2
+    exit 1
+  fi
+
+  printf '%s' "${doctor_status}"
+}
+
+doctor_status="$(run_doctor)"
+DOCTOR_OUTCOME="$(jq -r '.outcome' "${DOCTOR_JSON}")"
+DOCTOR_CERTIFYING="$(jq -r '.certifying' "${DOCTOR_JSON}")"
 
 run_a_status="$(run_manifest "${MANIFEST_A}" "${SUMMARY_A}" "${RUN_A_LOG}")"
 run_b_status="$(run_manifest "${MANIFEST_B}" "${SUMMARY_B}" "${RUN_B_LOG}")"
@@ -216,13 +306,13 @@ DEDUP_TOTAL_COUNT="$(jq -r '.run_report.deduplicated.total_before_dedup' "${MANI
 MISMATCH_CLASS_COUNTS="$(
   jq -c '
     .run_report.divergent_cases
-    | map(.classification // "unknown")
+    | map((.classification // "unknown") | tostring)
     | reduce .[] as $class ({}; .[$class] = ((.[$class] // 0) + 1))
   ' "${MANIFEST_A}"
 )"
 
-# Warning mode: semantic mismatches are tracked but non-blocking.
-if [[ "${run_a_status}" == "0" ]]; then
+# Warning mode: semantic mismatches and yellow preflight findings are tracked but non-blocking.
+if [[ "${run_a_status}" == "0" && "${doctor_status}" == "0" ]]; then
   LANE_OUTCOME="pass"
 else
   LANE_OUTCOME="warn"
@@ -249,6 +339,9 @@ if ${JSON_OUTPUT}; then
     --argjson generated_unix_ms "${GENERATED_UNIX_MS}" \
     --argjson run_a_exit_code "${run_a_status}" \
     --argjson run_b_exit_code "${run_b_status}" \
+    --argjson doctor_exit_code "${doctor_status}" \
+    --arg doctor_outcome "${DOCTOR_OUTCOME}" \
+    --arg doctor_certifying "${DOCTOR_CERTIFYING}" \
     --argjson deterministic_match true \
     --argjson total_cases "${TOTAL_CASES}" \
     --argjson passed_cases "${PASSED_CASES}" \
@@ -263,6 +356,9 @@ if ${JSON_OUTPUT}; then
     --arg summary_b "${SUMMARY_B#${WORKSPACE_ROOT}/}" \
     --arg runner_log_a "${RUN_A_LOG#${WORKSPACE_ROOT}/}" \
     --arg runner_log_b "${RUN_B_LOG#${WORKSPACE_ROOT}/}" \
+    --arg doctor_json "${DOCTOR_JSON#${WORKSPACE_ROOT}/}" \
+    --arg doctor_human "${DOCTOR_MD#${WORKSPACE_ROOT}/}" \
+    --arg doctor_log "${DOCTOR_LOG#${WORKSPACE_ROOT}/}" \
     --argjson promotion_criteria "$(printf '%s\n' "${PROMOTION_CRITERIA[@]}" | jq -R . | jq -s .)" \
     '
       {
@@ -281,6 +377,9 @@ if ${JSON_OUTPUT}; then
           commit_sha: $commit_sha,
           root_seed: $root_seed,
           generated_unix_ms: $generated_unix_ms,
+          doctor_exit_code: $doctor_exit_code,
+          doctor_outcome: $doctor_outcome,
+          doctor_certifying: ($doctor_certifying == "true"),
           run_a_exit_code: $run_a_exit_code,
           run_b_exit_code: $run_b_exit_code,
           deterministic_match: $deterministic_match
@@ -299,7 +398,10 @@ if ${JSON_OUTPUT}; then
           summary_a: $summary_a,
           summary_b: $summary_b,
           runner_log_a: $runner_log_a,
-          runner_log_b: $runner_log_b
+          runner_log_b: $runner_log_b,
+          doctor_json: $doctor_json,
+          doctor_human: $doctor_human,
+          doctor_log: $doctor_log
         },
         replay_command: $replay_command
       }
@@ -313,6 +415,9 @@ else
   echo "Commit SHA:           ${COMMIT_SHA}"
   echo "Root seed:            ${ROOT_SEED}"
   echo "Generated unix ms:    ${GENERATED_UNIX_MS}"
+  echo "Doctor exit code:     ${doctor_status}"
+  echo "Doctor outcome:       ${DOCTOR_OUTCOME}"
+  echo "Doctor certifying:    ${DOCTOR_CERTIFYING}"
   echo "Run A exit code:      ${run_a_status}"
   echo "Run B exit code:      ${run_b_status}"
   echo "Deterministic match:  true"
@@ -327,6 +432,8 @@ else
   echo "Manifest B:           ${MANIFEST_B#${WORKSPACE_ROOT}/}"
   echo "Runner log A:         ${RUN_A_LOG#${WORKSPACE_ROOT}/}"
   echo "Runner log B:         ${RUN_B_LOG#${WORKSPACE_ROOT}/}"
+  echo "Doctor report:        ${DOCTOR_JSON#${WORKSPACE_ROOT}/}"
+  echo "Doctor log:           ${DOCTOR_LOG#${WORKSPACE_ROOT}/}"
   echo "Promotion criteria:"
   for criterion in "${PROMOTION_CRITERIA[@]}"; do
     echo "  - ${criterion}"
