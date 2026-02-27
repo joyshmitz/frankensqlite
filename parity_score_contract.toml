@@ -1,0 +1,85 @@
+# Parity Score Contract v1.0.0
+#
+# Bead: bd-2yqp6.1.4
+# Purpose: lock the exact "100%" parity semantics and remove ambiguity in
+# score claims, exclusions, divergence handling, flaky handling, and coverage debt.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-2yqp6.1.4"
+track_id = "bd-2yqp6.1"
+generated_at = "2026-02-26"
+contract_owner = "track-a-score-owner"
+
+[formula]
+score_name = "weighted_parity_score"
+numerator = "sum(weight_i * status_weight(status_i))"
+denominator = "sum(weight_i) for status_i in included_statuses"
+result = "truncate_6dp(numerator / denominator)"
+rounding_mode = "truncate_6dp"
+included_statuses = ["pass", "fail", "partial"]
+excluded_statuses = ["excluded"]
+source_taxonomy = "parity_taxonomy.toml"
+
+[status_weights]
+pass = 1.0
+partial = 0.5
+fail = 0.0
+
+[exclusions]
+score_denominator_treatment = "excluded_features_removed_from_denominator"
+hundred_percent_treatment = "excluded_features_count_as_coverage_debt"
+require_documented_rationale = true
+
+[divergence_policy]
+open_divergences_block_hundred_percent = true
+requires_documented_intentional_divergence = true
+
+[flaky_policy]
+allow_flaky_in_hundred_percent = false
+required_stable_replays = 3
+required_pass_rate = 1.0
+
+[coverage_debt]
+definition = "coverage_debt_items = excluded_features + missing_evidence_items + invalid_evidence_items + unresolved_todo_debt_items"
+strict_hundred_percent_requires_zero = true
+
+[hundred_percent]
+required_score = 1.0
+max_fail_features = 0
+max_partial_features = 0
+max_excluded_features = 0
+max_open_divergences = 0
+max_flaky_failures = 0
+max_coverage_debt_items = 0
+
+[claim_validation]
+disallow_inequality_operators = true
+disallow_approximation_terms = true
+forbidden_terms = [
+  "about",
+  "approx",
+  "approximately",
+  "around",
+  "almost",
+  "near",
+  "close enough",
+  "mostly",
+  "partial",
+]
+required_fields = [
+  "score=",
+  "fail_features=",
+  "partial_features=",
+  "excluded_features=",
+  "open_divergences=",
+  "flaky_failures=",
+  "coverage_debt_items=",
+]
+
+[references]
+taxonomy = "parity_taxonomy.toml"
+surface_matrix = "supported_surface_matrix.toml"
+feature_ledger = "feature_universe_ledger.toml"
+verification_contract_module = "crates/fsqlite-harness/src/verification_contract_enforcement.rs"
+ratchet_policy_module = "crates/fsqlite-harness/src/ratchet_policy.rs"

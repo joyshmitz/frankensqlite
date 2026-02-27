@@ -1,0 +1,37 @@
+# Parity Release Threshold Policy v1.0.0
+#
+# Bead: bd-2yqp6.7.1
+# Purpose: enforce strict 100% release thresholds for declared supported
+# surface parity and required-suite pass rate.
+
+[meta]
+schema_version = "1.0.0"
+policy_version = "strict-100.v1"
+bead_id = "bd-2yqp6.7.1"
+track_id = "bd-2yqp6.7"
+generated_at = "2026-02-26"
+policy_owner = "track-g-cert-owner"
+
+[thresholds]
+declared_surface_parity_min = 1.0
+required_suite_pass_rate_min = 1.0
+score_engine_release_threshold = 1.0
+confidence_gate_release_threshold = 1.0
+ratchet_minimum_release_threshold = 1.0
+allow_threshold_downgrade = false
+
+[evidence]
+max_evidence_age_hours = 24
+require_fresh_evidence_for_release = true
+
+[signature]
+algorithm = "sha256"
+canonical_payload = "policy_version=strict-100.v1|declared_surface_parity_min=1.000000|required_suite_pass_rate_min=1.000000|score_engine_release_threshold=1.000000|confidence_gate_release_threshold=1.000000|ratchet_minimum_release_threshold=1.000000|allow_threshold_downgrade=false|max_evidence_age_hours=24|require_fresh_evidence_for_release=true"
+sha256 = "108b429bbc58b1c4d3b646044a1829db83b0d40ac366e9ae0f8638f3fd5c768f"
+
+[references]
+parity_score_contract = "parity_score_contract.toml"
+supported_surface_matrix = "supported_surface_matrix.toml"
+score_engine_module = "crates/fsqlite-harness/src/score_engine.rs"
+confidence_gates_module = "crates/fsqlite-harness/src/confidence_gates.rs"
+ratchet_policy_module = "crates/fsqlite-harness/src/ratchet_policy.rs"

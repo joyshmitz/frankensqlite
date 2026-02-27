@@ -1138,6 +1138,9 @@ surface. Any intentional divergence MUST be explicitly documented and
 annotated in the harness with rationale. The conformance suite runs SQL Logic
 Tests (SLT format) covering:
 
+The canonical target/version contract is pinned in
+`sqlite_version_contract.toml` and referenced by parity harness reports.
+
 - All DML and DDL operations
 - All join types (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL)
 - Subqueries, CTEs, window functions, triggers, views
@@ -2531,7 +2534,7 @@ A: SQLite's C codebase is well-engineered but carries 24 years of accumulated co
 A: **100% behavioral parity target** with C SQLite 3.52.0 for the supported
 surface, measured by running the SQLite test corpus against both implementations
 and comparing results. Any intentional divergence is documented and annotated
-with rationale.
+with rationale. The canonical contract file is `sqlite_version_contract.toml`.
 
 **Q: How does MVCC garbage collection affect latency?**
 A: The GC runs on a background thread every ~1 second. It walks version chains and frees unreachable versions. The GC never holds the WAL append mutex, so it does not block writers. The only contention point is the brief `RwLock` acquisition to read the active transaction set when computing the GC horizon.

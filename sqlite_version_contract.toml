@@ -1,0 +1,24 @@
+# SQLite Version Contract v1.0.0
+#
+# Bead: bd-2yqp6.1.3
+# Purpose: provide a single authoritative SQLite target version contract
+# consumed by runtime/harness/docs drift gates.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-2yqp6.1.3"
+track_id = "bd-2yqp6.1"
+generated_at = "2026-02-26"
+contract_owner = "track-a-version-owner"
+
+[contract]
+sqlite_target = "3.52.0"
+runtime_pragma_sqlite_version = "3.52.0"
+contract_reference_path = "sqlite_version_contract.toml"
+
+[references]
+runtime_source = "crates/fsqlite-core/src/connection.rs"
+surface_matrix = "supported_surface_matrix.toml"
+feature_ledger = "feature_universe_ledger.toml"
+parity_report_module = "crates/fsqlite-harness/src/differential_v2.rs"
+readme = "README.md"

@@ -9,6 +9,7 @@ schema_version = "1.0.0"
 bead_id = "bd-2yqp6.1.2"
 track_id = "bd-2yqp6.1"
 sqlite_target = "3.52.0"
+sqlite_version_contract = "sqlite_version_contract.toml"
 generated_at = "2026-02-26"
 contract_owner = "track-a-ledger-owner"
 
