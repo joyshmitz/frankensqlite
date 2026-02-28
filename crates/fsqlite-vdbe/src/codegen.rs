@@ -3219,12 +3219,22 @@ pub fn codegen_insert(
             }
             let rec_reg = b.alloc_reg();
             emit_strict_type_check(b, table, col_regs);
+            // Apply column type affinities before packing the record.
+            let aff_str = table.affinity_string();
+            b.emit_op(
+                Opcode::Affinity,
+                col_regs,
+                n_cols,
+                0,
+                P4::Affinity(aff_str.clone()),
+                0,
+            );
             b.emit_op(
                 Opcode::MakeRecord,
                 col_regs,
                 n_cols,
                 rec_reg,
-                P4::Affinity(table.affinity_string()),
+                P4::Affinity(aff_str),
                 0,
             );
             b.emit_op(
@@ -3485,7 +3495,8 @@ fn codegen_insert_select(
     };
 
     let src_table = find_table(schema, src_table_name)?;
-    let read_cursor = write_cursor + 1;
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let read_cursor = write_cursor + 1 + target_table.indexes.len() as i32;
 
     // Determine the number of output columns from the SELECT.
     let n_cols = result_column_count(columns, src_table);
@@ -3844,15 +3855,25 @@ pub fn codegen_update(
 
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, table, col_regs);
+    // Apply column type affinities before packing the record.
+    let aff_str = table.affinity_string();
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let n_cols_i32 = n_cols as i32;
+    b.emit_op(
+        Opcode::Affinity,
+        col_regs,
+        n_cols_i32,
+        0,
+        P4::Affinity(aff_str.clone()),
+        0,
+    );
     b.emit_op(
         Opcode::MakeRecord,
         col_regs,
         n_cols_i32,
         rec_reg,
-        P4::Affinity(table.affinity_string()),
+        P4::Affinity(aff_str),
         0,
     );
 
@@ -6502,14 +6523,18 @@ fn emit_expr_with_fallback(
 
 /// Check if a column reference resolves in a given scan context.
 fn resolve_column_in_ctx(col_ref: &ColumnRef, ctx: &ScanCtx<'_>) -> Option<usize> {
-    // Qualified: table.column
+    // Qualified: table.column (case-insensitive per SQL standard)
     if let Some(ref table_name) = col_ref.table {
-        if table_name == &ctx.table.name || ctx.table_alias == Some(table_name.as_str()) {
+        let table_match = table_name.eq_ignore_ascii_case(&ctx.table.name)
+            || ctx
+                .table_alias
+                .is_some_and(|alias| table_name.eq_ignore_ascii_case(alias));
+        if table_match {
             return ctx
                 .table
                 .columns
                 .iter()
-                .position(|c| c.name == col_ref.column);
+                .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column));
         }
         return None;
     }
@@ -6517,7 +6542,7 @@ fn resolve_column_in_ctx(col_ref: &ColumnRef, ctx: &ScanCtx<'_>) -> Option<usize
     ctx.table
         .columns
         .iter()
-        .position(|c| c.name == col_ref.column)
+        .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
 }
 
 /// Map an AST `BinaryOp` to the corresponding VDBE opcode.

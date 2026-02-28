@@ -874,7 +874,20 @@ impl ScalarFunction for QuoteFunc {
         let result = match &args[0] {
             SqliteValue::Null => "NULL".to_owned(),
             SqliteValue::Integer(i) => i.to_string(),
-            SqliteValue::Float(f) => format!("{f}"),
+            SqliteValue::Float(f) => {
+                let s = format!("{f}");
+                // C SQLite always includes a decimal point for floats.
+                if s.contains('.')
+                    || s.contains('e')
+                    || s.contains('E')
+                    || s.contains("inf")
+                    || s.contains("nan")
+                {
+                    s
+                } else {
+                    format!("{s}.0")
+                }
+            }
             SqliteValue::Text(s) => {
                 let escaped = s.replace('\'', "''");
                 format!("'{escaped}'")
@@ -1012,7 +1025,7 @@ impl ScalarFunction for SubstrFunc {
         let length = if has_length {
             args[2].to_integer()
         } else {
-            char_count + 1
+            1_000_000_000
         };
 
         // SQLite substr semantics:
@@ -1077,7 +1090,7 @@ impl SubstrFunc {
         let length = if has_length {
             args[2].to_integer()
         } else {
-            blob_len + 1
+            1_000_000_000
         };
 
         if length < 0 {
@@ -1606,7 +1619,12 @@ impl ScalarFunction for UnistrFunc {
         let mut i = 0;
         while i < chars.len() {
             if chars[i] == '\\' && i + 1 < chars.len() {
-                if chars[i + 1] == 'u' && i + 5 < chars.len() {
+                // C SQLite: \\ is an escaped backslash literal.
+                if chars[i + 1] == '\\' {
+                    result.push('\\');
+                    i += 2;
+                    continue;
+                } else if chars[i + 1] == 'u' && i + 5 < chars.len() {
                     // \uXXXX
                     let hex: String = chars[i + 2..i + 6].iter().collect();
                     if let Ok(cp) = u32::from_str_radix(&hex, 16) {
@@ -1950,26 +1968,28 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
                 param_idx += 1;
                 let prec = precision.unwrap_or(6);
-                let formatted = if spec == 'e' {
+                let raw = if spec == 'e' {
                     format!("{val:.prec$e}")
                 } else {
                     format!("{val:.prec$E}")
                 };
+                // C printf always uses explicit sign and minimum 2-digit exponent
+                let formatted = normalize_exponent(&raw);
                 result.push_str(&pad_string(&formatted, width, left_align));
             }
             'g' | 'G' => {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
                 param_idx += 1;
-                let _prec = precision.unwrap_or(6);
-                // Use shorter of %f and %e
-                let formatted = format!("{val}");
+                let prec = precision.unwrap_or(6);
+                let sig = prec.max(1);
+                let formatted = format_float_g(val, sig, spec == 'G');
                 result.push_str(&pad_string(&formatted, width, left_align));
             }
             's' | 'z' => {
                 let param = params.get(param_idx);
                 param_idx += 1;
                 let val = match param {
-                    Some(SqliteValue::Null) | None => "(null)".to_owned(),
+                    Some(SqliteValue::Null) | None => String::new(),
                     Some(v) => v.to_text(),
                 };
                 let truncated = if let Some(prec) = precision {
@@ -1980,11 +2000,11 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 result.push_str(&pad_string(&truncated, width, left_align));
             }
             'q' => {
-                // Single-quote escaping; NULL → literal "NULL" (no quotes)
+                // Single-quote escaping; NULL → literal "(NULL)" (C SQLite convention)
                 let param = params.get(param_idx);
                 param_idx += 1;
                 match param {
-                    Some(SqliteValue::Null) | None => result.push_str("NULL"),
+                    Some(SqliteValue::Null) | None => result.push_str("(NULL)"),
                     Some(v) => {
                         let val = v.to_text();
                         let escaped = val.replace('\'', "''");
@@ -2008,16 +2028,18 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 }
             }
             'w' => {
-                // Double-quote escaping for identifiers
-                let val = params
-                    .get(param_idx)
-                    .map(SqliteValue::to_text)
-                    .unwrap_or_default();
+                // Double-quote escaping for identifiers; NULL → "(NULL)"
+                let param = params.get(param_idx);
                 param_idx += 1;
-                let escaped = val.replace('"', "\"\"");
-                result.push('"');
-                result.push_str(&escaped);
-                result.push('"');
+                if matches!(param, Some(SqliteValue::Null) | None) {
+                    result.push_str("(NULL)");
+                } else {
+                    let val = param.map(SqliteValue::to_text).unwrap_or_default();
+                    let escaped = val.replace('"', "\"\"");
+                    result.push('"');
+                    result.push_str(&escaped);
+                    result.push('"');
+                }
             }
             'x' | 'X' => {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
@@ -2146,7 +2168,68 @@ fn pad_string(s: &str, width: usize, left_align: bool) -> String {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
+/// Normalize an exponent string to match C printf: explicit sign and
+/// minimum two digits (e.g. `"1.23e6"` → `"1.23e+06"`).
+fn normalize_exponent(s: &str) -> String {
+    let (prefix, e_char, exp_part) = if let Some(pos) = s.find('e') {
+        (&s[..pos], 'e', &s[pos + 1..])
+    } else if let Some(pos) = s.find('E') {
+        (&s[..pos], 'E', &s[pos + 1..])
+    } else {
+        return s.to_owned();
+    };
+    let (sign, digits) = if let Some(rest) = exp_part.strip_prefix('-') {
+        ("-", rest)
+    } else if let Some(rest) = exp_part.strip_prefix('+') {
+        ("+", rest)
+    } else {
+        ("+", exp_part)
+    };
+    let padded = if digits.len() < 2 {
+        format!("0{digits}")
+    } else {
+        digits.to_owned()
+    };
+    format!("{prefix}{e_char}{sign}{padded}")
+}
+
+/// Format a float using `%g`/`%G` semantics.
+fn format_float_g(val: f64, sig: usize, upper: bool) -> String {
+    if !val.is_finite() {
+        return format!("{val}");
+    }
+    let e_str = format!("{val:.prec$e}", prec = sig.saturating_sub(1));
+    let exp: i32 = e_str
+        .rsplit_once('e')
+        .and_then(|(_, e)| e.parse().ok())
+        .unwrap_or(0);
+    #[allow(clippy::cast_possible_wrap)]
+    let formatted = if exp < -4 || exp >= sig as i32 {
+        let s = format!("{val:.prec$e}", prec = sig.saturating_sub(1));
+        let s = if upper { s.replace('e', "E") } else { s };
+        // Strip trailing zeros from mantissa, then normalize the exponent.
+        let trimmed = if s.contains('.') {
+            if let Some(e_pos) = s.find('e').or_else(|| s.find('E')) {
+                let mantissa = s[..e_pos].trim_end_matches('0').trim_end_matches('.');
+                format!("{mantissa}{}", &s[e_pos..])
+            } else {
+                s.trim_end_matches('0').trim_end_matches('.').to_owned()
+            }
+        } else {
+            s
+        };
+        normalize_exponent(&trimmed)
+    } else {
+        let decimal_places = if exp >= 0 {
+            sig.saturating_sub((exp + 1) as usize)
+        } else {
+            sig + exp.unsigned_abs() as usize - 1
+        };
+        let s = format!("{val:.decimal_places$}");
+        s.trim_end_matches('0').trim_end_matches('.').to_owned()
+    };
+    formatted
+}
 
 #[cfg(test)]
 #[allow(clippy::too_many_lines)]
