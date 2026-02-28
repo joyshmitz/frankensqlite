@@ -317,6 +317,16 @@ impl WalFecGroupMeta {
         let k_source_usize = usize::try_from(k_source).map_err(|_| FrankenError::WalCorrupt {
             detail: format!("k_source {k_source} does not fit in usize"),
         })?;
+
+        // Prevent OOM panics from maliciously large k_source values by ensuring
+        // the buffer actually contains enough bytes for the arrays (4 bytes for pgno, 16 for hash).
+        let required_array_bytes = k_source_usize.saturating_mul(20);
+        if bytes.len().saturating_sub(cursor) < required_array_bytes {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!("k_source {} exceeds remaining buffer", k_source),
+            });
+        }
+
         let mut page_numbers = Vec::with_capacity(k_source_usize);
         for _ in 0..k_source_usize {
             page_numbers.push(read_u32_le(bytes, &mut cursor, "page_number")?);
@@ -2030,12 +2040,21 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
             break;
         };
         let meta = WalFecGroupMeta::from_record_bytes(meta_bytes)?;
-        let mut repair_symbols =
-            Vec::with_capacity(usize::try_from(meta.r_repair).map_err(|_| {
-                FrankenError::WalCorrupt {
-                    detail: format!("r_repair {} does not fit in usize", meta.r_repair),
-                }
-            })?);
+        let r_repair_usize = usize::try_from(meta.r_repair).map_err(|_| {
+            FrankenError::WalCorrupt {
+                detail: format!("r_repair {} does not fit in usize", meta.r_repair),
+            }
+        })?;
+
+        // Prevent OOM panics from maliciously large r_repair values.
+        // Each repair symbol requires at least 4 bytes for its length prefix.
+        if bytes.len().saturating_sub(cursor) < r_repair_usize.saturating_mul(4) {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!("r_repair {} exceeds remaining buffer", meta.r_repair),
+            });
+        }
+
+        let mut repair_symbols = Vec::with_capacity(r_repair_usize);
 
         for _ in 0..meta.r_repair {
             let Some(symbol_bytes) = read_length_prefixed(&bytes, &mut cursor)? else {

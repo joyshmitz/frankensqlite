@@ -2032,6 +2032,7 @@ impl VdbeEngine {
             cursor_root_pages: HashMap::new(),
             vtab_cursors: SwissIndex::new(),
             vtab_instances: SwissIndex::new(),
+            time_travel_cursors: HashMap::new(),
         }
     }
 
@@ -2043,6 +2044,16 @@ impl VdbeEngine {
     /// Returns the rowid of the last INSERT operation.
     pub fn last_insert_rowid(&self) -> i64 {
         self.last_insert_rowid
+    }
+
+    /// Returns the time-travel marker for a cursor, if any.
+    pub fn time_travel_marker(&self, cursor_id: i32) -> Option<&TimeTravelMarker> {
+        self.time_travel_cursors.get(&cursor_id)
+    }
+
+    /// Returns all time-travel cursor mappings.
+    pub fn time_travel_cursors(&self) -> &HashMap<i32, TimeTravelMarker> {
+        &self.time_travel_cursors
     }
 
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).

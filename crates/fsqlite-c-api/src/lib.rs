@@ -392,16 +392,25 @@ pub unsafe extern "C" fn sqlite3_free(ptr: *mut c_void) {
 // Thin wrappers around libc malloc/free so we don't depend on the libc crate
 // directly (it's in the workspace via nix but we keep the surface minimal).
 unsafe fn libc_malloc(size: usize) -> *mut u8 {
-    let layout = std::alloc::Layout::from_size_align(size, 1).expect("valid layout");
-    std::alloc::alloc(layout)
+    // std::alloc requires the exact Layout for deallocation. Since sqlite3_free
+    // doesn't receive the size, we must prefix the allocation with its size.
+    let layout = std::alloc::Layout::from_size_align(size + 8, 8).expect("valid layout");
+    let ptr = std::alloc::alloc(layout);
+    if ptr.is_null() {
+        return ptr;
+    }
+    ptr.cast::<usize>().write(size);
+    ptr.add(8)
 }
 
 unsafe fn libc_free(ptr: *mut c_void) {
-    // We allocated with align=1, but we don't know the size. Use a 1-byte
-    // dealloc — this is correct for global allocator since the allocator
-    // tracks the actual allocation size internally.
-    let layout = std::alloc::Layout::from_size_align(1, 1).expect("valid layout");
-    std::alloc::dealloc(ptr.cast(), layout);
+    if ptr.is_null() {
+        return;
+    }
+    let real_ptr = ptr.cast::<u8>().sub(8);
+    let size = real_ptr.cast::<usize>().read();
+    let layout = std::alloc::Layout::from_size_align(size + 8, 8).expect("valid layout");
+    std::alloc::dealloc(real_ptr, layout);
 }
 
 // ── sqlite3_prepare_v2 ─────────────────────────────────────────────

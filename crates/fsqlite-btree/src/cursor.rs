@@ -1547,7 +1547,110 @@ impl<P: PageWriter> BtCursor<P> {
     ///
     /// Does NOT trigger rebalancing — the caller is responsible for that.
     /// Returns the page number of the leaf and its new cell count.
-    fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
+    
+    fn replace_interior_cell(&mut self, cx: &Cx, new_payload: &[u8]) -> Result<()> {
+        let depth = self.stack.len();
+        let top = self.stack[depth - 1].clone();
+        let page_no = top.page_no;
+        let cell_idx = top.cell_idx;
+        
+        let cell_ref = self.parse_cell_at(&top, cell_idx)?;
+        let left_child = cell_ref.left_child.unwrap();
+        
+        // Encode the new cell
+        let mut new_cell = Vec::new();
+        new_cell.extend_from_slice(&left_child.get().to_be_bytes());
+        
+        let payload_size = u32::try_from(new_payload.len()).map_err(|_| FrankenError::TooBig)?;
+        let mut varint = [0u8; 9];
+        let p_len = write_varint(&mut varint, u64::from(payload_size));
+        new_cell.extend_from_slice(&varint[..p_len]);
+        
+        let local_size = cell::local_payload_size(
+            payload_size,
+            self.usable_size,
+            top.header.page_type,
+        ) as usize;
+        let local_size = local_size.min(new_payload.len());
+        
+        new_cell.extend_from_slice(&new_payload[..local_size]);
+        let overflow_head = if local_size < new_payload.len() {
+            let first_overflow = self.write_overflow_chain_for_insert(cx, &new_payload[local_size..])?;
+            new_cell.extend_from_slice(&first_overflow.get().to_be_bytes());
+            Some(first_overflow)
+        } else {
+            None
+        };
+        
+        // Remove old cell from page and try to insert new cell
+        let mut page_data = self.pager.read_page(cx, page_no)?;
+        let header_offset = cell::header_offset_for_page(page_no);
+        let mut header = BtreePageHeader::parse(&page_data, header_offset)?;
+        let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
+        
+        let old_overflow = cell_ref.overflow_page;
+        ptrs.remove(cell_idx as usize);
+        
+        // Defragment
+        let mut new_content_offset = self.usable_size as usize;
+        let old_page_data = page_data.clone();
+        let ptr_array_end = header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
+        
+        for ptr_mut in &mut ptrs {
+            let ptr = *ptr_mut as usize;
+            let c = CellRef::parse(&old_page_data, ptr, header.page_type, self.usable_size)?;
+            let size = crate::payload::cell_on_page_size(&c, ptr);
+            new_content_offset -= size;
+            page_data[new_content_offset..new_content_offset + size].copy_from_slice(&old_page_data[ptr..ptr + size]);
+            *ptr_mut = new_content_offset as u16;
+        }
+        
+        // Check if new cell fits
+        let ptr_array_end_with_new = ptr_array_end + 2;
+        if new_content_offset >= ptr_array_end_with_new + new_cell.len() {
+            // It fits!
+            new_content_offset -= new_cell.len();
+            page_data[new_content_offset..new_content_offset + new_cell.len()].copy_from_slice(&new_cell);
+            ptrs.insert(cell_idx as usize, new_content_offset as u16);
+            
+            header.cell_count = ptrs.len() as u16;
+            header.cell_content_offset = new_content_offset as u32;
+            header.write(&mut page_data, header_offset);
+            cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
+            
+            self.pager.write_page(cx, page_no, &page_data)?;
+            
+            if let Some(first) = old_overflow {
+                self.free_overflow_chain(cx, first)?;
+            }
+            
+            return Ok(());
+        }
+        
+        // It does not fit. We must balance!
+        header.cell_count = ptrs.len() as u16;
+        header.cell_content_offset = new_content_offset as u32;
+        header.write(&mut page_data, header_offset);
+        cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
+        self.pager.write_page(cx, page_no, &page_data)?;
+        
+        self.stack.truncate(depth);
+        let res = self.balance_for_insert(cx, &new_cell, cell_idx);
+        
+        if res.is_ok() {
+            if let Some(first) = old_overflow {
+                self.free_overflow_chain(cx, first)?;
+            }
+        } else {
+            if let Some(first) = overflow_head {
+                let _ = self.free_overflow_chain(cx, first);
+            }
+        }
+        
+        res
+    }
+
+fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
         let depth = self.stack.len();
         if depth == 0 || self.at_eof {
             return Err(FrankenError::internal("cursor at EOF during remove"));
@@ -1880,9 +1983,49 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             let top = cursor
                 .stack
                 .last()
-                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
+                .clone();
+                
             if !top.header.page_type.is_leaf() {
-                return Err(FrankenError::internal("cursor must be on a leaf to delete"));
+                // Interior node deletion (index B-trees).
+                // 1. Save the original key we want to delete.
+                let original_key = cursor.payload(cx)?;
+                
+                // 2. Advance to the successor. It is guaranteed to be on a leaf.
+                let advanced = cursor.advance_next(cx)?;
+                if !advanced || cursor.at_eof {
+                    return Err(FrankenError::DatabaseCorrupt { detail: "no successor for interior node".to_owned() });
+                }
+                
+                // 3. Save the successor's payload.
+                let successor_key = cursor.payload(cx)?;
+                
+                // 4. Delete the successor from the leaf.
+                let (_leaf_pgno, new_count) = cursor.remove_cell_from_leaf(cx)?;
+                if new_count == 0 {
+                    cursor.balance_for_delete(cx)?;
+                }
+                
+                // 5. Re-seek the original key. The tree might have rebalanced, moving the target cell.
+                let seek_res = cursor.index_seek(cx, &original_key)?;
+                if !seek_res.is_found() {
+                    return Err(FrankenError::DatabaseCorrupt { detail: "original key disappeared during interior delete".to_owned() });
+                }
+                
+                // 6. We are now pointing to the original cell again.
+                // If it became a leaf due to root collapse, we just delete it from the leaf!
+                let top_after = cursor.stack.last().unwrap().clone();
+                if top_after.header.page_type.is_leaf() {
+                    let (_leaf_pgno, new_count) = cursor.remove_cell_from_leaf(cx)?;
+                    if new_count == 0 {
+                        cursor.balance_for_delete(cx)?;
+                    }
+                    return Ok(());
+                }
+                
+                // 7. It is still an interior cell. Replace it with the successor payload.
+                cursor.replace_interior_cell(cx, &successor_key)?;
+                return Ok(());
             }
 
             // If the leaf is about to become empty (and it's not the root),
@@ -1935,8 +2078,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             Ok(())
         })
     }
-
-    fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
+fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
         }

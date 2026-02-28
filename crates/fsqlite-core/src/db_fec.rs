@@ -417,7 +417,9 @@ impl DbFecGroupMeta {
     /// Serialized size for a group with the given `group_size`.
     #[must_use]
     pub fn serialized_size_for(group_size: u32) -> usize {
-        Self::FIXED_SIZE + group_size as usize * 16
+        (group_size as usize)
+            .saturating_mul(16)
+            .saturating_add(Self::FIXED_SIZE)
     }
 
     /// Serialize to bytes.
@@ -1179,11 +1181,19 @@ pub fn read_db_fec_group_for_page(
     let meta = DbFecGroupMeta::from_bytes(&sidecar_data[seg_offset..meta_end])?;
 
     let actual_r = meta.r_repair;
+    let actual_meta_size = meta.serialized_size();
+    let mut sym_cursor = seg_offset + actual_meta_size;
+
+    // Defend against OOM from malicious r_repair values.
+    let needed_repair_bytes = (actual_r as usize).saturating_mul(ps);
+    if sym_cursor.saturating_add(needed_repair_bytes) > sidecar_data.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("sidecar too short for {} repair symbols", actual_r),
+        });
+    }
 
     // Read repair symbols.
     let mut symbols = Vec::with_capacity(actual_r as usize);
-    let actual_meta_size = meta.serialized_size();
-    let mut sym_cursor = seg_offset + actual_meta_size;
     for r_idx in 0..actual_r {
         if sym_cursor + ps > sidecar_data.len() {
             return Err(FrankenError::DatabaseCorrupt {

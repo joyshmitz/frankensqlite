@@ -2938,7 +2938,6 @@ impl Connection {
                     post_distinct_limit: if distinct { limit_clause } else { None },
                     schema_cookie: self.schema_cookie(),
                     root_cx: self.root_cx.clone(),
-                    schemas: self.schema.borrow().clone(),
                 })
             }
             _ => Err(FrankenError::NotImplemented(
