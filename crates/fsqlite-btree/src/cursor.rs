@@ -1472,7 +1472,7 @@ impl<P: PageWriter> BtCursor<P> {
             let parent_is_root = parent_page_no == self.root_page;
 
             self.note_merge_event();
-            let outcome = balance::balance_nonroot(
+            let mut outcome = balance::balance_nonroot(
                 cx,
                 &mut self.pager,
                 parent_page_no,
@@ -1482,10 +1482,39 @@ impl<P: PageWriter> BtCursor<P> {
                 self.usable_size,
                 parent_is_root,
             )?;
-            if matches!(outcome, balance::BalanceResult::Split { .. }) {
-                return Err(FrankenError::internal(
-                    "delete balance unexpectedly returned split requiring parent update",
-                ));
+
+            // If balancing split the parent page, propagate the split up the
+            // cursor stack by updating each ancestor in turn.
+            let mut split_level = level;
+            while let balance::BalanceResult::Split {
+                new_pgnos,
+                new_dividers,
+            } = outcome
+            {
+                self.note_split_event();
+                if split_level == 0 {
+                    return Err(FrankenError::internal(
+                        "balance split bubbled above root (unexpected)",
+                    ));
+                }
+
+                let ancestor_page_no = self.stack[split_level - 1].page_no;
+                let ancestor_child_idx = self.stack[split_level - 1].cell_idx as usize;
+                let ancestor_is_root = ancestor_page_no == self.root_page;
+
+                outcome = balance::apply_child_replacement(
+                    cx,
+                    &mut self.pager,
+                    ancestor_page_no,
+                    self.usable_size,
+                    ancestor_child_idx,
+                    1, // Replacing a single child page with its split siblings.
+                    &new_pgnos,
+                    &new_dividers,
+                    ancestor_is_root,
+                )?;
+
+                split_level -= 1;
             }
 
             // If we just balanced at the root level, we are done.

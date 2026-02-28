@@ -625,7 +625,11 @@ pub fn encode_changeset(page_size: u32, pages: &mut [PageEntry]) -> Result<Vec<u
         total_len,
     };
 
-    let mut buf = Vec::with_capacity(usize::try_from(total_len).unwrap_or(usize::MAX));
+    let buf_cap = usize::try_from(total_len).map_err(|_| FrankenError::OutOfRange {
+        what: "changeset total_len".to_owned(),
+        value: total_len.to_string(),
+    })?;
+    let mut buf = Vec::with_capacity(buf_cap);
     buf.extend_from_slice(&header.to_bytes());
 
     for page in pages.iter() {
@@ -713,8 +717,15 @@ pub fn shard_changeset(changeset_bytes: Vec<u8>, symbol_size: u16) -> Result<Vec
         "sharding large changeset"
     );
 
-    let mut shards = Vec::with_capacity(usize::try_from(n_shards).unwrap_or(256));
-    let max_chunk_usize = usize::try_from(max_chunk).unwrap_or(usize::MAX);
+    let n_shards_usize = usize::try_from(n_shards).map_err(|_| FrankenError::OutOfRange {
+        what: "n_shards".to_owned(),
+        value: n_shards.to_string(),
+    })?;
+    let mut shards = Vec::with_capacity(n_shards_usize);
+    let max_chunk_usize = usize::try_from(max_chunk).map_err(|_| FrankenError::OutOfRange {
+        what: "max_chunk".to_owned(),
+        value: max_chunk.to_string(),
+    })?;
 
     for (i, chunk) in changeset_bytes.chunks(max_chunk_usize).enumerate() {
         let shard_bytes = chunk.to_vec();

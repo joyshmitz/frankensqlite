@@ -32,7 +32,7 @@ const BEAD_ID: &str = "bd-1hi.15";
 #[derive(Debug, Clone)]
 pub struct BlockResumeState {
     /// Source block index (SBN).
-    pub block_id: u8,
+    pub block_id: u32,
     /// Number of unique symbols received.
     pub num_received: u32,
     /// Set of received ISIs (for O(1) dedup).
@@ -44,7 +44,7 @@ pub struct BlockResumeState {
 impl BlockResumeState {
     /// Create a new empty resume state for a block.
     #[must_use]
-    fn new(block_id: u8) -> Self {
+    fn new(block_id: u32) -> Self {
         Self {
             block_id,
             num_received: 0,
@@ -65,12 +65,12 @@ impl BlockResumeState {
 
     /// Serialize to a compact binary format for persistence.
     ///
-    /// Format: `block_id(1) | num_received(4 LE) | decoded(1) | n_isis(4 LE) | isis(4 LE each)`
+    /// Format: `block_id(4 LE) | num_received(4 LE) | decoded(1) | n_isis(4 LE) | isis(4 LE each)`
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let n = self.received_isis.len();
-        let mut buf = Vec::with_capacity(10 + n * 4);
-        buf.push(self.block_id);
+        let mut buf = Vec::with_capacity(13 + n * 4);
+        buf.extend_from_slice(&self.block_id.to_le_bytes());
         buf.extend_from_slice(&self.num_received.to_le_bytes());
         buf.push(u8::from(self.decoded));
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
@@ -89,19 +89,19 @@ impl BlockResumeState {
     ///
     /// Returns error if buffer is too short or malformed.
     pub fn from_bytes(buf: &[u8]) -> Result<(Self, usize)> {
-        if buf.len() < 10 {
+        if buf.len() < 13 {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("BlockResumeState too short: {} < 10", buf.len()),
+                detail: format!("BlockResumeState too short: {} < 13", buf.len()),
             });
         }
-        let block_id = buf[0];
-        let num_received = u32::from_le_bytes(buf[1..5].try_into().expect("4 bytes"));
-        let decoded = buf[5] != 0;
-        let n_isis = u32::from_le_bytes(buf[6..10].try_into().expect("4 bytes"));
+        let block_id = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes"));
+        let num_received = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
+        let decoded = buf[8] != 0;
+        let n_isis = u32::from_le_bytes(buf[9..13].try_into().expect("4 bytes"));
         let n = n_isis as usize;
         let expected = n
             .checked_mul(4)
-            .and_then(|v| v.checked_add(10))
+            .and_then(|v| v.checked_add(13))
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!("BlockResumeState n_isis ({n_isis}) causes size overflow"),
             })?;
@@ -112,7 +112,7 @@ impl BlockResumeState {
         }
         let mut received_isis = HashSet::with_capacity(n);
         for i in 0..n {
-            let offset = 10 + i * 4;
+            let offset = 13 + i * 4;
             let isi = u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("4 bytes"));
             received_isis.insert(isi);
         }
@@ -141,9 +141,7 @@ impl ResumeState {
     /// Create a new resume state for a snapshot with `total_blocks` blocks.
     #[must_use]
     pub fn new(total_blocks: u32) -> Self {
-        let blocks = (0..total_blocks)
-            .map(|i| BlockResumeState::new(u8::try_from(i).unwrap_or(u8::MAX)))
-            .collect();
+        let blocks = (0..total_blocks).map(BlockResumeState::new).collect();
         Self {
             blocks,
             total_blocks,
@@ -433,7 +431,7 @@ pub enum SnapshotReceiverState {
 #[derive(Debug, Clone)]
 pub struct DecodedBlock {
     /// Block index.
-    pub block_index: u8,
+    pub block_index: u32,
     /// Decoded pages sorted by page number.
     pub pages: Vec<DecodedBlockPage>,
 }
@@ -734,7 +732,7 @@ impl SnapshotReceiver {
             if let Some(padded) = decoder.try_decode() {
                 match parse_decoded_snapshot_block(&padded, self.page_size) {
                     Ok(pages) => {
-                        let block_id = u8::try_from(block_idx).unwrap_or(u8::MAX);
+                        let block_id = u32::try_from(block_idx).unwrap_or(u32::MAX);
                         decoder.decoded = true;
                         if block_idx < self.resume.blocks.len() {
                             self.resume.blocks[block_idx].decoded = true;
@@ -789,7 +787,7 @@ pub enum SnapshotPacketResult {
     /// Duplicate ISI, ignored.
     Duplicate,
     /// A source block was fully decoded (progressive).
-    BlockDecoded(u8),
+    BlockDecoded(u32),
     /// This block was already decoded.
     BlockAlreadyDecoded,
     /// Packet rejected (no available block slot or already complete).

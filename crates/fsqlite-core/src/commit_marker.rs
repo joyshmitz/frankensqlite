@@ -466,12 +466,14 @@ pub fn check_segment_integrity(segment_data: &[u8]) -> Result<u64, MarkerError> 
     let complete_u64 = complete_records as u64;
 
     if trailing > 0 || valid < complete_u64 {
-        let valid_usize = usize::try_from(valid).unwrap_or(usize::MAX);
+        let valid_usize = recovered.len();
         return Err(MarkerError::TornTail {
             complete_records: valid,
             trailing_bytes: if valid < complete_u64 {
                 // Corruption mid-stream: remaining bytes from corrupt record onward.
-                record_region.len() - (valid_usize * COMMIT_MARKER_RECORD_BYTES)
+                record_region
+                    .len()
+                    .saturating_sub(valid_usize.saturating_mul(COMMIT_MARKER_RECORD_BYTES))
             } else {
                 trailing
             },

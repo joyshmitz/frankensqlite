@@ -246,28 +246,47 @@ impl Scope {
         }
 
         // Unqualified: search all aliases in this scope.
-        let mut matches = Vec::new();
+        let mut known_matches = Vec::new();
+        let mut unknown_matches = Vec::new();
+
         for (alias, cols) in &self.columns {
-            if cols.as_ref().is_none_or(|c| c.contains(&col_lower)) {
-                matches.push(alias.clone());
+            match cols {
+                Some(c) if c.contains(&col_lower) => known_matches.push(alias.clone()),
+                None => unknown_matches.push(alias.clone()),
+                _ => {}
             }
         }
 
-        match matches.len() {
-            0 => {
-                // Check parent scope.
-                if let Some(ref parent) = self.parent {
-                    return parent.resolve_column(None, column_name);
+        match known_matches.len() {
+            0 => match unknown_matches.len() {
+                0 => {
+                    // Check parent scope.
+                    if let Some(ref parent) = self.parent {
+                        return parent.resolve_column(None, column_name);
+                    }
+                    ResolveResult::ColumnNotFound
                 }
-                ResolveResult::ColumnNotFound
-            }
-            1 => ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default()),
+                1 => {
+                    ResolveResult::Resolved(unknown_matches.into_iter().next().unwrap_or_default())
+                }
+                _ => {
+                    unknown_matches.sort();
+                    if self.using_columns.contains(&col_lower) {
+                        ResolveResult::Resolved(
+                            unknown_matches.into_iter().next().unwrap_or_default(),
+                        )
+                    } else {
+                        ResolveResult::Ambiguous(unknown_matches)
+                    }
+                }
+            },
+            1 => ResolveResult::Resolved(known_matches.into_iter().next().unwrap_or_default()),
             _ => {
-                matches.sort();
+                known_matches.sort();
                 if self.using_columns.contains(&col_lower) {
-                    ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default())
+                    ResolveResult::Resolved(known_matches.into_iter().next().unwrap_or_default())
                 } else {
-                    ResolveResult::Ambiguous(matches)
+                    ResolveResult::Ambiguous(known_matches)
                 }
             }
         }
