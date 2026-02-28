@@ -739,7 +739,7 @@ impl fmt::Display for TimeTravelTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CommitSequence(seq) => write!(f, "COMMITSEQ {seq}"),
-            Self::Timestamp(ts) => write!(f, "'{ts}'"),
+            Self::Timestamp(ts) => write!(f, "'{}'", ts.replace('\'', "''")),
         }
     }
 }

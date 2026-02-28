@@ -2040,11 +2040,10 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
             break;
         };
         let meta = WalFecGroupMeta::from_record_bytes(meta_bytes)?;
-        let r_repair_usize = usize::try_from(meta.r_repair).map_err(|_| {
-            FrankenError::WalCorrupt {
+        let r_repair_usize =
+            usize::try_from(meta.r_repair).map_err(|_| FrankenError::WalCorrupt {
                 detail: format!("r_repair {} does not fit in usize", meta.r_repair),
-            }
-        })?;
+            })?;
 
         // Prevent OOM panics from maliciously large r_repair values.
         // Each repair symbol requires at least 4 bytes for its length prefix.
