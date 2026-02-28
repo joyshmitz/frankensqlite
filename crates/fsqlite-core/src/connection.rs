@@ -507,7 +507,7 @@ impl PreparedStatement {
             if let Some(ref mut txn) = txn_back {
                 txn.commit(&op_cx)?;
             }
-            result?
+            result?.0
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -556,7 +556,7 @@ impl PreparedStatement {
             if let Some(ref mut txn) = txn_back {
                 txn.commit(&op_cx)?;
             }
-            result?
+            result?.0
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -1990,7 +1990,7 @@ impl Connection {
                         }
                     };
 
-                    let mut rows = self.execute_table_program(&program, params)?;
+                    let (mut rows, _) = self.execute_table_program(&program, params)?;
                     if distinct {
                         dedup_rows(&mut rows);
                         if let Some(limit_clause) = limit_clause.as_ref() {
@@ -2098,15 +2098,6 @@ impl Connection {
                 // from the pager, we can re-enable it for performance.
                 // For now, fall through to VDBE execution.
 
-                let affected = match &insert.source {
-                    fsqlite_ast::InsertSource::Values(v) => v.len(),
-                    fsqlite_ast::InsertSource::DefaultValues => 1,
-                    fsqlite_ast::InsertSource::Select(sel) => {
-                        // Run the inner SELECT to determine row count.
-                        self.execute_statement(Statement::Select(*sel.clone()), params)?
-                            .len()
-                    }
-                };
                 let program = {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
@@ -2118,7 +2109,7 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     self.compile_table_insert(insert)?
                 };
-                let rows = self.execute_table_program(&program, params)?;
+                let (rows, affected) = self.execute_table_program(&program, params)?;
 
                 // bd-thqgm: FK constraint checking on INSERT.
                 if self.fk_enforcement_enabled() {
@@ -2149,7 +2140,7 @@ impl Connection {
                 }
             }
             Statement::Update(ref update) => {
-                let (effective_update, limited_row_count_hint) =
+                let (effective_update, _limited_row_count_hint) =
                     self.materialize_update_limit_scope(update, params)?;
                 let table_name = &effective_update.table.name.name;
                 // Collect columns being updated for UPDATE OF trigger matching.
@@ -2223,19 +2214,6 @@ impl Connection {
                     }
                 }
 
-                let affected = if has_before_update || has_after_update {
-                    trigger_rows.len()
-                } else if let Some(materialized_rows) = limited_row_count_hint {
-                    materialized_rows
-                } else {
-                    self.count_matching_rows(
-                        &effective_update.table,
-                        effective_update.where_clause.as_ref(),
-                        &effective_update.order_by,
-                        effective_update.limit.as_ref(),
-                        params,
-                    )?
-                };
                 let program = {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
@@ -2247,7 +2225,7 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     self.compile_table_update(&effective_update)?
                 };
-                let rows = self.execute_table_program(&program, params)?;
+                let (rows, affected) = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {
@@ -2272,7 +2250,7 @@ impl Connection {
                 }
             }
             Statement::Delete(ref delete) => {
-                let (effective_delete, limited_row_count_hint) =
+                let (effective_delete, _limited_row_count_hint) =
                     self.materialize_delete_limit_scope(delete, params)?;
                 let table_name = &effective_delete.table.name.name;
                 let delete_event = fsqlite_ast::TriggerEvent::Delete;
@@ -2328,19 +2306,6 @@ impl Connection {
                     }
                 }
 
-                let affected = if has_before_delete || has_after_delete {
-                    trigger_old_rows.len()
-                } else if let Some(materialized_rows) = limited_row_count_hint {
-                    materialized_rows
-                } else {
-                    self.count_matching_rows(
-                        &effective_delete.table,
-                        effective_delete.where_clause.as_ref(),
-                        &effective_delete.order_by,
-                        effective_delete.limit.as_ref(),
-                        params,
-                    )?
-                };
                 let program = {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
@@ -2352,7 +2317,7 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     self.compile_table_delete(&effective_delete)?
                 };
-                let rows = self.execute_table_program(&program, params)?;
+                let (rows, affected) = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
@@ -3496,18 +3461,6 @@ impl Connection {
             .into_iter()
             .map(|row| row.values().to_vec())
             .collect())
-    }
-
-    fn count_matching_rows(
-        &self,
-        table_ref: &fsqlite_ast::QualifiedTableRef,
-        where_clause: Option<&Expr>,
-        order_by: &[fsqlite_ast::OrderingTerm],
-        limit: Option<&fsqlite_ast::LimitClause>,
-        params: Option<&[SqliteValue]>,
-    ) -> Result<usize> {
-        let rows = self.select_matching_rows(table_ref, where_clause, order_by, limit, params)?;
-        Ok(rows.len())
     }
 
     fn txn_metrics_mark_started(&self) {
@@ -8769,7 +8722,7 @@ impl Connection {
         // Compile and execute a raw SELECT * scan (no aggregates, no GROUP BY).
         let raw_select = build_raw_scan_select(select);
         let program = self.compile_table_select(&raw_select)?;
-        let raw_rows = self.execute_table_program(&program, params)?;
+        let (raw_rows, _) = self.execute_table_program(&program, params)?;
 
         // Group rows by evaluating GROUP BY expressions for each row.
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
@@ -9054,7 +9007,7 @@ impl Connection {
         // Execute raw SELECT * scan.
         let raw_select = build_raw_scan_select(select);
         let program = self.compile_table_select(&raw_select)?;
-        let raw_rows = self.execute_table_program(&program, params)?;
+        let (raw_rows, _) = self.execute_table_program(&program, params)?;
 
         let mut row_values: Vec<Vec<SqliteValue>> =
             raw_rows.iter().map(|r| r.values().to_vec()).collect();
@@ -9990,7 +9943,7 @@ impl Connection {
         &self,
         program: &VdbeProgram,
         params: Option<&[SqliteValue]>,
-    ) -> Result<Vec<Row>> {
+    ) -> Result<(Vec<Row>, usize)> {
         let execution_span = tracing::span!(
             target: "fsqlite.execution",
             tracing::Level::DEBUG,
@@ -12646,7 +12599,7 @@ fn execute_table_program_with_db(
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     reject_mem_fallback: bool,
-) -> (Result<Vec<Row>>, Option<Box<dyn TransactionHandle>>) {
+) -> (Result<(Vec<Row>, usize)>, Option<Box<dyn TransactionHandle>>) {
     let execution_span = tracing::span!(
         target: "fsqlite.execution",
         tracing::Level::DEBUG,
@@ -12716,12 +12669,16 @@ fn execute_table_program_with_db(
         Err(e) => return (Err(e), None),
     };
 
+    let changes = engine.changes();
     let result = match exec_res {
-        Ok(ExecOutcome::Done) => Ok(engine
-            .take_results()
-            .into_iter()
-            .map(|values| Row { values })
-            .collect()),
+        Ok(ExecOutcome::Done) => Ok((
+            engine
+                .take_results()
+                .into_iter()
+                .map(|values| Row { values })
+                .collect(),
+            changes,
+        )),
         Ok(ExecOutcome::Error { code, message }) => Err(FrankenError::Internal(format!(
             "VDBE halted with code {code}: {message}",
         ))),

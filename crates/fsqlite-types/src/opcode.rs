@@ -491,16 +491,16 @@ pub enum Opcode {
     /// P4 carries `TimeTravelCommitSeq(n)` or `TimeTravelTimestamp(ts)`.
     /// Must immediately follow the `OpenRead` for the same cursor.
     /// The cursor becomes read-only; DML/DDL through it returns an error.
-    SetSnapshot = 191,
+    SetSnapshot = 190,
 
     // === Noop (always last) ===
     /// No operation.
-    Noop = 192,
+    Noop = 191,
 }
 
 impl Opcode {
     /// Total number of opcodes defined.
-    pub const COUNT: usize = 193;
+    pub const COUNT: usize = 192;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -703,10 +703,10 @@ impl Opcode {
     /// Try to convert a u8 to an Opcode.
     #[allow(clippy::too_many_lines)]
     pub const fn from_byte(byte: u8) -> Option<Self> {
-        if byte == 0 || byte > 190 {
+        if byte == 0 || byte > 191 {
             return None;
         }
-        // SAFETY: All values 1..=190 are valid discriminants.
+        // SAFETY: All values 1..=191 are valid discriminants.
         // We verified byte is in range above.
         // Since the enum is repr(u8) with consecutive values, this is safe.
         // However, since unsafe is forbidden, we use a match instead.
@@ -901,8 +901,8 @@ impl Opcode {
             187 => Some(Self::CursorHint),
             188 => Some(Self::Abortable),
             189 => Some(Self::ReleaseReg),
-            191 => Some(Self::SetSnapshot),
-            192 => Some(Self::Noop),
+            190 => Some(Self::SetSnapshot),
+            191 => Some(Self::Noop),
             _ => None,
         }
     }
@@ -1408,7 +1408,7 @@ mod tests {
 
     #[test]
     fn opcode_count() {
-        assert_eq!(Opcode::COUNT, 191);
+        assert_eq!(Opcode::COUNT, 192);
     }
 
     #[test]
@@ -1427,15 +1427,16 @@ mod tests {
         assert_eq!(Opcode::from_byte(0), None);
         assert_eq!(Opcode::from_byte(1), Some(Opcode::Goto));
         assert_eq!(Opcode::from_byte(8), Some(Opcode::Halt));
-        assert_eq!(Opcode::from_byte(190), Some(Opcode::Noop));
-        assert_eq!(Opcode::from_byte(191), None);
+        assert_eq!(Opcode::from_byte(190), Some(Opcode::SetSnapshot));
+        assert_eq!(Opcode::from_byte(191), Some(Opcode::Noop));
+        assert_eq!(Opcode::from_byte(192), None);
         assert_eq!(Opcode::from_byte(255), None);
     }
 
     #[test]
     fn opcode_from_byte_exhaustive() {
-        // Every value 1..=190 should produce Some
-        for i in 1..=190u8 {
+        // Every value 1..=191 should produce Some
+        for i in 1..=191u8 {
             assert!(
                 Opcode::from_byte(i).is_some(),
                 "from_byte({i}) returned None"
@@ -1446,13 +1447,13 @@ mod tests {
     #[test]
     fn test_opcode_distinct_u8_values() {
         let mut encoded = HashSet::new();
-        for byte in 1..=190_u8 {
+        for byte in 1..=191_u8 {
             let opcode = Opcode::from_byte(byte).expect("opcode byte must decode");
             let inserted = encoded.insert(opcode as u8);
             assert!(inserted, "duplicate opcode byte value for {:?}", opcode);
         }
 
-        assert_eq!(encoded.len(), 190, "every opcode must map to a unique byte");
+        assert_eq!(encoded.len(), 191, "every opcode must map to a unique byte");
     }
 
     #[test]

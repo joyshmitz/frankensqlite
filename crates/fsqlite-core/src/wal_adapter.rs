@@ -875,7 +875,7 @@ mod tests {
         };
         adapter
             .inner_mut()
-            .reset(&cx, 1, new_salts)
+            .reset(&cx, 1, new_salts, false)
             .expect("WAL reset");
 
         // Write new data for the same page number in the new generation.

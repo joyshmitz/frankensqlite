@@ -381,7 +381,7 @@ mod wal_tests {
             salt1: 0x1111_2222,
             salt2: 0x3333_4444,
         };
-        wal.reset(&cx, 1, new_salts).expect("reset");
+        wal.reset(&cx, 1, new_salts, true).expect("reset");
 
         let ctx = DiagContext::new(BEAD_ID)
             .case("wal_reset")

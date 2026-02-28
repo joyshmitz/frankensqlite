@@ -49,8 +49,8 @@ mod bp {
     pub const COLLATE: u8 = 21;
     // Unary prefix (- + ~) right BP:
     pub const UNARY: u8 = 23;
-    // JSON access (-> ->>):
-    pub const JSON: (u8, u8) = (25, 26);
+    // JSON access (-> ->>): Same as CONCAT
+    pub const JSON: (u8, u8) = (19, 20);
 }
 
 impl Parser {

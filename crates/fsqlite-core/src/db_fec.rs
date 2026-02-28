@@ -172,7 +172,11 @@ pub fn partition_page_groups(db_size_pages: u32) -> Vec<PageGroup> {
             group_size,
             repair: DEFAULT_R_REPAIR,
         });
-        pgno += group_size;
+        if let Some(next) = pgno.checked_add(group_size) {
+            pgno = next;
+        } else {
+            break;
+        }
     }
 
     debug!(
@@ -1014,7 +1018,11 @@ pub fn generate_db_fec_from_bytes(db_data: &[u8]) -> Result<Vec<u8>> {
 
     // Total sidecar size: header + seg1 + (num_general_groups * full_seg_len).
     let num_general_groups = groups.len().saturating_sub(1);
-    let total_size = DB_FEC_HEADER_SIZE + seg1_len + num_general_groups * full_seg_len;
+    let total_size = if groups.is_empty() {
+        DB_FEC_HEADER_SIZE
+    } else {
+        DB_FEC_HEADER_SIZE + seg1_len + num_general_groups * full_seg_len
+    };
     let mut sidecar = vec![0u8; total_size];
 
     // Write header.

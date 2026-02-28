@@ -108,3 +108,6 @@ mod hot_path_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod interior_delete_test;

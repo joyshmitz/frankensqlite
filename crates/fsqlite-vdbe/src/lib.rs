@@ -1389,9 +1389,9 @@ mod tests {
     // ── test_all_opcode_dispatch_coverage ────────────────────────────────
     #[test]
     fn test_all_opcode_dispatch_coverage() {
-        // Every Opcode enum variant (1..=190) has a valid name and can be
+        // Every Opcode enum variant (1..=191) has a valid name and can be
         // constructed from its byte value. This ensures no gaps in the enum.
-        for byte in 1..=190u8 {
+        for byte in 1..=191u8 {
             let opcode = Opcode::from_byte(byte);
             assert!(
                 opcode.is_some(),
@@ -1401,7 +1401,7 @@ mod tests {
             let name = opcode.name();
             assert!(!name.is_empty(), "opcode {byte} has empty name");
         }
-        assert_eq!(Opcode::COUNT, 191);
+        assert_eq!(Opcode::COUNT, 192);
     }
 
     // ── test_p5_flags_u16_range ─────────────────────────────────────────

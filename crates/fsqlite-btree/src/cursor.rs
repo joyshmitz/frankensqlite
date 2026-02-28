@@ -173,6 +173,21 @@ impl MemPageStore {
         store.pages.insert(root_page.get(), page);
         store
     }
+
+    pub fn with_empty_index(root_page: PageNumber, page_size: u32) -> Self {
+        let mut store = Self::new(page_size);
+        let mut page = vec![0u8; page_size as usize];
+        // Initialize as empty leaf index page (type 0x0A).
+        page[0] = 0x0A;
+        // Bytes 1-2: first freeblock offset = 0 (none).
+        // Bytes 3-4: cell count = 0.
+        // Bytes 5-6: content area offset = page_size (no cells yet).
+        let content_offset = page_size as u16;
+        page[5..7].copy_from_slice(&content_offset.to_be_bytes());
+        // Byte 7: fragmented free bytes = 0.
+        store.pages.insert(root_page.get(), page);
+        store
+    }
 }
 
 impl PageReader for MemPageStore {
@@ -1148,6 +1163,7 @@ impl<P: PageWriter> BtCursor<P> {
             pages.push(self.pager.allocate_page(cx)?);
         }
 
+        let mut page_buf = vec![0u8; page_size];
         for (idx, &pgno) in pages.iter().enumerate() {
             let data_start = idx * bytes_per_page;
             let data_end = ((idx + 1) * bytes_per_page).min(overflow_data.len());
@@ -1159,9 +1175,12 @@ impl<P: PageWriter> BtCursor<P> {
                 0
             };
 
-            let mut page_buf = vec![0u8; page_size];
             page_buf[0..4].copy_from_slice(&next.to_be_bytes());
             page_buf[4..4 + chunk.len()].copy_from_slice(chunk);
+            if chunk.len() < bytes_per_page {
+                // Ensure tail is zeroed if the chunk didn't fill the space.
+                page_buf[4 + chunk.len()..].fill(0);
+            }
             if let Err(err) = self.pager.write_page(cx, pgno, &page_buf) {
                 // Best-effort cleanup: any overflow pages allocated for this
                 // cell must be released if chain materialization fails midway.
@@ -1543,114 +1562,170 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(())
     }
 
-    /// Remove the cell at the current cursor position from its leaf page.
-    ///
-    /// Does NOT trigger rebalancing — the caller is responsible for that.
-    /// Returns the page number of the leaf and its new cell count.
-    
     fn replace_interior_cell(&mut self, cx: &Cx, new_payload: &[u8]) -> Result<()> {
         let depth = self.stack.len();
-        let top = self.stack[depth - 1].clone();
+        if depth == 0 || self.at_eof {
+            return Err(FrankenError::internal(
+                "cursor at EOF during interior replace",
+            ));
+        }
+        let top = self
+            .stack
+            .last()
+            .cloned()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty during interior replace"))?;
         let page_no = top.page_no;
         let cell_idx = top.cell_idx;
-        
+
         let cell_ref = self.parse_cell_at(&top, cell_idx)?;
-        let left_child = cell_ref.left_child.unwrap();
-        
-        // Encode the new cell
+        let left_child = cell_ref
+            .left_child
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "interior cell missing left child pointer".to_owned(),
+            })?;
+
+        // Encode the new cell.
         let mut new_cell = Vec::new();
         new_cell.extend_from_slice(&left_child.get().to_be_bytes());
-        
+
         let payload_size = u32::try_from(new_payload.len()).map_err(|_| FrankenError::TooBig)?;
         let mut varint = [0u8; 9];
         let p_len = write_varint(&mut varint, u64::from(payload_size));
         new_cell.extend_from_slice(&varint[..p_len]);
-        
-        let local_size = cell::local_payload_size(
-            payload_size,
-            self.usable_size,
-            top.header.page_type,
-        ) as usize;
+
+        let local_size =
+            cell::local_payload_size(payload_size, self.usable_size, top.header.page_type)
+                as usize;
         let local_size = local_size.min(new_payload.len());
-        
+
         new_cell.extend_from_slice(&new_payload[..local_size]);
         let overflow_head = if local_size < new_payload.len() {
-            let first_overflow = self.write_overflow_chain_for_insert(cx, &new_payload[local_size..])?;
+            let first_overflow =
+                self.write_overflow_chain_for_insert(cx, &new_payload[local_size..])?;
             new_cell.extend_from_slice(&first_overflow.get().to_be_bytes());
             Some(first_overflow)
         } else {
             None
         };
-        
-        // Remove old cell from page and try to insert new cell
+
+        // Remove old cell from page and try to insert new cell.
         let mut page_data = self.pager.read_page(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let mut header = BtreePageHeader::parse(&page_data, header_offset)?;
         let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
-        
+        let cell_idx_usize = usize::from(cell_idx);
+        if cell_idx_usize >= ptrs.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "interior replace index {} out of bounds for page {} with {} cells",
+                    cell_idx,
+                    page_no,
+                    ptrs.len()
+                ),
+            });
+        }
+
         let old_overflow = cell_ref.overflow_page;
-        ptrs.remove(cell_idx as usize);
-        
-        // Defragment
+        ptrs.remove(cell_idx_usize);
+
+        // Defragment.
         let mut new_content_offset = self.usable_size as usize;
         let old_page_data = page_data.clone();
-        let ptr_array_end = header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
-        
+        let ptr_array_end =
+            header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
+
         for ptr_mut in &mut ptrs {
             let ptr = *ptr_mut as usize;
             let c = CellRef::parse(&old_page_data, ptr, header.page_type, self.usable_size)?;
             let size = crate::payload::cell_on_page_size(&c, ptr);
-            new_content_offset -= size;
-            page_data[new_content_offset..new_content_offset + size].copy_from_slice(&old_page_data[ptr..ptr + size]);
-            *ptr_mut = new_content_offset as u16;
+            new_content_offset = new_content_offset
+                .checked_sub(size)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "cell size overflow during interior defragmentation".to_owned(),
+                })?;
+            let src_end = ptr
+                .checked_add(size)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "interior cell size overflow while copying".to_owned(),
+                })?;
+            let dst_end =
+                new_content_offset
+                    .checked_add(size)
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior destination overflow while copying".to_owned(),
+                    })?;
+            if src_end > old_page_data.len() || dst_end > page_data.len() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: "interior cell copy out of bounds".to_owned(),
+                });
+            }
+            page_data[new_content_offset..dst_end].copy_from_slice(&old_page_data[ptr..src_end]);
+            *ptr_mut =
+                u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: "interior cell pointer exceeds u16 range".to_owned(),
+                })?;
         }
-        
-        // Check if new cell fits
+
+        // Check if new cell fits.
         let ptr_array_end_with_new = ptr_array_end + 2;
-        if new_content_offset >= ptr_array_end_with_new + new_cell.len() {
-            // It fits!
+        let fits = ptr_array_end_with_new
+            .checked_add(new_cell.len())
+            .is_some_and(|needed| new_content_offset >= needed);
+        if fits {
             new_content_offset -= new_cell.len();
-            page_data[new_content_offset..new_content_offset + new_cell.len()].copy_from_slice(&new_cell);
-            ptrs.insert(cell_idx as usize, new_content_offset as u16);
-            
-            header.cell_count = ptrs.len() as u16;
-            header.cell_content_offset = new_content_offset as u32;
+            let new_end = new_content_offset + new_cell.len();
+            page_data[new_content_offset..new_end].copy_from_slice(&new_cell);
+            ptrs.insert(
+                cell_idx_usize,
+                u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: "new interior cell offset exceeds u16 range".to_owned(),
+                })?,
+            );
+
+            header.cell_count = u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "interior cell count exceeds u16 range".to_owned(),
+            })?;
+            header.cell_content_offset =
+                u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: "interior content offset exceeds u32 range".to_owned(),
+                })?;
             header.write(&mut page_data, header_offset);
             cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
-            
+
             self.pager.write_page(cx, page_no, &page_data)?;
-            
             if let Some(first) = old_overflow {
                 self.free_overflow_chain(cx, first)?;
             }
-            
             return Ok(());
         }
-        
-        // It does not fit. We must balance!
-        header.cell_count = ptrs.len() as u16;
-        header.cell_content_offset = new_content_offset as u32;
+
+        // It does not fit. We must rebalance.
+        header.cell_count = u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "interior cell count exceeds u16 range".to_owned(),
+        })?;
+        header.cell_content_offset =
+            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
+                detail: "interior content offset exceeds u32 range".to_owned(),
+            })?;
         header.write(&mut page_data, header_offset);
         cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
         self.pager.write_page(cx, page_no, &page_data)?;
-        
+
         self.stack.truncate(depth);
         let res = self.balance_for_insert(cx, &new_cell, cell_idx);
-        
+
         if res.is_ok() {
             if let Some(first) = old_overflow {
                 self.free_overflow_chain(cx, first)?;
             }
-        } else {
-            if let Some(first) = overflow_head {
-                let _ = self.free_overflow_chain(cx, first);
-            }
+        } else if let Some(first) = overflow_head {
+            let _ = self.free_overflow_chain(cx, first);
         }
-        
+
         res
     }
 
-fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
+    fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
         let depth = self.stack.len();
         if depth == 0 || self.at_eof {
             return Err(FrankenError::internal("cursor at EOF during remove"));
@@ -2020,6 +2095,9 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     if new_count == 0 {
                         cursor.balance_for_delete(cx)?;
                     }
+                    // Restore the successor_key since we didn't get to replace the interior
+                    // cell with it, and it was deleted from the leaf in step 4.
+                    cursor.index_insert(cx, &successor_key)?;
                     return Ok(());
                 }
                 

@@ -179,6 +179,7 @@ where
         pages.push(allocate_page()?);
     }
 
+    let mut page_buf = vec![0u8; page_size];
     // Write each page with its next pointer and data chunk.
     for (i, &pgno) in pages.iter().enumerate() {
         let data_start = i * bytes_per_page;
@@ -191,9 +192,12 @@ where
             0 // End of chain.
         };
 
-        let mut page_buf = vec![0u8; page_size];
         page_buf[0..4].copy_from_slice(&next_pgno.to_be_bytes());
         page_buf[4..4 + chunk.len()].copy_from_slice(chunk);
+        if chunk.len() < bytes_per_page {
+            // Ensure tail is zeroed if the chunk didn't fill the space.
+            page_buf[4 + chunk.len()..].fill(0);
+        }
 
         write_page(pgno, &page_buf)?;
     }

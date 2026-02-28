@@ -1755,7 +1755,7 @@ mod tests {
             salt1: 0xAAAA_BBBB,
             salt2: 0xCCCC_DDDD,
         };
-        cp.reset(&cx, 1, new_salts).expect("reset");
+        cp.reset(&cx, 1, new_salts, false).expect("reset");
         cp.append_frame(&cx, 1, &sample_page(0xAA), 1)
             .expect("append after reset");
         cp.close(&cx).expect("close cp");
@@ -1946,7 +1946,7 @@ mod tests {
             .append_frame(&cx, 99, &sample_page(0xFF), 99)
             .expect("append old");
         // Reset to same salts as fresh.
-        wal_reset.reset(&cx, 1, salts).expect("reset");
+        wal_reset.reset(&cx, 1, salts, false).expect("reset");
         wal_reset
             .append_frame(&cx, 1, &sample_page(0x42), 1)
             .expect("append after reset");

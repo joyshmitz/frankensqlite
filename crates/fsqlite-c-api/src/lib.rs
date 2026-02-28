@@ -394,7 +394,10 @@ pub unsafe extern "C" fn sqlite3_free(ptr: *mut c_void) {
 unsafe fn libc_malloc(size: usize) -> *mut u8 {
     // std::alloc requires the exact Layout for deallocation. Since sqlite3_free
     // doesn't receive the size, we must prefix the allocation with its size.
-    let layout = std::alloc::Layout::from_size_align(size + 8, 8).expect("valid layout");
+    let layout = match std::alloc::Layout::from_size_align(size + 8, 8) {
+        Ok(l) => l,
+        Err(_) => return std::ptr::null_mut(),
+    };
     let ptr = std::alloc::alloc(layout);
     if ptr.is_null() {
         return ptr;
@@ -409,8 +412,9 @@ unsafe fn libc_free(ptr: *mut c_void) {
     }
     let real_ptr = ptr.cast::<u8>().sub(8);
     let size = real_ptr.cast::<usize>().read();
-    let layout = std::alloc::Layout::from_size_align(size + 8, 8).expect("valid layout");
-    std::alloc::dealloc(real_ptr, layout);
+    if let Ok(layout) = std::alloc::Layout::from_size_align(size + 8, 8) {
+        std::alloc::dealloc(real_ptr, layout);
+    }
 }
 
 // ── sqlite3_prepare_v2 ─────────────────────────────────────────────
