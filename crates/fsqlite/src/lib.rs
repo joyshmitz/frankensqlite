@@ -8631,4 +8631,78 @@ mod tests {
             .unwrap();
         assert_eq!(row_values(&r[0])[0], SqliteValue::Integer(0));
     }
+
+    // -----------------------------------------------------------------------
+    // Generated columns (VIRTUAL / STORED) — F-SQL.19
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generated_column_stored_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t (a, b) VALUES (3, 7)").unwrap();
+        let rows = conn.query("SELECT a, b, c FROM t").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(3));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(7));
+        assert_eq!(
+            row_values(&rows[0])[2],
+            SqliteValue::Integer(10),
+            "STORED generated column c = a + b should be 10"
+        );
+    }
+
+    #[test]
+    fn generated_column_stored_multiplication() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE prices (qty INTEGER, unit_price INTEGER, total INTEGER GENERATED ALWAYS AS (qty * unit_price) STORED)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO prices (qty, unit_price) VALUES (5, 12)")
+            .unwrap();
+        let rows = conn.query("SELECT total FROM prices").unwrap();
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Integer(60),
+            "STORED generated column total = qty * unit_price should be 60"
+        );
+    }
+
+    #[test]
+    fn generated_column_stored_multi_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t (x INTEGER, doubled INTEGER GENERATED ALWAYS AS (x * 2) STORED)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t (x) VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t (x) VALUES (5)").unwrap();
+        conn.execute("INSERT INTO t (x) VALUES (100)").unwrap();
+        let rows = conn.query("SELECT doubled FROM t ORDER BY x").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(10));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Integer(200));
+    }
+
+    #[test]
+    fn generated_column_stored_update_recomputes() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t (a, b) VALUES (3, 7)").unwrap();
+        conn.execute("UPDATE t SET a = 10 WHERE b = 7").unwrap();
+        let rows = conn.query("SELECT c FROM t").unwrap();
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Integer(17),
+            "STORED generated column should recompute after UPDATE: 10 + 7 = 17"
+        );
+    }
 }

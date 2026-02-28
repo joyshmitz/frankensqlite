@@ -3884,6 +3884,16 @@ pub fn codegen_update(
     {
         return Err(CodegenError::Unsupported(unsupported_in_message()));
     }
+    if stmt.from.is_some() {
+        return Err(CodegenError::Unsupported(
+            "UPDATE ... FROM is not supported in VDBE codegen path".to_owned(),
+        ));
+    }
+    if !stmt.order_by.is_empty() || stmt.limit.is_some() {
+        return Err(CodegenError::Unsupported(
+            "UPDATE ORDER BY/LIMIT/OFFSET must be materialized before codegen".to_owned(),
+        ));
+    }
 
     // Init.
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -4167,6 +4177,11 @@ pub fn codegen_delete(
         .is_some_and(contains_unsupported_in_expr)
     {
         return Err(CodegenError::Unsupported(unsupported_in_message()));
+    }
+    if !stmt.order_by.is_empty() || stmt.limit.is_some() {
+        return Err(CodegenError::Unsupported(
+            "DELETE ORDER BY/LIMIT/OFFSET must be materialized before codegen".to_owned(),
+        ));
     }
 
     // Init.
@@ -6252,6 +6267,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             ..
         } => {
             if let fsqlite_ast::InSet::List(values) = set {
+                if values.is_empty() {
+                    // x IN () is always FALSE, x NOT IN () is always TRUE, even if x is NULL.
+                    b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+                    return;
+                }
                 // IN (v1, v2, ...) → chain of equality checks with
                 // three-valued NULL semantics (SQL standard):
                 //   NULL IN (...)            → NULL
@@ -10483,6 +10503,78 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_update_rejects_from_clause_in_vdbe_path() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: Some(from_table("s")),
+            where_clause: None,
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        assert!(
+            matches!(&err, CodegenError::Unsupported(msg) if msg.contains("UPDATE ... FROM")),
+            "expected explicit unsupported error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_rejects_unmaterialized_order_by_limit() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                direction: Some(SortDirection::Desc),
+                nulls: None,
+            }],
+            limit: Some(LimitClause {
+                limit: Expr::Literal(Literal::Integer(1), Span::ZERO),
+                offset: Some(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            }),
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_update(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        assert!(
+            matches!(&err, CodegenError::Unsupported(msg) if msg.contains("materialized")),
+            "expected explicit unsupported error, got {err:?}"
+        );
+    }
+
+    #[test]
     fn test_codegen_update_where_in_subquery_supported_without_rewrite() {
         // UPDATE t SET b = ?1 WHERE a IN (SELECT b FROM s)
         let subquery = SelectStatement {
@@ -10781,6 +10873,42 @@ mod tests {
         assert!(
             prog.ops().iter().any(|op| op.opcode == Opcode::Variable),
             "expected Variable opcode for LIMIT parameter"
+        );
+    }
+
+    #[test]
+    fn test_codegen_delete_rejects_unmaterialized_order_by_limit() {
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(1)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                direction: None,
+                nulls: None,
+            }],
+            limit: Some(LimitClause {
+                limit: Expr::Literal(Literal::Integer(2), Span::ZERO),
+                offset: Some(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            }),
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        assert!(
+            matches!(&err, CodegenError::Unsupported(msg) if msg.contains("materialized")),
+            "expected explicit unsupported error, got {err:?}"
         );
     }
 
@@ -11085,6 +11213,234 @@ mod tests {
         assert_eq!(
             is_null_count, 3,
             "3-row INSERT with IPK should emit 3 IsNull opcodes, got {is_null_count}"
+        );
+    }
+
+    /// Schema: CREATE TABLE t (a INTEGER, b INTEGER, c GENERATED ALWAYS AS (a + b) STORED)
+    fn test_schema_with_stored_generated() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'd', false),
+                ColumnInfo::basic("b", 'd', false),
+                ColumnInfo {
+                    name: "c".to_owned(),
+                    affinity: 'd',
+                    is_ipk: false,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: Some("a + b".to_owned()),
+                    generated_stored: Some(true),
+                },
+            ],
+            indexes: vec![],
+            strict: false,
+            foreign_keys: Vec::new(),
+        }]
+    }
+
+    /// Schema: CREATE TABLE t (a INTEGER, b INTEGER, c GENERATED ALWAYS AS (a * 2) VIRTUAL)
+    fn test_schema_with_virtual_generated() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'd', false),
+                ColumnInfo::basic("b", 'd', false),
+                ColumnInfo {
+                    name: "c".to_owned(),
+                    affinity: 'd',
+                    is_ipk: false,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: Some("a * 2".to_owned()),
+                    generated_stored: Some(false),
+                },
+            ],
+            indexes: vec![],
+            strict: false,
+            foreign_keys: Vec::new(),
+        }]
+    }
+
+    #[test]
+    fn test_codegen_insert_stored_generated_column_emits_copy_and_add() {
+        // INSERT INTO t VALUES (?, ?, DEFAULT) — 3 columns, c is STORED generated
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![
+                placeholder(1),
+                placeholder(2),
+                Expr::Literal(Literal::Null, Span::ZERO), // placeholder for generated col
+            ]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema_with_stored_generated();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        // The generated column (c = a + b) should emit Copy opcodes to read
+        // columns a and b from their registers, then Add to compute the result.
+        assert!(
+            ops.contains(&Opcode::Copy),
+            "STORED generated column should emit Copy opcodes for column references"
+        );
+        assert!(
+            ops.contains(&Opcode::Add),
+            "STORED generated column 'a + b' should emit Add opcode"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_virtual_generated_column_emits_null() {
+        // INSERT INTO t VALUES (?, ?, DEFAULT) — c is VIRTUAL generated (not stored)
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![vec![
+                placeholder(1),
+                placeholder(2),
+                Expr::Literal(Literal::Null, Span::ZERO),
+            ]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema_with_virtual_generated();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        // VIRTUAL generated column should NOT emit Add (expression not evaluated
+        // at insert time); it should just emit Null.
+        assert!(
+            !ops.contains(&Opcode::Multiply),
+            "VIRTUAL generated column should not evaluate expression during INSERT"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_default_values_stored_generated() {
+        // INSERT INTO t DEFAULT VALUES — with a STORED generated column
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::DefaultValues,
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema_with_stored_generated();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        // Even with DEFAULT VALUES, stored generated columns should evaluate.
+        assert!(
+            ops.contains(&Opcode::Copy),
+            "DEFAULT VALUES with STORED generated column should emit Copy for references"
+        );
+        assert!(
+            ops.contains(&Opcode::Add),
+            "DEFAULT VALUES with STORED generated column 'a + b' should emit Add"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_stored_generated_with_explicit_columns() {
+        // INSERT INTO t(a, b) VALUES (?, ?) — c is omitted (STORED generated)
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["a".to_owned(), "b".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema_with_stored_generated();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        // With explicit column list omitting the generated column, it should
+        // still evaluate the STORED expression.
+        assert!(
+            ops.contains(&Opcode::Add),
+            "Explicit column list INSERT with STORED generated column should emit Add"
+        );
+    }
+
+    #[test]
+    fn test_codegen_update_stored_generated_column_recomputed() {
+        // UPDATE t SET a = ? WHERE b = ?
+        // STORED generated column c = a + b should be recomputed.
+        let stmt = fsqlite_ast::UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: fsqlite_ast::QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            assignments: vec![fsqlite_ast::Assignment {
+                target: fsqlite_ast::AssignmentTarget::Column("a".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(
+                    fsqlite_ast::ColumnRef {
+                        table: None,
+                        column: "b".to_owned(),
+                    },
+                    Span::ZERO,
+                )),
+                op: fsqlite_ast::BinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema_with_stored_generated();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        // UPDATE should recompute STORED generated column.
+        assert!(
+            ops.contains(&Opcode::Add),
+            "UPDATE should recompute STORED generated column 'a + b'"
         );
     }
 }
