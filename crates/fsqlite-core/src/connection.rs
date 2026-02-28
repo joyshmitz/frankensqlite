@@ -3991,6 +3991,7 @@ impl Connection {
             ],
             indexes: Vec::new(),
             strict: false,
+            foreign_keys: vec![],
         });
         self.insert_sqlite_master_row(
             "table",
@@ -4547,6 +4548,7 @@ impl Connection {
                     columns: col_infos,
                     indexes: implicit_indexes,
                     strict: create.strict,
+                    foreign_keys: vec![],
                 };
                 let create_sql = render_create_table_sql(&table_schema, is_autoincrement);
                 let rp = table_schema.root_page;
@@ -4631,6 +4633,7 @@ impl Connection {
                     columns: col_infos,
                     indexes: Vec::new(),
                     strict: false,
+                    foreign_keys: vec![],
                 };
                 let create_sql = crate::compat_persist::build_create_table_sql(&table_schema);
                 let rp = table_schema.root_page;
@@ -4699,6 +4702,7 @@ impl Connection {
             columns: col_infos,
             indexes: Vec::new(),
             strict: false,
+            foreign_keys: vec![],
         });
 
         self.insert_sqlite_master_row(
@@ -5542,6 +5546,7 @@ impl Connection {
                     columns: col_infos,
                     indexes: Vec::new(),
                     strict: false,
+                    foreign_keys: vec![],
                 });
                 materialized.push(view.name.clone());
 
@@ -5640,6 +5645,7 @@ impl Connection {
                     columns: virtual_columns.clone(),
                     indexes: Vec::new(),
                     strict: false,
+                    foreign_keys: vec![],
                 });
 
                 if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
@@ -8718,6 +8724,7 @@ impl Connection {
                         columns: col_infos,
                         indexes: Vec::new(),
                         strict: false,
+                        foreign_keys: vec![],
                     });
                     temp_names.push(cte_name.clone());
                     for (i, row) in cte_rows.iter().enumerate() {
@@ -8798,6 +8805,7 @@ impl Connection {
             columns: col_infos,
             indexes: Vec::new(),
             strict: false,
+            foreign_keys: vec![],
         });
         temp_names.push(cte_name.clone());
 
@@ -9690,6 +9698,7 @@ impl Connection {
                 columns,
                 indexes: Vec::new(),
                 strict: crate::compat_persist::is_strict_table_sql(&create_sql),
+                foreign_keys: vec![],
             });
 
             // Read all rows from this table's B-tree.

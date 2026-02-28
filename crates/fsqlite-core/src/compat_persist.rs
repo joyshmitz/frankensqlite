@@ -276,6 +276,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
             columns,
             indexes: Vec::new(),
             strict: is_strict_table_sql(&create_sql),
+            foreign_keys: vec![],
         });
 
         // Read all rows from this table's B-tree.
