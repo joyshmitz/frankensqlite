@@ -801,7 +801,7 @@ impl SlidingWindowCms {
                 hasher.update(&cms_config.seed.to_le_bytes());
                 hasher.update(&(i as u64).to_le_bytes());
                 let hash = hasher.finalize();
-                let bytes: [u8; 8] = hash.as_bytes()[..8].try_into().unwrap();
+                let bytes: [u8; 8] = hash.as_bytes()[..8].try_into().expect("8 bytes");
                 u64::from_le_bytes(bytes)
             })
             .collect();

@@ -745,9 +745,15 @@ impl<F: VfsFile> WalFile<F> {
     /// Reset the WAL for a new checkpoint generation.
     ///
     /// Writes a new header with updated checkpoint sequence and salts,
-    /// then truncates the file to header-only. Resets the running checksum
-    /// and frame count to zero.
-    pub fn reset(&mut self, cx: &Cx, new_checkpoint_seq: u32, new_salts: WalSalts) -> Result<()> {
+    /// and resets the running checksum and frame count to zero.
+    /// If `truncate_file` is true, also truncates the file to header-only.
+    pub fn reset(
+        &mut self,
+        cx: &Cx,
+        new_checkpoint_seq: u32,
+        new_salts: WalSalts,
+        truncate_file: bool,
+    ) -> Result<()> {
         let new_header = WalHeader {
             magic: self.header.magic,
             format_version: WAL_FORMAT_VERSION,
@@ -758,10 +764,13 @@ impl<F: VfsFile> WalFile<F> {
         };
         let header_bytes = new_header.to_bytes()?;
         self.file.write(cx, &header_bytes, 0)?;
-        self.file.truncate(
-            cx,
-            u64::try_from(WAL_HEADER_SIZE).expect("header size fits u64"),
-        )?;
+
+        if truncate_file {
+            self.file.truncate(
+                cx,
+                u64::try_from(WAL_HEADER_SIZE).expect("header size fits u64"),
+            )?;
+        }
 
         self.running_checksum = read_wal_header_checksum(&header_bytes)?;
         self.header = WalHeader::from_bytes(&header_bytes)?;
@@ -993,7 +1002,7 @@ mod tests {
             salt1: 0x1111_2222,
             salt2: 0x3333_4444,
         };
-        wal.reset(&cx, 1, new_salts).expect("reset");
+        wal.reset(&cx, 1, new_salts, true).expect("reset");
         assert_eq!(wal.frame_count(), 0);
         assert_eq!(wal.header().checkpoint_seq, 1);
         assert_eq!(wal.header().salts, new_salts);
@@ -2247,7 +2256,7 @@ mod tests {
             salt1: 0x5555_6666,
             salt2: 0x7777_8888,
         };
-        wal.reset(&cx, 1, new_salts).expect("reset");
+        wal.reset(&cx, 1, new_salts, true).expect("reset");
         assert_eq!(wal.frame_count(), 0);
 
         // Write partial txn (no commit).

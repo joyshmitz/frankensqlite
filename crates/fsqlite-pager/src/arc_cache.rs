@@ -171,11 +171,11 @@ impl CachedPage {
     ///
     /// # Panics
     ///
-    /// Debug-asserts that the previous count was > 0.
+    /// Panics if called when the pin count is already zero.
     #[inline]
     pub fn unpin(&self) {
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
-        debug_assert!(prev > 0, "unpin on page with ref_count 0");
+        assert!(prev > 0, "unpin on page with ref_count 0");
     }
 
     /// Returns `true` if this page is currently pinned.

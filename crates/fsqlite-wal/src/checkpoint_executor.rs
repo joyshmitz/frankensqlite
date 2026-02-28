@@ -162,7 +162,8 @@ pub fn execute_checkpoint<F: VfsFile>(
                 salt1: wal.header().salts.salt1.wrapping_add(1),
                 salt2: wal.header().salts.salt2.wrapping_add(1),
             };
-            wal.reset(cx, new_seq, new_salts)?;
+            let truncate = matches!(plan.post_action, CheckpointPostAction::TruncateWal);
+            wal.reset(cx, new_seq, new_salts, truncate)?;
             info!(
                 new_checkpoint_seq = new_seq,
                 action = ?plan.post_action,

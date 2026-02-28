@@ -472,6 +472,8 @@ impl VdbeProgram {
                 P4::Table(t) => format!("(tbl){t}"),
                 P4::Index(i) => format!("(idx){i}"),
                 P4::Affinity(a) => format!("(aff){a}"),
+                P4::TimeTravelCommitSeq(seq) => format!("(tt-seq){seq}"),
+                P4::TimeTravelTimestamp(ts) => format!("(tt-ts){ts}"),
             };
 
             let _ = writeln!(

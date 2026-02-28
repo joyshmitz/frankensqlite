@@ -8658,19 +8658,14 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE sales (product TEXT, amount INTEGER);")
             .unwrap();
-        conn.execute(
-            "INSERT INTO sales VALUES ('X', 10), ('X', 20), ('Y', 100), ('Y', 200);",
-        )
-        .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('X', 10), ('X', 20), ('Y', 100), ('Y', 200);")
+            .unwrap();
         // SUM(amount) is only in HAVING, not in SELECT.
         let rows = conn
             .query("SELECT product FROM sales GROUP BY product HAVING SUM(amount) > 50;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("Y".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("Y".to_owned()));
     }
 
     // -----------------------------------------------------------------------

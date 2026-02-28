@@ -1798,6 +1798,8 @@ pub struct VdbeEngine {
     schema_cookie: u32,
     /// Result of the last `Opcode::Compare` operation.
     last_compare_result: Option<Ordering>,
+    /// Number of rows modified (inserted, deleted, or updated) during execution.
+    changes: usize,
     /// Rowid of the last INSERT operation (for `last_insert_rowid()` support).
     last_insert_rowid: i64,
     /// Cursor ID used by the last Insert opcode (for conflict resolution in
@@ -1826,6 +1828,20 @@ pub struct VdbeEngine {
     vtab_cursors: SwissIndex<i32, VtabCursorState>,
     /// Virtual table instances keyed by cursor number (for transaction ops).
     vtab_instances: SwissIndex<i32, Box<dyn VtabInstance>>,
+    /// Cursors with time-travel snapshots (SQL:2011 temporal queries).
+    /// Keyed by cursor ID; the integration layer uses this to resolve
+    /// historical page versions and enforce read-only semantics.
+    time_travel_cursors: HashMap<i32, TimeTravelMarker>,
+}
+
+/// Time-travel target marker stored on cursors opened with
+/// `FOR SYSTEM_TIME AS OF ...`.
+#[derive(Debug, Clone)]
+pub enum TimeTravelMarker {
+    /// Pinned to a specific commit sequence number.
+    CommitSeq(u64),
+    /// Resolved from an ISO-8601 timestamp string.
+    Timestamp(String),
 }
 
 /// Type-erased virtual table instance for transaction and lifecycle ops.
@@ -2004,6 +2020,7 @@ impl VdbeEngine {
             aggregates: SwissIndex::new(),
             schema_cookie: 0,
             last_compare_result: None,
+            changes: 0,
             last_insert_rowid: 0,
             last_insert_cursor_id: None,
             conflict_skip_idx: false,
@@ -2016,6 +2033,11 @@ impl VdbeEngine {
             vtab_cursors: SwissIndex::new(),
             vtab_instances: SwissIndex::new(),
         }
+    }
+
+    /// Returns the number of rows modified (inserted, deleted, or updated).
+    pub fn changes(&self) -> usize {
+        self.changes
     }
 
     /// Returns the rowid of the last INSERT operation.
@@ -2394,6 +2416,34 @@ impl VdbeEngine {
                 }
 
                 Opcode::Noop => {
+                    pc += 1;
+                }
+
+                Opcode::SetSnapshot => {
+                    // Attach a time-travel snapshot marker to cursor P1.
+                    // The actual snapshot creation happens in the integration
+                    // layer (fsqlite-core) which intercepts this opcode and
+                    // calls `create_time_travel_snapshot()` from fsqlite-mvcc.
+                    //
+                    // At the VDBE level, we store the target so that:
+                    //   1. DML/DDL through this cursor is rejected.
+                    //   2. The integration layer can resolve pages at the
+                    //      correct historical version.
+                    let cursor_id = op.p1;
+                    let target = match &op.p4 {
+                        P4::TimeTravelCommitSeq(seq) => {
+                            TimeTravelMarker::CommitSeq(*seq)
+                        }
+                        P4::TimeTravelTimestamp(ts) => {
+                            TimeTravelMarker::Timestamp(ts.clone())
+                        }
+                        _ => {
+                            return Err(FrankenError::Internal(
+                                "SetSnapshot: invalid P4 (expected time-travel target)".to_owned(),
+                            ));
+                        }
+                    };
+                    self.time_travel_cursors.insert(cursor_id, target);
                     pc += 1;
                 }
 
@@ -3736,6 +3786,7 @@ impl VdbeEngine {
                     // Track last insert rowid only when a row was actually inserted.
                     // C SQLite does not update last_insert_rowid() when IGNORE skips.
                     if actually_inserted {
+                        self.changes += 1;
                         self.last_insert_rowid = rowid;
                     }
                     self.last_insert_cursor_id = Some(cursor_id);
@@ -3777,6 +3828,7 @@ impl VdbeEngine {
                         }
                     }
                     if deleted {
+                        self.changes += 1;
                         self.pending_next_after_delete.insert(cursor_id);
                     }
                     pc += 1;
@@ -3854,8 +3906,12 @@ impl VdbeEngine {
                                                     )?;
 
                                                 if let Some(old_rowid) = conflict_rowid {
-                                                    if let Some(tbl_cid) = self.last_insert_cursor_id {
-                                                        self.native_replace_row(tbl_cid, old_rowid)?;
+                                                    if let Some(tbl_cid) =
+                                                        self.last_insert_cursor_id
+                                                    {
+                                                        self.native_replace_row(
+                                                            tbl_cid, old_rowid,
+                                                        )?;
                                                     }
                                                 }
 

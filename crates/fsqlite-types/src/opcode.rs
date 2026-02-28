@@ -486,14 +486,21 @@ pub enum Opcode {
     /// Release register range.
     ReleaseReg = 189,
 
+    // === Time-travel (SQL:2011 temporal queries) ===
+    /// Set time-travel snapshot on cursor P1.
+    /// P4 carries `TimeTravelCommitSeq(n)` or `TimeTravelTimestamp(ts)`.
+    /// Must immediately follow the `OpenRead` for the same cursor.
+    /// The cursor becomes read-only; DML/DDL through it returns an error.
+    SetSnapshot = 191,
+
     // === Noop (always last) ===
     /// No operation.
-    Noop = 190,
+    Noop = 192,
 }
 
 impl Opcode {
     /// Total number of opcodes defined.
-    pub const COUNT: usize = 191;
+    pub const COUNT: usize = 193;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -688,6 +695,7 @@ impl Opcode {
             Self::CursorHint => "CursorHint",
             Self::Abortable => "Abortable",
             Self::ReleaseReg => "ReleaseReg",
+            Self::SetSnapshot => "SetSnapshot",
             Self::Noop => "Noop",
         }
     }
@@ -893,7 +901,8 @@ impl Opcode {
             187 => Some(Self::CursorHint),
             188 => Some(Self::Abortable),
             189 => Some(Self::ReleaseReg),
-            190 => Some(Self::Noop),
+            191 => Some(Self::SetSnapshot),
+            192 => Some(Self::Noop),
             _ => None,
         }
     }
@@ -1013,6 +1022,10 @@ pub enum P4 {
     Index(String),
     /// An affinity string (one char per column).
     Affinity(String),
+    /// Time-travel target: commit sequence for `FOR SYSTEM_TIME AS OF COMMITSEQ <n>`.
+    TimeTravelCommitSeq(u64),
+    /// Time-travel target: ISO-8601 timestamp for `FOR SYSTEM_TIME AS OF '<ts>'`.
+    TimeTravelTimestamp(String),
 }
 
 // ── VDBE Program Builder ────────────────────────────────────────────────────
@@ -1366,6 +1379,8 @@ impl VdbeProgram {
                 P4::Table(t) => format!("(tbl){t}"),
                 P4::Index(i) => format!("(idx){i}"),
                 P4::Affinity(a) => format!("(aff){a}"),
+                P4::TimeTravelCommitSeq(seq) => format!("(tt-seq){seq}"),
+                P4::TimeTravelTimestamp(ts) => format!("(tt-ts){ts}"),
             };
 
             writeln!(

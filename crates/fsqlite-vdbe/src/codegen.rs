@@ -10,7 +10,8 @@ use crate::ProgramBuilder;
 use fsqlite_ast::{
     ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FunctionArgs, InsertSource,
     InsertStatement, LimitClause, Literal, OrderingTerm, QualifiedTableRef, ResultColumn,
-    SelectCore, SelectStatement, SortDirection, Statement, TableOrSubquery, UpdateStatement,
+    SelectCore, SelectStatement, SortDirection, Statement, TableOrSubquery, TimeTravelClause,
+    TimeTravelTarget, UpdateStatement,
 };
 use fsqlite_parser::Parser as SqlParser;
 use fsqlite_types::StrictColumnType;
@@ -300,6 +301,18 @@ fn find_table<'a>(schema: &'a [TableSchema], name: &str) -> Result<&'a TableSche
 
 fn table_name_from_qualified(qtr: &QualifiedTableRef) -> &str {
     &qtr.name.name
+}
+
+/// Emit a `SetSnapshot` opcode for cursor `cursor` if a time-travel clause
+/// is present. Must be called immediately after the corresponding `OpenRead`.
+fn emit_set_snapshot(b: &mut ProgramBuilder, cursor: i32, tt: Option<&TimeTravelClause>) {
+    if let Some(clause) = tt {
+        let p4 = match &clause.target {
+            TimeTravelTarget::CommitSequence(seq) => P4::TimeTravelCommitSeq(*seq),
+            TimeTravelTarget::Timestamp(ts) => P4::TimeTravelTimestamp(ts.clone()),
+        };
+        b.emit_op(Opcode::SetSnapshot, cursor, 0, 0, p4, 0);
+    }
 }
 
 /// Count anonymous placeholders in an expression tree.
@@ -645,8 +658,13 @@ pub fn codegen_select(
         .as_ref()
         .ok_or_else(|| CodegenError::Unsupported("SELECT without FROM".to_owned()))?;
 
-    let (table_name, table_alias) = match &from_clause.source {
-        fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
+    let (table_name, table_alias, time_travel) = match &from_clause.source {
+        fsqlite_ast::TableOrSubquery::Table {
+            name,
+            alias,
+            time_travel,
+            ..
+        } => (&name.name, alias.as_deref(), time_travel.as_ref()),
         _ => {
             return Err(CodegenError::Unsupported(
                 "non-table FROM source".to_owned(),
@@ -703,6 +721,7 @@ pub fn codegen_select(
             P4::Table(table.name.clone()),
             0,
         );
+        emit_set_snapshot(b, cursor, time_travel);
         b.emit_jump_to_label(
             Opcode::SeekRowid,
             cursor,
@@ -1019,6 +1038,7 @@ fn codegen_select_full_scan(
         P4::Table(table.name.clone()),
         0,
     );
+    emit_set_snapshot(b, cursor, time_travel);
 
     // Rewind to first row; jump to done if table is empty.
     let loop_start = b.current_addr();
@@ -2586,10 +2606,7 @@ fn collect_having_aggregates(
             collect_having_aggregates(left, table, agg_columns, output_cols);
             collect_having_aggregates(right, table, agg_columns, output_cols);
         }
-        Expr::UnaryOp { expr: inner, .. } => {
-            collect_having_aggregates(inner, table, agg_columns, output_cols);
-        }
-        Expr::IsNull { expr: inner, .. } => {
+        Expr::UnaryOp { expr: inner, .. } | Expr::IsNull { expr: inner, .. } => {
             collect_having_aggregates(inner, table, agg_columns, output_cols);
         }
         Expr::Between {

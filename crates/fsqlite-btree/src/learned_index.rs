@@ -163,7 +163,10 @@ impl LearnedIndex {
 
         // Bounded search within [predicted - max_error, predicted + max_error].
         let lo = predicted.saturating_sub(self.max_error);
-        let hi = (predicted + self.max_error + 1).min(self.keys.len());
+        let hi = predicted
+            .saturating_add(self.max_error)
+            .saturating_add(1)
+            .min(self.keys.len());
 
         // Linear scan within the bounded range.
         for i in lo..hi {
@@ -415,5 +418,12 @@ mod tests {
             "max observed error {max_err} exceeds bound {}",
             config.max_error
         );
+    }
+
+    #[test]
+    fn lookup_with_extreme_key_does_not_overflow() {
+        let keys: Vec<u64> = (0..128).collect();
+        let idx = LearnedIndex::build(&keys, LearnedIndexConfig::default());
+        assert_eq!(idx.lookup(u64::MAX), None);
     }
 }

@@ -397,6 +397,19 @@ impl RegionTree {
     ///
     /// Returns an error if the region is not quiescent.
     pub fn complete_close(&mut self, id: Region) -> Result<()> {
+        let state = self
+            .nodes
+            .get(&id)
+            .map(|n| n.state)
+            .ok_or_else(|| FrankenError::Internal(format!("region {} not found", id.get())))?;
+        if state == RegionState::Closed {
+            return Ok(());
+        }
+        if state != RegionState::Closing {
+            return Err(FrankenError::Internal(
+                "region must be in Closing state before complete_close".to_owned(),
+            ));
+        }
         if !self.is_quiescent(id) {
             return Err(FrankenError::Internal(
                 "region not quiescent; cannot complete close".to_owned(),
@@ -661,6 +674,30 @@ mod tests {
         assert!(
             result.is_err(),
             "bead_id={BEAD_ID} case=detached_task_rejected"
+        );
+    }
+
+    #[test]
+    fn test_complete_close_requires_closing_state() {
+        let mut tree = RegionTree::new();
+        let root = tree
+            .create_root(RegionKind::DbRoot, Cx::new())
+            .expect("root");
+        let child = tree
+            .create_child(root, RegionKind::WriteCoordinator, Cx::new())
+            .expect("child");
+
+        let err = tree
+            .complete_close(child)
+            .expect_err("must require begin_close");
+        assert!(
+            matches!(err, FrankenError::Internal(_)),
+            "bead_id={BEAD_ID} case=complete_close_requires_closing_state got {err:?}"
+        );
+        assert_eq!(
+            tree.state(child),
+            Some(RegionState::Open),
+            "bead_id={BEAD_ID} case=child_state_unchanged_when_close_rejected"
         );
     }
 
