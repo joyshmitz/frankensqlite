@@ -224,7 +224,7 @@ impl SqliteValue {
         match self {
             Self::Null => String::new(),
             Self::Integer(i) => i.to_string(),
-            Self::Float(f) => format!("{f}"),
+            Self::Float(f) => format_sqlite_float(*f),
             Self::Text(s) => s.clone(),
             Self::Blob(b) => {
                 use std::fmt::Write;
@@ -562,7 +562,7 @@ impl fmt::Display for SqliteValue {
         match self {
             Self::Null => f.write_str("NULL"),
             Self::Integer(i) => write!(f, "{i}"),
-            Self::Float(v) => write!(f, "{v}"),
+            Self::Float(v) => f.write_str(&format_sqlite_float(*v)),
             Self::Text(s) => write!(f, "'{s}'"),
             Self::Blob(b) => {
                 f.write_str("X'")?;
@@ -724,6 +724,34 @@ fn int_float_cmp(i: i64, r: f64) -> Ordering {
             let s = i as f64;
             s.partial_cmp(&r).unwrap_or(Ordering::Equal)
         }
+    }
+}
+
+/// Format a floating-point value as text matching SQLite's `%!.15g` behavior.
+///
+/// SQLite uses `printf("%!.15g", value)` to convert REAL to TEXT. The `!` flag
+/// ensures the result always contains a decimal point, distinguishing REAL from
+/// INTEGER in text output (e.g., `120.0` not `120`).
+#[must_use]
+pub fn format_sqlite_float(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".to_owned();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "Inf".to_owned()
+        } else {
+            "-Inf".to_owned()
+        };
+    }
+    // Use Rust's default float formatting (shortest round-trip representation).
+    let s = format!("{f}");
+    // Ensure a decimal point is present so REAL values are distinguishable from
+    // INTEGER values, matching SQLite's `%!.15g` flag behavior.
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{s}.0")
     }
 }
 
@@ -1499,5 +1527,37 @@ mod tests {
         assert!(sql_like("", "", None));
         assert!(!sql_like("a", "", None));
         assert!(!sql_like("", "a", None));
+    }
+
+    // ── format_sqlite_float ────────────────────────────────────────────
+
+    #[test]
+    fn test_format_sqlite_float_whole_number() {
+        assert_eq!(format_sqlite_float(120.0), "120.0");
+        assert_eq!(format_sqlite_float(0.0), "0.0");
+        assert_eq!(format_sqlite_float(-42.0), "-42.0");
+        assert_eq!(format_sqlite_float(1.0), "1.0");
+    }
+
+    #[test]
+    fn test_format_sqlite_float_fractional() {
+        assert_eq!(format_sqlite_float(3.14), "3.14");
+        assert_eq!(format_sqlite_float(0.5), "0.5");
+        assert_eq!(format_sqlite_float(-0.001), "-0.001");
+    }
+
+    #[test]
+    fn test_format_sqlite_float_special() {
+        assert_eq!(format_sqlite_float(f64::NAN), "NaN");
+        assert_eq!(format_sqlite_float(f64::INFINITY), "Inf");
+        assert_eq!(format_sqlite_float(f64::NEG_INFINITY), "-Inf");
+    }
+
+    #[test]
+    fn test_float_to_text_includes_decimal_point() {
+        let v = SqliteValue::Float(100.0);
+        assert_eq!(v.to_text(), "100.0");
+        let v = SqliteValue::Float(3.14);
+        assert_eq!(v.to_text(), "3.14");
     }
 }
