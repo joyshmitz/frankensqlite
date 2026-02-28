@@ -198,6 +198,7 @@ where
             write_set: HashMap::new(),
             freed_pages: Vec::new(),
             allocated_from_freelist: Vec::new(),
+            allocated_from_eof: Vec::new(),
             mode,
             is_writer: eager_writer,
             committed: false,
@@ -225,8 +226,8 @@ where
         if inner.checkpoint_active {
             return Err(FrankenError::Busy);
         }
-        if inner.writer_active {
-            // Cannot switch journal mode while a writer is active.
+        if inner.active_transactions > 0 {
+            // Cannot switch journal mode while any transaction is active.
             return Err(FrankenError::Busy);
         }
 
@@ -519,6 +520,8 @@ struct SavepointEntry {
     freelist_snapshot: Vec<PageNumber>,
     /// Snapshot of pages allocated from freelist by this transaction.
     allocated_from_freelist_snapshot: Vec<PageNumber>,
+    /// Snapshot of pages allocated from EOF by this transaction.
+    allocated_from_eof_snapshot: Vec<PageNumber>,
 }
 
 /// Transaction handle produced by [`SimplePager`].
@@ -529,6 +532,7 @@ pub struct SimpleTransaction<V: Vfs> {
     write_set: HashMap<PageNumber, PageBuf>,
     freed_pages: Vec<PageNumber>,
     allocated_from_freelist: Vec<PageNumber>,
+    allocated_from_eof: Vec<PageNumber>,
     mode: TransactionMode,
     is_writer: bool,
     committed: bool,
@@ -620,6 +624,38 @@ where
                 inner.flush_page(cx, *page_no, data)?;
                 inner.db_size = inner.db_size.max(page_no.get());
             }
+
+            // Phase 2b: Patch page_count and change_counter in the on-disk
+            // page 1 header so that external SQLite readers (which rely on
+            // the header's page_count at offset 28) see a consistent value.
+            // Without this, the header can report page_count=1 while the
+            // file actually contains dozens of pages, causing
+            // `PRAGMA integrity_check` to fail with "database disk image is
+            // malformed".  (See issue #8.)
+            {
+                let new_page_count = inner.db_size;
+                let new_change_counter = inner
+                    .commit_seq
+                    .get()
+                    .wrapping_add(1)
+                    .min(u64::from(u32::MAX)) as u32;
+
+                // Read existing page 1 from disk so we only patch the
+                // relevant header fields.
+                let mut page1 = vec![0u8; ps];
+                let bytes_read = inner.db_file.read(cx, &mut page1, 0)?;
+                if bytes_read >= DATABASE_HEADER_SIZE {
+                    // Offset 24..28: change counter (big-endian u32)
+                    page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+                    // Offset 28..32: page count (big-endian u32)
+                    page1[28..32].copy_from_slice(&new_page_count.to_be_bytes());
+                    // Offset 92..96: version-valid-for must equal change
+                    // counter so SQLite trusts the header page_count.
+                    page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+                    inner.db_file.write(cx, &page1, 0)?;
+                }
+            }
+
             inner.db_file.sync(cx, SyncFlags::NORMAL)?;
 
             // Phase 3: Delete journal (commit point).
@@ -648,18 +684,38 @@ where
             // The commit marker goes on the last frame written.
             let mut sorted_pages: Vec<_> = write_set.keys().copied().collect();
             sorted_pages.sort_unstable();
-            let page_count = sorted_pages.len();
+            let frame_count = sorted_pages.len();
             let max_written = sorted_pages.last().map_or(0, |p| p.get());
+
+            // Pre-compute the new db_size so we can patch page 1's header
+            // before it enters the WAL.  (See issue #8.)
+            let new_db_size = inner.db_size.max(max_written);
+            let new_change_counter = inner
+                .commit_seq
+                .get()
+                .wrapping_add(1)
+                .min(u64::from(u32::MAX)) as u32;
 
             for (idx, page_no) in sorted_pages.iter().enumerate() {
                 let data = &write_set[page_no];
                 // The last frame in the commit gets db_size > 0 as commit marker.
-                let db_size_if_commit = if idx + 1 == page_count {
-                    inner.db_size.max(max_written)
+                let db_size_if_commit = if idx + 1 == frame_count {
+                    new_db_size
                 } else {
                     0
                 };
-                wal.append_frame(cx, page_no.get(), data, db_size_if_commit)?;
+
+                // Patch page 1 header with correct page_count so that WAL
+                // checkpointing produces a valid database file.
+                if *page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
+                    let mut patched = data.to_vec();
+                    patched[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+                    patched[28..32].copy_from_slice(&new_db_size.to_be_bytes());
+                    patched[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+                    wal.append_frame(cx, page_no.get(), &patched, db_size_if_commit)?;
+                } else {
+                    wal.append_frame(cx, page_no.get(), data, db_size_if_commit)?;
+                }
             }
 
             // Sync WAL to ensure durability.
@@ -670,9 +726,7 @@ where
             wal.sync(cx)?;
 
             // Update db_size for any new pages.
-            for page_no in write_set.keys() {
-                inner.db_size = inner.db_size.max(page_no.get());
-            }
+            inner.db_size = new_db_size;
         }
 
         for page_no in freed_pages.drain(..) {
@@ -779,10 +833,12 @@ where
         let raw = inner.next_page;
         inner.next_page = inner.next_page.saturating_add(1);
         drop(inner);
-        PageNumber::new(raw).ok_or_else(|| FrankenError::OutOfRange {
+        let page = PageNumber::new(raw).ok_or_else(|| FrankenError::OutOfRange {
             what: "allocated page number".to_owned(),
             value: raw.to_string(),
-        })
+        })?;
+        self.allocated_from_eof.push(page);
+        Ok(page)
     }
 
     fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
@@ -880,6 +936,10 @@ where
             inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
 
             inner.writer_active = false;
+        } else if self.is_writer && self.mode == TransactionMode::Concurrent {
+            for page in self.allocated_from_eof.drain(..) {
+                inner.freelist.push(page);
+            }
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
         drop(inner);
@@ -909,6 +969,7 @@ where
             next_page_snapshot: inner.next_page,
             freelist_snapshot: inner.freelist.clone(),
             allocated_from_freelist_snapshot: self.allocated_from_freelist.clone(),
+            allocated_from_eof_snapshot: self.allocated_from_eof.clone(),
         });
         drop(inner);
         Ok(())
@@ -949,7 +1010,6 @@ where
             })
             .collect::<Result<HashMap<_, _>>>()?;
         self.freed_pages = entry.freed_pages_snapshot.clone();
-        self.allocated_from_freelist = entry.allocated_from_freelist_snapshot.clone();
 
         // Restore allocation state.
         {
@@ -957,9 +1017,26 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-            inner.next_page = entry.next_page_snapshot;
-            inner.freelist.clone_from(&entry.freelist_snapshot);
+            if self.mode != TransactionMode::Concurrent {
+                inner.next_page = entry.next_page_snapshot;
+                inner.freelist.clone_from(&entry.freelist_snapshot);
+            } else {
+                for page in self
+                    .allocated_from_eof
+                    .drain(entry.allocated_from_eof_snapshot.len()..)
+                {
+                    inner.freelist.push(page);
+                }
+                for page in self
+                    .allocated_from_freelist
+                    .drain(entry.allocated_from_freelist_snapshot.len()..)
+                {
+                    inner.freelist.push(page);
+                }
+            }
         }
+        self.allocated_from_freelist = entry.allocated_from_freelist_snapshot.clone();
+        self.allocated_from_eof = entry.allocated_from_eof_snapshot.clone();
 
         // Discard savepoints created after the named one, but keep
         // the named savepoint itself (it can be rolled back to again).
@@ -988,6 +1065,10 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                 inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
 
                 inner.writer_active = false;
+            } else if self.is_writer && self.mode == TransactionMode::Concurrent {
+                for page in self.allocated_from_eof.drain(..) {
+                    inner.freelist.push(page);
+                }
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
         }
@@ -1032,17 +1113,35 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
 
+        // Update db_size if this page extends the database.
+        inner.db_size = inner.db_size.max(page_no.get());
+
         // Write directly to the database file, bypassing the cache.
         // The WAL checkpoint is authoritative, so we overwrite any cached version.
         let page_size = inner.page_size.as_usize();
         let offset = u64::from(page_no.get() - 1) * page_size as u64;
-        inner.db_file.write(cx, data, offset)?;
+
+        // For page 1, patch the header's page_count (offset 28..32) and
+        // change_counter / version_valid_for so external SQLite readers see a
+        // consistent file.  (See issue #8.)
+        if page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
+            let mut patched = data.to_vec();
+            let new_page_count = inner.db_size;
+            let new_change_counter = inner
+                .commit_seq
+                .get()
+                .wrapping_add(1)
+                .min(u64::from(u32::MAX)) as u32;
+            patched[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+            patched[28..32].copy_from_slice(&new_page_count.to_be_bytes());
+            patched[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+            inner.db_file.write(cx, &patched, offset)?;
+        } else {
+            inner.db_file.write(cx, data, offset)?;
+        }
 
         // Invalidate cache entry if present to avoid stale reads.
         inner.cache.evict(page_no);
-
-        // Update db_size if this page extends the database.
-        inner.db_size = inner.db_size.max(page_no.get());
 
         drop(inner);
         Ok(())
