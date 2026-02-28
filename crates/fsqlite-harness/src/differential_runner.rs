@@ -54,6 +54,7 @@ use crate::mismatch_minimizer::{
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-mblr.7.1.2";
 const DEFAULT_BASE_SEED: u64 = u64::from_be_bytes(*b"\0FRANKEN");
+const PASSING_REPLAY_SAMPLE_LIMIT: usize = 3;
 
 // ===========================================================================
 // Configuration
@@ -150,6 +151,8 @@ pub struct DifferentialRunReport {
     pub passed: usize,
     /// Cases that diverged.
     pub diverged: usize,
+    /// Deterministic sample of passing cases for replay evidence.
+    pub sampled_passing_cases: Vec<PassingCaseSample>,
     /// Cases skipped (generation produced no transformable cases).
     pub skipped: usize,
     /// Per-case results (only divergent cases included to save space).
@@ -158,6 +161,17 @@ pub struct DifferentialRunReport {
     pub deduplicated: DeduplicatedFailures,
     /// Coverage summary by transform family and equivalence type.
     pub coverage_summary: CoverageSummary,
+}
+
+/// Deterministic sampled passing-case metadata for replay evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PassingCaseSample {
+    /// Test case identifier.
+    pub case_id: String,
+    /// Transform name that generated this case.
+    pub transform_name: String,
+    /// Deterministic case seed.
+    pub seed: u64,
 }
 
 /// Summary of which transforms and equivalence types were exercised.
@@ -209,6 +223,7 @@ where
 
     let mut passed = 0usize;
     let mut diverged = 0usize;
+    let mut sampled_passing_cases = Vec::new();
     let mut divergent_cases = Vec::new();
     let mut all_reproductions: Vec<MinimalReproduction> = Vec::new();
 
@@ -236,6 +251,13 @@ where
         )? {
             SingleCaseOutcome::Passed => {
                 passed += 1;
+                if sampled_passing_cases.len() < PASSING_REPLAY_SAMPLE_LIMIT {
+                    sampled_passing_cases.push(PassingCaseSample {
+                        case_id: case.id.clone(),
+                        transform_name: case.transform_name.clone(),
+                        seed: case.seed,
+                    });
+                }
             }
             SingleCaseOutcome::Diverged(result) => {
                 diverged += 1;
@@ -265,6 +287,7 @@ where
         total_cases: cases.len(),
         passed,
         diverged,
+        sampled_passing_cases,
         skipped: 0,
         divergent_cases,
         deduplicated,
@@ -744,6 +767,7 @@ mod tests {
         assert_eq!(report.total_cases, 0);
         assert_eq!(report.passed, 0);
         assert_eq!(report.diverged, 0);
+        assert!(report.sampled_passing_cases.is_empty());
     }
 
     #[test]
@@ -774,6 +798,53 @@ mod tests {
         // With matching stub executors, no divergences.
         assert_eq!(report.diverged, 0);
         assert!(report.divergent_cases.is_empty());
+        assert!(!report.sampled_passing_cases.is_empty());
+        assert!(
+            report.sampled_passing_cases.len() <= PASSING_REPLAY_SAMPLE_LIMIT,
+            "passing sample size must be bounded"
+        );
+    }
+
+    #[test]
+    fn test_passing_case_sampling_is_deterministic() {
+        let entries = vec![make_entry(
+            "sampling",
+            vec![
+                "CREATE TABLE t(a INTEGER, b TEXT)",
+                "INSERT INTO t VALUES(1, 'hello')",
+                "SELECT * FROM t",
+            ],
+        )];
+        let config = RunConfig {
+            max_cases_per_entry: 4,
+            enable_minimization: false,
+            ..RunConfig::default()
+        };
+
+        let report_a = run_metamorphic_differential(
+            &entries,
+            &config,
+            || Ok(StubExecutor::fsqlite_stub()),
+            || Ok(StubExecutor::csqlite_stub()),
+        )
+        .expect("first deterministic run should succeed");
+        let report_b = run_metamorphic_differential(
+            &entries,
+            &config,
+            || Ok(StubExecutor::fsqlite_stub()),
+            || Ok(StubExecutor::csqlite_stub()),
+        )
+        .expect("second deterministic run should succeed");
+
+        assert_eq!(
+            report_a.sampled_passing_cases, report_b.sampled_passing_cases,
+            "passing replay samples must be deterministic for identical seeds and corpus"
+        );
+        assert_eq!(
+            report_a.sampled_passing_cases.len(),
+            report_a.passed.min(PASSING_REPLAY_SAMPLE_LIMIT),
+            "sample count should be bounded by pass count and sample limit"
+        );
     }
 
     #[test]

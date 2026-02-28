@@ -24,6 +24,8 @@ use fsqlite_harness::fixture_root_contract::{
 const BEAD_ID: &str = "bd-mblr.7.1.2";
 const DEFAULT_SCENARIO_ID: &str = "DIFF-712";
 const DEFAULT_OUTPUT_PREFIX: &str = "artifacts/differential-manifest";
+const MANIFEST_JSON_ARTIFACT_ENTRY: &str = "differential_manifest_json";
+const MANIFEST_SUMMARY_ARTIFACT_ENTRY: &str = "differential_manifest_summary";
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -368,6 +370,19 @@ struct FirstFailureReplay {
     divergence_source: String,
     statement_index: Option<usize>,
     replay_command: String,
+    diagnostic_json_pointer: String,
+    minimal_reproduction_json_pointer: Option<String>,
+    artifact_entries: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SampledPassingReplay {
+    case_id: String,
+    transform_name: String,
+    seed: u64,
+    replay_command: String,
+    diagnostic_json_pointer: String,
+    artifact_entries: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -398,6 +413,7 @@ struct DifferentialManifest {
     overall_pass: bool,
     run_report: DifferentialRunReport,
     first_failure: Option<FirstFailureReplay>,
+    sampled_passing_replays: Vec<SampledPassingReplay>,
     replay: ReplayCommand,
 }
 
@@ -521,6 +537,18 @@ fn normalize_one_command(command: &str) -> Option<String> {
     Some(normalized.to_owned())
 }
 
+fn ensure_one_command(command: &str, field_name: &str) -> Result<String, String> {
+    normalize_one_command(command)
+        .ok_or_else(|| format!("{field_name}: must be non-empty, single-line command"))
+}
+
+fn replay_artifact_entries() -> Vec<String> {
+    vec![
+        MANIFEST_JSON_ARTIFACT_ENTRY.to_owned(),
+        MANIFEST_SUMMARY_ARTIFACT_ENTRY.to_owned(),
+    ]
+}
+
 fn divergence_source_label(source: Option<DivergenceSource>) -> &'static str {
     match source {
         Some(DivergenceSource::Original) => "original",
@@ -533,16 +561,19 @@ fn divergence_source_label(source: Option<DivergenceSource>) -> &'static str {
 fn first_failure_replay(
     run_report: &DifferentialRunReport,
     fallback_replay: &str,
-) -> Option<FirstFailureReplay> {
-    let first_case = run_report.divergent_cases.first()?;
+) -> Result<Option<FirstFailureReplay>, String> {
+    let Some(first_case) = run_report.divergent_cases.first() else {
+        return Ok(None);
+    };
     let fallback = fallback_replay.to_owned();
     let replay_command = first_case
         .minimal_reproduction
         .as_ref()
         .and_then(|repro| normalize_one_command(&repro.repro_command))
         .unwrap_or(fallback);
+    let replay_command = ensure_one_command(&replay_command, "first_failure.replay_command")?;
 
-    Some(FirstFailureReplay {
+    Ok(Some(FirstFailureReplay {
         case_id: first_case.case_id.clone(),
         transform_name: first_case.transform_name.clone(),
         divergence_source: divergence_source_label(first_case.divergence_source).to_owned(),
@@ -551,7 +582,46 @@ fn first_failure_replay(
             .as_ref()
             .and_then(|repro| repro.first_divergence_index),
         replay_command,
-    })
+        diagnostic_json_pointer: "/run_report/divergent_cases/0".to_owned(),
+        minimal_reproduction_json_pointer: first_case
+            .minimal_reproduction
+            .as_ref()
+            .map(|_| "/run_report/divergent_cases/0/minimal_reproduction".to_owned()),
+        artifact_entries: replay_artifact_entries(),
+    }))
+}
+
+fn sampled_passing_replays(
+    run_report: &DifferentialRunReport,
+    fallback_replay: &str,
+) -> Result<Vec<SampledPassingReplay>, String> {
+    let replay_command = ensure_one_command(fallback_replay, "sampled_passing_replay.command")?;
+    let samples = run_report
+        .sampled_passing_cases
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| SampledPassingReplay {
+            case_id: sample.case_id.clone(),
+            transform_name: sample.transform_name.clone(),
+            seed: sample.seed,
+            replay_command: replay_command.clone(),
+            diagnostic_json_pointer: format!("/run_report/sampled_passing_cases/{index}"),
+            artifact_entries: replay_artifact_entries(),
+        })
+        .collect::<Vec<_>>();
+
+    if run_report.passed > 0 && samples.is_empty() {
+        return Err(
+            "sampled_passing_replay_generation_failed: passed>0 but no replay samples".to_owned(),
+        );
+    }
+    if run_report.passed == 0 && !samples.is_empty() {
+        return Err(
+            "sampled_passing_replay_generation_failed: samples present with passed=0".to_owned(),
+        );
+    }
+
+    Ok(samples)
 }
 
 fn build_replay_command(config: &Config) -> String {
@@ -600,13 +670,53 @@ fn build_replay_command(config: &Config) -> String {
             config.min_slt_files, config.min_slt_entries, config.min_slt_sql_statements,
         );
     }
-    let _ = write!(
-        replay,
-        " --output-json {} --output-human {}",
-        shell_single_quote(&path_to_utf8(&config.output_json)),
-        shell_single_quote(&path_to_utf8(&config.output_human)),
-    );
     replay
+}
+
+fn validate_manifest_replay_contract(manifest: &DifferentialManifest) -> Result<(), String> {
+    ensure_one_command(&manifest.replay.command, "replay.command")?;
+
+    if manifest.run_report.diverged > 0 && manifest.first_failure.is_none() {
+        return Err("first_failure missing while run_report.diverged > 0".to_owned());
+    }
+    if manifest.run_report.passed > 0 && manifest.sampled_passing_replays.is_empty() {
+        return Err("sampled_passing_replays missing while run_report.passed > 0".to_owned());
+    }
+
+    if let Some(first_failure) = &manifest.first_failure {
+        ensure_one_command(
+            &first_failure.replay_command,
+            "first_failure.replay_command",
+        )?;
+        if first_failure.diagnostic_json_pointer.trim().is_empty() {
+            return Err("first_failure.diagnostic_json_pointer must be non-empty".to_owned());
+        }
+        if first_failure
+            .artifact_entries
+            .iter()
+            .any(|entry| entry.trim().is_empty())
+        {
+            return Err("first_failure.artifact_entries contains empty value".to_owned());
+        }
+    }
+
+    for sample in &manifest.sampled_passing_replays {
+        ensure_one_command(&sample.replay_command, "sampled_passing_replay.command")?;
+        if sample.diagnostic_json_pointer.trim().is_empty() {
+            return Err(
+                "sampled_passing_replay.diagnostic_json_pointer must be non-empty".to_owned(),
+            );
+        }
+        if sample
+            .artifact_entries
+            .iter()
+            .any(|entry| entry.trim().is_empty())
+        {
+            return Err("sampled_passing_replay.artifact_entries contains empty value".to_owned());
+        }
+    }
+
+    Ok(())
 }
 
 fn build_human_summary(manifest: &DifferentialManifest) -> String {
@@ -623,6 +733,43 @@ fn build_human_summary(manifest: &DifferentialManifest) -> String {
         || "none".to_owned(),
         |failure| failure.replay_command.clone(),
     );
+    let first_failure_pointer = manifest.first_failure.as_ref().map_or_else(
+        || "none".to_owned(),
+        |failure| failure.diagnostic_json_pointer.clone(),
+    );
+    let first_failure_minimal_pointer = manifest.first_failure.as_ref().map_or_else(
+        || "none".to_owned(),
+        |failure| {
+            failure
+                .minimal_reproduction_json_pointer
+                .clone()
+                .unwrap_or_else(|| "none".to_owned())
+        },
+    );
+    let first_failure_artifact_entries = manifest.first_failure.as_ref().map_or_else(
+        || "none".to_owned(),
+        |failure| failure.artifact_entries.join(", "),
+    );
+    let sampled_passing_section = if manifest.sampled_passing_replays.is_empty() {
+        "none".to_owned()
+    } else {
+        manifest
+            .sampled_passing_replays
+            .iter()
+            .map(|sample| {
+                format!(
+                    "- case_id=`{}` transform=`{}` seed=`{}` pointer=`{}` artifacts=`{}`\n  replay=`{}`",
+                    sample.case_id,
+                    sample.transform_name,
+                    sample.seed,
+                    sample.diagnostic_json_pointer,
+                    sample.artifact_entries.join(", "),
+                    sample.replay_command
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     format!(
         "# Differential Manifest ({BEAD_ID})\n\n\
@@ -653,10 +800,15 @@ overall_pass: `{}`\n\
 data_hash: `{}`\n\n\
 first_failure_case_id: `{}`\n\
 first_failure_statement_index: `{}`\n\n\
+first_failure_json_pointer: `{}`\n\
+first_failure_minimal_repro_pointer: `{}`\n\
+first_failure_artifact_entries: `{}`\n\n\
 ## Replay\n\n\
 `{}`\n\n\
 ## First Failure Replay\n\n\
-`{}`\n",
+`{}`\n\n\
+## Sampled Passing Replays\n\n\
+{}\n",
         manifest.run_id,
         manifest.trace_id,
         manifest.scenario_id,
@@ -684,8 +836,12 @@ first_failure_statement_index: `{}`\n\n\
         manifest.run_report.data_hash,
         first_failure_case_id,
         first_failure_statement_index,
+        first_failure_pointer,
+        first_failure_minimal_pointer,
+        first_failure_artifact_entries,
         manifest.replay.command,
         first_failure_replay,
+        sampled_passing_section,
     )
 }
 
@@ -748,10 +904,12 @@ fn run() -> Result<bool, String> {
         CsqliteExecutor::open_in_memory,
     )?;
 
-    let replay_command = build_replay_command(&config);
-    let replay_command = normalize_one_command(&replay_command)
-        .ok_or_else(|| "replay_command_generation_failed: empty_or_multiline_command".to_owned())?;
-    let first_failure = first_failure_replay(&run_report, &replay_command);
+    let replay_command = ensure_one_command(
+        &build_replay_command(&config),
+        "replay_command_generation_failed",
+    )?;
+    let first_failure = first_failure_replay(&run_report, &replay_command)?;
+    let sampled_passing_replays = sampled_passing_replays(&run_report, &replay_command)?;
 
     let manifest = DifferentialManifest {
         schema_version: 1,
@@ -780,10 +938,12 @@ fn run() -> Result<bool, String> {
         overall_pass: run_report.diverged == 0,
         run_report,
         first_failure,
+        sampled_passing_replays,
         replay: ReplayCommand {
             command: replay_command,
         },
     };
+    validate_manifest_replay_contract(&manifest)?;
 
     let json = serde_json::to_string_pretty(&manifest)
         .map_err(|error| format!("manifest_serialize_failed: {error}"))?;
@@ -982,16 +1142,16 @@ mod tests {
         assert!(replay.contains("--generated-unix-ms 1700000000000"));
         assert!(replay.contains("--skip-fixtures"));
         assert!(replay.contains("--skip-slt"));
-        assert!(
-            replay.contains(
-                "--output-json artifacts/differential-manifest/differential_manifest.json"
-            )
-        );
-        assert!(
-            replay.contains(
-                "--output-human artifacts/differential-manifest/differential_manifest.md"
-            )
-        );
+        assert!(!replay.contains("--output-json"));
+        assert!(!replay.contains("--output-human"));
+    }
+
+    #[test]
+    fn replay_command_is_one_line_after_normalization() {
+        let replay = build_replay_command(&test_config());
+        let normalized = ensure_one_command(&replay, "replay.command")
+            .expect("runner replay command should be one-line");
+        assert_eq!(normalized, replay);
     }
 
     #[test]
@@ -1022,6 +1182,22 @@ mod tests {
     }
 
     #[test]
+    fn replay_command_is_stable_across_output_path_changes() {
+        let mut config_a = test_config();
+        config_a.output_json = PathBuf::from("/tmp/out/run-a.json");
+        config_a.output_human = PathBuf::from("/tmp/out/run-a.md");
+
+        let mut config_b = test_config();
+        config_b.output_json = PathBuf::from("/tmp/out/run-b.json");
+        config_b.output_human = PathBuf::from("/tmp/out/run-b.md");
+
+        assert_eq!(
+            build_replay_command(&config_a),
+            build_replay_command(&config_b)
+        );
+    }
+
+    #[test]
     fn human_summary_contains_replay_and_counts() {
         let config = test_config();
         let replay = build_replay_command(&config);
@@ -1032,6 +1208,11 @@ mod tests {
             total_cases: 12,
             passed: 11,
             diverged: 1,
+            sampled_passing_cases: vec![fsqlite_harness::differential_runner::PassingCaseSample {
+                case_id: "mm-corpus-pass-1".to_owned(),
+                transform_name: "noop".to_owned(),
+                seed: 42,
+            }],
             skipped: 0,
             divergent_cases: Vec::new(),
             deduplicated: DeduplicatedFailures::default(),
@@ -1064,6 +1245,14 @@ mod tests {
             overall_pass: false,
             run_report,
             first_failure: None,
+            sampled_passing_replays: vec![SampledPassingReplay {
+                case_id: "mm-corpus-pass-1".to_owned(),
+                transform_name: "noop".to_owned(),
+                seed: 42,
+                replay_command: replay.clone(),
+                diagnostic_json_pointer: "/run_report/sampled_passing_cases/0".to_owned(),
+                artifact_entries: replay_artifact_entries(),
+            }],
             replay: ReplayCommand {
                 command: replay.clone(),
             },
@@ -1086,6 +1275,64 @@ mod tests {
         assert!(human.contains("fixture_sql_statements_ingested: `24`"));
         assert!(human.contains("slt_files_seen: `2`"));
         assert!(human.contains("slt_entries_ingested: `6`"));
+        assert!(human.contains("Sampled Passing Replays"));
+    }
+
+    #[test]
+    fn validate_manifest_replay_contract_requires_samples_when_passed() {
+        let config = test_config();
+        let replay = build_replay_command(&config);
+        let run_report = DifferentialRunReport {
+            bead_id: BEAD_ID.to_owned(),
+            data_hash: "abc123".to_owned(),
+            base_seed: config.root_seed,
+            total_cases: 2,
+            passed: 1,
+            diverged: 0,
+            sampled_passing_cases: vec![fsqlite_harness::differential_runner::PassingCaseSample {
+                case_id: "mm-pass".to_owned(),
+                transform_name: "noop".to_owned(),
+                seed: 7,
+            }],
+            skipped: 0,
+            divergent_cases: Vec::new(),
+            deduplicated: DeduplicatedFailures::default(),
+            coverage_summary: CoverageSummary::default(),
+        };
+        let manifest = DifferentialManifest {
+            schema_version: 1,
+            bead_id: BEAD_ID.to_owned(),
+            run_id: config.run_id.clone(),
+            trace_id: config.trace_id.clone(),
+            scenario_id: config.scenario_id.clone(),
+            generated_unix_ms: config.generated_unix_ms,
+            commit_sha: "deadbeef".to_owned(),
+            root_seed: config.root_seed,
+            fixture_root_manifest_path: path_to_utf8(&config.fixture_root_manifest_path),
+            fixture_root_manifest_sha256: config.fixture_root_manifest_sha256.clone(),
+            fixture_json_files_seen: 0,
+            fixture_entries_ingested: 0,
+            fixture_sql_statements_ingested: 0,
+            min_fixture_json_files: config.min_fixture_json_files,
+            min_fixture_entries: config.min_fixture_entries,
+            min_fixture_sql_statements: config.min_fixture_sql_statements,
+            slt_files_seen: 0,
+            slt_entries_ingested: 0,
+            slt_sql_statements_ingested: 0,
+            min_slt_files: config.min_slt_files,
+            min_slt_entries: config.min_slt_entries,
+            min_slt_sql_statements: config.min_slt_sql_statements,
+            corpus_entries: 1,
+            overall_pass: true,
+            run_report,
+            first_failure: None,
+            sampled_passing_replays: Vec::new(),
+            replay: ReplayCommand { command: replay },
+        };
+
+        let error = validate_manifest_replay_contract(&manifest)
+            .expect_err("missing sampled passing replay contract should fail");
+        assert!(error.contains("sampled_passing_replays"));
     }
 
     #[test]
