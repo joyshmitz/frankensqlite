@@ -1291,17 +1291,18 @@ fn emit_comparison_expr(
 
 /// Convert a SQL type name to a single-char affinity code for CAST.
 fn type_to_affinity(type_name: &str) -> char {
+    // SQLite affinity characters: A=Blob/None, B=Text, C=Numeric, D=Integer, E=Real
     let upper = type_name.to_uppercase();
     if upper.contains("INT") {
-        'd' // integer
+        'D' // integer
     } else if upper.contains("CHAR")
         || upper.contains("CLOB")
         || upper.contains("TEXT")
         || upper.contains("VARCHAR")
     {
-        'C' // text
+        'B' // text
     } else if upper.contains("BLOB") || upper.is_empty() {
-        'B' // blob
+        'A' // blob (no affinity)
     } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
         'E' // real
     } else {

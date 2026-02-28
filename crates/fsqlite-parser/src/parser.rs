@@ -333,11 +333,12 @@ impl Parser {
         let name = self.parse_qualified_name()?;
         let alias = self.try_alias()?;
         let index_hint = self.parse_index_hint()?;
+        let time_travel = self.parse_time_travel_clause()?;
         Ok(QualifiedTableRef {
             name,
             alias,
             index_hint,
-            time_travel: None,
+            time_travel,
         })
     }
 
@@ -759,11 +760,12 @@ impl Parser {
 
         let alias = self.try_alias()?;
         let index_hint = self.parse_index_hint()?;
+        let time_travel = self.parse_time_travel_clause()?;
         Ok(TableOrSubquery::Table {
             name,
             alias,
             index_hint,
-            time_travel: None,
+            time_travel,
         })
     }
 

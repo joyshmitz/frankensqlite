@@ -777,7 +777,6 @@ enum TriggerStatementOutcome {
 }
 
 /// Describes the action to take when a FK-referenced parent row is deleted.
-#[allow(dead_code)]
 enum FkDeleteAction {
     /// No child rows reference this parent — deletion is allowed.
     Allow,
@@ -2202,6 +2201,28 @@ impl Connection {
                     return Ok(Vec::new());
                 }
 
+                // FK enforcement on UPDATE:
+                // 1. Parent-side: check old values aren't orphaning children
+                // 2. Child-side: check new FK values have valid parents
+                if self.fk_enforcement_enabled() {
+                    let rows_to_check = if !trigger_rows.is_empty() {
+                        trigger_rows
+                            .iter()
+                            .map(|(old, new)| (old.clone(), new.clone()))
+                            .collect::<Vec<_>>()
+                    } else {
+                        self.collect_update_trigger_rows(&effective_update, params)?
+                    };
+                    for (old_values, new_values) in &rows_to_check {
+                        // Parent-side: if this table is referenced by children,
+                        // check that changing FK-referenced values doesn't orphan them.
+                        let action = self.check_fk_on_delete(table_name, old_values)?;
+                        self.execute_fk_delete_action(&action)?;
+                        // Child-side: validate new FK values against parent tables.
+                        self.check_fk_parent_exists(table_name, new_values)?;
+                    }
+                }
+
                 let affected = if has_before_update || has_after_update {
                     trigger_rows.len()
                 } else if let Some(materialized_rows) = limited_row_count_hint {
@@ -2292,6 +2313,19 @@ impl Connection {
                 if skip_dml {
                     *self.last_changes.borrow_mut() = 0;
                     return Ok(Vec::new());
+                }
+
+                // FK enforcement on DELETE: check/cascade for each row.
+                if self.fk_enforcement_enabled() {
+                    let rows_to_check = if !trigger_old_rows.is_empty() {
+                        trigger_old_rows.clone()
+                    } else {
+                        self.collect_delete_trigger_rows(&effective_delete, params)?
+                    };
+                    for row_values in &rows_to_check {
+                        let action = self.check_fk_on_delete(table_name, row_values)?;
+                        self.execute_fk_delete_action(&action)?;
+                    }
                 }
 
                 let affected = if has_before_delete || has_after_delete {
@@ -5669,7 +5703,6 @@ impl Connection {
     ///
     /// `row_values` are the column values of the row about to be deleted.
     /// Returns `Ok(())` if deletion is allowed, or an error/cascade action.
-    #[allow(dead_code)]
     fn check_fk_on_delete(
         &self,
         table_name: &str,
