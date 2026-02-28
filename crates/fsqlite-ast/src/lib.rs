@@ -1718,6 +1718,7 @@ mod tests {
             name: QualifiedName::bare("t"),
             alias: None,
             index_hint: None,
+            time_travel: None,
         };
         let _ = Statement::Update(UpdateStatement {
             with: None,
