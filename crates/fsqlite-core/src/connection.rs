@@ -5810,7 +5810,6 @@ impl Connection {
     }
 
     /// Execute FK cascade/set-null actions for a DELETE operation.
-    #[allow(dead_code)]
     fn execute_fk_delete_action(&self, action: &FkDeleteAction) -> Result<()> {
         match action {
             FkDeleteAction::Allow => Ok(()),
