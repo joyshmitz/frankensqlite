@@ -6774,6 +6774,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -6784,6 +6786,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                 ],
                 indexes: vec![],

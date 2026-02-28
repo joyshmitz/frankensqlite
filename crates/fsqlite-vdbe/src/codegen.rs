@@ -96,6 +96,11 @@ pub struct ColumnInfo {
     pub default_value: Option<String>,
     /// Strict type for STRICT tables; `None` for non-STRICT tables.
     pub strict_type: Option<StrictColumnType>,
+    /// Generated column expression as SQL text, if this is a generated column.
+    pub generated_expr: Option<String>,
+    /// Whether the generated column is STORED (`true`) or VIRTUAL (`false`).
+    /// `None` for non-generated columns.
+    pub generated_stored: Option<bool>,
 }
 
 impl ColumnInfo {
@@ -111,6 +116,8 @@ impl ColumnInfo {
             unique: false,
             default_value: None,
             strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
         }
     }
 }
@@ -128,6 +135,38 @@ pub struct IndexSchema {
     pub is_unique: bool,
 }
 
+/// A foreign key constraint definition stored on the child table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FkDef {
+    /// Column indices in the child table that form the FK.
+    pub child_columns: Vec<usize>,
+    /// Referenced (parent) table name.
+    pub parent_table: String,
+    /// Referenced column names in the parent table.
+    /// Empty means the parent's implicit rowid.
+    pub parent_columns: Vec<String>,
+    /// Action on parent row deletion.
+    pub on_delete: FkActionType,
+    /// Action on parent row update.
+    pub on_update: FkActionType,
+}
+
+/// Foreign key action type (mirrors `fsqlite_ast::ForeignKeyActionType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FkActionType {
+    /// No action (default) — raise error if children exist.
+    #[default]
+    NoAction,
+    /// Propagate delete/update to children.
+    Cascade,
+    /// Set child FK columns to NULL.
+    SetNull,
+    /// Set child FK columns to their default value.
+    SetDefault,
+    /// Like `NoAction` but checked immediately (not deferred).
+    Restrict,
+}
+
 /// Minimal table schema needed by the code generator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
@@ -141,6 +180,8 @@ pub struct TableSchema {
     pub indexes: Vec<IndexSchema>,
     /// Whether this table uses SQLite STRICT typing rules.
     pub strict: bool,
+    /// Foreign key constraints declared on this table (child side).
+    pub foreign_keys: Vec<FkDef>,
 }
 
 impl TableSchema {
@@ -836,6 +877,7 @@ pub fn codegen_select(
             schema,
             columns,
             where_clause.as_deref(),
+            having.as_deref(),
             out_regs,
             out_col_count,
             done_label,
@@ -1455,7 +1497,7 @@ fn codegen_select_ordered_scan(
     // Resolve ORDER BY sources (column indices, rowid, or expressions).
     let sort_keys: Vec<SortKeySource> = order_by
         .iter()
-        .map(|term| resolve_sort_key(&term.expr, table, table_alias))
+        .map(|term| resolve_sort_key(&term.expr, table, table_alias, columns))
         .collect();
 
     let num_sort_keys = sort_keys.len();
@@ -1527,6 +1569,7 @@ fn codegen_select_ordered_scan(
             table,
             table_alias,
             schema: Some(schema),
+            register_base: None,
         };
         for key in &sort_keys {
             match key {
@@ -1960,6 +2003,7 @@ fn codegen_select_aggregate(
     schema: &[TableSchema],
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
+    having: Option<&Expr>,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
@@ -2019,6 +2063,7 @@ fn codegen_select_aggregate(
                 table,
                 table_alias,
                 schema: Some(schema),
+                register_base: None,
             };
             emit_expr(b, filter_expr, filter_reg, Some(&scan_ctx));
             // p3=1: treat NULL as false (skip AggStep).
@@ -2056,6 +2101,7 @@ fn codegen_select_aggregate(
                     table,
                     table_alias,
                     schema: Some(schema),
+                    register_base: None,
                 };
                 emit_expr(b, expr, arg_base, Some(&scan_ctx));
             } else {
@@ -2078,6 +2124,7 @@ fn codegen_select_aggregate(
                     table,
                     table_alias,
                     schema: Some(schema),
+                    register_base: None,
                 };
                 for (j, extra_expr) in agg.extra_args.iter().enumerate() {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -2135,8 +2182,37 @@ fn codegen_select_aggregate(
         }
     }
 
-    // ResultRow.
+    // HAVING filter: skip ResultRow if HAVING predicate is false/NULL.
+    // For single-group aggregate (no GROUP BY), each output column maps
+    // directly to its aggregate accumulator at accum_base + i.
+    let having_skip_label = if let Some(having_expr) = having {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let output_cols: Vec<GroupByOutputCol> = (0..agg_columns.len())
+            .map(|i| GroupByOutputCol::Aggregate { agg_index: i })
+            .collect();
+        let skip = b.emit_label();
+        emit_having_filter(
+            b,
+            having_expr,
+            &output_cols,
+            &agg_columns,
+            &[],
+            table,
+            accum_base,
+            skip,
+        );
+        Some(skip)
+    } else {
+        None
+    };
+
+    // ResultRow (reached when HAVING passes or when there is no HAVING).
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    // Resolve HAVING skip label after ResultRow so failed HAVING jumps past it.
+    if let Some(skip) = having_skip_label {
+        b.resolve_label(skip);
+    }
 
     // Done: Close + Halt.
     b.resolve_label(done_label);
@@ -2566,6 +2642,7 @@ fn codegen_select_group_by_aggregate(
             table,
             table_alias,
             schema: Some(schema),
+            register_base: None,
         };
         let mut reg = sorter_base;
         for key in &group_by_keys {
@@ -3217,6 +3294,9 @@ pub fn codegen_insert(
                     0,
                 );
             }
+            // Evaluate STORED generated columns before packing the record.
+            emit_stored_generated_columns(b, table, col_regs);
+
             let rec_reg = b.alloc_reg();
             emit_strict_type_check(b, table, col_regs);
             // Apply column type affinities before packing the record.
@@ -3247,7 +3327,7 @@ pub fn codegen_insert(
             );
 
             // Index maintenance: insert into each index (bd-so1h).
-            emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg);
+            emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, oe_flag);
 
             if !stmt.returning.is_empty() {
                 emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
@@ -3389,6 +3469,9 @@ fn codegen_insert_values(
             );
         }
 
+        // Evaluate STORED generated columns before packing the record.
+        emit_stored_generated_columns(b, table, val_regs);
+
         // Apply column type affinities before packing the record.
         let aff_str = table.affinity_string();
         b.emit_op(
@@ -3423,7 +3506,7 @@ fn codegen_insert_values(
         );
 
         // Index maintenance: insert into each index (bd-so1h).
-        emit_index_inserts(b, table, cursor, val_regs, rowid_reg);
+        emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
 
         // RETURNING clause: position cursor on inserted row and read columns.
         if !returning.is_empty() {
@@ -3585,6 +3668,9 @@ fn codegen_insert_select(
         );
     }
 
+    // Evaluate STORED generated columns before packing the record.
+    emit_stored_generated_columns(b, target_table, val_regs);
+
     // Apply column type affinities before packing the record.
     let aff_str = target_table.affinity_string();
     b.emit_op(
@@ -3618,7 +3704,7 @@ fn codegen_insert_select(
     );
 
     // Index maintenance: insert into each index (bd-so1h).
-    emit_index_inserts(b, target_table, write_cursor, val_regs, rowid_reg);
+    emit_index_inserts(b, target_table, write_cursor, val_regs, rowid_reg, oe_flag);
 
     // RETURNING clause: position cursor on inserted row and read columns.
     if !returning.is_empty() {
@@ -3798,6 +3884,7 @@ pub fn codegen_update(
         table,
         table_alias: stmt.table.alias.as_deref(),
         schema: Some(schema),
+        register_base: None,
     };
     // Reset placeholder counter to 1 for SET expressions (they appear first in SQL text).
     b.set_next_anon_placeholder(1);
@@ -3853,6 +3940,9 @@ pub fn codegen_update(
         b.resolve_label(rowid_done_label);
     }
 
+    // Recompute STORED generated columns after SET assignments.
+    emit_stored_generated_columns(b, table, col_regs);
+
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, table, col_regs);
     // Apply column type affinities before packing the record.
@@ -3889,7 +3979,7 @@ pub fn codegen_update(
 
     // Index maintenance (bd-2f9t): Insert NEW index entries after table insert.
     // col_regs now contains NEW column values.
-    emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg);
+    emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, 0);
 
     // RETURNING clause: position cursor on updated row and read columns.
     if !stmt.returning.is_empty() {
@@ -4130,6 +4220,42 @@ fn parse_default_expr(default_sql: &str) -> Option<Expr> {
     }
 }
 
+/// Evaluate STORED generated column expressions during INSERT/UPDATE.
+///
+/// For each column with `generated_stored == Some(true)`, parses the stored
+/// expression SQL, evaluates it using register-based column resolution, and
+/// writes the result into the corresponding column register.
+///
+/// VIRTUAL generated columns are set to NULL (they are computed at SELECT time).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, val_regs: i32) {
+    for (col_idx, col) in table.columns.iter().enumerate() {
+        let Some(ref expr_sql) = col.generated_expr else {
+            continue;
+        };
+        let dest_reg = val_regs + col_idx as i32;
+        if col.generated_stored == Some(true) {
+            // STORED: evaluate expression and write result to register.
+            if let Some(expr) = parse_default_expr(expr_sql) {
+                let gen_ctx = ScanCtx {
+                    cursor: 0,
+                    table,
+                    table_alias: None,
+                    schema: None,
+                    register_base: Some(val_regs),
+                };
+                emit_expr(b, &expr, dest_reg, Some(&gen_ctx));
+            } else {
+                // Expression parse failed — store NULL.
+                b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
+            }
+        } else {
+            // VIRTUAL: not stored in the record; set NULL as placeholder.
+            b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
+        }
+    }
+}
+
 /// Emit `IdxInsert` opcodes for all indexes on the table (bd-so1h: Phase 5I.3).
 ///
 /// For each index, this reads the indexed column values from the provided
@@ -4148,6 +4274,7 @@ fn emit_index_inserts(
     table_cursor: i32,
     col_regs: i32,
     rowid_reg: i32,
+    oe_flag: u16,
 ) {
     for (idx_offset, index) in table.indexes.iter().enumerate() {
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
@@ -4186,7 +4313,7 @@ fn emit_index_inserts(
         // (excluding the trailing rowid) so the engine can enforce the
         // uniqueness constraint while allowing multiple NULLs.
         let (p3_unique, p5_unique) = if index.is_unique {
-            (n_idx_cols as i32, 1)
+            (n_idx_cols as i32, 1 | (oe_flag << 1))
         } else {
             (0, 0)
         };
@@ -4345,6 +4472,7 @@ fn emit_column_reads(
                         table,
                         table_alias,
                         schema: Some(schema),
+                        register_base: None,
                     };
                     emit_expr(b, expr, reg, Some(&scan));
                 }
@@ -4637,6 +4765,7 @@ fn emit_where_filter(
                 table,
                 table_alias,
                 schema: Some(schema),
+                register_base: None,
             };
             // Check for COLLATE on either operand.
             let collation_p4 = extract_collation(left)
@@ -4730,6 +4859,7 @@ fn emit_where_filter(
                 table,
                 table_alias,
                 schema: Some(schema),
+                register_base: None,
             };
             let cond_reg = b.alloc_temp();
             emit_expr(b, where_expr, cond_reg, Some(&scan));
@@ -4780,7 +4910,27 @@ struct OrderByIndexPlan {
 ///
 /// Returns `Column` or `Rowid` for simple column references; falls back to
 /// `Expression` for arbitrary expressions (arithmetic, function calls, etc.).
-fn resolve_sort_key(expr: &Expr, table: &TableSchema, table_alias: Option<&str>) -> SortKeySource {
+/// Handles numeric column indices (e.g., `ORDER BY 2`) by resolving them to
+/// the corresponding result column expression.
+fn resolve_sort_key(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    columns: &[ResultColumn],
+) -> SortKeySource {
+    // Handle numeric column index (ORDER BY 1, ORDER BY 2, etc.).
+    if let Expr::Literal(Literal::Integer(n), _) = expr {
+        let idx = usize::try_from(*n).unwrap_or(0);
+        if idx >= 1 && idx <= columns.len() {
+            let result_col = &columns[idx - 1];
+            // Extract the underlying expression from the result column and
+            // recursively resolve it as a sort key.
+            if let ResultColumn::Expr { expr: col_expr, .. } = result_col {
+                return resolve_sort_key(col_expr, table, table_alias, columns);
+            }
+        }
+    }
+
     if let Expr::Column(col_ref, _) = expr {
         if let Some(qualifier) = &col_ref.table {
             if !matches_table_or_alias(qualifier, table, table_alias) {
@@ -4908,7 +5058,24 @@ fn resolve_order_by_index_plan(
             direction = Some(term_direction);
         }
 
-        let Expr::Column(col_ref, _) = &term.expr else {
+        // Resolve numeric column indices (e.g., ORDER BY 2) to the
+        // corresponding result column expression before checking for column refs.
+        let resolved_expr = if let Expr::Literal(Literal::Integer(n), _) = &term.expr {
+            let idx = usize::try_from(*n).unwrap_or(0);
+            if idx >= 1 && idx <= columns.len() {
+                if let ResultColumn::Expr { expr, .. } = &columns[idx - 1] {
+                    expr
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        } else {
+            &term.expr
+        };
+
+        let Expr::Column(col_ref, _) = resolved_expr else {
             return None;
         };
         if let Some(qualifier) = &col_ref.table
@@ -5092,6 +5259,10 @@ struct ScanCtx<'a> {
     table: &'a TableSchema,
     table_alias: Option<&'a str>,
     schema: Option<&'a [TableSchema]>,
+    /// When set, column references are resolved by copying from registers
+    /// (`register_base + col_index`) instead of reading from the B-tree cursor.
+    /// Used for generated column expression evaluation during INSERT.
+    register_base: Option<i32>,
 }
 
 enum InProbeValue<'a> {
@@ -5352,11 +5523,12 @@ fn try_emit_complex_in_subquery(
             table,
             table_alias,
             schema: Some(schema),
+            register_base: None,
         };
 
         // Emit sort key columns.
         for (i, term) in subquery.order_by.iter().enumerate() {
-            let key_source = resolve_sort_key(&term.expr, table, table_alias);
+            let key_source = resolve_sort_key(&term.expr, table, table_alias, columns);
             match key_source {
                 SortKeySource::Column(col_idx) => {
                     b.emit_op(
@@ -5526,6 +5698,7 @@ fn try_emit_complex_in_subquery(
             table,
             table_alias,
             schema: Some(schema),
+            register_base: None,
         };
 
         let r_probe = b.alloc_temp();
@@ -5646,6 +5819,7 @@ fn emit_in_probe_expr(
         table: probe_source.table,
         table_alias: probe_source.table_alias,
         schema: Some(schema),
+        register_base: None,
     };
     match probe_source.value {
         InProbeValue::Expr(expr) => emit_expr(b, expr, r_probe, Some(&probe_scan)),
@@ -6002,7 +6176,16 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     return;
                 }
             }
-            if is_rowid_alias(&col_ref.column) {
+            // Register-based resolution for generated column expressions
+            // during INSERT: copy from the register holding that column's value.
+            if let Some(reg_base) = sc.register_base {
+                if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    b.emit_op(Opcode::Copy, reg_base + col_idx as i32, reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                }
+            } else if is_rowid_alias(&col_ref.column) {
                 b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
             } else if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -6152,6 +6335,7 @@ fn emit_exists_subquery(
         table,
         table_alias: sub_alias,
         schema: Some(schema),
+        register_base: None,
     };
 
     // Apply WHERE filter if present.
@@ -6263,6 +6447,7 @@ fn emit_scalar_subquery(
         table,
         table_alias: sub_alias,
         schema: Some(schema),
+        register_base: None,
     };
 
     // Check if this is an aggregate query (e.g., SELECT MAX(x) FROM t).
@@ -6877,6 +7062,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -6887,6 +7074,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                 ],
                 indexes: vec![],
@@ -7303,6 +7492,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -7313,6 +7504,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                 ],
                 indexes: vec![],
@@ -7331,6 +7524,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
@@ -7341,6 +7536,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                 ],
                 indexes: vec![],
@@ -7617,6 +7814,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -7627,6 +7826,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                 ],
                 indexes: vec![],
@@ -7645,6 +7846,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
@@ -7655,6 +7858,8 @@ mod tests {
                         unique: false,
                         default_value: None,
                         strict_type: None,
+                        generated_expr: None,
+                        generated_stored: None,
                     },
                     ColumnInfo::basic("z", 'e', false),
                 ],

@@ -101,8 +101,8 @@ impl VdbeFrame {
 /// allowed (OFF by default, matching `PRAGMA recursive_triggers`).
 #[derive(Debug)]
 pub struct FrameStack {
-    /// The stack of active frames (index 0 = outermost trigger).
-    frames: Vec<VdbeFrame>,
+    /// The stack of active frames (index 0 = outermost trigger), along with their memory cost at push time.
+    frames: Vec<(VdbeFrame, usize)>,
     /// Maximum nesting depth.
     max_depth: usize,
     /// Cx memory budget (total bytes allowed across all frames).
@@ -174,7 +174,7 @@ impl FrameStack {
             let is_self_recursive = self
                 .frames
                 .iter()
-                .any(|f| f.trigger_name == frame.trigger_name);
+                .any(|(f, _)| f.trigger_name == frame.trigger_name);
             if is_self_recursive {
                 return Err(FrankenError::Internal(
                     "recursive triggers are disabled (PRAGMA recursive_triggers = OFF)".to_owned(),
@@ -191,7 +191,7 @@ impl FrameStack {
 
         // All checks passed — push the frame.
         self.current_memory = new_total;
-        self.frames.push(frame);
+        self.frames.push((frame, frame_mem));
         Ok(())
     }
 
@@ -199,20 +199,19 @@ impl FrameStack {
     ///
     /// Returns the popped frame, or `None` if the stack is empty.
     pub fn pop_frame(&mut self) -> Option<VdbeFrame> {
-        let frame = self.frames.pop()?;
-        let frame_mem = frame.estimated_memory();
-        self.current_memory = self.current_memory.saturating_sub(frame_mem);
+        let (frame, pushed_mem) = self.frames.pop()?;
+        self.current_memory = self.current_memory.saturating_sub(pushed_mem);
         Some(frame)
     }
 
     /// Peek at the top frame without removing it.
     pub fn top(&self) -> Option<&VdbeFrame> {
-        self.frames.last()
+        self.frames.last().map(|(f, _)| f)
     }
 
     /// Mutable reference to the top frame.
     pub fn top_mut(&mut self) -> Option<&mut VdbeFrame> {
-        self.frames.last_mut()
+        self.frames.last_mut().map(|(f, _)| f)
     }
 
     /// Unwind all frames (cleanup on error). Returns the unwound frames
@@ -478,7 +477,7 @@ mod tests {
         stack.push_frame(trigger_frame).unwrap();
 
         // Access OLD/NEW from the parent frame (index 0).
-        let parent = &stack.frames[0];
+        let parent = &stack.frames[0].0;
         let mapping = parent.pseudo_tables.as_ref().unwrap();
 
         // Read OLD.a (register at old_base + 0).
@@ -495,7 +494,7 @@ mod tests {
         assert!(matches!(&parent.registers[new_base + 1], SqliteValue::Text(s) if s == "world"));
 
         // Modify NEW.a in parent frame (simulates trigger body setting NEW value).
-        let parent_mut = &mut stack.frames[0];
+        let parent_mut = &mut stack.frames[0].0;
         let new_base_mut = usize::try_from(
             parent_mut
                 .pseudo_tables
@@ -508,7 +507,7 @@ mod tests {
         parent_mut.registers[new_base_mut] = SqliteValue::Integer(999);
 
         // Verify the modification persists.
-        let parent = &stack.frames[0];
+        let parent = &stack.frames[0].0;
         let new_base = usize::try_from(
             parent
                 .pseudo_tables
