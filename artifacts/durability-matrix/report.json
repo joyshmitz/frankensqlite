@@ -2,9 +2,9 @@
   "schema_version": "fsqlite.durability-matrix.v1",
   "bead_id": "bd-mblr.7.4",
   "run": {
-    "run_id": "bd-mblr.7.4-20260220T102526Z",
-    "trace_id": "trace-ce0899ffad69238d",
-    "commit_sha": "af7fee7b8bf28a68c3cdd3d396b6fa5b981c3ede",
+    "run_id": "bd-mblr.7.4-20260228T083124Z",
+    "trace_id": "trace-3ffe7ac339dc1e9e",
+    "commit_sha": "27dabea9133a09e8eaa78d546920505f6b883b8a",
     "root_seed": 13204554107450294273
   },
   "lane": {
