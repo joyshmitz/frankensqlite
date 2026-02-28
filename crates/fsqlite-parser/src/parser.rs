@@ -18,7 +18,8 @@ use fsqlite_ast::{
     Literal, NullsOrder, OrderingTerm, PragmaStatement, PragmaValue, QualifiedName,
     QualifiedTableRef, ResultColumn, RollbackStatement, SelectBody, SelectCore, SelectStatement,
     SortDirection, Span, Statement, TableConstraint, TableConstraintKind, TableOrSubquery,
-    TransactionMode, TriggerEvent, TriggerTiming, TypeName, UpdateStatement, UpsertAction,
+    TimeTravelClause, TimeTravelTarget, TransactionMode, TriggerEvent, TriggerTiming, TypeName,
+    UpdateStatement, UpsertAction,
     UpsertClause, UpsertTarget, VacuumStatement, WindowDef, WindowSpec, WithClause,
 };
 
@@ -336,6 +337,7 @@ impl Parser {
             name,
             alias,
             index_hint,
+            time_travel: None,
         })
     }
 
@@ -368,6 +370,49 @@ impl Parser {
         } else {
             Ok(None)
         }
+    }
+
+    /// Parse an optional `FOR SYSTEM_TIME AS OF ...` clause (SQL:2011 temporal query).
+    ///
+    /// Grammar:
+    /// ```text
+    /// time_travel_clause ::= FOR SYSTEM_TIME AS OF COMMITSEQ integer
+    ///                      | FOR SYSTEM_TIME AS OF string_literal
+    /// ```
+    fn parse_time_travel_clause(&mut self) -> Result<Option<TimeTravelClause>, ParseError> {
+        if !self.check_kw(&TokenKind::KwFor) {
+            return Ok(None);
+        }
+        // Lookahead: FOR must be followed by SYSTEM_TIME (contextual identifier).
+        if !matches!(self.peek_nth(1), TokenKind::Id(s) if s.eq_ignore_ascii_case("SYSTEM_TIME")) {
+            return Ok(None);
+        }
+        self.advance(); // consume FOR
+        self.advance(); // consume SYSTEM_TIME
+        self.expect_kw(&TokenKind::KwAs)?;
+        self.expect_kw(&TokenKind::KwOf)?;
+
+        let target = if self.eat_kw(&TokenKind::KwCommitseq) {
+            match self.peek().clone() {
+                TokenKind::Integer(n) if n >= 0 => {
+                    self.advance();
+                    TimeTravelTarget::CommitSequence(n as u64)
+                }
+                _ => return Err(self.err_expected("non-negative integer after COMMITSEQ")),
+            }
+        } else {
+            match self.peek().clone() {
+                TokenKind::String(s) => {
+                    self.advance();
+                    TimeTravelTarget::Timestamp(s)
+                }
+                _ => return Err(self.err_expected(
+                    "COMMITSEQ <n> or '<timestamp>' after FOR SYSTEM_TIME AS OF",
+                )),
+            }
+        };
+
+        Ok(Some(TimeTravelClause { target }))
     }
 
     pub(crate) fn parse_comma_sep<T>(
@@ -718,6 +763,7 @@ impl Parser {
             name,
             alias,
             index_hint,
+            time_travel: None,
         })
     }
 

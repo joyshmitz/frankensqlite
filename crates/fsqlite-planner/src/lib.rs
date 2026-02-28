@@ -829,6 +829,7 @@ fn collect_table_index_hints_inner(
                 name,
                 alias,
                 index_hint,
+                ..
             } => {
                 if let Some(hint) = index_hint {
                     output.insert(canonical_table_key(&name.name), hint.clone());
@@ -3425,6 +3426,7 @@ mod tests {
                     name: QualifiedName::bare(table_name),
                     alias: alias.map(str::to_owned),
                     index_hint: None,
+                    time_travel: None,
                 },
                 joins: vec![],
             }),
@@ -4595,6 +4597,7 @@ mod tests {
                 name: QualifiedName::bare("a"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             joins: vec![JoinClause {
                 join_type: JoinType {
@@ -4605,6 +4608,7 @@ mod tests {
                     name: QualifiedName::bare("b"),
                     alias: None,
                     index_hint: None,
+                    time_travel: None,
                 },
                 constraint: Some(JoinConstraint::On(Expr::BinaryOp {
                     left: Box::new(Expr::Column(ColumnRef::qualified("a", "k"), Span::ZERO)),
@@ -4645,6 +4649,7 @@ mod tests {
                 name: QualifiedName::bare("users"),
                 alias: Some("u".to_owned()),
                 index_hint: Some(IndexHint::IndexedBy("idx_users_email".to_owned())),
+                time_travel: None,
             },
             joins: vec![JoinClause {
                 join_type: JoinType {
@@ -4655,6 +4660,7 @@ mod tests {
                     name: QualifiedName::bare("events"),
                     alias: Some("e".to_owned()),
                     index_hint: Some(IndexHint::NotIndexed),
+                    time_travel: None,
                 },
                 constraint: None,
             }],
@@ -5028,6 +5034,7 @@ mod tests {
                     name: QualifiedName::bare("t"),
                     alias: None,
                     index_hint: None,
+                    time_travel: None,
                 },
                 joins: vec![JoinClause {
                     join_type: JoinType {
@@ -5038,6 +5045,7 @@ mod tests {
                         name: QualifiedName::bare("u"),
                         alias: None,
                         index_hint: None,
+                        time_travel: None,
                     },
                     constraint: None,
                 }],
@@ -5749,6 +5757,7 @@ mod tests {
                 name: QualifiedName::bare("users"),
                 alias: Some("u".to_owned()),
                 index_hint: Some(IndexHint::IndexedBy("idx_users_email".to_owned())),
+                time_travel: None,
             },
             joins: vec![JoinClause {
                 join_type: JoinType {
@@ -5759,6 +5768,7 @@ mod tests {
                     name: QualifiedName::bare("events"),
                     alias: Some("e".to_owned()),
                     index_hint: Some(IndexHint::NotIndexed),
+                    time_travel: None,
                 },
                 constraint: None,
             }],

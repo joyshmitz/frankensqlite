@@ -1826,6 +1826,7 @@ pub fn try_cleanup_orphaned_slot(
             slot.pid_birth.store(0, Ordering::Release);
             slot.lease_expiry.store(0, Ordering::Release);
             slot.cleanup_txn_id.store(0, Ordering::Release);
+            slot.claiming_timestamp.store(0, Ordering::Release);
 
             if !was_claiming && prior_cleanup_marker != 0 {
                 GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, reclaim_pid);
@@ -1881,6 +1882,23 @@ pub fn try_cleanup_orphaned_slot(
         .compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
+        // Zero all fields as per bead_id=bd-2xns field_order_state.
+        slot.state.store(0, Ordering::Release);
+        slot.mode.store(0, Ordering::Release);
+        slot.commit_seq.store(0, Ordering::Release);
+        slot.begin_seq.store(0, Ordering::Release);
+        slot.snapshot_high.store(0, Ordering::Release);
+        slot.witness_epoch.store(0, Ordering::Release);
+        slot.has_in_rw.store(false, Ordering::Release);
+        slot.has_out_rw.store(false, Ordering::Release);
+        slot.marked_for_abort.store(false, Ordering::Release);
+        slot.write_set_pages.store(0, Ordering::Release);
+        slot.pid.store(0, Ordering::Release);
+        slot.pid_birth.store(0, Ordering::Release);
+        slot.lease_expiry.store(0, Ordering::Release);
+        slot.cleanup_txn_id.store(0, Ordering::Release);
+        slot.claiming_timestamp.store(0, Ordering::Release);
+
         GLOBAL_TXN_SLOT_METRICS.record_slot_released(None, pid);
         return SlotCleanupResult::Reclaimed {
             orphan_txn_id,

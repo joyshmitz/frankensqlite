@@ -1650,6 +1650,7 @@ mod tests {
                 name: QualifiedName::bare(name),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             joins: vec![],
         }
@@ -2039,6 +2040,7 @@ mod tests {
                             name: QualifiedName::bare("s"),
                             alias: None,
                             index_hint: None,
+                            time_travel: None,
                         },
                         joins: vec![],
                     }),
@@ -2124,6 +2126,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -2184,6 +2187,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             where_clause: Some(Expr::BinaryOp {
                 left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
@@ -2648,6 +2652,7 @@ mod tests {
                 name: QualifiedName::bare("nonexistent"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![],
             from: None,
@@ -2672,6 +2677,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("no_such_col".to_owned()),
@@ -2702,6 +2708,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -2729,6 +2736,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -2792,6 +2800,7 @@ mod tests {
                             name: QualifiedName::bare("t"),
                             alias: None,
                             index_hint: None,
+                            time_travel: None,
                         },
                         joins: vec![],
                     }),
@@ -2820,6 +2829,7 @@ mod tests {
                 name: QualifiedName::bare("nonexistent"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             where_clause: None,
             returning: vec![],
