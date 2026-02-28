@@ -328,7 +328,7 @@ impl ConformalOracleCalibrator {
 
         let n = sorted.len();
         let q_idx = ((1.0 - self.config.alpha) * (n + 1) as f64).ceil() as usize;
-        let idx = q_idx.min(n) - 1;
+        let idx = q_idx.min(n).saturating_sub(1);
         sorted[idx]
     }
 }

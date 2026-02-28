@@ -356,6 +356,7 @@ pub struct PreparedStatement {
     /// Root capability context inherited from the Connection that prepared
     /// this statement. Carries trace/decision/policy IDs for observability.
     root_cx: Cx,
+    schemas: Vec<fsqlite_vdbe::codegen::TableSchema>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2916,6 +2917,7 @@ impl Connection {
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     root_cx: self.root_cx.clone(),
+                    schemas: Vec::new(),
                 })
             }
             Statement::Select(select) => {
@@ -2938,6 +2940,7 @@ impl Connection {
                     post_distinct_limit: if distinct { limit_clause } else { None },
                     schema_cookie: self.schema_cookie(),
                     root_cx: self.root_cx.clone(),
+                    schemas: self.get_vdbe_schema(),
                 })
             }
             _ => Err(FrankenError::NotImplemented(
@@ -10021,6 +10024,7 @@ impl Connection {
         let reject_mem = *self.reject_mem_fallback.borrow();
         let autoincrement_seq_by_root_page = self.autoincrement_sequence_by_root_page();
         let col_defaults_by_root_page = self.column_defaults_by_root_page();
+        let schemas = self.get_vdbe_schema();
         let (result, txn_back) = execute_table_program_with_db(
             program,
             params,
@@ -10032,6 +10036,7 @@ impl Connection {
             autoincrement_seq_by_root_page,
             col_defaults_by_root_page,
             reject_mem,
+            schemas,
         );
         // Always restore the transaction handle, even on error.
         if let Some(txn) = txn_back {
@@ -12644,6 +12649,7 @@ fn execute_table_program_with_db(
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     reject_mem_fallback: bool,
+    schemas: Vec<fsqlite_vdbe::codegen::TableSchema>,
 ) -> (Result<Vec<Row>>, Option<Box<dyn TransactionHandle>>) {
     let execution_span = tracing::span!(
         target: "fsqlite.execution",
@@ -12667,6 +12673,7 @@ fn execute_table_program_with_db(
     engine.set_column_defaults_by_root_page(column_defaults_by_root_page);
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);
+    engine.set_schemas(schemas);
 
     // Phase 5 (bd-2a3y): if a transaction handle is available, lend it to
     // the engine so storage cursors route through the real pager/WAL stack.

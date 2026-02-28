@@ -201,7 +201,7 @@ impl PageCache {
         file: &mut impl VfsFile,
         page_no: PageNumber,
     ) -> Result<&[u8]> {
-        if self.get(page_no).is_none() {
+        if !self.contains(page_no) {
             let mut buf = self.pool.acquire()?;
             let offset = page_offset(page_no, self.page_size);
             let bytes_read = file.read(cx, buf.as_mut_slice(), offset)?;

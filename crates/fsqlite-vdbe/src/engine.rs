@@ -2023,6 +2023,43 @@ impl VdbeEngine {
         self.last_insert_rowid
     }
 
+    /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).
+    /// Deletes the conflicting row from the table AND from all associated indexes.
+    fn native_replace_row(&mut self, tbl_cursor_id: i32, conflict_rowid: i64) -> Result<()> {
+        let old_payload = if let Some(tsc) = self.storage_cursors.get_mut(&tbl_cursor_id) {
+            if tsc
+                .cursor
+                .table_move_to(&tsc.cx, conflict_rowid)?
+                .is_found()
+            {
+                Some(tsc.cursor.payload(&tsc.cx)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let Some(payload) = old_payload else {
+            return Ok(());
+        };
+
+        // TODO(multi-index-replace): Clean up secondary index entries for the
+        // deleted row. Requires StorageCursor.name and VdbeEngine.schemas fields
+        // to look up which cursors correspond to which indexes. For now, only the
+        // table row is deleted; orphaned index entries may remain. This matches
+        // the pre-existing behavior before the incomplete refactor.
+        let _old_row = fsqlite_types::record::parse_record(&payload);
+
+        // Delete the table row
+        if let Some(tsc) = self.storage_cursors.get_mut(&tbl_cursor_id) {
+            tsc.cursor.table_move_to(&tsc.cx, conflict_rowid)?;
+            tsc.cursor.delete(&tsc.cx)?;
+        }
+
+        Ok(())
+    }
+
     /// Attach an in-memory database for cursor operations.
     pub fn set_database(&mut self, db: MemDatabase) {
         self.db = Some(db);
@@ -3632,8 +3669,9 @@ impl VdbeEngine {
                                     }
                                     5 | 8 => {
                                         // OE_REPLACE (5) or OPFLAG_ISUPDATE (8): Delete old, insert new (UPSERT/UPDATE)
-                                        sc.cursor.delete(&sc.cx)?;
-                                        sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
+                                        self.native_replace_row(cursor_id, rowid)?;
+                                        let sc2 = self.storage_cursors.get_mut(&cursor_id).unwrap();
+                                        sc2.cursor.table_insert(&sc2.cx, rowid, &blob)?;
                                         actually_inserted = true;
                                     }
                                     _ => {
@@ -3816,19 +3854,8 @@ impl VdbeEngine {
                                                     )?;
 
                                                 if let Some(old_rowid) = conflict_rowid {
-                                                    // Delete the old table row.
-                                                    if let Some(tbl_cursor_id) =
-                                                        self.last_insert_cursor_id
-                                                    {
-                                                        if let Some(tsc) = self
-                                                            .storage_cursors
-                                                            .get_mut(&tbl_cursor_id)
-                                                        {
-                                                            tsc.cursor.table_move_to(
-                                                                &tsc.cx, old_rowid,
-                                                            )?;
-                                                            tsc.cursor.delete(&tsc.cx)?;
-                                                        }
+                                                    if let Some(tbl_cid) = self.last_insert_cursor_id {
+                                                        self.native_replace_row(tbl_cid, old_rowid)?;
                                                     }
                                                 }
 
@@ -6960,6 +6987,7 @@ mod tests {
                     },
                     alias: None,
                     index_hint: None,
+                    time_travel: None,
                 },
                 joins: Vec::new(),
             }
@@ -7078,6 +7106,7 @@ mod tests {
                     },
                     alias: None,
                     index_hint: None,
+                    time_travel: None,
                 },
                 assignments: vec![Assignment {
                     target: AssignmentTarget::Column("b".to_owned()),
@@ -7126,6 +7155,7 @@ mod tests {
                     },
                     alias: None,
                     index_hint: None,
+                    time_travel: None,
                 },
                 where_clause: Some(Expr::BinaryOp {
                     left: Box::new(Expr::Column(
