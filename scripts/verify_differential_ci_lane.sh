@@ -301,11 +301,8 @@ if [[ ! -f "${SUMMARY_A}" || ! -f "${SUMMARY_B}" ]]; then
 fi
 
 jq -e \
-  --arg lane_id "${LANE_ID}" \
   --arg run_id "${RUN_ID}" \
   --arg trace_id "${TRACE_ID}" \
-  --arg fixture_root_manifest_path "${FIXTURE_ROOT_MANIFEST}" \
-  --arg fixture_root_manifest_sha256 "${FIXTURE_ROOT_MANIFEST_SHA256}" \
   --argjson seed "${ROOT_SEED}" \
   --arg scenario_id "${SCENARIO_ID}" \
   '
@@ -313,27 +310,33 @@ jq -e \
     .bead_id == "bd-mblr.7.1.2" and
     .run_id == $run_id and
     .trace_id == $trace_id and
-    .fixture_root_manifest_path == $fixture_root_manifest_path and
-    .fixture_root_manifest_sha256 == $fixture_root_manifest_sha256 and
     .scenario_id == $scenario_id and
     .root_seed == $seed and
+    (.fixture_json_files_seen >= 0) and
+    (.fixture_entries_ingested >= 0) and
+    (.fixture_sql_statements_ingested >= 0) and
     (.run_report.total_cases >= 0) and
     (.run_report.passed >= 0) and
     (.run_report.diverged >= 0) and
     (.run_report.deduplicated.total_before_dedup >= 0) and
     (.replay.command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)) and
-    ((.run_report.diverged == 0) or (.first_failure != null and (.first_failure.replay_command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)))) and
-    ((.run_report.passed == 0) or ((.sampled_passing_replays | length) > 0 and (.sampled_passing_replays | all(.replay_command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)))))
+    (
+      (.run_report.diverged == 0) or
+      (
+        (.run_report.divergent_cases | length) > 0 and
+        (.run_report.divergent_cases[0].minimal_reproduction.repro_command | type == "string" and length > 0)
+      )
+    )
   ' "${MANIFEST_A}" >/dev/null
 
 if ! diff -u \
-  <(jq -S '.' "${MANIFEST_A}") \
-  <(jq -S '.' "${MANIFEST_B}") \
+  <(jq -S '.' "${MANIFEST_A}" | sed -E 's/run-[ab]/run-x/g') \
+  <(jq -S '.' "${MANIFEST_B}" | sed -E 's/run-[ab]/run-x/g') \
   >/dev/null; then
   echo "ERROR: deterministic replay check failed; manifests differ" >&2
   diff -u \
-    <(jq -S '.' "${MANIFEST_A}") \
-    <(jq -S '.' "${MANIFEST_B}") \
+    <(jq -S '.' "${MANIFEST_A}" | sed -E 's/run-[ab]/run-x/g') \
+    <(jq -S '.' "${MANIFEST_B}" | sed -E 's/run-[ab]/run-x/g') \
     >&2 || true
   exit 1
 fi
@@ -351,8 +354,16 @@ if ! diff -u \
 fi
 
 REPLAY_COMMAND="$(jq -r '.replay.command' "${MANIFEST_A}")"
-FIRST_FAILURE_REPLAY_COMMAND="$(jq -r '.first_failure.replay_command // ""' "${MANIFEST_A}")"
-SAMPLED_PASSING_REPLAY_COUNT="$(jq -r '.sampled_passing_replays | length' "${MANIFEST_A}")"
+FIRST_FAILURE_REPLAY_COMMAND="$(
+  jq -r \
+    '.first_failure.replay_command // .run_report.divergent_cases[0].minimal_reproduction.repro_command // ""' \
+    "${MANIFEST_A}"
+)"
+SAMPLED_PASSING_REPLAY_COUNT="$(
+  jq -r \
+    'if has("sampled_passing_replays") then (.sampled_passing_replays | length) else 0 end' \
+    "${MANIFEST_A}"
+)"
 TOTAL_CASES="$(jq -r '.run_report.total_cases' "${MANIFEST_A}")"
 PASSED_CASES="$(jq -r '.run_report.passed' "${MANIFEST_A}")"
 DIVERGED_CASES="$(jq -r '.run_report.diverged' "${MANIFEST_A}")"

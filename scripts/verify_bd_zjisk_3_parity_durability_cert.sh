@@ -281,8 +281,8 @@ REPORT_PAYLOAD="$(
     --arg durability_replay_matrix "${DURABILITY_REPLAY_MATRIX}" \
     --arg durability_replay_dry_run "${DURABILITY_REPLAY_DRY_RUN}" \
     --argjson artifact_hashes "${artifact_hashes_json}" \
-    --argfile differential "${DIFF_REPORT}" \
-    --argfile durability "${DURABILITY_REPORT}" \
+    --slurpfile differential "${DIFF_REPORT}" \
+    --slurpfile durability "${DURABILITY_REPORT}" \
     '
       {
         schema_version: $schema_version,
@@ -323,8 +323,8 @@ REPORT_PAYLOAD="$(
           durability_log: $durability_log
         },
         artifact_hashes: $artifact_hashes,
-        differential_gate: $differential,
-        durability_gate: $durability
+        differential_gate: $differential[0],
+        durability_gate: $durability[0]
       }
     '
 )"
