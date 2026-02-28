@@ -4389,13 +4389,14 @@ pub fn codegen_delete(
     emit_index_deletes(b, table, table_cursor);
 
     // Delete at cursor position.
+    // P5 bit 0 = OPFLAG_NCHANGE: count this deletion in changes().
     b.emit_op(
         Opcode::Delete,
         table_cursor,
         0,
         0,
         P4::Table(table.name.clone()),
-        0,
+        1,
     );
 
     // Skip label for WHERE-filtered rows.

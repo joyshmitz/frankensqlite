@@ -2442,12 +2442,8 @@ impl VdbeEngine {
                     //      correct historical version.
                     let cursor_id = op.p1;
                     let target = match &op.p4 {
-                        P4::TimeTravelCommitSeq(seq) => {
-                            TimeTravelMarker::CommitSeq(*seq)
-                        }
-                        P4::TimeTravelTimestamp(ts) => {
-                            TimeTravelMarker::Timestamp(ts.clone())
-                        }
+                        P4::TimeTravelCommitSeq(seq) => TimeTravelMarker::CommitSeq(*seq),
+                        P4::TimeTravelTimestamp(ts) => TimeTravelMarker::Timestamp(ts.clone()),
                         _ => {
                             return Err(FrankenError::Internal(
                                 "SetSnapshot: invalid P4 (expected time-travel target)".to_owned(),
@@ -3731,7 +3727,14 @@ impl VdbeEngine {
                                     5 | 8 => {
                                         // OE_REPLACE (5) or OPFLAG_ISUPDATE (8): Delete old, insert new (UPSERT/UPDATE)
                                         self.native_replace_row(cursor_id, rowid)?;
-                                        let sc2 = self.storage_cursors.get_mut(&cursor_id).unwrap();
+                                        let sc2 = self
+                                            .storage_cursors
+                                            .get_mut(&cursor_id)
+                                            .ok_or_else(|| {
+                                                FrankenError::internal(
+                                                    "cursor disappeared during REPLACE",
+                                                )
+                                            })?;
                                         sc2.cursor.table_insert(&sc2.cx, rowid, &blob)?;
                                         actually_inserted = true;
                                     }
@@ -3839,7 +3842,12 @@ impl VdbeEngine {
                         }
                     }
                     if deleted {
-                        self.changes += 1;
+                        // P5 bit 0 = OPFLAG_NCHANGE: only count standalone
+                        // DELETE changes. UPDATE's internal Delete uses P5=0
+                        // so only the subsequent Insert counts.
+                        if op.p5 & 1 != 0 {
+                            self.changes += 1;
+                        }
                         self.pending_next_after_delete.insert(cursor_id);
                     }
                     pc += 1;
@@ -4679,15 +4687,20 @@ impl VdbeEngine {
 
                 // ── LIMIT/OFFSET support ────────────────────────────────
                 // DecrJumpZero: decrement register p1; if result is zero
-                // or negative, jump to p2. Used to count down remaining LIMIT rows.
-                // C SQLite: `if( pIn1->u.i<=0 ) goto jump_to_p2;`
+                // jump to p2. If value is initially zero or negative, do nothing.
+                // Used to count down remaining LIMIT rows.
                 Opcode::DecrJumpZero => {
-                    let val = self.get_reg(op.p1).to_integer() - 1;
-                    self.set_reg(op.p1, SqliteValue::Integer(val));
-                    if val <= 0 {
-                        #[allow(clippy::cast_sign_loss)]
-                        {
-                            pc = op.p2 as usize;
+                    let mut val = self.get_reg(op.p1).to_integer();
+                    if val > 0 {
+                        val -= 1;
+                        self.set_reg(op.p1, SqliteValue::Integer(val));
+                        if val == 0 {
+                            #[allow(clippy::cast_sign_loss)]
+                            {
+                                pc = op.p2 as usize;
+                            }
+                        } else {
+                            pc += 1;
                         }
                     } else {
                         pc += 1;

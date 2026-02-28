@@ -12,10 +12,9 @@
 //   & | << >> (bitwise)
 //   + - (binary)
 //   * / %
-//   || (concat)
+//   || -> ->> (left-associative; same precedence level)
 //   COLLATE (postfix)
 //   ~ - + (unary prefix)
-//   -> ->> (JSON)
 
 use fsqlite_ast::{
     BinaryOp, ColumnRef, Expr, FunctionArgs, InSet, JsonArrow, LikeOp, Literal, PlaceholderType,
@@ -2334,27 +2333,49 @@ mod tests {
         }
     }
 
-    // JSON operators at highest infix precedence
+    // JSON operators share precedence with concat and associate left-to-right.
     #[test]
-    fn test_pratt_json_highest_infix() {
-        // a || b -> c → a || (b -> c) since JSON binds tightest
+    fn test_pratt_json_same_precedence_as_concat() {
+        // a || b -> c parses as (a || b) -> c.
         let expr = parse("a || b -> c");
         match &expr {
-            Expr::BinaryOp {
-                op: BinaryOp::Concat,
-                right,
+            Expr::JsonAccess {
+                expr: left,
+                path: right,
+                arrow: JsonArrow::Arrow,
                 ..
-            } => assert!(
-                matches!(
-                    right.as_ref(),
-                    Expr::JsonAccess {
-                        arrow: JsonArrow::Arrow,
-                        ..
-                    }
-                ),
-                "JSON -> should bind tighter than concat"
-            ),
-            other => unreachable!("expected Concat(a, JsonAccess(b,c)), got {other:?}"),
+            } => {
+                assert!(
+                    matches!(
+                        left.as_ref(),
+                        Expr::BinaryOp {
+                            op: BinaryOp::Concat,
+                            ..
+                        }
+                    ),
+                    "left side should be concat expression"
+                );
+                assert!(
+                    matches!(right.as_ref(), Expr::Column(_, _)),
+                    "path should remain the right-hand expression"
+                );
+            }
+            other => unreachable!("expected JsonAccess(Concat(a,b), c), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_pratt_double_arrow_same_precedence_as_concat() {
+        let expr = parse("a || b ->> c");
+        assert!(
+            matches!(
+                expr,
+                Expr::JsonAccess {
+                    arrow: JsonArrow::DoubleArrow,
+                    ..
+                }
+            ),
+            "double-arrow should parse as JsonAccess at the same precedence level as concat"
+        );
     }
 }

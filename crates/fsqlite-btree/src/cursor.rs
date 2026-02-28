@@ -1563,17 +1563,15 @@ impl<P: PageWriter> BtCursor<P> {
     }
 
     fn replace_interior_cell(&mut self, cx: &Cx, new_payload: &[u8]) -> Result<()> {
-        let depth = self.stack.len();
-        if depth == 0 || self.at_eof {
+        if self.stack.is_empty() || self.at_eof {
             return Err(FrankenError::internal(
                 "cursor at EOF during interior replace",
             ));
         }
-        let top = self
-            .stack
-            .last()
-            .cloned()
-            .ok_or_else(|| FrankenError::internal("cursor stack empty during interior replace"))?;
+        let top =
+            self.stack.last().cloned().ok_or_else(|| {
+                FrankenError::internal("cursor stack empty during interior replace")
+            })?;
         let page_no = top.page_no;
         let cell_idx = top.cell_idx;
 
@@ -1594,8 +1592,7 @@ impl<P: PageWriter> BtCursor<P> {
         new_cell.extend_from_slice(&varint[..p_len]);
 
         let local_size =
-            cell::local_payload_size(payload_size, self.usable_size, top.header.page_type)
-                as usize;
+            cell::local_payload_size(payload_size, self.usable_size, top.header.page_type) as usize;
         let local_size = local_size.min(new_payload.len());
 
         new_cell.extend_from_slice(&new_payload[..local_size]);
@@ -1638,22 +1635,21 @@ impl<P: PageWriter> BtCursor<P> {
             let ptr = *ptr_mut as usize;
             let c = CellRef::parse(&old_page_data, ptr, header.page_type, self.usable_size)?;
             let size = crate::payload::cell_on_page_size(&c, ptr);
-            new_content_offset = new_content_offset
-                .checked_sub(size)
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
                     detail: "cell size overflow during interior defragmentation".to_owned(),
-                })?;
+                }
+            })?;
             let src_end = ptr
                 .checked_add(size)
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "interior cell size overflow while copying".to_owned(),
                 })?;
-            let dst_end =
-                new_content_offset
-                    .checked_add(size)
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: "interior destination overflow while copying".to_owned(),
-                    })?;
+            let dst_end = new_content_offset.checked_add(size).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "interior destination overflow while copying".to_owned(),
+                }
+            })?;
             if src_end > old_page_data.len() || dst_end > page_data.len() {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "interior cell copy out of bounds".to_owned(),
@@ -1682,9 +1678,10 @@ impl<P: PageWriter> BtCursor<P> {
                 })?,
             );
 
-            header.cell_count = u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
-                detail: "interior cell count exceeds u16 range".to_owned(),
-            })?;
+            header.cell_count =
+                u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+                    detail: "interior cell count exceeds u16 range".to_owned(),
+                })?;
             header.cell_content_offset =
                 u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
                     detail: "interior content offset exceeds u32 range".to_owned(),
@@ -1699,30 +1696,14 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(());
         }
 
-        // It does not fit. We must rebalance.
-        header.cell_count = u16::try_from(ptrs.len()).map_err(|_| FrankenError::DatabaseCorrupt {
-            detail: "interior cell count exceeds u16 range".to_owned(),
-        })?;
-        header.cell_content_offset =
-            u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
-                detail: "interior content offset exceeds u32 range".to_owned(),
-            })?;
-        header.write(&mut page_data, header_offset);
-        cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
-        self.pager.write_page(cx, page_no, &page_data)?;
-
-        self.stack.truncate(depth);
-        let res = self.balance_for_insert(cx, &new_cell, cell_idx);
-
-        if res.is_ok() {
-            if let Some(first) = old_overflow {
-                self.free_overflow_chain(cx, first)?;
-            }
-        } else if let Some(first) = overflow_head {
+        // Replacement that would require structural rebalance is intentionally
+        // rejected here so delete paths remain failure-atomic at the cursor layer.
+        if let Some(first) = overflow_head {
             let _ = self.free_overflow_chain(cx, first);
         }
-
-        res
+        Err(FrankenError::DatabaseCorrupt {
+            detail: "interior replacement requires rebalance; refusing partial update".to_owned(),
+        })
     }
 
     fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {
@@ -2060,49 +2041,80 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 .last()
                 .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
                 .clone();
-                
+
             if !top.header.page_type.is_leaf() {
-                // Interior node deletion (index B-trees).
-                // 1. Save the original key we want to delete.
+                // Interior node deletion (index B-trees):
+                // 1) identify successor payload, 2) replace interior key,
+                // 3) remove duplicate successor from leaf.
                 let original_key = cursor.payload(cx)?;
-                
-                // 2. Advance to the successor. It is guaranteed to be on a leaf.
+
+                // Advance to the successor in the right subtree.
                 let advanced = cursor.advance_next(cx)?;
                 if !advanced || cursor.at_eof {
-                    return Err(FrankenError::DatabaseCorrupt { detail: "no successor for interior node".to_owned() });
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "no successor for interior node".to_owned(),
+                    });
                 }
-                
-                // 3. Save the successor's payload.
                 let successor_key = cursor.payload(cx)?;
-                
-                // 4. Delete the successor from the leaf.
+
+                // Re-seek the original key to perform in-place interior replacement.
+                let seek_res = cursor.index_seek(cx, &original_key)?;
+                if !seek_res.is_found() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "original key disappeared during interior delete".to_owned(),
+                    });
+                }
+
+                let top_after = cursor
+                    .stack
+                    .last()
+                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
+                    .clone();
+                if top_after.header.page_type.is_leaf() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "interior delete target unexpectedly resolved to leaf".to_owned(),
+                    });
+                }
+
+                // Replace the interior key first so failures do not lose both keys.
+                cursor.replace_interior_cell(cx, &successor_key)?;
+
+                // Re-seek successor. A found interior match means the duplicate leaf
+                // successor should be the immediate next entry.
+                let successor_seek = cursor.index_seek(cx, &successor_key)?;
+                if !successor_seek.is_found() {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "successor key missing after interior replacement".to_owned(),
+                    });
+                }
+
+                let top_successor = cursor
+                    .stack
+                    .last()
+                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
+                    .clone();
+                if !top_successor.header.page_type.is_leaf() {
+                    let moved = cursor.advance_next(cx)?;
+                    if !moved || cursor.at_eof {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "missing leaf successor during interior delete".to_owned(),
+                        });
+                    }
+                    let key_at_cursor = cursor.payload(cx)?;
+                    if key_at_cursor != successor_key {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: "failed to locate duplicate leaf successor".to_owned(),
+                        });
+                    }
+                }
+
                 let (_leaf_pgno, new_count) = cursor.remove_cell_from_leaf(cx)?;
                 if new_count == 0 {
                     cursor.balance_for_delete(cx)?;
                 }
-                
-                // 5. Re-seek the original key. The tree might have rebalanced, moving the target cell.
-                let seek_res = cursor.index_seek(cx, &original_key)?;
-                if !seek_res.is_found() {
-                    return Err(FrankenError::DatabaseCorrupt { detail: "original key disappeared during interior delete".to_owned() });
-                }
-                
-                // 6. We are now pointing to the original cell again.
-                // If it became a leaf due to root collapse, we just delete it from the leaf!
-                let top_after = cursor.stack.last().unwrap().clone();
-                if top_after.header.page_type.is_leaf() {
-                    let (_leaf_pgno, new_count) = cursor.remove_cell_from_leaf(cx)?;
-                    if new_count == 0 {
-                        cursor.balance_for_delete(cx)?;
-                    }
-                    // Restore the successor_key since we didn't get to replace the interior
-                    // cell with it, and it was deleted from the leaf in step 4.
-                    cursor.index_insert(cx, &successor_key)?;
-                    return Ok(());
-                }
-                
-                // 7. It is still an interior cell. Replace it with the successor payload.
-                cursor.replace_interior_cell(cx, &successor_key)?;
+
+                // Delete contract: position cursor at the next logical entry.
+                let _ = cursor.index_seek(cx, &successor_key)?;
                 return Ok(());
             }
 
@@ -2156,7 +2168,8 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             Ok(())
         })
     }
-fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
+
+    fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
         }
