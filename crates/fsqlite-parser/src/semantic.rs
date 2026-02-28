@@ -204,7 +204,7 @@ impl Scope {
     #[must_use]
     pub fn has_alias(&self, alias: &str) -> bool {
         let key = alias.to_ascii_lowercase();
-        if self.aliases.contains_key(&key) || self.ctes.contains(&key) {
+        if self.aliases.contains_key(&key) {
             return true;
         }
         self.parent.as_ref().is_some_and(|p| p.has_alias(alias))
@@ -214,7 +214,7 @@ impl Scope {
     #[must_use]
     pub fn has_alias_local(&self, alias: &str) -> bool {
         let key = alias.to_ascii_lowercase();
-        self.aliases.contains_key(&key) || self.ctes.contains(&key)
+        self.aliases.contains_key(&key)
     }
 
     /// Resolve a column reference: find which alias provides it.

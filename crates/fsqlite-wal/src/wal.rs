@@ -567,9 +567,13 @@ impl<F: VfsFile> WalFile<F> {
         &mut self,
         frames_written: usize,
         new_running_checksum: SqliteWalChecksum,
-    ) {
-        self.frame_count = self.frame_count.saturating_add(frames_written);
+    ) -> Result<()> {
+        self.frame_count = self
+            .frame_count
+            .checked_add(frames_written)
+            .ok_or(FrankenError::DatabaseFull)?;
         self.running_checksum = new_running_checksum;
+        Ok(())
     }
 
     /// Append a frame to the WAL.

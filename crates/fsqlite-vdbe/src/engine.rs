@@ -3831,7 +3831,9 @@ impl VdbeEngine {
                                                 let sc2 = self
                                                     .storage_cursors
                                                     .get_mut(&cursor_id)
-                                                    .expect("cursor must exist");
+                                                    .ok_or_else(|| {
+                                                        FrankenError::internal("cursor must exist")
+                                                    })?;
                                                 sc2.cursor.index_insert(&sc2.cx, &key_bytes)?;
                                             }
                                             // Default: propagate the error
@@ -4090,11 +4092,15 @@ impl VdbeEngine {
                     let start_a = op.p1;
                     let start_b = op.p2;
                     let count = op.p3;
+                    let compare_collations = parse_compare_collations(&op.p4);
                     let mut result = Ordering::Equal;
                     for i in 0..count {
                         let val_a = self.get_reg(start_a + i);
                         let val_b = self.get_reg(start_b + i);
-                        let ord = if let P4::Collation(ref coll_name) = op.p4 {
+                        let coll_name = usize::try_from(i).ok().and_then(|field_idx| {
+                            compare_collation_for_field(compare_collations.as_deref(), field_idx)
+                        });
+                        let ord = if let Some(coll_name) = coll_name {
                             collate_compare(val_a, val_b, coll_name)
                         } else {
                             val_a.partial_cmp(val_b)
@@ -5541,6 +5547,30 @@ fn collate_compare(
     }
 }
 
+fn parse_compare_collations(p4: &P4) -> Option<Vec<String>> {
+    match p4 {
+        P4::Collation(name) => Some(vec![name.clone()]),
+        P4::Str(spec) => {
+            let parsed: Vec<String> = spec
+                .split([',', '|', '\0'])
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_owned)
+                .collect();
+            (!parsed.is_empty()).then_some(parsed)
+        }
+        _ => None,
+    }
+}
+
+fn compare_collation_for_field(collations: Option<&[String]>, field_idx: usize) -> Option<&str> {
+    let collations = collations?;
+    if collations.len() == 1 {
+        return collations.first().map(String::as_str);
+    }
+    collations.get(field_idx).map(String::as_str)
+}
+
 /// For REPLACE conflict resolution: re-seek the index cursor, find the
 /// conflicting entry (which has matching indexed columns but a different
 /// rowid), delete it from the index, and return its rowid so the caller
@@ -6343,6 +6373,119 @@ mod tests {
         assert_eq!(rows[1], vec![SqliteValue::Integer(0)]); // 3 > 5 = false
     }
 
+    #[test]
+    fn test_compare_opcode_uses_per_field_collation_list() {
+        let mut b = ProgramBuilder::new();
+        let left_key = b.alloc_regs(2);
+        let right_key = b.alloc_regs(2);
+
+        b.emit_op(
+            Opcode::String8,
+            0,
+            left_key,
+            0,
+            P4::Str("Apple".to_owned()),
+            0,
+        );
+        b.emit_op(
+            Opcode::String8,
+            0,
+            left_key + 1,
+            0,
+            P4::Str("beta".to_owned()),
+            0,
+        );
+        b.emit_op(
+            Opcode::String8,
+            0,
+            right_key,
+            0,
+            P4::Str("apple".to_owned()),
+            0,
+        );
+        b.emit_op(
+            Opcode::String8,
+            0,
+            right_key + 1,
+            0,
+            P4::Str("Beta".to_owned()),
+            0,
+        );
+        b.emit_op(
+            Opcode::Compare,
+            left_key,
+            right_key,
+            2,
+            P4::Str("NOCASE,BINARY".to_owned()),
+            0,
+        );
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            engine.last_compare_result,
+            Some(std::cmp::Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn test_compare_opcode_parses_trimmed_collation_list() {
+        let mut b = ProgramBuilder::new();
+        let left_key = b.alloc_regs(2);
+        let right_key = b.alloc_regs(2);
+
+        b.emit_op(
+            Opcode::String8,
+            0,
+            left_key,
+            0,
+            P4::Str("Alpha".to_owned()),
+            0,
+        );
+        b.emit_op(
+            Opcode::String8,
+            0,
+            left_key + 1,
+            0,
+            P4::Str("tail   ".to_owned()),
+            0,
+        );
+        b.emit_op(
+            Opcode::String8,
+            0,
+            right_key,
+            0,
+            P4::Str("alpha".to_owned()),
+            0,
+        );
+        b.emit_op(
+            Opcode::String8,
+            0,
+            right_key + 1,
+            0,
+            P4::Str("tail".to_owned()),
+            0,
+        );
+        b.emit_op(
+            Opcode::Compare,
+            left_key,
+            right_key,
+            2,
+            P4::Str(" NOCASE | RTRIM ".to_owned()),
+            0,
+        );
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(engine.last_compare_result, Some(std::cmp::Ordering::Equal));
+    }
+
     // ── test_vdbe_division_by_zero ──────────────────────────────────────
     #[test]
     fn test_vdbe_division_by_zero() {
@@ -6792,6 +6935,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             }]
         }
 

@@ -422,6 +422,7 @@ impl TokenKind {
                 | Self::KwAlter
                 | Self::KwBegin
                 | Self::KwCommit
+                | Self::KwEnd
                 | Self::KwRollback
                 | Self::KwSavepoint
                 | Self::KwRelease

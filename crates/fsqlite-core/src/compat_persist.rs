@@ -276,6 +276,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
             columns,
             indexes: Vec::new(),
             strict: is_strict_table_sql(&create_sql),
+            foreign_keys: Vec::new(),
         });
 
         // Read all rows from this table's B-tree.
@@ -773,6 +774,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             strict: false,
+            foreign_keys: Vec::new(),
         }];
 
         (schema, db)
@@ -925,6 +927,7 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 strict: false,
+                foreign_keys: Vec::new(),
             },
             TableSchema {
                 name: "beta".to_owned(),
@@ -943,6 +946,7 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 strict: false,
+                foreign_keys: Vec::new(),
             },
         ];
 
@@ -1037,6 +1041,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             strict: true,
+            foreign_keys: Vec::new(),
         };
 
         let sql = build_create_table_sql(&table);

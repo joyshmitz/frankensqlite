@@ -197,7 +197,8 @@ impl PageWriter for MemPageStore {
             .copied()
             .max()
             .unwrap_or(1)
-            .saturating_add(1);
+            .checked_add(1)
+            .ok_or(FrankenError::DatabaseFull)?;
         let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
         self.pages.insert(next, vec![0u8; self.page_size as usize]);
         Ok(pgno)
@@ -1552,6 +1553,16 @@ impl<P: PageWriter> BtCursor<P> {
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let mut header = BtreePageHeader::parse(&page_data, header_offset)?;
         let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
+        if delete_idx >= ptrs.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "delete_idx {} out of bounds for page {} with {} cells",
+                    delete_idx,
+                    leaf_page_no,
+                    ptrs.len()
+                ),
+            });
+        }
         ptrs.remove(delete_idx);
 
         // Defragment the page to reclaim the space used by the deleted cell.

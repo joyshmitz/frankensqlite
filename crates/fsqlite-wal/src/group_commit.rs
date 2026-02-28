@@ -641,7 +641,7 @@ pub fn write_consolidated_frames<F: VfsFile>(
     wal.file_mut().sync(cx, SyncFlags::FULL)?;
 
     let frames_written = total_frames;
-    wal.advance_state_after_write(frames_written, running_checksum);
+    wal.advance_state_after_write(frames_written, running_checksum)?;
 
     // Record metrics.
     let bytes_written = u64::try_from(total_bytes).unwrap_or(u64::MAX);

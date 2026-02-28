@@ -102,8 +102,8 @@ pub fn balance_deeper<W: PageWriter>(
         let cell_ref = CellRef::parse(&root_data, cell_offset, root_header.page_type, usable_size)?;
         let cell_end = cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
         let data = root_data[cell_offset..cell_end].to_vec();
-        let size = u16::try_from(data.len()).map_err(|_| {
-            FrankenError::Internal("cell too large during balance_deeper".to_owned())
+        let size = u16::try_from(data.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "cell too large during balance_deeper".to_owned(),
         })?;
         root_cells.push(GatheredCell { data, size });
     }
@@ -1345,8 +1345,8 @@ fn balance_shallower<W: PageWriter>(
         )?;
         let cell_end = cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
         let data = child_data[cell_offset..cell_end].to_vec();
-        let size = u16::try_from(data.len()).map_err(|_| {
-            FrankenError::Internal("cell too large during balance_shallower".to_owned())
+        let size = u16::try_from(data.len()).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: "cell too large during balance_shallower".to_owned(),
         })?;
         child_cells.push(GatheredCell { data, size });
     }

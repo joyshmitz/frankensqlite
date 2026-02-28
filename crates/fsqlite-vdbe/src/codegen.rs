@@ -3556,6 +3556,19 @@ fn codegen_insert_select(
         }
     };
 
+    if from.is_none() {
+        return codegen_insert_select_without_from(
+            b,
+            columns,
+            where_clause.as_deref(),
+            write_cursor,
+            target_table,
+            returning,
+            ctx,
+            oe_flag,
+        );
+    }
+
     let from_clause = from
         .as_ref()
         .ok_or_else(|| CodegenError::Unsupported("INSERT ... SELECT without FROM".to_owned()))?;
@@ -3722,6 +3735,116 @@ fn codegen_insert_select(
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, read_cursor, 0, 0, P4::None, 0);
 
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn codegen_insert_select_without_from(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    write_cursor: i32,
+    target_table: &TableSchema,
+    returning: &[ResultColumn],
+    ctx: &CodegenContext,
+    oe_flag: u16,
+) -> Result<(), CodegenError> {
+    let n_cols = result_column_count_without_from(columns)?;
+    let rowid_reg = b.alloc_reg();
+    let val_regs = b.alloc_regs(n_cols);
+    let rec_reg = b.alloc_reg();
+    let concurrent_flag = i32::from(ctx.concurrent_mode);
+    let done_label = b.emit_label();
+
+    if let Some(where_expr) = where_clause {
+        let filter_reg = b.alloc_temp();
+        emit_expr(b, where_expr, filter_reg, None);
+        // Treat NULL WHERE results as false (skip insert).
+        b.emit_jump_to_label(Opcode::IfNot, filter_reg, 1, done_label, P4::None, 0);
+        b.free_temp(filter_reg);
+    }
+
+    emit_projection_without_from(b, columns, val_regs)?;
+
+    // Rowid determination: use IPK column value if present, else auto-generate.
+    if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
+        let ipk_reg = val_regs + ipk_idx as i32;
+        let auto_label = b.emit_label();
+        let done_rowid = b.emit_label();
+
+        b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
+
+        // Non-NULL: use the selected value as rowid.
+        b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_rowid, P4::None, 0);
+
+        // NULL: auto-generate and sync back.
+        b.resolve_label(auto_label);
+        b.emit_op(
+            Opcode::NewRowid,
+            write_cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+        b.resolve_label(done_rowid);
+    } else {
+        b.emit_op(
+            Opcode::NewRowid,
+            write_cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
+    }
+
+    // Evaluate STORED generated columns before packing the record.
+    emit_stored_generated_columns(b, target_table, val_regs);
+
+    // Apply column type affinities before packing the record.
+    let aff_str = target_table.affinity_string();
+    b.emit_op(
+        Opcode::Affinity,
+        val_regs,
+        n_cols,
+        0,
+        P4::Affinity(aff_str.clone()),
+        0,
+    );
+
+    emit_strict_type_check(b, target_table, val_regs);
+    b.emit_op(
+        Opcode::MakeRecord,
+        val_regs,
+        n_cols,
+        rec_reg,
+        P4::Affinity(aff_str),
+        0,
+    );
+
+    b.emit_op(
+        Opcode::Insert,
+        write_cursor,
+        rec_reg,
+        rowid_reg,
+        P4::Table(target_table.name.clone()),
+        oe_flag,
+    );
+
+    emit_index_inserts(b, target_table, write_cursor, val_regs, rowid_reg, oe_flag);
+
+    if !returning.is_empty() {
+        emit_returning(b, write_cursor, target_table, returning, rowid_reg)?;
+    }
+
+    b.resolve_label(done_label);
     Ok(())
 }
 
@@ -4405,6 +4528,22 @@ fn result_column_count(columns: &[ResultColumn], table: &TableSchema) -> i32 {
     count
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn result_column_count_without_from(columns: &[ResultColumn]) -> Result<i32, CodegenError> {
+    let mut count = 0i32;
+    for col in columns {
+        match col {
+            ResultColumn::Expr { .. } => count += 1,
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                return Err(CodegenError::Unsupported(
+                    "INSERT ... SELECT without FROM does not support `*` projections".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Emit Column instructions to read result columns into registers.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_column_reads(
@@ -4477,6 +4616,29 @@ fn emit_column_reads(
                     emit_expr(b, expr, reg, Some(&scan));
                 }
                 reg += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_projection_without_from(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+    base_reg: i32,
+) -> Result<(), CodegenError> {
+    let mut reg = base_reg;
+    for col in columns {
+        match col {
+            ResultColumn::Expr { expr, .. } => {
+                emit_expr(b, expr, reg, None);
+                reg += 1;
+            }
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                return Err(CodegenError::Unsupported(
+                    "INSERT ... SELECT without FROM does not support `*` projections".to_owned(),
+                ));
             }
         }
     }
@@ -7026,6 +7188,7 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            foreign_keys: Vec::new(),
         }]
     }
 
@@ -7044,6 +7207,7 @@ mod tests {
                 is_unique: false,
             }],
             strict: false,
+            foreign_keys: Vec::new(),
         }]
     }
 
@@ -7080,6 +7244,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -7087,6 +7252,7 @@ mod tests {
                 columns: vec![ColumnInfo::basic("b", 'd', false)],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
         ]
     }
@@ -7246,6 +7412,7 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            foreign_keys: Vec::new(),
         }]
     }
 
@@ -7510,6 +7677,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -7542,6 +7710,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
         ];
 
@@ -7636,6 +7805,124 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_insert_select_without_from_emits_single_insert_path() {
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'd', false),
+                ColumnInfo::basic("b", 'C', false),
+            ],
+            indexes: vec![],
+            strict: false,
+            foreign_keys: Vec::new(),
+        }];
+
+        let inner_select = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Literal(Literal::Integer(7), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Literal(Literal::String("seven".to_owned()), Span::ZERO),
+                            alias: None,
+                        },
+                    ],
+                    from: None,
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Select(Box::new(inner_select)),
+            upsert: vec![],
+            returning: vec![],
+        };
+
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(ops.contains(&Opcode::Insert));
+        assert!(ops.contains(&Opcode::Integer));
+        assert!(ops.contains(&Opcode::String8));
+        assert!(!ops.contains(&Opcode::OpenRead));
+        assert!(!ops.contains(&Opcode::Rewind));
+        assert!(!ops.contains(&Opcode::Next));
+    }
+
+    #[test]
+    fn test_codegen_insert_select_without_from_where_emits_filter_jump() {
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![ColumnInfo::basic("a", 'd', false)],
+            indexes: vec![],
+            strict: false,
+            foreign_keys: Vec::new(),
+        }];
+
+        let inner_select = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: None,
+                    where_clause: Some(Box::new(Expr::Literal(Literal::False, Span::ZERO))),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Select(Box::new(inner_select)),
+            upsert: vec![],
+            returning: vec![],
+        };
+
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::IfNot),
+            "expected WHERE filter in no-FROM INSERT ... SELECT path"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn test_codegen_insert_select_propagates_or_conflict_to_insert_p5() {
         let schema = vec![
@@ -7648,6 +7935,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -7658,6 +7946,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
         ];
 
@@ -7729,6 +8018,7 @@ mod tests {
                     is_unique: false,
                 }],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -7739,6 +8029,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
         ];
 
@@ -7832,6 +8123,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -7865,6 +8157,7 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                foreign_keys: Vec::new(),
             },
         ];
 

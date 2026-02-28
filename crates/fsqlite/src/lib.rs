@@ -8574,10 +8574,8 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t2(x TEXT, y INTEGER, z REAL)")
             .unwrap();
-        conn.execute(
-            "INSERT INTO t2 VALUES ('a', 3, 1.0), ('b', 1, 3.0), ('c', 2, 2.0)",
-        )
-        .unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('a', 3, 1.0), ('b', 1, 3.0), ('c', 2, 2.0)")
+            .unwrap();
         // ORDER BY first column (text, ascending)
         let r = conn.query("SELECT x, y FROM t2 ORDER BY 1").unwrap();
         assert_eq!(row_values(&r[0])[0].to_text(), "a");

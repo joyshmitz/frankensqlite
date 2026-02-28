@@ -45,8 +45,8 @@ use fsqlite_types::{
     BTreePageHeader, DatabaseHeader, PageNumber, PageSize, StrictColumnType, TextEncoding,
 };
 use fsqlite_vdbe::codegen::{
-    CodegenContext, CodegenError, ColumnInfo, IndexSchema, TableSchema, codegen_delete,
-    codegen_insert, codegen_select, codegen_update,
+    CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
+    codegen_delete, codegen_insert, codegen_select, codegen_update,
 };
 use fsqlite_vdbe::engine::{
     ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine, reset_vdbe_jit_metrics,
@@ -774,6 +774,25 @@ struct TriggerRaiseDirective {
 enum TriggerStatementOutcome {
     Continue,
     SkipDml,
+}
+
+/// Describes the action to take when a FK-referenced parent row is deleted.
+#[allow(dead_code)]
+enum FkDeleteAction {
+    /// No child rows reference this parent — deletion is allowed.
+    Allow,
+    /// Child rows exist and ON DELETE CASCADE is specified.
+    Cascade {
+        child_table: String,
+        child_columns: Vec<String>,
+        parent_values: Vec<SqliteValue>,
+    },
+    /// Child rows exist and ON DELETE SET NULL is specified.
+    SetNull {
+        child_table: String,
+        child_columns: Vec<String>,
+        parent_values: Vec<SqliteValue>,
+    },
 }
 
 fn trigger_statement_raise_directive(
@@ -2102,6 +2121,11 @@ impl Connection {
                 };
                 let rows = self.execute_table_program(&program, params)?;
 
+                // bd-thqgm: FK constraint checking on INSERT.
+                if self.fk_enforcement_enabled() {
+                    self.enforce_fk_on_insert(insert, table_name, params)?;
+                }
+
                 // Phase 5G.3: Fire AFTER INSERT triggers.
                 if has_after_insert {
                     for new_values in &trigger_new_rows {
@@ -2126,9 +2150,11 @@ impl Connection {
                 }
             }
             Statement::Update(ref update) => {
-                let table_name = &update.table.name.name;
+                let (effective_update, limited_row_count_hint) =
+                    self.materialize_update_limit_scope(update, params)?;
+                let table_name = &effective_update.table.name.name;
                 // Collect columns being updated for UPDATE OF trigger matching.
-                let update_cols: Vec<String> = update
+                let update_cols: Vec<String> = effective_update
                     .assignments
                     .iter()
                     .flat_map(|a| match &a.target {
@@ -2148,7 +2174,7 @@ impl Connection {
                     &update_event,
                 );
                 let trigger_rows = if has_before_update || has_after_update {
-                    self.collect_update_trigger_rows(update, params)?
+                    self.collect_update_trigger_rows(&effective_update, params)?
                 } else {
                     Vec::new()
                 };
@@ -2178,14 +2204,14 @@ impl Connection {
 
                 let affected = if has_before_update || has_after_update {
                     trigger_rows.len()
+                } else if let Some(materialized_rows) = limited_row_count_hint {
+                    materialized_rows
                 } else {
-                    // VDBE UPDATE execution currently ignores ORDER BY/LIMIT.
-                    // Keep affected-row bookkeeping aligned with executed rows.
                     self.count_matching_rows(
-                        &update.table,
-                        update.where_clause.as_ref(),
-                        &[],
-                        None,
+                        &effective_update.table,
+                        effective_update.where_clause.as_ref(),
+                        &effective_update.order_by,
+                        effective_update.limit.as_ref(),
                         params,
                     )?
                 };
@@ -2198,7 +2224,7 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    self.compile_table_update(update)?
+                    self.compile_table_update(&effective_update)?
                 };
                 let rows = self.execute_table_program(&program, params)?;
 
@@ -2218,14 +2244,16 @@ impl Connection {
                 *self.last_changes.borrow_mut() = affected;
                 #[allow(clippy::cast_possible_wrap)]
                 set_last_changes(affected as i64);
-                if update.returning.is_empty() {
+                if effective_update.returning.is_empty() {
                     Ok(Vec::new())
                 } else {
                     Ok(rows)
                 }
             }
             Statement::Delete(ref delete) => {
-                let table_name = &delete.table.name.name;
+                let (effective_delete, limited_row_count_hint) =
+                    self.materialize_delete_limit_scope(delete, params)?;
+                let table_name = &effective_delete.table.name.name;
                 let delete_event = fsqlite_ast::TriggerEvent::Delete;
                 let has_before_delete = self.has_matching_triggers(
                     table_name,
@@ -2238,7 +2266,7 @@ impl Connection {
                     &delete_event,
                 );
                 let trigger_old_rows = if has_before_delete || has_after_delete {
-                    self.collect_delete_trigger_rows(delete, params)?
+                    self.collect_delete_trigger_rows(&effective_delete, params)?
                 } else {
                     Vec::new()
                 };
@@ -2268,14 +2296,14 @@ impl Connection {
 
                 let affected = if has_before_delete || has_after_delete {
                     trigger_old_rows.len()
+                } else if let Some(materialized_rows) = limited_row_count_hint {
+                    materialized_rows
                 } else {
-                    // VDBE DELETE execution currently ignores ORDER BY/LIMIT.
-                    // Keep affected-row bookkeeping aligned with executed rows.
                     self.count_matching_rows(
-                        &delete.table,
-                        delete.where_clause.as_ref(),
-                        &[],
-                        None,
+                        &effective_delete.table,
+                        effective_delete.where_clause.as_ref(),
+                        &effective_delete.order_by,
+                        effective_delete.limit.as_ref(),
                         params,
                     )?
                 };
@@ -2288,7 +2316,7 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    self.compile_table_delete(delete)?
+                    self.compile_table_delete(&effective_delete)?
                 };
                 let rows = self.execute_table_program(&program, params)?;
 
@@ -2303,7 +2331,7 @@ impl Connection {
                 *self.last_changes.borrow_mut() = affected;
                 #[allow(clippy::cast_possible_wrap)]
                 set_last_changes(affected as i64);
-                if delete.returning.is_empty() {
+                if effective_delete.returning.is_empty() {
                     Ok(Vec::new())
                 } else {
                     Ok(rows)
@@ -2922,6 +2950,247 @@ impl Connection {
             self.query_with_params(&sql, params)
         } else {
             self.query(&sql)
+        }
+    }
+
+    /// Materialize the target row-set for `UPDATE ... ORDER BY/LIMIT` into a
+    /// deterministic key-filter expression so VDBE execution mutates only the
+    /// selected rows.
+    fn materialize_update_limit_scope(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<(fsqlite_ast::UpdateStatement, Option<usize>)> {
+        if update.order_by.is_empty() && update.limit.is_none() {
+            return Ok((update.clone(), None));
+        }
+        if update.from.is_some() {
+            return Err(FrankenError::NotImplemented(
+                "UPDATE ... FROM with ORDER BY/LIMIT is not yet supported".to_owned(),
+            ));
+        }
+
+        let (key_column, is_hidden_rowid) = self.resolve_dml_limit_key(&update.table.name.name)?;
+        let selected_keys = self.select_matching_limit_keys(
+            &update.table,
+            update.where_clause.as_ref(),
+            &update.order_by,
+            update.limit.as_ref(),
+            params,
+            &key_column,
+            is_hidden_rowid,
+        )?;
+
+        let mut effective = update.clone();
+        effective.where_clause = Some(Self::build_limit_scope_filter_expr(
+            &effective.table,
+            &key_column,
+            &selected_keys,
+        ));
+        effective.order_by.clear();
+        effective.limit = None;
+        Ok((effective, Some(selected_keys.len())))
+    }
+
+    /// Materialize the target row-set for `DELETE ... ORDER BY/LIMIT` into a
+    /// deterministic key-filter expression so VDBE execution deletes only the
+    /// selected rows.
+    fn materialize_delete_limit_scope(
+        &self,
+        delete: &fsqlite_ast::DeleteStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<(fsqlite_ast::DeleteStatement, Option<usize>)> {
+        if delete.order_by.is_empty() && delete.limit.is_none() {
+            return Ok((delete.clone(), None));
+        }
+
+        let (key_column, is_hidden_rowid) = self.resolve_dml_limit_key(&delete.table.name.name)?;
+        let selected_keys = self.select_matching_limit_keys(
+            &delete.table,
+            delete.where_clause.as_ref(),
+            &delete.order_by,
+            delete.limit.as_ref(),
+            params,
+            &key_column,
+            is_hidden_rowid,
+        )?;
+
+        let mut effective = delete.clone();
+        effective.where_clause = Some(Self::build_limit_scope_filter_expr(
+            &effective.table,
+            &key_column,
+            &selected_keys,
+        ));
+        effective.order_by.clear();
+        effective.limit = None;
+        Ok((effective, Some(selected_keys.len())))
+    }
+
+    /// Resolve a stable key column for DML LIMIT scoping.
+    ///
+    /// Prefers hidden rowid aliases when available; otherwise falls back to the
+    /// INTEGER PRIMARY KEY column when all rowid aliases are shadowed.
+    fn resolve_dml_limit_key(&self, table_name: &str) -> Result<(String, bool)> {
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|tbl| tbl.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.to_owned(),
+            })?;
+
+        let shadowed: HashSet<String> = table
+            .columns
+            .iter()
+            .map(|column| column.name.to_ascii_lowercase())
+            .collect();
+
+        for candidate in ["rowid", "_rowid_", "oid"] {
+            if !shadowed.contains(candidate) {
+                return Ok((candidate.to_owned(), true));
+            }
+        }
+
+        if let Some(ipk_column) = table.columns.iter().find(|column| column.is_ipk) {
+            return Ok((ipk_column.name.clone(), false));
+        }
+
+        Err(FrankenError::NotImplemented(format!(
+            "ORDER BY/LIMIT for UPDATE/DELETE requires rowid or INTEGER PRIMARY KEY on table `{table_name}`"
+        )))
+    }
+
+    /// Select key values for UPDATE/DELETE LIMIT scoping using the statement's
+    /// original WHERE/ORDER BY/LIMIT clauses.
+    #[allow(clippy::too_many_arguments)]
+    fn select_matching_limit_keys(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        where_clause: Option<&Expr>,
+        order_by: &[fsqlite_ast::OrderingTerm],
+        limit: Option<&fsqlite_ast::LimitClause>,
+        params: Option<&[SqliteValue]>,
+        key_column: &str,
+        is_hidden_rowid: bool,
+    ) -> Result<Vec<i64>> {
+        let projection = Self::format_limit_scope_projection(
+            table_ref.alias.as_deref(),
+            key_column,
+            is_hidden_rowid,
+        );
+        let alias_clause = table_ref
+            .alias
+            .as_ref()
+            .map_or(String::new(), |alias| format!(" AS {alias}"));
+        let mut sql = if let Some(cond) = where_clause {
+            format!(
+                "SELECT {projection} FROM {}{alias_clause} WHERE {cond}",
+                table_ref.name
+            )
+        } else {
+            format!("SELECT {projection} FROM {}{alias_clause}", table_ref.name)
+        };
+
+        if !order_by.is_empty() {
+            let order_terms: Vec<String> = order_by.iter().map(ToString::to_string).collect();
+            sql.push_str(" ORDER BY ");
+            sql.push_str(&order_terms.join(", "));
+        }
+
+        if let Some(limit_clause) = limit {
+            sql.push(' ');
+            sql.push_str(&limit_clause.to_string());
+        }
+
+        let rows = if let Some(bindings) = params {
+            self.query_with_params(&sql, bindings)?
+        } else {
+            self.query(&sql)?
+        };
+
+        rows.iter()
+            .map(|row| {
+                let key_value = row.values().first().ok_or_else(|| {
+                    FrankenError::Internal(
+                        "DML LIMIT key materialization returned an empty row".to_owned(),
+                    )
+                })?;
+                Self::decode_limit_scope_key(key_value, key_column)
+            })
+            .collect()
+    }
+
+    fn format_limit_scope_projection(
+        table_alias: Option<&str>,
+        key_column: &str,
+        is_hidden_rowid: bool,
+    ) -> String {
+        let key_sql = if is_hidden_rowid {
+            key_column.to_owned()
+        } else {
+            quote_identifier(key_column)
+        };
+
+        if let Some(alias) = table_alias {
+            format!("{}.{}", quote_identifier(alias), key_sql)
+        } else {
+            key_sql
+        }
+    }
+
+    fn build_limit_scope_filter_expr(
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        key_column: &str,
+        selected_keys: &[i64],
+    ) -> Expr {
+        if selected_keys.is_empty() {
+            return Expr::Literal(Literal::Integer(0), Span::ZERO);
+        }
+
+        let key_ref = Expr::Column(
+            ColumnRef {
+                table: table_ref.alias.clone(),
+                column: key_column.to_owned(),
+            },
+            Span::ZERO,
+        );
+        let list = selected_keys
+            .iter()
+            .map(|value| Expr::Literal(Literal::Integer(*value), Span::ZERO))
+            .collect();
+
+        Expr::In {
+            expr: Box::new(key_ref),
+            set: InSet::List(list),
+            not: false,
+            span: Span::ZERO,
+        }
+    }
+
+    fn decode_limit_scope_key(value: &SqliteValue, key_column: &str) -> Result<i64> {
+        match value {
+            SqliteValue::Integer(n) => Ok(*n),
+            SqliteValue::Float(f) => {
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && *f >= i64::MIN as f64
+                    && *f <= i64::MAX as f64
+                {
+                    Ok(*f as i64)
+                } else {
+                    Err(FrankenError::Internal(format!(
+                        "non-integral key value `{f}` materialized for `{key_column}`"
+                    )))
+                }
+            }
+            SqliteValue::Text(text) => text.parse::<i64>().map_err(|err| {
+                FrankenError::Internal(format!(
+                    "failed to parse key `{text}` for `{key_column}` as INTEGER: {err}"
+                ))
+            }),
+            other => Err(FrankenError::Internal(format!(
+                "unsupported key type `{other:?}` materialized for `{key_column}`"
+            ))),
         }
     }
 
@@ -3991,6 +4260,7 @@ impl Connection {
             ],
             indexes: Vec::new(),
             strict: false,
+            foreign_keys: Vec::new(),
         });
         self.insert_sqlite_master_row(
             "table",
@@ -4541,12 +4811,45 @@ impl Connection {
                     }
                 }
 
+                // Extract foreign key constraints from column-level and
+                // table-level REFERENCES clauses.
+                let mut fk_defs = Vec::new();
+                for (i, col) in columns.iter().enumerate() {
+                    for c in &col.constraints {
+                        if let ColumnConstraintKind::ForeignKey(ref fk_clause) = c.kind {
+                            fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                        }
+                    }
+                }
+                if let CreateTableBody::Columns { constraints, .. } = &create.body {
+                    for tc in constraints {
+                        if let TableConstraintKind::ForeignKey {
+                            columns: fk_cols,
+                            clause,
+                        } = &tc.kind
+                        {
+                            let child_indices: Vec<usize> = fk_cols
+                                .iter()
+                                .filter_map(|name| {
+                                    col_infos
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(name))
+                                })
+                                .collect();
+                            if !child_indices.is_empty() {
+                                fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                            }
+                        }
+                    }
+                }
+
                 let table_schema = TableSchema {
                     name: table_name,
                     root_page,
                     columns: col_infos,
                     indexes: implicit_indexes,
                     strict: create.strict,
+                    foreign_keys: fk_defs,
                 };
                 let create_sql = render_create_table_sql(&table_schema, is_autoincrement);
                 let rp = table_schema.root_page;
@@ -4631,6 +4934,7 @@ impl Connection {
                     columns: col_infos,
                     indexes: Vec::new(),
                     strict: false,
+                    foreign_keys: Vec::new(),
                 };
                 let create_sql = crate::compat_persist::build_create_table_sql(&table_schema);
                 let rp = table_schema.root_page;
@@ -4699,6 +5003,7 @@ impl Connection {
             columns: col_infos,
             indexes: Vec::new(),
             strict: false,
+            foreign_keys: Vec::new(),
         });
 
         self.insert_sqlite_master_row(
@@ -5256,6 +5561,270 @@ impl Connection {
         }
     }
 
+    // ── Foreign Key enforcement helpers (bd-thqgm) ─────────────────────
+
+    /// Returns `true` when `PRAGMA foreign_keys` is currently ON.
+    fn fk_enforcement_enabled(&self) -> bool {
+        self.pragma_state.borrow().foreign_keys
+    }
+
+    /// Enforce parent-existence checks for rows inserted by an INSERT statement.
+    ///
+    /// This resolves inserted row values in table-column order (including
+    /// DEFAULT handling) and validates each row against parent FK targets.
+    fn enforce_fk_on_insert(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        table_name: &str,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<()> {
+        for row_values in self.collect_insert_trigger_rows(insert, params)? {
+            self.check_fk_parent_exists(table_name, &row_values)?;
+        }
+        Ok(())
+    }
+
+    /// Verify that every FK value in a child row has a matching parent row.
+    ///
+    /// `table_name` is the child table being inserted into.
+    /// `row_values` are the column values for the inserted row (in storage
+    /// order, matching `TableSchema.columns`).
+    fn check_fk_parent_exists(&self, table_name: &str, row_values: &[SqliteValue]) -> Result<()> {
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(table_name));
+        let Some(table) = table else {
+            return Ok(());
+        };
+        if table.foreign_keys.is_empty() {
+            return Ok(());
+        }
+        let fk_defs = table.foreign_keys.clone();
+        drop(schema);
+
+        for fk in &fk_defs {
+            // Collect child column values for this FK.
+            let fk_values: Vec<&SqliteValue> = fk
+                .child_columns
+                .iter()
+                .filter_map(|&idx| row_values.get(idx))
+                .collect();
+
+            // NULL in any FK column means the constraint is satisfied (SQL
+            // standard: a partially-NULL FK does not require a parent match).
+            if fk_values.iter().any(|v| matches!(v, SqliteValue::Null)) {
+                continue;
+            }
+
+            // Build a lookup query against the parent table.
+            let parent_schema = self.schema.borrow();
+            let parent = parent_schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&fk.parent_table));
+            let Some(parent) = parent else {
+                return Err(FrankenError::ForeignKeyViolation);
+            };
+
+            // Determine the parent columns to match against.
+            let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+                // Implicit rowid reference — match against the IPK column.
+                parent
+                    .columns
+                    .iter()
+                    .find(|c| c.is_ipk)
+                    .map(|c| vec![c.name.clone()])
+                    .unwrap_or_default()
+            } else {
+                fk.parent_columns.clone()
+            };
+            drop(parent_schema);
+
+            if parent_cols.is_empty() {
+                // No identifiable parent column — skip (degenerate schema).
+                continue;
+            }
+
+            // Build WHERE clause: parent_col1 = ?1 AND parent_col2 = ?2 ...
+            let where_parts: Vec<String> = parent_cols
+                .iter()
+                .enumerate()
+                .map(|(i, col)| format!("\"{col}\" = ?{}", i + 1))
+                .collect();
+            let sql = format!(
+                "SELECT 1 FROM \"{}\" WHERE {} LIMIT 1",
+                fk.parent_table,
+                where_parts.join(" AND ")
+            );
+            let params: Vec<SqliteValue> = fk_values.iter().map(|v| (*v).clone()).collect();
+            let rows = self.query_with_params(&sql, &params)?;
+            if rows.is_empty() {
+                return Err(FrankenError::ForeignKeyViolation);
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify that no child table references a row being deleted from `table_name`.
+    ///
+    /// `row_values` are the column values of the row about to be deleted.
+    /// Returns `Ok(())` if deletion is allowed, or an error/cascade action.
+    #[allow(dead_code)]
+    fn check_fk_on_delete(
+        &self,
+        table_name: &str,
+        row_values: &[SqliteValue],
+    ) -> Result<FkDeleteAction> {
+        let schema = self.schema.borrow();
+        // Find all child tables that have FK references to this parent table.
+        let mut actions: Vec<(String, FkDef, Vec<String>)> = Vec::new();
+        for table in schema.iter() {
+            for fk in &table.foreign_keys {
+                if fk.parent_table.eq_ignore_ascii_case(table_name) {
+                    let child_col_names: Vec<String> = fk
+                        .child_columns
+                        .iter()
+                        .filter_map(|&idx| table.columns.get(idx).map(|c| c.name.clone()))
+                        .collect();
+                    actions.push((table.name.clone(), fk.clone(), child_col_names));
+                }
+            }
+        }
+        // Determine parent column values to match.
+        let parent = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(table_name));
+        let parent_cols: Vec<String> = parent.map_or_else(Vec::new, |p| {
+            p.columns.iter().map(|c| c.name.clone()).collect()
+        });
+        drop(schema);
+
+        if actions.is_empty() {
+            return Ok(FkDeleteAction::Allow);
+        }
+
+        for (child_table, fk, child_col_names) in &actions {
+            // Determine which parent column values to match.
+            let parent_key_cols: &[String] = if fk.parent_columns.is_empty() {
+                // Implicit rowid — we don't have a good way to get this yet.
+                // For now, assume single-column IPK.
+                &parent_cols
+            } else {
+                &fk.parent_columns
+            };
+
+            // Get parent values for the FK columns.
+            let parent_schema = self.schema.borrow();
+            let parent_table = parent_schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(table_name));
+            let parent_values: Vec<SqliteValue> = parent_key_cols
+                .iter()
+                .filter_map(|col_name| {
+                    parent_table.and_then(|p| {
+                        p.columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                            .and_then(|idx| row_values.get(idx).cloned())
+                    })
+                })
+                .collect();
+            drop(parent_schema);
+
+            if parent_values.iter().any(|v| matches!(v, SqliteValue::Null)) {
+                continue;
+            }
+            if parent_values.len() != child_col_names.len() {
+                continue;
+            }
+
+            // Check if any child rows reference this parent row.
+            let where_parts: Vec<String> = child_col_names
+                .iter()
+                .enumerate()
+                .map(|(i, col)| format!("\"{col}\" = ?{}", i + 1))
+                .collect();
+            let sql = format!(
+                "SELECT 1 FROM \"{}\" WHERE {} LIMIT 1",
+                child_table,
+                where_parts.join(" AND ")
+            );
+            let rows = self.query_with_params(&sql, &parent_values)?;
+            if !rows.is_empty() {
+                // Children exist — action depends on ON DELETE clause.
+                match fk.on_delete {
+                    FkActionType::Cascade => {
+                        return Ok(FkDeleteAction::Cascade {
+                            child_table: child_table.clone(),
+                            child_columns: child_col_names.clone(),
+                            parent_values: parent_values.clone(),
+                        });
+                    }
+                    FkActionType::SetNull => {
+                        return Ok(FkDeleteAction::SetNull {
+                            child_table: child_table.clone(),
+                            child_columns: child_col_names.clone(),
+                            parent_values: parent_values.clone(),
+                        });
+                    }
+                    FkActionType::NoAction | FkActionType::Restrict | FkActionType::SetDefault => {
+                        return Err(FrankenError::ForeignKeyViolation);
+                    }
+                }
+            }
+        }
+        Ok(FkDeleteAction::Allow)
+    }
+
+    /// Execute FK cascade/set-null actions for a DELETE operation.
+    #[allow(dead_code)]
+    fn execute_fk_delete_action(&self, action: &FkDeleteAction) -> Result<()> {
+        match action {
+            FkDeleteAction::Allow => Ok(()),
+            FkDeleteAction::Cascade {
+                child_table,
+                child_columns,
+                parent_values,
+            } => {
+                let where_parts: Vec<String> = child_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| format!("\"{col}\" = ?{}", i + 1))
+                    .collect();
+                let sql = format!(
+                    "DELETE FROM \"{}\" WHERE {}",
+                    child_table,
+                    where_parts.join(" AND ")
+                );
+                self.execute_with_params(&sql, parent_values)?;
+                Ok(())
+            }
+            FkDeleteAction::SetNull {
+                child_table,
+                child_columns,
+                parent_values,
+            } => {
+                let set_parts: Vec<String> = child_columns
+                    .iter()
+                    .map(|col| format!("\"{col}\" = NULL"))
+                    .collect();
+                let where_parts: Vec<String> = child_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| format!("\"{col}\" = ?{}", i + 1))
+                    .collect();
+                let sql = format!(
+                    "UPDATE \"{}\" SET {} WHERE {}",
+                    child_table,
+                    set_parts.join(", "),
+                    where_parts.join(" AND ")
+                );
+                self.execute_with_params(&sql, parent_values)?;
+                Ok(())
+            }
+        }
+    }
+
     fn has_matching_triggers(
         &self,
         table_name: &str,
@@ -5542,6 +6111,7 @@ impl Connection {
                     columns: col_infos,
                     indexes: Vec::new(),
                     strict: false,
+                    foreign_keys: Vec::new(),
                 });
                 materialized.push(view.name.clone());
 
@@ -5640,6 +6210,7 @@ impl Connection {
                     columns: virtual_columns.clone(),
                     indexes: Vec::new(),
                     strict: false,
+                    foreign_keys: Vec::new(),
                 });
 
                 if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
@@ -8718,6 +9289,7 @@ impl Connection {
                         columns: col_infos,
                         indexes: Vec::new(),
                         strict: false,
+                        foreign_keys: Vec::new(),
                     });
                     temp_names.push(cte_name.clone());
                     for (i, row) in cte_rows.iter().enumerate() {
@@ -8798,6 +9370,7 @@ impl Connection {
             columns: col_infos,
             indexes: Vec::new(),
             strict: false,
+            foreign_keys: Vec::new(),
         });
         temp_names.push(cte_name.clone());
 
@@ -9690,6 +10263,7 @@ impl Connection {
                 columns,
                 indexes: Vec::new(),
                 strict: crate::compat_persist::is_strict_table_sql(&create_sql),
+                foreign_keys: Vec::new(),
             });
 
             // Read all rows from this table's B-tree.
@@ -11862,6 +12436,32 @@ fn sort_rows_by_order_terms(
     });
 
     Ok(())
+}
+
+/// Convert an AST `ForeignKeyClause` to a codegen `FkDef`.
+fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyClause) -> FkDef {
+    let mut on_delete = FkActionType::NoAction;
+    let mut on_update = FkActionType::NoAction;
+    for action in &clause.actions {
+        let action_type = match action.action {
+            fsqlite_ast::ForeignKeyActionType::SetNull => FkActionType::SetNull,
+            fsqlite_ast::ForeignKeyActionType::SetDefault => FkActionType::SetDefault,
+            fsqlite_ast::ForeignKeyActionType::Cascade => FkActionType::Cascade,
+            fsqlite_ast::ForeignKeyActionType::Restrict => FkActionType::Restrict,
+            fsqlite_ast::ForeignKeyActionType::NoAction => FkActionType::NoAction,
+        };
+        match action.trigger {
+            fsqlite_ast::ForeignKeyTrigger::OnDelete => on_delete = action_type,
+            fsqlite_ast::ForeignKeyTrigger::OnUpdate => on_update = action_type,
+        }
+    }
+    FkDef {
+        child_columns: child_indices.to_vec(),
+        parent_table: clause.table.clone(),
+        parent_columns: clause.columns.clone(),
+        on_delete,
+        on_update,
+    }
 }
 
 /// Map an AST type name to a codegen affinity character.
@@ -17763,6 +18363,38 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_select_without_from_inserts_single_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER, name TEXT);")
+            .unwrap();
+
+        let inserted = conn.execute("INSERT INTO dst SELECT 7, 'seven';").unwrap();
+        assert_eq!(inserted, 1);
+
+        let rows = conn.query("SELECT id, name FROM dst;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Text("seven".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_select_without_from_respects_where_filter() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER);").unwrap();
+
+        let inserted = conn.execute("INSERT INTO dst SELECT 1 WHERE 0;").unwrap();
+        assert_eq!(inserted, 0);
+
+        let rows = conn.query("SELECT id FROM dst;").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn test_insert_select_respects_target_column_list_order() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE src (a INTEGER, b TEXT);")
@@ -18003,23 +18635,19 @@ mod tests {
 
         let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 3);
-        let expected_bases = [10_i64, 20, 30];
-        let mut updated_rows = 0usize;
-        for (row, base) in rows.iter().zip(expected_bases) {
-            let values = row_values(row);
-            let SqliteValue::Integer(actual) = values[1] else {
-                panic!("expected INTEGER value column, got {:?}", values[1]);
-            };
-            if actual == base + 100 {
-                updated_rows = updated_rows.saturating_add(1);
-            } else {
-                assert_eq!(actual, base);
-            }
-        }
         assert_eq!(
-            affected, updated_rows,
-            "reported affected-row count must match actual updated rows"
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(110)]
         );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Integer(20)]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![SqliteValue::Integer(3), SqliteValue::Integer(30)]
+        );
+        assert_eq!(affected, 1, "LIMIT 1 must update exactly one row");
     }
 
     #[test]
@@ -18035,10 +18663,73 @@ mod tests {
             .unwrap();
 
         let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
-        let actual_deleted = 3usize.saturating_sub(rows.len());
+        assert_eq!(deleted, 2, "LIMIT 2 must delete exactly two rows");
+        assert_eq!(rows.len(), 1);
         assert_eq!(
-            deleted, actual_deleted,
-            "reported affected-row count must match actual deleted rows"
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(3), SqliteValue::Integer(30)]
+        );
+    }
+
+    #[test]
+    fn test_update_order_by_limit_offset_targets_expected_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40);")
+            .unwrap();
+
+        let affected = conn
+            .execute("UPDATE t SET v = v + 1000 ORDER BY id ASC LIMIT 1 OFFSET 2;")
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(10)]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Integer(20)]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![SqliteValue::Integer(3), SqliteValue::Integer(1030)]
+        );
+        assert_eq!(
+            row_values(&rows[3]),
+            vec![SqliteValue::Integer(4), SqliteValue::Integer(40)]
+        );
+    }
+
+    #[test]
+    fn test_delete_order_by_limit_offset_targets_expected_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);")
+            .unwrap();
+
+        let deleted = conn
+            .execute("DELETE FROM t ORDER BY id ASC LIMIT 2 OFFSET 1;")
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(10)]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(4), SqliteValue::Integer(40)]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![SqliteValue::Integer(5), SqliteValue::Integer(50)]
         );
     }
 
