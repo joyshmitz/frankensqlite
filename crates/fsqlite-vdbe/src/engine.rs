@@ -3619,6 +3619,7 @@ impl VdbeEngine {
                     // Phase 5B.2 (bd-1yi8): write-through — route ONLY through
                     // StorageCursor when one exists; fall back to MemDatabase
                     // only for legacy Phase 4 cursors.
+                    let mut actually_inserted = false;
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
                             let blob = record_blob_bytes(&record_val);
@@ -3633,6 +3634,7 @@ impl VdbeEngine {
                                         // OE_REPLACE (5) or OPFLAG_ISUPDATE (8): Delete old, insert new (UPSERT/UPDATE)
                                         sc.cursor.delete(&sc.cx)?;
                                         sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
+                                        actually_inserted = true;
                                     }
                                     _ => {
                                         // Default (ABORT/FAIL/ROLLBACK): constraint error.
@@ -3642,6 +3644,7 @@ impl VdbeEngine {
                             } else {
                                 // No conflict — insert normally
                                 sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
+                                actually_inserted = true;
                             }
                         }
                     } else if let Some(root) = self.cursors.get(&cursor_id).map(|c| c.root_page) {
@@ -3677,6 +3680,7 @@ impl VdbeEngine {
                                                 .map(|t| t.delete_by_rowid(conflict_rid));
                                         }
                                         db.upsert_row(root, rowid, values);
+                                        actually_inserted = true;
                                     }
                                     _ => {
                                         // Default (ABORT/FAIL/ROLLBACK): constraint error.
@@ -3686,12 +3690,16 @@ impl VdbeEngine {
                             } else {
                                 // No conflict — insert normally
                                 db.upsert_row(root, rowid, values);
+                                actually_inserted = true;
                             }
                         }
                     }
 
-                    // Track last insert rowid for last_insert_rowid() support.
-                    self.last_insert_rowid = rowid;
+                    // Track last insert rowid only when a row was actually inserted.
+                    // C SQLite does not update last_insert_rowid() when IGNORE skips.
+                    if actually_inserted {
+                        self.last_insert_rowid = rowid;
+                    }
                     self.last_insert_cursor_id = Some(cursor_id);
                     self.conflict_skip_idx = false;
 
@@ -4576,12 +4584,13 @@ impl VdbeEngine {
                 }
 
                 // ── LIMIT/OFFSET support ────────────────────────────────
-                // DecrJumpZero: decrement register p1; if result is zero,
-                // jump to p2. Used to count down remaining LIMIT rows.
+                // DecrJumpZero: decrement register p1; if result is zero
+                // or negative, jump to p2. Used to count down remaining LIMIT rows.
+                // C SQLite: `if( pIn1->u.i<=0 ) goto jump_to_p2;`
                 Opcode::DecrJumpZero => {
                     let val = self.get_reg(op.p1).to_integer() - 1;
                     self.set_reg(op.p1, SqliteValue::Integer(val));
-                    if val == 0 {
+                    if val <= 0 {
                         #[allow(clippy::cast_sign_loss)]
                         {
                             pc = op.p2 as usize;
@@ -5112,6 +5121,9 @@ impl VdbeEngine {
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn set_reg_fast(&mut self, r: i32, val: SqliteValue) {
+        if !(0..=65535).contains(&r) {
+            return;
+        }
         let idx = r as usize;
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);

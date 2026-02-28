@@ -723,14 +723,38 @@ pub struct FromClause {
     pub joins: Vec<JoinClause>,
 }
 
+// ---------------------------------------------------------------------------
+// Time-travel (SQL:2011 temporal queries)
+// ---------------------------------------------------------------------------
+
+/// Target for a `FOR SYSTEM_TIME AS OF` clause.
+///
+/// This is the AST-level representation — decoupled from the MVCC
+/// `TimeTravelTarget` in `fsqlite-mvcc`. Conversion happens in the
+/// integration layer (`fsqlite-core`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TimeTravelTarget {
+    /// `FOR SYSTEM_TIME AS OF COMMITSEQ <n>` — pinned to a commit sequence number.
+    CommitSequence(u64),
+    /// `FOR SYSTEM_TIME AS OF '<iso8601>'` — resolved to a commit sequence later.
+    Timestamp(String),
+}
+
+/// A `FOR SYSTEM_TIME AS OF ...` clause attached to a table reference.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TimeTravelClause {
+    pub target: TimeTravelTarget,
+}
+
 /// A table source in a FROM clause.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableOrSubquery {
-    /// A named table: `[schema.]table [AS alias] [INDEXED BY idx | NOT INDEXED]`.
+    /// A named table: `[schema.]table [AS alias] [INDEXED BY idx | NOT INDEXED] [FOR SYSTEM_TIME AS OF ...]`.
     Table {
         name: QualifiedName,
         alias: Option<String>,
         index_hint: Option<IndexHint>,
+        time_travel: Option<TimeTravelClause>,
     },
     /// A subquery: `(SELECT ...) [AS alias]`.
     Subquery {
@@ -964,6 +988,7 @@ pub struct QualifiedTableRef {
     pub name: QualifiedName,
     pub alias: Option<String>,
     pub index_hint: Option<IndexHint>,
+    pub time_travel: Option<TimeTravelClause>,
 }
 
 // ---------------------------------------------------------------------------

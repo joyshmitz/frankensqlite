@@ -674,6 +674,7 @@ impl fmt::Display for TableOrSubquery {
                 name,
                 alias,
                 index_hint,
+                time_travel,
             } => {
                 write!(f, "{name}")?;
                 if let Some(a) = alias {
@@ -682,6 +683,9 @@ impl fmt::Display for TableOrSubquery {
                 }
                 if let Some(hint) = index_hint {
                     write!(f, " {hint}")?;
+                }
+                if let Some(tt) = time_travel {
+                    write!(f, " {tt}")?;
                 }
                 Ok(())
             }
@@ -717,6 +721,25 @@ impl fmt::Display for IndexHint {
                 write_ident(f, name)
             }
             Self::NotIndexed => f.write_str("NOT INDEXED"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Time-travel clause
+// ---------------------------------------------------------------------------
+
+impl fmt::Display for TimeTravelClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FOR SYSTEM_TIME AS OF {}", self.target)
+    }
+}
+
+impl fmt::Display for TimeTravelTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommitSequence(seq) => write!(f, "COMMITSEQ {seq}"),
+            Self::Timestamp(ts) => write!(f, "'{ts}'"),
         }
     }
 }
@@ -983,6 +1006,9 @@ impl fmt::Display for QualifiedTableRef {
         }
         if let Some(ref hint) = self.index_hint {
             write!(f, " {hint}")?;
+        }
+        if let Some(ref tt) = self.time_travel {
+            write!(f, " {tt}")?;
         }
         Ok(())
     }
