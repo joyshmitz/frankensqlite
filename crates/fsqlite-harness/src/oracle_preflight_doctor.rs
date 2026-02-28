@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::corpus_ingest::{CorpusBuilder, ingest_conformance_fixtures_with_report};
 use crate::differential_v2::TARGET_SQLITE_VERSION;
+use crate::fixture_root_contract::{
+    DEFAULT_FIXTURE_ROOT_MANIFEST_PATH, enforce_fixture_contract_alignment,
+    load_fixture_root_contract,
+};
 use crate::oracle::{find_sqlite3_binary, verify_oracle_version};
 
 /// Owning bead identifier.
@@ -24,7 +28,7 @@ pub const DEFAULT_SCENARIO_ID: &str = "DIFF-ORACLE-PREFLIGHT-B5";
 /// Default fixtures directory relative to workspace root.
 pub const DEFAULT_FIXTURES_DIR: &str = "crates/fsqlite-harness/conformance";
 /// Default fixture-manifest path relative to workspace root.
-pub const DEFAULT_FIXTURE_MANIFEST_PATH: &str = "corpus_manifest.toml";
+pub const DEFAULT_FIXTURE_MANIFEST_PATH: &str = DEFAULT_FIXTURE_ROOT_MANIFEST_PATH;
 /// Default fixture count sanity floor.
 pub const DEFAULT_MIN_FIXTURE_JSON_FILES: usize = 8;
 /// Default fixture entry sanity floor.
@@ -137,6 +141,8 @@ pub struct OraclePreflightChecks {
     pub skipped_fixture_files: usize,
     /// Manifest mtime in unix ms when available.
     pub fixture_manifest_mtime_unix_ms: Option<u128>,
+    /// SHA-256 hash for canonical fixture-root manifest when available.
+    pub fixture_manifest_sha256: Option<String>,
     /// Latest fixture mtime in unix ms when available.
     pub latest_fixture_mtime_unix_ms: Option<u128>,
 }
@@ -183,6 +189,8 @@ pub struct DoctorConfig {
     pub fixtures_dir: PathBuf,
     /// Fixture manifest path for freshness checks.
     pub fixture_manifest_path: PathBuf,
+    /// Optional fixture-root manifest hash captured from canonical contract.
+    pub fixture_manifest_sha256: Option<String>,
     /// Minimum fixture JSON files required.
     pub min_fixture_json_files: usize,
     /// Minimum fixture entries required.
@@ -218,10 +226,11 @@ impl DoctorConfig {
         let trace_id = build_trace_id(&run_id);
         let fixtures_dir = workspace_root.join(DEFAULT_FIXTURES_DIR);
         let fixture_manifest_path = workspace_root.join(DEFAULT_FIXTURE_MANIFEST_PATH);
-        Self {
+        let mut config = Self {
             workspace_root,
             fixtures_dir,
             fixture_manifest_path,
+            fixture_manifest_sha256: None,
             min_fixture_json_files: DEFAULT_MIN_FIXTURE_JSON_FILES,
             min_fixture_entries: DEFAULT_MIN_FIXTURE_ENTRIES,
             min_fixture_sql_statements: DEFAULT_MIN_FIXTURE_SQL_STATEMENTS,
@@ -234,7 +243,19 @@ impl DoctorConfig {
             scenario_id: DEFAULT_SCENARIO_ID.to_owned(),
             seed: 424_242,
             generated_unix_ms,
+        };
+
+        if let Ok(contract) =
+            load_fixture_root_contract(&config.workspace_root, &config.fixture_manifest_path)
+        {
+            config.fixtures_dir = contract.fixtures_dir;
+            config.min_fixture_json_files = contract.min_fixture_json_files;
+            config.min_fixture_entries = contract.min_fixture_entries;
+            config.min_fixture_sql_statements = contract.min_fixture_sql_statements;
+            config.fixture_manifest_sha256 = Some(contract.manifest_sha256);
         }
+
+        config
     }
 
     /// Render deterministic replay command for this configuration.
@@ -288,10 +309,12 @@ pub fn run_oracle_preflight_doctor(config: &DoctorConfig) -> OraclePreflightRepo
         fixture_sql_statements_ingested: 0,
         skipped_fixture_files: 0,
         fixture_manifest_mtime_unix_ms: None,
+        fixture_manifest_sha256: config.fixture_manifest_sha256.clone(),
         latest_fixture_mtime_unix_ms: None,
     };
 
     validate_config(config, &mut findings);
+    check_fixture_root_contract(config, &mut findings, &mut checks);
     let sqlite3_path = resolve_oracle_binary(config, &mut findings);
     if let Some(path) = sqlite3_path.as_ref() {
         checks.oracle_binary_path = Some(path.display().to_string());
@@ -632,8 +655,8 @@ fn check_manifest_freshness(
     let manifest_path = &config.fixture_manifest_path;
     if !manifest_path.is_file() {
         findings.push(DoctorFinding {
-            outcome: DoctorOutcome::Yellow,
-            remediation_class: RemediationClass::StaleManifest,
+            outcome: DoctorOutcome::Red,
+            remediation_class: RemediationClass::InvalidConfig,
             summary: "fixture manifest file is missing".to_owned(),
             details: format!("missing fixture manifest: {}", manifest_path.display()),
             fix_command: format!(
@@ -692,6 +715,55 @@ fn check_manifest_freshness(
                 "cargo run -p fsqlite-harness --bin differential_manifest_runner -- --workspace-root {} --fixtures-dir {}",
                 config.workspace_root.display(),
                 config.fixtures_dir.display()
+            ),
+        });
+    }
+}
+
+fn check_fixture_root_contract(
+    config: &DoctorConfig,
+    findings: &mut Vec<DoctorFinding>,
+    checks: &mut OraclePreflightChecks,
+) {
+    let contract =
+        match load_fixture_root_contract(&config.workspace_root, &config.fixture_manifest_path) {
+            Ok(contract) => contract,
+            Err(error) => {
+                findings.push(DoctorFinding {
+                    outcome: DoctorOutcome::Red,
+                    remediation_class: RemediationClass::InvalidConfig,
+                    summary: "failed to load canonical fixture-root contract".to_owned(),
+                    details: error,
+                    fix_command: format!(
+                        "cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner -- --fixture-manifest-path {}",
+                        config.workspace_root.join(DEFAULT_FIXTURE_MANIFEST_PATH).display()
+                    ),
+                });
+                return;
+            }
+        };
+
+    checks.fixture_manifest_sha256 = Some(contract.manifest_sha256.clone());
+
+    if let Err(error) = enforce_fixture_contract_alignment(
+        &contract,
+        &config.fixtures_dir,
+        &contract.slt_dir,
+        config.min_fixture_json_files,
+        config.min_fixture_entries,
+        config.min_fixture_sql_statements,
+        contract.min_slt_files,
+        contract.min_slt_entries,
+        contract.min_slt_sql_statements,
+    ) {
+        findings.push(DoctorFinding {
+            outcome: DoctorOutcome::Red,
+            remediation_class: RemediationClass::InvalidConfig,
+            summary: "fixture-root contract is misaligned with doctor configuration".to_owned(),
+            details: error,
+            fix_command: format!(
+                "cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner -- --fixture-manifest-path {}",
+                contract.manifest_path.display()
             ),
         });
     }

@@ -6,6 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use fsqlite_harness::fixture_root_contract::{
+    DEFAULT_FIXTURE_ROOT_MANIFEST_PATH, load_fixture_root_contract,
+};
 use fsqlite_harness::validation_manifest::{
     ARTIFACT_HASH_RATCHET_BASELINE_SCHEMA_VERSION, ARTIFACT_HASH_RATCHET_BEAD_ID,
     ArtifactHashRatchetBaseline, VALIDATION_MANIFEST_SCENARIO_ID, ValidationManifestConfig,
@@ -26,6 +29,8 @@ struct Config {
     run_id: String,
     trace_id: String,
     scenario_id: String,
+    fixture_root_manifest_path: PathBuf,
+    fixture_root_manifest_sha256: String,
     root_seed: Option<u64>,
     generated_unix_ms: u128,
     artifact_uri_prefix: String,
@@ -46,6 +51,7 @@ impl Config {
         let mut run_id: Option<String> = None;
         let mut trace_id: Option<String> = None;
         let mut scenario_id = VALIDATION_MANIFEST_SCENARIO_ID.to_owned();
+        let mut fixture_root_manifest_path: Option<PathBuf> = None;
         let mut root_seed = Some(424_242_u64);
         let mut generated_unix_ms = now_unix_ms();
         let mut artifact_uri_prefix = DEFAULT_ARTIFACT_PREFIX.to_owned();
@@ -113,6 +119,13 @@ impl Config {
                         .get(index)
                         .ok_or_else(|| "missing value for --scenario-id".to_owned())?;
                     value.clone_into(&mut scenario_id);
+                }
+                "--fixture-root-manifest" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --fixture-root-manifest".to_owned())?;
+                    fixture_root_manifest_path = Some(PathBuf::from(value));
                 }
                 "--root-seed" => {
                     index += 1;
@@ -192,6 +205,15 @@ impl Config {
         if scenario_id.trim().is_empty() {
             return Err("scenario_id must be non-empty".to_owned());
         }
+        let fixture_root_manifest_path = fixture_root_manifest_path
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_FIXTURE_ROOT_MANIFEST_PATH));
+        let fixture_root_manifest_path = if fixture_root_manifest_path.is_relative() {
+            workspace_root.join(fixture_root_manifest_path)
+        } else {
+            fixture_root_manifest_path
+        };
+        let fixture_root_contract =
+            load_fixture_root_contract(&workspace_root, &fixture_root_manifest_path)?;
 
         Ok(Self {
             workspace_root,
@@ -202,6 +224,8 @@ impl Config {
             run_id,
             trace_id,
             scenario_id,
+            fixture_root_manifest_path: fixture_root_contract.manifest_path,
+            fixture_root_manifest_sha256: fixture_root_contract.manifest_sha256,
             root_seed,
             generated_unix_ms,
             artifact_uri_prefix,
@@ -230,6 +254,8 @@ OPTIONS:
   --run-id <ID>                Deterministic run identifier
   --trace-id <ID>              Deterministic trace identifier
   --scenario-id <ID>           Scenario identifier (default: QUALITY-351)
+  --fixture-root-manifest <PATH>
+                               Canonical fixture-root manifest path (default: <workspace-root>/corpus_manifest.toml)
   --root-seed <U64>            Deterministic orchestrator root seed (default: 424242)
   --no-root-seed               Use canonical orchestrator default seed source
   --generated-unix-ms <U128>   Deterministic timestamp for manifest and gate records
@@ -305,6 +331,10 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|error| format!("output_write_failed path={} error={error}", path.display()))
 }
 
+fn path_to_utf8(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 fn read_optional_artifact_hash_baseline(
     baseline_path: &Path,
 ) -> Result<Option<ArtifactHashRatchetBaseline>, String> {
@@ -366,6 +396,8 @@ fn run() -> Result<bool, String> {
         trace_id: config.trace_id.clone(),
         scenario_id: config.scenario_id.clone(),
         generated_unix_ms: config.generated_unix_ms,
+        fixture_root_manifest_path: path_to_utf8(&config.fixture_root_manifest_path),
+        fixture_root_manifest_sha256: config.fixture_root_manifest_sha256.clone(),
         root_seed: config.root_seed,
         artifact_uri_prefix: config.artifact_uri_prefix.clone(),
     })?;

@@ -13,6 +13,29 @@ generated_at = "2026-02-26"
 contract_owner = "track-c-corpus-owner"
 root_seed = 3520
 
+[fixture_roots]
+schema_version = "1.0.0"
+fixtures_dir = "crates/fsqlite-harness/conformance"
+slt_dir = "conformance/slt"
+min_fixture_json_files = 8
+min_fixture_entries = 8
+min_fixture_sql_statements = 40
+min_slt_files = 1
+min_slt_entries = 1
+min_slt_sql_statements = 1
+required_category_families = [
+  "ddl",
+  "dml",
+  "joins",
+  "windows",
+  "ctes",
+  "triggers",
+  "views",
+  "functions",
+  "pragma",
+  "error_paths",
+]
+
 [[category_floors]]
 category = "ddl"
 min_entries = 4

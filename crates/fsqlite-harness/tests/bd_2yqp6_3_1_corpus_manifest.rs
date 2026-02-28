@@ -27,6 +27,7 @@ const MIN_FIXTURE_SQL_STATEMENTS: usize = 40;
 #[derive(Debug, Deserialize)]
 struct CorpusManifestContract {
     meta: Meta,
+    fixture_roots: FixtureRoots,
     category_floors: Vec<CategoryFloor>,
     entries: Vec<CorpusEntry>,
     shards: Vec<Shard>,
@@ -47,6 +48,20 @@ struct Meta {
 struct CategoryFloor {
     category: String,
     min_entries: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureRoots {
+    schema_version: String,
+    fixtures_dir: String,
+    slt_dir: String,
+    min_fixture_json_files: usize,
+    min_fixture_entries: usize,
+    min_fixture_sql_statements: usize,
+    min_slt_files: usize,
+    min_slt_entries: usize,
+    min_slt_sql_statements: usize,
+    required_category_families: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -320,6 +335,30 @@ fn category_floors_are_satisfied() {
             floor.min_entries
         );
     }
+
+    for family in &manifest.fixture_roots.required_category_families {
+        assert!(
+            floor_categories.contains(family.as_str()),
+            "required category family '{}' missing from category_floors",
+            family
+        );
+    }
+}
+
+#[test]
+fn fixture_roots_contract_is_present_and_positive() {
+    let manifest = load_manifest();
+    let fixture_roots = &manifest.fixture_roots;
+    assert_eq!(fixture_roots.schema_version, "1.0.0");
+    assert!(!fixture_roots.fixtures_dir.trim().is_empty());
+    assert!(!fixture_roots.slt_dir.trim().is_empty());
+    assert!(fixture_roots.min_fixture_json_files > 0);
+    assert!(fixture_roots.min_fixture_entries > 0);
+    assert!(fixture_roots.min_fixture_sql_statements > 0);
+    assert!(fixture_roots.min_slt_files > 0);
+    assert!(fixture_roots.min_slt_entries > 0);
+    assert!(fixture_roots.min_slt_sql_statements > 0);
+    assert!(!fixture_roots.required_category_families.is_empty());
 }
 
 #[test]

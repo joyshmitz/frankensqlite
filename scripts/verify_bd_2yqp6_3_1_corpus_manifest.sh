@@ -77,6 +77,37 @@ for floor in floors:
     if int(floor.get("min_entries", 0)) <= 0:
         raise SystemExit(f"invalid floor min_entries for category {floor.get('category')}")
 
+fixture_roots = manifest.get("fixture_roots")
+if not isinstance(fixture_roots, dict):
+    raise SystemExit("missing fixture_roots section")
+if fixture_roots.get("schema_version") != "1.0.0":
+    raise SystemExit("fixture_roots.schema_version must be 1.0.0")
+for key in ("fixtures_dir", "slt_dir"):
+    if not str(fixture_roots.get(key, "")).strip():
+        raise SystemExit(f"fixture_roots.{key} must be non-empty")
+for key in (
+    "min_fixture_json_files",
+    "min_fixture_entries",
+    "min_fixture_sql_statements",
+    "min_slt_files",
+    "min_slt_entries",
+    "min_slt_sql_statements",
+):
+    if int(fixture_roots.get(key, 0)) <= 0:
+        raise SystemExit(f"fixture_roots.{key} must be > 0")
+required_families = fixture_roots.get("required_category_families", [])
+if not required_families:
+    raise SystemExit("fixture_roots.required_category_families must be non-empty")
+floor_categories = {str(floor.get("category", "")).strip() for floor in floors}
+for family in required_families:
+    family_name = str(family).strip()
+    if not family_name:
+        raise SystemExit("fixture_roots.required_category_families contains empty value")
+    if family_name not in floor_categories:
+        raise SystemExit(
+            f"required category family missing from category_floors: {family_name}"
+        )
+
 entries = manifest.get("entries", [])
 if not entries:
     raise SystemExit("missing entries")

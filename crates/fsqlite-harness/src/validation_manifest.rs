@@ -21,6 +21,7 @@ use crate::e2e_orchestrator::{
     ManifestExecutionMode, build_default_manifest, build_execution_manifest, execute_manifest,
 };
 use crate::e2e_traceability;
+use crate::fixture_root_contract::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH;
 use crate::log_schema_validator::{ValidationReport, validate_event_stream};
 use crate::no_mock_critical_path_gate::{
     DEFAULT_CRITICAL_CATEGORIES, NoMockCriticalPathReport, NoMockVerdict,
@@ -399,6 +400,10 @@ pub struct ValidationManifest {
     pub generated_unix_ms: u128,
     /// Commit SHA associated with this build.
     pub commit_sha: String,
+    /// Canonical fixture-root manifest path used by all fixture/slt lanes.
+    pub fixture_root_manifest_path: String,
+    /// SHA-256 of the fixture-root manifest payload.
+    pub fixture_root_manifest_sha256: String,
     /// Aggregate gate outcome.
     pub overall_outcome: GateOutcome,
     /// Convenience boolean for fail-closed checks.
@@ -454,6 +459,16 @@ impl ValidationManifest {
         let _ = writeln!(out, "- trace_id: `{}`", self.trace_id);
         let _ = writeln!(out, "- scenario_id: `{}`", self.scenario_id);
         let _ = writeln!(out, "- commit_sha: `{}`", self.commit_sha);
+        let _ = writeln!(
+            out,
+            "- fixture_root_manifest_path: `{}`",
+            self.fixture_root_manifest_path
+        );
+        let _ = writeln!(
+            out,
+            "- fixture_root_manifest_sha256: `{}`",
+            self.fixture_root_manifest_sha256
+        );
         let _ = writeln!(out, "- generated_unix_ms: `{}`", self.generated_unix_ms);
         let _ = writeln!(out, "- overall_outcome: `{}`", self.overall_outcome);
         let _ = writeln!(out, "- overall_pass: `{}`", self.overall_pass);
@@ -490,6 +505,10 @@ pub struct ValidationManifestConfig {
     pub scenario_id: String,
     /// Deterministic timestamp for this build.
     pub generated_unix_ms: u128,
+    /// Canonical fixture-root manifest path used to source fixture/SLT roots.
+    pub fixture_root_manifest_path: String,
+    /// SHA-256 hash of canonical fixture-root manifest payload.
+    pub fixture_root_manifest_sha256: String,
     /// Root seed used by scenario manifest generation.
     pub root_seed: Option<u64>,
     /// URI prefix used for generated gate artifacts.
@@ -504,6 +523,9 @@ impl Default for ValidationManifestConfig {
             trace_id: "trace-unknown".to_owned(),
             scenario_id: VALIDATION_MANIFEST_SCENARIO_ID.to_owned(),
             generated_unix_ms: 1_700_000_000_000,
+            fixture_root_manifest_path: DEFAULT_FIXTURE_ROOT_MANIFEST_PATH.to_owned(),
+            fixture_root_manifest_sha256:
+                "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
             root_seed: Some(424_242),
             artifact_uri_prefix: "artifacts/validation-manifest".to_owned(),
         }
@@ -717,6 +739,8 @@ pub fn build_validation_manifest_bundle(
         scenario_id: config.scenario_id.clone(),
         generated_unix_ms: config.generated_unix_ms,
         commit_sha: config.commit_sha.clone(),
+        fixture_root_manifest_path: config.fixture_root_manifest_path.clone(),
+        fixture_root_manifest_sha256: config.fixture_root_manifest_sha256.clone(),
         overall_outcome,
         overall_pass,
         replay,
@@ -1098,8 +1122,9 @@ fn build_replay_command(
 ) -> String {
     format!(
         "cargo run -p fsqlite-harness --bin validation_manifest_runner -- \
---root-seed {root_seed} --generated-unix-ms {} --commit-sha {} --run-id {} --trace-id {} --scenario-id {} --artifact-uri-prefix {}",
+--root-seed {root_seed} --generated-unix-ms {} --fixture-root-manifest {} --commit-sha {} --run-id {} --trace-id {} --scenario-id {} --artifact-uri-prefix {}",
         config.generated_unix_ms,
+        shell_single_quote(&config.fixture_root_manifest_path),
         shell_single_quote(&config.commit_sha),
         shell_single_quote(&config.run_id),
         shell_single_quote(&config.trace_id),
@@ -1609,6 +1634,14 @@ fn validate_manifest_top_level_fields(manifest: &ValidationManifest) -> Vec<Stri
     if manifest.commit_sha.trim().is_empty() {
         errors.push("commit_sha must be non-empty".to_owned());
     }
+    if manifest.fixture_root_manifest_path.trim().is_empty() {
+        errors.push("fixture_root_manifest_path must be non-empty".to_owned());
+    }
+    if !is_sha256_hex_64(&manifest.fixture_root_manifest_sha256) {
+        errors.push(
+            "fixture_root_manifest_sha256 must be 64 lowercase hex characters".to_owned(),
+        );
+    }
     if manifest.gates.is_empty() {
         errors.push("gates must not be empty".to_owned());
     }
@@ -1630,6 +1663,7 @@ fn validate_manifest_replay_contract(manifest: &ValidationManifest) -> Vec<Strin
             "validation_manifest_runner",
             "--root-seed",
             "--generated-unix-ms",
+            "--fixture-root-manifest",
             "--commit-sha",
             "--run-id",
             "--trace-id",
@@ -1642,6 +1676,16 @@ fn validate_manifest_replay_contract(manifest: &ValidationManifest) -> Vec<Strin
                     required_fragment
                 ));
             }
+        }
+        let expected_manifest_fragment = shell_single_quote(&manifest.fixture_root_manifest_path);
+        if !manifest
+            .replay
+            .command
+            .contains(expected_manifest_fragment.as_str())
+        {
+            errors.push(
+                "replay.command must include shell-quoted manifest fixture-root path".to_owned(),
+            );
         }
     }
     if manifest.replay.scenario_id != manifest.scenario_id {
@@ -1829,6 +1873,9 @@ mod tests {
             trace_id: "trace-424242".to_owned(),
             scenario_id: VALIDATION_MANIFEST_SCENARIO_ID.to_owned(),
             generated_unix_ms: 1_700_000_000_000,
+            fixture_root_manifest_path: "corpus_manifest.toml".to_owned(),
+            fixture_root_manifest_sha256:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
             root_seed: Some(424_242),
             artifact_uri_prefix: "artifacts/validation-manifest".to_owned(),
         }
@@ -1968,6 +2015,7 @@ mod tests {
             "validation_manifest_runner",
             "--root-seed",
             "--generated-unix-ms",
+            "--fixture-root-manifest",
             "--commit-sha",
             "--run-id",
             "--trace-id",
@@ -1993,6 +2041,9 @@ mod tests {
             trace_id: "trace'xyz".to_owned(),
             scenario_id: "QUALITY 'SCENARIO'".to_owned(),
             generated_unix_ms: 1_700_000_000_111,
+            fixture_root_manifest_path: "fixture roots/'canon'.toml".to_owned(),
+            fixture_root_manifest_sha256:
+                "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
             root_seed: Some(7),
             artifact_uri_prefix: "artifacts/manifest special".to_owned(),
         };
@@ -2004,6 +2055,7 @@ mod tests {
         assert!(replay.contains("'run id with spaces'"));
         assert!(replay.contains("'trace'\"'\"'xyz'"));
         assert!(replay.contains("'QUALITY '\"'\"'SCENARIO'\"'\"''"));
+        assert!(replay.contains("'fixture roots/'\"'\"'canon'\"'\"'.toml'"));
         assert!(replay.contains("'artifacts/manifest special'"));
     }
 

@@ -58,6 +58,69 @@ fn write_manifest(workspace_root: &Path) -> PathBuf {
 schema_version = "1.0.0"
 bead_id = "bd-2yqp6.2.5"
 generated_at = "2026-02-27T00:00:00Z"
+
+[fixture_roots]
+schema_version = "1.0.0"
+fixtures_dir = "crates/fsqlite-harness/conformance"
+slt_dir = "conformance/slt"
+min_fixture_json_files = 1
+min_fixture_entries = 1
+min_fixture_sql_statements = 2
+min_slt_files = 1
+min_slt_entries = 1
+min_slt_sql_statements = 1
+required_category_families = [
+  "ddl",
+  "dml",
+  "joins",
+  "windows",
+  "ctes",
+  "triggers",
+  "views",
+  "functions",
+  "pragma",
+  "error_paths",
+]
+
+[[category_floors]]
+category = "ddl"
+min_entries = 1
+
+[[category_floors]]
+category = "dml"
+min_entries = 1
+
+[[category_floors]]
+category = "joins"
+min_entries = 1
+
+[[category_floors]]
+category = "windows"
+min_entries = 1
+
+[[category_floors]]
+category = "ctes"
+min_entries = 1
+
+[[category_floors]]
+category = "triggers"
+min_entries = 1
+
+[[category_floors]]
+category = "views"
+min_entries = 1
+
+[[category_floors]]
+category = "functions"
+min_entries = 1
+
+[[category_floors]]
+category = "pragma"
+min_entries = 1
+
+[[category_floors]]
+category = "error_paths"
+min_entries = 1
 "#,
     )
     .expect("write manifest");

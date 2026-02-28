@@ -96,8 +96,15 @@ DOCTOR_DIR="${RUN_ROOT}/doctor"
 DOCTOR_JSON="${DOCTOR_DIR}/oracle_preflight_doctor.json"
 DOCTOR_MD="${DOCTOR_DIR}/oracle_preflight_doctor.md"
 DOCTOR_LOG="${DOCTOR_DIR}/oracle_preflight_doctor_runner.log"
+FIXTURE_ROOT_MANIFEST="${WORKSPACE_ROOT}/corpus_manifest.toml"
 
 mkdir -p "${RUN_A}" "${RUN_B}" "${DOCTOR_DIR}"
+
+if [[ ! -f "${FIXTURE_ROOT_MANIFEST}" ]]; then
+  echo "ERROR: canonical fixture-root manifest missing at ${FIXTURE_ROOT_MANIFEST}" >&2
+  exit 1
+fi
+FIXTURE_ROOT_MANIFEST_SHA256="$(sha256sum "${FIXTURE_ROOT_MANIFEST}" | awk '{print $1}')"
 
 RUN_ID="${BEAD_ID}-${LANE_ID}-seed-${ROOT_SEED}"
 TRACE_ID="trace-$(printf '%s' "${RUN_ID}" | sha256sum | awk '{print $1}' | cut -c1-16)"
@@ -154,6 +161,7 @@ fi
 
 COMMON_ARGS=(
   --workspace-root "${WORKSPACE_ROOT}"
+  --fixture-root-manifest "${FIXTURE_ROOT_MANIFEST}"
   --run-id "${RUN_ID}"
   --trace-id "${TRACE_ID}"
   --scenario-id "${SCENARIO_ID}"
@@ -196,7 +204,7 @@ run_doctor() {
   "${DOCTOR_RUNNER[@]}" \
     --workspace-root "${WORKSPACE_ROOT}" \
     --fixtures-dir "${WORKSPACE_ROOT}/crates/fsqlite-harness/conformance" \
-    --fixture-manifest-path "${WORKSPACE_ROOT}/corpus_manifest.toml" \
+    --fixture-manifest-path "${FIXTURE_ROOT_MANIFEST}" \
     --run-id "${RUN_ID}-doctor" \
     --trace-id "${TRACE_ID}-doctor" \
     --scenario-id "${SCENARIO_ID}-doctor" \
@@ -257,6 +265,8 @@ jq -e \
   --arg lane_id "${LANE_ID}" \
   --arg run_id "${RUN_ID}" \
   --arg trace_id "${TRACE_ID}" \
+  --arg fixture_root_manifest_path "${FIXTURE_ROOT_MANIFEST}" \
+  --arg fixture_root_manifest_sha256 "${FIXTURE_ROOT_MANIFEST_SHA256}" \
   --argjson seed "${ROOT_SEED}" \
   --arg scenario_id "${SCENARIO_ID}" \
   '
@@ -264,6 +274,8 @@ jq -e \
     .bead_id == "bd-mblr.7.1.2" and
     .run_id == $run_id and
     .trace_id == $trace_id and
+    .fixture_root_manifest_path == $fixture_root_manifest_path and
+    .fixture_root_manifest_sha256 == $fixture_root_manifest_sha256 and
     .scenario_id == $scenario_id and
     .root_seed == $seed and
     (.run_report.total_cases >= 0) and
@@ -337,6 +349,8 @@ if ${JSON_OUTPUT}; then
     --arg commit_sha "${COMMIT_SHA}" \
     --argjson root_seed "${ROOT_SEED}" \
     --argjson generated_unix_ms "${GENERATED_UNIX_MS}" \
+    --arg fixture_root_manifest_path "${FIXTURE_ROOT_MANIFEST}" \
+    --arg fixture_root_manifest_sha256 "${FIXTURE_ROOT_MANIFEST_SHA256}" \
     --argjson run_a_exit_code "${run_a_status}" \
     --argjson run_b_exit_code "${run_b_status}" \
     --argjson doctor_exit_code "${doctor_status}" \
@@ -377,6 +391,8 @@ if ${JSON_OUTPUT}; then
           commit_sha: $commit_sha,
           root_seed: $root_seed,
           generated_unix_ms: $generated_unix_ms,
+          fixture_root_manifest_path: $fixture_root_manifest_path,
+          fixture_root_manifest_sha256: $fixture_root_manifest_sha256,
           doctor_exit_code: $doctor_exit_code,
           doctor_outcome: $doctor_outcome,
           doctor_certifying: ($doctor_certifying == "true"),
@@ -415,6 +431,8 @@ else
   echo "Commit SHA:           ${COMMIT_SHA}"
   echo "Root seed:            ${ROOT_SEED}"
   echo "Generated unix ms:    ${GENERATED_UNIX_MS}"
+  echo "Fixture manifest:     ${FIXTURE_ROOT_MANIFEST#${WORKSPACE_ROOT}/}"
+  echo "Fixture sha256:       ${FIXTURE_ROOT_MANIFEST_SHA256}"
   echo "Doctor exit code:     ${doctor_status}"
   echo "Doctor outcome:       ${DOCTOR_OUTCOME}"
   echo "Doctor certifying:    ${DOCTOR_CERTIFYING}"

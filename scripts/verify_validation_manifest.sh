@@ -60,8 +60,15 @@ SUMMARY_B="$RUN_B/validation_manifest.md"
 RUN_A_LOG="$RUN_A/validation_manifest_runner.log"
 RUN_B_LOG="$RUN_B/validation_manifest_runner.log"
 ARTIFACT_URI_PREFIX="artifacts/validation-manifest-e2e/shared"
+FIXTURE_ROOT_MANIFEST="$WORKSPACE_ROOT/corpus_manifest.toml"
 
 mkdir -p "$RUN_A" "$RUN_B"
+
+if [[ ! -f "$FIXTURE_ROOT_MANIFEST" ]]; then
+    echo "ERROR: canonical fixture-root manifest missing at $FIXTURE_ROOT_MANIFEST" >&2
+    exit 1
+fi
+FIXTURE_ROOT_MANIFEST_SHA256="$(sha256sum "$FIXTURE_ROOT_MANIFEST" | awk '{print $1}')"
 
 COMMIT_SHA="$(git -C "$WORKSPACE_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 RUN_ID="bd-mblr.3.5.1-seed-${ROOT_SEED}"
@@ -80,6 +87,7 @@ COMMON_ARGS=(
     --run-id "$RUN_ID"
     --trace-id "$TRACE_ID"
     --scenario-id "$SCENARIO_ID"
+    --fixture-root-manifest "$FIXTURE_ROOT_MANIFEST"
     --root-seed "$ROOT_SEED"
     --generated-unix-ms "$GENERATED_UNIX_MS"
 )
@@ -125,16 +133,22 @@ if [[ ! -f "$MANIFEST_A" || ! -f "$MANIFEST_B" ]]; then
     exit 1
 fi
 
-jq -e '
+jq -e \
+    --arg fixture_manifest_path "$FIXTURE_ROOT_MANIFEST" \
+    --arg fixture_manifest_sha256 "$FIXTURE_ROOT_MANIFEST_SHA256" \
+    '
     .schema_version == "1.0.0" and
     .bead_id == "bd-mblr.3.5.1" and
     (.commit_sha | length) > 0 and
     (.run_id | length) > 0 and
     (.trace_id | length) > 0 and
     (.scenario_id == "QUALITY-351") and
+    (.fixture_root_manifest_path == $fixture_manifest_path) and
+    (.fixture_root_manifest_sha256 == $fixture_manifest_sha256) and
     (.gates | length) >= 5 and
     (.artifact_uris | length) >= 6 and
     (.replay.command | length) > 0 and
+    (.replay.command | contains("--fixture-root-manifest")) and
     (.logging_conformance.gate_id == "bd-mblr.5.5.1") and
     (.logging_conformance.log_validation.passed == true) and
     (.logging_conformance.shell_script_conformance.overall_pass == true)
@@ -147,7 +161,7 @@ if ! diff -u "$MANIFEST_A" "$MANIFEST_B" >/dev/null; then
 fi
 
 REPLAY_COMMAND="$(jq -r '.replay.command' "$MANIFEST_A")"
-EXPECTED_REPLAY_COMMAND="cargo run -p fsqlite-harness --bin validation_manifest_runner -- --root-seed ${ROOT_SEED} --generated-unix-ms ${GENERATED_UNIX_MS} --commit-sha '${COMMIT_SHA}' --run-id '${RUN_ID}' --trace-id '${TRACE_ID}' --scenario-id '${SCENARIO_ID}' --artifact-uri-prefix '${ARTIFACT_URI_PREFIX}'"
+EXPECTED_REPLAY_COMMAND="cargo run -p fsqlite-harness --bin validation_manifest_runner -- --root-seed ${ROOT_SEED} --generated-unix-ms ${GENERATED_UNIX_MS} --fixture-root-manifest '${FIXTURE_ROOT_MANIFEST}' --commit-sha '${COMMIT_SHA}' --run-id '${RUN_ID}' --trace-id '${TRACE_ID}' --scenario-id '${SCENARIO_ID}' --artifact-uri-prefix '${ARTIFACT_URI_PREFIX}'"
 if [[ "${REPLAY_COMMAND}" != "${EXPECTED_REPLAY_COMMAND}" ]]; then
     echo "ERROR: replay command mismatch (expected deterministic exact command)" >&2
     echo "expected: ${EXPECTED_REPLAY_COMMAND}" >&2
@@ -169,6 +183,8 @@ if $JSON_OUTPUT; then
   "commit_sha": "$COMMIT_SHA",
   "root_seed": "$ROOT_SEED",
   "generated_unix_ms": "$GENERATED_UNIX_MS",
+  "fixture_root_manifest_path": "$FIXTURE_ROOT_MANIFEST",
+  "fixture_root_manifest_sha256": "$FIXTURE_ROOT_MANIFEST_SHA256",
   "deterministic_match": true,
   "manifest_a": "${MANIFEST_A#$WORKSPACE_ROOT/}",
   "manifest_b": "${MANIFEST_B#$WORKSPACE_ROOT/}",
@@ -193,6 +209,8 @@ else
     echo "Commit SHA:         $COMMIT_SHA"
     echo "Root seed:          $ROOT_SEED"
     echo "Generated unix ms:  $GENERATED_UNIX_MS"
+    echo "Fixture manifest:   ${FIXTURE_ROOT_MANIFEST#$WORKSPACE_ROOT/}"
+    echo "Fixture sha256:     $FIXTURE_ROOT_MANIFEST_SHA256"
     echo "Gate count:         $GATE_COUNT"
     echo "Artifact count:     $ARTIFACT_COUNT"
     echo "Overall outcome:    $OVERALL_OUTCOME"

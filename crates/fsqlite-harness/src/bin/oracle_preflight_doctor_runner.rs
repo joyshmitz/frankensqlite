@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use fsqlite_harness::differential_v2::TARGET_SQLITE_VERSION;
+use fsqlite_harness::fixture_root_contract::DEFAULT_FIXTURE_ROOT_MANIFEST_PATH;
 use fsqlite_harness::oracle_preflight_doctor::{
     BEAD_ID, DEFAULT_SCENARIO_ID, DoctorConfig, DoctorOutcome, OraclePreflightReport,
     run_oracle_preflight_doctor,
@@ -194,7 +195,9 @@ impl Config {
                 .join("crates/fsqlite-harness/conformance");
         }
         if workspace_root_overridden && !fixture_manifest_overridden {
-            doctor.fixture_manifest_path = doctor.workspace_root.join("corpus_manifest.toml");
+            doctor.fixture_manifest_path = doctor
+                .workspace_root
+                .join(DEFAULT_FIXTURE_ROOT_MANIFEST_PATH);
         }
         if workspace_root_overridden && !output_dir_overridden {
             output_dir = doctor.workspace_root.join(DEFAULT_OUTPUT_DIR);
@@ -314,6 +317,7 @@ oracle_version: `{}`\n\
 expected_sqlite_version_prefix: `{}`\n\
 fixtures_dir: `{}`\n\
 fixture_manifest_path: `{}`\n\
+fixture_manifest_sha256: `{}`\n\
 fixture_json_files_seen: `{}`\n\
 fixture_entries_ingested: `{}`\n\
 fixture_sql_statements_ingested: `{}`\n\
@@ -338,6 +342,11 @@ skipped_fixture_files: `{}`\n",
         report.checks.expected_sqlite_version_prefix,
         report.checks.fixtures_dir,
         report.checks.fixture_manifest_path,
+        report
+            .checks
+            .fixture_manifest_sha256
+            .clone()
+            .unwrap_or_else(|| "none".to_owned()),
         report.checks.fixture_json_files_seen,
         report.checks.fixture_entries_ingested,
         report.checks.fixture_sql_statements_ingested,

@@ -16,24 +16,22 @@ use fsqlite_harness::differential_runner::{
     DifferentialRunReport, DivergenceSource, RunConfig, run_metamorphic_differential,
 };
 use fsqlite_harness::differential_v2::{CsqliteExecutor, FsqliteExecutor};
+use fsqlite_harness::fixture_root_contract::{
+    DEFAULT_FIXTURE_ROOT_MANIFEST_PATH, enforce_fixture_contract_alignment,
+    load_fixture_root_contract,
+};
 
 const BEAD_ID: &str = "bd-mblr.7.1.2";
 const DEFAULT_SCENARIO_ID: &str = "DIFF-712";
 const DEFAULT_OUTPUT_PREFIX: &str = "artifacts/differential-manifest";
-const DEFAULT_FIXTURES_DIR: &str = "crates/fsqlite-harness/conformance";
-const DEFAULT_SLT_DIR: &str = "conformance/slt";
-const DEFAULT_MIN_FIXTURE_JSON_FILES: usize = 8;
-const DEFAULT_MIN_FIXTURE_ENTRIES: usize = 8;
-const DEFAULT_MIN_FIXTURE_SQL_STATEMENTS: usize = 40;
-const DEFAULT_MIN_SLT_FILES: usize = 1;
-const DEFAULT_MIN_SLT_ENTRIES: usize = 1;
-const DEFAULT_MIN_SLT_SQL_STATEMENTS: usize = 1;
 
 #[derive(Debug, Clone)]
 struct Config {
     workspace_root: PathBuf,
     output_json: PathBuf,
     output_human: PathBuf,
+    fixture_root_manifest_path: PathBuf,
+    fixture_root_manifest_sha256: String,
     fixtures_dir: PathBuf,
     slt_dir: PathBuf,
     run_id: String,
@@ -60,6 +58,7 @@ impl Config {
         let mut output_dir = workspace_root.join(DEFAULT_OUTPUT_PREFIX);
         let mut output_json: Option<PathBuf> = None;
         let mut output_human: Option<PathBuf> = None;
+        let mut fixture_root_manifest_path: Option<PathBuf> = None;
         let mut fixtures_dir: Option<PathBuf> = None;
         let mut slt_dir: Option<PathBuf> = None;
         let mut run_id: Option<String> = None;
@@ -68,12 +67,12 @@ impl Config {
         let mut root_seed = 424_242_u64;
         let mut max_cases_per_entry = RunConfig::default().max_cases_per_entry;
         let mut max_entries: Option<usize> = None;
-        let mut min_fixture_json_files = DEFAULT_MIN_FIXTURE_JSON_FILES;
-        let mut min_fixture_entries = DEFAULT_MIN_FIXTURE_ENTRIES;
-        let mut min_fixture_sql_statements = DEFAULT_MIN_FIXTURE_SQL_STATEMENTS;
-        let mut min_slt_files = DEFAULT_MIN_SLT_FILES;
-        let mut min_slt_entries = DEFAULT_MIN_SLT_ENTRIES;
-        let mut min_slt_sql_statements = DEFAULT_MIN_SLT_SQL_STATEMENTS;
+        let mut min_fixture_json_files: Option<usize> = None;
+        let mut min_fixture_entries: Option<usize> = None;
+        let mut min_fixture_sql_statements: Option<usize> = None;
+        let mut min_slt_files: Option<usize> = None;
+        let mut min_slt_entries: Option<usize> = None;
+        let mut min_slt_sql_statements: Option<usize> = None;
         let mut generated_unix_ms = now_unix_ms();
         let mut skip_fixtures = false;
         let mut skip_slt = true;
@@ -109,6 +108,13 @@ impl Config {
                         .get(index)
                         .ok_or_else(|| "missing value for --output-human".to_owned())?;
                     output_human = Some(PathBuf::from(value));
+                }
+                "--fixture-root-manifest" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --fixture-root-manifest".to_owned())?;
+                    fixture_root_manifest_path = Some(PathBuf::from(value));
                 }
                 "--fixtures-dir" => {
                     index += 1;
@@ -178,54 +184,54 @@ impl Config {
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --min-fixture-json-files".to_owned())?;
-                    min_fixture_json_files = value.parse::<usize>().map_err(|error| {
+                    min_fixture_json_files = Some(value.parse::<usize>().map_err(|error| {
                         format!("invalid --min-fixture-json-files value={value}: {error}")
-                    })?;
+                    })?);
                 }
                 "--min-fixture-entries" => {
                     index += 1;
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --min-fixture-entries".to_owned())?;
-                    min_fixture_entries = value.parse::<usize>().map_err(|error| {
+                    min_fixture_entries = Some(value.parse::<usize>().map_err(|error| {
                         format!("invalid --min-fixture-entries value={value}: {error}")
-                    })?;
+                    })?);
                 }
                 "--min-fixture-sql-statements" => {
                     index += 1;
                     let value = args.get(index).ok_or_else(|| {
                         "missing value for --min-fixture-sql-statements".to_owned()
                     })?;
-                    min_fixture_sql_statements = value.parse::<usize>().map_err(|error| {
+                    min_fixture_sql_statements = Some(value.parse::<usize>().map_err(|error| {
                         format!("invalid --min-fixture-sql-statements value={value}: {error}")
-                    })?;
+                    })?);
                 }
                 "--min-slt-files" => {
                     index += 1;
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --min-slt-files".to_owned())?;
-                    min_slt_files = value.parse::<usize>().map_err(|error| {
+                    min_slt_files = Some(value.parse::<usize>().map_err(|error| {
                         format!("invalid --min-slt-files value={value}: {error}")
-                    })?;
+                    })?);
                 }
                 "--min-slt-entries" => {
                     index += 1;
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --min-slt-entries".to_owned())?;
-                    min_slt_entries = value.parse::<usize>().map_err(|error| {
+                    min_slt_entries = Some(value.parse::<usize>().map_err(|error| {
                         format!("invalid --min-slt-entries value={value}: {error}")
-                    })?;
+                    })?);
                 }
                 "--min-slt-sql-statements" => {
                     index += 1;
                     let value = args
                         .get(index)
                         .ok_or_else(|| "missing value for --min-slt-sql-statements".to_owned())?;
-                    min_slt_sql_statements = value.parse::<usize>().map_err(|error| {
+                    min_slt_sql_statements = Some(value.parse::<usize>().map_err(|error| {
                         format!("invalid --min-slt-sql-statements value={value}: {error}")
-                    })?;
+                    })?);
                 }
                 "--generated-unix-ms" => {
                     index += 1;
@@ -254,23 +260,25 @@ impl Config {
             index += 1;
         }
 
+        if scenario_id.trim().is_empty() {
+            return Err("--scenario-id must be non-empty".to_owned());
+        }
         if max_cases_per_entry == 0 {
             return Err("--max-cases-per-entry must be > 0".to_owned());
         }
         if let Some(max_entries) = max_entries {
             require_positive("--max-entries", max_entries)?;
         }
-        require_positive("--min-fixture-json-files", min_fixture_json_files)?;
-        require_positive("--min-fixture-entries", min_fixture_entries)?;
-        require_positive("--min-fixture-sql-statements", min_fixture_sql_statements)?;
-        if !skip_slt {
-            require_positive("--min-slt-files", min_slt_files)?;
-            require_positive("--min-slt-entries", min_slt_entries)?;
-            require_positive("--min-slt-sql-statements", min_slt_sql_statements)?;
-        }
-        if scenario_id.trim().is_empty() {
-            return Err("--scenario-id must be non-empty".to_owned());
-        }
+
+        let fixture_root_manifest_path = fixture_root_manifest_path
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_FIXTURE_ROOT_MANIFEST_PATH));
+        let fixture_root_manifest_path = if fixture_root_manifest_path.is_relative() {
+            workspace_root.join(fixture_root_manifest_path)
+        } else {
+            fixture_root_manifest_path
+        };
+        let fixture_root_contract =
+            load_fixture_root_contract(&workspace_root, &fixture_root_manifest_path)?;
 
         let run_id = run_id
             .unwrap_or_else(|| format!("{BEAD_ID}-{}-{}", generated_unix_ms, std::process::id()));
@@ -279,14 +287,53 @@ impl Config {
             output_json.unwrap_or_else(|| output_dir.join("differential_manifest.json"));
         let output_human =
             output_human.unwrap_or_else(|| output_dir.join("differential_manifest.md"));
-        let fixtures_dir =
-            fixtures_dir.unwrap_or_else(|| workspace_root.join(DEFAULT_FIXTURES_DIR));
-        let slt_dir = slt_dir.unwrap_or_else(|| workspace_root.join(DEFAULT_SLT_DIR));
+        let fixtures_dir = fixtures_dir.unwrap_or_else(|| fixture_root_contract.fixtures_dir.clone());
+        let fixtures_dir = if fixtures_dir.is_relative() {
+            workspace_root.join(fixtures_dir)
+        } else {
+            fixtures_dir
+        };
+        let slt_dir = slt_dir.unwrap_or_else(|| fixture_root_contract.slt_dir.clone());
+        let slt_dir = if slt_dir.is_relative() {
+            workspace_root.join(slt_dir)
+        } else {
+            slt_dir
+        };
+        let min_fixture_json_files =
+            min_fixture_json_files.unwrap_or(fixture_root_contract.min_fixture_json_files);
+        let min_fixture_entries =
+            min_fixture_entries.unwrap_or(fixture_root_contract.min_fixture_entries);
+        let min_fixture_sql_statements =
+            min_fixture_sql_statements.unwrap_or(fixture_root_contract.min_fixture_sql_statements);
+        let min_slt_files = min_slt_files.unwrap_or(fixture_root_contract.min_slt_files);
+        let min_slt_entries = min_slt_entries.unwrap_or(fixture_root_contract.min_slt_entries);
+        let min_slt_sql_statements =
+            min_slt_sql_statements.unwrap_or(fixture_root_contract.min_slt_sql_statements);
+
+        require_positive("--min-fixture-json-files", min_fixture_json_files)?;
+        require_positive("--min-fixture-entries", min_fixture_entries)?;
+        require_positive("--min-fixture-sql-statements", min_fixture_sql_statements)?;
+        require_positive("--min-slt-files", min_slt_files)?;
+        require_positive("--min-slt-entries", min_slt_entries)?;
+        require_positive("--min-slt-sql-statements", min_slt_sql_statements)?;
+        enforce_fixture_contract_alignment(
+            &fixture_root_contract,
+            &fixtures_dir,
+            &slt_dir,
+            min_fixture_json_files,
+            min_fixture_entries,
+            min_fixture_sql_statements,
+            min_slt_files,
+            min_slt_entries,
+            min_slt_sql_statements,
+        )?;
 
         Ok(Self {
             workspace_root,
             output_json,
             output_human,
+            fixture_root_manifest_path: fixture_root_contract.manifest_path,
+            fixture_root_manifest_sha256: fixture_root_contract.manifest_sha256,
             fixtures_dir,
             slt_dir,
             run_id,
@@ -332,6 +379,8 @@ struct DifferentialManifest {
     generated_unix_ms: u128,
     commit_sha: String,
     root_seed: u64,
+    fixture_root_manifest_path: String,
+    fixture_root_manifest_sha256: String,
     fixture_json_files_seen: usize,
     fixture_entries_ingested: usize,
     fixture_sql_statements_ingested: usize,
@@ -361,18 +410,19 @@ USAGE:
 
 OPTIONS:
   --workspace-root <PATH>        Workspace root (default: auto-detected)
+  --fixture-root-manifest <PATH> Canonical fixture-root manifest (default: <workspace-root>/corpus_manifest.toml)
   --output-dir <PATH>            Output directory (default: artifacts/differential-manifest)
   --output-json <PATH>           Output JSON path (default: <output-dir>/differential_manifest.json)
   --output-human <PATH>          Output Markdown summary path (default: <output-dir>/differential_manifest.md)
-  --fixtures-dir <PATH>          Conformance fixtures directory (default: <workspace-root>/crates/fsqlite-harness/conformance)
-  --slt-dir <PATH>               SQLLogicTest directory (default: <workspace-root>/conformance/slt)
-  --min-fixture-json-files <N>   Minimum fixture JSON files required when fixtures are enabled (default: 8, must be > 0)
-  --min-fixture-entries <N>      Minimum fixture entries ingested when fixtures are enabled (default: 8, must be > 0)
+  --fixtures-dir <PATH>          Conformance fixtures directory (must align with fixture-root manifest)
+  --slt-dir <PATH>               SQLLogicTest directory (must align with fixture-root manifest)
+  --min-fixture-json-files <N>   Minimum fixture JSON files required when fixtures are enabled (must align with fixture-root manifest)
+  --min-fixture-entries <N>      Minimum fixture entries ingested when fixtures are enabled (must align with fixture-root manifest)
   --min-fixture-sql-statements <N>
-                                 Minimum SQL statements extracted from fixtures (default: 40, must be > 0)
-  --min-slt-files <N>            Minimum SLT files required when SLT ingestion is enabled (default: 1, must be > 0)
-  --min-slt-entries <N>          Minimum parsed SLT entries when SLT ingestion is enabled (default: 1, must be > 0)
-  --min-slt-sql-statements <N>   Minimum SQL statements extracted from SLT when enabled (default: 1, must be > 0)
+                                 Minimum SQL statements extracted from fixtures (must align with fixture-root manifest)
+  --min-slt-files <N>            Minimum SLT files required when SLT ingestion is enabled (must align with fixture-root manifest)
+  --min-slt-entries <N>          Minimum parsed SLT entries when SLT ingestion is enabled (must align with fixture-root manifest)
+  --min-slt-sql-statements <N>   Minimum SQL statements extracted from SLT when enabled (must align with fixture-root manifest)
   --skip-fixtures                Skip conformance fixture ingestion (seed corpus only)
   --enable-slt                   Enable SQLLogicTest ingestion into the corpus pipeline
   --skip-slt                     Disable SQLLogicTest ingestion (default)
@@ -505,8 +555,9 @@ fn first_failure_replay(
 
 fn build_replay_command(config: &Config) -> String {
     let mut replay = format!(
-        "cargo run -p fsqlite-harness --bin differential_manifest_runner -- --workspace-root {} --run-id {} --trace-id {} --scenario-id {} --root-seed {} --max-cases-per-entry {} --generated-unix-ms {}",
+        "cargo run -p fsqlite-harness --bin differential_manifest_runner -- --workspace-root {} --fixture-root-manifest {} --run-id {} --trace-id {} --scenario-id {} --root-seed {} --max-cases-per-entry {} --generated-unix-ms {}",
         shell_single_quote(&path_to_utf8(&config.workspace_root)),
+        shell_single_quote(&path_to_utf8(&config.fixture_root_manifest_path)),
         shell_single_quote(&config.run_id),
         shell_single_quote(&config.trace_id),
         shell_single_quote(&config.scenario_id),
@@ -579,6 +630,8 @@ trace_id: `{}`\n\
 scenario_id: `{}`\n\
 commit_sha: `{}`\n\
 root_seed: `{}`\n\
+fixture_root_manifest_path: `{}`\n\
+fixture_root_manifest_sha256: `{}`\n\
 corpus_entries: `{}`\n\
 fixture_json_files_seen: `{}`\n\
 fixture_entries_ingested: `{}`\n\
@@ -608,6 +661,8 @@ first_failure_statement_index: `{}`\n\n\
         manifest.scenario_id,
         manifest.commit_sha,
         manifest.root_seed,
+        manifest.fixture_root_manifest_path,
+        manifest.fixture_root_manifest_sha256,
         manifest.corpus_entries,
         manifest.fixture_json_files_seen,
         manifest.fixture_entries_ingested,
@@ -645,11 +700,10 @@ fn run() -> Result<bool, String> {
         if !config.fixtures_dir.exists() {
             return Err(format!(
                 "fixture_ingest_failed: fixtures directory does not exist: {}. \
-                 remediation: pass --fixtures-dir <PATH> (recommended: {}/{}), \
+                 remediation: pass --fixtures-dir <PATH> matching fixture-root contract in {}, \
                  or run with --skip-fixtures if seed-only execution is intentional.",
                 config.fixtures_dir.display(),
-                config.workspace_root.display(),
-                DEFAULT_FIXTURES_DIR,
+                config.fixture_root_manifest_path.display(),
             ));
         }
 
@@ -664,11 +718,10 @@ fn run() -> Result<bool, String> {
         if !config.slt_dir.exists() {
             return Err(format!(
                 "slt_ingest_failed: slt directory does not exist: {}. \
-                 remediation: pass --slt-dir <PATH> (recommended: {}/{}), \
+                 remediation: pass --slt-dir <PATH> matching fixture-root contract in {}, \
                  or run with --skip-slt.",
                 config.slt_dir.display(),
-                config.workspace_root.display(),
-                DEFAULT_SLT_DIR,
+                config.fixture_root_manifest_path.display(),
             ));
         }
         let report = ingest_slt_files_with_report(&config.slt_dir, &mut builder)?;
@@ -708,6 +761,8 @@ fn run() -> Result<bool, String> {
         generated_unix_ms: config.generated_unix_ms,
         commit_sha: resolve_commit_sha(&config.workspace_root),
         root_seed: config.root_seed,
+        fixture_root_manifest_path: path_to_utf8(&config.fixture_root_manifest_path),
+        fixture_root_manifest_sha256: config.fixture_root_manifest_sha256.clone(),
         fixture_json_files_seen: fixture_report.fixture_json_files_seen,
         fixture_entries_ingested: fixture_report.fixture_entries_ingested,
         fixture_sql_statements_ingested: fixture_report.sql_statements_ingested,
@@ -796,11 +851,9 @@ fn enforce_fixture_sanity(report: &FixtureIngestReport, config: &Config) -> Resu
 
     let _ = write!(
         message,
-        ". remediation: verify fixture quality/size in {} (recommended default: \
-         {}/{}). If seed-only execution was intended, rerun with --skip-fixtures.",
+        ". remediation: verify fixture quality/size in {} and confirm canonical fixture-root contract in {}. If seed-only execution was intended, rerun with --skip-fixtures.",
         config.fixtures_dir.display(),
-        config.workspace_root.display(),
-        DEFAULT_FIXTURES_DIR,
+        config.fixture_root_manifest_path.display(),
     );
 
     Err(message)
@@ -847,11 +900,9 @@ fn enforce_slt_sanity(report: &SltIngestReport, config: &Config) -> Result<(), S
 
     let _ = write!(
         message,
-        ". remediation: verify SQLLogicTest suite quality/size in {} (recommended default: \
-         {}/{}). If SLT ingestion was not intended, rerun with --skip-slt.",
+        ". remediation: verify SQLLogicTest suite quality/size in {} and confirm canonical fixture-root contract in {}. If SLT ingestion was not intended, rerun with --skip-slt.",
         config.slt_dir.display(),
-        config.workspace_root.display(),
-        DEFAULT_SLT_DIR,
+        config.fixture_root_manifest_path.display(),
     );
     Err(message)
 }
@@ -883,20 +934,23 @@ mod tests {
                 "artifacts/differential-manifest/differential_manifest.json",
             ),
             output_human: PathBuf::from("artifacts/differential-manifest/differential_manifest.md"),
-            fixtures_dir: PathBuf::from(DEFAULT_FIXTURES_DIR),
-            slt_dir: PathBuf::from(DEFAULT_SLT_DIR),
+            fixture_root_manifest_path: PathBuf::from("/tmp/workspace/corpus_manifest.toml"),
+            fixture_root_manifest_sha256:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            fixtures_dir: PathBuf::from("/tmp/workspace/crates/fsqlite-harness/conformance"),
+            slt_dir: PathBuf::from("/tmp/workspace/conformance/slt"),
             run_id: "bd-mblr.7.1.2-test-run".to_owned(),
             trace_id: "trace-test".to_owned(),
             scenario_id: "DIFF-712".to_owned(),
             root_seed: 424_242,
             max_cases_per_entry: 8,
             max_entries: Some(64),
-            min_fixture_json_files: DEFAULT_MIN_FIXTURE_JSON_FILES,
-            min_fixture_entries: DEFAULT_MIN_FIXTURE_ENTRIES,
-            min_fixture_sql_statements: DEFAULT_MIN_FIXTURE_SQL_STATEMENTS,
-            min_slt_files: DEFAULT_MIN_SLT_FILES,
-            min_slt_entries: DEFAULT_MIN_SLT_ENTRIES,
-            min_slt_sql_statements: DEFAULT_MIN_SLT_SQL_STATEMENTS,
+            min_fixture_json_files: 8,
+            min_fixture_entries: 8,
+            min_fixture_sql_statements: 40,
+            min_slt_files: 1,
+            min_slt_entries: 1,
+            min_slt_sql_statements: 1,
             generated_unix_ms: 1_700_000_000_000,
             skip_fixtures: true,
             skip_slt: true,
@@ -920,6 +974,7 @@ mod tests {
         let config = test_config();
         let replay = build_replay_command(&config);
 
+        assert!(replay.contains("--fixture-root-manifest '/tmp/workspace/corpus_manifest.toml'"));
         assert!(replay.contains("--root-seed 424242"));
         assert!(replay.contains("--max-cases-per-entry 8"));
         assert!(replay.contains("--max-entries 64"));
@@ -944,7 +999,9 @@ mod tests {
         config.skip_fixtures = false;
         let replay = build_replay_command(&config);
 
-        assert!(replay.contains("--fixtures-dir crates/fsqlite-harness/conformance"));
+        assert!(
+            replay.contains("--fixtures-dir '/tmp/workspace/crates/fsqlite-harness/conformance'")
+        );
         assert!(replay.contains("--min-fixture-json-files 8"));
         assert!(replay.contains("--min-fixture-entries 8"));
         assert!(replay.contains("--min-fixture-sql-statements 40"));
@@ -957,7 +1014,7 @@ mod tests {
         let replay = build_replay_command(&config);
 
         assert!(replay.contains("--enable-slt"));
-        assert!(replay.contains("--slt-dir conformance/slt"));
+        assert!(replay.contains("--slt-dir '/tmp/workspace/conformance/slt'"));
         assert!(replay.contains("--min-slt-files 1"));
         assert!(replay.contains("--min-slt-entries 1"));
         assert!(replay.contains("--min-slt-sql-statements 1"));
@@ -988,6 +1045,8 @@ mod tests {
             generated_unix_ms: config.generated_unix_ms,
             commit_sha: "deadbeef".to_owned(),
             root_seed: config.root_seed,
+            fixture_root_manifest_path: path_to_utf8(&config.fixture_root_manifest_path),
+            fixture_root_manifest_sha256: config.fixture_root_manifest_sha256.clone(),
             fixture_json_files_seen: 9,
             fixture_entries_ingested: 4,
             fixture_sql_statements_ingested: 24,
@@ -1014,6 +1073,12 @@ mod tests {
         assert!(human.contains("diverged: `1`"));
         assert!(human.contains("overall_pass: `false`"));
         assert!(human.contains(&replay));
+        assert!(human.contains("fixture_root_manifest_path: `/tmp/workspace/corpus_manifest.toml`"));
+        assert!(
+            human.contains(
+                "fixture_root_manifest_sha256: `0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`"
+            )
+        );
         assert!(human.contains("fixture_json_files_seen: `9`"));
         assert!(human.contains("fixture_sql_statements_ingested: `24`"));
         assert!(human.contains("slt_files_seen: `2`"));

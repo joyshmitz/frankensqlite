@@ -18,6 +18,9 @@ fn deterministic_config() -> ValidationManifestConfig {
         trace_id: "trace-b9-integrity".to_owned(),
         scenario_id: "ARTIFACT-HASH-RATCHET-B9".to_owned(),
         generated_unix_ms: 1_730_000_000_000,
+        fixture_root_manifest_path: "corpus_manifest.toml".to_owned(),
+        fixture_root_manifest_sha256:
+            "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
         root_seed: Some(9_209),
         artifact_uri_prefix: "artifacts/bd-2yqp6.2.9".to_owned(),
     }

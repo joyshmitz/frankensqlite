@@ -132,13 +132,14 @@ FrankenSQLite is organized as a 24-crate Cargo workspace with strict layered dep
 
 ## Current Implementation Status
 
-This README describes the target end-state architecture. The runnable code today still uses the Phase 4 in-memory query engine:
+This README describes the target end-state architecture. The runnable code today is in a hybrid state:
 
 - Public entry point: `fsqlite::Connection` (`crates/fsqlite/src/lib.rs`), implemented by `fsqlite-core::Connection` (`crates/fsqlite-core/src/connection.rs`).
-- Execution backend: table storage is backed by `fsqlite-vdbe::engine::MemDatabase` and executed via `fsqlite-vdbe::VdbeEngine` (`crates/fsqlite-vdbe/src/engine.rs`).
-- Persistence: for non-`:memory:` paths, `Connection` snapshots `MemDatabase` to a SQLite-format file via `compat_persist` and reloads from that snapshot on open. This is full-file snapshot persistence, not WAL/incremental pager-backed persistence yet.
-- Extensions: extension crates are present and feature-gated in the workspace/public API crate, but the runtime connection path is still centered on `fsqlite-func` registrations; extension virtual table/function wiring is still in progress.
-- Storage stack status: `fsqlite-vfs`, `fsqlite-pager`, `fsqlite-wal`, `fsqlite-mvcc`, and `fsqlite-btree` exist and have extensive tests, and `fsqlite-vdbe` has early "storage cursor" support behind a flag, but `Connection` is not yet wired to use the pager/WAL/B-tree stack as its default backend (see Phase 5+ below).
+- Execution backend: the default table-backed path uses pager transactions plus storage cursors into the B-tree stack, executed by `fsqlite-vdbe::VdbeEngine` (`crates/fsqlite-vdbe/src/engine.rs`).
+- Runtime image/fallback: `fsqlite-vdbe::engine::MemDatabase` is still maintained as the in-memory execution image and remains in selected compatibility/fallback paths while cutover work continues.
+- Persistence: for non-`:memory:` paths, `Connection` opens pager/VFS state, applies journal-mode configuration, and reloads runtime image from pager-backed data; compatibility snapshot flows remain in the codebase for specific paths.
+- Extensions: extension crates are present and feature-gated in the workspace/public API crate, but extension virtual table/function wiring is still in progress.
+- Storage stack status: `fsqlite-vfs`, `fsqlite-pager`, `fsqlite-wal`, `fsqlite-mvcc`, and `fsqlite-btree` are wired into default runtime execution. Remaining work focuses on removing residual fallback paths, closing opcode/behavior gaps, and finishing parity/certification tracks.
 
 ---
 

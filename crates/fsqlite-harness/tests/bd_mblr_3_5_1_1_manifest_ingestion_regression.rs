@@ -26,6 +26,9 @@ fn canonical_config() -> ValidationManifestConfig {
         trace_id: "trace-ingestion-351".to_owned(),
         scenario_id: VALIDATION_MANIFEST_SCENARIO_ID.to_owned(),
         generated_unix_ms: 1_710_000_000_000,
+        fixture_root_manifest_path: "corpus_manifest.toml".to_owned(),
+        fixture_root_manifest_sha256:
+            "3333333333333333333333333333333333333333333333333333333333333333".to_owned(),
         root_seed: Some(424_242),
         artifact_uri_prefix: "artifacts/ingestion-test".to_owned(),
     }
@@ -38,6 +41,9 @@ fn alternate_config() -> ValidationManifestConfig {
         trace_id: "trace-ingestion-alt".to_owned(),
         scenario_id: VALIDATION_MANIFEST_SCENARIO_ID.to_owned(),
         generated_unix_ms: 1_710_000_001_000,
+        fixture_root_manifest_path: "corpus_manifest.toml".to_owned(),
+        fixture_root_manifest_sha256:
+            "4444444444444444444444444444444444444444444444444444444444444444".to_owned(),
         root_seed: Some(424_242),
         artifact_uri_prefix: "artifacts/ingestion-alt".to_owned(),
     }
