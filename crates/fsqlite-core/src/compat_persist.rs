@@ -485,6 +485,8 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
                 unique: upper.contains("UNIQUE") || (is_ipk && upper.contains("PRIMARY KEY")),
                 default_value: None,
                 strict_type,
+                generated_expr: None,
+                generated_stored: None,
             })
         })
         .collect()
@@ -753,6 +755,8 @@ mod tests {
                     unique: false,
                     default_value: None,
                     strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
                 },
                 ColumnInfo {
                     name: "name".to_owned(),
@@ -763,6 +767,8 @@ mod tests {
                     unique: false,
                     default_value: None,
                     strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
                 },
             ],
             indexes: Vec::new(),
@@ -914,6 +920,8 @@ mod tests {
                     unique: false,
                     default_value: None,
                     strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
                 }],
                 indexes: Vec::new(),
                 strict: false,
@@ -930,6 +938,8 @@ mod tests {
                     unique: false,
                     default_value: None,
                     strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
                 }],
                 indexes: Vec::new(),
                 strict: false,
@@ -1022,6 +1032,8 @@ mod tests {
                 unique: false,
                 default_value: None,
                 strict_type: Some(StrictColumnType::Integer),
+                generated_expr: None,
+                generated_stored: None,
             }],
             indexes: Vec::new(),
             strict: true,

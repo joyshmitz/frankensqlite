@@ -158,6 +158,8 @@ pub fn explain_query_plan(program: &VdbeProgram) -> Vec<EqpRow> {
             | Opcode::SeekLT
             | Opcode::IdxGE
             | Opcode::IdxGT
+            | Opcode::IdxLE
+            | Opcode::IdxLT
             | Opcode::Rewind
             | Opcode::Last
             | Opcode::Next

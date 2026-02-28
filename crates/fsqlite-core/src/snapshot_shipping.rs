@@ -99,7 +99,12 @@ impl BlockResumeState {
         let decoded = buf[5] != 0;
         let n_isis = u32::from_le_bytes(buf[6..10].try_into().expect("4 bytes"));
         let n = n_isis as usize;
-        let expected = 10 + n * 4;
+        let expected = n
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(10))
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("BlockResumeState n_isis ({n_isis}) causes size overflow"),
+            })?;
         if buf.len() < expected {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!("BlockResumeState truncated: {} < {expected}", buf.len()),

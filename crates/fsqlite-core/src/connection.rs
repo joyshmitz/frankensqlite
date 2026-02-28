@@ -20,10 +20,10 @@ use serde_json::json;
 
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
-    DefaultValue, Distinctness, DropObjectType, Expr, FunctionArgs, InSet, JoinConstraint,
-    JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, PragmaValue,
-    ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement,
-    TableConstraintKind, TableOrSubquery, UnaryOp,
+    DefaultValue, Distinctness, DropObjectType, Expr, FunctionArgs, GeneratedStorage, InSet,
+    JoinConstraint, JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm,
+    PlaceholderType, PragmaValue, ResultColumn, SelectBody, SelectCore, SelectStatement,
+    SortDirection, Span, Statement, TableConstraintKind, TableOrSubquery, UnaryOp,
 };
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
@@ -2692,6 +2692,9 @@ impl Connection {
                 }
             }
 
+            // TODO: Evaluate STORED generated columns in the fallback path.
+            // The VDBE bytecode path handles this via emit_stored_generated_columns.
+
             let mut db = self.db.borrow_mut();
 
             // Check UNIQUE constraints on columns.
@@ -3970,6 +3973,8 @@ impl Connection {
                     unique: false,
                     default_value: None,
                     strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
                 },
                 ColumnInfo {
                     name: "seq".to_owned(),
@@ -3980,6 +3985,8 @@ impl Connection {
                     unique: false,
                     default_value: None,
                     strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
                 },
             ],
             indexes: Vec::new(),
@@ -4390,6 +4397,20 @@ impl Connection {
                         } else {
                             None
                         };
+                        // Extract generated column info.
+                        let (generated_expr, generated_stored) = col
+                            .constraints
+                            .iter()
+                            .find_map(|c| match &c.kind {
+                                ColumnConstraintKind::Generated { expr, storage } => {
+                                    let stored = storage
+                                        .as_ref()
+                                        .is_some_and(|s| *s == GeneratedStorage::Stored);
+                                    Some((Some(format!("{expr}")), Some(stored)))
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or((None, None));
                         Ok(ColumnInfo {
                             name: col.name.clone(),
                             affinity,
@@ -4399,6 +4420,8 @@ impl Connection {
                             unique,
                             default_value,
                             strict_type,
+                            generated_expr,
+                            generated_stored,
                         })
                     })
                     .collect::<Result<_>>()?;
@@ -4595,6 +4618,8 @@ impl Connection {
                             unique: false,
                             default_value: None,
                             strict_type: None,
+                            generated_expr: None,
+                            generated_stored: None,
                         }
                     })
                     .collect();
@@ -4952,6 +4977,8 @@ impl Connection {
                     unique,
                     default_value,
                     strict_type,
+                    generated_expr: None,
+                    generated_stored: None,
                 });
                 table.clone()
             }
@@ -5486,6 +5513,8 @@ impl Connection {
                             unique: false,
                             default_value: None,
                             strict_type: None,
+                            generated_expr: None,
+                            generated_stored: None,
                         })
                         .collect()
                 } else {
@@ -5500,6 +5529,8 @@ impl Connection {
                             unique: false,
                             default_value: None,
                             strict_type: None,
+                            generated_expr: None,
+                            generated_stored: None,
                         })
                         .collect()
                 };
@@ -8675,6 +8706,8 @@ impl Connection {
                             unique: false,
                             default_value: None,
                             strict_type: None,
+                            generated_expr: None,
+                            generated_stored: None,
                         })
                         .collect();
                     let num_columns = col_infos.len();
@@ -8753,6 +8786,8 @@ impl Connection {
                 unique: false,
                 default_value: None,
                 strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
             })
             .collect();
         let num_columns = col_infos.len();
@@ -10139,6 +10174,8 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             unique: false,
             default_value: None,
             strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
         });
     }
 
@@ -10152,6 +10189,8 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             unique: false,
             default_value: None,
             strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
         });
     }
 
@@ -10204,6 +10243,8 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             unique: false,
             default_value: None,
             strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
         },
         ColumnInfo {
             name: "name".to_owned(),
@@ -10214,6 +10255,8 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             unique: false,
             default_value: None,
             strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
         },
         ColumnInfo {
             name: "tbl_name".to_owned(),
@@ -10224,6 +10267,8 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             unique: false,
             default_value: None,
             strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
         },
         ColumnInfo {
             name: "rootpage".to_owned(),
@@ -10234,6 +10279,8 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             unique: false,
             default_value: None,
             strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
         },
         ColumnInfo {
             name: "sql".to_owned(),
@@ -10244,6 +10291,8 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             unique: false,
             default_value: None,
             strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
         },
     ]
 }
@@ -11396,7 +11445,10 @@ fn evaluate_having_value(
                 LikeOp::Like => simple_like_match(&p, &s),
                 LikeOp::Glob => simple_glob_match(&p, &s),
                 LikeOp::Match => simple_match_query(&p, &s),
-                LikeOp::Regexp => false,
+                // REGEXP requires a user-defined function; this fallback
+                // eval path cannot call it, so return NULL (parity: SQLite
+                // errors if no regexp() function is registered).
+                LikeOp::Regexp => return SqliteValue::Null,
             };
             SqliteValue::Integer(i64::from(if *not { !matched } else { matched }))
         }
@@ -14339,11 +14391,8 @@ fn emit_like_expr(
     let func_name = match op {
         LikeOp::Like => "like",
         LikeOp::Glob => "glob",
-        LikeOp::Match | LikeOp::Regexp => {
-            return Err(FrankenError::NotImplemented(format!(
-                "{op:?} operator is not yet supported",
-            )));
-        }
+        LikeOp::Match => "match",
+        LikeOp::Regexp => "regexp",
     };
 
     let has_escape = escape.is_some();
@@ -14697,7 +14746,11 @@ fn eval_join_expr(
                 LikeOp::Like => simple_like_match(&p, &s),
                 LikeOp::Glob => simple_glob_match(&p, &s),
                 LikeOp::Match => simple_match_query(&p, &s),
-                LikeOp::Regexp => false,
+                LikeOp::Regexp => {
+                    return Err(FrankenError::Internal(
+                        "no such function: regexp".to_owned(),
+                    ));
+                }
             };
             Ok(SqliteValue::Integer(i64::from(if *not {
                 !matched
