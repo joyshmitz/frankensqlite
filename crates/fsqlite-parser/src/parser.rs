@@ -19,8 +19,8 @@ use fsqlite_ast::{
     QualifiedTableRef, ResultColumn, RollbackStatement, SelectBody, SelectCore, SelectStatement,
     SortDirection, Span, Statement, TableConstraint, TableConstraintKind, TableOrSubquery,
     TimeTravelClause, TimeTravelTarget, TransactionMode, TriggerEvent, TriggerTiming, TypeName,
-    UpdateStatement, UpsertAction,
-    UpsertClause, UpsertTarget, VacuumStatement, WindowDef, WindowSpec, WithClause,
+    UpdateStatement, UpsertAction, UpsertClause, UpsertTarget, VacuumStatement, WindowDef,
+    WindowSpec, WithClause,
 };
 
 use crate::lexer::Lexer;
@@ -407,9 +407,11 @@ impl Parser {
                     self.advance();
                     TimeTravelTarget::Timestamp(s)
                 }
-                _ => return Err(self.err_expected(
-                    "COMMITSEQ <n> or '<timestamp>' after FOR SYSTEM_TIME AS OF",
-                )),
+                _ => {
+                    return Err(self.err_expected(
+                        "COMMITSEQ <n> or '<timestamp>' after FOR SYSTEM_TIME AS OF",
+                    ));
+                }
             }
         };
 
