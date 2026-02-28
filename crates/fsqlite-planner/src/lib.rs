@@ -475,6 +475,8 @@ pub struct AccessPath {
     pub estimated_cost: f64,
     /// Estimated rows returned.
     pub estimated_rows: f64,
+    /// Time-travel clause (SQL:2011 temporal query) — `FOR SYSTEM_TIME AS OF ...`.
+    pub time_travel: Option<fsqlite_ast::TimeTravelClause>,
 }
 
 /// The final output of the query planner: an ordered access plan.
@@ -933,6 +935,7 @@ fn best_access_path_internal(
             estimate_cost(&AccessPathKind::FullTableScan, table.n_pages, 0)
         },
         estimated_rows: table.n_rows as f64,
+        time_travel: None,
     };
 
     let mut candidates_considered: usize = 0;
@@ -1106,6 +1109,7 @@ fn best_access_path_internal(
                 index: Some(idx.name.clone()),
                 estimated_cost: cost,
                 estimated_rows: est_rows,
+                time_travel: None,
             };
         }
     }
@@ -1121,6 +1125,7 @@ fn best_access_path_internal(
                 index: None,
                 estimated_cost: cost,
                 estimated_rows: 1.0,
+                time_travel: None,
             };
         }
     }
@@ -1132,6 +1137,7 @@ fn best_access_path_internal(
             index: None,
             estimated_cost: estimate_cost(&AccessPathKind::FullTableScan, table.n_pages, 0),
             estimated_rows: table.n_rows as f64,
+            time_travel: None,
         };
     }
 
@@ -4781,6 +4787,7 @@ mod tests {
                     index: None,
                     estimated_cost: 100.0,
                     estimated_rows: 1000.0,
+                    time_travel: None,
                 },
                 AccessPath {
                     table: "t2".to_owned(),
@@ -4788,6 +4795,7 @@ mod tests {
                     index: Some("idx_t2".to_owned()),
                     estimated_cost: 15.0,
                     estimated_rows: 10.0,
+                    time_travel: None,
                 },
             ],
             join_segments: vec![JoinPlanSegment {

@@ -8633,6 +8633,47 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Regression: HAVING aggregate not in SELECT list (review fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn regression_having_aggregate_not_in_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE emp (dept TEXT, salary INTEGER);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO emp VALUES ('A', 100), ('A', 200), ('B', 50), ('B', 60), ('B', 70);",
+        )
+        .unwrap();
+        // COUNT(*) is only in HAVING, not in the SELECT list.
+        let rows = conn
+            .query("SELECT dept FROM emp GROUP BY dept HAVING COUNT(*) >= 3;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("B".to_owned()));
+    }
+
+    #[test]
+    fn regression_having_sum_not_in_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales (product TEXT, amount INTEGER);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sales VALUES ('X', 10), ('X', 20), ('Y', 100), ('Y', 200);",
+        )
+        .unwrap();
+        // SUM(amount) is only in HAVING, not in SELECT.
+        let rows = conn
+            .query("SELECT product FROM sales GROUP BY product HAVING SUM(amount) > 50;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("Y".to_owned())
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Generated columns (VIRTUAL / STORED) — F-SQL.19
     // -----------------------------------------------------------------------
 
@@ -8703,6 +8744,142 @@ mod tests {
             row_values(&rows[0])[0],
             SqliteValue::Integer(17),
             "STORED generated column should recompute after UPDATE: 10 + 7 = 17"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Foreign Key enforcement — bd-thqgm
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fk_insert_valid_parent_succeeds() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1, 'Alice')")
+            .unwrap();
+        // Child references existing parent — should succeed.
+        conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+        let rows = conn.query("SELECT * FROM child").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn fk_insert_missing_parent_fails() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+        // No parent row with id=99 — should fail.
+        let result = conn.execute("INSERT INTO child VALUES (1, 99)");
+        assert!(result.is_err(), "INSERT with missing FK parent should fail");
+    }
+
+    #[test]
+    fn fk_insert_null_fk_value_succeeds() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+        // NULL FK value should always succeed (SQL standard).
+        conn.execute("INSERT INTO child VALUES (1, NULL)").unwrap();
+        let rows = conn.query("SELECT * FROM child").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn fk_off_by_default() {
+        let conn = Connection::open(":memory:").unwrap();
+        // FK enforcement is OFF by default (matching SQLite).
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+        // Should succeed even without parent, because FK enforcement is off.
+        conn.execute("INSERT INTO child VALUES (1, 99)").unwrap();
+    }
+
+    #[test]
+    fn fk_delete_parent_with_children_fails() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1, 'Alice')")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+        // Deleting parent with child references should fail (default NO ACTION).
+        let result = conn.execute("DELETE FROM parent WHERE id = 1");
+        assert!(
+            result.is_err(),
+            "DELETE parent with child references should fail with FK ON"
+        );
+    }
+
+    #[test]
+    fn fk_delete_cascade() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1, 'Alice')")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+        conn.execute("INSERT INTO child VALUES (2, 1)").unwrap();
+        // CASCADE should delete children too.
+        conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+        let rows = conn.query("SELECT * FROM child").unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "ON DELETE CASCADE should delete all child rows"
+        );
+    }
+
+    #[test]
+    fn fk_delete_set_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1, 'Alice')")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+        // SET NULL should null out the FK column in children.
+        conn.execute("DELETE FROM parent WHERE id = 1").unwrap();
+        let rows = conn.query("SELECT parent_id FROM child").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Null,
+            "ON DELETE SET NULL should set FK column to NULL"
         );
     }
 }

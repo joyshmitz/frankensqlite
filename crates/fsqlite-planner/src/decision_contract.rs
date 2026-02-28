@@ -713,6 +713,7 @@ mod tests {
                     index: None,
                     estimated_cost: 100.0,
                     estimated_rows: 10_000.0,
+                    time_travel: None,
                 },
                 AccessPath {
                     table: "orders".to_owned(),
@@ -720,6 +721,7 @@ mod tests {
                     index: Some("idx_orders_user_id".to_owned()),
                     estimated_cost: 15.0,
                     estimated_rows: 10.0,
+                    time_travel: None,
                 },
             ],
             join_segments: vec![crate::JoinPlanSegment {

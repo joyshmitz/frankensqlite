@@ -680,6 +680,7 @@ pub enum CompoundOp {
 
 /// A single SELECT core or VALUES clause.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum SelectCore {
     /// `SELECT [DISTINCT|ALL] columns FROM ... WHERE ... GROUP BY ... HAVING ... WINDOW ...`
     Select {

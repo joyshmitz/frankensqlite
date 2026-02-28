@@ -2488,6 +2488,124 @@ fn parse_group_by_output(
     Ok((output_cols, group_by_keys, agg_columns))
 }
 
+/// Walk a HAVING expression to find aggregate function calls and add any that
+/// are not already present in `agg_columns` / `output_cols`.  This ensures that
+/// aggregates referenced only in HAVING (not in the SELECT list) still get
+/// accumulator slots and `AggStep`/`AggFinal` instructions.
+fn collect_having_aggregates(
+    expr: &Expr,
+    table: &TableSchema,
+    agg_columns: &mut Vec<AggColumn>,
+    output_cols: &mut Vec<GroupByOutputCol>,
+) {
+    match expr {
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            filter,
+            ..
+        } if is_aggregate_function(name) => {
+            let lower = name.to_ascii_lowercase();
+            // Check if this aggregate already exists in agg_columns.
+            let already_exists = agg_columns.iter().any(|agg| {
+                if agg.name != lower {
+                    return false;
+                }
+                match args {
+                    FunctionArgs::Star => agg.num_args == 0,
+                    FunctionArgs::List(exprs) => {
+                        if exprs.is_empty() {
+                            return agg.num_args == 0;
+                        }
+                        if let Some(ci) = resolve_column_index(&exprs[0], table) {
+                            agg.arg_col_index == Some(ci)
+                        } else if let Some(ref arg_expr) = agg.arg_expr {
+                            exprs.len() == 1 && *arg_expr == Box::new(exprs[0].clone())
+                        } else {
+                            false
+                        }
+                    }
+                }
+            });
+            if !already_exists {
+                let agg_index = agg_columns.len();
+                let filt = filter.clone();
+                match args {
+                    FunctionArgs::Star => {
+                        agg_columns.push(AggColumn {
+                            name: lower,
+                            num_args: 0,
+                            arg_col_index: None,
+                            arg_is_rowid: false,
+                            distinct: *distinct,
+                            arg_expr: None,
+                            extra_args: Vec::new(),
+                            filter: filt,
+                        });
+                    }
+                    FunctionArgs::List(exprs) => {
+                        if exprs.is_empty() {
+                            agg_columns.push(AggColumn {
+                                name: lower,
+                                num_args: 0,
+                                arg_col_index: None,
+                                arg_is_rowid: false,
+                                distinct: *distinct,
+                                arg_expr: None,
+                                extra_args: Vec::new(),
+                                filter: filt,
+                            });
+                        } else {
+                            let (col_idx, is_rowid, arg_e) =
+                                match resolve_column_ref(&exprs[0], table, None) {
+                                    Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
+                                    Some(SortKeySource::Rowid) => (None, true, None),
+                                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
+                                };
+                            let extra: Vec<Expr> = exprs[1..].to_vec();
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                            agg_columns.push(AggColumn {
+                                name: lower,
+                                num_args: exprs.len() as i32,
+                                arg_col_index: col_idx,
+                                arg_is_rowid: is_rowid,
+                                distinct: *distinct,
+                                arg_expr: arg_e,
+                                extra_args: extra,
+                                filter: filt,
+                            });
+                        }
+                    }
+                }
+                output_cols.push(GroupByOutputCol::Aggregate { agg_index });
+            }
+        }
+        // Recurse into sub-expressions to find nested aggregates.
+        Expr::BinaryOp { left, right, .. } => {
+            collect_having_aggregates(left, table, agg_columns, output_cols);
+            collect_having_aggregates(right, table, agg_columns, output_cols);
+        }
+        Expr::UnaryOp { expr: inner, .. } => {
+            collect_having_aggregates(inner, table, agg_columns, output_cols);
+        }
+        Expr::IsNull { expr: inner, .. } => {
+            collect_having_aggregates(inner, table, agg_columns, output_cols);
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_having_aggregates(inner, table, agg_columns, output_cols);
+            collect_having_aggregates(low, table, agg_columns, output_cols);
+            collect_having_aggregates(high, table, agg_columns, output_cols);
+        }
+        _ => {}
+    }
+}
+
 /// Generate VDBE bytecode for an aggregate SELECT **with GROUP BY**.
 ///
 /// Two-pass pattern:
@@ -2510,8 +2628,13 @@ fn codegen_select_group_by_aggregate(
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
-    let (mut output_cols, group_by_keys, agg_columns) =
+    let (mut output_cols, group_by_keys, mut agg_columns) =
         parse_group_by_output(columns, table, group_by)?;
+
+    // Collect aggregates from the HAVING clause that are not in the SELECT list.
+    if let Some(having_expr) = having {
+        collect_having_aggregates(having_expr, table, &mut agg_columns, &mut output_cols);
+    }
 
     let num_group_keys = group_by_keys.len();
     let num_aggs = agg_columns.len();
@@ -4762,9 +4885,13 @@ fn emit_having_expr(
                         if exprs.is_empty() {
                             return agg.num_args == 0;
                         }
-                        // Match by argument column index.
+                        // Match by argument column index first.
                         if let Some(ci) = resolve_column_index(&exprs[0], table) {
                             agg.arg_col_index == Some(ci)
+                        } else if let Some(ref arg_expr) = agg.arg_expr {
+                            // Fall back to structural expression comparison
+                            // for aggregates with expression arguments.
+                            exprs.len() == 1 && *arg_expr == Box::new(exprs[0].clone())
                         } else {
                             false
                         }
@@ -7283,6 +7410,7 @@ mod tests {
                 name: QualifiedName::bare(name),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             joins: vec![],
         }
@@ -7746,6 +7874,7 @@ mod tests {
                             name: QualifiedName::bare("s"),
                             alias: None,
                             index_hint: None,
+                            time_travel: None,
                         },
                         joins: vec![],
                     }),
@@ -7981,6 +8110,7 @@ mod tests {
                             name: QualifiedName::bare("s"),
                             alias: None,
                             index_hint: None,
+                            time_travel: None,
                         },
                         joins: vec![],
                     }),
@@ -8064,6 +8194,7 @@ mod tests {
                             name: QualifiedName::bare("s"),
                             alias: None,
                             index_hint: None,
+                            time_travel: None,
                         },
                         joins: vec![],
                     }),
@@ -8202,6 +8333,7 @@ mod tests {
                             name: QualifiedName::bare("s"),
                             alias: None,
                             index_hint: None,
+                            time_travel: None,
                         },
                         joins: vec![],
                     }),
@@ -8460,6 +8592,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -8523,6 +8656,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("a".to_owned()),
@@ -8584,6 +8718,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             where_clause: Some(Expr::BinaryOp {
                 left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
@@ -8626,6 +8761,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -8667,6 +8803,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             where_clause: Some(Expr::BinaryOp {
                 left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
@@ -10383,6 +10520,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: Some("u".to_owned()),
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -10427,6 +10565,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: Some("u".to_owned()),
                 index_hint: None,
+                time_travel: None,
             },
             where_clause: Some(Expr::BinaryOp {
                 left: Box::new(Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO)),
@@ -10467,6 +10606,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: Some("u".to_owned()),
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -10511,6 +10651,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -10541,6 +10682,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -10604,6 +10746,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -10685,6 +10828,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
@@ -10738,6 +10882,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             where_clause: Some(Expr::In {
                 expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
@@ -10790,6 +10935,7 @@ mod tests {
                             name: QualifiedName::bare("s"),
                             alias: None,
                             index_hint: None,
+                            time_travel: None,
                         },
                         joins: vec![],
                     }),
@@ -10817,6 +10963,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             where_clause: Some(Expr::In {
                 expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
@@ -10884,6 +11031,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             where_clause: Some(Expr::BinaryOp {
                 left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
@@ -10922,6 +11070,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             where_clause: Some(Expr::BinaryOp {
                 left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
@@ -10966,6 +11115,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("a".to_owned()),
@@ -11408,6 +11558,7 @@ mod tests {
                 name: QualifiedName::bare("t"),
                 alias: None,
                 index_hint: None,
+                time_travel: None,
             },
             assignments: vec![fsqlite_ast::Assignment {
                 target: fsqlite_ast::AssignmentTarget::Column("a".to_owned()),
