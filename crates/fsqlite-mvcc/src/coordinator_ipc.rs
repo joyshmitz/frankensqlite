@@ -1340,8 +1340,7 @@ pub fn authenticate_peer(
 ) -> Result<(), PeerAuthError> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 
-    let cred = getsockopt(stream, PeerCredentials)
-        .map_err(|_| PeerAuthError::NoCreds)?;
+    let cred = getsockopt(stream, PeerCredentials).map_err(|_| PeerAuthError::NoCreds)?;
     let actual_uid = cred.uid();
     if actual_uid != expected_uid {
         return Err(PeerAuthError::UidMismatch {
@@ -1387,10 +1386,10 @@ pub fn send_with_fd(
     data: &[u8],
     fd: std::os::unix::io::RawFd,
 ) -> std::io::Result<usize> {
-    use std::io::Write as _;
-    use std::os::unix::io::AsRawFd;
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
     use std::io::IoSlice;
+    use std::io::Write as _;
+    use std::os::unix::io::AsRawFd;
 
     if data.is_empty() {
         return Err(std::io::Error::other(
@@ -1429,15 +1428,20 @@ pub fn recv_with_fd(
     stream: &std::os::unix::net::UnixStream,
     buf: &mut [u8],
 ) -> std::io::Result<(usize, Option<ReceivedFd>)> {
-    use std::os::unix::io::AsRawFd;
     use nix::cmsg_space;
     use nix::sys::socket::{MsgFlags, recvmsg};
     use std::io::IoSliceMut;
+    use std::os::unix::io::AsRawFd;
 
     let mut cmsg_buf = cmsg_space!(std::os::unix::io::RawFd);
     let mut iov = [IoSliceMut::new(buf)];
-    let msg = recvmsg::<()>(stream.as_raw_fd(), &mut iov, Some(&mut cmsg_buf), MsgFlags::empty())
-        .map_err(std::io::Error::other)?;
+    let msg = recvmsg::<()>(
+        stream.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_buf),
+        MsgFlags::empty(),
+    )
+    .map_err(std::io::Error::other)?;
 
     let n = msg.bytes;
 
@@ -1449,7 +1453,9 @@ pub fn recv_with_fd(
     }
 
     let mut fds = Vec::<std::os::unix::io::RawFd>::new();
-    let cmsgs = msg.cmsgs().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let cmsgs = msg
+        .cmsgs()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     for cmsg in cmsgs {
         if let nix::sys::socket::ControlMessageOwned::ScmRights(scm_fds) = cmsg {
             fds.extend(scm_fds);
@@ -1744,8 +1750,7 @@ mod tests {
         let (a, _b) = UnixStream::pair().expect("socketpair");
 
         use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-        let actual_uid = getsockopt(&a, PeerCredentials)
-            .expect("peer_cred").uid();
+        let actual_uid = getsockopt(&a, PeerCredentials).expect("peer_cred").uid();
         authenticate_peer(&a, actual_uid).expect("peer auth ok");
 
         let wrong_uid = actual_uid ^ 1;
@@ -1879,7 +1884,8 @@ mod tests {
 
         use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
         let expected_uid = getsockopt(&server_sock, PeerCredentials)
-            .expect("peer_cred").uid();
+            .expect("peer_cred")
+            .uid();
         authenticate_peer(&server_sock, expected_uid).expect("E2E peer auth");
 
         let pm_server = Arc::clone(&pm);

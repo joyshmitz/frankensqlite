@@ -160,7 +160,10 @@ where
     }
     if usable_size <= 4 {
         return Err(FrankenError::DatabaseCorrupt {
-            detail: format!("invalid usable page size {} for overflow chain", usable_size),
+            detail: format!(
+                "invalid usable page size {} for overflow chain",
+                usable_size
+            ),
         });
     }
 

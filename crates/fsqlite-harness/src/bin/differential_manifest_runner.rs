@@ -287,7 +287,8 @@ impl Config {
             output_json.unwrap_or_else(|| output_dir.join("differential_manifest.json"));
         let output_human =
             output_human.unwrap_or_else(|| output_dir.join("differential_manifest.md"));
-        let fixtures_dir = fixtures_dir.unwrap_or_else(|| fixture_root_contract.fixtures_dir.clone());
+        let fixtures_dir =
+            fixtures_dir.unwrap_or_else(|| fixture_root_contract.fixtures_dir.clone());
         let fixtures_dir = if fixtures_dir.is_relative() {
             workspace_root.join(fixtures_dir)
         } else {
@@ -1073,7 +1074,9 @@ mod tests {
         assert!(human.contains("diverged: `1`"));
         assert!(human.contains("overall_pass: `false`"));
         assert!(human.contains(&replay));
-        assert!(human.contains("fixture_root_manifest_path: `/tmp/workspace/corpus_manifest.toml`"));
+        assert!(
+            human.contains("fixture_root_manifest_path: `/tmp/workspace/corpus_manifest.toml`")
+        );
         assert!(
             human.contains(
                 "fixture_root_manifest_sha256: `0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`"

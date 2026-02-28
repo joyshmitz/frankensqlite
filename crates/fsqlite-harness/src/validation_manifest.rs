@@ -1638,9 +1638,7 @@ fn validate_manifest_top_level_fields(manifest: &ValidationManifest) -> Vec<Stri
         errors.push("fixture_root_manifest_path must be non-empty".to_owned());
     }
     if !is_sha256_hex_64(&manifest.fixture_root_manifest_sha256) {
-        errors.push(
-            "fixture_root_manifest_sha256 must be 64 lowercase hex characters".to_owned(),
-        );
+        errors.push("fixture_root_manifest_sha256 must be 64 lowercase hex characters".to_owned());
     }
     if manifest.gates.is_empty() {
         errors.push("gates must not be empty".to_owned());

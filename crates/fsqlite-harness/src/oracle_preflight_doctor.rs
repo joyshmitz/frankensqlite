@@ -725,11 +725,13 @@ fn check_fixture_root_contract(
     findings: &mut Vec<DoctorFinding>,
     checks: &mut OraclePreflightChecks,
 ) {
-    let contract =
-        match load_fixture_root_contract(&config.workspace_root, &config.fixture_manifest_path) {
-            Ok(contract) => contract,
-            Err(error) => {
-                findings.push(DoctorFinding {
+    let contract = match load_fixture_root_contract(
+        &config.workspace_root,
+        &config.fixture_manifest_path,
+    ) {
+        Ok(contract) => contract,
+        Err(error) => {
+            findings.push(DoctorFinding {
                     outcome: DoctorOutcome::Red,
                     remediation_class: RemediationClass::InvalidConfig,
                     summary: "failed to load canonical fixture-root contract".to_owned(),
@@ -739,9 +741,9 @@ fn check_fixture_root_contract(
                         config.workspace_root.join(DEFAULT_FIXTURE_MANIFEST_PATH).display()
                     ),
                 });
-                return;
-            }
-        };
+            return;
+        }
+    };
 
     checks.fixture_manifest_sha256 = Some(contract.manifest_sha256.clone());
 

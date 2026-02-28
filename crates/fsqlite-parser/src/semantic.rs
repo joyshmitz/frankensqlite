@@ -263,11 +263,10 @@ impl Scope {
             }
             1 => ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default()),
             _ => {
+                matches.sort();
                 if self.using_columns.contains(&col_lower) {
-                    matches.sort();
                     ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default())
                 } else {
-                    matches.sort();
                     ResolveResult::Ambiguous(matches)
                 }
             }

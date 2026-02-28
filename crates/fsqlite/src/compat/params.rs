@@ -100,17 +100,13 @@ impl From<u32> for ParamValue {
 
 impl From<u64> for ParamValue {
     fn from(v: u64) -> Self {
-        Self(SqliteValue::Integer(
-            i64::try_from(v).unwrap_or(i64::MAX),
-        ))
+        Self(SqliteValue::Integer(i64::try_from(v).unwrap_or(i64::MAX)))
     }
 }
 
 impl From<usize> for ParamValue {
     fn from(v: usize) -> Self {
-        Self(SqliteValue::Integer(
-            i64::try_from(v).unwrap_or(i64::MAX),
-        ))
+        Self(SqliteValue::Integer(i64::try_from(v).unwrap_or(i64::MAX)))
     }
 }
 
@@ -131,9 +127,7 @@ impl From<SqliteValue> for ParamValue {
 
 /// Convert an iterator of values into a `Vec<SqliteValue>`, analogous to
 /// `rusqlite::params_from_iter`.
-pub fn params_from_iter(
-    iter: impl IntoIterator<Item = impl Into<ParamValue>>,
-) -> Vec<SqliteValue> {
+pub fn params_from_iter(iter: impl IntoIterator<Item = impl Into<ParamValue>>) -> Vec<SqliteValue> {
     iter.into_iter().map(|v| v.into().into_inner()).collect()
 }
 

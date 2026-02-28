@@ -283,8 +283,6 @@ impl SharedTxnSlot {
             None
         }
     }
-
-
 }
 
 impl Default for SharedTxnSlot {

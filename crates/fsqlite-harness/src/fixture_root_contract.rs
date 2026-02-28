@@ -129,7 +129,10 @@ pub fn load_fixture_root_contract(
         "fixture_roots.min_fixture_json_files",
         section.min_fixture_json_files,
     )?;
-    require_positive("fixture_roots.min_fixture_entries", section.min_fixture_entries)?;
+    require_positive(
+        "fixture_roots.min_fixture_entries",
+        section.min_fixture_entries,
+    )?;
     require_positive(
         "fixture_roots.min_fixture_sql_statements",
         section.min_fixture_sql_statements,

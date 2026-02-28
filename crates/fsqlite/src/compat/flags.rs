@@ -90,8 +90,7 @@ mod tests {
 
     #[test]
     fn bitor_combines_flags() {
-        let flags =
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
         assert!(flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE));
         assert!(flags.contains(OpenFlags::SQLITE_OPEN_CREATE));
     }
