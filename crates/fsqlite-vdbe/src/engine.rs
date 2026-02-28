@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
+use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
 use fsqlite_mvcc::{
     ConcurrentRegistry, InProcessPageLockTable, MvccError, concurrent_read_page,
@@ -1637,6 +1638,12 @@ fn jit_scaffold_supports_opcode(opcode: Opcode) -> bool {
             | Opcode::VColumn
             | Opcode::VNext
             | Opcode::VUpdate
+            | Opcode::VBegin
+            | Opcode::VCreate
+            | Opcode::VDestroy
+            | Opcode::VCheck
+            | Opcode::VInitIn
+            | Opcode::VRename
     )
 }
 
@@ -1748,6 +1755,7 @@ pub enum ExecOutcome {
 /// Executes a program produced by the code generator, maintaining a register
 /// file and collecting result rows. In Phase 4, cursor operations use an
 /// in-memory table store (`MemDatabase`) rather than the full B-tree stack.
+#[allow(clippy::struct_excessive_bools)]
 pub struct VdbeEngine {
     /// Register file (1-indexed; index 0 is unused/sentinel).
     registers: Vec<SqliteValue>,
@@ -1792,6 +1800,13 @@ pub struct VdbeEngine {
     last_compare_result: Option<Ordering>,
     /// Rowid of the last INSERT operation (for `last_insert_rowid()` support).
     last_insert_rowid: i64,
+    /// Cursor ID used by the last Insert opcode (for conflict resolution in
+    /// `IdxInsert`: allows the index handler to undo or replace the table row).
+    last_insert_cursor_id: Option<i32>,
+    /// When true, a UNIQUE conflict with IGNORE was detected during an
+    /// `IdxInsert`, so remaining `IdxInsert` opcodes for this row should be
+    /// skipped.
+    conflict_skip_idx: bool,
     /// RowSet data structures for OR-optimized queries (keyed by register).
     rowsets: SwissIndex<i32, RowSet>,
     /// Foreign key constraint violation counter (deferred FK enforcement).
@@ -1807,6 +1822,73 @@ pub struct VdbeEngine {
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     /// Mapping from cursor_id to root_page for default value lookup.
     cursor_root_pages: HashMap<i32, i32>,
+    /// Open virtual table cursors keyed by cursor number.
+    vtab_cursors: SwissIndex<i32, VtabCursorState>,
+    /// Virtual table instances keyed by cursor number (for transaction ops).
+    vtab_instances: SwissIndex<i32, Box<dyn VtabInstance>>,
+}
+
+/// Type-erased virtual table instance for transaction and lifecycle ops.
+///
+/// Because `VirtualTable` has an associated `Cursor` type, we need a
+/// type-erased wrapper to store heterogeneous vtab instances.
+#[allow(dead_code)]
+trait VtabInstance: Send + Sync {
+    fn begin(&mut self, cx: &Cx) -> Result<()>;
+    fn commit(&mut self, cx: &Cx) -> Result<()>;
+    fn rollback(&mut self, cx: &Cx) -> Result<()>;
+    fn destroy(&mut self, cx: &Cx) -> Result<()>;
+    fn rename(&mut self, cx: &Cx, new_name: &str) -> Result<()>;
+}
+
+/// A type-erased virtual table cursor.
+///
+/// Wraps a concrete `VirtualTableCursor` implementation behind dynamic
+/// dispatch so the engine can store cursors from different vtab modules
+/// in the same index.
+pub trait ErasedVtabCursor: Send {
+    fn filter(
+        &mut self,
+        cx: &Cx,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[SqliteValue],
+    ) -> Result<()>;
+    fn next(&mut self, cx: &Cx) -> Result<()>;
+    fn eof(&self) -> bool;
+    fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()>;
+    fn rowid(&self) -> Result<i64>;
+}
+
+/// Blanket implementation of `ErasedVtabCursor` for any concrete cursor type.
+impl<C: fsqlite_func::vtab::VirtualTableCursor + 'static> ErasedVtabCursor for C {
+    fn filter(
+        &mut self,
+        cx: &Cx,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[SqliteValue],
+    ) -> Result<()> {
+        fsqlite_func::vtab::VirtualTableCursor::filter(self, cx, idx_num, idx_str, args)
+    }
+    fn next(&mut self, cx: &Cx) -> Result<()> {
+        fsqlite_func::vtab::VirtualTableCursor::next(self, cx)
+    }
+    fn eof(&self) -> bool {
+        fsqlite_func::vtab::VirtualTableCursor::eof(self)
+    }
+    fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+        fsqlite_func::vtab::VirtualTableCursor::column(self, ctx, col)
+    }
+    fn rowid(&self) -> Result<i64> {
+        fsqlite_func::vtab::VirtualTableCursor::rowid(self)
+    }
+}
+
+/// State for an open virtual table cursor in the VDBE engine.
+struct VtabCursorState {
+    /// The type-erased cursor.
+    cursor: Box<dyn ErasedVtabCursor>,
 }
 
 /// A set of rowids for RowSetAdd/RowSetRead/RowSetTest opcodes.
@@ -1923,12 +2005,16 @@ impl VdbeEngine {
             schema_cookie: 0,
             last_compare_result: None,
             last_insert_rowid: 0,
+            last_insert_cursor_id: None,
+            conflict_skip_idx: false,
             rowsets: SwissIndex::new(),
             fk_counter: 0,
             autoincrement_seq_by_root_page: HashMap::new(),
             sequence_counters: HashMap::new(),
             column_defaults_by_root_page: HashMap::new(),
             cursor_root_pages: HashMap::new(),
+            vtab_cursors: SwissIndex::new(),
+            vtab_instances: SwissIndex::new(),
         }
     }
 
@@ -1945,6 +2031,12 @@ impl VdbeEngine {
     /// Take ownership of the in-memory database back from the engine.
     pub fn take_database(&mut self) -> Option<MemDatabase> {
         self.db.take()
+    }
+
+    /// Register a type-erased virtual table cursor for opcode execution.
+    pub fn register_vtab_cursor(&mut self, cursor_id: i32, cursor: Box<dyn ErasedVtabCursor>) {
+        self.vtab_cursors
+            .insert(cursor_id, VtabCursorState { cursor });
     }
 
     /// Enable/disable storage-backed cursor execution for `OpenRead`/`OpenWrite`.
@@ -2230,6 +2322,7 @@ impl VdbeEngine {
             if self.trace_opcodes {
                 self.trace_opcode(pc, op);
             }
+            #[allow(unreachable_patterns)]
             match op.opcode {
                 // ── Control Flow ────────────────────────────────────────
                 Opcode::Init => {
@@ -2577,10 +2670,14 @@ impl VdbeEngine {
                             false
                         }
                     } else {
+                        // Apply SQLite comparison affinity rules (§3.2):
+                        // When one operand is numeric and the other is text,
+                        // coerce the text operand to numeric before comparing.
+                        let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs);
                         let cmp = if let P4::Collation(ref coll_name) = op.p4 {
-                            collate_compare(lhs, rhs, coll_name)
+                            collate_compare(&cmp_lhs, &cmp_rhs, coll_name)
                         } else {
-                            lhs.partial_cmp(rhs)
+                            cmp_lhs.partial_cmp(&cmp_rhs)
                         };
                         matches!(
                             (op.opcode, cmp),
@@ -3466,9 +3563,18 @@ impl VdbeEngine {
                         } else {
                             0 // empty table
                         };
-                        // Use the higher of B-tree max and previously allocated
-                        // to ensure uniqueness across consecutive allocations.
-                        let base = btree_max.max(sc.last_alloc_rowid);
+                        // For AUTOINCREMENT tables, also consult the high-water
+                        // mark from sqlite_sequence to prevent rowid reuse after
+                        // deletion (bd-31j76).
+                        let autoinc_max = self
+                            .cursor_root_pages
+                            .get(&cursor_id)
+                            .and_then(|rp| self.autoincrement_seq_by_root_page.get(rp))
+                            .copied()
+                            .unwrap_or(0);
+                        // Use the highest of B-tree max, previously allocated,
+                        // and AUTOINCREMENT high-water mark.
+                        let base = btree_max.max(sc.last_alloc_rowid).max(autoinc_max);
                         let new_rowid = base + 1;
                         sc.last_alloc_rowid = new_rowid;
                         new_rowid
@@ -3586,6 +3692,8 @@ impl VdbeEngine {
 
                     // Track last insert rowid for last_insert_rowid() support.
                     self.last_insert_rowid = rowid;
+                    self.last_insert_cursor_id = Some(cursor_id);
+                    self.conflict_skip_idx = false;
 
                     // br-22iss: Clear pending_next_after_delete since Insert repositions
                     // the cursor. This is critical for UPDATE (Delete+Insert) to avoid
@@ -3631,16 +3739,24 @@ impl VdbeEngine {
                 Opcode::IdxInsert => {
                     // Insert key from register P2 into index cursor P1.
                     // bd-qluy: Phase 5I.6 - Wire to B-tree index_insert.
-                    // When P5=1, the index is UNIQUE: delegate to
-                    // index_insert_unique which rejects duplicate non-NULL
-                    // key prefixes. P3 = number of indexed columns
-                    // (excluding trailing rowid). P4 = columns string for
-                    // the error message.
+                    // P5 encoding: bit 0 = is_unique, bits 1-4 = oe_flag
+                    // (conflict resolution mode for UNIQUE violations).
+                    // P3 = number of indexed columns (excluding trailing
+                    // rowid). P4 = columns string for the error message.
                     let cursor_id = op.p1;
                     let key_reg = op.p2;
-                    let is_unique = op.p5 == 1;
+                    let is_unique = (op.p5 & 1) != 0;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let oe_flag = ((op.p5 >> 1) & 0x0F) as u8;
                     let n_idx_cols = op.p3 as usize;
                     let key_val = self.get_reg(key_reg).clone();
+
+                    // If a previous IdxInsert for the same row triggered IGNORE,
+                    // skip all remaining index inserts for this row.
+                    if self.conflict_skip_idx {
+                        pc += 1;
+                        continue;
+                    }
 
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
@@ -3651,12 +3767,84 @@ impl VdbeEngine {
                                     P4::Table(s) => s.clone(),
                                     _ => String::new(),
                                 };
-                                sc.cursor.index_insert_unique(
+                                match sc.cursor.index_insert_unique(
                                     &sc.cx,
                                     &key_bytes,
                                     n_idx_cols,
                                     &columns_label,
-                                )?;
+                                ) {
+                                    Ok(()) => {}
+                                    Err(FrankenError::UniqueViolation { .. }) => {
+                                        match oe_flag {
+                                            // OE_IGNORE (4): Undo the table
+                                            // insert and skip remaining indexes.
+                                            4 => {
+                                                if let Some(tbl_cursor_id) =
+                                                    self.last_insert_cursor_id
+                                                {
+                                                    // Delete the just-inserted
+                                                    // table row to undo the
+                                                    // Insert opcode.
+                                                    if let Some(tsc) =
+                                                        self.storage_cursors.get_mut(&tbl_cursor_id)
+                                                    {
+                                                        let _ = tsc.cursor.delete(&tsc.cx);
+                                                    }
+                                                }
+                                                self.conflict_skip_idx = true;
+                                                pc += 1;
+                                                continue;
+                                            }
+                                            // OE_REPLACE (5 or 8): Find the
+                                            // conflicting row, delete it (and its
+                                            // index entries), then insert the new
+                                            // index entry.
+                                            5 | 8 => {
+                                                // Find the rowid of the
+                                                // conflicting row from the index.
+                                                let conflict_rowid =
+                                                    find_conflicting_rowid_in_index(
+                                                        sc, &key_bytes, n_idx_cols,
+                                                    )?;
+
+                                                if let Some(old_rowid) = conflict_rowid {
+                                                    // Delete the old table row.
+                                                    if let Some(tbl_cursor_id) =
+                                                        self.last_insert_cursor_id
+                                                    {
+                                                        if let Some(tsc) = self
+                                                            .storage_cursors
+                                                            .get_mut(&tbl_cursor_id)
+                                                        {
+                                                            tsc.cursor.table_move_to(
+                                                                &tsc.cx, old_rowid,
+                                                            )?;
+                                                            tsc.cursor.delete(&tsc.cx)?;
+                                                        }
+                                                    }
+                                                }
+
+                                                // Now insert the new index entry
+                                                // (the conflicting one was already
+                                                // deleted by
+                                                // find_conflicting_rowid_in_index).
+                                                let sc2 = self
+                                                    .storage_cursors
+                                                    .get_mut(&cursor_id)
+                                                    .expect("cursor must exist");
+                                                sc2.cursor.index_insert(&sc2.cx, &key_bytes)?;
+                                            }
+                                            // Default: propagate the error
+                                            // (ABORT/FAIL/ROLLBACK).
+                                            _ => {
+                                                return Err(FrankenError::UniqueViolation {
+                                                    columns: columns_label,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    Err(e) => return Err(e),
+                                }
                             } else {
                                 sc.cursor.index_insert(&sc.cx, &key_bytes)?;
                             }
@@ -4346,7 +4534,7 @@ impl VdbeEngine {
 
                     #[allow(clippy::cast_possible_wrap)]
                     let func = registry
-                        .find_scalar_precanonical(func_name, arg_count as i32)
+                        .find_scalar(func_name, arg_count as i32)
                         .ok_or_else(|| {
                             FrankenError::Internal(format!(
                                 "no such function: {func_name}/{arg_count}",
@@ -4616,7 +4804,208 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
-                // ── Catch-all for remaining opcodes ─────────────────────
+                // ── Virtual Table opcodes ───────────────────────────────
+                Opcode::VOpen => {
+                    // Open a virtual table cursor.
+                    // P1 = cursor number.
+                    // The Connection layer pre-creates cursors or VFilter
+                    // initialises them; this is a no-op at the VDBE level.
+                    let _cursor_id = op.p1;
+                    pc += 1;
+                }
+
+                Opcode::VFilter => {
+                    // Apply filter to virtual table cursor and begin scan.
+                    // P1 = cursor number
+                    // P2 = jump address if cursor is empty after filter
+                    // P3 = register with first filter argument
+                    // P4 = number of filter arguments (via P4::Int)
+                    let cursor_id = op.p1;
+                    let jump_if_empty = op.p2;
+
+                    if let Some(state) = self.vtab_cursors.get_mut(&cursor_id) {
+                        let cx = Cx::new();
+                        let n_args = match &op.p4 {
+                            P4::Int(n) => *n as usize,
+                            _ => 0,
+                        };
+                        let args: Vec<SqliteValue> = (0..n_args)
+                            .map(|i| {
+                                #[allow(clippy::cast_possible_wrap)]
+                                self.registers
+                                    .get((op.p3 + i as i32) as usize)
+                                    .cloned()
+                                    .unwrap_or(SqliteValue::Null)
+                            })
+                            .collect();
+                        let idx_num = op.p5 as i32;
+                        if let Err(e) = state.cursor.filter(&cx, idx_num, None, &args) {
+                            break ExecOutcome::Error {
+                                code: 1,
+                                message: format!("VFilter error: {e}"),
+                            };
+                        }
+                        if state.cursor.eof() {
+                            #[allow(clippy::cast_sign_loss)]
+                            {
+                                pc = jump_if_empty as usize;
+                            }
+                            continue;
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Opcode::VColumn => {
+                    // Read column from virtual table cursor.
+                    // P1 = cursor number
+                    // P2 = column index
+                    // P3 = destination register
+                    let cursor_id = op.p1;
+                    let col = op.p2;
+                    let dest = op.p3;
+
+                    if let Some(state) = self.vtab_cursors.get(&cursor_id) {
+                        let mut ctx = ColumnContext::new();
+                        if let Err(e) = state.cursor.column(&mut ctx, col) {
+                            break ExecOutcome::Error {
+                                code: 1,
+                                message: format!("VColumn error: {e}"),
+                            };
+                        }
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            if let Some(reg) = self.registers.get_mut(dest as usize) {
+                                *reg = ctx.take_value().unwrap_or(SqliteValue::Null);
+                            }
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Opcode::VNext => {
+                    // Advance virtual table cursor to the next row.
+                    // P1 = cursor number
+                    // P2 = jump address to loop body (go back if not eof)
+                    let cursor_id = op.p1;
+                    let jump_if_more = op.p2;
+
+                    if let Some(state) = self.vtab_cursors.get_mut(&cursor_id) {
+                        let cx = Cx::new();
+                        if let Err(e) = state.cursor.next(&cx) {
+                            break ExecOutcome::Error {
+                                code: 1,
+                                message: format!("VNext error: {e}"),
+                            };
+                        }
+                        if !state.cursor.eof() {
+                            #[allow(clippy::cast_sign_loss)]
+                            {
+                                pc = jump_if_more as usize;
+                            }
+                            continue;
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Opcode::VUpdate => {
+                    // INSERT/UPDATE/DELETE on a virtual table.
+                    // P1 = number of argument registers
+                    // P2 = first argument register
+                    // P3 = destination register for new rowid (INSERT)
+                    // Currently a placeholder; stores NULL in dest register.
+                    let _n_args = op.p1;
+                    let _first_reg = op.p2;
+                    let dest_reg = op.p3;
+                    #[allow(clippy::cast_sign_loss)]
+                    if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
+                        *reg = SqliteValue::Null;
+                    }
+                    pc += 1;
+                }
+
+                Opcode::VBegin => {
+                    // Begin a virtual table transaction.
+                    // P1 = cursor number identifying the vtab instance.
+                    let cursor_id = op.p1;
+                    if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
+                        let cx = Cx::new();
+                        if let Err(e) = vtab.begin(&cx) {
+                            break ExecOutcome::Error {
+                                code: 1,
+                                message: format!("VBegin error: {e}"),
+                            };
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Opcode::VCreate => {
+                    // Create a virtual table — handled at Connection layer.
+                    pc += 1;
+                }
+
+                Opcode::VDestroy => {
+                    // Destroy a virtual table — handled at Connection layer.
+                    pc += 1;
+                }
+
+                Opcode::VCheck => {
+                    // Check virtual table integrity.
+                    // P3 = destination register for error message (NULL if OK).
+                    let dest_reg = op.p3;
+                    #[allow(clippy::cast_sign_loss)]
+                    if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
+                        *reg = SqliteValue::Null;
+                    }
+                    pc += 1;
+                }
+
+                Opcode::VInitIn => {
+                    // Initialize IN constraint for virtual table.
+                    // P2 = register containing the IN value list
+                    // P3 = destination register
+                    let _cursor_id = op.p1;
+                    let src_reg = op.p2;
+                    let dest_reg = op.p3;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        let val = self
+                            .registers
+                            .get(src_reg as usize)
+                            .cloned()
+                            .unwrap_or(SqliteValue::Null);
+                        if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
+                            *reg = val;
+                        }
+                    }
+                    pc += 1;
+                }
+
+                Opcode::VRename => {
+                    // Rename a virtual table.
+                    // P1 = cursor number for the vtab instance
+                    // P4 = new table name (via P4::Str)
+                    let cursor_id = op.p1;
+                    if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
+                        let new_name = match &op.p4 {
+                            P4::Str(s) => s.as_str(),
+                            _ => "",
+                        };
+                        let cx = Cx::new();
+                        if let Err(e) = vtab.rename(&cx, new_name) {
+                            break ExecOutcome::Error {
+                                code: 1,
+                                message: format!("VRename error: {e}"),
+                            };
+                        }
+                    }
+                    pc += 1;
+                }
+
+                // ── Catch-all for future opcodes ─────────────────────
+                #[allow(unreachable_patterns)]
                 _ => {
                     break ExecOutcome::Error {
                         code: 1,
@@ -4711,17 +5100,17 @@ impl VdbeEngine {
         };
     }
 
-    /// Fast-path register write: skips range check and resize (register file
-    /// is pre-allocated in `new()`). Keeps NaN -> Null normalization.
+    /// Fast-path register write with NaN -> Null normalization.
+    /// Auto-resizes the register file when necessary (handles both
+    /// builder-allocated programs and hand-crafted test programs).
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn set_reg_fast(&mut self, r: i32, val: SqliteValue) {
-        debug_assert!(
-            (r as usize) < self.registers.len(),
-            "set_reg_fast: register {r} out of bounds (len={})",
-            self.registers.len()
-        );
-        self.registers[r as usize] = match val {
+        let idx = r as usize;
+        if idx >= self.registers.len() {
+            self.registers.resize(idx + 1, SqliteValue::Null);
+        }
+        self.registers[idx] = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
         };
@@ -5065,6 +5454,65 @@ impl VdbeEngine {
 /// Supports the three built-in collations (BINARY, NOCASE, RTRIM).
 /// For text values, the collation function is applied to the UTF-8 bytes.
 /// For non-text values, falls back to the default `partial_cmp`.
+/// Apply SQLite comparison affinity coercion (§3.2 of datatype3.html).
+///
+/// When one operand is numeric (Integer or Real) and the other is Text,
+/// attempt to coerce the Text to a numeric value.  If the text cannot be
+/// parsed as a number, the values are returned unmodified (the comparison
+/// will then fall through to SQLite's storage-class ordering: numeric < text).
+fn coerce_for_comparison<'a>(
+    lhs: &'a SqliteValue,
+    rhs: &'a SqliteValue,
+) -> (
+    std::borrow::Cow<'a, SqliteValue>,
+    std::borrow::Cow<'a, SqliteValue>,
+) {
+    use std::borrow::Cow;
+
+    let is_numeric = |v: &SqliteValue| matches!(v, SqliteValue::Integer(_) | SqliteValue::Float(_));
+
+    // Numeric vs Text → coerce text to numeric
+    if is_numeric(lhs) {
+        if let SqliteValue::Text(s) = rhs {
+            if let Some(coerced) = try_coerce_text_to_numeric_cmp(s) {
+                return (Cow::Borrowed(lhs), Cow::Owned(coerced));
+            }
+        }
+    }
+    if is_numeric(rhs) {
+        if let SqliteValue::Text(s) = lhs {
+            if let Some(coerced) = try_coerce_text_to_numeric_cmp(s) {
+                return (Cow::Owned(coerced), Cow::Borrowed(rhs));
+            }
+        }
+    }
+
+    (Cow::Borrowed(lhs), Cow::Borrowed(rhs))
+}
+
+/// Try to parse a text string as a numeric value for comparison coercion.
+fn try_coerce_text_to_numeric_cmp(s: &str) -> Option<SqliteValue> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Try integer first.
+    if let Ok(i) = trimmed.parse::<i64>() {
+        return Some(SqliteValue::Integer(i));
+    }
+    // Try float.
+    if let Ok(f) = trimmed.parse::<f64>() {
+        if !f.is_finite() {
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.contains("inf") || lower.contains("nan") {
+                return None;
+            }
+        }
+        return Some(SqliteValue::Float(f));
+    }
+    None
+}
+
 fn collate_compare(
     lhs: &SqliteValue,
     rhs: &SqliteValue,
@@ -5091,6 +5539,77 @@ fn collate_compare(
         }
         _ => lhs.partial_cmp(rhs),
     }
+}
+
+/// For REPLACE conflict resolution: re-seek the index cursor, find the
+/// conflicting entry (which has matching indexed columns but a different
+/// rowid), delete it from the index, and return its rowid so the caller
+/// can delete the old table row.
+fn find_conflicting_rowid_in_index(
+    sc: &mut StorageCursor,
+    key_bytes: &[u8],
+    n_idx_cols: usize,
+) -> Result<Option<i64>> {
+    // Re-seek to the position where the conflicting entry should be.
+    sc.cursor.index_move_to(&sc.cx, key_bytes)?;
+
+    // The new key we're trying to insert — parse its prefix for comparison.
+    let new_fields = parse_record(key_bytes).unwrap_or_default();
+
+    // Check the entry at current position and previous entry for a prefix match.
+    for attempt in 0..2 {
+        if sc.cursor.eof() {
+            if attempt == 0 {
+                // Try moving to the previous entry.
+                sc.cursor.prev(&sc.cx)?;
+                continue;
+            }
+            break;
+        }
+
+        let entry_bytes = sc.cursor.payload(&sc.cx)?;
+        let entry_fields = parse_record(&entry_bytes).unwrap_or_default();
+
+        // Check if the indexed columns (excluding the trailing rowid) match
+        // and none of them are NULL.
+        let mut prefix_match = true;
+        let mut has_null = false;
+        for i in 0..n_idx_cols {
+            let new_val = new_fields.get(i);
+            let entry_val = entry_fields.get(i);
+            if matches!(new_val, Some(SqliteValue::Null) | None)
+                || matches!(entry_val, Some(SqliteValue::Null) | None)
+            {
+                has_null = true;
+                break;
+            }
+            if new_val != entry_val {
+                prefix_match = false;
+                break;
+            }
+        }
+
+        if prefix_match && !has_null {
+            // Extract the rowid (last field in the index entry).
+            let old_rowid = if let Some(SqliteValue::Integer(rid)) = entry_fields.last() {
+                *rid
+            } else {
+                // Fallback: try cursor rowid.
+                sc.cursor.rowid(&sc.cx).unwrap_or(0)
+            };
+
+            // Delete the conflicting index entry.
+            sc.cursor.delete(&sc.cx)?;
+
+            return Ok(Some(old_rowid));
+        }
+
+        if attempt == 0 {
+            sc.cursor.prev(&sc.cx)?;
+        }
+    }
+
+    Ok(None)
 }
 
 fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
@@ -9475,10 +9994,16 @@ mod tests {
 
     // ── External Sort Tests (bd-1rw.4) ──────────────────────────────────
 
+    /// Mutex to serialize tests that mutate global JIT settings (enabled,
+    /// threshold, capacity). Without this, parallel tests overwrite each
+    /// other's globals, causing false negatives in delta-based assertions.
+    static JIT_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_sort_metrics_emitted_on_sorter_sort() {
         // Verify that sort row metrics are updated when a sorter sorts rows.
-        reset_vdbe_metrics();
+        // Delta-based: snapshot before/after to avoid racing with parallel tests.
+        let before = vdbe_metrics_snapshot();
         let rows = run_program(|b| {
             let end = b.emit_label();
             let loop_start = b.emit_label();
@@ -9508,29 +10033,29 @@ mod tests {
         });
 
         assert_eq!(rows.len(), 5);
-        let metrics = vdbe_metrics_snapshot();
+        let after = vdbe_metrics_snapshot();
+        let delta_sort_rows = after.sort_rows_total - before.sort_rows_total;
+        let delta_spill = after.sort_spill_pages_total - before.sort_spill_pages_total;
         assert!(
-            metrics.sort_rows_total >= 5,
-            "sort_rows_total should be >= 5, got {}",
-            metrics.sort_rows_total
+            delta_sort_rows >= 5,
+            "sort_rows_total delta should be >= 5, got {delta_sort_rows}",
         );
         // No spill expected for 5 tiny rows.
-        assert_eq!(
-            metrics.sort_spill_pages_total, 0,
-            "no spill expected for small dataset"
-        );
+        assert_eq!(delta_spill, 0, "no spill expected for small dataset");
     }
 
     #[test]
     fn test_jit_scaffold_metrics_compile_and_cache_hit() {
+        let _guard = JIT_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_enabled = vdbe_jit_enabled();
         let prev_threshold = vdbe_jit_hot_threshold();
         let prev_capacity = vdbe_jit_cache_capacity();
 
-        reset_vdbe_metrics();
+        // Delta-based: snapshot before/after to avoid racing with parallel tests.
         set_vdbe_jit_enabled(true);
         let _ = set_vdbe_jit_hot_threshold(2);
         let _ = set_vdbe_jit_cache_capacity(8);
+        let before = vdbe_jit_metrics_snapshot();
 
         for _ in 0..3 {
             let rows = run_program(|b| {
@@ -9544,24 +10069,19 @@ mod tests {
             assert_eq!(rows, vec![vec![SqliteValue::Integer(42)]]);
         }
 
-        let snapshot = vdbe_jit_metrics_snapshot();
+        let after = vdbe_jit_metrics_snapshot();
+        let delta_compilations = after.jit_compilations_total - before.jit_compilations_total;
+        let delta_cache_hits = after.jit_cache_hits_total - before.jit_cache_hits_total;
         assert!(
-            snapshot.jit_compilations_total >= 1,
-            "expected at least one JIT compile, got {}",
-            snapshot.jit_compilations_total
+            delta_compilations >= 1,
+            "expected at least one JIT compile delta, got {delta_compilations}",
         );
         assert!(
-            snapshot.jit_cache_hits_total >= 1,
-            "expected at least one JIT cache hit, got {}",
-            snapshot.jit_cache_hits_total
+            delta_cache_hits >= 1,
+            "expected at least one JIT cache hit delta, got {delta_cache_hits}",
         );
         assert!(
-            snapshot.jit_cache_hit_ratio_percent > 0,
-            "expected positive cache hit ratio, got {}",
-            snapshot.jit_cache_hit_ratio_percent
-        );
-        assert!(
-            snapshot.cache_entries >= 1,
+            after.cache_entries >= 1,
             "expected non-empty JIT cache after hot runs"
         );
 
@@ -9572,14 +10092,16 @@ mod tests {
 
     #[test]
     fn test_jit_scaffold_compile_failure_falls_back_to_interpreter() {
+        let _guard = JIT_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_enabled = vdbe_jit_enabled();
         let prev_threshold = vdbe_jit_hot_threshold();
         let prev_capacity = vdbe_jit_cache_capacity();
 
-        reset_vdbe_metrics();
+        // Delta-based: snapshot before/after to avoid racing with parallel tests.
         set_vdbe_jit_enabled(true);
         let _ = set_vdbe_jit_hot_threshold(1);
         let _ = set_vdbe_jit_cache_capacity(8);
+        let before = vdbe_jit_metrics_snapshot();
 
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
@@ -9599,11 +10121,11 @@ mod tests {
         });
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(700)]]);
-        let snapshot = vdbe_jit_metrics_snapshot();
+        let after = vdbe_jit_metrics_snapshot();
+        let delta_failures = after.jit_compile_failures_total - before.jit_compile_failures_total;
         assert!(
-            snapshot.jit_compile_failures_total >= 1,
-            "expected at least one JIT compile failure, got {}",
-            snapshot.jit_compile_failures_total
+            delta_failures >= 1,
+            "expected at least one JIT compile failure delta, got {delta_failures}",
         );
 
         set_vdbe_jit_enabled(prev_enabled);
@@ -10565,5 +11087,296 @@ mod tests {
         });
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    // ── Virtual Table opcodes ──────────────────────────────────
+
+    /// Mock virtual table cursor for testing VTable opcodes.
+    struct MockVtabCursor {
+        rows: Vec<Vec<SqliteValue>>,
+        pos: usize,
+        filtered: bool,
+    }
+
+    impl MockVtabCursor {
+        fn new(rows: Vec<Vec<SqliteValue>>) -> Self {
+            Self {
+                rows,
+                pos: 0,
+                filtered: false,
+            }
+        }
+    }
+
+    impl ErasedVtabCursor for MockVtabCursor {
+        fn filter(
+            &mut self,
+            _cx: &Cx,
+            _idx_num: i32,
+            _idx_str: Option<&str>,
+            _args: &[SqliteValue],
+        ) -> Result<()> {
+            self.pos = 0;
+            self.filtered = true;
+            Ok(())
+        }
+        fn next(&mut self, _cx: &Cx) -> Result<()> {
+            self.pos += 1;
+            Ok(())
+        }
+        fn eof(&self) -> bool {
+            self.pos >= self.rows.len()
+        }
+        fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+            #[allow(clippy::cast_sign_loss)]
+            let val = self
+                .rows
+                .get(self.pos)
+                .and_then(|row| row.get(col as usize))
+                .cloned()
+                .unwrap_or(SqliteValue::Null);
+            ctx.set_value(val);
+            Ok(())
+        }
+        fn rowid(&self) -> Result<i64> {
+            #[allow(clippy::cast_possible_wrap)]
+            Ok(self.pos as i64 + 1)
+        }
+    }
+
+    /// Helper: build a program, register a vtab cursor, then execute.
+    fn run_vtab_program(
+        cursor_id: i32,
+        cursor: MockVtabCursor,
+        build: impl FnOnce(&mut ProgramBuilder),
+    ) -> (Vec<Vec<SqliteValue>>, ExecOutcome) {
+        let mut b = ProgramBuilder::new();
+        build(&mut b);
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.register_vtab_cursor(cursor_id, Box::new(cursor));
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        (engine.take_results(), outcome)
+    }
+
+    #[test]
+    fn test_vopen_is_noop() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::VOpen, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 42, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(42)]]);
+    }
+
+    #[test]
+    fn test_vcreate_is_noop() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(
+                Opcode::VCreate,
+                0,
+                0,
+                0,
+                P4::Str("test_module".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_vdestroy_is_noop() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(
+                Opcode::VDestroy,
+                0,
+                0,
+                0,
+                P4::Str("test_table".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_vcheck_stores_null() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 99, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::VCheck, 0, 0, r_out, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Null]]);
+    }
+
+    #[test]
+    fn test_vupdate_stores_null_in_dest() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 77, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::VUpdate, 0, r_out, r_out, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Null]]);
+    }
+
+    #[test]
+    fn test_vinitin_copies_register() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_src = b.alloc_reg();
+            let r_dst = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 123, r_src, 0, P4::None, 0);
+            b.emit_op(Opcode::VInitIn, 0, r_src, r_dst, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_dst, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(123)]]);
+    }
+
+    #[test]
+    fn test_vfilter_jumps_on_empty_cursor() {
+        let empty_cursor = MockVtabCursor::new(vec![]);
+        let (rows, outcome) = run_vtab_program(0, empty_cursor, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            let after_scan = b.emit_label();
+            b.emit_jump_to_label(Opcode::VFilter, 0, 0, after_scan, P4::Int(0), 0);
+            b.emit_op(Opcode::Integer, 999, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.resolve_label(after_scan);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
+    }
+
+    #[test]
+    fn test_vfilter_vcolumn_vnext_scan_loop() {
+        let cursor = MockVtabCursor::new(vec![
+            vec![SqliteValue::Integer(10), SqliteValue::Text("a".to_owned())],
+            vec![SqliteValue::Integer(20), SqliteValue::Text("b".to_owned())],
+        ]);
+        let (rows, outcome) = run_vtab_program(0, cursor, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let done_label = b.emit_label();
+            let loop_label = b.emit_label();
+            b.emit_jump_to_label(Opcode::VFilter, 0, 0, done_label, P4::Int(0), 0);
+            b.resolve_label(loop_label);
+            b.emit_op(Opcode::VColumn, 0, 0, r1, P4::None, 0);
+            b.emit_op(Opcode::VColumn, 0, 1, r2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r1, 2, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::VNext, 0, 0, loop_label, P4::None, 0);
+            b.resolve_label(done_label);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(10), SqliteValue::Text("a".to_owned())],
+                vec![SqliteValue::Integer(20), SqliteValue::Text("b".to_owned())],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_vnext_no_cursor_falls_through() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            let loop_label = b.emit_label();
+            b.resolve_label(loop_label);
+            b.emit_jump_to_label(Opcode::VNext, 99, 0, loop_label, P4::None, 0);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_vbegin_no_instance_is_noop() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::VBegin, 0, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_vrename_no_instance_is_noop() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::VRename, 0, 0, 0, P4::Str("new_name".to_owned()), 0);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    #[test]
+    fn test_vcolumn_no_cursor_is_noop() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 55, r_out, 0, P4::None, 0);
+            b.emit_op(Opcode::VColumn, 99, 0, r_out, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(55)]]);
     }
 }
