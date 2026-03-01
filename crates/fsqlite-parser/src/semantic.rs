@@ -1450,7 +1450,9 @@ mod tests {
 
     #[test]
     fn test_semantic_metrics() {
-        reset_semantic_metrics();
+        // Delta-based assertion: never call reset_semantic_metrics() in tests
+        // as it races with parallel tests.
+        let before = semantic_metrics_snapshot();
         let schema = make_schema();
 
         // Trigger an error.
@@ -1458,7 +1460,12 @@ mod tests {
         let mut resolver = Resolver::new(&schema);
         let _ = resolver.resolve_statement(&stmt);
 
-        let snap = semantic_metrics_snapshot();
-        assert!(snap.fsqlite_semantic_errors_total >= 1);
+        let after = semantic_metrics_snapshot();
+        assert!(
+            after.fsqlite_semantic_errors_total > before.fsqlite_semantic_errors_total,
+            "expected at least 1 new semantic error, before={}, after={}",
+            before.fsqlite_semantic_errors_total,
+            after.fsqlite_semantic_errors_total,
+        );
     }
 }
