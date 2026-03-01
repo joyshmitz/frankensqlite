@@ -823,7 +823,6 @@ impl std::fmt::Debug for SharedMemoryLayout {
             .finish_non_exhaustive()
     }
 }
-
 // ---------------------------------------------------------------------------
 // Wire-format helpers (little-endian)
 // ---------------------------------------------------------------------------
@@ -1303,6 +1302,23 @@ mod tests {
                 .serialized_writer_lease_expiry
                 .load(Ordering::Relaxed),
             0
+        );
+    }
+
+    #[test]
+    fn test_stale_indicator_clears_when_now_equals_lease_expiry() {
+        let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
+        let now = 500_u64;
+
+        // Boundary condition: lease expires exactly at `now`.
+        assert!(layout.acquire_serialized_writer(77, 4321, 123, now));
+        assert!(layout.check_serialized_writer().is_some());
+
+        let res = layout.check_serialized_writer_exclusion(now, |_pid, _birth| true);
+        assert!(res.is_ok(), "lease boundary should be treated as stale");
+        assert!(
+            layout.check_serialized_writer().is_none(),
+            "stale indicator must be cleared at lease boundary"
         );
     }
 

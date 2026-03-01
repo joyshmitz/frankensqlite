@@ -6392,7 +6392,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[ignore = "window functions not yet implemented"]
+
     fn conformance_027_row_number() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE sales(id INTEGER PRIMARY KEY, region TEXT, amount REAL)")
@@ -6414,7 +6414,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "window functions not yet implemented"]
+
     fn conformance_027_rank_dense_rank() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE scores(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
@@ -6436,7 +6436,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "window functions not yet implemented"]
+
     fn conformance_027_sum_over() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE txns(id INTEGER PRIMARY KEY, amount REAL)")
@@ -6455,7 +6455,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "window functions not yet implemented"]
+
     fn conformance_027_lag_lead() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE seq(id INTEGER PRIMARY KEY, val TEXT)")

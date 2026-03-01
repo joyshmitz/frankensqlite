@@ -41,6 +41,29 @@ const NO_GC_HORIZON: u64 = u64::MAX;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
+fn process_alive_os(pid: u32, pid_birth: u64) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return false;
+        }
+
+        // Conservative fallback for unix targets without /proc: treat as alive
+        // so we never clear a potentially live writer based on missing OS hooks.
+        if !std::path::Path::new("/proc").exists() {
+            return true;
+        }
+
+        let _ = pid_birth;
+        std::path::Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, pid_birth);
+        true
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BeginKind
 // ---------------------------------------------------------------------------
@@ -991,7 +1014,7 @@ impl TransactionManager {
         // Check serialized writer exclusion first.
         if self
             .shm
-            .check_serialized_writer_exclusion(logical_now_epoch_secs(), |_pid, _birth| true)
+            .check_serialized_writer_exclusion(logical_now_epoch_secs(), process_alive_os)
             .is_err()
         {
             return Err(MvccError::Busy);
@@ -1343,7 +1366,7 @@ impl TransactionManager {
         // If a serialized-writer token is present and not stale, treat as BUSY.
         if self
             .shm
-            .check_serialized_writer_exclusion(now, |_pid, _birth| true)
+            .check_serialized_writer_exclusion(now, process_alive_os)
             .is_err()
         {
             self.write_mutex.release(txn_id);
@@ -1554,6 +1577,23 @@ mod tests {
         let result = tracing::subscriber::with_default(subscriber, f);
         let bytes = buf.lock().expect("log buffer lock").clone();
         (result, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[test]
+    fn test_process_alive_os_current_pid_is_alive() {
+        assert!(process_alive_os(
+            std::process::id(),
+            logical_now_epoch_secs()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_process_alive_os_rejects_out_of_range_pid() {
+        let invalid_pid = u32::try_from(i32::MAX)
+            .expect("i32::MAX must fit u32")
+            .saturating_add(1);
+        assert!(!process_alive_os(invalid_pid, logical_now_epoch_secs()));
     }
 
     #[test]

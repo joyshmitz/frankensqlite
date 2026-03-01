@@ -91,6 +91,24 @@ fn mode_pragmas_report_expected_state() {
         SqliteValue::Integer(0),
         "parity_cert_strict defaults OFF for non-certifying runtime by default"
     );
+
+    let backend_kind_rows = conn
+        .query("PRAGMA fsqlite.backend_kind;")
+        .expect("query backend_kind");
+    assert_eq!(
+        backend_kind_rows[0].values()[0],
+        SqliteValue::Text("memory".to_owned()),
+        "in-memory connection must report memory backend_kind"
+    );
+
+    let backend_mode_rows = conn
+        .query("PRAGMA fsqlite.backend_mode;")
+        .expect("query backend_mode");
+    assert_eq!(
+        backend_mode_rows[0].values()[0],
+        SqliteValue::Text("parity_cert".to_owned()),
+        "backend_mode must reflect default parity_cert mode"
+    );
 }
 
 #[test]
