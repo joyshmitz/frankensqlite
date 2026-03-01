@@ -705,6 +705,354 @@ impl WindowFunction for NthValueFunc {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Aggregate-as-window functions: SUM, AVG, COUNT, MIN, MAX, TOTAL
+// SQLite allows any aggregate function to be used as a window function.
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub struct WindowSumState {
+    sum: f64,
+    has_value: bool,
+    is_int: bool,
+    int_sum: i64,
+}
+
+pub struct WindowSumFunc;
+
+impl WindowFunction for WindowSumFunc {
+    type State = WindowSumState;
+
+    fn initial_state(&self) -> Self::State {
+        WindowSumState {
+            sum: 0.0,
+            has_value: false,
+            is_int: true,
+            int_sum: 0,
+        }
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        if args.is_empty() || args[0].is_null() {
+            return Ok(());
+        }
+        state.has_value = true;
+        match &args[0] {
+            SqliteValue::Integer(i) => {
+                state.int_sum = state.int_sum.wrapping_add(*i);
+                state.sum += *i as f64;
+            }
+            SqliteValue::Float(f) => {
+                state.is_int = false;
+                state.sum += f;
+            }
+            other => {
+                let f = other.to_float();
+                if f != 0.0 || other.to_text() == "0" {
+                    state.is_int = false;
+                    state.sum += f;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn inverse(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        if args.is_empty() || args[0].is_null() {
+            return Ok(());
+        }
+        match &args[0] {
+            SqliteValue::Integer(i) => {
+                state.int_sum = state.int_sum.wrapping_sub(*i);
+                state.sum -= *i as f64;
+            }
+            _ => {
+                state.sum -= args[0].to_float();
+            }
+        }
+        Ok(())
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        if !state.has_value {
+            return Ok(SqliteValue::Null);
+        }
+        if state.is_int {
+            Ok(SqliteValue::Integer(state.int_sum))
+        } else {
+            Ok(SqliteValue::Float(state.sum))
+        }
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        self.value(&state)
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &str {
+        "SUM"
+    }
+}
+
+pub struct WindowTotalFunc;
+
+impl WindowFunction for WindowTotalFunc {
+    type State = f64;
+
+    fn initial_state(&self) -> Self::State {
+        0.0
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        if !args.is_empty() && !args[0].is_null() {
+            *state += args[0].to_float();
+        }
+        Ok(())
+    }
+
+    fn inverse(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        if !args.is_empty() && !args[0].is_null() {
+            *state -= args[0].to_float();
+        }
+        Ok(())
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        Ok(SqliteValue::Float(*state))
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        Ok(SqliteValue::Float(state))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &str {
+        "TOTAL"
+    }
+}
+
+pub struct WindowCountState {
+    count: i64,
+}
+
+pub struct WindowCountFunc;
+
+impl WindowFunction for WindowCountFunc {
+    type State = WindowCountState;
+
+    fn initial_state(&self) -> Self::State {
+        WindowCountState { count: 0 }
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        // COUNT(*) has 0 args → count all rows; COUNT(x) skips NULLs.
+        if args.is_empty() || !args[0].is_null() {
+            state.count += 1;
+        }
+        Ok(())
+    }
+
+    fn inverse(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        if args.is_empty() || !args[0].is_null() {
+            state.count -= 1;
+        }
+        Ok(())
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        Ok(SqliteValue::Integer(state.count))
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        Ok(SqliteValue::Integer(state.count))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1 // variadic: COUNT(*) = 0 args, COUNT(x) = 1 arg
+    }
+
+    fn name(&self) -> &str {
+        "COUNT"
+    }
+}
+
+pub struct WindowMinState {
+    min: Option<SqliteValue>,
+}
+
+pub struct WindowMinFunc;
+
+impl WindowFunction for WindowMinFunc {
+    type State = WindowMinState;
+
+    fn initial_state(&self) -> Self::State {
+        WindowMinState { min: None }
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        if args.is_empty() || args[0].is_null() {
+            return Ok(());
+        }
+        state.min = Some(match state.min.take() {
+            None => args[0].clone(),
+            Some(cur) => {
+                if cmp_values(&args[0], &cur) == std::cmp::Ordering::Less {
+                    args[0].clone()
+                } else {
+                    cur
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn inverse(&self, _state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+        // MIN inverse is not efficiently invertible; no-op for unbounded frames.
+        Ok(())
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        Ok(state.min.clone().unwrap_or(SqliteValue::Null))
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        Ok(state.min.unwrap_or(SqliteValue::Null))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &str {
+        "MIN"
+    }
+}
+
+pub struct WindowMaxState {
+    max: Option<SqliteValue>,
+}
+
+pub struct WindowMaxFunc;
+
+impl WindowFunction for WindowMaxFunc {
+    type State = WindowMaxState;
+
+    fn initial_state(&self) -> Self::State {
+        WindowMaxState { max: None }
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        if args.is_empty() || args[0].is_null() {
+            return Ok(());
+        }
+        state.max = Some(match state.max.take() {
+            None => args[0].clone(),
+            Some(cur) => {
+                if cmp_values(&args[0], &cur) == std::cmp::Ordering::Greater {
+                    args[0].clone()
+                } else {
+                    cur
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn inverse(&self, _state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+        Ok(())
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        Ok(state.max.clone().unwrap_or(SqliteValue::Null))
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        Ok(state.max.unwrap_or(SqliteValue::Null))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &str {
+        "MAX"
+    }
+}
+
+pub struct WindowAvgState {
+    sum: f64,
+    count: i64,
+}
+
+pub struct WindowAvgFunc;
+
+impl WindowFunction for WindowAvgFunc {
+    type State = WindowAvgState;
+
+    fn initial_state(&self) -> Self::State {
+        WindowAvgState { sum: 0.0, count: 0 }
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        if args.is_empty() || args[0].is_null() {
+            return Ok(());
+        }
+        state.sum += args[0].to_float();
+        state.count += 1;
+        Ok(())
+    }
+
+    fn inverse(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        if args.is_empty() || args[0].is_null() {
+            return Ok(());
+        }
+        state.sum -= args[0].to_float();
+        state.count -= 1;
+        Ok(())
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        if state.count == 0 {
+            Ok(SqliteValue::Null)
+        } else {
+            Ok(SqliteValue::Float(state.sum / state.count as f64))
+        }
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        self.value(&state)
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &str {
+        "AVG"
+    }
+}
+
+/// Compare two SQLite values using type-aware ordering.
+pub fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
+    match (a, b) {
+        (SqliteValue::Null, SqliteValue::Null) => std::cmp::Ordering::Equal,
+        (SqliteValue::Null, _) => std::cmp::Ordering::Less,
+        (_, SqliteValue::Null) => std::cmp::Ordering::Greater,
+        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => ai.cmp(bi),
+        (SqliteValue::Float(af), SqliteValue::Float(bf)) => af.total_cmp(bf),
+        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => (*ai as f64).total_cmp(bf),
+        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => af.total_cmp(&(*bi as f64)),
+        (SqliteValue::Text(at), SqliteValue::Text(bt)) => at.cmp(bt),
+        (SqliteValue::Blob(ab), SqliteValue::Blob(bb)) => ab.cmp(bb),
+        _ => a.to_text().cmp(&b.to_text()),
+    }
+}
+
 // ── Registration ──────────────────────────────────────────────────────────
 
 /// Register all S13.5 window functions.
@@ -720,6 +1068,14 @@ pub fn register_window_builtins(registry: &mut FunctionRegistry) {
     registry.register_window(FirstValueFunc);
     registry.register_window(LastValueFunc);
     registry.register_window(NthValueFunc);
+
+    // Aggregate-as-window functions (SQLite allows any aggregate as a window fn).
+    registry.register_window(WindowSumFunc);
+    registry.register_window(WindowTotalFunc);
+    registry.register_window(WindowCountFunc);
+    registry.register_window(WindowMinFunc);
+    registry.register_window(WindowMaxFunc);
+    registry.register_window(WindowAvgFunc);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
