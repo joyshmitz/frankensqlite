@@ -7287,6 +7287,12 @@ impl Connection {
         };
 
         match full_name.as_str() {
+            "fsqlite.backend_kind" | "backend_kind" => Ok(vec![Row {
+                values: vec![SqliteValue::Text(self.pager_backend_kind().to_owned())],
+            }]),
+            "fsqlite.backend_mode" | "backend_mode" => Ok(vec![Row {
+                values: vec![SqliteValue::Text(self.backend_mode_label().to_owned())],
+            }]),
             "fsqlite.concurrent_mode" | "concurrent_mode" => {
                 if let Some(ref val) = pragma.value {
                     let enabled = parse_pragma_bool(val)?;
@@ -9992,6 +9998,17 @@ impl Connection {
         );
         record_trace_span_created();
         let _execution_guard = execution_span.enter();
+        // Collect column defaults BEFORE taking the active transaction.
+        // `column_defaults_by_root_page()` calls `evaluate_column_default_value()`
+        // which uses `execute_statement` internally.  If `active_txn` were already
+        // taken, that nested execute_statement would create a new pager
+        // transaction and overwrite `concurrent_txn`/`concurrent_session_id`,
+        // causing the outer concurrent commit to skip page-lock release.
+        let func_reg = self.func_registry.borrow().clone();
+        let reject_mem = *self.reject_mem_fallback.borrow();
+        let autoincrement_seq_by_root_page = self.autoincrement_sequence_by_root_page();
+        let col_defaults_by_root_page = self.column_defaults_by_root_page();
+
         // Lend the active transaction to the VDBE engine so that storage
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
         let txn = self.active_txn.borrow_mut().take();
@@ -10012,10 +10029,6 @@ impl Connection {
             None
         };
 
-        let func_reg = self.func_registry.borrow().clone();
-        let reject_mem = *self.reject_mem_fallback.borrow();
-        let autoincrement_seq_by_root_page = self.autoincrement_sequence_by_root_page();
-        let col_defaults_by_root_page = self.column_defaults_by_root_page();
         let (result, txn_back) = execute_table_program_with_db(
             program,
             params,
@@ -11305,6 +11318,12 @@ fn rewrite_in_expr(
             *expr = Expr::Literal(Literal::Integer(i64::from(result)), *span);
         }
         Expr::Subquery(sub, span) => {
+            // Correlated scalar subqueries reference outer table columns and
+            // must be evaluated per-row; skip the eager rewrite so they survive
+            // into the VDBE codegen which handles them via emit_scalar_subquery.
+            if is_correlated_subquery(sub) {
+                return Ok(());
+            }
             let rows = conn.execute_statement(Statement::Select(*sub.clone()), params)?;
             let val = rows
                 .into_iter()
@@ -16239,31 +16258,11 @@ mod tests {
         .unwrap();
         // Check schema
         let schema = conn.schema.borrow();
-        let table = schema.iter().find(|t| t.name == "issues").unwrap();
-        let root_page = table.root_page;
-        eprintln!("[DIAG] issues table root_page={root_page}");
+        assert!(
+            schema.iter().any(|t| t.name == "issues"),
+            "issues table should exist in schema"
+        );
         drop(schema);
-
-        // Check pager db_size after schema
-        {
-            let cx = conn.op_cx();
-            let mut txn = conn
-                .pager
-                .begin(&cx, super::TransactionMode::Deferred)
-                .unwrap();
-            eprintln!("[DIAG] After schema: can read root page {root_page}");
-            #[allow(clippy::cast_sign_loss)]
-            let page = txn
-                .get_page(&cx, PageNumber::new(root_page as u32).unwrap())
-                .unwrap();
-            let data = page.as_ref();
-            eprintln!(
-                "[DIAG] root page first_byte=0x{:02x} is_zero={}",
-                data[0],
-                data.iter().all(|&b| b == 0)
-            );
-            let _ = txn.rollback(&cx);
-        }
 
         // Explicit transaction: INSERT
         conn.execute("BEGIN IMMEDIATE").unwrap();
@@ -16286,7 +16285,6 @@ mod tests {
             .and_then(|r| r.values().first())
             .and_then(SqliteValue::as_integer)
             .unwrap_or(-1);
-        eprintln!("[DIAG] count after explicit txn: {count}");
         assert_eq!(count, 1, "data inserted in explicit txn should be visible");
     }
 
@@ -29060,6 +29058,55 @@ mod pager_routing_tests {
         );
         let rows = conn.query("PRAGMA fsqlite.parity_cert;").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_zjisk1_pragma_backend_kind_reports_runtime_path() {
+        let mem_conn = Connection::open(":memory:").unwrap();
+        let mem_rows = mem_conn.query("PRAGMA fsqlite.backend_kind;").unwrap();
+        assert_eq!(
+            mem_rows[0].values()[0],
+            SqliteValue::Text("memory".to_owned())
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("backend-kind.db")
+            .to_string_lossy()
+            .to_string();
+        let file_conn = Connection::open(&path).unwrap();
+        let file_rows = file_conn.query("PRAGMA fsqlite.backend_kind;").unwrap();
+        assert_eq!(
+            file_rows[0].values()[0],
+            SqliteValue::Text("unix".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_pragma_backend_mode_tracks_cert_flags() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let rows = conn.query("PRAGMA fsqlite.backend_mode;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("parity_cert".to_owned())
+        );
+
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .unwrap();
+        let rows = conn.query("PRAGMA fsqlite.backend_mode;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("parity_cert_strict".to_owned())
+        );
+
+        conn.execute("PRAGMA fsqlite.parity_cert = OFF;").unwrap();
+        let rows = conn.query("PRAGMA fsqlite.backend_mode;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("fallback_allowed".to_owned())
+        );
     }
 
     #[test]

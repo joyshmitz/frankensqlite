@@ -7,6 +7,7 @@ pub use fsqlite_core::connection::{Connection, PreparedStatement, Row, TraceEven
 pub use fsqlite_vfs;
 
 pub mod compat;
+pub mod migrate;
 
 #[cfg(test)]
 #[allow(
@@ -6808,7 +6809,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "MVCC Busy on REPLACE INTO with 3-column table — pre-existing pager issue"]
     fn conformance_031_replace_into() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
@@ -8386,7 +8386,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[ignore = "correlated subqueries not yet fully implemented"]
     fn conformance_058_correlated_subquery_in_where() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)")
@@ -8411,7 +8410,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "correlated subqueries not yet fully implemented"]
     fn conformance_058_correlated_subquery_in_select() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
