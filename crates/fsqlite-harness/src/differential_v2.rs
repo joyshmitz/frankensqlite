@@ -213,6 +213,69 @@ impl ExecutionEnvelope {
             canonicalization: CanonicalizationRules::default(),
         }
     }
+
+    /// Validate strict parity-mode envelope requirements.
+    ///
+    /// This validator enforces schema completeness and replay-relevant
+    /// invariants before any engine execution occurs.
+    #[must_use]
+    pub fn validate_parity_contract(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        if self.format_version != FORMAT_VERSION {
+            errors.push(format!(
+                "envelope.format_version must be {FORMAT_VERSION}, got {}",
+                self.format_version
+            ));
+        }
+        if self.scenario_id.trim().is_empty() {
+            errors.push("envelope.scenario_id must be non-empty".to_owned());
+        }
+        if self.engines.fsqlite.trim().is_empty() {
+            errors.push("envelope.engines.fsqlite must be non-empty".to_owned());
+        }
+        if is_missing_identity_metadata(&self.engines.subject_identity) {
+            errors.push("envelope.engines.subject_identity must be non-empty".to_owned());
+        } else if !self
+            .engines
+            .subject_identity
+            .eq_ignore_ascii_case(SUBJECT_IDENTITY_LABEL)
+        {
+            errors.push("envelope.engines.subject_identity must be 'frankensqlite'".to_owned());
+        }
+        if is_missing_identity_metadata(&self.engines.reference_identity) {
+            errors.push("envelope.engines.reference_identity must be non-empty".to_owned());
+        } else if !self
+            .engines
+            .reference_identity
+            .eq_ignore_ascii_case(REFERENCE_IDENTITY_LABEL)
+        {
+            errors.push("envelope.engines.reference_identity must be 'csqlite-oracle'".to_owned());
+        }
+        if self.engines.csqlite.trim().is_empty() {
+            errors.push("envelope.engines.csqlite must be non-empty".to_owned());
+        } else if is_missing_oracle_metadata(&self.engines.csqlite) {
+            errors
+                .push("envelope.engines.csqlite must contain concrete oracle metadata".to_owned());
+        }
+
+        for (index, stmt) in self.schema.iter().enumerate() {
+            if stmt.trim().is_empty() {
+                errors.push(format!("envelope.schema[{index}] must be non-empty"));
+            }
+        }
+        for (index, stmt) in self.workload.iter().enumerate() {
+            if stmt.trim().is_empty() {
+                errors.push(format!("envelope.workload[{index}] must be non-empty"));
+            }
+        }
+        if self.schema.is_empty() && self.workload.is_empty() {
+            errors
+                .push("envelope must include at least one schema or workload statement".to_owned());
+        }
+
+        errors
+    }
 }
 
 /// Canonical form for hashing — excludes run_id.
@@ -889,43 +952,11 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
     let started_at = Instant::now();
 
     if matches!(mode, DifferentialMode::Parity) {
-        if is_missing_identity_metadata(&envelope.engines.subject_identity) {
+        if let Some(first_error) = envelope.validate_parity_contract().first() {
             return parity_contract_violation(
                 envelope,
-                "parity_contract_violation: envelope.engines.subject_identity must be non-empty",
-                "subject_identity_missing",
-                elapsed_millis(started_at.elapsed()),
-            );
-        }
-        if !envelope
-            .engines
-            .subject_identity
-            .eq_ignore_ascii_case(SUBJECT_IDENTITY_LABEL)
-        {
-            return parity_contract_violation(
-                envelope,
-                "parity_contract_violation: envelope.engines.subject_identity must be 'frankensqlite'",
-                "subject_identity_mismatch",
-                elapsed_millis(started_at.elapsed()),
-            );
-        }
-        if is_missing_identity_metadata(&envelope.engines.reference_identity) {
-            return parity_contract_violation(
-                envelope,
-                "parity_contract_violation: envelope.engines.reference_identity must be non-empty",
-                "reference_identity_missing",
-                elapsed_millis(started_at.elapsed()),
-            );
-        }
-        if !envelope
-            .engines
-            .reference_identity
-            .eq_ignore_ascii_case(REFERENCE_IDENTITY_LABEL)
-        {
-            return parity_contract_violation(
-                envelope,
-                "parity_contract_violation: envelope.engines.reference_identity must be 'csqlite-oracle'",
-                "reference_identity_mismatch",
+                &format!("parity_contract_violation: {first_error}"),
+                parity_reason_code_from_envelope_error(first_error),
                 elapsed_millis(started_at.elapsed()),
             );
         }
@@ -934,22 +965,6 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
                 envelope,
                 "parity_contract_violation: subject executor must identify as FrankenSqlite",
                 "subject_executor_identity_mismatch",
-                elapsed_millis(started_at.elapsed()),
-            );
-        }
-        if envelope.engines.csqlite.trim().is_empty() {
-            return parity_contract_violation(
-                envelope,
-                "parity_contract_violation: envelope.engines.csqlite must be non-empty",
-                "csqlite_version_missing",
-                elapsed_millis(started_at.elapsed()),
-            );
-        }
-        if is_missing_oracle_metadata(&envelope.engines.csqlite) {
-            return parity_contract_violation(
-                envelope,
-                "parity_contract_violation: envelope.engines.csqlite must contain concrete oracle metadata",
-                "csqlite_version_placeholder",
                 elapsed_millis(started_at.elapsed()),
             );
         }
@@ -1224,6 +1239,37 @@ fn log_differential_summary(result: &DifferentialResult) {
 
 fn elapsed_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn parity_reason_code_from_envelope_error(error: &str) -> &'static str {
+    if error.contains("subject_identity") {
+        return "subject_identity_invalid";
+    }
+    if error.contains("reference_identity") {
+        return "reference_identity_invalid";
+    }
+    if error.contains("engines.csqlite") {
+        return "csqlite_version_invalid";
+    }
+    if error.contains("engines.fsqlite") {
+        return "fsqlite_version_missing";
+    }
+    if error.contains("schema[") {
+        return "schema_statement_empty";
+    }
+    if error.contains("workload[") {
+        return "workload_statement_empty";
+    }
+    if error.contains("at least one schema or workload statement") {
+        return "statement_stream_empty";
+    }
+    if error.contains("format_version") {
+        return "format_version_mismatch";
+    }
+    if error.contains("scenario_id") {
+        return "scenario_id_missing";
+    }
+    "envelope_validation_failed"
 }
 
 fn is_missing_identity_metadata(value: &str) -> bool {
@@ -1767,4 +1813,85 @@ fn fixture_manifest_hash(envelope: &ExecutionEnvelope) -> String {
     let encoded =
         serde_json::to_string(&fixture_manifest).expect("fixture manifest serialization must work");
     sha256_hex(encoded.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    struct NoopExecutor {
+        identity: EngineIdentity,
+    }
+
+    impl SqlExecutor for NoopExecutor {
+        fn execute(&self, _sql: &str) -> Result<usize, String> {
+            Ok(0)
+        }
+
+        fn query(&self, _sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
+            Ok(Vec::new())
+        }
+
+        fn engine_identity(&self) -> EngineIdentity {
+            self.identity
+        }
+    }
+
+    #[test]
+    fn parity_contract_validator_rejects_missing_oracle_and_empty_statement() {
+        let envelope = ExecutionEnvelope::builder(7)
+            .engines("0.1.0", "unknown")
+            .schema(["   "])
+            .workload(["SELECT 1"])
+            .build();
+
+        let errors = envelope.validate_parity_contract();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("envelope.engines.csqlite")),
+            "bead_id={BEAD_ID} case=parity_validate_oracle errors={errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("envelope.schema[0]")),
+            "bead_id={BEAD_ID} case=parity_validate_empty_schema errors={errors:?}"
+        );
+    }
+
+    #[test]
+    fn parity_mode_hard_fails_when_statement_stream_is_empty() {
+        let envelope = ExecutionEnvelope::builder(42)
+            .engines("0.1.0", "3.52.0")
+            .build();
+        let f = NoopExecutor {
+            identity: EngineIdentity::FrankenSqlite,
+        };
+        let c = NoopExecutor {
+            identity: EngineIdentity::CSqliteOracle,
+        };
+
+        let result = run_differential(&envelope, &f, &c);
+        assert_eq!(result.outcome, Outcome::Error);
+        assert_eq!(result.metadata.normalized_outcome, "error");
+    }
+
+    #[test]
+    fn diagnostic_mode_skips_strict_parity_envelope_checks() {
+        let envelope = ExecutionEnvelope::builder(42)
+            .engines("0.1.0", "unknown")
+            .build();
+        let f = NoopExecutor {
+            identity: EngineIdentity::Unknown,
+        };
+        let c = NoopExecutor {
+            identity: EngineIdentity::Unknown,
+        };
+
+        let result = run_differential_diagnostic(&envelope, &f, &c);
+        assert_eq!(result.outcome, Outcome::Pass);
+        assert_eq!(result.metadata.normalized_outcome, "pass");
+    }
 }

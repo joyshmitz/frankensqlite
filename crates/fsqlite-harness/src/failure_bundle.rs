@@ -20,13 +20,16 @@
 //! [`crate::test_diagnostics`].
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-mblr.4.4";
 
 /// Schema version for the failure bundle format.
 pub const BUNDLE_SCHEMA_VERSION: &str = "1.0.0";
+const FIRST_FAILURE_DIAGNOSTIC_POINTER: &str = "/failure/first_divergence";
 
 // ─── Failure Types ──────────────────────────────────────────────────────
 
@@ -222,9 +225,74 @@ pub struct FailureBundle {
     pub state_snapshots: BTreeMap<String, String>,
     /// Triage tags for automated classification.
     pub triage_tags: Vec<String>,
+    /// Deterministic content hash over canonical payload (excludes human labels).
+    pub content_hash: String,
 }
 
 impl FailureBundle {
+    /// JSON pointer linking to first-failure diagnostics when available.
+    #[must_use]
+    pub fn first_failure_diagnostics_pointer(&self) -> Option<&'static str> {
+        self.failure
+            .first_divergence
+            .as_ref()
+            .map(|_| FIRST_FAILURE_DIAGNOSTIC_POINTER)
+    }
+
+    /// Deterministic hash over canonical replay-relevant bundle content.
+    ///
+    /// Human labels (`bundle_id`, `created_at`) are intentionally excluded so
+    /// logically identical failures share the same identity hash.
+    #[must_use]
+    pub fn deterministic_bundle_hash(&self) -> String {
+        #[derive(Serialize)]
+        struct CanonicalReproducibility<'a> {
+            seed: Option<u64>,
+            fixture_id: &'a Option<String>,
+            schedule_fingerprint: &'a Option<String>,
+            repro_command: &'a str,
+            storage_mode: &'a Option<String>,
+            concurrency_mode: &'a Option<String>,
+        }
+
+        #[derive(Serialize)]
+        struct CanonicalFailureBundle<'a> {
+            schema_version: &'a str,
+            run_id: &'a str,
+            scenario: &'a ScenarioInfo,
+            failure: &'a FailureInfo,
+            first_failure_diagnostics_pointer: Option<&'a str>,
+            reproducibility: CanonicalReproducibility<'a>,
+            environment: &'a EnvironmentInfo,
+            artifacts: &'a [ArtifactEntry],
+            state_snapshots: &'a BTreeMap<String, String>,
+            triage_tags: &'a [String],
+        }
+
+        let canonical = CanonicalFailureBundle {
+            schema_version: &self.schema_version,
+            run_id: &self.run_id,
+            scenario: &self.scenario,
+            failure: &self.failure,
+            first_failure_diagnostics_pointer: self.first_failure_diagnostics_pointer(),
+            reproducibility: CanonicalReproducibility {
+                seed: self.reproducibility.seed,
+                fixture_id: &self.reproducibility.fixture_id,
+                schedule_fingerprint: &self.reproducibility.schedule_fingerprint,
+                repro_command: self.reproducibility.repro_command.as_str(),
+                storage_mode: &self.reproducibility.storage_mode,
+                concurrency_mode: &self.reproducibility.concurrency_mode,
+            },
+            environment: &self.environment,
+            artifacts: &self.artifacts,
+            state_snapshots: &self.state_snapshots,
+            triage_tags: &self.triage_tags,
+        };
+        let payload = serde_json::to_string(&canonical)
+            .expect("failure bundle canonical serialization must not fail");
+        sha256_hex(payload.as_bytes())
+    }
+
     /// Validate that all required fields are populated.
     ///
     /// Returns a list of validation errors (empty if valid).
@@ -232,43 +300,62 @@ impl FailureBundle {
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
 
-        if self.schema_version.is_empty() {
+        if self.schema_version.trim().is_empty() {
             errors.push("schema_version is empty".to_owned());
         }
-        if self.bundle_id.is_empty() {
+        if self.bundle_id.trim().is_empty() {
             errors.push("bundle_id is empty".to_owned());
         }
-        if self.created_at.is_empty() {
+        if self.created_at.trim().is_empty() {
             errors.push("created_at is empty".to_owned());
         }
-        if self.run_id.is_empty() {
+        if self.run_id.trim().is_empty() {
             errors.push("run_id is empty".to_owned());
         }
-        if self.scenario.scenario_id.is_empty() {
+        if self.scenario.scenario_id.trim().is_empty() {
             errors.push("scenario.scenario_id is empty".to_owned());
         }
-        if self.scenario.bead_id.is_empty() {
+        if self.scenario.bead_id.trim().is_empty() {
             errors.push("scenario.bead_id is empty".to_owned());
         }
-        if self.scenario.test_name.is_empty() {
+        if self.scenario.test_name.trim().is_empty() {
             errors.push("scenario.test_name is empty".to_owned());
         }
-        if self.failure.message.is_empty() {
+        if self
+            .scenario
+            .script_path
+            .as_ref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            errors.push("scenario.script_path must be non-empty when present".to_owned());
+        }
+        if self.failure.message.trim().is_empty() {
             errors.push("failure.message is empty".to_owned());
         }
-        if self.reproducibility.repro_command.is_empty() {
-            errors.push("reproducibility.repro_command is empty".to_owned());
+        if normalize_one_command(&self.reproducibility.repro_command).is_none() {
+            errors.push(
+                "reproducibility.repro_command must be non-empty, single-line command".to_owned(),
+            );
         }
-        if self.environment.git_sha.is_empty() {
+        if self.environment.git_sha.trim().is_empty() {
             errors.push("environment.git_sha is empty".to_owned());
+        }
+        if !is_sha256_hex_64(&self.content_hash) {
+            errors.push("content_hash must be 64 lowercase hex chars".to_owned());
+        }
+        if self.content_hash != self.deterministic_bundle_hash() {
+            errors.push("content_hash does not match canonical bundle payload".to_owned());
         }
 
         // Validate artifact entries
         for (i, art) in self.artifacts.iter().enumerate() {
-            if art.label.is_empty() {
+            if art.label.trim().is_empty() {
                 errors.push(format!("artifacts[{i}].label is empty"));
             }
-            if art.sha256.is_empty() {
+            if art.path.trim().is_empty() {
+                errors.push(format!("artifacts[{i}].path is empty"));
+            }
+            if art.sha256.trim().is_empty() {
                 errors.push(format!("artifacts[{i}].sha256 is empty"));
             }
         }
@@ -412,10 +499,14 @@ impl FailureBundleBuilder {
         let run_id = self.run_id.ok_or("run_id is required")?;
         let scenario = self.scenario.ok_or("scenario is required")?;
         let failure = self.failure.ok_or("failure is required")?;
-        let reproducibility = self.reproducibility.ok_or("reproducibility is required")?;
+        let mut reproducibility = self.reproducibility.ok_or("reproducibility is required")?;
+        reproducibility.repro_command = normalize_one_command(&reproducibility.repro_command)
+            .ok_or(
+            "reproducibility.repro_command is required and must be non-empty, single-line command",
+        )?;
         let environment = self.environment.ok_or("environment is required")?;
 
-        Ok(FailureBundle {
+        let mut bundle = FailureBundle {
             schema_version: BUNDLE_SCHEMA_VERSION.to_owned(),
             bundle_id,
             created_at,
@@ -427,7 +518,10 @@ impl FailureBundleBuilder {
             artifacts: self.artifacts,
             state_snapshots: self.state_snapshots,
             triage_tags: self.triage_tags,
-        })
+            content_hash: String::new(),
+        };
+        bundle.content_hash = bundle.deterministic_bundle_hash();
+        Ok(bundle)
     }
 }
 
@@ -781,6 +875,30 @@ assert!(errors.is_empty(), "bundle validation failed: {errors:?}");"#.to_owned()
     ]
 }
 
+fn normalize_one_command(command: &str) -> Option<String> {
+    let normalized = command.trim();
+    if normalized.is_empty() || normalized.contains('\n') || normalized.contains('\r') {
+        return None;
+    }
+    Some(normalized.to_owned())
+}
+
+fn is_sha256_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -825,10 +943,10 @@ mod tests {
         }
     }
 
-    fn sample_bundle() -> FailureBundle {
+    fn sample_bundle_with_labels(bundle_id: &str, created_at: &str) -> FailureBundle {
         FailureBundleBuilder::new()
-            .bundle_id("fb-run001-1")
-            .created_at("2026-02-13T06:00:00Z")
+            .bundle_id(bundle_id)
+            .created_at(created_at)
             .run_id("bd-test-20260213-1234")
             .scenario(sample_scenario())
             .failure(sample_failure())
@@ -846,6 +964,10 @@ mod tests {
             .triage_tag("mvcc")
             .build()
             .expect("sample bundle should build")
+    }
+
+    fn sample_bundle() -> FailureBundle {
+        sample_bundle_with_labels("fb-run001-1", "2026-02-13T06:00:00Z")
     }
 
     // ── Schema version ──────────────────────────────────────────────
@@ -939,6 +1061,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn builder_rejects_multiline_repro_command() {
+        let result = FailureBundleBuilder::new()
+            .bundle_id("fb-1")
+            .created_at("2026-02-13T06:00:00Z")
+            .run_id("run1")
+            .scenario(sample_scenario())
+            .failure(sample_failure())
+            .reproducibility(ReproducibilityInfo {
+                seed: Some(1),
+                fixture_id: None,
+                schedule_fingerprint: None,
+                repro_command: "cargo test\n-- --nocapture".to_owned(),
+                storage_mode: None,
+                concurrency_mode: None,
+            })
+            .environment(sample_env())
+            .build();
+        let error = result.expect_err("multiline repro command should fail");
+        assert!(
+            error.contains("single-line"),
+            "bead_id={BEAD_ID} case=builder_multiline_repro_error error={error}"
+        );
+    }
+
     // ── Validation ──────────────────────────────────────────────────
 
     #[test]
@@ -971,6 +1118,70 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("label")),
             "bead_id={BEAD_ID} case=validate_empty_artifact_label errors={errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_catches_multiline_repro_command() {
+        let mut bundle = sample_bundle();
+        bundle.reproducibility.repro_command = "cargo test\n-- --nocapture".to_owned();
+        let errors = bundle.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("single-line")),
+            "bead_id={BEAD_ID} case=validate_multiline_repro errors={errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_catches_content_hash_mismatch() {
+        let mut bundle = sample_bundle();
+        bundle.content_hash = "0".repeat(64);
+        let errors = bundle.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("content_hash does not match canonical bundle payload")),
+            "bead_id={BEAD_ID} case=validate_content_hash_mismatch errors={errors:?}"
+        );
+    }
+
+    #[test]
+    fn deterministic_content_hash_stable_across_human_labels() {
+        let bundle_a = sample_bundle_with_labels("fb-run001-1", "2026-02-13T06:00:00Z");
+        let bundle_b = sample_bundle_with_labels("fb-run999-9", "2030-01-01T00:00:00Z");
+
+        assert_eq!(
+            bundle_a.content_hash, bundle_b.content_hash,
+            "bead_id={BEAD_ID} case=content_hash_stable_labels"
+        );
+        assert_eq!(
+            bundle_a.deterministic_bundle_hash(),
+            bundle_b.deterministic_bundle_hash(),
+            "bead_id={BEAD_ID} case=content_hash_stable_labels_recompute"
+        );
+    }
+
+    #[test]
+    fn deterministic_content_hash_includes_first_failure_linkage() {
+        let without_first_failure = sample_bundle();
+        let without_hash = without_first_failure.deterministic_bundle_hash();
+
+        let mut with_first_failure = sample_bundle();
+        with_first_failure.failure.first_divergence = Some(FirstDivergence {
+            operation_index: 12,
+            sql: Some("SELECT * FROM t".to_owned()),
+            phase: Some("execute".to_owned()),
+        });
+        let with_hash = with_first_failure.deterministic_bundle_hash();
+
+        assert_ne!(
+            without_hash, with_hash,
+            "bead_id={BEAD_ID} case=content_hash_first_failure_linkage"
+        );
+        assert_eq!(
+            with_first_failure.first_failure_diagnostics_pointer(),
+            Some(FIRST_FAILURE_DIAGNOSTIC_POINTER),
+            "bead_id={BEAD_ID} case=first_failure_pointer"
         );
     }
 

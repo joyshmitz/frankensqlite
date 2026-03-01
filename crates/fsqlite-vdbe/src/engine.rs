@@ -2934,14 +2934,18 @@ impl VdbeEngine {
                 }
 
                 Opcode::Once => {
-                    // Jump to p2 on first execution only (bitset-backed).
+                    // Fall through on first execution (run the body), jump to
+                    // p2 on subsequent executions (skip the body).  This
+                    // matches C SQLite's OP_Once semantics.
                     let word = pc / 64;
                     let bit = 1u64 << (pc % 64);
                     if once_bits[word] & bit != 0 {
-                        pc += 1;
-                    } else {
-                        once_bits[word] |= bit;
+                        // Already fired — skip the body.
                         pc = op.p2 as usize;
+                    } else {
+                        // First time — mark as fired, fall through.
+                        once_bits[word] |= bit;
+                        pc += 1;
                     }
                 }
 
@@ -8560,31 +8564,31 @@ mod tests {
 
     #[test]
     fn test_once_fires_only_once() {
-        // Once at the same PC fires on first pass, falls through on second.
+        // Once falls through on first pass (runs the body), jumps to p2 on
+        // subsequent passes (skips the body).  This matches C SQLite semantics.
         let rows = run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             let r_counter = b.alloc_reg();
             b.emit_op(Opcode::Integer, 0, r_counter, 0, P4::None, 0);
-            // First pass: Once jumps to `init_code`
+
             let loop_start = b.emit_label();
             b.resolve_label(loop_start);
-            let init_code = b.emit_label();
-            b.emit_jump_to_label(Opcode::Once, 0, 0, init_code, P4::None, 0);
-            // Fall-through path (second+ pass): just output
-            let done = b.emit_label();
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
-            // Init code: increment counter and loop back
-            b.resolve_label(init_code);
+            // Once: first pass → fall through (run init code below),
+            //        second+ pass → jump to `skip_init`.
+            let skip_init = b.emit_label();
+            b.emit_jump_to_label(Opcode::Once, 0, 0, skip_init, P4::None, 0);
+            // Init code (runs only on first pass): increment counter.
             b.emit_op(Opcode::AddImm, r_counter, 1, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::Goto, 0, 0, loop_start, P4::None, 0);
-            // Done
-            b.resolve_label(done);
+            // Second pass lands here — skip the init, output result.
+            b.resolve_label(skip_init);
             b.emit_op(Opcode::ResultRow, r_counter, 1, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        // Once fires on first execution (increments to 1), then falls through
+        // First pass: Once falls through → counter becomes 1 → loop back.
+        // Second pass: Once jumps to skip_init → output counter=1.
         assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
     }
 

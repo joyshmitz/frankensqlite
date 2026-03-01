@@ -6,17 +6,17 @@
 //! bd-mblr.4.4 (failure artifact bundling).
 
 use fsqlite_harness::ci_gate_matrix::{
-    ArtifactEntry, ArtifactKind, ArtifactManifest, AutoBisectConfig, BisectDispatchContext,
-    BisectRunTelemetry, BisectTrigger, CiLane, FlakeBudgetPolicy, FlakeEscalationLevel,
-    QuarantinePolicy, QuarantineTicket, RetryFailureClass, RetryPolicy, TestOutcome,
     build_artifact_manifest, build_bisect_request, build_bisect_result_summary,
     evaluate_bisect_dispatch, evaluate_flake_budget, evaluate_global_flake_budget,
-    evaluate_quarantine_ticket, evaluate_retry_decision, should_trigger_bisect,
+    evaluate_quarantine_ticket, evaluate_retry_decision, should_trigger_bisect, ArtifactEntry,
+    ArtifactKind, ArtifactManifest, AutoBisectConfig, BisectDispatchContext, BisectRunTelemetry,
+    BisectTrigger, CiLane, FlakeBudgetPolicy, FlakeEscalationLevel, QuarantinePolicy,
+    QuarantineTicket, RetryFailureClass, RetryPolicy, TestOutcome,
 };
 use fsqlite_harness::e2e_logging_init::{E2eLoggingConfig, LogOutputFormat, RunContext};
 use fsqlite_harness::failure_bundle::{
-    BUNDLE_SCHEMA_VERSION, EnvironmentInfo, FailureBundle, FailureInfo, FailureType,
-    FirstDivergence, ReproducibilityInfo, ScenarioInfo,
+    EnvironmentInfo, FailureBundle, FailureInfo, FailureType, FirstDivergence, ReproducibilityInfo,
+    ScenarioInfo, BUNDLE_SCHEMA_VERSION,
 };
 
 const BEAD_ID: &str = "bd-mblr.3.2";
@@ -62,7 +62,7 @@ fn make_artifact(kind: ArtifactKind, path: &str, desc: &str) -> ArtifactEntry {
 
 /// Build a minimal failure bundle for testing artifact integration.
 fn make_failure_bundle(scenario_id: &str, failure_type: FailureType, seed: u64) -> FailureBundle {
-    FailureBundle {
+    let mut bundle = FailureBundle {
         schema_version: BUNDLE_SCHEMA_VERSION.to_owned(),
         bundle_id: format!("{BEAD_ID}-bundle-{scenario_id}"),
         created_at: "2026-02-21T12:00:00Z".to_owned(),
@@ -111,7 +111,10 @@ fn make_failure_bundle(scenario_id: &str, failure_type: FailureType, seed: u64) 
         ],
         state_snapshots: std::collections::BTreeMap::new(),
         triage_tags: vec!["e2e-matrix".to_owned(), failure_type.label().to_owned()],
-    }
+        content_hash: String::new(),
+    };
+    bundle.content_hash = bundle.deterministic_bundle_hash();
+    bundle
 }
 
 /// Simulate running a matrix lane and collect results.

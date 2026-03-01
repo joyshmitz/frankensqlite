@@ -2165,6 +2165,27 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_concurrent_write_clears_dead_serialized_indicator_without_lease() {
+        let m = mgr();
+        let now = logical_now_epoch_secs();
+
+        // Simulate a stale indicator that has no lease metadata and points to
+        // a non-existent process ID.
+        assert!(m.shm.acquire_serialized_writer(777_777, u32::MAX, now, 0));
+
+        let pgno = PageNumber::new(1).unwrap();
+        let mut txn_conc = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn_conc, pgno, test_data(0x2A))
+            .expect("dead serialized indicator should be cleaned and not block writes");
+
+        assert!(
+            m.shm.check_serialized_writer().is_none(),
+            "stale serialized indicator should be cleared by concurrent preflight"
+        );
+    }
+
     #[test]
     fn test_concurrent_writer_blocks_serialized_acquisition() {
         let m = mgr_with_busy_timeout_ms(5);
