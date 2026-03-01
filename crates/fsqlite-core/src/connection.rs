@@ -12627,6 +12627,9 @@ struct ConcurrentExecContext {
     busy_timeout_ms: u64,
 }
 
+type TableProgramExecResult = Result<(Vec<Row>, usize)>;
+type TableProgramExecOutcome = (TableProgramExecResult, Option<Box<dyn TransactionHandle>>);
+
 #[allow(clippy::too_many_arguments)]
 fn execute_table_program_with_db(
     program: &VdbeProgram,
@@ -12639,10 +12642,7 @@ fn execute_table_program_with_db(
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     reject_mem_fallback: bool,
-) -> (
-    Result<(Vec<Row>, usize)>,
-    Option<Box<dyn TransactionHandle>>,
-) {
+) -> TableProgramExecOutcome {
     let execution_span = tracing::span!(
         target: "fsqlite.execution",
         tracing::Level::DEBUG,
@@ -13587,51 +13587,110 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
                 });
             }
 
-            let out_count =
-                i32::try_from(columns.len()).map_err(|_| FrankenError::TooManyColumns {
-                    count: columns.len(),
-                    max: i32::MAX as usize,
-                })?;
-            let out_first_reg = builder.alloc_regs(out_count);
-            let skip_row_label = if let Some(predicate) = where_clause.as_ref() {
-                let predicate_reg = builder.alloc_temp();
-                emit_expr(&mut builder, predicate, predicate_reg, &mut bind_state)?;
-                let skip_label = builder.emit_label();
-                builder.emit_jump_to_label(
-                    Opcode::IfNot,
-                    predicate_reg,
-                    1,
-                    skip_label,
-                    P4::None,
-                    0,
-                );
-                builder.free_temp(predicate_reg);
-                Some(skip_label)
+            let is_count_star_only = if columns.len() == 1 {
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr:
+                            Expr::FunctionCall {
+                                name,
+                                args,
+                                distinct,
+                                filter,
+                                over,
+                                ..
+                            },
+                        ..
+                    } if name.eq_ignore_ascii_case("count")
+                        && (matches!(args, FunctionArgs::Star)
+                            || matches!(args, FunctionArgs::List(v) if v.is_empty())) =>
+                    {
+                        if *distinct || filter.is_some() || over.is_some() {
+                            return Err(FrankenError::NotImplemented(
+                                "function modifiers (DISTINCT/FILTER/OVER) are not supported"
+                                    .to_owned(),
+                            ));
+                        }
+                        true
+                    }
+                    _ => false,
+                }
             } else {
-                None
+                false
             };
 
-            for (idx, column) in columns.iter().enumerate() {
-                let expr = match column {
-                    ResultColumn::Expr { expr, .. } => expr,
-                    ResultColumn::Star | ResultColumn::TableStar(_) => {
-                        return Err(FrankenError::NotImplemented(
-                            "star expansion requires name resolution and FROM sources".to_owned(),
-                        ));
-                    }
+            if is_count_star_only {
+                let out_first_reg = builder.alloc_regs(1);
+                if let Some(predicate) = where_clause.as_ref() {
+                    let predicate_reg = builder.alloc_temp();
+                    emit_expr(&mut builder, predicate, predicate_reg, &mut bind_state)?;
+                    let false_label = builder.emit_label();
+                    let done_label = builder.emit_label();
+                    builder.emit_jump_to_label(
+                        Opcode::IfNot,
+                        predicate_reg,
+                        1,
+                        false_label,
+                        P4::None,
+                        0,
+                    );
+                    builder.free_temp(predicate_reg);
+                    builder.emit_op(Opcode::Integer, 1, out_first_reg, 0, P4::None, 0);
+                    builder.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    builder.resolve_label(false_label);
+                    builder.emit_op(Opcode::Integer, 0, out_first_reg, 0, P4::None, 0);
+                    builder.resolve_label(done_label);
+                } else {
+                    builder.emit_op(Opcode::Integer, 1, out_first_reg, 0, P4::None, 0);
+                }
+                builder.emit_op(Opcode::ResultRow, out_first_reg, 1, 0, P4::None, 0);
+            } else {
+                let out_count =
+                    i32::try_from(columns.len()).map_err(|_| FrankenError::TooManyColumns {
+                        count: columns.len(),
+                        max: i32::MAX as usize,
+                    })?;
+                let out_first_reg = builder.alloc_regs(out_count);
+                let skip_row_label = if let Some(predicate) = where_clause.as_ref() {
+                    let predicate_reg = builder.alloc_temp();
+                    emit_expr(&mut builder, predicate, predicate_reg, &mut bind_state)?;
+                    let skip_label = builder.emit_label();
+                    builder.emit_jump_to_label(
+                        Opcode::IfNot,
+                        predicate_reg,
+                        1,
+                        skip_label,
+                        P4::None,
+                        0,
+                    );
+                    builder.free_temp(predicate_reg);
+                    Some(skip_label)
+                } else {
+                    None
                 };
 
-                let idx_i32 = i32::try_from(idx).map_err(|_| FrankenError::OutOfRange {
-                    what: "result column index".to_owned(),
-                    value: idx.to_string(),
-                })?;
-                let output_reg = out_first_reg + idx_i32;
-                emit_expr(&mut builder, expr, output_reg, &mut bind_state)?;
-            }
+                for (idx, column) in columns.iter().enumerate() {
+                    let expr = match column {
+                        ResultColumn::Expr { expr, .. } => expr,
+                        ResultColumn::Star | ResultColumn::TableStar(_) => {
+                            return Err(FrankenError::NotImplemented(
+                                "star expansion requires name resolution and FROM sources"
+                                    .to_owned(),
+                            ));
+                        }
+                    };
 
-            builder.emit_op(Opcode::ResultRow, out_first_reg, out_count, 0, P4::None, 0);
-            if let Some(skip_label) = skip_row_label {
-                builder.resolve_label(skip_label);
+                    let idx_i32 = i32::try_from(idx).map_err(|_| FrankenError::OutOfRange {
+                        what: "result column index".to_owned(),
+                        value: idx.to_string(),
+                    })?;
+                    let output_reg = out_first_reg + idx_i32;
+                    emit_expr(&mut builder, expr, output_reg, &mut bind_state)?;
+                }
+
+                builder.emit_op(Opcode::ResultRow, out_first_reg, out_count, 0, P4::None, 0);
+                if let Some(skip_label) = skip_row_label {
+                    builder.resolve_label(skip_label);
+                }
             }
         }
         SelectCore::Values(rows) => {
@@ -13863,13 +13922,20 @@ fn emit_binary_expr(
             let coll_p4 = extract_collation(left)
                 .or_else(|| extract_collation(right))
                 .map_or(P4::None, |c| P4::Collation(c.to_owned()));
+            // SQL three-valued logic: if either operand is NULL, result is NULL.
+            let null_label = builder.emit_label();
             let true_label = builder.emit_label();
             let done_label = builder.emit_label();
+            builder.emit_jump_to_label(Opcode::IsNull, left_reg, 0, null_label, P4::None, 0);
+            builder.emit_jump_to_label(Opcode::IsNull, right_reg, 0, null_label, P4::None, 0);
             builder.emit_jump_to_label(cmp_opcode, right_reg, left_reg, true_label, coll_p4, 0);
             builder.emit_op(Opcode::Integer, 0, target_reg, 0, P4::None, 0);
             builder.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
             builder.resolve_label(true_label);
             builder.emit_op(Opcode::Integer, 1, target_reg, 0, P4::None, 0);
+            builder.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            builder.resolve_label(null_label);
+            builder.emit_op(Opcode::Null, 0, target_reg, 0, P4::None, 0);
             builder.resolve_label(done_label);
             builder.free_temp(right_reg);
             builder.free_temp(left_reg);
@@ -16488,6 +16554,46 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT 1 WHERE NULL;").unwrap();
         assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn test_expression_only_count_star_returns_one() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT count(*);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_expression_only_count_star_where_false_returns_zero() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT count(*) WHERE 0;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(0)]);
+    }
+
+    #[test]
+    fn test_expression_only_count_star_where_true_returns_one() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT count(*) WHERE 1;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_expression_only_count_empty_args_returns_one() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT count();").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_expression_only_count_empty_args_where_false_returns_zero() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT count() WHERE 0;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(0)]);
     }
 
     #[test]

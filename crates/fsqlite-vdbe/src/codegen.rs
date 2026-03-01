@@ -4979,64 +4979,35 @@ fn emit_having_expr(
             );
 
             match op {
-                fsqlite_ast::BinaryOp::Gt => {
+                fsqlite_ast::BinaryOp::Gt
+                | fsqlite_ast::BinaryOp::Lt
+                | fsqlite_ast::BinaryOp::Ge
+                | fsqlite_ast::BinaryOp::Le
+                | fsqlite_ast::BinaryOp::Eq
+                | fsqlite_ast::BinaryOp::Ne => {
+                    let cmp_opcode = match op {
+                        fsqlite_ast::BinaryOp::Gt => Opcode::Gt,
+                        fsqlite_ast::BinaryOp::Lt => Opcode::Lt,
+                        fsqlite_ast::BinaryOp::Ge => Opcode::Ge,
+                        fsqlite_ast::BinaryOp::Le => Opcode::Le,
+                        fsqlite_ast::BinaryOp::Eq => Opcode::Eq,
+                        fsqlite_ast::BinaryOp::Ne => Opcode::Ne,
+                        _ => unreachable!(),
+                    };
+                    // SQL three-valued logic: if either operand is NULL, result is NULL.
+                    let null_label = b.emit_label();
                     let true_label = b.emit_label();
                     let done_label = b.emit_label();
-                    b.emit_jump_to_label(Opcode::Gt, right_reg, left_reg, true_label, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::IsNull, left_reg, 0, null_label, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::IsNull, right_reg, 0, null_label, P4::None, 0);
+                    b.emit_jump_to_label(cmp_opcode, right_reg, left_reg, true_label, P4::None, 0);
                     b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                     b.resolve_label(true_label);
                     b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
-                    b.resolve_label(done_label);
-                }
-                fsqlite_ast::BinaryOp::Lt => {
-                    let true_label = b.emit_label();
-                    let done_label = b.emit_label();
-                    b.emit_jump_to_label(Opcode::Lt, right_reg, left_reg, true_label, P4::None, 0);
-                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(true_label);
-                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
-                    b.resolve_label(done_label);
-                }
-                fsqlite_ast::BinaryOp::Ge => {
-                    let true_label = b.emit_label();
-                    let done_label = b.emit_label();
-                    b.emit_jump_to_label(Opcode::Ge, right_reg, left_reg, true_label, P4::None, 0);
-                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(true_label);
-                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
-                    b.resolve_label(done_label);
-                }
-                fsqlite_ast::BinaryOp::Le => {
-                    let true_label = b.emit_label();
-                    let done_label = b.emit_label();
-                    b.emit_jump_to_label(Opcode::Le, right_reg, left_reg, true_label, P4::None, 0);
-                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(true_label);
-                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
-                    b.resolve_label(done_label);
-                }
-                fsqlite_ast::BinaryOp::Eq => {
-                    let true_label = b.emit_label();
-                    let done_label = b.emit_label();
-                    b.emit_jump_to_label(Opcode::Eq, right_reg, left_reg, true_label, P4::None, 0);
-                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(true_label);
-                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
-                    b.resolve_label(done_label);
-                }
-                fsqlite_ast::BinaryOp::Ne => {
-                    let true_label = b.emit_label();
-                    let done_label = b.emit_label();
-                    b.emit_jump_to_label(Opcode::Ne, right_reg, left_reg, true_label, P4::None, 0);
-                    b.emit_op(Opcode::Integer, 0, dest_reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(true_label);
-                    b.emit_op(Opcode::Integer, 1, dest_reg, 0, P4::None, 0);
+                    b.resolve_label(null_label);
+                    b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
                     b.resolve_label(done_label);
                 }
                 fsqlite_ast::BinaryOp::And => {
@@ -6979,14 +6950,20 @@ fn emit_expr_with_fallback(
                     fsqlite_ast::BinaryOp::Ge => Opcode::Ge,
                     _ => unreachable!(),
                 };
-                // Comparison: p1=rhs, p3=lhs, label→p2.
+                // SQL three-valued logic: if either operand is NULL, result is NULL.
+                let null_label = b.emit_label();
                 let true_label = b.emit_label();
                 let done_label = b.emit_label();
+                b.emit_jump_to_label(Opcode::IsNull, r_left, 0, null_label, P4::None, 0);
+                b.emit_jump_to_label(Opcode::IsNull, r_right, 0, null_label, P4::None, 0);
                 b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, P4::None, 0);
                 b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
                 b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                 b.resolve_label(true_label);
                 b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                b.resolve_label(null_label);
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                 b.resolve_label(done_label);
             } else if matches!(op, fsqlite_ast::BinaryOp::Is | fsqlite_ast::BinaryOp::IsNot) {
                 let (cmp_opcode, flag) = match op {
@@ -7173,9 +7150,14 @@ fn emit_comparison(
         .or_else(|| extract_collation(right))
         .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
 
-    // Pattern: assume false (0), jump to true_label if condition holds.
+    // SQL three-valued logic: if either operand is NULL, the result is NULL.
+    // Check for NULL before the comparison.
+    let null_label = b.emit_label();
     let true_label = b.emit_label();
     let done_label = b.emit_label();
+
+    b.emit_jump_to_label(Opcode::IsNull, r_left, 0, null_label, P4::None, 0);
+    b.emit_jump_to_label(Opcode::IsNull, r_right, 0, null_label, P4::None, 0);
 
     // Comparison: p1=rhs_reg, p2=jump_target (label), p3=lhs_reg
     b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, p4, 0);
@@ -7183,6 +7165,9 @@ fn emit_comparison(
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
     b.resolve_label(true_label);
     b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.resolve_label(null_label);
+    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
     b.resolve_label(done_label);
 
     b.free_temp(r_right);

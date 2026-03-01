@@ -8668,6 +8668,32 @@ mod tests {
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("Y".to_owned()));
     }
 
+    #[test]
+    fn regression_null_comparison_returns_null_not_zero() {
+        let conn = Connection::open(":memory:").unwrap();
+        // SQL three-valued logic: comparison with NULL produces NULL, not 0.
+        let rows = conn.query("SELECT (1 = NULL);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+
+        let rows = conn.query("SELECT (NULL > 5);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+
+        let rows = conn.query("SELECT (NULL = NULL);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+
+        // IS / IS NOT should still return 0/1, not NULL.
+        let rows = conn.query("SELECT (1 IS NULL);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(0));
+
+        let rows = conn.query("SELECT (NULL IS NULL);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
     // -----------------------------------------------------------------------
     // Generated columns (VIRTUAL / STORED) — F-SQL.19
     // -----------------------------------------------------------------------
