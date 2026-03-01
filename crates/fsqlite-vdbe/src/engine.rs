@@ -751,6 +751,13 @@ impl PageWriter for SharedTxnPageIo {
                             "mvcc write conflict detected"
                         );
                         if deadline.is_zero() || started.elapsed() >= deadline {
+                            let holder = ctx.lock_table.holder(page_no);
+                            eprintln!(
+                                "[DEBUG-BUSY] VDBE page_lock_busy timeout for page {} session {} holder={:?}",
+                                page_no.get(),
+                                ctx.session_id,
+                                holder
+                            );
                             return Err(FrankenError::Busy);
                         }
 
@@ -3669,7 +3676,11 @@ impl VdbeEngine {
                         // Use the highest of B-tree max, previously allocated,
                         // and AUTOINCREMENT high-water mark.
                         let base = btree_max.max(sc.last_alloc_rowid).max(autoinc_max);
-                        let new_rowid = base + 1;
+                        let new_rowid = base.checked_add(1).ok_or_else(|| {
+                            FrankenError::VdbeExecutionError {
+                                detail: "rowid overflow: maximum rowid reached".into(),
+                            }
+                        })?;
                         sc.last_alloc_rowid = new_rowid;
                         new_rowid
                     } else {
@@ -4210,16 +4221,29 @@ impl VdbeEngine {
                         let coll_name = usize::try_from(i).ok().and_then(|field_idx| {
                             compare_collation_for_field(compare_collations.as_deref(), field_idx)
                         });
+                        // SQLite NULL sort order: NULLs sort before all other
+                        // values.  When partial_cmp returns None (NULL vs
+                        // non-NULL or NaN), apply NULL-first ordering.
                         let ord = if let Some(coll_name) = coll_name {
                             collate_compare(val_a, val_b, coll_name)
                         } else {
                             val_a.partial_cmp(val_b)
                         };
-                        if let Some(o) = ord {
-                            if o != Ordering::Equal {
-                                result = o;
-                                break;
+                        let o = match ord {
+                            Some(o) => o,
+                            None => {
+                                // NULL < non-NULL; NULL == NULL for sort purposes.
+                                match (val_a.is_null(), val_b.is_null()) {
+                                    (true, true) => Ordering::Equal,
+                                    (true, false) => Ordering::Less,
+                                    (false, true) => Ordering::Greater,
+                                    (false, false) => Ordering::Equal, // NaN edge case fallback
+                                }
                             }
+                        };
+                        if o != Ordering::Equal {
+                            result = o;
+                            break;
                         }
                     }
                     self.last_compare_result = Some(result);
@@ -6029,7 +6053,12 @@ fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if fb == 0.0 {
         return SqliteValue::Null;
     }
-    SqliteValue::Float(fa % fb)
+    let result = fa % fb;
+    if result.is_nan() {
+        SqliteValue::Null
+    } else {
+        SqliteValue::Float(result)
+    }
 }
 
 /// SQL shift left (SQLite semantics: negative shift = shift right).
