@@ -219,23 +219,18 @@ impl SqliteValue {
         }
     }
 
-    /// Convert to text following SQLite's type coercion rules.
+    /// Convert to text following SQLite's CAST(x AS TEXT) coercion rules.
+    ///
+    /// For blobs, this interprets the raw bytes as UTF-8 (with lossy
+    /// replacement for invalid sequences), matching C SQLite behavior.
+    /// For the SQL-literal hex format (`X'...'`), use the `Display` impl.
     pub fn to_text(&self) -> String {
         match self {
             Self::Null => String::new(),
             Self::Integer(i) => i.to_string(),
             Self::Float(f) => format_sqlite_float(*f),
             Self::Text(s) => s.clone(),
-            Self::Blob(b) => {
-                use std::fmt::Write;
-                let mut hex = String::with_capacity(2 + b.len() * 2);
-                hex.push_str("X'");
-                for byte in b {
-                    let _ = write!(hex, "{byte:02X}");
-                }
-                hex.push('\'');
-                hex
-            }
+            Self::Blob(b) => String::from_utf8_lossy(b).into_owned(),
         }
     }
 
@@ -762,7 +757,7 @@ pub fn format_sqlite_float(f: f64) -> String {
             // Strip trailing zeros in the mantissa before 'e'.
             if let Some(e_pos) = s.find('e') {
                 let mantissa = &s[..e_pos];
-                let exponent = &s[e_pos..];
+                let exp_str = &s[e_pos + 1..]; // after 'e'
                 let trimmed = mantissa.trim_end_matches('0');
                 // Ensure decimal point is kept (the `!` flag).
                 let trimmed = if trimmed.ends_with('.') {
@@ -770,7 +765,17 @@ pub fn format_sqlite_float(f: f64) -> String {
                 } else {
                     trimmed.to_owned()
                 };
-                s = format!("{trimmed}{exponent}");
+                // Normalize exponent to match C printf: explicit +/- sign
+                // and at least 2 digits (e.g. "e-05" not "e-5", "e+15" not "e15").
+                let (exp_sign, exp_digits) = if let Some(rest) = exp_str.strip_prefix('-') {
+                    ("-", rest)
+                } else if let Some(rest) = exp_str.strip_prefix('+') {
+                    ("+", rest)
+                } else {
+                    ("+", exp_str)
+                };
+                let exp_num: u32 = exp_digits.parse().unwrap_or(0);
+                s = format!("{trimmed}e{exp_sign}{exp_num:02}");
             }
             s
         } else {
@@ -868,7 +873,9 @@ mod tests {
         assert_eq!(v.as_blob(), Some(&[0xDE, 0xAD][..]));
         assert_eq!(v.to_integer(), 0);
         assert_eq!(v.to_float(), 0.0);
-        assert_eq!(v.to_text(), "X'DEAD'");
+        // to_text() interprets blob bytes as UTF-8 (matching CAST(blob AS TEXT)).
+        // 0xDE 0xAD is valid UTF-8 encoding of U+07AD.
+        assert_eq!(v.to_text(), "\u{07AD}");
     }
 
     #[test]

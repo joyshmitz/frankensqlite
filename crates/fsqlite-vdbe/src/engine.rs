@@ -751,13 +751,6 @@ impl PageWriter for SharedTxnPageIo {
                             "mvcc write conflict detected"
                         );
                         if deadline.is_zero() || started.elapsed() >= deadline {
-                            let holder = ctx.lock_table.holder(page_no);
-                            eprintln!(
-                                "[DEBUG-BUSY] VDBE page_lock_busy timeout for page {} session {} holder={:?}",
-                                page_no.get(),
-                                ctx.session_id,
-                                holder
-                            );
                             return Err(FrankenError::Busy);
                         }
 
@@ -1342,6 +1335,8 @@ struct JitRuntimeState {
     executions_by_plan: HashMap<u64, u64>,
     cache: HashMap<u64, JitCacheEntry>,
     lru: VecDeque<u64>,
+    unsupported_plans: HashSet<u64>,
+    unsupported_lru: VecDeque<u64>,
 }
 
 impl JitRuntimeState {
@@ -1382,6 +1377,8 @@ impl JitRuntimeState {
         if cache_capacity == 0 {
             self.cache.clear();
             self.lru.clear();
+            self.unsupported_plans.clear();
+            self.unsupported_lru.clear();
             return;
         }
         while self.cache.len() > cache_capacity {
@@ -1391,6 +1388,35 @@ impl JitRuntimeState {
                 break;
             }
         }
+        while self.unsupported_plans.len() > cache_capacity {
+            if let Some(oldest) = self.unsupported_lru.pop_front() {
+                self.unsupported_plans.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn mark_unsupported_plan(&mut self, plan_hash: u64, cache_capacity: usize) {
+        if cache_capacity == 0 {
+            return;
+        }
+        if !self.unsupported_plans.insert(plan_hash) {
+            self.unsupported_lru
+                .retain(|candidate| *candidate != plan_hash);
+            self.unsupported_lru.push_back(plan_hash);
+            return;
+        }
+        if self.unsupported_plans.len() > cache_capacity
+            && let Some(oldest) = self.unsupported_lru.pop_front()
+        {
+            self.unsupported_plans.remove(&oldest);
+        }
+        self.unsupported_lru.push_back(plan_hash);
+    }
+
+    fn is_unsupported_plan(&self, plan_hash: u64) -> bool {
+        self.unsupported_plans.contains(&plan_hash)
     }
 }
 
@@ -1515,6 +1541,8 @@ pub fn reset_vdbe_jit_metrics() {
     runtime.executions_by_plan.clear();
     runtime.cache.clear();
     runtime.lru.clear();
+    runtime.unsupported_plans.clear();
+    runtime.unsupported_lru.clear();
 }
 
 // ── Sort metrics (bd-1rw.4) ─────────────────────────────────────────────────
@@ -1572,6 +1600,9 @@ enum JitDecision {
     CacheHit {
         plan_hash: u64,
         code_size_bytes: u64,
+    },
+    UnsupportedCached {
+        plan_hash: u64,
     },
     Compiled {
         plan_hash: u64,
@@ -1688,6 +1719,9 @@ fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
     }
 
     FSQLITE_JIT_TRIGGERS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+    if runtime.is_unsupported_plan(plan_hash) {
+        return JitDecision::UnsupportedCached { plan_hash };
+    }
     if let Some(code_size_bytes) = runtime
         .cache
         .get(&plan_hash)
@@ -1721,6 +1755,7 @@ fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
             FSQLITE_JIT_COMPILE_FAILURES_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             let compile_time_us =
                 u64::try_from(compile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            runtime.mark_unsupported_plan(plan_hash, cache_capacity.max(1));
             JitDecision::CompileFailed {
                 plan_hash,
                 compile_time_us,
@@ -2322,6 +2357,14 @@ impl VdbeEngine {
                     plan_hash = format_args!("{plan_hash:016x}"),
                     code_size_bytes,
                     "jit trigger cache hit (interpreter fallback path)"
+                );
+            }
+            JitDecision::UnsupportedCached { plan_hash } => {
+                tracing::debug!(
+                    target: "fsqlite_vdbe::jit",
+                    program_id,
+                    plan_hash = format_args!("{plan_hash:016x}"),
+                    "jit unsupported-plan cache hit (skipping recompilation)"
                 );
             }
             JitDecision::Compiled {

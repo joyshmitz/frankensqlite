@@ -26,13 +26,20 @@ use crate::{FunctionRegistry, ScalarFunction};
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Coerce a `SqliteValue` to `f64`.  Returns `None` for `Null`.
+/// Coerce a `SqliteValue` to `f64`.  Returns `None` for `Null` and for
+/// non-numeric text (SQLite math functions return NULL for these cases,
+/// per `sqlite3_value_numeric_type()` semantics in C SQLite).
 fn to_f64(v: &SqliteValue) -> Option<f64> {
     match v {
         SqliteValue::Null => None,
         SqliteValue::Integer(i) => Some(*i as f64),
         SqliteValue::Float(f) => Some(*f),
-        SqliteValue::Text(s) => s.parse::<f64>().ok(),
+        // SQLite trims leading/trailing whitespace via sqlite3AtoF before
+        // numeric conversion.  Non-numeric text produces NULL (not 0.0).
+        SqliteValue::Text(s) => {
+            let trimmed = s.trim();
+            trimmed.parse::<f64>().ok()
+        }
         SqliteValue::Blob(_) => Some(0.0),
     }
 }

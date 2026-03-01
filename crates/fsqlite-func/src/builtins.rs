@@ -27,6 +27,7 @@ use std::fmt::Write as _;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::SqliteValue;
+use fsqlite_types::value::format_sqlite_float;
 
 use crate::agg_builtins::register_aggregate_builtins;
 use crate::datetime::register_datetime_builtins;
@@ -874,20 +875,7 @@ impl ScalarFunction for QuoteFunc {
         let result = match &args[0] {
             SqliteValue::Null => "NULL".to_owned(),
             SqliteValue::Integer(i) => i.to_string(),
-            SqliteValue::Float(f) => {
-                let s = format!("{f}");
-                // C SQLite always includes a decimal point for floats.
-                if s.contains('.')
-                    || s.contains('e')
-                    || s.contains('E')
-                    || s.contains("inf")
-                    || s.contains("nan")
-                {
-                    s
-                } else {
-                    format!("{s}.0")
-                }
-            }
+            SqliteValue::Float(f) => format_sqlite_float(*f),
             SqliteValue::Text(s) => {
                 let escaped = s.replace('\'', "''");
                 format!("'{escaped}'")
