@@ -391,28 +391,37 @@ pub unsafe extern "C" fn sqlite3_free(ptr: *mut c_void) {
 
 // Thin wrappers around libc malloc/free so we don't depend on the libc crate
 // directly (it's in the workspace via nix but we keep the surface minimal).
+const ALLOC_HEADER_SIZE: usize = std::mem::size_of::<usize>();
+const ALLOC_HEADER_ALIGN: usize = std::mem::align_of::<usize>();
+
 unsafe fn libc_malloc(size: usize) -> *mut u8 {
     // std::alloc requires the exact Layout for deallocation. Since sqlite3_free
     // doesn't receive the size, we must prefix the allocation with its size.
-    let layout = match std::alloc::Layout::from_size_align(size + 8, 8) {
-        Ok(l) => l,
-        Err(_) => return std::ptr::null_mut(),
+    let Ok(layout) =
+        std::alloc::Layout::from_size_align(size + ALLOC_HEADER_SIZE, ALLOC_HEADER_ALIGN)
+    else {
+        return std::ptr::null_mut();
     };
     let ptr = std::alloc::alloc(layout);
     if ptr.is_null() {
         return ptr;
     }
-    ptr.cast::<usize>().write(size);
-    ptr.add(8)
+    let size_bytes = size.to_ne_bytes();
+    std::ptr::copy_nonoverlapping(size_bytes.as_ptr(), ptr, ALLOC_HEADER_SIZE);
+    ptr.add(ALLOC_HEADER_SIZE)
 }
 
 unsafe fn libc_free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
-    let real_ptr = ptr.cast::<u8>().sub(8);
-    let size = real_ptr.cast::<usize>().read();
-    if let Ok(layout) = std::alloc::Layout::from_size_align(size + 8, 8) {
+    let real_ptr = ptr.cast::<u8>().sub(ALLOC_HEADER_SIZE);
+    let mut size_bytes = [0_u8; ALLOC_HEADER_SIZE];
+    std::ptr::copy_nonoverlapping(real_ptr, size_bytes.as_mut_ptr(), ALLOC_HEADER_SIZE);
+    let size = usize::from_ne_bytes(size_bytes);
+    if let Ok(layout) =
+        std::alloc::Layout::from_size_align(size + ALLOC_HEADER_SIZE, ALLOC_HEADER_ALIGN)
+    {
         std::alloc::dealloc(real_ptr, layout);
     }
 }
