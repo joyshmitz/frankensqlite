@@ -744,15 +744,55 @@ pub fn format_sqlite_float(f: f64) -> String {
             "-Inf".to_owned()
         };
     }
-    // Use Rust's default float formatting (shortest round-trip representation).
-    let s = format!("{f}");
-    // Ensure a decimal point is present so REAL values are distinguishable from
-    // INTEGER values, matching SQLite's `%!.15g` flag behavior.
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        s
+    // Emulate C's `printf("%!.15g", f)`:
+    // - 15 significant digits
+    // - Use scientific notation if exponent < -4 or >= 15
+    // - Strip trailing zeros (but keep at least one digit after decimal point)
+    let abs = f.abs();
+    let s = if abs == 0.0 {
+        // Zero: just "0.0"
+        "0.0".to_owned()
     } else {
-        format!("{s}.0")
-    }
+        // Determine which format is shorter: fixed vs scientific.
+        // C's %g uses scientific if exponent < -4 or >= precision.
+        let exp = abs.log10().floor() as i32;
+        if exp >= 15 || exp < -4 {
+            // Scientific notation with 14 decimal places (15 sig digits total).
+            let mut s = format!("{f:.14e}");
+            // Strip trailing zeros in the mantissa before 'e'.
+            if let Some(e_pos) = s.find('e') {
+                let mantissa = &s[..e_pos];
+                let exponent = &s[e_pos..];
+                let trimmed = mantissa.trim_end_matches('0');
+                // Ensure decimal point is kept (the `!` flag).
+                let trimmed = if trimmed.ends_with('.') {
+                    format!("{trimmed}0")
+                } else {
+                    trimmed.to_owned()
+                };
+                s = format!("{trimmed}{exponent}");
+            }
+            s
+        } else {
+            // Fixed notation: number of decimal places = 15 - (exp + 1).
+            #[allow(clippy::cast_sign_loss)]
+            let decimal_places = (14 - exp).max(0) as usize;
+            let mut s = format!("{f:.decimal_places$}");
+            // Strip trailing zeros but keep at least one digit after decimal.
+            if s.contains('.') {
+                let trimmed = s.trim_end_matches('0');
+                s = if trimmed.ends_with('.') {
+                    format!("{trimmed}0")
+                } else {
+                    trimmed.to_owned()
+                };
+            } else {
+                s.push_str(".0");
+            }
+            s
+        }
+    };
+    s
 }
 
 #[cfg(test)]
