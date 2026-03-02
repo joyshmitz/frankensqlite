@@ -618,6 +618,9 @@ impl Parser {
     fn parse_like(&mut self, lhs: Expr, op: LikeOp, not: bool) -> Result<Expr, ParseError> {
         let pattern = self.parse_expr_bp(bp::EQUALITY.1)?;
         let escape = if self.eat_kind(&TokenKind::KwEscape) {
+            if op != LikeOp::Like {
+                return Err(self.err_here(format!("ESCAPE clause is not supported for {:?}", op)));
+            }
             Some(Box::new(self.parse_expr_bp(bp::EQUALITY.1)?))
         } else {
             None
@@ -744,6 +747,9 @@ impl Parser {
         self.expect_kind(&TokenKind::LeftParen)?;
 
         let (args, distinct) = if matches!(self.peek_kind(), TokenKind::Star) {
+            if !name.eq_ignore_ascii_case("count") {
+                return Err(self.err_here("'*' can only be used with count() function"));
+            }
             self.advance_token();
             (FunctionArgs::Star, false)
         } else {
@@ -761,6 +767,14 @@ impl Parser {
                 FunctionArgs::List(list)
             };
             (args, distinct)
+        };
+
+        // In-aggregate ORDER BY (SQLite 3.44+): group_concat(x, ',' ORDER BY y DESC)
+        let order_by = if self.eat_kind(&TokenKind::KwOrder) {
+            self.expect_kind(&TokenKind::KwBy)?;
+            self.parse_comma_sep(Self::parse_ordering_term)?
+        } else {
+            vec![]
         };
 
         let mut end = self.expect_kind(&TokenKind::RightParen)?;
@@ -800,6 +814,7 @@ impl Parser {
             name,
             args,
             distinct,
+            order_by,
             filter,
             over,
             span,
