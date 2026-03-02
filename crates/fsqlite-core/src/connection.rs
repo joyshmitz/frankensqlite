@@ -14,7 +14,7 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -28,6 +28,7 @@ use fsqlite_ast::{
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_func::vtab::{ErasedVtabInstance, VtabModuleFactory};
 use fsqlite_func::{
     ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
     get_total_changes, reset_total_changes, set_last_changes, set_last_insert_rowid,
@@ -42,7 +43,8 @@ use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{
-    BTreePageHeader, DatabaseHeader, PageNumber, PageSize, StrictColumnType, TextEncoding,
+    BTreePageHeader, DatabaseHeader, EProcessConfig, EProcessOracle, PageNumber, PageSize,
+    StrictColumnType, TextEncoding,
 };
 use fsqlite_vdbe::codegen::{
     CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
@@ -72,7 +74,7 @@ use fsqlite_mvcc::{
     SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger,
     SsiReadSetSummary, VersionStore, concurrent_abort, concurrent_rollback_to_savepoint,
     concurrent_savepoint, finalize_prepared_concurrent_commit_with_ssi,
-    prepare_concurrent_commit_with_ssi,
+    prepare_concurrent_commit_with_ssi, ssi_metrics_snapshot,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 use fsqlite_observability::{
@@ -84,6 +86,21 @@ use fsqlite_observability::{
 use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
 
 use crate::wal_adapter::WalBackendAdapter;
+
+const EPROCESS_DEFAULT_CONFIG: EProcessConfig = EProcessConfig {
+    p0: 0.1,
+    lambda: 3.0,
+    alpha: 0.05,
+    max_evalue: 1e12,
+};
+const EPROCESS_PRIORITY_THRESHOLD: u8 = 1;
+
+/// Maximum trigger recursion depth (F-PGM.11).
+///
+/// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
+/// level consumes significantly more stack space than C. A practical limit of
+/// 100 prevents stack overflow while still allowing deep trigger chains.
+const MAX_TRIGGER_DEPTH: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Storage backend abstraction
@@ -611,12 +628,12 @@ struct ViewDef {
 
 /// A stored trigger definition captured from `CREATE TRIGGER`.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // 5G.2/5G.3 will consume full trigger metadata during DML execution.
 struct TriggerDef {
     name: String,
     table_name: String,
     timing: fsqlite_ast::TriggerTiming,
     event: fsqlite_ast::TriggerEvent,
+    #[allow(dead_code)] // SQLite-only: always true; retained for display/roundtrip fidelity.
     for_each_row: bool,
     when_clause: Option<Expr>,
     body: Vec<Statement>,
@@ -1064,7 +1081,7 @@ pub struct Connection {
     /// Set by execute_begin() when mode is Concurrent.
     concurrent_session_id: RefCell<Option<u64>>,
     /// Page-level lock table for concurrent writers.
-    /// Wrapped in Rc for sharing with VdbeEngine during execution (bd-kivg).
+    /// Wrapped in Arc for sharing with VdbeEngine during execution (bd-kivg).
     concurrent_lock_table: Arc<InProcessPageLockTable>,
     /// Commit index mapping pages to their latest committed sequence.
     concurrent_commit_index: Arc<CommitIndex>,
@@ -1086,6 +1103,8 @@ pub struct Connection {
     /// Root capability context for this connection. All per-operation contexts
     /// are derived from this via `op_cx()`, inheriting the connection's trace ID.
     root_cx: Cx,
+    /// Connection-scoped e-process oracle for adaptive cancellation decisions.
+    eprocess_oracle: Arc<EProcessOracle>,
     // ── MVCC garbage collection (bd-3bql / 5E.5) ─────────────────────────────
     /// Version store for MVCC page versioning.  Stores committed page versions
     /// in an arena with version chains for snapshot resolution.
@@ -1107,6 +1126,14 @@ pub struct Connection {
     /// certifying runs to fail fast on unsupported fallback paths without
     /// changing default developer ergonomics.
     reject_mem_fallback_strict: RefCell<bool>,
+    // ── Virtual table module registry (bd-196x4) ────────────────────────────
+    /// Registered virtual-table module factories, keyed by module name
+    /// (uppercased).  Used by `CREATE VIRTUAL TABLE ... USING module(args)`.
+    vtab_modules: RefCell<HashMap<String, Box<dyn VtabModuleFactory>>>,
+    /// Instantiated virtual-table instances, keyed by table name (uppercased).
+    /// Each entry is created by `execute_create_virtual_table` and registered
+    /// with the VDBE engine before program execution.
+    vtab_instances: RefCell<HashMap<String, Box<dyn ErasedVtabInstance>>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -1141,6 +1168,12 @@ impl Connection {
                 .load(AtomicOrdering::Acquire)
                 .saturating_sub(1),
         );
+        let root_cx = Cx::new().with_trace_context(next_trace_id(), 0, 0);
+        let eprocess_oracle = Arc::new(EProcessOracle::new(
+            EPROCESS_DEFAULT_CONFIG,
+            EPROCESS_PRIORITY_THRESHOLD,
+        ));
+        root_cx.set_eprocess_oracle(Arc::clone(&eprocess_oracle));
 
         let conn = Self {
             path,
@@ -1184,7 +1217,8 @@ impl Connection {
             commit_write_mutex: Arc::clone(&shared_mvcc_state.commit_write_mutex),
             closed: RefCell::new(false),
             // Cx capability context (bd-2g5.6)
-            root_cx: Cx::new().with_trace_context(next_trace_id(), 0, 0),
+            root_cx,
+            eprocess_oracle,
             // MVCC garbage collection (bd-3bql / 5E.5)
             version_store: Rc::new(RefCell::new(VersionStore::new(PageSize::DEFAULT))),
             gc_scheduler: RefCell::new(GcScheduler::new()),
@@ -1198,6 +1232,9 @@ impl Connection {
             reject_mem_fallback: RefCell::new(true),
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
+            // Virtual table module registry (bd-196x4)
+            vtab_modules: RefCell::new(HashMap::new()),
+            vtab_instances: RefCell::new(HashMap::new()),
         };
         // Reset cumulative total_changes counter for this new connection.
         reset_total_changes();
@@ -1350,7 +1387,37 @@ impl Connection {
     /// Each call allocates a new `decision_id` so that per-operation tracing
     /// can distinguish individual SQL operations within a connection's trace.
     fn op_cx(&self) -> Cx {
+        self.refresh_eprocess_oracle();
         self.root_cx.clone().with_decision_id(next_decision_id())
+    }
+
+    /// Refresh the e-process telemetry inputs from live MVCC/cache signals and
+    /// advance the oracle by one observation.
+    fn refresh_eprocess_oracle(&self) {
+        let ssi_snapshot = ssi_metrics_snapshot();
+        let fcw_abort_rate = ssi_snapshot.conflict_rate();
+        let (cache_miss_ratio, memory_pressure) = if let Ok(cache_snapshot) =
+            self.pager.cache_metrics_snapshot()
+        {
+            let miss_ratio = (100.0 - cache_snapshot.hit_rate_percent()).clamp(0.0, 100.0) / 100.0;
+            let pressure = if cache_snapshot.pool_capacity == 0 {
+                0.0
+            } else {
+                match cache_snapshot.cached_pages.saturating_mul(4) / cache_snapshot.pool_capacity {
+                    0 => 0.0,
+                    1 => 0.25,
+                    2 => 0.5,
+                    3 => 0.75,
+                    _ => 1.0,
+                }
+            };
+            (miss_ratio, pressure)
+        } else {
+            (0.0, 0.0)
+        };
+        let anomaly_score =
+            fcw_abort_rate.mul_add(0.5, cache_miss_ratio.mul_add(0.3, memory_pressure * 0.2));
+        self.eprocess_oracle.observe_sample(anomaly_score >= 0.5);
     }
 
     #[inline]
@@ -1542,6 +1609,16 @@ impl Connection {
         let mut registry = FunctionRegistry::clone_from_arc(&self.func_registry.borrow());
         registry.register_window(function);
         *self.func_registry.borrow_mut() = Arc::new(registry);
+    }
+
+    /// Register a virtual-table module factory under the given name.
+    ///
+    /// Once registered, `CREATE VIRTUAL TABLE t USING name(args)` will
+    /// invoke the factory's `create` method to instantiate the vtab.
+    pub fn register_module(&self, name: &str, factory: Box<dyn VtabModuleFactory>) {
+        self.vtab_modules
+            .borrow_mut()
+            .insert(name.to_ascii_uppercase(), factory);
     }
 
     /// Return lowercase names of all custom aggregate UDFs in the registry.
@@ -4996,13 +5073,7 @@ impl Connection {
         &self,
         create: &fsqlite_ast::CreateVirtualTableStatement,
     ) -> Result<()> {
-        if !create.module.eq_ignore_ascii_case("fts5") {
-            return Err(FrankenError::NotImplemented(format!(
-                "CREATE VIRTUAL TABLE USING {} is not supported in this connection path",
-                create.module
-            )));
-        }
-
+        let module_key = create.module.to_ascii_uppercase();
         let table_name = create.name.name.clone();
 
         let schema = self.schema.borrow();
@@ -5018,6 +5089,51 @@ impl Connection {
             )));
         }
         drop(schema);
+
+        // Try the registered module registry first, then fall back to FTS5.
+        let modules = self.vtab_modules.borrow();
+        if let Some(factory) = modules.get(&module_key) {
+            let arg_strs: Vec<&str> = create.args.iter().map(String::as_str).collect();
+            let cx = self.op_cx();
+            let instance = factory.create(&cx, &arg_strs)?;
+            drop(modules);
+
+            let col_infos = parse_virtual_table_column_infos(&create.args);
+            let root_page = self.allocate_root_page()?;
+            self.db
+                .borrow_mut()
+                .create_table_at(root_page, col_infos.len());
+            self.schema.borrow_mut().push(TableSchema {
+                name: table_name.clone(),
+                root_page,
+                columns: col_infos,
+                indexes: Vec::new(),
+                strict: false,
+                foreign_keys: Vec::new(),
+            });
+            self.vtab_instances
+                .borrow_mut()
+                .insert(table_name.to_ascii_uppercase(), instance);
+
+            self.insert_sqlite_master_row(
+                "table",
+                &table_name,
+                &table_name,
+                root_page,
+                &create.to_string(),
+            )?;
+            self.increment_schema_cookie();
+            return Ok(());
+        }
+        drop(modules);
+
+        // Legacy FTS5 fallback path.
+        if !module_key.eq_ignore_ascii_case("FTS5") {
+            return Err(FrankenError::NotImplemented(format!(
+                "CREATE VIRTUAL TABLE USING {} is not supported — no module registered",
+                create.module
+            )));
+        }
 
         let col_infos = parse_virtual_table_column_infos(&create.args);
         let root_page = self.allocate_root_page()?;
@@ -5985,6 +6101,16 @@ impl Connection {
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<bool> {
+        // F-PGM.11: Enforce trigger recursion depth limit.
+        // SQLite uses SQLITE_MAX_TRIGGER_DEPTH=1000, but each Rust recursion
+        // level is heavier on the call stack than C. Use 100 as a practical
+        // limit that prevents stack overflow while still allowing deep nesting.
+        if self.trigger_frame_stack.borrow().len() >= MAX_TRIGGER_DEPTH {
+            return Err(FrankenError::Internal(
+                "too many levels of trigger recursion".to_owned(),
+            ));
+        }
+
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
@@ -6032,6 +6158,13 @@ impl Connection {
         old_values: Option<&[SqliteValue]>,
         new_values: Option<&[SqliteValue]>,
     ) -> Result<()> {
+        // F-PGM.11: Enforce trigger recursion depth limit (see fire_before_triggers).
+        if self.trigger_frame_stack.borrow().len() >= MAX_TRIGGER_DEPTH {
+            return Err(FrankenError::Internal(
+                "too many levels of trigger recursion".to_owned(),
+            ));
+        }
+
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
@@ -6490,7 +6623,32 @@ impl Connection {
         } else {
             None
         };
-        let mut txn = self.pager.begin(&cx, pager_mode)?;
+        // Respect busy_timeout: retry pager.begin() with exponential backoff
+        // when an IMMEDIATE/EXCLUSIVE transaction gets SQLITE_BUSY because
+        // another writer is active.  Without this, BEGIN IMMEDIATE returns
+        // Busy immediately even though the caller configured a timeout.
+        // (issue #109: dead busy_timeout parameter)
+        let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+        let mut txn = {
+            let deadline = Duration::from_millis(busy_timeout_ms);
+            let started = Instant::now();
+            let mut backoff = Duration::from_micros(500);
+            loop {
+                match self.pager.begin(&cx, pager_mode) {
+                    Ok(t) => break t,
+                    Err(FrankenError::Busy)
+                        if busy_timeout_ms > 0 && started.elapsed() < deadline =>
+                    {
+                        std::thread::sleep(backoff);
+                        backoff = backoff.saturating_mul(2).min(Duration::from_millis(50));
+                        // Refresh memdb before retrying -- another writer may
+                        // have committed while we waited.
+                        self.refresh_memdb_if_stale(&cx)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
         // MVCC concurrent-writer session (bd-14zc / 5E.1):
         // When mode is Concurrent, register with ConcurrentRegistry for
         // page-level MVCC locking and first-committer-wins validation.
@@ -16500,6 +16658,19 @@ mod tests {
     }
 
     #[test]
+    fn test_connection_root_cx_has_eprocess_oracle_attached() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(conn.root_cx().checkpoint().is_ok());
+        let before = conn.eprocess_oracle.snapshot().observations;
+        let _ = conn.query("SELECT 1").unwrap();
+        let after = conn.eprocess_oracle.snapshot().observations;
+        assert!(
+            after > before,
+            "per-operation Cx derivation should feed e-process observations"
+        );
+    }
+
+    #[test]
     fn test_two_connections_get_different_trace_ids() {
         let conn1 = Connection::open(":memory:").unwrap();
         let conn2 = Connection::open(":memory:").unwrap();
@@ -17397,9 +17568,9 @@ mod tests {
         let err = conn
             .execute("INSERT INTO strict_types VALUES ('bad', 1.0, 'oops', X'CC', 1);")
             .expect_err("TEXT value in INTEGER STRICT column must fail");
-        assert!(
-            matches!(err, FrankenError::Internal(msg) if msg.contains("STRICT type check failed"))
-        );
+        let is_strict_err = matches!(err, FrankenError::DatatypeViolation { .. })
+            || matches!(&err, FrankenError::Internal(m) if m.contains("STRICT type check"));
+        assert!(is_strict_err, "expected STRICT type violation, got: {err}");
     }
 
     #[test]
@@ -18310,6 +18481,28 @@ mod tests {
             FrankenError::FunctionError(ref msg) if msg == "inner trigger abort"
         ));
         assert!(conn.trigger_frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_recursive_trigger_depth_limit() {
+        // F-PGM.11: Recursive triggers must be bounded at MAX_TRIGGER_DEPTH.
+        // Create a self-referencing trigger that would infinitely recurse.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE counter (n INTEGER);").unwrap();
+        conn.execute("INSERT INTO counter VALUES (0);").unwrap();
+        // AFTER UPDATE trigger re-fires UPDATE on the same table → infinite recursion.
+        conn.execute(
+            "CREATE TRIGGER trg_loop AFTER UPDATE ON counter BEGIN UPDATE counter SET n = NEW.n + 1; END;",
+        )
+        .unwrap();
+        let err = conn
+            .execute("UPDATE counter SET n = 1;")
+            .expect_err("should hit trigger depth limit");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("too many levels of trigger recursion"),
+            "unexpected error: {msg}",
+        );
     }
 
     #[test]
@@ -25020,6 +25213,87 @@ mod transaction_lifecycle_tests {
             &SqliteValue::Text("old_alice".into())
         );
         assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Text("bob".into()));
+    }
+
+    #[test]
+    fn test_update_or_ignore_does_not_error() {
+        // Verify UPDATE OR IGNORE does not raise an error when a UNIQUE
+        // constraint would be violated. Full IGNORE semantics (keeping
+        // the original row unchanged) requires pre-update constraint
+        // checking which is not yet implemented — this test just verifies
+        // the statement succeeds without error.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'carol')").unwrap();
+
+        // Should not return an error (unlike plain UPDATE which errors).
+        let result = conn.execute("UPDATE OR IGNORE t SET name = 'alice' WHERE id = 2");
+        assert!(
+            result.is_ok(),
+            "UPDATE OR IGNORE should not error on UNIQUE conflict"
+        );
+
+        // alice's row (id=1) should be untouched.
+        let rows = conn.query("SELECT name FROM t WHERE id = 1").unwrap();
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Text("alice".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_update_or_replace_replaces_conflicting_row() {
+        // Verify UPDATE OR REPLACE deletes the conflicting row and applies
+        // the update (like INSERT OR REPLACE but for UPDATE).
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'carol')").unwrap();
+
+        // Update id=2's name to 'alice' with OR REPLACE.
+        // This should delete the conflicting row (id=1, 'alice') and update id=2.
+        conn.execute("UPDATE OR REPLACE t SET name = 'alice' WHERE id = 2")
+            .unwrap();
+
+        // id=1 should be gone (it was replaced/deleted due to UNIQUE conflict).
+        let rows = conn.query("SELECT id, name FROM t ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(2));
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &SqliteValue::Text("alice".to_owned())
+        );
+        assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_update_default_aborts_on_unique_conflict() {
+        // Verify a plain UPDATE (no OR clause) raises a constraint error
+        // when the update would violate a UNIQUE constraint.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+
+        // Plain UPDATE that conflicts should error.
+        let result = conn.execute("UPDATE t SET name = 'alice' WHERE id = 2");
+        assert!(
+            result.is_err(),
+            "Plain UPDATE should error on UNIQUE constraint conflict"
+        );
+
+        // Data should be unchanged after the error.
+        let rows = conn.query("SELECT name FROM t WHERE id = 2").unwrap();
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Text("bob".to_owned())
+        );
     }
 
     #[test]
@@ -31994,6 +32268,51 @@ mod pager_routing_tests {
         // NULL group first (NULL sorts before integers in ORDER BY)
         // then grp=1
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_group_by_with_limit() {
+        // GROUP BY + LIMIT should only return the specified number of groups.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE gl (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO gl VALUES (1, 'a', 10)").unwrap();
+        conn.execute("INSERT INTO gl VALUES (2, 'a', 20)").unwrap();
+        conn.execute("INSERT INTO gl VALUES (3, 'b', 30)").unwrap();
+        conn.execute("INSERT INTO gl VALUES (4, 'b', 40)").unwrap();
+        conn.execute("INSERT INTO gl VALUES (5, 'c', 50)").unwrap();
+
+        let rows = conn
+            .query("SELECT grp, SUM(val) FROM gl GROUP BY grp LIMIT 2")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "GROUP BY + LIMIT 2 should return exactly 2 groups"
+        );
+    }
+
+    #[test]
+    fn test_group_by_with_limit_offset() {
+        // GROUP BY + LIMIT + OFFSET should skip groups.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE glo (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO glo VALUES (1, 'a', 10)").unwrap();
+        conn.execute("INSERT INTO glo VALUES (2, 'b', 20)").unwrap();
+        conn.execute("INSERT INTO glo VALUES (3, 'c', 30)").unwrap();
+        conn.execute("INSERT INTO glo VALUES (4, 'd', 40)").unwrap();
+
+        let rows = conn
+            .query("SELECT grp, SUM(val) FROM glo GROUP BY grp LIMIT 2 OFFSET 1")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "GROUP BY + LIMIT 2 OFFSET 1 should return 2 groups"
+        );
+        // With alphabetical group ordering, offset 1 should skip 'a' group.
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("b".to_owned()));
     }
 
     #[test]
