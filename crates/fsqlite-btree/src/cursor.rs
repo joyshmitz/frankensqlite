@@ -824,10 +824,31 @@ impl<P: PageReader> BtCursor<P> {
                         let mut entry = entry;
                         if idx >= entry.header.cell_count {
                             // Target is strictly greater than the last key on this leaf.
-                            // Preserve stack context for insertion paths while flagging EOF.
-                            entry.cell_idx = entry.header.cell_count.saturating_sub(1);
-                            self.stack.push(entry);
-                            self.at_eof = true;
+                            // To match API expectations (position at successor), we must look
+                            // up the tree for the first ancestor where we took a left branch.
+                            let mut has_successor = false;
+                            for parent in self.stack.iter().rev() {
+                                if parent.cell_idx < parent.header.cell_count {
+                                    has_successor = true;
+                                    break;
+                                }
+                            }
+
+                            if has_successor {
+                                // Pop up to the successor.
+                                while let Some(parent) = self.stack.last() {
+                                    if parent.cell_idx < parent.header.cell_count {
+                                        break;
+                                    }
+                                    self.stack.pop();
+                                }
+                                self.at_eof = false;
+                            } else {
+                                // Global EOF. Keep the leaf on the stack for INSERT.
+                                entry.cell_idx = entry.header.cell_count.saturating_sub(1);
+                                self.stack.push(entry);
+                                self.at_eof = true;
+                            }
                         } else {
                             entry.cell_idx = idx;
                             self.stack.push(entry);
@@ -1877,17 +1898,34 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             let mut insert_idx;
 
             if !is_leaf {
-                // Matched exactly on an interior page. Descend to the right child's leftmost leaf.
-                let right_child = {
+                if seek.is_found() {
+                    // Matched exactly on an interior page. Descend to the right child's leftmost leaf.
+                    let right_child = {
+                        let top = cursor
+                            .stack
+                            .last()
+                            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                        cursor.child_page_at(top, cell_idx + 1)?
+                    };
+                    cursor.move_to_leftmost_leaf(cx, right_child, false)?;
+
+                    insert_idx = 0; // The new key goes at the very beginning of the right subtree.
+                } else {
+                    // Successor on an interior page. The key belongs in the LEFT child's rightmost leaf.
+                    let left_child = {
+                        let top = cursor
+                            .stack
+                            .last()
+                            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                        cursor.child_page_at(top, cell_idx)?
+                    };
+                    cursor.move_to_rightmost_leaf(cx, left_child, false)?;
                     let top = cursor
                         .stack
                         .last()
                         .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                    cursor.child_page_at(top, cell_idx + 1)?
-                };
-                cursor.move_to_leftmost_leaf(cx, right_child, false)?;
-
-                insert_idx = 0; // The new key goes at the very beginning of the right subtree.
+                    insert_idx = top.header.cell_count; // Append at the end of the left child.
+                }
             } else {
                 let top = cursor
                     .stack
