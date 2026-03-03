@@ -668,6 +668,33 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Seek to a rowid in a table B-tree. Returns the seek result.
     fn table_seek(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
+        let res = self.table_seek_for_insert(cx, target_rowid)?;
+        if !res.is_found() && self.at_eof {
+            // We fell off the right edge of the leaf.
+            // Determine if there is a successor up the tree.
+            let mut has_successor = false;
+            for parent in self.stack.iter().rev() {
+                if parent.cell_idx < parent.header.cell_count {
+                    has_successor = true;
+                    break;
+                }
+            }
+
+            if has_successor {
+                // There is a successor. Reset eof and use advance_next to reach it.
+                self.at_eof = false;
+                let advanced = self.advance_next(cx)?;
+                if !advanced {
+                    self.at_eof = true;
+                }
+            }
+        }
+        Ok(res)
+    }
+
+    /// Internal seek used by INSERT that anchors the cursor on the leaf where
+    /// the target belongs, even if it falls off the right edge.
+    fn table_seek_for_insert(&mut self, cx: &Cx, target_rowid: i64) -> Result<SeekResult> {
         self.stack.clear();
         let mut current_page = self.root_page;
 
@@ -2027,7 +2054,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            let seek = cursor.table_seek(cx, rowid)?;
+            let seek = cursor.table_seek_for_insert(cx, rowid)?;
             if seek.is_found() {
                 return Err(FrankenError::PrimaryKeyViolation);
             }

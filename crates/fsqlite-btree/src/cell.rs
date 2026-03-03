@@ -233,6 +233,15 @@ pub fn read_cell_pointers(
         });
     }
 
+    if ptr_array_end > header.cell_content_offset as usize {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "cell pointer array overlaps with cell content area: ptr_end={} > content={}",
+                ptr_array_end, header.cell_content_offset
+            ),
+        });
+    }
+
     let mut pointers = Vec::with_capacity(count);
     for i in 0..count {
         let off = ptr_array_start + i * CELL_POINTER_SIZE as usize;

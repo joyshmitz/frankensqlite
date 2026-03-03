@@ -111,3 +111,6 @@ mod hot_path_tests {
 
 #[cfg(test)]
 mod interior_delete_test;
+
+#[cfg(test)]
+mod table_seek_bug_test;
