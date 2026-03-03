@@ -460,10 +460,12 @@ fn gather_column_inner(
             let mut new_data: Vec<u8> = Vec::new();
             new_offsets.push(0);
             for (out_idx, &row) in indices.iter().enumerate() {
-                let start = offsets.get(row).copied().unwrap_or_default() as usize;
-                let end = offsets.get(row + 1).copied().unwrap_or_default() as usize;
-                if start <= end && end <= src.len() {
-                    new_data.extend_from_slice(&src[start..end]);
+                if !extra_nulls[out_idx] && validity.is_valid(row) {
+                    let start = offsets.get(row).copied().unwrap_or_default() as usize;
+                    let end = offsets.get(row + 1).copied().unwrap_or_default() as usize;
+                    if start <= end && end <= src.len() {
+                        new_data.extend_from_slice(&src[start..end]);
+                    }
                 }
                 #[allow(clippy::cast_possible_truncation)]
                 new_offsets.push(new_data.len() as u32);
@@ -479,10 +481,12 @@ fn gather_column_inner(
             let mut new_data: Vec<u8> = Vec::new();
             new_offsets.push(0);
             for (out_idx, &row) in indices.iter().enumerate() {
-                let start = offsets.get(row).copied().unwrap_or_default() as usize;
-                let end = offsets.get(row + 1).copied().unwrap_or_default() as usize;
-                if start <= end && end <= src.len() {
-                    new_data.extend_from_slice(&src[start..end]);
+                if !extra_nulls[out_idx] && validity.is_valid(row) {
+                    let start = offsets.get(row).copied().unwrap_or_default() as usize;
+                    let end = offsets.get(row + 1).copied().unwrap_or_default() as usize;
+                    if start <= end && end <= src.len() {
+                        new_data.extend_from_slice(&src[start..end]);
+                    }
                 }
                 #[allow(clippy::cast_possible_truncation)]
                 new_offsets.push(new_data.len() as u32);
