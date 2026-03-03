@@ -10,7 +10,7 @@
 //! - `CommitProof` for commits
 //! - `AbortWitness` for SSI aborts
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -283,7 +283,7 @@ pub fn discover_incoming_edges(
         let candidate_begin = candidate.begin_seq().get();
         let candidate_end = u64::MAX;
         let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
-        
+
         if !overlaps || seen_sources.contains(&candidate.token()) {
             continue;
         }
@@ -320,7 +320,7 @@ pub fn discover_incoming_edges(
         let candidate_begin = reader.begin_seq.get();
         let candidate_end = reader.commit_seq.get();
         let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
-        
+
         if !overlaps || seen_sources.contains(&reader.token) {
             continue;
         }
@@ -387,7 +387,7 @@ pub fn discover_outgoing_edges(
         let candidate_begin = candidate.begin_seq().get();
         let candidate_end = u64::MAX;
         let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
-        
+
         if !overlaps || seen_targets.contains(&candidate.token()) {
             continue;
         }
@@ -424,7 +424,7 @@ pub fn discover_outgoing_edges(
         let candidate_begin = 0; // Committed writers overlap test uses 0 for begin_seq
         let candidate_end = writer.commit_seq.get();
         let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
-        
+
         if !overlaps || seen_targets.contains(&writer.token) {
             continue;
         }
@@ -1179,10 +1179,14 @@ mod tests {
             &self.writes
         }
         fn check_read_overlap(&self, key: &WitnessKey) -> bool {
-            self.reads.iter().any(|k| crate::witness_plane::witness_keys_overlap(k, key))
+            self.reads
+                .iter()
+                .any(|k| crate::witness_plane::witness_keys_overlap(k, key))
         }
         fn check_write_overlap(&self, key: &WitnessKey) -> bool {
-            self.writes.iter().any(|k| crate::witness_plane::witness_keys_overlap(k, key))
+            self.writes
+                .iter()
+                .any(|k| crate::witness_plane::witness_keys_overlap(k, key))
         }
         fn has_in_rw(&self) -> bool {
             self.has_in.get()

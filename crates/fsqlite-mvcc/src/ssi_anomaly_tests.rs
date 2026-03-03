@@ -118,10 +118,14 @@ impl ActiveTxnView for MockActiveTxn {
         &self.writes
     }
     fn check_read_overlap(&self, key: &WitnessKey) -> bool {
-        self.reads.iter().any(|k| crate::witness_plane::witness_keys_overlap(k, key))
+        self.reads
+            .iter()
+            .any(|k| crate::witness_plane::witness_keys_overlap(k, key))
     }
     fn check_write_overlap(&self, key: &WitnessKey) -> bool {
-        self.writes.iter().any(|k| crate::witness_plane::witness_keys_overlap(k, key))
+        self.writes
+            .iter()
+            .any(|k| crate::witness_plane::witness_keys_overlap(k, key))
     }
     fn has_in_rw(&self) -> bool {
         self.has_in.get()

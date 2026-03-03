@@ -20,7 +20,7 @@ use fsqlite_mvcc::{
     ActiveTxnView, BeginKind, ChainHeadTable, CommitIndex, CommittedWriterInfo, ConcurrentRegistry,
     DiscoveredEdge, GcTodo, InProcessPageLockTable, TransactionManager, VersionArena,
     discover_incoming_edges, discover_outgoing_edges, gc_tick, prune_page_chain,
-    validate_first_committer_wins,
+    validate_first_committer_wins, witness_keys_overlap,
 };
 use fsqlite_observability::{ConflictObserver, MetricsObserver};
 use fsqlite_types::{
@@ -802,6 +802,16 @@ impl ActiveTxnView for BenchActiveTxn {
     }
     fn write_keys(&self) -> &[WitnessKey] {
         &self.write_keys
+    }
+    fn check_read_overlap(&self, key: &WitnessKey) -> bool {
+        self.read_keys
+            .iter()
+            .any(|read_key| witness_keys_overlap(read_key, key))
+    }
+    fn check_write_overlap(&self, key: &WitnessKey) -> bool {
+        self.write_keys
+            .iter()
+            .any(|write_key| witness_keys_overlap(write_key, key))
     }
     fn has_in_rw(&self) -> bool {
         self.has_in_rw.load(Ordering::Relaxed)

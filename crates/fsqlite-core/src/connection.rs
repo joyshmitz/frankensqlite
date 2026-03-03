@@ -11232,7 +11232,10 @@ impl Connection {
             (entries, max_rowid)
         };
 
-        eprintln!("RELOAD_MEMDB: master_entries.len()={}", master_entries.len());
+        eprintln!(
+            "RELOAD_MEMDB: master_entries.len()={}",
+            master_entries.len()
+        );
 
         // Parse each sqlite_master row and rebuild schema + MemDatabase.
         // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)

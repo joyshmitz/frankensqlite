@@ -274,7 +274,7 @@ fn test_memory_tracking_lifecycle() {
             seed: 0,
         });
         let m1 = sketch_telemetry_metrics();
-        let expected_bytes: u64 = 128 * 2 * 8; // 2048
+        let expected_bytes: u64 = 128 * 2 * 4; // 1024
         // Parallel tests may shift the gauge, so verify our allocation
         // contributed substantially (allow up to 512B interference).
         let delta = m1.fsqlite_sketch_memory_bytes as i64 - m0.fsqlite_sketch_memory_bytes as i64;

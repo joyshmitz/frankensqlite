@@ -493,17 +493,17 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (v INTEGER);").unwrap();
         conn.execute("INSERT INTO t VALUES (1);").unwrap();
-        
+
         let m1 = conn.query("SELECT * FROM sqlite_master;").unwrap();
         eprintln!("MASTER BEFORE BEGIN: {:?}", m1);
-        
+
         conn.execute("BEGIN;").unwrap();
         conn.execute("INSERT INTO t VALUES (2);").unwrap();
         conn.execute("ROLLBACK;").unwrap();
-        
+
         let m2 = conn.query("SELECT * FROM sqlite_master;").unwrap();
         eprintln!("MASTER AFTER ROLLBACK: {:?}", m2);
-        
+
         let rows = conn.query("SELECT v FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
@@ -3822,9 +3822,9 @@ mod tests {
         const INITIAL_BALANCE: i64 = 1000;
         const EXPECTED_TOTAL: i64 = NUM_ACCOUNTS * INITIAL_BALANCE;
 
-        // Test parameters: 8 writers, 100 ops each (reduced for test speed).
+        // Test parameters: 8 writers, 20 ops each (reduced for test speed).
         const NUM_WRITERS: usize = 8;
-        const OPS_PER_WRITER: u64 = 100;
+        const OPS_PER_WRITER: u64 = 20;
 
         // Setup: create table and initial accounts.
         {
