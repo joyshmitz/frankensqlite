@@ -142,3 +142,34 @@ crates/*/target/
 **/archived_mailbox_states/
 .env
 .claude/settings.local.json
+
+# Alternative target directories
+target-local/
+target-fresh/
+
+# Agent-generated Python scripts (one-off analysis/fix tools)
+/find_*.py
+/fix_*.py
+/get_*.py
+/parse_*.py
+/test_*.py
+
+# Clippy analysis output
+clippy_out.*
+clippy_output.*
+
+# MCP config files (contain local bearer tokens)
+*.mcp.json
+
+# Artifacts directories (CI/E2E/validation run outputs)
+artifacts/
+
+# One-off test shell scripts at repo root
+/run_test.sh
+
+# Test output files
+/test_out.txt
+/test_*.db
+/test_*.db-wal
+/test_*.sql
+unwraps.txt
