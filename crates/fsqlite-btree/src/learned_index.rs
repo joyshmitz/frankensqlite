@@ -290,47 +290,40 @@ fn train_piecewise_linear(keys: &[u64], max_error: usize) -> Vec<Segment> {
     let mut seg_start = 0usize;
 
     while seg_start < keys.len() {
-        // Try to extend the segment as far as possible.
         let mut seg_end = seg_start;
+        let mut slope_min = 0.0f64;
+        let mut slope_max = f64::INFINITY;
 
-        loop {
-            let next_end = seg_end + 1;
-            if next_end >= keys.len() {
-                seg_end = keys.len() - 1;
+        for i in seg_start + 1..keys.len() {
+            let dx = keys[i] as f64 - keys[seg_start] as f64;
+            let dy = (i - seg_start) as f64;
+
+            if dx == 0.0 {
+                if i - seg_start > max_error {
+                    break;
+                }
+                seg_end = i;
+                continue;
+            }
+
+            let p_min = (dy - max_error as f64) / dx;
+            let p_max = (dy + max_error as f64) / dx;
+
+            let new_min = slope_min.max(p_min);
+            let new_max = slope_max.min(p_max);
+
+            if new_min > new_max {
                 break;
             }
 
-            // Compute linear fit from seg_start to next_end.
-            let key_range = keys[next_end] as f64 - keys[seg_start] as f64;
-            let slope = if key_range > 0.0 {
-                (next_end - seg_start) as f64 / key_range
-            } else {
-                0.0
-            };
-            let intercept = seg_start as f64;
-
-            // Check error for all points in [seg_start, next_end].
-            let mut max_err = 0usize;
-            for i in seg_start..=next_end {
-                let predicted = intercept + slope * (keys[i] as f64 - keys[seg_start] as f64);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let predicted_pos = predicted.round().max(0.0) as usize;
-                let err = predicted_pos.abs_diff(i);
-                max_err = max_err.max(err);
-            }
-
-            if max_err > max_error {
-                // Error exceeded — end segment at seg_end.
-                break;
-            }
-
-            seg_end = next_end;
+            slope_min = new_min;
+            slope_max = new_max;
+            seg_end = i;
         }
 
-        // Build segment from seg_start to seg_end.
-        let key_range = keys[seg_end] as f64 - keys[seg_start] as f64;
-        let slope = if key_range > 0.0 {
-            (seg_end - seg_start) as f64 / key_range
+        let dx = keys[seg_end] as f64 - keys[seg_start] as f64;
+        let slope = if dx > 0.0 {
+            ((seg_end - seg_start) as f64 / dx).clamp(slope_min, slope_max)
         } else {
             0.0
         };
