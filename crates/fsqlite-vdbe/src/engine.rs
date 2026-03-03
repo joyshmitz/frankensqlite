@@ -20,7 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
+use fsqlite_btree::{
+    BtCursor, BtreeCursorOps, BtreePageHeader, BtreePageType, MemPageStore, PageReader, PageWriter,
+    SeekResult, header_offset_for_page,
+};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
@@ -2650,17 +2653,20 @@ impl VdbeEngine {
                     // values into a temporary buffer before writing them to the destination.
                     let p3_usize = op.p3 as usize;
                     let mut temp = Vec::with_capacity(p3_usize);
-                    
+
                     #[allow(clippy::cast_sign_loss)]
                     for i in 0..op.p3 {
                         let src_idx = (op.p1 + i) as usize;
                         if src_idx < self.registers.len() {
-                            temp.push(std::mem::replace(&mut self.registers[src_idx], SqliteValue::Null));
+                            temp.push(std::mem::replace(
+                                &mut self.registers[src_idx],
+                                SqliteValue::Null,
+                            ));
                         } else {
                             temp.push(SqliteValue::Null);
                         }
                     }
-                    
+
                     for (i, val) in temp.into_iter().enumerate() {
                         self.set_reg(op.p2 + (i as i32), val);
                     }
@@ -5706,7 +5712,7 @@ impl VdbeEngine {
                 return Ok(SqliteValue::Null);
             }
             let payload = cursor.cursor.payload(&cursor.cx)?;
-            
+
             let values = if let Some((cached_payload, cached_values)) = &cursor.cached_row {
                 if cached_payload == &payload {
                     Some(cached_values)
@@ -5716,7 +5722,7 @@ impl VdbeEngine {
             } else {
                 None
             };
-            
+
             let decoded = if let Some(vals) = values {
                 vals
             } else {
@@ -5831,7 +5837,6 @@ impl VdbeEngine {
         // zero-initialized root page that we can initialize in-place.
         if let Some(ref mut page_io) = self.txn_page_io {
             let cx = Cx::new();
-            // Check if the page has a valid B-tree header (type byte != 0x00).
             // If the pager read itself fails, fail cursor open instead of
             // treating it as an uninitialized page.
             let page_data = match page_io.read_page(&cx, root_pgno) {
@@ -5851,12 +5856,21 @@ impl VdbeEngine {
                     return false;
                 }
             };
-            let is_valid_btree = !page_data.is_empty() && page_data[0] != 0x00;
+            let parsed_header =
+                BtreePageHeader::parse(&page_data, header_offset_for_page(root_pgno)).ok();
+            // Keep the legacy non-zero first-byte gate so existing tests that
+            // use MockTransaction's synthetic pages still open cursors.
+            let is_valid_btree =
+                parsed_header.is_some() || (!page_data.is_empty() && page_data[0] != 0x00);
             let is_zero_page = page_data.iter().all(|&byte| byte == 0);
 
             if is_valid_btree {
-                // Real table backed by pager: open cursor on EXISTING page data.
-                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
+                // Real B-tree backed by pager: infer table-vs-index from the
+                // parsed page header when available.
+                let (is_table_btree, detected_page_type) = parsed_header
+                    .map(|header| (header.page_type.is_table(), Some(header.page_type)))
+                    .unwrap_or((true, None));
+                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, is_table_btree);
                 self.storage_cursors.insert(
                     cursor_id,
                     StorageCursor {
@@ -5875,6 +5889,8 @@ impl VdbeEngine {
                     mode,
                     backend_kind = "txn",
                     decision_reason = "valid_btree_page",
+                    detected_page_type = ?detected_page_type,
+                    is_table_btree,
                     "open_storage_cursor: routed through pager transaction"
                 );
                 return true;
@@ -5883,10 +5899,20 @@ impl VdbeEngine {
             // For writable cursors on truly zeroed pages (e.g., freshly
             // allocated roots), initialize an empty root page.
             if writable && is_zero_page {
-                // Initialize empty leaf table page (type 0x0D) - matches
-                // MemPageStore::with_empty_table format.
+                // Infer root kind from MemDatabase when available; default to
+                // table for backwards compatibility if MemDatabase is absent.
+                let is_table_btree = self
+                    .db
+                    .as_ref()
+                    .is_none_or(|db| db.get_table(root_page).is_some());
+                let init_page_type = if is_table_btree {
+                    BtreePageType::LeafTable
+                } else {
+                    BtreePageType::LeafIndex
+                };
+                // Initialize empty leaf page for the inferred B-tree kind.
                 let mut page = vec![0u8; PAGE_SIZE as usize];
-                page[0] = 0x0D; // Leaf table page
+                page[0] = init_page_type as u8;
                 // Bytes 1-2: first freeblock offset = 0 (none).
                 // Bytes 3-4: cell count = 0.
                 // Bytes 5-6: content area offset = page_size (no cells yet).
@@ -5910,7 +5936,7 @@ impl VdbeEngine {
                     );
                     return false;
                 }
-                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
+                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, is_table_btree);
                 self.storage_cursors.insert(
                     cursor_id,
                     StorageCursor {
@@ -5929,6 +5955,8 @@ impl VdbeEngine {
                     mode,
                     backend_kind = "txn",
                     decision_reason = "zero_page_initialized",
+                    initialized_page_type = ?init_page_type,
+                    is_table_btree,
                     "open_storage_cursor: initialized empty root page via pager"
                 );
                 return true;
@@ -5988,11 +6016,21 @@ impl VdbeEngine {
         // Fallback: build a transient B-tree snapshot (Phase 4 path used by
         // tests without a real pager). Both read and write cursors can operate
         // on empty tables (INSERT needs to work on new tables).
-        let store = MemPageStore::with_empty_table(root_pgno, PAGE_SIZE);
+        let is_table_btree = self
+            .db
+            .as_ref()
+            .is_none_or(|db| db.get_table(root_page).is_some());
+        let store = if is_table_btree {
+            MemPageStore::with_empty_table(root_pgno, PAGE_SIZE)
+        } else {
+            MemPageStore::with_empty_index(root_pgno, PAGE_SIZE)
+        };
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, root_pgno, PAGE_SIZE, writable);
+        let mut cursor = BtCursor::new(store, root_pgno, PAGE_SIZE, is_table_btree);
         // Populate cursor from MemDatabase if available.
-        if let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page)) {
+        if is_table_btree
+            && let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page))
+        {
             for row in &table.rows {
                 let payload = encode_record(&row.values);
                 if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
@@ -6019,6 +6057,7 @@ impl VdbeEngine {
             mode,
             backend_kind = "mem",
             decision_reason = "no_pager_transaction",
+            is_table_btree,
             "open_storage_cursor: routed through MemPageStore fallback"
         );
         true
