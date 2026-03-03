@@ -384,6 +384,16 @@ impl WriteCoordinator {
             CoordinatorMode::Native,
             "native_publish called in compatibility mode"
         );
+        if !self.has_active_lease() {
+            warn!(
+                bead_id = "bd-389e",
+                txn = ?req.txn,
+                "native_publish rejected: no active coordinator lease"
+            );
+            return NativePublishResponse::IoError {
+                message: "coordinator lease not held".to_owned(),
+            };
+        }
 
         debug!(
             bead_id = "bd-389e",
@@ -441,6 +451,16 @@ impl WriteCoordinator {
             CoordinatorMode::Compatibility,
             "compat_commit called in native mode"
         );
+        if !self.has_active_lease() {
+            warn!(
+                bead_id = "bd-389e",
+                txn = ?req.txn,
+                "compat_commit rejected: no active coordinator lease"
+            );
+            return CompatCommitResponse::IoError {
+                message: "coordinator lease not held".to_owned(),
+            };
+        }
 
         let page_numbers: Vec<u32> = req
             .write_set
@@ -525,6 +545,19 @@ impl WriteCoordinator {
             CoordinatorMode::Compatibility,
             "compat_commit_batch called in native mode"
         );
+        if !self.has_active_lease() {
+            warn!(
+                bead_id = "bd-389e",
+                requests = requests.len(),
+                "compat_commit_batch rejected: no active coordinator lease"
+            );
+            return requests
+                .iter()
+                .map(|_| CompatCommitResponse::IoError {
+                    message: "coordinator lease not held".to_owned(),
+                })
+                .collect();
+        }
 
         let mut responses = Vec::with_capacity(requests.len());
         let mut accepted_commits: Vec<(CommitSeq, BTreeSet<u32>)> = Vec::new();
@@ -620,6 +653,11 @@ impl WriteCoordinator {
     }
 
     // -- Internal helpers --
+
+    /// Whether an active coordinator lease is currently held.
+    fn has_active_lease(&self) -> bool {
+        self.lease.read().is_some()
+    }
 
     /// Validate first-committer-wins against the commit page index.
     ///
@@ -723,6 +761,38 @@ mod tests {
             map.insert(PageNumber::new(pgno).unwrap(), test_page_data(pgno));
         }
         CommitWriteSet::Inline(map)
+    }
+
+    fn native_request(txn_id: u64, begin_seq: u64, pages: &[u32]) -> NativePublishRequest {
+        NativePublishRequest {
+            txn: test_token(txn_id),
+            begin_seq: CommitSeq::new(begin_seq),
+            capsule_object_id: ObjectId::from_bytes([1u8; 16]),
+            capsule_digest: [0xAB; 32],
+            write_set_summary: pages.iter().copied().collect(),
+            read_witnesses: vec![ObjectId::from_bytes([2u8; 16])],
+            write_witnesses: vec![ObjectId::from_bytes([3u8; 16])],
+            edge_ids: Vec::new(),
+            merge_witnesses: Vec::new(),
+            abort_policy: AbortPolicy::AbortPivot,
+        }
+    }
+
+    fn compat_request(txn_id: u64, pages: &[u32]) -> CompatCommitRequest {
+        CompatCommitRequest {
+            txn: test_token(txn_id),
+            mode: TransactionMode::Concurrent,
+            write_set: inline_write_set(pages),
+            intent_log: Vec::new(),
+            page_locks: pages
+                .iter()
+                .filter_map(|pgno| PageNumber::new(*pgno))
+                .collect(),
+            snapshot: test_snapshot(0),
+            has_in_rw: false,
+            has_out_rw: false,
+            wal_fec_r: 0,
+        }
     }
 
     // -- §5.9.1 test 1: Native sequencer writes only marker, not page data --
@@ -889,6 +959,74 @@ mod tests {
         assert!(
             !coord.release_lease(999),
             "release by non-holder should fail"
+        );
+    }
+
+    #[test]
+    fn test_native_publish_requires_active_lease() {
+        let coord = WriteCoordinator::new(CoordinatorMode::Native);
+        let req = native_request(1, 0, &[5, 10, 15]);
+
+        match coord.native_publish(&req) {
+            NativePublishResponse::IoError { message } => {
+                assert!(
+                    message.contains("lease"),
+                    "missing lease should return explicit lease error"
+                );
+            }
+            other => panic!("expected IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_compat_commit_requires_active_lease() {
+        let coord = WriteCoordinator::new(CoordinatorMode::Compatibility);
+        let req = compat_request(1, &[7, 9]);
+
+        match coord.compat_commit(&req) {
+            CompatCommitResponse::IoError { message } => {
+                assert!(
+                    message.contains("lease"),
+                    "missing lease should return explicit lease error"
+                );
+            }
+            other => panic!("expected IoError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_commit_paths_reject_after_lease_release() {
+        let native = WriteCoordinator::new(CoordinatorMode::Native);
+        assert!(native.acquire_lease(100, 0));
+        assert!(native.release_lease(100));
+        let native_req = native_request(1, 0, &[1]);
+        assert!(
+            matches!(
+                native.native_publish(&native_req),
+                NativePublishResponse::IoError { .. }
+            ),
+            "native publish should fail after lease release"
+        );
+
+        let compat = WriteCoordinator::new(CoordinatorMode::Compatibility);
+        assert!(compat.acquire_lease(200, 0));
+        assert!(compat.release_lease(200));
+        let req = compat_request(2, &[11]);
+        assert!(
+            matches!(
+                compat.compat_commit(&req),
+                CompatCommitResponse::IoError { .. }
+            ),
+            "compat commit should fail after lease release"
+        );
+        let batch = vec![compat_request(3, &[12]), compat_request(4, &[13])];
+        let responses = compat.compat_commit_batch(&batch);
+        assert_eq!(responses.len(), 2);
+        assert!(
+            responses
+                .iter()
+                .all(|resp| matches!(resp, CompatCommitResponse::IoError { .. })),
+            "compat batch should reject all requests after lease release"
         );
     }
 

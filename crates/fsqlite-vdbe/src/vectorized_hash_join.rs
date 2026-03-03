@@ -75,6 +75,10 @@ pub fn hash_join_build(
     build_batch: Batch,
     build_key_columns: &[usize],
 ) -> Result<HashJoinTable, String> {
+    if build_key_columns.is_empty() {
+        return Err("hash join build requires at least one key column".to_owned());
+    }
+
     let sel = build_batch.selection();
     let hashes = hash_batch_columns(&build_batch, build_key_columns)?;
 
@@ -134,6 +138,17 @@ pub fn hash_join_probe(
     probe_key_columns: &[usize],
     join_type: JoinType,
 ) -> Result<Batch, String> {
+    if probe_key_columns.is_empty() {
+        return Err("hash join probe requires at least one key column".to_owned());
+    }
+    if table.build_key_columns.len() != probe_key_columns.len() {
+        return Err(format!(
+            "hash join key arity mismatch: build has {} key columns, probe has {}",
+            table.build_key_columns.len(),
+            probe_key_columns.len()
+        ));
+    }
+
     let sel = probe_batch.selection();
     let simd_path = simd_path_label();
     let input_rows = sel.len() as u64;
@@ -842,6 +857,60 @@ mod tests {
         assert!(
             err.contains("out of bounds"),
             "bead_id={BEAD_HJ} case=build_key_oob"
+        );
+    }
+
+    #[test]
+    fn build_key_empty_rejected() {
+        let build = build_batch(&[(1, 100)]);
+        let err = hash_join_build(build, &[]).unwrap_err();
+        assert!(
+            err.contains("at least one key"),
+            "bead_id={BEAD_HJ} case=build_key_empty"
+        );
+    }
+
+    #[test]
+    fn probe_key_empty_rejected() {
+        let build = build_batch(&[(1, 100)]);
+        let probe = probe_batch(&[(1, 10)]);
+        let table = hash_join_build(build, &[0]).unwrap();
+        let err = hash_join_probe(&table, &probe, &[], JoinType::Inner).unwrap_err();
+        assert!(
+            err.contains("at least one key"),
+            "bead_id={BEAD_HJ} case=probe_key_empty"
+        );
+    }
+
+    #[test]
+    fn key_arity_mismatch_rejected() {
+        let build_specs = vec![
+            ColumnSpec::new("a", ColumnVectorType::Int64),
+            ColumnSpec::new("b", ColumnVectorType::Int64),
+            ColumnSpec::new("build_val", ColumnVectorType::Int64),
+        ];
+        let build_rows: Vec<Vec<SqliteValue>> = vec![vec![
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(10),
+            SqliteValue::Integer(100),
+        ]];
+        let build =
+            Batch::from_rows(&build_rows, &build_specs, DEFAULT_BATCH_ROW_CAPACITY).unwrap();
+
+        let probe_specs = vec![
+            ColumnSpec::new("a", ColumnVectorType::Int64),
+            ColumnSpec::new("probe_val", ColumnVectorType::Int64),
+        ];
+        let probe_rows: Vec<Vec<SqliteValue>> =
+            vec![vec![SqliteValue::Integer(1), SqliteValue::Integer(1000)]];
+        let probe =
+            Batch::from_rows(&probe_rows, &probe_specs, DEFAULT_BATCH_ROW_CAPACITY).unwrap();
+
+        let table = hash_join_build(build, &[0, 1]).unwrap();
+        let err = hash_join_probe(&table, &probe, &[0], JoinType::Inner).unwrap_err();
+        assert!(
+            err.contains("arity mismatch"),
+            "bead_id={BEAD_HJ} case=key_arity_mismatch"
         );
     }
 

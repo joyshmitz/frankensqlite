@@ -257,11 +257,7 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
     } else {
         let max_leaf_entries = (ps / 4).saturating_sub(2).max(1);
         let trunk_count = freelist.len().div_ceil(max_leaf_entries + 1);
-        let trunks: Vec<u32> = freelist
-            .iter()
-            .take(trunk_count)
-            .map(|p| p.get())
-            .collect();
+        let trunks: Vec<u32> = freelist.iter().take(trunk_count).map(|p| p.get()).collect();
         (trunks[0], trunks)
     };
 
@@ -818,18 +814,13 @@ where
             let _ = vfs.delete(cx, journal_path, true);
         }
 
-        for page_no in freed_pages.drain(..) {
-            inner.freelist.push(page_no);
-        }
-                Ok(())
+        Ok(())
     }
-
     /// Commit using the WAL protocol (append frames to WAL file).
     fn commit_wal(
         cx: &Cx,
         inner: &mut PagerInner<V::File>,
         write_set: &HashMap<PageNumber, PageBuf>,
-        freed_pages: &mut Vec<PageNumber>,
     ) -> Result<()> {
         if !write_set.is_empty() {
             let wal = inner.wal_backend.as_mut().ok_or_else(|| {
@@ -869,9 +860,6 @@ where
             inner.db_size = new_db_size;
         }
 
-        for page_no in freed_pages.drain(..) {
-            inner.freelist.push(page_no);
-        }
         Ok(())
     }
 
@@ -1018,6 +1006,11 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
+        for page_no in self.freed_pages.drain(..) {
+            inner.freelist.push(page_no);
+        }
+        serialize_freelist_to_write_set(cx, &mut inner, &mut self.write_set)?;
+
         // ── Header Patching ──
         // Patch page 1 header with correct page_count and change_counter in the write set.
         // This ensures the commit functions write a consistent header without needing extra I/O.
@@ -1037,7 +1030,7 @@ where
         }
 
         let commit_result = if self.journal_mode == JournalMode::Wal {
-            Self::commit_wal(cx, &mut inner, &self.write_set, &mut self.freed_pages)
+            Self::commit_wal(cx, &mut inner, &self.write_set)
         } else {
             Self::commit_journal(
                 cx,
@@ -1045,7 +1038,6 @@ where
                 &self.journal_path,
                 &mut inner,
                 &self.write_set,
-                &mut self.freed_pages,
                 self.original_db_size,
             )
         };
@@ -1155,9 +1147,9 @@ where
             .iter()
             .rposition(|sp| sp.name == name)
             .ok_or_else(|| FrankenError::internal(format!("no savepoint named '{name}'")))?;
-        
+
         let entry = &self.savepoint_stack[pos];
-        
+
         // Restore write-set FIRST to ensure we don't leave the transaction in an
         // inconsistent state if PageBuf allocation fails (OOM).
         let new_write_set = entry
@@ -1378,7 +1370,7 @@ where
         // Ensure header page_count reflects the final db_size after all
         // checkpoint writes/truncation, even if page 1 was checkpointed early.
         Self::patch_page1_header(&mut inner, cx)?;
-                inner.db_file.sync(cx, SyncFlags::NORMAL)
+        inner.db_file.sync(cx, SyncFlags::NORMAL)
     }
 }
 
@@ -1493,7 +1485,11 @@ where
 
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
-        guard.wal.as_mut().expect("wal was just inserted").checkpoint(cx, mode, &mut writer, 0, None)
+        guard
+            .wal
+            .as_mut()
+            .expect("wal was just inserted")
+            .checkpoint(cx, mode, &mut writer, 0, None)
     }
 }
 
@@ -3468,7 +3464,10 @@ mod tests {
 
         let mut txn3 = reopened.begin(&cx, TransactionMode::Immediate).unwrap();
         let reused = txn3.allocate_page(&cx).unwrap();
-        assert_eq!(reused, p, "reopened pager should reuse persisted freelist page");
+        assert_eq!(
+            reused, p,
+            "reopened pager should reuse persisted freelist page"
+        );
         txn3.commit(&cx).unwrap();
     }
 

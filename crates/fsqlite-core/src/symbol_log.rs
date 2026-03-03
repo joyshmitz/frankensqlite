@@ -580,18 +580,41 @@ pub fn read_aligned_symbol_record(
             detail: "absolute offset overflow while reading aligned symbol".to_owned(),
         })?;
     let logical_len = u32_to_usize(entry.logical_len, "logical_len")?;
+    let padded_len = u32_to_usize(entry.padded_len, "padded_len")?;
+    if logical_len > padded_len {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "invalid aligned index entry: logical_len {} exceeds padded_len {}",
+                entry.logical_len, entry.padded_len
+            ),
+        });
+    }
+    let padded_end =
+        absolute_offset
+            .checked_add(padded_len)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "aligned padded read overflow".to_owned(),
+            })?;
+    if padded_end > bytes.len() {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "aligned symbol padded range out of bounds: end={}, file_len={}",
+                padded_end,
+                bytes.len()
+            ),
+        });
+    }
     let end =
         absolute_offset
             .checked_add(logical_len)
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "aligned logical read overflow".to_owned(),
             })?;
-    if end > bytes.len() {
+    if end > padded_end {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
-                "aligned symbol read out of bounds: end={}, file_len={}",
-                end,
-                bytes.len()
+                "aligned logical range exceeds padded slot: logical_end={}, padded_end={}",
+                end, padded_end
             ),
         });
     }
@@ -1889,6 +1912,29 @@ mod tests {
         assert_eq!(loaded.esi, record.esi);
         assert_eq!(loaded.frame_xxh3, record.frame_xxh3);
         assert!(loaded.verify_integrity());
+    }
+
+    #[test]
+    fn test_aligned_read_rejects_inconsistent_index_entry() {
+        let dir = tempdir().expect("tempdir");
+        let header = SymbolSegmentHeader::new(1, 42, 100);
+        let record = test_record(6, 0, 1024, 0x99);
+        let entry = append_symbol_record_aligned(dir.path(), header, &record, 4096)
+            .expect("aligned append");
+
+        let segment_path = symbol_segment_path(dir.path(), 1);
+        let mut bad = entry;
+        bad.padded_len = bad.logical_len.saturating_sub(1);
+
+        let err =
+            read_aligned_symbol_record(&segment_path, bad).expect_err("must reject bad index");
+        let FrankenError::DatabaseCorrupt { detail } = err else {
+            panic!("expected DatabaseCorrupt for inconsistent aligned index");
+        };
+        assert!(
+            detail.contains("logical_len") && detail.contains("padded_len"),
+            "unexpected detail: {detail}"
+        );
     }
 
     #[test]

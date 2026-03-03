@@ -2865,6 +2865,10 @@ fn codegen_select_group_by_aggregate(
     // Count expression-arg aggregates (each gets its own sorter slot).
     let num_expr_args = agg_columns.iter().filter(|a| a.arg_expr.is_some()).count();
 
+    // Rowid-argument aggregates (e.g. SUM(rowid)) need one shared sorter slot.
+    let needs_rowid = agg_columns.iter().any(|a| a.arg_is_rowid);
+    let num_rowid_slots: usize = usize::from(needs_rowid);
+
     // Count aggregates with FILTER clauses (each gets a boolean sorter slot).
     let num_filter_cols = agg_columns.iter().filter(|a| a.filter.is_some()).count();
 
@@ -2873,8 +2877,11 @@ fn codegen_select_group_by_aggregate(
         .iter()
         .filter(|c| matches!(c, GroupByOutputCol::NonGroupedColumn { .. }))
         .count();
-    let nongrouped_start =
-        num_group_keys + agg_arg_table_cols.len() + num_expr_args + num_filter_cols;
+    let nongrouped_start = num_group_keys
+        + agg_arg_table_cols.len()
+        + num_expr_args
+        + num_rowid_slots
+        + num_filter_cols;
     let mut next_nongrouped_slot = nongrouped_start;
     for col in &mut output_cols {
         if let GroupByOutputCol::NonGroupedColumn { sorter_col, .. } = col {
@@ -2883,21 +2890,25 @@ fn codegen_select_group_by_aggregate(
         }
     }
 
-    // Sorter layout: [group_keys..., col_args..., expr_args..., filter_bools..., nongrouped_cols...]
+    // Sorter layout: [group_keys..., col_args..., expr_args..., rowid_slot?, filter_bools..., nongrouped_cols...]
     let total_sorter_cols = num_group_keys
         + agg_arg_table_cols.len()
         + num_expr_args
+        + num_rowid_slots
         + num_filter_cols
         + num_nongrouped;
 
     // Map each aggregate's arg to its sorter column index.
     let mut agg_sorter_col: Vec<Option<usize>> = Vec::with_capacity(agg_columns.len());
     let mut next_expr_slot = num_group_keys + agg_arg_table_cols.len();
+    let rowid_slot = num_group_keys + agg_arg_table_cols.len() + num_expr_args;
     for agg in &agg_columns {
         let sorter_col = if agg.arg_expr.is_some() {
             let slot = next_expr_slot;
             next_expr_slot += 1;
             Some(slot)
+        } else if agg.arg_is_rowid {
+            Some(rowid_slot)
         } else if let Some(ci) = agg.arg_col_index {
             let Some(pos) = agg_arg_table_cols.iter().position(|&x| x == ci) else {
                 return Err(CodegenError::Unsupported(
@@ -2913,7 +2924,8 @@ fn codegen_select_group_by_aggregate(
 
     // Map each FILTER-bearing aggregate to its boolean sorter column.
     let mut filter_sorter_col: Vec<Option<usize>> = Vec::with_capacity(agg_columns.len());
-    let mut next_filter_slot = num_group_keys + agg_arg_table_cols.len() + num_expr_args;
+    let mut next_filter_slot =
+        num_group_keys + agg_arg_table_cols.len() + num_expr_args + num_rowid_slots;
     for agg in &agg_columns {
         if agg.filter.is_some() {
             filter_sorter_col.push(Some(next_filter_slot));
@@ -3004,6 +3016,11 @@ fn codegen_select_group_by_aggregate(
                 emit_expr(b, expr, reg, Some(&scan_ctx));
                 reg += 1;
             }
+        }
+        // Rowid slot: store rowid if any aggregate references it (e.g. SUM(rowid)).
+        if needs_rowid {
+            b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+            reg += 1;
         }
         // FILTER clause booleans: evaluate each filter and store 0/1 in sorter.
         for agg in &agg_columns {

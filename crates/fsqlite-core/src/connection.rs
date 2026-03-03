@@ -11180,9 +11180,16 @@ impl Connection {
         let page1 = txn.get_page(cx, PageNumber::ONE)?;
         let page1_bytes = page1.as_ref();
 
+        eprintln!(
+            "RELOAD_MEMDB: page1_bytes len={}, first 16={:?}",
+            page1_bytes.len(),
+            &page1_bytes[..16.min(page1_bytes.len())]
+        );
+
         // If page 1 is all zeros or doesn't have a valid B-tree header, the
         // database is empty. Reset to a fresh state.
         if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < 100 {
+            eprintln!("RELOAD_MEMDB: DB considered empty. Clearing schema!");
             *self.db.borrow_mut() = MemDatabase::new();
             self.schema.borrow_mut().clear();
             self.views.borrow_mut().clear();
@@ -11224,6 +11231,8 @@ impl Connection {
             }
             (entries, max_rowid)
         };
+
+        eprintln!("RELOAD_MEMDB: master_entries.len()={}", master_entries.len());
 
         // Parse each sqlite_master row and rebuild schema + MemDatabase.
         // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
@@ -20810,6 +20819,32 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("eng".to_owned()));
+    }
+
+    /// bd-3ew8w: HAVING-only aggregate in no-GROUP-BY path.
+    /// `SELECT COUNT(*) FROM t HAVING SUM(x) > N` must accumulate SUM(x) even
+    /// though it does not appear in the SELECT list and there is no GROUP BY.
+    #[test]
+    fn test_having_only_aggregate_no_group_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (20);").unwrap();
+        conn.execute("INSERT INTO t VALUES (30);").unwrap();
+        // SUM(x) = 60, COUNT(*) = 3.
+
+        // HAVING SUM(x) > 50 → passes → returns 1 row with COUNT(*) = 3.
+        let rows = conn
+            .query("SELECT COUNT(*) FROM t HAVING SUM(x) > 50;")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "HAVING passes, expected 1 row");
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+
+        // HAVING SUM(x) > 100 → fails → empty result.
+        let rows = conn
+            .query("SELECT COUNT(*) FROM t HAVING SUM(x) > 100;")
+            .unwrap();
+        assert_eq!(rows.len(), 0, "HAVING fails, expected empty");
     }
 
     #[test]
