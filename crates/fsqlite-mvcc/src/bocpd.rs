@@ -406,11 +406,11 @@ impl BocpdMonitor {
             run_length: 0,
             log_prob: log_cp_prob,
             ng_stats: match self.config.model {
-                ConjugateModel::NormalGamma { .. } => Some(NormalGammaStats::new()),
+                ConjugateModel::NormalGamma { .. } => Some(NormalGammaStats::new().update(x)),
                 ConjugateModel::BetaBinomial { .. } => None,
             },
             bb_stats: match self.config.model {
-                ConjugateModel::BetaBinomial { .. } => Some(BetaBinomialStats::new()),
+                ConjugateModel::BetaBinomial { .. } => Some(BetaBinomialStats::new().update(x)),
                 ConjugateModel::NormalGamma { .. } => None,
             },
         };
@@ -482,11 +482,11 @@ impl BocpdMonitor {
                 run_length: 0,
                 log_prob: 0.0,
                 ng_stats: match self.config.model {
-                    ConjugateModel::NormalGamma { .. } => Some(NormalGammaStats::new()),
+                    ConjugateModel::NormalGamma { .. } => Some(NormalGammaStats::new().update(x)),
                     ConjugateModel::BetaBinomial { .. } => None,
                 },
                 bb_stats: match self.config.model {
-                    ConjugateModel::BetaBinomial { .. } => Some(BetaBinomialStats::new()),
+                    ConjugateModel::BetaBinomial { .. } => Some(BetaBinomialStats::new().update(x)),
                     ConjugateModel::NormalGamma { .. } => None,
                 },
             });

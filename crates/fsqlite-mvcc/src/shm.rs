@@ -12,7 +12,7 @@
 //! the on-disk byte-level wire format uses explicit `to_le_bytes`/`from_le_bytes`
 //! at computed offsets. No `unsafe`, no `repr(C)` reinterpret casts.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_types::{CommitSeq, PageSize, SchemaEpoch, TxnId};
 use xxhash_rust::xxh3::xxh3_64;
@@ -550,7 +550,8 @@ impl SharedMemoryLayout {
         let new_gen = old_gen.wrapping_add(1);
         let new_packed = u64::from(pid) | (u64::from(new_gen) << 32);
 
-        self.serialized_writer_pid_and_gen.store(new_packed, Ordering::Release);
+        self.serialized_writer_pid_and_gen
+            .store(new_packed, Ordering::Release);
         self.serialized_writer_pid_birth
             .store(pid_birth, Ordering::Release);
         self.serialized_writer_lease_expiry
@@ -581,9 +582,24 @@ impl SharedMemoryLayout {
         // Because `pid_and_gen` incorporates a generation counter incremented on every
         // acquire, this CAS is guaranteed to fail if a new writer acquired the lock,
         // even if the new writer is from the exact same process (same PID).
-        let _ = self.serialized_writer_pid_and_gen.compare_exchange(my_packed, 0, Ordering::AcqRel, Ordering::Relaxed);
-        let _ = self.serialized_writer_pid_birth.compare_exchange(my_birth, 0, Ordering::AcqRel, Ordering::Relaxed);
-        let _ = self.serialized_writer_lease_expiry.compare_exchange(my_lease, 0, Ordering::AcqRel, Ordering::Relaxed);
+        let _ = self.serialized_writer_pid_and_gen.compare_exchange(
+            my_packed,
+            0,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        let _ = self.serialized_writer_pid_birth.compare_exchange(
+            my_birth,
+            0,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+        let _ = self.serialized_writer_lease_expiry.compare_exchange(
+            my_lease,
+            0,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
         true
     }
 
@@ -665,8 +681,8 @@ impl SharedMemoryLayout {
             let mut is_torn = false;
             for _ in 0..10 {
                 std::hint::spin_loop();
-                if self.serialized_writer_txn_id.load(Ordering::Acquire) != writer_txn_id_raw ||
-                   self.serialized_writer_pid_and_gen.load(Ordering::Acquire) != packed_pid
+                if self.serialized_writer_txn_id.load(Ordering::Acquire) != writer_txn_id_raw
+                    || self.serialized_writer_pid_and_gen.load(Ordering::Acquire) != packed_pid
                 {
                     is_torn = true;
                     break;
@@ -694,9 +710,24 @@ impl SharedMemoryLayout {
                 .is_ok()
             {
                 // Clear auxiliary fields using CAS to avoid stomping a new writer's fields.
-                let _ = self.serialized_writer_pid_and_gen.compare_exchange(packed_pid, 0, Ordering::AcqRel, Ordering::Relaxed);
-                let _ = self.serialized_writer_pid_birth.compare_exchange(pid_birth, 0, Ordering::AcqRel, Ordering::Relaxed);
-                let _ = self.serialized_writer_lease_expiry.compare_exchange(lease_expiry, 0, Ordering::AcqRel, Ordering::Relaxed);
+                let _ = self.serialized_writer_pid_and_gen.compare_exchange(
+                    packed_pid,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                let _ = self.serialized_writer_pid_birth.compare_exchange(
+                    pid_birth,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
+                let _ = self.serialized_writer_lease_expiry.compare_exchange(
+                    lease_expiry,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                );
 
                 tracing::info!(
                     writer_txn_id_raw,
@@ -1290,7 +1321,10 @@ mod tests {
                 .load(Ordering::Relaxed),
             lease_expiry
         );
-        assert_eq!(layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32, 1234);
+        assert_eq!(
+            layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32,
+            1234
+        );
         assert_eq!(
             layout.serialized_writer_pid_birth.load(Ordering::Relaxed),
             999
@@ -1320,7 +1354,10 @@ mod tests {
         let res = layout.check_serialized_writer_exclusion(now, |_pid, _birth| false);
         assert!(res.is_ok(), "stale indicator should be cleared");
         assert!(layout.check_serialized_writer().is_none());
-        assert_eq!(layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32, 0);
+        assert_eq!(
+            layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32,
+            0
+        );
         assert_eq!(
             layout.serialized_writer_pid_birth.load(Ordering::Relaxed),
             0
@@ -1455,9 +1492,7 @@ mod tests {
         let bytes = layout.to_bytes();
 
         let align0 = read_u32(&bytes, offsets::ALIGN0);
-        let align1 = read_u32(&bytes, offsets::ALIGN1);
         assert_eq!(align0, 0, "_align0 padding must be 0");
-        assert_eq!(align1, 0, "_align1 padding must be 0");
     }
 
     #[test]
@@ -1525,7 +1560,10 @@ mod tests {
         assert!(layout.acquire_serialized_writer(42, 1234, 999, 10_000));
 
         // Verify aux fields are set.
-        assert_eq!(layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32, 1234);
+        assert_eq!(
+            layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32,
+            1234
+        );
         assert_eq!(
             layout.serialized_writer_pid_birth.load(Ordering::Relaxed),
             999
