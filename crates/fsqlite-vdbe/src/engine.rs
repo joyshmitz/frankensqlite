@@ -974,6 +974,8 @@ struct StorageCursor {
     /// Ensures consecutive allocations return unique values even when
     /// no Insert has been issued between them.
     last_alloc_rowid: i64,
+    /// Cache for the decoded row payload to optimize OP_Column.
+    cached_row: Option<(Vec<u8>, Vec<SqliteValue>)>,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -2644,16 +2646,23 @@ impl VdbeEngine {
                 // ── Register Operations ─────────────────────────────────
                 Opcode::Move => {
                     // Move p3 registers from p1 to p2.
+                    // To handle potential overlap correctly, we collect all source
+                    // values into a temporary buffer before writing them to the destination.
+                    let p3_usize = op.p3 as usize;
+                    let mut temp = Vec::with_capacity(p3_usize);
+                    
                     #[allow(clippy::cast_sign_loss)]
                     for i in 0..op.p3 {
                         let src_idx = (op.p1 + i) as usize;
                         if src_idx < self.registers.len() {
-                            let val =
-                                std::mem::replace(&mut self.registers[src_idx], SqliteValue::Null);
-                            self.set_reg(op.p2 + i, val);
+                            temp.push(std::mem::replace(&mut self.registers[src_idx], SqliteValue::Null));
                         } else {
-                            self.set_reg(op.p2 + i, SqliteValue::Null);
+                            temp.push(SqliteValue::Null);
                         }
+                    }
+                    
+                    for (i, val) in temp.into_iter().enumerate() {
+                        self.set_reg(op.p2 + (i as i32), val);
                     }
                     pc += 1;
                 }
@@ -5691,15 +5700,33 @@ impl VdbeEngine {
     }
 
     /// Read a column value from the cursor's current row.
-    fn cursor_column(&self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
-        if let Some(cursor) = self.storage_cursors.get(&cursor_id) {
+    fn cursor_column(&mut self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
+        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
             }
             let payload = cursor.cursor.payload(&cursor.cx)?;
-            let values = decode_record(&SqliteValue::Blob(payload))?;
-            if col_idx < values.len() {
-                return Ok(values[col_idx].clone());
+            
+            let values = if let Some((cached_payload, cached_values)) = &cursor.cached_row {
+                if cached_payload == &payload {
+                    Some(cached_values)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            let decoded = if let Some(vals) = values {
+                vals
+            } else {
+                let new_values = decode_record(&SqliteValue::Blob(payload.clone()))?;
+                cursor.cached_row = Some((payload, new_values));
+                &cursor.cached_row.as_ref().unwrap().1
+            };
+
+            if col_idx < decoded.len() {
+                return Ok(decoded[col_idx].clone());
             }
             // Column beyond record width — check ALTER TABLE ADD COLUMN defaults.
             if let Some(&root_page) = self.cursor_root_pages.get(&cursor_id) {
@@ -5837,6 +5864,7 @@ impl VdbeEngine {
                         cx,
                         writable,
                         last_alloc_rowid: 0,
+                        cached_row: None,
                     },
                 );
                 tracing::debug!(
@@ -5890,6 +5918,7 @@ impl VdbeEngine {
                         cx,
                         writable,
                         last_alloc_rowid: 0,
+                        cached_row: None,
                     },
                 );
                 tracing::debug!(
@@ -5979,6 +6008,7 @@ impl VdbeEngine {
                 cx,
                 writable,
                 last_alloc_rowid: 0,
+                cached_row: None,
             },
         );
         tracing::debug!(
