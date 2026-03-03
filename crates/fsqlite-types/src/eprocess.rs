@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct EProcessConfig {
     /// Null hypothesis anomaly rate bound.
     pub p0: f64,
-    /// GROW mixing weight (controls sensitivity vs. robustness).
+    /// Betting parameter in `E_{t+1} = E_t * (1 + lambda * (x_t - p0))`.
     pub lambda: f64,
     /// Significance level (reject when e-value >= 1/alpha).
     pub alpha: f64,
@@ -47,6 +47,7 @@ impl EProcessOracle {
     /// Create a new oracle.
     #[must_use]
     pub fn new(config: EProcessConfig, priority_threshold: u8) -> Self {
+        let config = sanitize_config(config);
         Self {
             config,
             priority_threshold,
@@ -59,25 +60,25 @@ impl EProcessOracle {
     pub fn observe_sample(&self, anomaly: bool) {
         self.observations.fetch_add(1, Ordering::Relaxed);
 
-        // GROW likelihood ratio update:
-        //   E_{t+1} = E_t * (lambda * (x_t / p0) + (1 - lambda))
-        // where x_t = 1 for anomaly, 0 for normal.
-        let factor = if anomaly {
-            self.config
-                .lambda
-                .mul_add(1.0 / self.config.p0, 1.0 - self.config.lambda)
-        } else {
-            // Under normal observation: multiply by (1 - lambda + lambda * 0/p0) = 1 - lambda
-            // But this would make e-value shrink to zero. Correct GROW:
-            // factor = lambda * (0 / p0) + (1 - lambda) = 1 - lambda
-            1.0 - self.config.lambda
-        };
+        // Betting-martingale update (anytime-valid under H0):
+        //   E_{t+1} = E_t * (1 + lambda * (x_t - p0))
+        // where x_t = 1 for anomaly and 0 for normal.
+        let x_t = if anomaly { 1.0 } else { 0.0 };
+        let factor = self
+            .config
+            .lambda
+            .mul_add(x_t - self.config.p0, 1.0)
+            .max(0.0);
 
         // Atomic CAS loop to update the e-value.
         loop {
             let old_bits = self.evalue_bits.load(Ordering::Relaxed);
             let old_val = f64::from_bits(old_bits);
-            let new_val = (old_val * factor).min(self.config.max_evalue).max(0.0);
+            let mut new_val = old_val * factor;
+            if !new_val.is_finite() {
+                new_val = self.config.max_evalue;
+            }
+            new_val = new_val.min(self.config.max_evalue).max(0.0);
             let new_bits = new_val.to_bits();
             if self
                 .evalue_bits
@@ -97,7 +98,13 @@ impl EProcessOracle {
             return false;
         }
         let evalue = f64::from_bits(self.evalue_bits.load(Ordering::Acquire));
-        evalue >= 1.0 / self.config.alpha
+        evalue >= self.rejection_threshold()
+    }
+
+    /// Rejection threshold `1/alpha` for the current oracle configuration.
+    #[must_use]
+    pub fn rejection_threshold(&self) -> f64 {
+        1.0 / self.config.alpha
     }
 
     /// Snapshot current oracle state.
@@ -107,5 +114,145 @@ impl EProcessOracle {
             evalue: f64::from_bits(self.evalue_bits.load(Ordering::Acquire)),
             observations: self.observations.load(Ordering::Relaxed),
         }
+    }
+}
+
+fn sanitize_config(mut config: EProcessConfig) -> EProcessConfig {
+    const EPS: f64 = 1e-9;
+
+    if !config.p0.is_finite() {
+        config.p0 = 0.1;
+    }
+    config.p0 = config.p0.clamp(EPS, 1.0 - EPS);
+
+    if !config.alpha.is_finite() || config.alpha <= 0.0 {
+        config.alpha = 0.05;
+    }
+    config.alpha = config.alpha.clamp(EPS, 1.0);
+
+    if !config.max_evalue.is_finite() || config.max_evalue < 1.0 {
+        config.max_evalue = 1.0;
+    }
+
+    let lambda_min = -1.0 / (1.0 - config.p0) + EPS;
+    let lambda_max = 1.0 / config.p0 - EPS;
+    if !config.lambda.is_finite() {
+        config.lambda = 0.0;
+    }
+    config.lambda = config.lambda.clamp(lambda_min, lambda_max);
+
+    config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg_next(state: &mut u64) -> u64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        *state
+    }
+
+    fn bernoulli_sample(state: &mut u64, p: f64) -> bool {
+        let raw = (lcg_next(state) >> 11) as f64 / ((1_u64 << 53) as f64);
+        raw < p
+    }
+
+    fn test_config() -> EProcessConfig {
+        EProcessConfig {
+            p0: 0.1,
+            lambda: 5.0,
+            alpha: 0.05,
+            max_evalue: 1e12,
+        }
+    }
+
+    #[test]
+    fn eprocess_threshold_crossing_triggers_shed() {
+        let oracle = EProcessOracle::new(test_config(), 1);
+        oracle.observe_sample(true);
+        oracle.observe_sample(true);
+        assert!(oracle.snapshot().evalue >= oracle.rejection_threshold());
+        assert!(oracle.should_shed(3));
+    }
+
+    #[test]
+    fn eprocess_priority_threshold_blocks_shed() {
+        let oracle = EProcessOracle::new(test_config(), 1);
+        oracle.observe_sample(true);
+        oracle.observe_sample(true);
+        assert!(!oracle.should_shed(1));
+    }
+
+    #[test]
+    fn eprocess_healthy_stream_does_not_false_alarm() {
+        let oracle = EProcessOracle::new(
+            EProcessConfig {
+                p0: 0.1,
+                lambda: 0.5,
+                alpha: 0.01,
+                max_evalue: 1e12,
+            },
+            0,
+        );
+
+        for _ in 0..500 {
+            oracle.observe_sample(false);
+        }
+
+        let snapshot = oracle.snapshot();
+        assert!(snapshot.evalue < oracle.rejection_threshold());
+        assert!(!oracle.should_shed(2));
+    }
+
+    #[test]
+    fn eprocess_null_rate_stream_stays_below_threshold() {
+        let oracle = EProcessOracle::new(
+            EProcessConfig {
+                p0: 0.1,
+                lambda: 0.5,
+                alpha: 0.01,
+                max_evalue: 1e12,
+            },
+            0,
+        );
+
+        let mut state = 0x5eed_u64;
+        for _ in 0..2_000 {
+            let anomaly = bernoulli_sample(&mut state, 0.02);
+            oracle.observe_sample(anomaly);
+        }
+
+        assert!(oracle.snapshot().evalue < oracle.rejection_threshold());
+    }
+
+    #[test]
+    fn eprocess_snapshot_tracks_observations() {
+        let oracle = EProcessOracle::new(test_config(), 1);
+        oracle.observe_sample(true);
+        oracle.observe_sample(false);
+        oracle.observe_sample(true);
+        assert_eq!(oracle.snapshot().observations, 3);
+    }
+
+    #[test]
+    fn eprocess_sanitizes_invalid_config() {
+        let oracle = EProcessOracle::new(
+            EProcessConfig {
+                p0: 5.0,
+                lambda: f64::INFINITY,
+                alpha: 0.0,
+                max_evalue: -1.0,
+            },
+            0,
+        );
+
+        // Should remain finite and non-negative after updates.
+        oracle.observe_sample(false);
+        oracle.observe_sample(true);
+        let snapshot = oracle.snapshot();
+        assert!(snapshot.evalue.is_finite());
+        assert!(snapshot.evalue >= 0.0);
+        assert!(oracle.rejection_threshold().is_finite());
     }
 }
