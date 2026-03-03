@@ -1021,6 +1021,12 @@ struct ActiveConflictEvidence {
     conflict_pages: Vec<PageNumber>,
 }
 
+#[derive(Debug, Clone)]
+struct ParseCacheEntry {
+    sql: String,
+    statement: Statement,
+}
+
 /// A database connection holding schema metadata and execution/cache state.
 ///
 /// Supports transactions (BEGIN/COMMIT/ROLLBACK) and savepoints
@@ -1175,7 +1181,7 @@ pub struct Connection {
     /// LRU-bounded cache of parsed SQL ASTs keyed by SQL text hash.
     /// Avoids re-parsing the same SQL string on repeated query/execute calls.
     /// Invalidated on DDL operations (schema cookie increment).
-    parse_cache: RefCell<HashMap<u64, Statement>>,
+    parse_cache: RefCell<HashMap<u64, ParseCacheEntry>>,
     /// Schema cookie value at time of last cache fill.  When schema_cookie
     /// changes (DDL executed), the entire cache is invalidated.
     parse_cache_cookie: RefCell<u32>,
@@ -1833,26 +1839,13 @@ impl Connection {
     /// Return a cached parsed single statement, or parse fresh and cache it.
     /// The cache is invalidated whenever the schema cookie changes (DDL).
     fn cached_parse_single(&self, sql: &str) -> Result<Statement> {
-        let current_cookie = *self.schema_cookie.borrow();
-        // Invalidate cache if schema changed since last fill.
-        {
-            let cached_cookie = *self.parse_cache_cookie.borrow();
-            if cached_cookie != current_cookie {
-                self.parse_cache.borrow_mut().clear();
-                *self.parse_cache_cookie.borrow_mut() = current_cookie;
-            }
-        }
         let key = Self::sql_hash(sql);
-        if let Some(cached) = self.parse_cache.borrow().get(&key) {
-            return Ok(cached.clone());
+        self.refresh_parse_cache_if_needed();
+        if let Some(cached) = self.lookup_parse_cache(key, sql) {
+            return Ok(cached);
         }
         let stmt = parse_single_statement(sql)?;
-        // Bound cache size to avoid unbounded growth.
-        let mut cache = self.parse_cache.borrow_mut();
-        if cache.len() >= 256 {
-            cache.clear();
-        }
-        cache.insert(key, stmt.clone());
+        self.insert_parse_cache(key, sql, &stmt);
         Ok(stmt)
     }
 
@@ -1860,28 +1853,51 @@ impl Connection {
     /// Multi-statement SQL is less common and cache hit rate is lower,
     /// so we only cache single-statement SQL in this path.
     fn cached_parse_multi(&self, sql: &str) -> Result<Vec<Statement>> {
+        // Hot path optimization for repeated single-statement execute() calls.
+        // Use the same collision-safe SQL equality check as cached_parse_single.
+        let key = Self::sql_hash(sql);
+        self.refresh_parse_cache_if_needed();
+        if let Some(cached) = self.lookup_parse_cache(key, sql) {
+            return Ok(vec![cached]);
+        }
+
         // For single-statement SQL, use the cache.
         let stmts = parse_statements(sql)?;
         if stmts.len() == 1 {
-            // Re-check cache for single statements.
-            let current_cookie = *self.schema_cookie.borrow();
-            {
-                let cached_cookie = *self.parse_cache_cookie.borrow();
-                if cached_cookie != current_cookie {
-                    self.parse_cache.borrow_mut().clear();
-                    *self.parse_cache_cookie.borrow_mut() = current_cookie;
-                }
-            }
-            let key = Self::sql_hash(sql);
-            let mut cache = self.parse_cache.borrow_mut();
-            if !cache.contains_key(&key) {
-                if cache.len() >= 256 {
-                    cache.clear();
-                }
-                cache.insert(key, stmts[0].clone());
-            }
+            self.insert_parse_cache(key, sql, &stmts[0]);
         }
         Ok(stmts)
+    }
+
+    fn refresh_parse_cache_if_needed(&self) {
+        let current_cookie = *self.schema_cookie.borrow();
+        let cached_cookie = *self.parse_cache_cookie.borrow();
+        if cached_cookie != current_cookie {
+            self.parse_cache.borrow_mut().clear();
+            *self.parse_cache_cookie.borrow_mut() = current_cookie;
+        }
+    }
+
+    fn lookup_parse_cache(&self, key: u64, sql: &str) -> Option<Statement> {
+        self.parse_cache
+            .borrow()
+            .get(&key)
+            .and_then(|entry| (entry.sql == sql).then_some(entry.statement.clone()))
+    }
+
+    fn insert_parse_cache(&self, key: u64, sql: &str, statement: &Statement) {
+        // Bound cache size to avoid unbounded growth.
+        let mut cache = self.parse_cache.borrow_mut();
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            ParseCacheEntry {
+                sql: sql.to_owned(),
+                statement: statement.clone(),
+            },
+        );
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -32987,6 +33003,28 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_parse_cache_execute_uses_single_statement_fast_path() {
+        let conn = Connection::open(":memory:").unwrap();
+        let cached_sql = "THIS IS DEFINITELY NOT VALID SQL";
+        let key = Connection::sql_hash(cached_sql);
+        let statement = parse_single_statement("SELECT 1;").unwrap();
+        let cookie = *conn.schema_cookie.borrow();
+        *conn.parse_cache_cookie.borrow_mut() = cookie;
+        conn.parse_cache.borrow_mut().insert(
+            key,
+            ParseCacheEntry {
+                sql: cached_sql.to_owned(),
+                statement,
+            },
+        );
+
+        // If execute() reparses first, this call fails with a parse error.
+        // The fast path should return from cache and execute successfully.
+        let count = conn.execute(cached_sql).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn test_parse_cache_invalidated_by_ddl() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE pc2 (id INTEGER PRIMARY KEY, x TEXT);")
@@ -33042,6 +33080,37 @@ mod pager_routing_tests {
 
         assert_eq!(rows_a[0].values()[0], SqliteValue::Text("alpha".to_owned()));
         assert_eq!(rows_b[0].values()[0], SqliteValue::Text("beta".to_owned()));
+    }
+
+    #[test]
+    fn test_parse_cache_hash_match_requires_sql_equality() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE pc_hash (id INTEGER PRIMARY KEY, a TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO pc_hash VALUES (1, 'alpha');")
+            .unwrap();
+
+        let target_sql = "SELECT a FROM pc_hash";
+        let key = Connection::sql_hash(target_sql);
+        let cookie = *conn.schema_cookie.borrow();
+        *conn.parse_cache_cookie.borrow_mut() = cookie;
+        conn.parse_cache.borrow_mut().insert(
+            key,
+            ParseCacheEntry {
+                sql: "SELECT 1".to_owned(),
+                statement: parse_single_statement("SELECT 1").unwrap(),
+            },
+        );
+
+        // A hash-key match with different SQL text must not return wrong AST.
+        let rows = conn.query(target_sql).unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+
+        let cache = conn.parse_cache.borrow();
+        let entry = cache
+            .get(&key)
+            .expect("cache entry should be refreshed for target SQL");
+        assert_eq!(entry.sql, target_sql);
     }
 
     #[test]
