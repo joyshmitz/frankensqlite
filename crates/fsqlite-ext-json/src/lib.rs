@@ -1350,9 +1350,7 @@ fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
             Ok(Value::Number(number))
         }
         SqliteValue::Text(text) => Ok(Value::String(text.clone())),
-        SqliteValue::Blob(_) => Err(FrankenError::function_error(
-            "JSON cannot hold BLOB values",
-        )),
+        SqliteValue::Blob(_) => Err(FrankenError::function_error("JSON cannot hold BLOB values")),
     }
 }
 
@@ -2980,7 +2978,7 @@ mod tests {
     fn test_json_extract_no_paths_error() {
         let empty: &[&str] = &[];
         assert!(json_extract(r#"{"a":1}"#, empty).is_err());
-        
+
         let func = JsonExtractFunc;
         let args = vec![SqliteValue::Text(r#"{"a":1}"#.to_owned())];
         assert_eq!(func.invoke(&args).unwrap(), SqliteValue::Null);
@@ -3161,8 +3159,14 @@ mod tests {
 
     #[test]
     fn test_json_quote_float_infinity() {
-        assert_eq!(json_quote(&SqliteValue::Float(f64::INFINITY)).unwrap(), "null");
-        assert_eq!(json_quote(&SqliteValue::Float(f64::NEG_INFINITY)).unwrap(), "null");
+        assert_eq!(
+            json_quote(&SqliteValue::Float(f64::INFINITY)).unwrap(),
+            "null"
+        );
+        assert_eq!(
+            json_quote(&SqliteValue::Float(f64::NEG_INFINITY)).unwrap(),
+            "null"
+        );
         assert_eq!(json_quote(&SqliteValue::Float(f64::NAN)).unwrap(), "null");
     }
 
@@ -3170,7 +3174,12 @@ mod tests {
     fn test_json_quote_blob() {
         let result = json_quote(&SqliteValue::Blob(vec![0xDE, 0xAD]));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("JSON cannot hold BLOB values"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("JSON cannot hold BLOB values")
+        );
     }
 
     #[test]
