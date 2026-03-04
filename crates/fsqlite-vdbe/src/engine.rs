@@ -943,6 +943,16 @@ impl CursorBackend {
             Self::TimeTravel(_) => "time_travel",
         }
     }
+
+    /// Whether the underlying B-tree cursor is for a table (intkey) B-tree.
+    #[must_use]
+    fn is_table_btree(&self) -> bool {
+        match self {
+            Self::Mem(c) => c.is_table(),
+            Self::Txn(c) => c.is_table(),
+            Self::TimeTravel(c) => c.is_table(),
+        }
+    }
 }
 
 /// Dispatch B-tree cursor operations across all backends.
@@ -2320,7 +2330,7 @@ impl VdbeEngine {
         };
 
         // Parse old row to extract column values for index key construction.
-        let old_row = parse_record(&payload);
+        let old_row = parse_record(&payload).unwrap_or_default();
 
         // Delete secondary index entries for the old row using the metadata
         // registered by the codegen. For each index cursor, build the index
@@ -7031,7 +7041,7 @@ fn char_to_affinity(ch: char) -> fsqlite_types::TypeAffinity {
 mod tests {
     use super::*;
     use crate::ProgramBuilder;
-    use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4, VdbeOp};
+    use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 
     /// Build and execute a program, returning results.
     fn run_program(build: impl FnOnce(&mut ProgramBuilder)) -> Vec<Vec<SqliteValue>> {
