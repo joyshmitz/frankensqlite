@@ -86,3 +86,13 @@ fn test_update_returning_from_clause() {
     let errors = resolver.resolve_statement(&stmt);
     assert_eq!(errors.len(), 1, "Expected error when RETURNING references FROM clause table");
 }
+
+
+#[test]
+fn test_order_by_select_alias() {
+    let schema = make_schema();
+    let stmt = parse_one("SELECT id AS alias_id FROM users ORDER BY alias_id");
+    let mut resolver = Resolver::new(&schema);
+    let errors = resolver.resolve_statement(&stmt);
+    assert!(errors.is_empty(), "Expected no errors, got {:?}", errors);
+}

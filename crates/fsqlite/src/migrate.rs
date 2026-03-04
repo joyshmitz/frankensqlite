@@ -154,19 +154,21 @@ impl MigrationRunner {
     /// On failure, issues ROLLBACK before propagating the error.
     fn apply_one(conn: &Connection, migration: &Migration) -> Result<(), FrankenError> {
         conn.execute("BEGIN;")?;
-
-        // Execute each statement in the migration SQL.
-        use crate::compat::BatchExt;
-        let result = conn.execute_batch(migration.up_sql);
-
-        if let Err(e) = result {
+        let result = Self::apply_one_inner(conn, migration);
+        if result.is_err() {
             // Best-effort rollback; ignore rollback errors since
             // the original error is more informative.
             let _ = conn.execute("ROLLBACK;");
-            return Err(e);
+        } else {
+            conn.execute("COMMIT;")?;
         }
+        result
+    }
 
-        // Record the migration version.
+    /// Executes migration SQL and records the version, without transaction management.
+    fn apply_one_inner(conn: &Connection, migration: &Migration) -> Result<(), FrankenError> {
+        use crate::compat::BatchExt;
+        conn.execute_batch(migration.up_sql)?;
         conn.execute_with_params(
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
             &[
@@ -174,8 +176,6 @@ impl MigrationRunner {
                 SqliteValue::Text(migration.name.to_owned()),
             ],
         )?;
-
-        conn.execute("COMMIT;")?;
         Ok(())
     }
 }

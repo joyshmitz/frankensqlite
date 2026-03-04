@@ -311,13 +311,14 @@ fn emit_upsert_assignments(
     target_regs: i32,
     existing_ctx: &ScanCtx<'_>,
     excluded_ctx: &ScanCtx<'_>,
-) {
+) -> Result<(), CodegenError> {
     for assign in assignments {
         let col_name = match &assign.target {
             AssignmentTarget::Column(name) => name.as_str(),
-            AssignmentTarget::ColumnList(names) => {
-                // Multi-column assignment: only use first column.
-                names.first().map(String::as_str).unwrap_or("")
+            AssignmentTarget::ColumnList(_) => {
+                return Err(CodegenError::Unsupported(
+                    "multi-column SET (a, b) = (...) assignment is not yet supported".to_owned(),
+                ));
             }
         };
         if let Some(col_idx) = table.column_index(col_name) {
@@ -332,6 +333,7 @@ fn emit_upsert_assignments(
             );
         }
     }
+    Ok(())
 }
 
 /// Emit an expression that may reference both `excluded.*` and existing row columns.
@@ -4623,7 +4625,7 @@ fn codegen_insert_values(
                         existing_regs,
                         &existing_ctx,
                         &excluded_ctx,
-                    );
+                    )?;
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
                     emit_index_deletes(b, table, cursor);
@@ -4653,6 +4655,9 @@ fn codegen_insert_values(
                         update_rowid_reg,
                         OE_REPLACE,
                     );
+                    if !returning.is_empty() {
+                        emit_returning(b, cursor, table, returning, update_rowid_reg)?;
+                    }
                     b.resolve_label(skip_update_label);
                 } else {
                     // No WHERE clause — always update on conflict.
@@ -4663,7 +4668,7 @@ fn codegen_insert_values(
                         existing_regs,
                         &existing_ctx,
                         &excluded_ctx,
-                    );
+                    )?;
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
                     emit_index_deletes(b, table, cursor);
@@ -4692,6 +4697,9 @@ fn codegen_insert_values(
                         update_rowid_reg,
                         OE_REPLACE,
                     );
+                    if !returning.is_empty() {
+                        emit_returning(b, cursor, table, returning, update_rowid_reg)?;
+                    }
                 }
 
                 b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);

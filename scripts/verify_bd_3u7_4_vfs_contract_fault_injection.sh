@@ -2,7 +2,7 @@
 # verify_bd_3u7_4_vfs_contract_fault_injection.sh — bead bd-3u7.4 verification runner
 #
 # Usage:
-#   ./scripts/verify_bd_3u7_4_vfs_contract_fault_injection.sh [--json] [--seed N] [--bench-iters N] [--require-io-uring]
+#   ./scripts/verify_bd_3u7_4_vfs_contract_fault_injection.sh [--json] [--seed N] [--bench-iters N] [--require-io-uring] [--max-attempts N]
 
 set -euo pipefail
 
@@ -13,6 +13,7 @@ JSON_OUTPUT=false
 SEED="${BD_3U7_4_SEED:-981286218}"
 BENCH_ITERS="${BD_3U7_4_BENCH_ITERS:-512}"
 REQUIRE_IO_URING="${BD_3U7_4_REQUIRE_IO_URING:-false}"
+MAX_ATTEMPTS="${BD_3U7_4_MAX_ATTEMPTS:-2}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -36,6 +37,12 @@ while [[ $# -gt 0 ]]; do
             REQUIRE_IO_URING=true
             shift
             ;;
+        --max-attempts)
+            shift
+            [[ $# -gt 0 ]] || { echo "ERROR: --max-attempts requires value" >&2; exit 2; }
+            MAX_ATTEMPTS="$1"
+            shift
+            ;;
         *)
             echo "ERROR: unknown argument: $1" >&2
             exit 2
@@ -43,26 +50,57 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if ! [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: --max-attempts must be a positive integer" >&2
+    exit 2
+fi
+
 if ! command -v rch >/dev/null 2>&1; then
     echo "ERROR: rch is required for bd-3u7.4 verification" >&2
     exit 3
 fi
 
-TEST_LOG="$(mktemp)"
 RESULT="pass"
+TEST_LOG=""
+SCENARIO_ARTIFACT_PATH=""
+RUN_ID_FROM_TEST=""
+TRACE_ID=""
+SCENARIO_ID=""
+ATTEMPT_USED=0
 
-if ! BD_3U7_4_SEED="$SEED" \
-     BD_3U7_4_BENCH_ITERS="$BENCH_ITERS" \
-     BD_3U7_4_REQUIRE_IO_URING="$REQUIRE_IO_URING" \
-     rch exec -- cargo test -p fsqlite-harness --test bd_3u7_4_vfs_contract_fault_injection -- --nocapture \
-     >"$TEST_LOG" 2>&1; then
-    RESULT="fail"
-fi
+for (( attempt=1; attempt<=MAX_ATTEMPTS; attempt++ )); do
+    ATTEMPT_USED="$attempt"
+    TEST_LOG="$(mktemp)"
+    RESULT="pass"
 
-SCENARIO_ARTIFACT_PATH="$({ rg -o 'path=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^path=//'; } || true)"
-RUN_ID_FROM_TEST="$({ rg -o 'run_id=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^run_id=//'; } || true)"
-TRACE_ID="$({ rg -o 'trace_id=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^trace_id=//'; } || true)"
-SCENARIO_ID="$({ rg -o 'scenario_id=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^scenario_id=//'; } || true)"
+    if ! BD_3U7_4_SEED="$SEED" \
+         BD_3U7_4_BENCH_ITERS="$BENCH_ITERS" \
+         BD_3U7_4_REQUIRE_IO_URING="$REQUIRE_IO_URING" \
+         rch exec -- cargo test -p fsqlite-harness --test bd_3u7_4_vfs_contract_fault_injection -- --nocapture \
+         >"$TEST_LOG" 2>&1; then
+        RESULT="fail"
+    fi
+
+    SCENARIO_ARTIFACT_PATH="$({ rg -o 'path=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^path=//'; } || true)"
+    RUN_ID_FROM_TEST="$({ rg -o 'run_id=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^run_id=//'; } || true)"
+    TRACE_ID="$({ rg -o 'trace_id=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^trace_id=//'; } || true)"
+    SCENARIO_ID="$({ rg -o 'scenario_id=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^scenario_id=//'; } || true)"
+
+    if [[ "$RESULT" == "pass" ]]; then
+        break
+    fi
+
+    # If the test actually ran and produced scenario metadata, treat failure as authoritative.
+    if [[ -n "$RUN_ID_FROM_TEST" || -n "$SCENARIO_ARTIFACT_PATH" ]]; then
+        break
+    fi
+
+    # No scenario metadata usually means compile drift / pre-test failure.
+    # Retry while attempts remain to reduce false negatives under multi-agent churn.
+    if (( attempt < MAX_ATTEMPTS )); then
+        echo "WARN: bd-3u7.4 verification failed before scenario execution (attempt $attempt/$MAX_ATTEMPTS), retrying..." >&2
+    fi
+done
 
 if [[ -n "$SCENARIO_ARTIFACT_PATH" && "$SCENARIO_ARTIFACT_PATH" != /* ]]; then
     SCENARIO_ARTIFACT_PATH="$REPO_ROOT/$SCENARIO_ARTIFACT_PATH"
@@ -78,6 +116,8 @@ cat >"$VERIFY_ARTIFACT_PATH" <<ENDVERIFY
   "bead_id": "bd-3u7.4",
   "seed": $SEED,
   "bench_iters": $BENCH_ITERS,
+  "attempt_used": $ATTEMPT_USED,
+  "max_attempts": $MAX_ATTEMPTS,
   "require_io_uring": $REQUIRE_IO_URING,
   "result": "$RESULT",
   "test_run_id": "$RUN_ID_FROM_TEST",
@@ -97,6 +137,8 @@ if [[ "$JSON_OUTPUT" == "true" ]]; then
   "bead_id": "bd-3u7.4",
   "seed": $SEED,
   "bench_iters": $BENCH_ITERS,
+  "attempt_used": $ATTEMPT_USED,
+  "max_attempts": $MAX_ATTEMPTS,
   "require_io_uring": $REQUIRE_IO_URING,
   "result": "$RESULT",
   "test_run_id": "$RUN_ID_FROM_TEST",
@@ -114,6 +156,7 @@ else
     echo "Result:        $RESULT"
     echo "Seed:          $SEED"
     echo "Bench iters:   $BENCH_ITERS"
+    echo "Attempt used:  $ATTEMPT_USED / $MAX_ATTEMPTS"
     echo "Require uring: $REQUIRE_IO_URING"
     echo "Test run_id:   $RUN_ID_FROM_TEST"
     echo "Trace ID:      $TRACE_ID"

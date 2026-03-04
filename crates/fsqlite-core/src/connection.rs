@@ -1850,6 +1850,10 @@ impl Connection {
     }
 
     /// Prepare and execute SQL as a query.
+    ///
+    /// When `sql` contains multiple statements, only the result rows from the
+    /// **last** statement are returned. Intermediate statement results are
+    /// discarded. This matches common SQL driver semantics (last statement wins).
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
         let statements = {
             let parse_span = tracing::span!(
@@ -4981,7 +4985,7 @@ impl Connection {
     fn allocate_root_page(&self) -> Result<i32> {
         self.with_pager_write_txn(|cx, txn| {
             let page_no = txn.allocate_page(cx)?;
-            let page_size = PageSize::DEFAULT.get();
+            let page_size = self.pragma_state.borrow().page_size;
             let mut page = vec![0u8; page_size as usize];
             BTreePageHeader::write_empty_leaf_table(&mut page, 0, page_size);
             txn.write_page(cx, page_no, &page)?;
@@ -4995,7 +4999,7 @@ impl Connection {
     fn allocate_index_root_page(&self) -> Result<i32> {
         self.with_pager_write_txn(|cx, txn| {
             let page_no = txn.allocate_page(cx)?;
-            let page_size = PageSize::DEFAULT.get();
+            let page_size = self.pragma_state.borrow().page_size;
             let mut page = vec![0u8; page_size as usize];
             BTreePageHeader::write_empty_leaf_index(&mut page, 0, page_size);
             txn.write_page(cx, page_no, &page)?;
@@ -5495,7 +5499,7 @@ impl Connection {
     #[allow(clippy::too_many_lines)]
     fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
         if create.without_rowid {
-            return Err(FrankenError::Unsupported("WITHOUT ROWID tables are not yet supported".to_owned()));
+            return Err(FrankenError::Unsupported);
         }
 
         let table_name = create.name.name.clone();
@@ -8771,31 +8775,43 @@ impl Connection {
                     Row {
                         values: vec![
                             SqliteValue::Text("dirty_ratio_pct".into()),
-                            SqliteValue::Integer(0),
+                            SqliteValue::Integer(to_i64_u64(snapshot.dirty_ratio_pct)),
                         ],
                     },
                     Row {
-                        values: vec![SqliteValue::Text("t1_size".into()), SqliteValue::Integer(0)],
+                        values: vec![
+                            SqliteValue::Text("t1_size".into()),
+                            SqliteValue::Integer(to_i64_usize(snapshot.t1_size)),
+                        ],
                     },
                     Row {
-                        values: vec![SqliteValue::Text("t2_size".into()), SqliteValue::Integer(0)],
+                        values: vec![
+                            SqliteValue::Text("t2_size".into()),
+                            SqliteValue::Integer(to_i64_usize(snapshot.t2_size)),
+                        ],
                     },
                     Row {
-                        values: vec![SqliteValue::Text("b1_size".into()), SqliteValue::Integer(0)],
+                        values: vec![
+                            SqliteValue::Text("b1_size".into()),
+                            SqliteValue::Integer(to_i64_usize(snapshot.b1_size)),
+                        ],
                     },
                     Row {
-                        values: vec![SqliteValue::Text("b2_size".into()), SqliteValue::Integer(0)],
+                        values: vec![
+                            SqliteValue::Text("b2_size".into()),
+                            SqliteValue::Integer(to_i64_usize(snapshot.b2_size)),
+                        ],
                     },
                     Row {
                         values: vec![
                             SqliteValue::Text("p_target".into()),
-                            SqliteValue::Integer(0),
+                            SqliteValue::Integer(to_i64_usize(snapshot.p_target)),
                         ],
                     },
                     Row {
                         values: vec![
                             SqliteValue::Text("mvcc_multi_version_pages".into()),
-                            SqliteValue::Integer(0),
+                            SqliteValue::Integer(to_i64_usize(snapshot.mvcc_multi_version_pages)),
                         ],
                     },
                     Row {
@@ -11339,16 +11355,9 @@ impl Connection {
         let page1 = txn.get_page(cx, PageNumber::ONE)?;
         let page1_bytes = page1.as_ref();
 
-        eprintln!(
-            "RELOAD_MEMDB: page1_bytes len={}, first 16={:?}",
-            page1_bytes.len(),
-            &page1_bytes[..16.min(page1_bytes.len())]
-        );
-
         // If page 1 is all zeros or doesn't have a valid B-tree header, the
         // database is empty. Reset to a fresh state.
         if page1_bytes.iter().all(|&b| b == 0) || page1_bytes.len() < 100 {
-            eprintln!("RELOAD_MEMDB: DB considered empty. Clearing schema!");
             *self.db.borrow_mut() = MemDatabase::new();
             self.schema.borrow_mut().clear();
             self.views.borrow_mut().clear();
@@ -11390,11 +11399,6 @@ impl Connection {
             }
             (entries, max_rowid)
         };
-
-        eprintln!(
-            "RELOAD_MEMDB: master_entries.len()={}",
-            master_entries.len()
-        );
 
         // Parse each sqlite_master row and rebuild schema + MemDatabase.
         // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
@@ -29357,12 +29361,34 @@ mod schema_loading_tests {
             metrics.get("admit_count"),
             Some(&i64::try_from(snapshot.admits).unwrap_or(i64::MAX))
         );
-        assert_eq!(metrics.get("t1_size"), Some(&0));
-        assert_eq!(metrics.get("t2_size"), Some(&0));
-        assert_eq!(metrics.get("b1_size"), Some(&0));
-        assert_eq!(metrics.get("b2_size"), Some(&0));
-        assert_eq!(metrics.get("p_target"), Some(&0));
-        assert_eq!(metrics.get("mvcc_multi_version_pages"), Some(&0));
+        assert_eq!(
+            metrics.get("dirty_ratio_pct"),
+            Some(&i64::try_from(snapshot.dirty_ratio_pct).unwrap_or(i64::MAX))
+        );
+        assert_eq!(
+            metrics.get("t1_size"),
+            Some(&i64::try_from(snapshot.t1_size).unwrap_or(i64::MAX))
+        );
+        assert_eq!(
+            metrics.get("t2_size"),
+            Some(&i64::try_from(snapshot.t2_size).unwrap_or(i64::MAX))
+        );
+        assert_eq!(
+            metrics.get("b1_size"),
+            Some(&i64::try_from(snapshot.b1_size).unwrap_or(i64::MAX))
+        );
+        assert_eq!(
+            metrics.get("b2_size"),
+            Some(&i64::try_from(snapshot.b2_size).unwrap_or(i64::MAX))
+        );
+        assert_eq!(
+            metrics.get("p_target"),
+            Some(&i64::try_from(snapshot.p_target).unwrap_or(i64::MAX))
+        );
+        assert_eq!(
+            metrics.get("mvcc_multi_version_pages"),
+            Some(&i64::try_from(snapshot.mvcc_multi_version_pages).unwrap_or(i64::MAX))
+        );
     }
 
     #[test]

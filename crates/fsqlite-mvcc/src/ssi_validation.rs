@@ -174,8 +174,12 @@ pub struct DiscoveredEdge {
     pub overlap_key: WitnessKey,
     /// Whether the source is still active (vs committed).
     pub source_is_active: bool,
-    /// Whether the source had an incoming rw edge at time of discovery
-    /// (for T3 rule on committed readers).
+    /// For incoming edges (other → committing): whether the source had an
+    /// incoming rw-antidependency at time of discovery (`has_in_rw`).
+    /// For outgoing edges (committing → other): stores the *target's*
+    /// `had_out_rw` flag, not the source's `has_in_rw`. The field name is
+    /// overloaded — in both cases it captures the relevant pivot-detection
+    /// flag for the SSI dangerous-structure check (T3 rule).
     pub source_has_in_rw: bool,
 }
 

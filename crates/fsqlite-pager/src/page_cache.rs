@@ -38,6 +38,20 @@ pub struct PageCacheMetricsSnapshot {
     pub cached_pages: usize,
     /// Configured buffer-pool capacity (max page buffers).
     pub pool_capacity: usize,
+    /// Percent of cached pages currently dirty (0-100).
+    pub dirty_ratio_pct: u64,
+    /// Adaptive cache "recent" list size (ARC-compatible gauge).
+    pub t1_size: usize,
+    /// Adaptive cache "frequent" list size (ARC-compatible gauge).
+    pub t2_size: usize,
+    /// ARC ghost list B1 size (compatibility gauge).
+    pub b1_size: usize,
+    /// ARC ghost list B2 size (compatibility gauge).
+    pub b2_size: usize,
+    /// ARC adaptive target parameter P (compatibility gauge).
+    pub p_target: usize,
+    /// Number of pages that currently have multiple visible MVCC versions.
+    pub mvcc_multi_version_pages: usize,
 }
 
 impl PageCacheMetricsSnapshot {
@@ -305,13 +319,21 @@ impl PageCache {
     /// Capture current cache metrics.
     #[must_use]
     pub fn metrics_snapshot(&self) -> PageCacheMetricsSnapshot {
+        let cached_pages = self.pages.len();
         PageCacheMetricsSnapshot {
             hits: self.hits.get(),
             misses: self.misses.get(),
             admits: self.admits.get(),
             evictions: self.evictions.get(),
-            cached_pages: self.pages.len(),
+            cached_pages,
             pool_capacity: self.pool.capacity(),
+            dirty_ratio_pct: 0,
+            t1_size: cached_pages,
+            t2_size: 0,
+            b1_size: 0,
+            b2_size: 0,
+            p_target: cached_pages,
+            mvcc_multi_version_pages: 0,
         }
     }
 

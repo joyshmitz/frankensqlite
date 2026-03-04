@@ -577,7 +577,7 @@ impl<'a> Resolver<'a> {
                         }
                     }
                 }
-                let mut returning_scope = scope.clone();
+                let returning_scope = scope.clone();
                 if let Some(from) = &update.from {
                     self.resolve_from(from, scope);
                 }
@@ -661,9 +661,23 @@ impl<'a> Resolver<'a> {
             self.resolve_select_core(core, &mut comp_scope);
         }
 
-        // Resolve ORDER BY against the first core's scope (which contains its FROM aliases).
+        // Resolve ORDER BY against the first core's scope augmented with SELECT aliases.
+        let mut order_by_scope = first_core_scope.clone();
+        if let SelectCore::Select { columns, .. } = &select.body.select {
+            for col in columns {
+                if let ResultColumn::Expr {
+                    alias: Some(alias_id),
+                    ..
+                } = col
+                {
+                    // Add the output column alias so ORDER BY can reference it.
+                    order_by_scope.add_alias(&alias_id, "<output>", None);
+                }
+            }
+        }
+
         for term in &select.order_by {
-            self.resolve_expr(&term.expr, &first_core_scope);
+            self.resolve_expr(&term.expr, &order_by_scope);
         }
 
         // Resolve LIMIT against the base scope (no FROM aliases).

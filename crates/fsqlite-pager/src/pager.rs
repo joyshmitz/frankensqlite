@@ -808,8 +808,12 @@ where
             jrnl_file.sync(cx, SyncFlags::NORMAL)?;
 
             // Phase 2: Write dirty pages to database.
+            let saved_db_size = inner.db_size;
             for (page_no, data) in write_set {
-                inner.flush_page(cx, *page_no, data)?;
+                if let Err(e) = inner.flush_page(cx, *page_no, data) {
+                    inner.db_size = saved_db_size;
+                    return Err(e);
+                }
                 inner.db_size = inner.db_size.max(page_no.get());
             }
 
@@ -2946,16 +2950,10 @@ mod tests {
             "bead_id={BEAD_ID} case=wal_two_frames_appended_including_header"
         );
         let p1_frame = locked_frames.iter().find(|f| f.0 == p1.get()).unwrap();
-        assert_eq!(
-            p1_frame.1[0], 0xAA,
-            "bead_id={BEAD_ID} case=wal_frame_data"
-        );
+        assert_eq!(p1_frame.1[0], 0xAA, "bead_id={BEAD_ID} case=wal_frame_data");
         // Commit frame should have db_size > 0.
         let commit_count = locked_frames.iter().filter(|f| f.2 > 0).count();
-        assert_eq!(
-            commit_count, 1,
-            "bead_id={BEAD_ID} case=wal_commit_marker"
-        );
+        assert_eq!(commit_count, 1, "bead_id={BEAD_ID} case=wal_commit_marker");
         drop(locked_frames);
     }
 

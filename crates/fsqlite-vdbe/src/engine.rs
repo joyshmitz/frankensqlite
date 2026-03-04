@@ -2254,6 +2254,13 @@ struct AggregateContext {
 }
 
 /// Per-accumulator window function context (for `AggInverse` / `AggValue`).
+///
+/// TODO: Window functions are not yet emitted by codegen, so `AggInverse` /
+/// `AggValue` opcodes are currently dead code. When window functions are
+/// implemented, the split between `self.aggregates` (used by `AggStep` /
+/// `AggFinal`) and `self.window_contexts` (used by `AggInverse` / `AggValue`)
+/// must be reconciled — a function registered as both aggregate and window
+/// would need its state shared, not duplicated across the two maps.
 struct WindowContext {
     func: Arc<ErasedWindowFunction>,
     state: Box<dyn Any + Send>,
@@ -4962,6 +4969,11 @@ impl VdbeEngine {
 
                 Opcode::IfEmpty => {
                     // Jump to P2 if the table/index at cursor P1 is empty.
+                    // WARNING: For storage cursors, this repositions the cursor
+                    // to the first entry via `cursor.first()` as a side-effect.
+                    // This is currently dead code (codegen never emits IfEmpty),
+                    // but if this opcode is ever used, the cursor repositioning
+                    // may invalidate assumptions about cursor position.
                     let cursor_id = op.p1;
                     let empty = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         // Try moving to first; false means empty.
