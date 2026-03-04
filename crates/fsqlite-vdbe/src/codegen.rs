@@ -2548,28 +2548,38 @@ fn parse_aggregate_columns(
 /// Handles COALESCE/IFNULL patterns: if the aggregate result in `result_reg`
 /// is NULL, substitute the first non-NULL fallback literal.
 fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
-    if let Expr::FunctionCall {
-        name,
-        args: FunctionArgs::List(args),
-        ..
-    } = wrapper
-    {
-        let upper = name.to_ascii_uppercase();
-        if (upper == "COALESCE" || upper == "IFNULL") && args.len() >= 2 {
-            // Chain: for each fallback, check if result_reg is non-null.
-            // NotNull jumps to done_label if result_reg is already non-null.
-            // Otherwise, load the fallback and check again.
-            let done_label = b.emit_label();
-            for fallback_arg in &args[1..] {
-                // If result_reg is NOT NULL, skip all remaining fallbacks.
-                b.emit_jump_to_label(Opcode::NotNull, result_reg, 0, done_label, P4::None, 0);
-                // Load fallback into result_reg.
-                emit_expr(b, fallback_arg, result_reg, None);
-            }
-            b.resolve_label(done_label);
-        }
-    }
-    // For unsupported wrapper patterns, the aggregate result is emitted as-is.
+    let fake_table = TableSchema {
+        name: "".to_owned(),
+        root_page: 0,
+        columns: vec![ColumnInfo {
+            name: "__agg_result__".to_owned(),
+            affinity: 'A',
+            is_ipk: false,
+            type_name: Some("ANY".to_owned()),
+            notnull: false,
+            unique: false,
+            default_value: None,
+            strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
+            collation: None,
+        }],
+        indexes: vec![],
+        strict: false,
+        foreign_keys: Vec::new(),
+        check_constraints: Vec::new(),
+    };
+    let scan = ScanCtx {
+        cursor: 0,
+        table: &fake_table,
+        table_alias: None,
+        schema: None,
+        register_base: Some(result_reg),
+    };
+    let temp = b.alloc_temp();
+    emit_expr(b, wrapper, temp, Some(&scan));
+    b.emit_op(Opcode::Copy, temp, result_reg, 0, P4::None, 0);
+    b.free_temp(temp);
 }
 
 /// Extract the single aggregate function call from a wrapper expression.
@@ -2580,93 +2590,191 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
 ///
 /// Handles patterns like `COALESCE(MAX(x), 0)`, `ABS(SUM(x))`, etc.
 fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColumn, Expr)> {
-    // Pattern: non-aggregate FunctionCall wrapping an aggregate in its args.
     if let Expr::FunctionCall {
-        name,
-        args: FunctionArgs::List(outer_args),
+        name: agg_name,
+        args: agg_args,
+        distinct,
+        filter,
         ..
     } = expr
     {
-        if is_aggregate_function(name) {
-            return None; // Already a bare aggregate — shouldn't reach here.
-        }
-        // Find the first argument that is an aggregate function call.
-        for (i, arg) in outer_args.iter().enumerate() {
-            if let Expr::FunctionCall {
-                name: agg_name,
-                args: agg_args,
-                distinct,
-                filter,
-                ..
-            } = arg
-            {
-                if !is_aggregate_function(agg_name) {
-                    continue;
-                }
-                let canon_name = agg_name.to_ascii_uppercase();
-                let filt = filter.clone();
-                let agg_col = match agg_args {
-                    FunctionArgs::Star => AggColumn {
+        if is_aggregate_function(agg_name) {
+            let canon_name = agg_name.to_ascii_uppercase();
+            let filt = filter.clone();
+            let agg_col = match agg_args {
+                FunctionArgs::Star => AggColumn {
+                    name: canon_name,
+                    num_args: 0,
+                    arg_col_index: None,
+                    arg_is_rowid: false,
+                    distinct: *distinct,
+                    arg_expr: None,
+                    extra_args: Vec::new(),
+                    filter: filt,
+                    wrapper_expr: None,
+                },
+                FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
+                    name: canon_name,
+                    num_args: 0,
+                    arg_col_index: None,
+                    arg_is_rowid: false,
+                    distinct: *distinct,
+                    arg_expr: None,
+                    extra_args: Vec::new(),
+                    filter: filt,
+                    wrapper_expr: None,
+                },
+                FunctionArgs::List(exprs) => {
+                    let (col_idx, is_rowid, a_expr) =
+                        match resolve_column_ref(&exprs[0], table, None) {
+                            Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
+                            Some(SortKeySource::Rowid) => (None, true, None),
+                            _ => (None, false, Some(Box::new(exprs[0].clone()))),
+                        };
+                    let extra: Vec<Expr> = exprs[1..].to_vec();
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    AggColumn {
                         name: canon_name,
-                        num_args: 0,
-                        arg_col_index: None,
-                        arg_is_rowid: false,
+                        num_args: exprs.len() as i32,
+                        arg_col_index: col_idx,
+                        arg_is_rowid: is_rowid,
                         distinct: *distinct,
-                        arg_expr: None,
-                        extra_args: Vec::new(),
+                        arg_expr: a_expr,
+                        extra_args: extra,
                         filter: filt,
                         wrapper_expr: None,
-                    },
-                    FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
-                        name: canon_name,
-                        num_args: 0,
-                        arg_col_index: None,
-                        arg_is_rowid: false,
-                        distinct: *distinct,
-                        arg_expr: None,
-                        extra_args: Vec::new(),
-                        filter: filt,
-                        wrapper_expr: None,
-                    },
-                    FunctionArgs::List(exprs) => {
-                        let (col_idx, is_rowid, a_expr) =
-                            match resolve_column_ref(&exprs[0], table, None) {
-                                Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
-                                Some(SortKeySource::Rowid) => (None, true, None),
-                                _ => (None, false, Some(Box::new(exprs[0].clone()))),
-                            };
-                        let extra: Vec<Expr> = exprs[1..].to_vec();
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                        AggColumn {
-                            name: canon_name,
-                            num_args: exprs.len() as i32,
-                            arg_col_index: col_idx,
-                            arg_is_rowid: is_rowid,
-                            distinct: *distinct,
-                            arg_expr: a_expr,
-                            extra_args: extra,
-                            filter: filt,
-                            wrapper_expr: None,
-                        }
                     }
-                };
-                // Build wrapper: replace the aggregate arg with a placeholder.
-                let placeholder =
-                    Expr::Column(ColumnRef::bare("__agg_result__"), fsqlite_ast::Span::ZERO);
-                let mut new_args = outer_args.clone();
-                new_args[i] = placeholder;
-                let wrapper = Expr::FunctionCall {
-                    name: name.clone(),
-                    args: FunctionArgs::List(new_args),
-                    distinct: false,
-                    order_by: Vec::new(),
-                    filter: None,
-                    over: None,
-                    span: fsqlite_ast::Span::ZERO,
-                };
-                return Some((agg_col, wrapper));
+                }
+            };
+            let placeholder = Expr::Column(ColumnRef::bare("__agg_result__"), fsqlite_ast::Span::ZERO);
+            return Some((agg_col, placeholder));
+        }
+    }
+
+    match expr {
+        Expr::FunctionCall { name, args, distinct, order_by, filter, over, span } => {
+            if let FunctionArgs::List(exprs) = args {
+                for (i, arg) in exprs.iter().enumerate() {
+                    if let Some((agg_col, new_arg)) = extract_inner_aggregate(arg, table) {
+                        let mut new_exprs = exprs.clone();
+                        new_exprs[i] = new_arg;
+                        return Some((agg_col, Expr::FunctionCall {
+                            name: name.clone(),
+                            args: FunctionArgs::List(new_exprs),
+                            distinct: *distinct,
+                            order_by: order_by.clone(),
+                            filter: filter.clone(),
+                            over: over.clone(),
+                            span: *span,
+                        }));
+                    }
+                }
             }
         }
+        Expr::BinaryOp { left, op, right, span } => {
+            if let Some((agg_col, new_left)) = extract_inner_aggregate(left, table) {
+                return Some((agg_col, Expr::BinaryOp {
+                    left: Box::new(new_left),
+                    op: *op,
+                    right: right.clone(),
+                    span: *span,
+                }));
+            }
+            if let Some((agg_col, new_right)) = extract_inner_aggregate(right, table) {
+                return Some((agg_col, Expr::BinaryOp {
+                    left: left.clone(),
+                    op: *op,
+                    right: Box::new(new_right),
+                    span: *span,
+                }));
+            }
+        }
+        Expr::UnaryOp { op, expr: inner, span } => {
+            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
+                return Some((agg_col, Expr::UnaryOp {
+                    op: *op,
+                    expr: Box::new(new_inner),
+                    span: *span,
+                }));
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            span,
+        } => {
+            if let Some(b) = operand {
+                if let Some((agg_col, new_base)) = extract_inner_aggregate(b, table) {
+                    return Some((agg_col, Expr::Case {
+                        operand: Some(Box::new(new_base)),
+                        whens: whens.clone(),
+                        else_expr: else_expr.clone(),
+                        span: *span,
+                    }));
+                }
+            }
+            for (i, (cond, val)) in whens.iter().enumerate() {
+                if let Some((agg_col, new_cond)) = extract_inner_aggregate(cond, table) {
+                    let mut new_whens = whens.clone();
+                    new_whens[i].0 = new_cond;
+                    return Some((agg_col, Expr::Case {
+                        operand: operand.clone(),
+                        whens: new_whens,
+                        else_expr: else_expr.clone(),
+                        span: *span,
+                    }));
+                }
+                if let Some((agg_col, new_val)) = extract_inner_aggregate(val, table) {
+                    let mut new_whens = whens.clone();
+                    new_whens[i].1 = new_val;
+                    return Some((agg_col, Expr::Case {
+                        operand: operand.clone(),
+                        whens: new_whens,
+                        else_expr: else_expr.clone(),
+                        span: *span,
+                    }));
+                }
+            }
+            if let Some(e) = else_expr {
+                if let Some((agg_col, new_else)) = extract_inner_aggregate(e, table) {
+                    return Some((agg_col, Expr::Case {
+                        operand: operand.clone(),
+                        whens: whens.clone(),
+                        else_expr: Some(Box::new(new_else)),
+                        span: *span,
+                    }));
+                }
+            }
+        }
+        Expr::IsNull { expr: inner, not, span } => {
+            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
+                return Some((agg_col, Expr::IsNull {
+                    expr: Box::new(new_inner),
+                    not: *not,
+                    span: *span,
+                }));
+            }
+        }
+        Expr::Cast { expr: inner, type_name, span } => {
+            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
+                return Some((agg_col, Expr::Cast {
+                    expr: Box::new(new_inner),
+                    type_name: type_name.clone(),
+                    span: *span,
+                }));
+            }
+        }
+        Expr::Collate { expr: inner, collation, span } => {
+            if let Some((agg_col, new_inner)) = extract_inner_aggregate(inner, table) {
+                return Some((agg_col, Expr::Collate {
+                    expr: Box::new(new_inner),
+                    collation: collation.clone(),
+                    span: *span,
+                }));
+            }
+        }
+        _ => {}
     }
     None
 }

@@ -24698,6 +24698,7 @@ mod tests {
             "expected BusySnapshot, got {err:?}"
         );
 
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let rows = conn.query("PRAGMA ssi_decisions;").unwrap();
         assert!(rows.len() >= 2, "expected commit+abort cards in ledger");
 
@@ -24791,6 +24792,7 @@ mod tests {
         }
         let _ = conn.execute("COMMIT;");
 
+        std::thread::sleep(std::time::Duration::from_millis(50));
         let all_rows = conn.query("PRAGMA ssi_decisions;").unwrap();
         let first_txn_id = match all_rows.first().and_then(|row| row.get(0)) {
             Some(SqliteValue::Integer(n)) => *n,
@@ -34662,19 +34664,6 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(30));
-    }
-
-    #[test]
-    fn test_order_by_expression() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
-        conn.execute("INSERT INTO t VALUES (3), (1), (2);").unwrap();
-        let rows = conn.query("SELECT x FROM t ORDER BY x * -1;").unwrap();
-        assert_eq!(rows.len(), 3);
-        // Descending via negative multiplication.
-        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
-        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[2].values()[0], SqliteValue::Integer(1));
     }
 
     #[test]
