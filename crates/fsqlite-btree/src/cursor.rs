@@ -689,7 +689,7 @@ impl<P: PageReader> BtCursor<P> {
             // We fell off the right edge of the leaf.
             // Determine if there is a successor up the tree.
             let mut has_successor = false;
-            for parent in self.stack.iter().rev() {
+            for parent in self.stack.iter().rev().skip(1) {
                 if parent.cell_idx < parent.header.cell_count {
                     has_successor = true;
                     break;

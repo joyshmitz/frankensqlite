@@ -2942,21 +2942,18 @@ mod tests {
         let locked_frames = frames.lock().unwrap();
         assert_eq!(
             locked_frames.len(),
-            1,
-            "bead_id={BEAD_ID} case=wal_one_frame_appended"
+            2,
+            "bead_id={BEAD_ID} case=wal_two_frames_appended_including_header"
         );
+        let p1_frame = locked_frames.iter().find(|f| f.0 == p1.get()).unwrap();
         assert_eq!(
-            locked_frames[0].0,
-            p1.get(),
-            "bead_id={BEAD_ID} case=wal_frame_page_number"
-        );
-        assert_eq!(
-            locked_frames[0].1[0], 0xAA,
+            p1_frame.1[0], 0xAA,
             "bead_id={BEAD_ID} case=wal_frame_data"
         );
         // Commit frame should have db_size > 0.
-        assert!(
-            locked_frames[0].2 > 0,
+        let commit_count = locked_frames.iter().filter(|f| f.2 > 0).count();
+        assert_eq!(
+            commit_count, 1,
             "bead_id={BEAD_ID} case=wal_commit_marker"
         );
         drop(locked_frames);
@@ -2978,7 +2975,7 @@ mod tests {
         let locked_frames = frames.lock().unwrap();
         assert_eq!(
             locked_frames.len(),
-            2,
+            3,
             "bead_id={BEAD_ID} case=wal_multi_page_count"
         );
         // Exactly one frame should be the commit frame (db_size > 0).

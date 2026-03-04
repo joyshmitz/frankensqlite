@@ -431,11 +431,7 @@ impl<'a> Lexer<'a> {
                 }
             } else {
                 // Unterminated string
-                let rest = String::from_utf8_lossy(&self.src[self.pos..]).into_owned();
-                value.push_str(&rest);
-                while self.pos < self.src.len() {
-                    self.advance();
-                }
+                self.pos = self.src.len();
                 return TokenKind::Error(format!(
                     "unterminated string literal starting at byte {}",
                     start
@@ -469,9 +465,7 @@ impl<'a> Lexer<'a> {
                     return TokenKind::QuotedId(value, true);
                 }
             } else {
-                while self.pos < self.src.len() {
-                    self.advance();
-                }
+                self.pos = self.src.len();
                 return TokenKind::Error(format!(
                     "unterminated double-quoted identifier at byte {}",
                     start
@@ -504,9 +498,7 @@ impl<'a> Lexer<'a> {
                     return TokenKind::QuotedId(value, false);
                 }
             } else {
-                while self.pos < self.src.len() {
-                    self.advance();
-                }
+                self.pos = self.src.len();
                 return TokenKind::Error(format!(
                     "unterminated backtick identifier at byte {}",
                     start
@@ -532,9 +524,7 @@ impl<'a> Lexer<'a> {
             self.advance(); // skip ]
             TokenKind::QuotedId(value, false)
         } else {
-            while self.pos < self.src.len() {
-                self.advance();
-            }
+            self.pos = self.src.len();
             TokenKind::Error(format!("unterminated bracket identifier at byte {}", start))
         }
     }
@@ -580,9 +570,7 @@ impl<'a> Lexer<'a> {
             }
             TokenKind::Blob(bytes)
         } else {
-            while self.pos < self.src.len() {
-                self.advance();
-            }
+            self.pos = self.src.len();
             TokenKind::Error(format!("unterminated blob literal at byte {}", start))
         }
     }

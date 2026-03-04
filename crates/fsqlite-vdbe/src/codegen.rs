@@ -681,81 +681,6 @@ fn count_anon_placeholders_in_frame_bound(bound: &fsqlite_ast::FrameBound) -> u3
     }
 }
 
-fn contains_unsupported_in_expr(expr: &Expr) -> bool {
-    match expr {
-        Expr::In {
-            expr: inner, set, ..
-        } => {
-            contains_unsupported_in_expr(inner)
-                || match set {
-                    fsqlite_ast::InSet::List(items) => {
-                        items.iter().any(contains_unsupported_in_expr)
-                    }
-                    // `IN (SELECT ...)` / `IN table` are handled by runtime probe
-                    // codegen in `emit_expr`.
-                    fsqlite_ast::InSet::Subquery(_) | fsqlite_ast::InSet::Table(_) => false,
-                }
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            contains_unsupported_in_expr(left) || contains_unsupported_in_expr(right)
-        }
-        Expr::UnaryOp { expr: inner, .. }
-        | Expr::IsNull { expr: inner, .. }
-        | Expr::Cast { expr: inner, .. }
-        | Expr::Collate { expr: inner, .. } => contains_unsupported_in_expr(inner),
-        Expr::Between {
-            expr: inner,
-            low,
-            high,
-            ..
-        } => {
-            contains_unsupported_in_expr(inner)
-                || contains_unsupported_in_expr(low)
-                || contains_unsupported_in_expr(high)
-        }
-        Expr::Like {
-            expr: inner,
-            pattern,
-            escape,
-            ..
-        } => {
-            contains_unsupported_in_expr(inner)
-                || contains_unsupported_in_expr(pattern)
-                || escape.as_deref().is_some_and(contains_unsupported_in_expr)
-        }
-        Expr::Case {
-            operand,
-            whens,
-            else_expr,
-            ..
-        } => {
-            operand.as_deref().is_some_and(contains_unsupported_in_expr)
-                || whens.iter().any(|(cond, then_expr)| {
-                    contains_unsupported_in_expr(cond) || contains_unsupported_in_expr(then_expr)
-                })
-                || else_expr
-                    .as_deref()
-                    .is_some_and(contains_unsupported_in_expr)
-        }
-        Expr::FunctionCall {
-            args: FunctionArgs::List(args),
-            ..
-        } => args.iter().any(contains_unsupported_in_expr),
-        Expr::RowValue(items, _) => items.iter().any(contains_unsupported_in_expr),
-        _ => false,
-    }
-}
-
-fn contains_unsupported_in_result_column(col: &ResultColumn) -> bool {
-    match col {
-        ResultColumn::Expr { expr, .. } => contains_unsupported_in_expr(expr),
-        ResultColumn::Star | ResultColumn::TableStar(_) => false,
-    }
-}
-
-fn unsupported_in_message() -> String {
-    "IN (SELECT ...) / IN table requires rewrite before VDBE codegen".to_owned()
-}
 
 // ---------------------------------------------------------------------------
 // SELECT codegen
@@ -790,22 +715,6 @@ pub fn codegen_select(
         }
     };
 
-    if columns.iter().any(contains_unsupported_in_result_column)
-        || where_clause
-            .as_ref()
-            .is_some_and(|expr| contains_unsupported_in_expr(expr))
-        || group_by.iter().any(contains_unsupported_in_expr)
-        || having
-            .as_ref()
-            .is_some_and(|expr| contains_unsupported_in_expr(expr))
-        || stmt
-            .order_by
-            .iter()
-            .any(|term| contains_unsupported_in_expr(&term.expr))
-    {
-        return Err(CodegenError::Unsupported(unsupported_in_message()));
-    }
-
     // Handle SELECT without FROM (e.g. SELECT 1, SELECT 1+1, SELECT abs(-5)).
     if from.is_none() {
         codegen_select_without_from(b, columns, where_clause.as_deref());
@@ -813,9 +722,8 @@ pub fn codegen_select(
     }
 
     // Determine the table from the FROM clause.
-    let from_clause = from
-        .as_ref()
-        .ok_or_else(|| CodegenError::Unsupported("SELECT without FROM".to_owned()))?;
+    // SAFETY: `from.is_none()` is handled above; `.expect` cannot panic.
+    let from_clause = from.as_ref().expect("from already checked above");
 
     let (table_name, table_alias, time_travel) = match &from_clause.source {
         fsqlite_ast::TableOrSubquery::Table {
@@ -4223,6 +4131,12 @@ pub fn codegen_insert(
                 let mut explicit_rowids: Vec<Option<Expr>> = Vec::with_capacity(rows.len());
                 let mut reordered: Vec<Vec<Expr>> = Vec::with_capacity(rows.len());
                 for row in rows {
+                    if row.len() != stmt.columns.len() {
+                        return Err(CodegenError::Unsupported(format!(
+                            "{} values for {} columns",
+                            row.len(), stmt.columns.len()
+                        )));
+                    }
                     let mut table_order = defaults.clone();
                     let mut explicit_rowid = None;
                     for (val_pos, col_name) in stmt.columns.iter().enumerate() {
@@ -4275,6 +4189,13 @@ pub fn codegen_insert(
             } else {
                 ctx.clone()
             };
+
+            let expected_cols = if stmt.columns.is_empty() {
+                Some(table.columns.len())
+            } else {
+                Some(stmt.columns.len())
+            };
+
             codegen_insert_select(
                 b,
                 select_stmt,
@@ -4284,6 +4205,7 @@ pub fn codegen_insert(
                 &stmt.returning,
                 &select_ctx,
                 oe_flag,
+                expected_cols,
             )?;
         }
         InsertSource::DefaultValues => {
@@ -4416,6 +4338,18 @@ fn codegen_insert_values(
         .first()
         .ok_or_else(|| CodegenError::Unsupported("empty VALUES".to_owned()))?
         .len();
+
+    // If no explicit rowids were mapped (meaning no column list was provided in the INSERT statement),
+    // the number of values MUST exactly match the number of columns in the table.
+    if explicit_rowids.is_none() && n_cols != table.columns.len() {
+        return Err(CodegenError::Unsupported(format!(
+            "table {} has {} columns but {} values were supplied",
+            table.name,
+            table.columns.len(),
+            n_cols
+        )));
+    }
+
     let rowid_reg = b.alloc_reg();
     let val_regs = b.alloc_regs(n_cols as i32);
     let rec_reg = b.alloc_reg();
@@ -4861,6 +4795,7 @@ fn codegen_insert_select(
     returning: &[ResultColumn],
     ctx: &CodegenContext,
     oe_flag: u16,
+    expected_cols: Option<usize>,
 ) -> Result<(), CodegenError> {
     // Extract columns, FROM, and WHERE from the inner SELECT.
     let (columns, from, where_clause) = match &select_stmt.body.select {
@@ -4887,20 +4822,12 @@ fn codegen_insert_select(
             returning,
             ctx,
             oe_flag,
+            expected_cols,
         );
     }
 
-    let from_clause = from
-        .as_ref()
-        .ok_or_else(|| CodegenError::Unsupported("INSERT ... SELECT without FROM".to_owned()))?;
-
-    if columns.iter().any(contains_unsupported_in_result_column)
-        || where_clause
-            .as_ref()
-            .is_some_and(|expr| contains_unsupported_in_expr(expr))
-    {
-        return Err(CodegenError::Unsupported(unsupported_in_message()));
-    }
+    // SAFETY: `from.is_none()` is handled above; `.expect` cannot panic.
+    let from_clause = from.as_ref().expect("from already checked above");
 
     let (src_table_name, src_table_alias) = match &from_clause.source {
         fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
@@ -4917,6 +4844,16 @@ fn codegen_insert_select(
 
     // Determine the number of output columns from the SELECT.
     let n_cols = result_column_count(columns, src_table);
+    let n_cols_usize = usize::try_from(n_cols).unwrap_or(0);
+
+    if let Some(expected) = expected_cols {
+        if n_cols_usize != expected {
+            return Err(CodegenError::Unsupported(format!(
+                "table {} has {} columns but {} values were supplied",
+                target_table.name, expected, n_cols_usize
+            )));
+        }
+    }
 
     // Allocate registers for the scan → insert pipeline.
     let rowid_reg = b.alloc_reg();
@@ -5075,8 +5012,20 @@ fn codegen_insert_select_without_from(
     returning: &[ResultColumn],
     ctx: &CodegenContext,
     oe_flag: u16,
+    expected_cols: Option<usize>,
 ) -> Result<(), CodegenError> {
     let n_cols = result_column_count_without_from(columns)?;
+    let n_cols_usize = usize::try_from(n_cols).unwrap_or(0);
+
+    if let Some(expected) = expected_cols {
+        if n_cols_usize != expected {
+            return Err(CodegenError::Unsupported(format!(
+                "table {} has {} columns but {} values were supplied",
+                target_table.name, expected, n_cols_usize
+            )));
+        }
+    }
+
     let rowid_reg = b.alloc_reg();
     let val_regs = b.alloc_regs(n_cols);
     let rec_reg = b.alloc_reg();
@@ -5198,17 +5147,6 @@ pub fn codegen_update(
     let end_label = b.emit_label();
     let done_label = b.emit_label();
 
-    if stmt
-        .where_clause
-        .as_ref()
-        .is_some_and(contains_unsupported_in_expr)
-        || stmt
-            .assignments
-            .iter()
-            .any(|assign| contains_unsupported_in_expr(&assign.value))
-    {
-        return Err(CodegenError::Unsupported(unsupported_in_message()));
-    }
     if stmt.from.is_some() {
         return Err(CodegenError::Unsupported(
             "UPDATE ... FROM is not supported in VDBE codegen path".to_owned(),
@@ -5502,13 +5440,6 @@ pub fn codegen_delete(
     let end_label = b.emit_label();
     let done_label = b.emit_label();
 
-    if stmt
-        .where_clause
-        .as_ref()
-        .is_some_and(contains_unsupported_in_expr)
-    {
-        return Err(CodegenError::Unsupported(unsupported_in_message()));
-    }
     if !stmt.order_by.is_empty() || stmt.limit.is_some() {
         return Err(CodegenError::Unsupported(
             "DELETE ORDER BY/LIMIT/OFFSET must be materialized before codegen".to_owned(),

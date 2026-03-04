@@ -49,6 +49,8 @@ compile_error!("fsqlite-vfs on Linux requires `linux-asupersync-uring`");
 const IO_URING_LOCK_POISONED_MSG: &str = "io_uring runtime lock poisoned";
 const IO_URING_READ_PANICKED_MSG: &str = "io_uring read panicked";
 const IO_URING_WRITE_PANICKED_MSG: &str = "io_uring write panicked";
+const IO_URING_READ_ERROR_FALLBACK_MSG: &str = "io_uring read error fallback";
+const IO_URING_WRITE_ERROR_FALLBACK_MSG: &str = "io_uring write error fallback";
 const IO_URING_READ_CONFORMAL_BREACH_MSG: &str = "io_uring read conformal tail breach";
 const IO_URING_WRITE_CONFORMAL_BREACH_MSG: &str = "io_uring write conformal tail breach";
 const IO_URING_MAX_RW_CHUNK_BYTES: usize = 64 * 1024;
@@ -56,6 +58,10 @@ const IO_URING_MAX_RW_CHUNK_BYTES: usize = 64 * 1024;
 const IO_URING_ASUPERSYNC_INIT_FAILED_MSG: &str = "asupersync io_uring backend init failed";
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_INIT_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+static FORCE_ASUPERSYNC_READ_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+static FORCE_ASUPERSYNC_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -370,6 +376,13 @@ impl IoUringFile {
                     ))
                 })?;
 
+            #[cfg(test)]
+            if FORCE_ASUPERSYNC_READ_FAIL.load(Ordering::Acquire) {
+                return Err(FrankenError::Io(io::Error::other(
+                    "forced asupersync read failure",
+                )));
+            }
+
             let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pollster::block_on(backend.read_at(&mut buf[total..chunk_end], off))
             }));
@@ -492,6 +505,12 @@ impl IoUringFile {
                         "offset overflow during io_uring write",
                     ))
                 })?;
+            #[cfg(test)]
+            if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
+                return Err(FrankenError::Io(io::Error::other(
+                    "forced asupersync write failure",
+                )));
+            }
             let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pollster::block_on(backend.write_at(&buf[total..chunk_end], off))
             }));
@@ -613,6 +632,7 @@ impl VfsFile for IoUringFile {
                     return Ok(bytes);
                 }
                 Err(_) => {
+                    self.runtime.disable(IO_URING_READ_ERROR_FALLBACK_MSG);
                     record_io_uring_unix_fallback();
                 }
             }
@@ -642,6 +662,7 @@ impl VfsFile for IoUringFile {
                     return Ok(());
                 }
                 Err(_) => {
+                    self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
                     record_io_uring_unix_fallback();
                 }
             }
@@ -893,5 +914,65 @@ mod tests {
             .expect("read should succeed via unix fallback");
         assert_eq!(n, 8);
         assert_eq!(&buf, b"fallback");
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_asupersync_write_error_disables_runtime_and_falls_back() {
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        if !vfs.is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("asupersync_forced_write_failure.db");
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open should succeed");
+
+        FORCE_ASUPERSYNC_WRITE_FAIL.store(true, Ordering::Release);
+        file.write(&cx, b"fallback", 0)
+            .expect("write should succeed via unix fallback");
+        FORCE_ASUPERSYNC_WRITE_FAIL.store(false, Ordering::Release);
+
+        assert!(vfs.runtime.is_disabled());
+        assert!(!vfs.is_available());
+
+        let mut buf = [0_u8; 8];
+        let n = file
+            .read(&cx, &mut buf, 0)
+            .expect("read should use unix path after runtime disable");
+        assert_eq!(n, 8);
+        assert_eq!(&buf, b"fallback");
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_asupersync_read_error_disables_runtime_and_falls_back() {
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        if !vfs.is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("asupersync_forced_read_failure.db");
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open should succeed");
+
+        file.write(&cx, b"fallback", 0)
+            .expect("write should seed data");
+
+        FORCE_ASUPERSYNC_READ_FAIL.store(true, Ordering::Release);
+        let mut buf = [0_u8; 8];
+        let n = file
+            .read(&cx, &mut buf, 0)
+            .expect("read should succeed via unix fallback");
+        FORCE_ASUPERSYNC_READ_FAIL.store(false, Ordering::Release);
+
+        assert_eq!(n, 8);
+        assert_eq!(&buf, b"fallback");
+        assert!(vfs.runtime.is_disabled());
+        assert!(!vfs.is_available());
     }
 }

@@ -768,7 +768,7 @@ mod tests {
 
     #[test]
     fn buffer_flush_on_overflow() {
-        reset_betree_metrics();
+        let snap_before = betree_metrics_snapshot();
         let config = BeTreeConfig {
             buffer_capacity: 2,
             leaf_capacity: 4,
@@ -779,8 +779,9 @@ mod tests {
         for i in 0..20 {
             tree.insert(i, i);
         }
-        let snap = betree_metrics_snapshot();
-        assert!(snap.buffer_flushes_total > 0, "expected flush events");
+        let snap_after = betree_metrics_snapshot();
+        let flushes = snap_after.buffer_flushes_total.saturating_sub(snap_before.buffer_flushes_total);
+        assert!(flushes > 0, "expected flush events, got {flushes}");
         assert_eq!(tree.len(), 20);
         // Verify all values.
         for i in 0..20 {

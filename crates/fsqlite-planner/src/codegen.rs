@@ -708,9 +708,14 @@ fn codegen_insert_select(
         ));
     }
 
-    // Extract columns and FROM from the inner SELECT.
-    let (columns, from) = match &select_stmt.body.select {
-        SelectCore::Select { columns, from, .. } => (columns, from),
+    // Extract columns, FROM, and WHERE from the inner SELECT.
+    let (columns, from, where_clause) = match &select_stmt.body.select {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            ..
+        } => (columns, from, where_clause),
         SelectCore::Values(rows) => {
             return codegen_insert_values(
                 b,
@@ -724,9 +729,19 @@ fn codegen_insert_select(
         }
     };
 
-    let from_clause = from
-        .as_ref()
-        .ok_or_else(|| CodegenError::Unsupported("INSERT ... SELECT without FROM".to_owned()))?;
+    // Handle INSERT ... SELECT <exprs> (no FROM clause).
+    let Some(from_clause) = from.as_ref() else {
+        return codegen_insert_select_expr_only(
+            b,
+            columns,
+            where_clause.as_deref(),
+            write_cursor,
+            target_table,
+            returning,
+            ctx,
+            oe_flag,
+        );
+    };
 
     let src_table_name = match &from_clause.source {
         fsqlite_ast::TableOrSubquery::Table { name, .. } => &name.name,
@@ -808,6 +823,105 @@ fn codegen_insert_select(
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, read_cursor, 0, 0, P4::None, 0);
 
+    Ok(())
+}
+
+/// Emit INSERT bytecode for `INSERT INTO target SELECT expr1, expr2, ...`
+/// (no FROM clause — expression-only single-row insert).
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn codegen_insert_select_expr_only(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    write_cursor: i32,
+    target_table: &TableSchema,
+    returning: &[ResultColumn],
+    ctx: &CodegenContext,
+    oe_flag: u16,
+) -> Result<(), CodegenError> {
+    // Count output columns: Expr → 1, Star/TableStar → 1 (yields NULL without table).
+    let n_cols = columns
+        .iter()
+        .map(|c| match c {
+            ResultColumn::Expr { .. } | ResultColumn::Star | ResultColumn::TableStar(_) => 1i32,
+        })
+        .sum::<i32>();
+
+    if n_cols == 0 {
+        return Err(CodegenError::Unsupported(
+            "INSERT ... SELECT with no columns".to_owned(),
+        ));
+    }
+
+    let rowid_reg = b.alloc_reg();
+    let val_regs = b.alloc_regs(n_cols);
+    let rec_reg = b.alloc_reg();
+    let concurrent_flag = i32::from(ctx.concurrent_mode);
+    let done_label = b.emit_label();
+
+    // Optional WHERE filter (e.g., INSERT INTO t SELECT 1 WHERE condition).
+    if let Some(where_expr) = where_clause {
+        let filter_reg = b.alloc_reg();
+        emit_expr(b, where_expr, filter_reg)?;
+        b.emit_jump_to_label(Opcode::IfNot, filter_reg, 1, done_label, P4::None, 0);
+    }
+
+    // Evaluate each result column expression into val_regs.
+    let mut reg = val_regs;
+    for col in columns {
+        match col {
+            ResultColumn::Expr { expr, .. } => {
+                emit_expr(b, expr, reg)?;
+                reg += 1;
+            }
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                // Star without a table produces NULL.
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                reg += 1;
+            }
+        }
+    }
+
+    // Auto-generate rowid.
+    b.emit_op(
+        Opcode::NewRowid,
+        write_cursor,
+        rowid_reg,
+        concurrent_flag,
+        P4::None,
+        0,
+    );
+
+    // MakeRecord from evaluated column values.
+    b.emit_op(
+        Opcode::MakeRecord,
+        val_regs,
+        n_cols,
+        rec_reg,
+        P4::Affinity(target_table.affinity_string()),
+        0,
+    );
+
+    // Insert into target table.
+    b.emit_op(
+        Opcode::Insert,
+        write_cursor,
+        rec_reg,
+        rowid_reg,
+        P4::Table(target_table.name.clone()),
+        oe_flag,
+    );
+
+    // RETURNING clause: emit ResultRow with rowid if present.
+    if !returning.is_empty() {
+        b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
+    }
+
+    b.resolve_label(done_label);
     Ok(())
 }
 
@@ -2103,6 +2217,89 @@ mod tests {
             .find(|op| op.opcode == Opcode::OpenRead)
             .unwrap();
         assert_eq!(open_read.p2, 3);
+    }
+
+    // === Test: INSERT ... SELECT without FROM (expression-only) ===
+    #[test]
+    fn test_codegen_insert_select_without_from() {
+        // INSERT INTO t SELECT 42, 'hello'
+        let inner_select = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Literal(Literal::Integer(42), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Literal(
+                                Literal::String("hello".to_owned()),
+                                Span::ZERO,
+                            ),
+                            alias: None,
+                        },
+                    ],
+                    from: None,
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Select(Box::new(inner_select)),
+            upsert: vec![],
+            returning: vec![],
+        };
+
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should produce a single-row insert without OpenRead/Rewind/Next.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::OpenWrite,
+                Opcode::Integer,  // 42
+                Opcode::String8,  // 'hello'
+                Opcode::NewRowid,
+                Opcode::MakeRecord,
+                Opcode::Insert,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+
+        // No OpenRead — no source table.
+        assert!(prog
+            .ops()
+            .iter()
+            .all(|op| op.opcode != Opcode::OpenRead));
+
+        // Transaction should be write (p2=1).
+        let txn = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Transaction)
+            .unwrap();
+        assert_eq!(txn.p2, 1);
     }
 
     // === Test 3: UPDATE by rowid ===

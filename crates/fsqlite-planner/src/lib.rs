@@ -2663,7 +2663,7 @@ pub fn order_joins_with_hints_and_features(
         return plan;
     }
 
-    if n <= DPCCP_MAX_TABLES {
+    if feature_flags.dpccp_join && n <= DPCCP_MAX_TABLES {
         if let Some((order_indices, total_cost, plans_counted, branches_pruned)) = dpccp_order_joins(
             tables,
             indexes,

@@ -2814,6 +2814,11 @@ impl Connection {
         statement: Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Statement> {
+        // Fast path: if the statement has no EXISTS/scalar-subquery expressions
+        // in rewrite-covered locations, skip the clone/traversal rewrite pass.
+        if !statement_contains_rewritable_subquery(&statement) {
+            return Ok(statement);
+        }
         match statement {
             Statement::Select(select) => {
                 let rewritten = self.rewrite_subqueries(&select, params)?;
@@ -5489,6 +5494,10 @@ impl Connection {
     /// in-memory table, and insert a row into sqlite_master on page 1.
     #[allow(clippy::too_many_lines)]
     fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
+        if create.without_rowid {
+            return Err(FrankenError::Unsupported("WITHOUT ROWID tables are not yet supported".to_owned()));
+        }
+
         let table_name = create.name.name.clone();
 
         // Check for duplicate table names.
@@ -12527,6 +12536,127 @@ fn rewrite_in_select_core(
     Ok(())
 }
 
+/// Returns true when statement-level subquery rewrite can mutate this statement.
+///
+/// This intentionally tracks only expression positions visited by
+/// `rewrite_subquery_statement` / `rewrite_in_select_core` with
+/// `rewrite_in_subqueries = false`.
+fn statement_contains_rewritable_subquery(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(select) => select_contains_rewritable_subquery(select),
+        Statement::Update(update) => {
+            update
+                .assignments
+                .iter()
+                .any(|assignment| expr_contains_rewritable_subquery(&assignment.value))
+                || update
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(expr_contains_rewritable_subquery)
+        }
+        Statement::Delete(delete) => delete
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_contains_rewritable_subquery),
+        _ => false,
+    }
+}
+
+/// Returns true when SELECT rewrite-covered expression sites contain
+/// EXISTS/scalar-subquery forms that `rewrite_in_expr(..., false, ...)` mutates.
+fn select_contains_rewritable_subquery(select: &SelectStatement) -> bool {
+    select_core_contains_rewritable_subquery(&select.body.select)
+        || select
+            .body
+            .compounds
+            .iter()
+            .any(|(_, core)| select_core_contains_rewritable_subquery(core))
+}
+
+fn select_core_contains_rewritable_subquery(core: &SelectCore) -> bool {
+    match core {
+        SelectCore::Select {
+            columns,
+            where_clause,
+            having,
+            ..
+        } => {
+            columns.iter().any(|column| match column {
+                ResultColumn::Expr { expr, .. } => expr_contains_rewritable_subquery(expr),
+                ResultColumn::Star | ResultColumn::TableStar(_) => false,
+            }) || where_clause
+                .as_ref()
+                .is_some_and(|expr| expr_contains_rewritable_subquery(expr))
+                || having
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_rewritable_subquery(expr))
+        }
+        SelectCore::Values(_) => false,
+    }
+}
+
+/// Recursively detect expression forms that the non-IN rewrite pass mutates.
+fn expr_contains_rewritable_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Exists { .. } | Expr::Subquery(_, _) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_rewritable_subquery(left) || expr_contains_rewritable_subquery(right)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            expr_contains_rewritable_subquery(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_rewritable_subquery(expr)
+                || expr_contains_rewritable_subquery(low)
+                || expr_contains_rewritable_subquery(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_contains_rewritable_subquery(expr)
+                || match set {
+                    InSet::List(exprs) => exprs.iter().any(expr_contains_rewritable_subquery),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|expr| expr_contains_rewritable_subquery(expr))
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_contains_rewritable_subquery(when_expr)
+                        || expr_contains_rewritable_subquery(then_expr)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_rewritable_subquery(expr))
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::List(exprs),
+            ..
+        } => exprs.iter().any(expr_contains_rewritable_subquery),
+        Expr::Like { expr, pattern, .. } => {
+            expr_contains_rewritable_subquery(expr) || expr_contains_rewritable_subquery(pattern)
+        }
+        Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::FunctionCall {
+            args: FunctionArgs::Star,
+            ..
+        }
+        | Expr::Placeholder(_, _)
+        | Expr::Raise { .. }
+        | Expr::Collate { .. }
+        | Expr::JsonAccess { .. }
+        | Expr::RowValue(_, _) => false,
+    }
+}
+
 #[derive(Debug)]
 struct SharedMvccState {
     registry: Arc<Mutex<ConcurrentRegistry>>,
@@ -17691,7 +17821,7 @@ fn project_join_column(
 mod tests {
     use super::{
         CommitSeq, Connection, InProcessPageLockTable, PagerBackend, Row, SchemaEpoch, Snapshot,
-        is_sqlite_master_entry_missing, lock_unpoisoned,
+        is_sqlite_master_entry_missing, lock_unpoisoned, statement_contains_rewritable_subquery,
     };
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
@@ -22106,6 +22236,52 @@ mod tests {
         let rows = conn.query("SELECT a FROM t1;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_statement_subquery_rewrite_probe_plain_select_is_false() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn.cached_parse_single("SELECT 1 + 2;").unwrap();
+        assert!(
+            !statement_contains_rewritable_subquery(&stmt),
+            "plain SELECT should bypass rewrite pre-pass"
+        );
+    }
+
+    #[test]
+    fn test_statement_subquery_rewrite_probe_exists_is_true() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn
+            .cached_parse_single("SELECT 1 WHERE EXISTS (SELECT 1);")
+            .unwrap();
+        assert!(
+            statement_contains_rewritable_subquery(&stmt),
+            "EXISTS should keep rewrite pre-pass enabled"
+        );
+    }
+
+    #[test]
+    fn test_statement_subquery_rewrite_probe_in_subquery_only_is_false() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn
+            .cached_parse_single("SELECT 1 WHERE 1 IN (SELECT 1);")
+            .unwrap();
+        assert!(
+            !statement_contains_rewritable_subquery(&stmt),
+            "IN (SELECT ...) alone is handled by VDBE probe path and should skip rewrite"
+        );
+    }
+
+    #[test]
+    fn test_statement_subquery_rewrite_probe_update_scalar_subquery_is_true() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn
+            .cached_parse_single("UPDATE t1 SET a = (SELECT b FROM t2) WHERE id = 1;")
+            .unwrap();
+        assert!(
+            statement_contains_rewritable_subquery(&stmt),
+            "scalar subquery in UPDATE should keep rewrite pre-pass enabled"
+        );
     }
 
     #[test]
