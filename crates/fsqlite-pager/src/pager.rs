@@ -1011,7 +1011,11 @@ where
         let max_written = self.write_set.keys().map(|p| p.get()).max().unwrap_or(0);
         if let Some(page1) = self.write_set.get_mut(&PageNumber::ONE) {
             if page1.len() >= DATABASE_HEADER_SIZE {
-                let new_db_size = inner.db_size.max(max_written).max(page1[28..32].iter().fold(0, |acc, &x| (acc << 8) | (x as u32)));
+                let new_db_size = inner.db_size.max(max_written).max(
+                    page1[28..32]
+                        .iter()
+                        .fold(0, |acc, &x| (acc << 8) | (x as u32)),
+                );
                 let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
 
                 // Offset 24..28: change counter (big-endian u32)
