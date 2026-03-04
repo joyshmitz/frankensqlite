@@ -1469,6 +1469,21 @@ impl Connection {
         }
     }
 
+    /// Known-benign SELECT fallback reasons that are expected in parity-cert mode.
+    /// These represent SQL patterns the VDBE engine doesn't natively handle yet,
+    /// so falling back to in-memory evaluation is the correct behavior.
+    const KNOWN_BENIGN_FALLBACK_REASONS: &'static [&'static str] = &[
+        "with_clause_materialization",
+        "view_materialization",
+        "sqlite_schema_virtual_materialization",
+        "group_by_join_fallback",
+        "group_by_fallback",
+        "window_function_fallback",
+        "match_operator_fallback",
+        "join_or_subquery_fallback",
+        "insert_select_row_by_row_fallback",
+    ];
+
     fn log_mem_execution_fallback(
         &self,
         statement_kind: &'static str,
@@ -1478,19 +1493,44 @@ impl Connection {
         let reject_mem = *self.reject_mem_fallback.borrow();
         let strict_reject = *self.reject_mem_fallback_strict.borrow();
         if reject_mem {
-            tracing::warn!(
-                target: "fsqlite.storage_wiring",
-                backend_kind = "mem",
-                mode,
-                strict_reject,
-                statement_kind,
-                decision_reason,
-                "execute_statement_dispatch: using in-memory fallback path while parity-cert mode is enabled"
-            );
             if strict_reject {
+                tracing::warn!(
+                    target: "fsqlite.storage_wiring",
+                    backend_kind = "mem",
+                    mode,
+                    strict_reject,
+                    statement_kind,
+                    decision_reason,
+                    "execute_statement_dispatch: using in-memory fallback path while parity-cert mode is enabled"
+                );
                 return Err(FrankenError::not_implemented(format!(
                     "in-memory fallback disabled in strict parity-cert mode: statement_kind={statement_kind}, decision_reason={decision_reason}"
                 )));
+            }
+            // Non-strict parity-cert: known-benign fallbacks log at DEBUG to
+            // avoid noisy repeated warnings for expected SQL patterns (WITH,
+            // JOIN, GROUP BY, window functions, etc.). Unexpected fallbacks
+            // still emit WARN so they are noticed.
+            if Self::KNOWN_BENIGN_FALLBACK_REASONS.contains(&decision_reason) {
+                tracing::debug!(
+                    target: "fsqlite.storage_wiring",
+                    backend_kind = "mem",
+                    mode,
+                    strict_reject,
+                    statement_kind,
+                    decision_reason,
+                    "execute_statement_dispatch: using in-memory fallback path (known-benign pattern in parity-cert mode)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "fsqlite.storage_wiring",
+                    backend_kind = "mem",
+                    mode,
+                    strict_reject,
+                    statement_kind,
+                    decision_reason,
+                    "execute_statement_dispatch: using in-memory fallback path while parity-cert mode is enabled"
+                );
             }
         } else {
             tracing::debug!(
