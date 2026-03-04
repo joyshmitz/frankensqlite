@@ -203,6 +203,8 @@ pub struct ProgramBuilder {
     regs: RegisterAllocator,
     /// Counter for anonymous placeholder numbering (1-based).
     next_anon_placeholder: u32,
+    /// Table-to-index cursor metadata for REPLACE conflict resolution.
+    table_index_meta: Vec<(i32, Vec<fsqlite_types::opcode::IndexCursorMeta>)>,
 }
 
 impl ProgramBuilder {
@@ -213,6 +215,7 @@ impl ProgramBuilder {
             labels: Vec::new(),
             regs: RegisterAllocator::new(),
             next_anon_placeholder: 1,
+            table_index_meta: Vec::new(),
         }
     }
 
@@ -378,6 +381,22 @@ impl ProgramBuilder {
         self.regs.count()
     }
 
+    // ── Table-index metadata ─────────────────────────────────────────────
+
+    /// Register the index cursors associated with a table cursor.
+    ///
+    /// Used by the engine during REPLACE conflict resolution to delete
+    /// orphaned secondary index entries before replacing the table row.
+    pub fn register_table_indexes(
+        &mut self,
+        table_cursor: i32,
+        indexes: Vec<fsqlite_types::opcode::IndexCursorMeta>,
+    ) {
+        if !indexes.is_empty() {
+            self.table_index_meta.push((table_cursor, indexes));
+        }
+    }
+
     // ── Finalization ────────────────────────────────────────────────────
 
     /// Validate all labels are resolved and return the finished program.
@@ -399,6 +418,7 @@ impl ProgramBuilder {
             ops: self.ops,
             register_count: self.regs.count(),
             bind_parameter_requirement,
+            table_index_meta: self.table_index_meta,
         })
     }
 }
@@ -423,6 +443,8 @@ pub struct VdbeProgram {
     /// `Ok(max_index)` means all variable opcodes carry valid 1-based indexes.
     /// `Err(raw_index)` stores the first invalid raw index encountered.
     bind_parameter_requirement: std::result::Result<usize, i32>,
+    /// Table-to-index cursor metadata for REPLACE conflict resolution.
+    table_index_meta: Vec<(i32, Vec<fsqlite_types::opcode::IndexCursorMeta>)>,
 }
 
 impl VdbeProgram {
@@ -458,6 +480,11 @@ impl VdbeProgram {
     /// Get the instruction at the given program counter.
     pub fn get(&self, pc: usize) -> Option<&VdbeOp> {
         self.ops.get(pc)
+    }
+
+    /// Table-to-index cursor metadata for REPLACE conflict resolution.
+    pub fn table_index_meta(&self) -> &[(i32, Vec<fsqlite_types::opcode::IndexCursorMeta>)] {
+        &self.table_index_meta
     }
 
     /// Disassemble the program to a human-readable string.
