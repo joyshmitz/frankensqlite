@@ -608,6 +608,7 @@ impl PreparedStatement {
                 HashMap::new(),
                 HashMap::new(),
                 false,
+                None,
             );
             // Commit the read transaction (no-op for deferred reads).
             if let Some(ref mut txn) = txn_back {
@@ -658,6 +659,7 @@ impl PreparedStatement {
                 HashMap::new(),
                 HashMap::new(),
                 false,
+                None,
             );
             if let Some(ref mut txn) = txn_back {
                 txn.commit(&op_cx)?;
@@ -11212,6 +11214,7 @@ impl Connection {
             autoincrement_seq_by_root_page,
             col_defaults_by_root_page,
             reject_mem,
+            Some(Rc::clone(&self.version_store)),
         );
         // Always restore the transaction handle, even on error.
         if let Some(txn) = txn_back {
@@ -14059,6 +14062,7 @@ fn execute_table_program_with_db(
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     reject_mem_fallback: bool,
+    version_store: Option<Rc<RefCell<VersionStore>>>,
 ) -> TableProgramExecOutcome {
     let execution_span = tracing::span!(
         target: "fsqlite.execution",
@@ -14082,6 +14086,11 @@ fn execute_table_program_with_db(
     engine.set_column_defaults_by_root_page(column_defaults_by_root_page);
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);
+    // Time-travel support: pass the MVCC version store so SetSnapshot can
+    // create TimeTravelPageIo cursors for historical page resolution.
+    if let Some(vs) = version_store {
+        engine.set_version_store(vs);
+    }
 
     // Phase 5 (bd-2a3y): if a transaction handle is available, lend it to
     // the engine so storage cursors route through the real pager/WAL stack.
@@ -31034,6 +31043,8 @@ mod pager_routing_tests {
             "iouring"
         } else if cfg!(unix) {
             "unix"
+        } else if cfg!(target_os = "windows") {
+            "windows"
         } else {
             "memory"
         };
@@ -31310,6 +31321,8 @@ mod pager_routing_tests {
             "iouring"
         } else if cfg!(unix) {
             "unix"
+        } else if cfg!(target_os = "windows") {
+            "windows"
         } else {
             "memory"
         };
