@@ -1372,7 +1372,7 @@ impl<P: PageWriter> BtCursor<P> {
         let mut header = BtreePageHeader::parse(&page_data, header_offset)?;
         let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
 
-        let content_offset = header.cell_content_offset as usize;
+        let content_offset = header.content_offset(self.usable_size);
         let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
             return Ok(false); // Page full.
         };

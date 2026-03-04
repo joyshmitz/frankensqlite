@@ -115,6 +115,7 @@ pub struct BtreePageHeader {
     pub cell_count: u16,
     /// Byte offset of the first byte of the cell content area.
     /// A value of 0 means 65536.
+    /// The raw value from the header. Use `content_offset()` for the usable value.
     pub cell_content_offset: u32,
     /// Number of fragmented free bytes in the cell content area.
     pub fragmented_free_bytes: u8,
@@ -124,6 +125,16 @@ pub struct BtreePageHeader {
 }
 
 impl BtreePageHeader {
+    /// Return the resolved content offset, clamping the 65536 sentinel to `usable_size`.
+    #[must_use]
+    pub fn content_offset(&self, usable_size: u32) -> usize {
+        if self.cell_count == 0 || self.cell_content_offset >= 65536 {
+            usable_size as usize
+        } else {
+            self.cell_content_offset as usize
+        }
+    }
+
     /// Parse a B-tree page header from raw page bytes.
     ///
     /// `header_offset` is typically 0, except for page 1 where the database

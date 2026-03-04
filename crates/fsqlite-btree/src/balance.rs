@@ -202,7 +202,7 @@ pub fn balance_quick<W: PageWriter>(
         + usize::from(parent_header.page_type.header_size())
         + (usize::from(parent_header.cell_count) * 2);
 
-    let free_space = (parent_header.cell_content_offset as usize).saturating_sub(parent_used);
+    let free_space = parent_header.content_offset(usable_size).saturating_sub(parent_used);
 
     // We need space for:
     // 1. The new cell pointer (2 bytes)
@@ -1098,7 +1098,8 @@ fn insert_cell_into_page<W: PageWriter>(
     let mut ptrs = read_cell_pointers(&page_data, &header, offset)?;
 
     let cell_len = cell_data.len();
-    let new_content_offset = (header.cell_content_offset as usize)
+    let new_content_offset = header
+        .content_offset(_usable_size)
         .checked_sub(cell_len)
         .ok_or_else(|| FrankenError::internal("cell too large for page content area"))?;
 

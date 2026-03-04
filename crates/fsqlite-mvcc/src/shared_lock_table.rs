@@ -916,27 +916,42 @@ impl SharedPageLockTable {
 
         // Step 3: Drain with polling.
         let mut orphaned_cleaned = 0_u32;
+        let mut loops_since_full_scan = 0_u32;
         loop {
-            // Clean orphaned locks.
-            orphaned_cleaned += self.drain_orphaned(&is_active_txn);
+            // Run full table scans (orphaned cleanup and exact remaining count)
+            // only periodically (every ~100ms) to avoid pegging the CPU and
+            // memory bus with millions of atomic loads per millisecond.
+            if loops_since_full_scan % 100 == 0 {
+                orphaned_cleaned += self.drain_orphaned(&is_active_txn);
 
-            // Check quiescence.
-            if let Some(status) = self.drain_progress() {
-                if status.quiescent {
-                    break;
+                // Log progress occasionally.
+                if let Some(status) = self.drain_progress() {
+                    if status.quiescent {
+                        break;
+                    }
+                    debug!(remaining = status.remaining, "drain in progress");
                 }
-
-                debug!(remaining = status.remaining, "drain in progress");
+            } else {
+                // Fast path: early-return scan. Checks if table is quiescent
+                // without scanning the whole table if it's not.
+                let draining_idx = self.draining_table.load(Ordering::Acquire);
+                if draining_idx != DRAINING_NONE {
+                    let draining = &self.tables[draining_idx as usize];
+                    if draining.is_quiescent() {
+                        break;
+                    }
+                }
             }
+            loops_since_full_scan += 1;
 
             // Check timeout.
             if remaining_budget_ms == 0 {
                 // Cancel: must still finalize if quiescent, otherwise
                 // leave drain in progress for next attempt.
-                if let Some(status) = self.drain_progress() {
-                    if status.quiescent {
-                        break;
-                    }
+                let draining_idx = self.draining_table.load(Ordering::Acquire);
+                let quiescent = draining_idx != DRAINING_NONE && self.tables[draining_idx as usize].is_quiescent();
+                
+                if !quiescent {
                     // Release lease but leave draining state for later.
                     self.rebuild_pid.store(0, Ordering::Release);
                     return Ok(RebuildResult {
