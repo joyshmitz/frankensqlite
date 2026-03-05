@@ -263,11 +263,14 @@ impl Scope {
 
         for (alias, cols) in &self.columns {
             let is_match = match cols {
-                Some(c) => c.contains(&col_lower) || {
-                    self.aliases.get(alias)
-                        .and_then(|t| schema.find_table(t))
-                        .is_some_and(|td| td.is_rowid_alias(&col_lower))
-                },
+                Some(c) => {
+                    c.contains(&col_lower) || {
+                        self.aliases
+                            .get(alias)
+                            .and_then(|t| schema.find_table(t))
+                            .is_some_and(|td| td.is_rowid_alias(&col_lower))
+                    }
+                }
                 None => true,
             };
             if is_match {

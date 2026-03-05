@@ -176,7 +176,7 @@ pub fn check_sheaf_consistency_with_chains<S: std::hash::BuildHasher>(
                 if let Some(chain) = global_version_chains.get(&page) {
                     let pos_a = chain.iter().position(|&v| v == ver_a);
                     let pos_b = chain.iter().position(|&v| v == ver_b);
-                    
+
                     match (pos_a, pos_b) {
                         (Some(pa), Some(pb)) => {
                             if pa > pb {

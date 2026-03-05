@@ -202,7 +202,9 @@ pub fn balance_quick<W: PageWriter>(
         + usize::from(parent_header.page_type.header_size())
         + (usize::from(parent_header.cell_count) * 2);
 
-    let free_space = parent_header.content_offset(usable_size).saturating_sub(parent_used);
+    let free_space = parent_header
+        .content_offset(usable_size)
+        .saturating_sub(parent_used);
 
     // We need space for:
     // 1. The new cell pointer (2 bytes)

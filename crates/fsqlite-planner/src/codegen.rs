@@ -2237,10 +2237,7 @@ mod tests {
                             alias: None,
                         },
                         ResultColumn::Expr {
-                            expr: Expr::Literal(
-                                Literal::String("hello".to_owned()),
-                                Span::ZERO,
-                            ),
+                            expr: Expr::Literal(Literal::String("hello".to_owned()), Span::ZERO),
                             alias: None,
                         },
                     ],
@@ -2280,8 +2277,8 @@ mod tests {
                 Opcode::Init,
                 Opcode::Transaction,
                 Opcode::OpenWrite,
-                Opcode::Integer,  // 42
-                Opcode::String8,  // 'hello'
+                Opcode::Integer, // 42
+                Opcode::String8, // 'hello'
                 Opcode::NewRowid,
                 Opcode::MakeRecord,
                 Opcode::Insert,
@@ -2291,10 +2288,7 @@ mod tests {
         ));
 
         // No OpenRead — no source table.
-        assert!(prog
-            .ops()
-            .iter()
-            .all(|op| op.opcode != Opcode::OpenRead));
+        assert!(prog.ops().iter().all(|op| op.opcode != Opcode::OpenRead));
 
         // Transaction should be write (p2=1).
         let txn = prog

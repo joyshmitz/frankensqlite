@@ -1358,7 +1358,6 @@ impl ArcCacheInner {
         removed
     }
 
-
     fn remove_page_version(&mut self, pgno: PageNumber, seq: CommitSeq) {
         if let Some(versions) = self.page_versions.get_mut(&pgno) {
             versions.retain(|&v| v != seq);

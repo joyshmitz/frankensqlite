@@ -673,7 +673,7 @@ impl ScalarFunction for ReplaceFunc {
         if y.is_empty() {
             return Ok(SqliteValue::Text(x));
         }
-        
+
         // Prevent OOM from massive string expansion
         if z.len() > y.len() {
             let occurrences = x.matches(&y).count();
@@ -682,7 +682,7 @@ impl ScalarFunction for ReplaceFunc {
                 return Err(FrankenError::TooBig);
             }
         }
-        
+
         Ok(SqliteValue::Text(x.replace(&y, &z)))
     }
 
@@ -1101,7 +1101,11 @@ impl ScalarFunction for SubstrFunc {
 }
 
 impl SubstrFunc {
-    #[allow(clippy::unused_self, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+    #[allow(
+        clippy::unused_self,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap
+    )]
     fn invoke_blob(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         let blob = match &args[0] {
             SqliteValue::Blob(b) => b,
@@ -1149,7 +1153,9 @@ impl SubstrFunc {
             return Ok(SqliteValue::Blob(Vec::new()));
         }
 
-        Ok(SqliteValue::Blob(blob[p1 as usize..(p1 + p2) as usize].to_vec()))
+        Ok(SqliteValue::Blob(
+            blob[p1 as usize..(p1 + p2) as usize].to_vec(),
+        ))
     }
 }
 

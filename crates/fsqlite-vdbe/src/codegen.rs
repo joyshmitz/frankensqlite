@@ -1002,7 +1002,6 @@ fn count_anon_placeholders_in_frame_bound(bound: &fsqlite_ast::FrameBound) -> u3
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // SELECT codegen
 // ---------------------------------------------------------------------------
@@ -4455,7 +4454,8 @@ pub fn codegen_insert(
                     if row.len() != stmt.columns.len() {
                         return Err(CodegenError::Unsupported(format!(
                             "{} values for {} columns",
-                            row.len(), stmt.columns.len()
+                            row.len(),
+                            stmt.columns.len()
                         )));
                     }
                     let mut table_order = defaults.clone();
@@ -5266,7 +5266,14 @@ fn codegen_insert_select(
         for (tbl_idx, src) in mapping.iter().enumerate() {
             let dest = table_regs + tbl_idx as i32;
             if let Some(sel_pos) = src {
-                b.emit_op(Opcode::Copy, val_regs + *sel_pos as i32, dest, 0, P4::None, 0);
+                b.emit_op(
+                    Opcode::Copy,
+                    val_regs + *sel_pos as i32,
+                    dest,
+                    0,
+                    P4::None,
+                    0,
+                );
             } else {
                 emit_default_value(b, &target_table.columns[tbl_idx], dest);
             }
@@ -5351,7 +5358,14 @@ fn codegen_insert_select(
     );
 
     // Index maintenance: insert into each index (bd-so1h).
-    emit_index_inserts(b, target_table, write_cursor, final_regs, rowid_reg, oe_flag);
+    emit_index_inserts(
+        b,
+        target_table,
+        write_cursor,
+        final_regs,
+        rowid_reg,
+        oe_flag,
+    );
 
     // RETURNING clause: position cursor on inserted row and read columns.
     if !returning.is_empty() {
@@ -6620,7 +6634,14 @@ fn emit_where_filter(
                 // value expression evaluates to NULL, skip the row unconditionally.
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
                 // NULLEQ (0x80) | column affinity so the engine coerces correctly.
-                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, collation_p4, cmp_p5);
+                b.emit_jump_to_label(
+                    Opcode::Ne,
+                    val_reg,
+                    col_reg,
+                    skip_label,
+                    collation_p4,
+                    cmp_p5,
+                );
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             } else if let Some(resolved) = resolve_column_ref(right, table, table_alias) {
@@ -6641,7 +6662,14 @@ fn emit_where_filter(
                 emit_expr(b, left, val_reg, Some(&scan));
                 // SQL semantics: `NULL = col` is UNKNOWN (false in WHERE).
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, collation_p4, cmp_p5);
+                b.emit_jump_to_label(
+                    Opcode::Ne,
+                    val_reg,
+                    col_reg,
+                    skip_label,
+                    collation_p4,
+                    cmp_p5,
+                );
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             } else {

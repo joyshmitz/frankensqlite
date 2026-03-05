@@ -925,7 +925,9 @@ fn build_dependency_edges(
             to: edge.to,
             key_basis: EdgeKeyBasis {
                 level: 0,
-                range_prefix: witness_key_page(&edge.overlap_key).map(|p| p.get()).unwrap_or(0),
+                range_prefix: witness_key_page(&edge.overlap_key)
+                    .map(|p| p.get())
+                    .unwrap_or(0),
                 refinement: Some(KeySummary::ExactKeys(vec![edge.overlap_key.clone()])),
             },
             observed_by: observer,
@@ -969,10 +971,7 @@ fn decision_outcome(decision_type: SsiDecisionType) -> &'static str {
 }
 
 fn witness_keys_to_pages(keys: &[WitnessKey]) -> Vec<PageNumber> {
-    let mut pages: Vec<PageNumber> = keys
-        .iter()
-        .filter_map(witness_key_page)
-        .collect();
+    let mut pages: Vec<PageNumber> = keys.iter().filter_map(witness_key_page).collect();
     pages.sort_by_key(|page| page.get());
     pages.dedup();
     pages

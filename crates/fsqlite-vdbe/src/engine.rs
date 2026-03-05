@@ -13160,10 +13160,7 @@ mod tests {
             b.resolve_label(end);
         });
         // Due to Bloom filter false positives, we can't assert the exact value.
-        assert!(matches!(
-            rows[0][0],
-            SqliteValue::Integer(0 | 1)
-        ));
+        assert!(matches!(rows[0][0], SqliteValue::Integer(0 | 1)));
     }
 
     #[test]

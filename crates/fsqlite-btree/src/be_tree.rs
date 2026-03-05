@@ -780,7 +780,9 @@ mod tests {
             tree.insert(i, i);
         }
         let snap_after = betree_metrics_snapshot();
-        let flushes = snap_after.buffer_flushes_total.saturating_sub(snap_before.buffer_flushes_total);
+        let flushes = snap_after
+            .buffer_flushes_total
+            .saturating_sub(snap_before.buffer_flushes_total);
         assert!(flushes > 0, "expected flush events, got {flushes}");
         assert_eq!(tree.len(), 20);
         // Verify all values.

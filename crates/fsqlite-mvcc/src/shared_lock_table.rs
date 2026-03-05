@@ -949,8 +949,9 @@ impl SharedPageLockTable {
                 // Cancel: must still finalize if quiescent, otherwise
                 // leave drain in progress for next attempt.
                 let draining_idx = self.draining_table.load(Ordering::Acquire);
-                let quiescent = draining_idx != DRAINING_NONE && self.tables[draining_idx as usize].is_quiescent();
-                
+                let quiescent = draining_idx != DRAINING_NONE
+                    && self.tables[draining_idx as usize].is_quiescent();
+
                 if !quiescent {
                     // Release lease but leave draining state for later.
                     self.rebuild_pid.store(0, Ordering::Release);
