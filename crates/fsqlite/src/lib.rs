@@ -7992,7 +7992,7 @@ mod tests {
         let r = conn
             .query("SELECT CASE WHEN 10 = '10' THEN 'equal' ELSE 'not_equal' END")
             .unwrap();
-        assert_eq!(row_values(&r[0])[0].to_text(), "equal");
+        assert_eq!(row_values(&r[0])[0].to_text(), "not_equal");
     }
 
     #[test]
@@ -8620,17 +8620,17 @@ mod tests {
     #[test]
     fn conformance_060_numeric_text_comparison_variants() {
         let conn = Connection::open(":memory:").unwrap();
-        // Integer = text-integer
+        // Integer != text-integer without affinity
         let r = conn
             .query("SELECT CASE WHEN 42 = '42' THEN 1 ELSE 0 END")
             .unwrap();
-        assert_eq!(row_values(&r[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&r[0])[0], SqliteValue::Integer(0));
 
-        // Float = text-float
+        // Float != text-float without affinity
         let r = conn
             .query("SELECT CASE WHEN 3.14 = '3.14' THEN 1 ELSE 0 END")
             .unwrap();
-        assert_eq!(row_values(&r[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&r[0])[0], SqliteValue::Integer(0));
 
         // Text that doesn't parse as number should NOT equal an integer
         let r = conn

@@ -323,12 +323,15 @@ fn gather_sorted_column(
             let mut new_data: Vec<u8> = Vec::new();
             new_offsets.push(0);
             for (out_idx, &row) in indices.iter().enumerate() {
-                let start = offsets[row] as usize;
-                let end = offsets[row + 1] as usize;
-                new_data.extend_from_slice(&src[start..end]);
+                let is_valid = validity.is_valid(row);
+                if is_valid {
+                    let start = offsets[row] as usize;
+                    let end = offsets[row + 1] as usize;
+                    new_data.extend_from_slice(&src[start..end]);
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 new_offsets.push(new_data.len() as u32);
-                if validity.is_valid(row) {
+                if is_valid {
                     validity_bytes[out_idx / 8] |= 1_u8 << (out_idx % 8);
                 }
             }
@@ -342,12 +345,15 @@ fn gather_sorted_column(
             let mut new_data: Vec<u8> = Vec::new();
             new_offsets.push(0);
             for (out_idx, &row) in indices.iter().enumerate() {
-                let start = offsets[row] as usize;
-                let end = offsets[row + 1] as usize;
-                new_data.extend_from_slice(&src[start..end]);
+                let is_valid = validity.is_valid(row);
+                if is_valid {
+                    let start = offsets[row] as usize;
+                    let end = offsets[row + 1] as usize;
+                    new_data.extend_from_slice(&src[start..end]);
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 new_offsets.push(new_data.len() as u32);
-                if validity.is_valid(row) {
+                if is_valid {
                     validity_bytes[out_idx / 8] |= 1_u8 << (out_idx % 8);
                 }
             }

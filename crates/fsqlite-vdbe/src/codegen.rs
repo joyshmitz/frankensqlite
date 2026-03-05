@@ -5545,8 +5545,11 @@ pub fn codegen_update(
         .map(|assign| {
             let col_name = match &assign.target {
                 fsqlite_ast::AssignmentTarget::Column(name) => name.as_str(),
-                fsqlite_ast::AssignmentTarget::ColumnList(names) => {
-                    names.first().map_or("", |n| n.as_str())
+                fsqlite_ast::AssignmentTarget::ColumnList(_) => {
+                    return Err(CodegenError::Unsupported(
+                        "multi-column SET (a, b) = (...) assignment is not yet supported"
+                            .to_owned(),
+                    ));
                 }
             };
             table
@@ -6600,6 +6603,7 @@ fn emit_where_filter(
             if let Some(resolved) = resolve_column_ref(left, table, table_alias) {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
+                let cmp_p5 = column_cmp_p5(table, &resolved);
                 match resolved {
                     SortKeySource::Column(idx) => {
                         b.emit_op(Opcode::Column, cursor, idx as i32, col_reg, P4::None, 0);
@@ -6615,13 +6619,14 @@ fn emit_where_filter(
                 // SQL semantics: `col = NULL` is UNKNOWN (false in WHERE). If the
                 // value expression evaluates to NULL, skip the row unconditionally.
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
-                // Use NULLEQ flag (0x80) so NULL column != non-NULL value → skip.
-                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, collation_p4, 0x80);
+                // NULLEQ (0x80) | column affinity so the engine coerces correctly.
+                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, collation_p4, cmp_p5);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             } else if let Some(resolved) = resolve_column_ref(right, table, table_alias) {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
+                let cmp_p5 = column_cmp_p5(table, &resolved);
                 match resolved {
                     SortKeySource::Column(idx) => {
                         b.emit_op(Opcode::Column, cursor, idx as i32, col_reg, P4::None, 0);
@@ -6636,7 +6641,7 @@ fn emit_where_filter(
                 emit_expr(b, left, val_reg, Some(&scan));
                 // SQL semantics: `NULL = col` is UNKNOWN (false in WHERE).
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, collation_p4, 0x80);
+                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, collation_p4, cmp_p5);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             } else {
@@ -6807,6 +6812,19 @@ fn resolve_column_ref(
         }
     }
     None
+}
+
+/// Compute comparison p5 flags for a column reference.
+///
+/// Encodes NULLEQ (0x80) and the column's type affinity so the VDBE engine
+/// applies correct text↔numeric coercion during comparison (§3.2).
+fn column_cmp_p5(table: &TableSchema, resolved: &SortKeySource) -> u16 {
+    let affinity: u16 = match resolved {
+        SortKeySource::Column(idx) => u16::from(table.columns[*idx].affinity as u8),
+        SortKeySource::Rowid => u16::from(b'D'), // INTEGER
+        SortKeySource::Expression(_) => u16::from(b'A'), // BLOB (no coercion)
+    };
+    0x80 | affinity
 }
 
 /// Resolve a column reference to its 0-based index (ignoring rowid aliases).

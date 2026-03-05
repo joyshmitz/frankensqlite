@@ -314,6 +314,25 @@ impl<'a> Lexer<'a> {
     // Helpers
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::cast_possible_truncation)]
+    fn advance_by(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let end = self.pos + n;
+        let slice = &self.src[self.pos..end];
+        #[allow(clippy::naive_bytecount)]
+        let newlines = slice.iter().filter(|&&b| b == b'\n').count();
+        if newlines > 0 {
+            self.line += newlines as u32;
+            let last_nl = slice.iter().rposition(|&b| b == b'\n').unwrap();
+            self.col = (n - last_nl) as u32;
+        } else {
+            self.col += n as u32;
+        }
+        self.pos = end;
+    }
+
     fn advance(&mut self) -> u8 {
         let pos = self.pos;
         let line = self.line;
@@ -417,9 +436,7 @@ impl<'a> Lexer<'a> {
                     &self.src[self.pos..self.pos + offset],
                 ));
                 // Advance past the accumulated bytes and the quote
-                for _ in 0..offset {
-                    self.advance();
-                }
+                self.advance_by(offset);
                 self.advance(); // the quote itself
 
                 // Check for escaped quote ('')
@@ -452,9 +469,7 @@ impl<'a> Lexer<'a> {
                 value.push_str(&String::from_utf8_lossy(
                     &self.src[self.pos..self.pos + offset],
                 ));
-                for _ in 0..offset {
-                    self.advance();
-                }
+                self.advance_by(offset);
                 self.advance(); // the quote
 
                 // Doubled-quote escape: "" -> "
@@ -486,9 +501,7 @@ impl<'a> Lexer<'a> {
                 value.push_str(&String::from_utf8_lossy(
                     &self.src[self.pos..self.pos + offset],
                 ));
-                for _ in 0..offset {
-                    self.advance();
-                }
+                self.advance_by(offset);
                 self.advance(); // the backtick
 
                 if self.peek() == Some(b'`') {
@@ -518,9 +531,7 @@ impl<'a> Lexer<'a> {
             value.push_str(&String::from_utf8_lossy(
                 &self.src[self.pos..self.pos + offset],
             ));
-            for _ in 0..offset {
-                self.advance();
-            }
+            self.advance_by(offset);
             self.advance(); // skip ]
             TokenKind::QuotedId(value, false)
         } else {
@@ -539,9 +550,7 @@ impl<'a> Lexer<'a> {
         let remaining = &self.src[self.pos..];
         if let Some(offset) = memchr(b'\'', remaining) {
             let hex_bytes = &self.src[hex_start..hex_start + offset];
-            for _ in 0..offset {
-                self.advance();
-            }
+            self.advance_by(offset);
             self.advance(); // skip closing '
 
             // Validate hex content

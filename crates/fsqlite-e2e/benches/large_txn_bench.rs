@@ -108,7 +108,7 @@ fn bench_large_txn_100k(c: &mut Criterion) {
                     .unwrap();
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..ROW_COUNT_100K as i64 {
-                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                    conn.execute_prepared_with_params(&stmt, &[SqliteValue::Integer(i)])
                         .unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
@@ -189,7 +189,7 @@ fn bench_large_txn_100k_batched(c: &mut Criterion) {
                     conn.execute("BEGIN").unwrap();
                     let base = batch * 10_000;
                     for i in base..base + 10_000 {
-                        stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                        conn.execute_prepared_with_params(&stmt, &[SqliteValue::Integer(i)])
                             .unwrap();
                     }
                     conn.execute("COMMIT").unwrap();

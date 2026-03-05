@@ -967,8 +967,11 @@ pub fn codegen_update(
         .map(|assign| {
             let col_name = match &assign.target {
                 fsqlite_ast::AssignmentTarget::Column(name) => name.as_str(),
-                fsqlite_ast::AssignmentTarget::ColumnList(names) => {
-                    names.first().map_or("", |n| n.as_str())
+                fsqlite_ast::AssignmentTarget::ColumnList(_) => {
+                    return Err(CodegenError::Unsupported(
+                        "multi-column SET (a, b) = (...) assignment is not yet supported"
+                            .to_owned(),
+                    ));
                 }
             };
             let col_idx =

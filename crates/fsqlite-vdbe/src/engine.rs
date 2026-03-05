@@ -2964,11 +2964,11 @@ impl VdbeEngine {
                     // Move p3 registers from p1 to p2.
                     // To handle potential overlap correctly, we collect all source
                     // values into a temporary buffer before writing them to the destination.
-                    let p3_usize = op.p3 as usize;
+                    let p3_usize = op.p3.max(0) as usize;
                     let mut temp = Vec::with_capacity(p3_usize);
 
                     #[allow(clippy::cast_sign_loss)]
-                    for i in 0..op.p3 {
+                    for i in 0..op.p3.max(0) {
                         let src_idx = (op.p1 + i) as usize;
                         if src_idx < self.registers.len() {
                             temp.push(std::mem::replace(
@@ -3009,8 +3009,8 @@ impl VdbeEngine {
                 // ── Result Row ──────────────────────────────────────────
                 Opcode::ResultRow => {
                     // Output p2 registers starting at p1.
-                    let start = op.p1 as usize;
-                    let count = op.p2 as usize;
+                    let start = op.p1.max(0) as usize;
+                    let count = op.p2.max(0) as usize;
                     let row: Vec<SqliteValue> = (start..start + count)
                         .map(|r| self.get_reg(r as i32).clone())
                         .collect();
@@ -3226,9 +3226,8 @@ impl VdbeEngine {
                         }
                     } else {
                         // Apply SQLite comparison affinity rules (§3.2):
-                        // When one operand is numeric and the other is text,
-                        // coerce the text operand to numeric before comparing.
-                        let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs);
+                        // coercion only happens when p5 carries numeric affinity.
+                        let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, op.p5);
                         let cmp = if let P4::Collation(ref coll_name) = op.p4 {
                             collate_compare(&cmp_lhs, &cmp_rhs, coll_name)
                         } else {
@@ -6516,40 +6515,45 @@ impl VdbeEngine {
 // (header + body). Using the same format internally avoids later translation
 // when wiring VDBE cursors to the real B-tree layer.
 
-/// Compare two `SqliteValue`s using a named collation.
-///
-/// Supports the three built-in collations (BINARY, NOCASE, RTRIM).
-/// For text values, the collation function is applied to the UTF-8 bytes.
-/// For non-text values, falls back to the default `partial_cmp`.
+/// SQLite affinity constants (from §3.2 of datatype3.html).
+/// Encoded in the lower bits of comparison opcode p5 (masked by 0x47).
+const SQLITE_AFF_NUMERIC: u16 = 0x43; // 'C'
+
 /// Apply SQLite comparison affinity coercion (§3.2 of datatype3.html).
 ///
-/// When one operand is numeric (Integer or Real) and the other is Text,
-/// attempt to coerce the Text to a numeric value.  If the text cannot be
-/// parsed as a number, the values are returned unmodified (the comparison
-/// will then fall through to SQLite's storage-class ordering: numeric < text).
+/// Coercion only applies when the comparison opcode's p5 carries a
+/// numeric-class affinity (>= NUMERIC / 0x43).  When p5 is 0 or carries
+/// BLOB affinity (0x41), no coercion is performed — values compare using
+/// their native storage classes (NULL < numeric < text < blob).
 fn coerce_for_comparison<'a>(
     lhs: &'a SqliteValue,
     rhs: &'a SqliteValue,
+    p5: u16,
 ) -> (
     std::borrow::Cow<'a, SqliteValue>,
     std::borrow::Cow<'a, SqliteValue>,
 ) {
     use std::borrow::Cow;
 
-    let is_numeric = |v: &SqliteValue| matches!(v, SqliteValue::Integer(_) | SqliteValue::Float(_));
+    let affinity = p5 & 0x47_u16; // SQLITE_AFF_MASK
 
-    // Numeric vs Text → coerce text to numeric
-    if is_numeric(lhs) {
-        if let SqliteValue::Text(s) = rhs {
-            if let Some(coerced) = try_coerce_text_to_numeric_cmp(s) {
-                return (Cow::Borrowed(lhs), Cow::Owned(coerced));
+    // Only coerce text→numeric when the opcode carries numeric affinity.
+    if affinity >= SQLITE_AFF_NUMERIC {
+        let is_numeric =
+            |v: &SqliteValue| matches!(v, SqliteValue::Integer(_) | SqliteValue::Float(_));
+
+        if is_numeric(lhs) {
+            if let SqliteValue::Text(s) = rhs {
+                if let Some(coerced) = try_coerce_text_to_numeric_cmp(s) {
+                    return (Cow::Borrowed(lhs), Cow::Owned(coerced));
+                }
             }
         }
-    }
-    if is_numeric(rhs) {
-        if let SqliteValue::Text(s) = lhs {
-            if let Some(coerced) = try_coerce_text_to_numeric_cmp(s) {
-                return (Cow::Owned(coerced), Cow::Borrowed(rhs));
+        if is_numeric(rhs) {
+            if let SqliteValue::Text(s) = lhs {
+                if let Some(coerced) = try_coerce_text_to_numeric_cmp(s) {
+                    return (Cow::Owned(coerced), Cow::Borrowed(rhs));
+                }
             }
         }
     }
@@ -6977,17 +6981,15 @@ fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
             None => SqliteValue::Integer(0),
         };
     }
-    let fa = dividend.to_float();
-    let fb = divisor.to_float();
-    if fb == 0.0 {
+    // C SQLite: OP_Remainder always converts to integers even for float
+    // operands, performs integer %, then returns result as Float.
+    let ia = dividend.to_integer();
+    let ib = divisor.to_integer();
+    if ib == 0 {
         return SqliteValue::Null;
     }
-    let result = fa % fb;
-    if result.is_nan() {
-        SqliteValue::Null
-    } else {
-        SqliteValue::Float(result)
-    }
+    let result = ia.checked_rem(ib).unwrap_or_default();
+    SqliteValue::Float(result as f64)
 }
 
 /// SQL shift left (SQLite semantics: negative shift = shift right).
@@ -7158,7 +7160,9 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
                         }
                         #[allow(clippy::cast_possible_truncation)]
                         if let Ok(f) = prefix.parse::<f64>() {
-                            return SqliteValue::Integer(f as i64);
+                            if f.is_finite() {
+                                return SqliteValue::Integer(f as i64);
+                            }
                         }
                     }
                     SqliteValue::Integer(0)
@@ -7172,12 +7176,17 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
                 SqliteValue::Text(s) => {
                     let trimmed = s.trim();
                     if let Ok(f) = trimmed.parse::<f64>() {
-                        return SqliteValue::Float(f);
+                        // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
+                        if f.is_finite() {
+                            return SqliteValue::Float(f);
+                        }
                     }
                     let end = scan_numeric_prefix(trimmed.as_bytes());
                     if end > 0 {
                         if let Ok(f) = trimmed[..end].parse::<f64>() {
-                            return SqliteValue::Float(f);
+                            if f.is_finite() {
+                                return SqliteValue::Float(f);
+                            }
                         }
                     }
                     SqliteValue::Float(0.0)

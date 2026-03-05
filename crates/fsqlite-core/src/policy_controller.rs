@@ -176,9 +176,9 @@ fn clamp_overhead_percent(raw_percent: i64) -> u32 {
 fn round_basis_points_to_percent(raw_basis_points: i64) -> i64 {
     // Deterministic rounding to nearest percent, ties away from zero.
     if raw_basis_points >= 0 {
-        (raw_basis_points + 50).div_euclid(100)
+        (raw_basis_points + 50) / 100
     } else {
-        (raw_basis_points - 50).div_euclid(100)
+        (raw_basis_points - 50) / 100
     }
 }
 
