@@ -381,7 +381,10 @@ impl ConcurrentRegistry {
             let mut oldest_id = None;
             let mut oldest_seq = CommitSeq::new(u64::MAX);
             for (&id, handle) in &self.active {
-                if handle.is_active() && !handle.is_marked_for_abort() && handle.snapshot.high < oldest_seq {
+                if handle.is_active()
+                    && !handle.is_marked_for_abort()
+                    && handle.snapshot.high < oldest_seq
+                {
                     oldest_seq = handle.snapshot.high;
                     oldest_id = Some(id);
                 }
@@ -396,7 +399,7 @@ impl ConcurrentRegistry {
                 if let Some(handle) = self.active.get_mut(&id) {
                     handle.set_marked_for_abort(true);
                 }
-                
+
                 // Recompute horizon and prune again now that the oldest is marked for abort
                 let new_horizon = self.gc_horizon().unwrap_or(CommitSeq::new(u64::MAX));
                 self.committed_readers

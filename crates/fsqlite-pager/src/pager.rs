@@ -339,13 +339,6 @@ where
             return Err(FrankenError::Busy);
         }
 
-        if inner.journal_mode == JournalMode::Wal {
-            let wal = inner.wal_backend.as_mut().ok_or_else(|| {
-                FrankenError::internal("WAL mode active but no WAL backend installed")
-            })?;
-            wal.begin_transaction(cx)?;
-        }
-
         let eager_writer = matches!(
             mode,
             TransactionMode::Immediate | TransactionMode::Exclusive
@@ -356,6 +349,22 @@ where
         if eager_writer {
             inner.writer_active = true;
         }
+
+        if inner.journal_mode == JournalMode::Wal {
+            let wal_begin_result = {
+                let wal = inner.wal_backend.as_mut().ok_or_else(|| {
+                    FrankenError::internal("WAL mode active but no WAL backend installed")
+                })?;
+                wal.begin_transaction(cx)
+            };
+            if let Err(err) = wal_begin_result {
+                if eager_writer {
+                    inner.writer_active = false;
+                }
+                return Err(err);
+            }
+        }
+
         inner.active_transactions = inner.active_transactions.saturating_add(1);
         let original_db_size = inner.db_size;
         let journal_mode = inner.journal_mode;
@@ -2732,21 +2741,31 @@ mod tests {
     /// In-memory WAL backend for testing WAL-mode commit and page lookup.
     struct MockWalBackend {
         frames: SharedFrames,
+        begin_calls: StdArc<StdMutex<usize>>,
     }
 
     impl MockWalBackend {
-        fn new() -> (Self, SharedFrames) {
+        fn new() -> (Self, SharedFrames, StdArc<StdMutex<usize>>) {
             let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+            let begin_calls = StdArc::new(StdMutex::new(0));
             (
                 Self {
                     frames: StdArc::clone(&frames),
+                    begin_calls: StdArc::clone(&begin_calls),
                 },
                 frames,
+                begin_calls,
             )
         }
     }
 
     impl crate::traits::WalBackend for MockWalBackend {
+        fn begin_transaction(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
+            let mut begin_calls = self.begin_calls.lock().unwrap();
+            *begin_calls += 1;
+            Ok(())
+        }
+
         fn append_frame(
             &mut self,
             _cx: &Cx,
@@ -2810,7 +2829,7 @@ mod tests {
         let path = PathBuf::from("/wal_test.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
         let cx = Cx::new();
-        let (backend, frames) = MockWalBackend::new();
+        let (backend, frames, _) = MockWalBackend::new();
         pager.set_wal_backend(Box::new(backend)).unwrap();
         pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
         (pager, frames)
@@ -2842,7 +2861,7 @@ mod tests {
     fn test_set_journal_mode_wal_with_backend() {
         let (pager, _) = test_pager();
         let cx = Cx::new();
-        let (backend, _frames) = MockWalBackend::new();
+        let (backend, _frames, _) = MockWalBackend::new();
         pager.set_wal_backend(Box::new(backend)).unwrap();
         let mode = pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
         assert_eq!(
@@ -2862,7 +2881,7 @@ mod tests {
         let (pager, _) = test_pager();
         let cx = Cx::new();
         let _writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
-        let (backend, _frames) = MockWalBackend::new();
+        let (backend, _frames, _) = MockWalBackend::new();
         pager.set_wal_backend(Box::new(backend)).unwrap();
         let result = pager.set_journal_mode(&cx, JournalMode::Wal);
         assert!(
@@ -3032,7 +3051,7 @@ mod tests {
         let path = PathBuf::from("/wal_no_jrnl.db");
         let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
         let cx = Cx::new();
-        let (backend, _frames) = MockWalBackend::new();
+        let (backend, _frames, _) = MockWalBackend::new();
         pager.set_wal_backend(Box::new(backend)).unwrap();
         pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
 
@@ -3046,6 +3065,33 @@ mod tests {
         assert!(
             !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
             "bead_id={BEAD_ID} case=wal_no_journal_created"
+        );
+    }
+
+    #[test]
+    fn test_wal_begin_not_called_for_rejected_eager_writer() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let (backend, _frames, begin_calls) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let _writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        assert_eq!(
+            *begin_calls.lock().unwrap(),
+            1,
+            "bead_id={BEAD_ID} case=first_writer_initializes_wal_snapshot"
+        );
+
+        let err = pager
+            .begin(&cx, TransactionMode::Immediate)
+            .err()
+            .expect("second eager writer should be rejected");
+        assert!(matches!(err, FrankenError::Busy));
+        assert_eq!(
+            *begin_calls.lock().unwrap(),
+            1,
+            "bead_id={BEAD_ID} case=rejected_writer_must_not_mutate_wal_state"
         );
     }
 

@@ -4102,11 +4102,16 @@ impl VdbeEngine {
 
                 Opcode::Found => {
                     // Jump to P2 if key found in cursor P1 (exact match).
+                    // NULL key → never found (don't jump).
                     let cursor_id = op.p1;
                     if self.storage_cursors.contains_key(&cursor_id) {
                         self.pending_next_after_delete.remove(&cursor_id);
                     }
                     let key_val = self.get_reg(op.p3).clone();
+                    if key_val.is_null() {
+                        pc += 1;
+                        continue;
+                    }
                     let exists = if matches!(key_val, SqliteValue::Blob(_)) {
                         let key_bytes = record_blob_bytes(&key_val);
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {

@@ -92,22 +92,33 @@ fn coerce_numeric(v: &SqliteValue) -> SqliteValue {
     match v {
         SqliteValue::Integer(_) | SqliteValue::Float(_) => v.clone(),
         SqliteValue::Text(s) => {
+            // Try exact integer parse first.
             let t = s.trim();
             if let Ok(i) = t.parse::<i64>() {
-                SqliteValue::Integer(i)
-            } else if let Ok(f) = t.parse::<f64>() {
-                // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
+                return SqliteValue::Integer(i);
+            }
+            // Try exact float parse.
+            if let Ok(f) = t.parse::<f64>() {
                 if f.is_finite() {
-                    SqliteValue::Float(f)
-                } else {
-                    SqliteValue::Integer(0)
+                    return SqliteValue::Float(f);
                 }
-            } else {
+            }
+            // Fall back to prefix extraction (matches sqlite3_value_int64 behavior).
+            let f = v.to_float();
+            if f == 0.0 {
                 SqliteValue::Integer(0)
+            } else {
+                let i = v.to_integer();
+                #[allow(clippy::cast_precision_loss)]
+                if i as f64 == f {
+                    SqliteValue::Integer(i)
+                } else {
+                    SqliteValue::Float(f)
+                }
             }
         }
         SqliteValue::Null => SqliteValue::Null,
-        SqliteValue::Blob(_) => SqliteValue::Integer(0),
+        SqliteValue::Blob(_) => SqliteValue::Integer(v.to_integer()),
     }
 }
 
@@ -749,28 +760,17 @@ impl ScalarFunction for SignFunc {
                     Ok(SqliteValue::Integer(0))
                 }
             }
-            SqliteValue::Text(s) => {
-                // Non-numeric strings => NULL per spec
-                let t = s.trim();
-                if let Ok(i) = t.parse::<i64>() {
-                    Ok(SqliteValue::Integer(i.signum()))
-                } else if let Ok(f) = t.parse::<f64>() {
-                    // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
-                    if !f.is_finite() {
-                        Ok(SqliteValue::Null)
-                    } else if f > 0.0 {
-                        Ok(SqliteValue::Integer(1))
-                    } else if f < 0.0 {
-                        Ok(SqliteValue::Integer(-1))
-                    } else {
-                        Ok(SqliteValue::Integer(0))
-                    }
+            other => {
+                // Coerce text/blob to numeric via prefix extraction.
+                let f = other.to_float();
+                if f > 0.0 {
+                    Ok(SqliteValue::Integer(1))
+                } else if f < 0.0 {
+                    Ok(SqliteValue::Integer(-1))
                 } else {
-                    Ok(SqliteValue::Null)
+                    Ok(SqliteValue::Integer(0))
                 }
             }
-            SqliteValue::Blob(_) => Ok(SqliteValue::Null),
-            SqliteValue::Null => Ok(SqliteValue::Null),
         }
     }
 
@@ -2850,9 +2850,10 @@ mod tests {
 
     #[test]
     fn test_sign_non_numeric() {
+        // C SQLite: "abc" coerces to 0.0 via sqlite3_value_double, so sign = 0.
         assert_eq!(
             invoke1(&SignFunc, SqliteValue::Text("abc".to_owned())).unwrap(),
-            SqliteValue::Null
+            SqliteValue::Integer(0)
         );
     }
 

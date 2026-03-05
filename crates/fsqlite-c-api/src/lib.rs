@@ -20,9 +20,9 @@
 use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
 use std::os::raw::{c_char, c_double, c_int, c_void};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite::Connection;
 use fsqlite_error::{ErrorCode, FrankenError};
@@ -122,35 +122,59 @@ pub fn reset_compat_metrics() {
 
 // ── Opaque handle types ─────────────────────────────────────────────
 
+const DEFAULT_ERROR_MESSAGE: &str = "not an error";
+
 /// Opaque database connection handle exposed via C FFI.
 ///
 /// Wraps a `Connection` plus the last error message for `sqlite3_errmsg`.
 pub struct Sqlite3 {
     conn: Connection,
     last_error: Mutex<CString>,
+    last_error_code: AtomicI32,
+    last_changes: AtomicI32,
 }
 
 impl Sqlite3 {
     fn new(conn: Connection) -> Self {
         Self {
             conn,
-            last_error: Mutex::new(CString::new("not an error").expect("static")),
+            last_error: Mutex::new(CString::new(DEFAULT_ERROR_MESSAGE).expect("static")),
+            last_error_code: AtomicI32::new(SQLITE_OK),
+            last_changes: AtomicI32::new(0),
         }
     }
 
     fn set_error(&self, err: &FrankenError) {
-        let msg = err.to_string();
-        if let Ok(c) = CString::new(msg) {
+        self.set_error_message_and_code(&err.to_string(), error_to_code(err));
+    }
+
+    fn set_error_message_and_code(&self, message: &str, code: c_int) {
+        if let Ok(c) = CString::new(message) {
             if let Ok(mut guard) = self.last_error.lock() {
                 *guard = c;
             }
         }
+        self.last_error_code.store(code, Ordering::Relaxed);
     }
 
     fn clear_error(&self) {
         if let Ok(mut guard) = self.last_error.lock() {
-            *guard = CString::new("not an error").expect("static");
+            *guard = CString::new(DEFAULT_ERROR_MESSAGE).expect("static");
         }
+        self.last_error_code.store(SQLITE_OK, Ordering::Relaxed);
+    }
+
+    fn refresh_last_changes(&self) {
+        let changes = self
+            .conn
+            .query_row("SELECT changes();")
+            .ok()
+            .and_then(|row| match row.get(0) {
+                Some(SqliteValue::Integer(n)) => Some(i64_to_c_int_saturating(*n)),
+                _ => None,
+            })
+            .unwrap_or(0);
+        self.last_changes.store(changes, Ordering::Relaxed);
     }
 }
 
@@ -176,6 +200,30 @@ pub struct Sqlite3Stmt {
 
 fn error_to_code(err: &FrankenError) -> c_int {
     err.error_code() as c_int
+}
+
+fn i64_to_c_int_saturating(value: i64) -> c_int {
+    if value < i64::from(c_int::MIN) {
+        c_int::MIN
+    } else if value > i64::from(c_int::MAX) {
+        c_int::MAX
+    } else {
+        value as c_int
+    }
+}
+
+unsafe fn write_error_message(errmsg: *mut *mut c_char, message: &str) {
+    if errmsg.is_null() {
+        return;
+    }
+    if let Ok(cmsg) = CString::new(message) {
+        let len = cmsg.as_bytes_with_nul().len();
+        let buf = libc_malloc(len);
+        if !buf.is_null() {
+            std::ptr::copy_nonoverlapping(cmsg.as_ptr(), buf.cast(), len);
+            *errmsg = buf.cast();
+        }
+    }
 }
 
 // ── sqlite3_open ────────────────────────────────────────────────────
@@ -289,15 +337,23 @@ pub unsafe extern "C" fn sqlite3_exec(
 
     let handle = &*db;
     let Ok(sql_str) = CStr::from_ptr(sql).to_str() else {
-        return SQLITE_ERROR;
+        let err = FrankenError::ParseError {
+            offset: 0,
+            detail: "SQL text is not valid UTF-8".to_owned(),
+        };
+        handle.set_error(&err);
+        write_error_message(errmsg, &err.to_string());
+        return error_to_code(&err);
     };
 
     tracing::info!(target: "fsqlite.compat", sql = %sql_str, "sqlite3_exec");
 
-    // Try as a query first (returns rows), fall back to execute (DML/DDL).
+    // Route through Connection::query() because FrankenSQLite already executes
+    // DDL/DML there and returns rows only for result-producing statements.
     match handle.conn.query(sql_str) {
         Ok(rows) => {
             handle.clear_error();
+            handle.refresh_last_changes();
             if let Some(cb) = callback {
                 for row in &rows {
                     let vals = row.values();
@@ -355,21 +411,13 @@ pub unsafe extern "C" fn sqlite3_exec(
         }
         Err(ref e) if matches!(e, FrankenError::QueryReturnedNoRows) => {
             handle.clear_error();
+            handle.refresh_last_changes();
             SQLITE_OK
         }
         Err(e) => {
             tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_exec failed");
             handle.set_error(&e);
-            if !errmsg.is_null() {
-                if let Ok(cmsg) = CString::new(e.to_string()) {
-                    let len = cmsg.as_bytes_with_nul().len();
-                    let buf = libc_malloc(len);
-                    if !buf.is_null() {
-                        std::ptr::copy_nonoverlapping(cmsg.as_ptr(), buf.cast(), len);
-                        *errmsg = buf.cast();
-                    }
-                }
-            }
+            write_error_message(errmsg, &e.to_string());
             error_to_code(&e)
         }
     }
@@ -457,21 +505,34 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     }
 
     let sql_str = if n_byte < 0 {
-        match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s.to_owned(),
-            Err(_) => return SQLITE_ERROR,
+        if let Ok(s) = CStr::from_ptr(sql).to_str() {
+            s.to_owned()
+        } else {
+            let err = FrankenError::ParseError {
+                offset: 0,
+                detail: "SQL text is not valid UTF-8".to_owned(),
+            };
+            (&*db).set_error(&err);
+            return error_to_code(&err);
         }
     } else {
         let slice = std::slice::from_raw_parts(sql.cast::<u8>(), n_byte as usize);
         // Find the first nul if present, otherwise take the whole slice.
         let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-        match std::str::from_utf8(&slice[..end]) {
-            Ok(s) => s.to_owned(),
-            Err(_) => return SQLITE_ERROR,
+        if let Ok(s) = std::str::from_utf8(&slice[..end]) {
+            s.to_owned()
+        } else {
+            let err = FrankenError::ParseError {
+                offset: 0,
+                detail: "SQL text is not valid UTF-8".to_owned(),
+            };
+            (&*db).set_error(&err);
+            return error_to_code(&err);
         }
     };
 
     if sql_str.trim().is_empty() {
+        (&*db).clear_error();
         return SQLITE_OK;
     }
 
@@ -540,6 +601,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
         match db.conn.query(&s.sql) {
             Ok(rows) => {
                 db.clear_error();
+                db.refresh_last_changes();
                 if let Some(first) = rows.first() {
                     s.column_count = first.values().len() as c_int;
                 }
@@ -548,6 +610,7 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             }
             Err(ref e) if matches!(e, FrankenError::QueryReturnedNoRows) => {
                 db.clear_error();
+                db.refresh_last_changes();
                 s.rows = Some(Vec::new());
                 s.cursor = 0;
                 s.column_count = 0;
@@ -848,7 +911,7 @@ pub unsafe extern "C" fn sqlite3_column_bytes(stmt: *mut Sqlite3Stmt, i_col: c_i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_errmsg(db: *mut Sqlite3) -> *const c_char {
     static DEFAULT_MSG: LazyLock<CString> =
-        LazyLock::new(|| CString::new("not an error").expect("static"));
+        LazyLock::new(|| CString::new(DEFAULT_ERROR_MESSAGE).expect("static"));
 
     COMPAT_ERRMSG.fetch_add(1, Ordering::Relaxed);
 
@@ -872,9 +935,7 @@ pub unsafe extern "C" fn sqlite3_errcode(db: *mut Sqlite3) -> c_int {
     if db.is_null() {
         return SQLITE_OK;
     }
-    // We don't store the error code separately; return OK.
-    // A more complete implementation would track this.
-    SQLITE_OK
+    (&*db).last_error_code.load(Ordering::Relaxed)
 }
 
 // ── sqlite3_changes ─────────────────────────────────────────────────
@@ -884,9 +945,11 @@ pub unsafe extern "C" fn sqlite3_errcode(db: *mut Sqlite3) -> c_int {
 /// # Safety
 /// `db` must be a valid handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sqlite3_changes(_db: *mut Sqlite3) -> c_int {
-    // Placeholder: full tracking requires connection-level state.
-    0
+pub unsafe extern "C" fn sqlite3_changes(db: *mut Sqlite3) -> c_int {
+    if db.is_null() {
+        return 0;
+    }
+    (&*db).last_changes.load(Ordering::Relaxed)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1185,6 +1248,29 @@ mod tests {
     }
 
     #[test]
+    fn test_errcode_tracks_last_result() {
+        unsafe {
+            let db = open_memory();
+
+            assert_eq!(sqlite3_errcode(db), SQLITE_OK);
+
+            let sql = CString::new("SELEC invalid;").unwrap();
+            let rc = sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
+            assert_ne!(rc, SQLITE_OK);
+            assert_eq!(sqlite3_errcode(db), rc);
+
+            let sql = CString::new("SELECT 1;").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_errcode(db), SQLITE_OK);
+
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
     fn test_errmsg_null_db() {
         unsafe {
             let msg = sqlite3_errmsg(ptr::null_mut());
@@ -1411,6 +1497,43 @@ mod tests {
                 sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
                 SQLITE_OK
             );
+
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_changes_tracks_last_dml_and_survives_select() {
+        unsafe {
+            let db = open_memory();
+
+            let sql = CString::new("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_changes(db), 0);
+
+            let sql = CString::new("INSERT INTO t VALUES(1, 'a');").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_changes(db), 1);
+
+            let sql = CString::new("SELECT v FROM t;").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_changes(db), 1);
+
+            let sql = CString::new("UPDATE t SET v = 'b' WHERE id = 99;").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_changes(db), 0);
 
             sqlite3_close(db);
         }

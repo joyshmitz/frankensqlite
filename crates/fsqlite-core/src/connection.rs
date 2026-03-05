@@ -7,7 +7,7 @@
 //! VDBE execution image and compatibility fallback for selected paths while
 //! cutover work continues.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -62,7 +62,7 @@ use fsqlite_vfs::IoUringVfs;
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
-use fsqlite_vfs::traits::Vfs;
+use fsqlite_vfs::traits::{Vfs, VfsFile};
 use fsqlite_wal::{
     WalFecRepairEvidenceCard, WalFecRepairEvidenceQuery, WalFecRepairSeverityBucket, WalFile,
     WalSalts, query_raptorq_repair_evidence, raptorq_repair_events_snapshot,
@@ -297,6 +297,33 @@ impl PagerBackend {
         }
     }
 
+    /// Probe whether a sibling `-wal` file exists and is large enough to
+    /// contain at least a complete WAL header.
+    fn wal_file_present(&self, cx: &Cx, db_path: &str) -> bool {
+        let wal_path = wal_path_for_db_path(db_path);
+        match self {
+            Self::Memory(_) => {
+                let vfs = MemoryVfs::new();
+                wal_file_present_with_vfs(&vfs, cx, &wal_path)
+            }
+            #[cfg(target_os = "linux")]
+            Self::IoUring(_) => {
+                let vfs = IoUringVfs::new();
+                wal_file_present_with_vfs(&vfs, cx, &wal_path)
+            }
+            #[cfg(unix)]
+            Self::Unix(_) => {
+                let vfs = UnixVfs::new();
+                wal_file_present_with_vfs(&vfs, cx, &wal_path)
+            }
+            #[cfg(target_os = "windows")]
+            Self::Windows(_) => {
+                let vfs = fsqlite_vfs::WindowsVfs::new();
+                wal_file_present_with_vfs(&vfs, cx, &wal_path)
+            }
+        }
+    }
+
     /// Run a WAL checkpoint.
     fn checkpoint(
         &self,
@@ -381,6 +408,26 @@ where
     pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))
 }
 
+fn wal_file_present_with_vfs<V>(vfs: &V, cx: &Cx, wal_path: &Path) -> bool
+where
+    V: Vfs + Send + Sync + 'static,
+{
+    if !vfs
+        .access(cx, wal_path, AccessFlags::EXISTS)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+
+    let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+    let Ok((mut file, _)) = vfs.open(cx, Some(wal_path), open_flags) else {
+        return false;
+    };
+    let size = file.file_size(cx).ok();
+    let _ = file.close(cx);
+    size.is_some_and(|len| len >= 32)
+}
+
 /// Build a [`FunctionRegistry`] populated with all built-in scalar,
 /// aggregate, datetime, and math functions.
 fn default_function_registry() -> Arc<FunctionRegistry> {
@@ -451,8 +498,8 @@ pub struct PreparedStatement<'conn> {
     /// This mirrors `Connection::execute_statement`'s distinct+limit handling
     /// to avoid returning too few rows when LIMIT is applied before DISTINCT.
     post_distinct_limit: Option<LimitClause>,
-    /// Schema cookie captured at prepare time (bd-3mmj).  Used by the
-    /// engine's `ReadCookie` opcode and for future stale-schema detection.
+    /// Schema cookie captured at prepare time (bd-3mmj). Used by the
+    /// engine's `ReadCookie` opcode and prepared-statement invalidation.
     schema_cookie: u32,
     /// Root capability context inherited from the Connection that prepared
     /// this statement. Carries trace/decision/policy IDs for observability.
@@ -584,6 +631,17 @@ impl std::fmt::Debug for PreparedStatement<'_> {
 }
 
 impl PreparedStatement<'_> {
+    fn requires_schema_validation(&self) -> bool {
+        self.db.is_some() || self.dml_statement.is_some()
+    }
+
+    fn ensure_schema_unchanged(&self) -> Result<()> {
+        if self.requires_schema_validation() && self.conn.schema_cookie() != self.schema_cookie {
+            return Err(FrankenError::SchemaChanged);
+        }
+        Ok(())
+    }
+
     /// Returns `true` if this prepared statement is a DML statement
     /// (INSERT/UPDATE/DELETE).
     pub fn is_dml(&self) -> bool {
@@ -599,6 +657,7 @@ impl PreparedStatement<'_> {
                     .to_owned(),
             ));
         }
+        self.ensure_schema_unchanged()?;
         let mut rows = if let Some(db) = self.db.as_ref() {
             let Some(registry) = self.func_registry.as_ref() else {
                 return Err(FrankenError::Internal(
@@ -659,6 +718,7 @@ impl PreparedStatement<'_> {
                     .to_owned(),
             ));
         }
+        self.ensure_schema_unchanged()?;
         let mut rows = if let Some(db) = self.db.as_ref() {
             let Some(registry) = self.func_registry.as_ref() else {
                 return Err(FrankenError::Internal(
@@ -859,6 +919,16 @@ impl Drop for TriggerFrameGuard<'_> {
     }
 }
 
+struct StatementSavepointDepthGuard<'a> {
+    depth: &'a Cell<usize>,
+}
+
+impl Drop for StatementSavepointDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.depth.set(self.depth.get().saturating_sub(1));
+    }
+}
+
 /// Check if a trigger event matches a DML event.
 ///
 /// For INSERT/DELETE, this is an exact match.
@@ -891,13 +961,12 @@ fn trigger_event_matches(
 }
 
 /// Evaluate a trigger WHEN clause in a constant-expression context.
-///
-/// If evaluation fails (for example due to unresolved OLD/NEW references),
-/// return `true` to preserve current trigger behavior until pseudo-table
-/// bindings are fully implemented.
-fn trigger_when_matches(when_clause: Option<&Expr>, frame: Option<&TriggerFrame>) -> bool {
+fn trigger_when_matches(
+    when_clause: Option<&Expr>,
+    frame: Option<&TriggerFrame>,
+) -> Result<bool> {
     let Some(expr) = when_clause else {
-        return true;
+        return Ok(true);
     };
     let mut bound_expr = expr.clone();
     if let Some(active_frame) = frame {
@@ -905,10 +974,8 @@ fn trigger_when_matches(when_clause: Option<&Expr>, frame: Option<&TriggerFrame>
     }
     let row: [SqliteValue; 0] = [];
     let col_map: [(String, String); 0] = [];
-    match eval_join_expr(&bound_expr, &row, &col_map) {
-        Ok(value) => is_sqlite_truthy(&value),
-        Err(_) => true,
-    }
+    let value = eval_join_expr(&bound_expr, &row, &col_map)?;
+    Ok(is_sqlite_truthy(&value))
 }
 
 /// For `UPDATE OF col1, col2` triggers, ensure at least one listed column
@@ -1012,6 +1079,7 @@ struct DbSnapshot {
     autoincrement_tables: HashSet<String>,
     sqlite_sequence_cache: HashMap<String, i64>,
     next_master_rowid: i64,
+    schema_cookie: u32,
 }
 
 /// A named savepoint with its pre-state snapshot.
@@ -1223,6 +1291,10 @@ pub struct Connection {
     checkpoint_advisor_state: RefCell<CheckpointAdvisorState>,
     /// Number of rows affected by the most recent DML statement.
     last_changes: RefCell<usize>,
+    /// Tracks nested internal statement savepoints so one top-level write
+    /// statement can protect all nested trigger/FK work without per-substatement
+    /// savepoint churn.
+    internal_statement_savepoint_depth: Cell<usize>,
     /// Whether the current transaction was started implicitly by SAVEPOINT
     /// (as opposed to an explicit BEGIN).  Used by RELEASE to decide whether
     /// to auto-commit when the last savepoint is released.
@@ -1398,6 +1470,7 @@ impl Connection {
             txn_lifecycle_metrics: RefCell::new(TxnLifecycleMetrics::default()),
             checkpoint_advisor_state: RefCell::new(CheckpointAdvisorState::default()),
             last_changes: RefCell::new(0),
+            internal_statement_savepoint_depth: Cell::new(0),
             implicit_txn: RefCell::new(false),
             concurrent_txn: RefCell::new(false),
             concurrent_mode_default: RefCell::new(true),
@@ -1717,8 +1790,7 @@ impl Connection {
             .ok()
             .flatten()
             .is_some_and(|header| header.write_version == 2 || header.read_version == 2);
-        let wal_path = wal_path_for_db_path(&self.path);
-        let wal_file_present = std::fs::metadata(wal_path).is_ok_and(|meta| meta.len() >= 32);
+        let wal_file_present = self.pager.wal_file_present(&self.op_cx(), &self.path);
         if header_requests_wal || wal_file_present {
             let mut pragma_state = self.pragma_state.borrow_mut();
             "wal".clone_into(&mut pragma_state.journal_mode);
@@ -2054,6 +2126,7 @@ impl Connection {
         params: &[SqliteValue],
     ) -> Result<usize> {
         if let Some(dml) = &stmt.dml_statement {
+            stmt.ensure_schema_unchanged()?;
             let p = if params.is_empty() {
                 None
             } else {
@@ -2153,6 +2226,144 @@ impl Connection {
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
+
+    fn next_internal_savepoint_name(&self, purpose: &str) -> String {
+        let mut suffix = 0_u64;
+        loop {
+            let candidate = format!("__fsqlite_stmt_{purpose}_{}_{}", next_trace_id(), suffix);
+            let conflicts = self
+                .savepoints
+                .borrow()
+                .iter()
+                .any(|savepoint| savepoint.name.eq_ignore_ascii_case(&candidate));
+            if !conflicts {
+                return candidate;
+            }
+            suffix = suffix.saturating_add(1);
+        }
+    }
+
+    fn with_internal_statement_savepoint<T>(
+        &self,
+        purpose: &str,
+        body: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let cx = self.op_cx();
+        let savepoint_name = self.next_internal_savepoint_name(purpose);
+        let snapshot = self.snapshot();
+        self.internal_statement_savepoint_depth
+            .set(self.internal_statement_savepoint_depth.get().saturating_add(1));
+        let _depth_guard = StatementSavepointDepthGuard {
+            depth: &self.internal_statement_savepoint_depth,
+        };
+
+        if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+            txn.savepoint(&cx, &savepoint_name)?;
+        }
+
+        let concurrent_snapshot = if *self.concurrent_txn.borrow() {
+            let concurrent_result = (|| -> Result<Option<ConcurrentSavepoint>> {
+                let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
+                    FrankenError::Internal(
+                        "concurrent transaction active but no session ID".to_owned(),
+                    )
+                })?;
+                let registry = lock_unpoisoned(&self.concurrent_registry);
+                let handle = registry.get(session_id).ok_or_else(|| {
+                    FrankenError::Internal("concurrent session handle not found".to_owned())
+                })?;
+                let snapshot = concurrent_savepoint(handle, &savepoint_name).map_err(|e| {
+                    FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
+                })?;
+                Ok(Some(snapshot))
+            })();
+            match concurrent_result {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                        let _ = txn.rollback_to_savepoint(&cx, &savepoint_name);
+                        let _ = txn.release_savepoint(&cx, &savepoint_name);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+
+        match body() {
+            Ok(value) => {
+                if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                    txn.release_savepoint(&cx, &savepoint_name)?;
+                }
+                Ok(value)
+            }
+            Err(statement_error) => {
+                // Full ROLLBACK can clear the transaction underneath us
+                // (for example via trigger RAISE(ROLLBACK)). In that case,
+                // the outer rollback has already restored connection state.
+                if self.active_txn.borrow().is_none() {
+                    return Err(statement_error);
+                }
+
+                let mut cleanup_errors = Vec::new();
+                let mut pager_rollback_succeeded = false;
+                if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
+                    match txn.rollback_to_savepoint(&cx, &savepoint_name) {
+                        Ok(()) => {
+                            pager_rollback_succeeded = true;
+                            if let Err(err) = txn.release_savepoint(&cx, &savepoint_name) {
+                                cleanup_errors.push(format!(
+                                    "pager release_savepoint('{savepoint_name}') failed: {err}"
+                                ));
+                            }
+                        }
+                        Err(err) => cleanup_errors.push(format!(
+                            "pager rollback_to_savepoint('{savepoint_name}') failed: {err}"
+                        )),
+                    }
+                }
+
+                if let Some(concurrent_snap) = concurrent_snapshot.as_ref() {
+                    if let Some(session_id) = *self.concurrent_session_id.borrow() {
+                        let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                        if let Some(handle) = registry.get_mut(session_id) {
+                            if let Err(err) =
+                                concurrent_rollback_to_savepoint(handle, concurrent_snap)
+                            {
+                                cleanup_errors.push(format!(
+                                    "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
+                                ));
+                            }
+                        } else {
+                            cleanup_errors.push(format!(
+                                "concurrent session {session_id} missing during rollback"
+                            ));
+                        }
+                    } else {
+                        cleanup_errors.push(
+                            "concurrent transaction active but no session ID during rollback"
+                                .to_owned(),
+                        );
+                    }
+                }
+
+                if pager_rollback_succeeded {
+                    self.txn_metrics_note_rollback();
+                    self.restore_snapshot(&snapshot);
+                }
+
+                if !cleanup_errors.is_empty() {
+                    return Err(FrankenError::Internal(format!(
+                        "statement savepoint rollback failed after {purpose}: {statement_error}; cleanup failed: {}",
+                        cleanup_errors.join("; ")
+                    )));
+                }
+
+                Err(statement_error)
+            }
+        }
+    }
 
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
     /// DML (SELECT/INSERT/UPDATE/DELETE).
@@ -2259,7 +2470,20 @@ impl Connection {
                 self.txn_metrics_note_read();
             }
         }
-        let result = self.execute_statement_dispatch(statement, params);
+        let use_statement_savepoint = !was_auto
+            && self.active_txn.borrow().is_some()
+            && self.internal_statement_savepoint_depth.get() == 0
+            && matches!(
+                &statement,
+                Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+            );
+        let result = if use_statement_savepoint {
+            self.with_internal_statement_savepoint(statement_kind, || {
+                self.execute_statement_dispatch(statement, params)
+            })
+        } else {
+            self.execute_statement_dispatch(statement, params)
+        };
         let ok = result.is_ok();
         self.resolve_autocommit_txn(was_auto, ok)?;
         let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -7087,9 +7311,8 @@ impl Connection {
         let frame = self.make_trigger_frame(table_name, old_values, new_values)?;
         for trigger in matching {
             let _frame_guard = self.push_trigger_frame(frame.clone());
-            // Evaluate constant WHEN expressions now; unresolved OLD/NEW-based
-            // clauses still fall back to firing until pseudo-tables are wired.
-            if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame)) {
+            // Evaluate the bound WHEN predicate against the current OLD/NEW frame.
+            if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame))? {
                 continue;
             }
 
@@ -7141,7 +7364,7 @@ impl Connection {
         let frame = self.make_trigger_frame(table_name, old_values, new_values)?;
         for trigger in matching {
             let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame)) {
+            if !trigger_when_matches(trigger.when_clause.as_ref(), Some(&frame))? {
                 continue;
             }
 
@@ -7520,6 +7743,7 @@ impl Connection {
             autoincrement_tables: self.autoincrement_tables.borrow().clone(),
             sqlite_sequence_cache: self.sqlite_sequence_cache.borrow().clone(),
             next_master_rowid: *self.next_master_rowid.borrow(),
+            schema_cookie: *self.schema_cookie.borrow(),
         }
     }
 
@@ -7533,6 +7757,7 @@ impl Connection {
         (*self.autoincrement_tables.borrow_mut()).clone_from(&snap.autoincrement_tables);
         (*self.sqlite_sequence_cache.borrow_mut()).clone_from(&snap.sqlite_sequence_cache);
         *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
+        *self.schema_cookie.borrow_mut() = snap.schema_cookie;
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
@@ -17841,7 +18066,16 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             }
         }
         "abs" => match args.first() {
-            Some(SqliteValue::Integer(n)) => SqliteValue::Integer(n.abs()),
+            Some(SqliteValue::Integer(n)) => {
+                if *n == i64::MIN {
+                    // i64::MIN cannot be negated; C SQLite returns integer overflow error.
+                    // Promote to float to avoid panic.
+                    #[allow(clippy::cast_precision_loss)]
+                    SqliteValue::Float((*n as f64).abs())
+                } else {
+                    SqliteValue::Integer(n.abs())
+                }
+            }
             Some(SqliteValue::Float(f)) => SqliteValue::Float(f.abs()),
             _ => SqliteValue::Null,
         },
@@ -17903,10 +18137,17 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             .unwrap_or(SqliteValue::Null),
         "replace" => {
             if args.len() >= 3 {
+                if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+                    return SqliteValue::Null;
+                }
                 let s = sqlite_value_to_text(&args[0]);
                 let from = sqlite_value_to_text(&args[1]);
                 let to = sqlite_value_to_text(&args[2]);
-                SqliteValue::Text(s.replace(&from, &to))
+                if from.is_empty() {
+                    SqliteValue::Text(s)
+                } else {
+                    SqliteValue::Text(s.replace(&from, &to))
+                }
             } else {
                 SqliteValue::Null
             }
@@ -18143,13 +18384,18 @@ mod tests {
     use super::{
         CommitSeq, Connection, InProcessPageLockTable, PagerBackend, Row, SchemaEpoch, Snapshot,
         is_sqlite_master_entry_missing, lock_unpoisoned, statement_contains_rewritable_subquery,
+        wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
     use fsqlite_types::PageNumber;
+    use fsqlite_types::cx::Cx;
+    use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
     use fsqlite_vdbe::ProgramBuilder;
+    use fsqlite_vfs::MemoryVfs;
+    use fsqlite_vfs::traits::{Vfs, VfsFile};
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -19637,6 +19883,33 @@ mod tests {
     }
 
     #[test]
+    fn test_trigger_when_invalid_column_returns_error_and_rolls_back_statement() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_when_bad AFTER INSERT ON t WHEN NEW.missing > 0 BEGIN INSERT INTO log VALUES ('fired'); END;",
+        )
+        .unwrap();
+
+        let err = conn
+            .execute("INSERT INTO t VALUES (1);")
+            .expect_err("INSERT should fail when trigger WHEN references a missing column");
+        assert!(matches!(
+            err,
+            FrankenError::Internal(ref msg) if msg.contains("column not found: missing")
+        ));
+
+        let rows = conn.query("SELECT id FROM t;").unwrap();
+        assert!(rows.is_empty(), "failed AFTER trigger should roll back INSERT");
+        let rows = conn.query("SELECT msg FROM log;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "trigger body must not run when WHEN clause evaluation fails"
+        );
+    }
+
+    #[test]
     fn test_trigger_body_binds_old_new_columns_from_frame() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
@@ -19755,6 +20028,31 @@ mod tests {
             row_values(&rows[0])[0],
             SqliteValue::Text("changed".to_owned())
         );
+    }
+
+    #[test]
+    fn test_trigger_when_error_aborts_insert_instead_of_firing() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE log (msg TEXT);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_bad_when AFTER INSERT ON t WHEN NEW.missing > 0 BEGIN INSERT INTO log VALUES ('fired'); END;",
+        )
+        .unwrap();
+
+        let err = conn
+            .execute("INSERT INTO t VALUES (1);")
+            .expect_err("invalid trigger WHEN clause should abort the statement");
+        assert!(
+            matches!(err, FrankenError::Internal(ref msg) if msg.contains("missing")),
+            "expected missing-column error, got {err:?}"
+        );
+
+        let rows = conn.query("SELECT COUNT(*) FROM t;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+
+        let rows = conn.query("SELECT COUNT(*) FROM log;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
     }
 
     #[test]
@@ -19878,6 +20176,37 @@ mod tests {
             rows.is_empty(),
             "transaction should be rolled back by RAISE(ROLLBACK)"
         );
+    }
+
+    #[test]
+    fn test_fk_violation_rolls_back_only_failed_statement_in_explicit_txn() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("CREATE TABLE child (parent_id INTEGER REFERENCES parent(id));")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        let err = conn
+            .execute("INSERT INTO child VALUES (1);")
+            .expect_err("FK violation should abort the statement");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        assert!(conn.in_transaction(), "explicit transaction should remain open");
+
+        let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(0),
+            "failed INSERT should not leave partial child rows behind"
+        );
+
+        conn.execute("INSERT INTO parent VALUES (1);").unwrap();
+        conn.execute("INSERT INTO child VALUES (1);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
     }
 
     #[test]
@@ -24904,6 +25233,35 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_txn_fk_violation_rolls_back_only_the_statement() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys=ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (parent_id INTEGER REFERENCES parent(id));",
+        )
+        .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        let err = conn
+            .execute("INSERT INTO child VALUES (42);")
+            .expect_err("INSERT should fail due to missing parent row");
+        assert!(matches!(err, FrankenError::ForeignKeyViolation));
+        assert!(conn.in_transaction(), "FK failure should not abort transaction");
+
+        let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+
+        conn.execute("INSERT INTO parent VALUES (42);").unwrap();
+        conn.execute("INSERT INTO child VALUES (42);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+    }
+
+    #[test]
     fn test_pragma_user_version_and_application_id_persist_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("pragma_header_roundtrip.db");
@@ -25961,6 +26319,26 @@ mod tests {
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
         assert_eq!(*rows[0].get(1).unwrap(), SqliteValue::Integer(-1));
         assert_eq!(*rows[0].get(2).unwrap(), SqliteValue::Integer(-1));
+    }
+
+    #[test]
+    fn test_wal_file_present_with_vfs_requires_header_sized_artifact() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let wal_path = wal_path_for_db_path("/wal_present.db");
+        let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+
+        assert!(!wal_file_present_with_vfs(&vfs, &cx, &wal_path));
+
+        let (mut short_file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        short_file.write(&cx, &[0_u8; 31], 0).unwrap();
+        short_file.close(&cx).unwrap();
+        assert!(!wal_file_present_with_vfs(&vfs, &cx, &wal_path));
+
+        let (mut full_file, _) = vfs.open(&cx, Some(&wal_path), open_flags).unwrap();
+        full_file.write(&cx, &[0_u8; 32], 0).unwrap();
+        full_file.close(&cx).unwrap();
+        assert!(wal_file_present_with_vfs(&vfs, &cx, &wal_path));
     }
 
     // ─── bd-1dp9.4.1: Journal mode transition + checkpoint parity tests ──
@@ -28328,6 +28706,25 @@ mod schema_cookie_tests {
 
         conn.execute("DROP VIEW v1;").unwrap();
         assert_eq!(conn.schema_cookie(), 3);
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_restores_schema_cookie() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        assert_eq!(conn.schema_cookie(), 1);
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT ddl_step;").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        assert_eq!(conn.schema_cookie(), 2);
+
+        conn.execute("ROLLBACK TO ddl_step;").unwrap();
+        assert_eq!(conn.schema_cookie(), 1);
+        assert!(conn.query("SELECT * FROM t2;").is_err());
+
+        conn.execute("RELEASE ddl_step;").unwrap();
+        conn.execute("COMMIT;").unwrap();
     }
 
     #[test]
@@ -35079,6 +35476,52 @@ mod pager_routing_tests {
 
         let rows = conn.query("SELECT val FROM ps_exec2 WHERE id = 1").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
+    }
+
+    #[test]
+    fn test_prepared_select_rejects_schema_change() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_schema_sel (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_schema_sel VALUES (1, 'alpha');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT val FROM prep_schema_sel ORDER BY id")
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+
+        conn.execute("CREATE TABLE prep_schema_sel_bump (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let err = stmt.query().unwrap_err();
+        assert!(matches!(err, FrankenError::SchemaChanged));
+    }
+
+    #[test]
+    fn test_prepared_dml_rejects_schema_change() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_schema_dml (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO prep_schema_dml (id, val) VALUES (?1, ?2)")
+            .unwrap();
+        conn.execute("CREATE TABLE prep_schema_dml_bump (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let err = stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("alpha".to_owned()),
+            ])
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::SchemaChanged));
+
+        let rows = conn.query("SELECT COUNT(*) FROM prep_schema_dml;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
     }
 
     #[test]

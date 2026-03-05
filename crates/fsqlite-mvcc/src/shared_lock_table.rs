@@ -435,7 +435,12 @@ impl SharedPageLockTable {
                 ) {
                     Ok(_) => {
                         if self.rebuild_epoch.load(Ordering::Acquire) != start_epoch {
-                            let _ = entry.owner_txn.compare_exchange(txn_id, 0, Ordering::AcqRel, Ordering::Relaxed);
+                            let _ = entry.owner_txn.compare_exchange(
+                                txn_id,
+                                0,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            );
                             return self.try_acquire(page_number, txn_id);
                         }
                         return AcquireResult::Acquired;
@@ -487,7 +492,12 @@ impl SharedPageLockTable {
                 ) {
                     Ok(_) => {
                         if self.rebuild_epoch.load(Ordering::Acquire) != start_epoch {
-                            let _ = entry.owner_txn.compare_exchange(txn_id, 0, Ordering::AcqRel, Ordering::Relaxed);
+                            let _ = entry.owner_txn.compare_exchange(
+                                txn_id,
+                                0,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            );
                             return self.try_acquire(page_number, txn_id);
                         }
                         AcquireResult::Acquired
