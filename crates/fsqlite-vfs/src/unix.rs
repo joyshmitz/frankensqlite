@@ -177,7 +177,7 @@ fn build_empty_sqlite_wal_shm_header(
     write_ne_u32(&mut hdr, 4, 0); // unused
     write_ne_u32(&mut hdr, 8, 0); // iChange
     hdr[12] = 1; // isInit
-    hdr[13] = 0; // bigEndCksum (normal little-endian WAL checksums)
+    hdr[13] = if cfg!(target_endian = "big") { 1 } else { 0 }; // bigEndCksum
     hdr[14..16].copy_from_slice(&sz_page_u16.to_ne_bytes());
     write_ne_u32(&mut hdr, 16, 0); // mxFrame (empty WAL)
     write_ne_u32(&mut hdr, 20, n_page);

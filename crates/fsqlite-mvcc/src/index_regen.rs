@@ -388,11 +388,15 @@ fn numeric_rem(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
         }
         SqliteValue::Integer(a.wrapping_rem(*b))
     } else {
-        let fb = r.to_float();
-        if fb == 0.0 {
+        // C SQLite: OP_Remainder always converts to integers even for float
+        // operands, performs integer %, then returns result as Float.
+        let ia = l.to_integer();
+        let ib = r.to_integer();
+        if ib == 0 {
             return SqliteValue::Null;
         }
-        SqliteValue::from(l.to_float() % fb)
+        let result = ia.checked_rem(ib).unwrap_or_default();
+        SqliteValue::Float(result as f64)
     }
 }
 

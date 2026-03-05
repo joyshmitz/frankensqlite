@@ -1765,9 +1765,9 @@ impl<P: PageWriter> BtCursor<P> {
         if let Some(first) = overflow_head {
             let _ = self.free_overflow_chain(cx, first);
         }
-        Err(FrankenError::DatabaseCorrupt {
-            detail: "interior replacement requires rebalance; refusing partial update".to_owned(),
-        })
+        Err(FrankenError::internal(
+            "interior replacement requires rebalance; refusing partial update"
+        ))
     }
 
     fn remove_cell_from_leaf(&mut self, cx: &Cx) -> Result<(PageNumber, u16)> {

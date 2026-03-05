@@ -87,6 +87,10 @@ impl FreelistTrunk {
     /// Serialize this trunk page into a page-sized buffer.
     #[allow(clippy::cast_possible_truncation)]
     pub fn write(&self, page: &mut [u8]) {
+        if page.len() < 8 {
+            return;
+        }
+
         let next = self.next_trunk.map_or(0u32, PageNumber::get);
         page[0..4].copy_from_slice(&next.to_be_bytes());
 

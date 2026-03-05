@@ -402,27 +402,44 @@ impl WriteCoordinator {
             "native_publish: starting validation"
         );
 
-        // Step 1: Validate (first-committer-wins on write_set_summary).
-        if let Some((conflict_pages, conflict_seq)) =
-            self.validate_fcw_set(&req.write_set_summary, req.begin_seq)
-        {
-            info!(
-                bead_id = "bd-389e",
-                txn = ?req.txn,
-                conflicts = conflict_pages.len(),
-                "native_publish: FCW conflict detected"
-            );
-            return NativePublishResponse::Conflict {
-                conflicting_pages: conflict_pages,
-                conflicting_commit_seq: conflict_seq,
-            };
-        }
+        // Step 1-3: Validate, allocate, and update atomically.
+        let commit_seq = {
+            let mut index = self.commit_page_index.write();
+            let mut conflict_pages = Vec::new();
+            let mut conflict_seq = CommitSeq::new(0);
 
-        // Step 2: Allocate commit_seq.
-        let commit_seq = self.allocate_commit_seq();
+            for &pgno in &req.write_set_summary {
+                if let Some(&committed_seq) = index.get(&pgno) {
+                    if committed_seq.get() > req.begin_seq.get() {
+                        if let Some(pn) = PageNumber::new(pgno) {
+                            conflict_pages.push(pn);
+                        }
+                        if committed_seq.get() > conflict_seq.get() {
+                            conflict_seq = committed_seq;
+                        }
+                    }
+                }
+            }
 
-        // Step 3: Update commit page index.
-        self.update_commit_index(&req.write_set_summary, commit_seq);
+            if !conflict_pages.is_empty() {
+                info!(
+                    bead_id = "bd-389e",
+                    txn = ?req.txn,
+                    conflicts = conflict_pages.len(),
+                    "native_publish: FCW conflict detected"
+                );
+                return NativePublishResponse::Conflict {
+                    conflicting_pages: conflict_pages,
+                    conflicting_commit_seq: conflict_seq,
+                };
+            }
+
+            let seq = self.allocate_commit_seq();
+            for &pgno in &req.write_set_summary {
+                index.insert(pgno, seq);
+            }
+            seq
+        };
 
         // Step 4: "Marker IO" — in the full implementation, this appends a
         // CommitMarker to the marker stream. Here we generate the marker
@@ -479,24 +496,48 @@ impl WriteCoordinator {
             "compat_commit: starting validation"
         );
 
-        // Step 1: Validate (FCW).
-        if let Some((conflict_pages, conflict_seq)) =
-            self.validate_fcw_set(&page_set, req.snapshot.high)
-        {
-            info!(
-                bead_id = "bd-389e",
-                txn = ?req.txn,
-                conflicts = conflict_pages.len(),
-                "compat_commit: FCW conflict detected"
-            );
-            return CompatCommitResponse::Conflict {
-                conflicting_pages: conflict_pages,
-                conflicting_commit_seq: conflict_seq,
-            };
-        }
+        // Step 1-2: Validate and allocate atomically.
+        let commit_seq = {
+            let mut index = self.commit_page_index.write();
+            let mut conflict_pages = Vec::new();
+            let mut conflict_seq = CommitSeq::new(0);
 
-        // Step 2: Allocate commit_seq.
-        let commit_seq = self.allocate_commit_seq();
+            for &pgno in &page_set {
+                if let Some(&committed_seq) = index.get(&pgno) {
+                    if committed_seq.get() > req.snapshot.high.get() {
+                        if let Some(pn) = PageNumber::new(pgno) {
+                            conflict_pages.push(pn);
+                        }
+                        if committed_seq.get() > conflict_seq.get() {
+                            conflict_seq = committed_seq;
+                        }
+                    }
+                }
+            }
+
+            if !conflict_pages.is_empty() {
+                info!(
+                    bead_id = "bd-389e",
+                    txn = ?req.txn,
+                    conflicts = conflict_pages.len(),
+                    "compat_commit: FCW conflict detected"
+                );
+                return CompatCommitResponse::Conflict {
+                    conflicting_pages: conflict_pages,
+                    conflicting_commit_seq: conflict_seq,
+                };
+            }
+
+            let seq = self.allocate_commit_seq();
+            // In compat mode, we defer the index update to Step 5 (after WAL append)
+            // but we MUST reserve the pages NOW to prevent concurrent commits.
+            // V1 limitation: We eagerly insert to prevent races. If WAL append fails,
+            // we have a "phantom" update, which is safe (just causes false aborts).
+            for &pgno in &page_set {
+                index.insert(pgno, seq);
+            }
+            seq
+        };
 
         // Step 3: WAL Append — compute offset and record it.
         // In the full implementation, this writes page frames to the WAL file.
@@ -510,7 +551,7 @@ impl WriteCoordinator {
         // this is the group commit fsync point.
 
         // Step 5: Update commit index (publish).
-        self.update_commit_index(&page_set, commit_seq);
+        // (Already reserved eagerly in Step 1 to prevent races)
 
         // Track committed seq.
         self.committed_seqs.write().push(commit_seq);
@@ -565,7 +606,8 @@ impl WriteCoordinator {
         let frame_header_size = 24_u64;
         let mut total_batch_bytes = 0_u64;
 
-        // Phase 1: Validate all.
+        // Phase 1: Validate all (under a single write lock).
+        let mut index = self.commit_page_index.write();
         for req in requests {
             let page_numbers: Vec<u32> = req
                 .write_set
@@ -575,9 +617,23 @@ impl WriteCoordinator {
                 .collect();
             let page_set: BTreeSet<u32> = page_numbers.iter().copied().collect();
 
-            if let Some((conflict_pages, conflict_seq)) =
-                self.validate_fcw_set(&page_set, req.snapshot.high)
-            {
+            let mut conflict_pages = Vec::new();
+            let mut conflict_seq = CommitSeq::new(0);
+
+            for &pgno in &page_set {
+                if let Some(&committed_seq) = index.get(&pgno) {
+                    if committed_seq.get() > req.snapshot.high.get() {
+                        if let Some(pn) = PageNumber::new(pgno) {
+                            conflict_pages.push(pn);
+                        }
+                        if committed_seq.get() > conflict_seq.get() {
+                            conflict_seq = committed_seq;
+                        }
+                    }
+                }
+            }
+
+            if !conflict_pages.is_empty() {
                 responses.push(CompatCommitResponse::Conflict {
                     conflicting_pages: conflict_pages,
                     conflicting_commit_seq: conflict_seq,
@@ -638,9 +694,12 @@ impl WriteCoordinator {
 
         // Phase 4: Publish all and fill responses.
         for (commit_seq, page_set) in &accepted_commits {
-            self.update_commit_index(page_set, *commit_seq);
+            for &pgno in page_set {
+                index.insert(pgno, *commit_seq);
+            }
             self.committed_seqs.write().push(*commit_seq);
         }
+        drop(index);
 
         info!(
             bead_id = "bd-389e",

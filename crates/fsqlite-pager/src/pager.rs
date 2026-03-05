@@ -966,6 +966,11 @@ where
     fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
         self.ensure_writer()?;
 
+        // First, try to reuse a page freed by this transaction.
+        if let Some(page) = self.freed_pages.pop() {
+            return Ok(page);
+        }
+
         let mut inner = self
             .inner
             .lock()
@@ -976,8 +981,12 @@ where
             return Ok(page);
         }
 
-        let raw = inner.next_page;
-        inner.next_page = inner.next_page.saturating_add(1);
+        let mut raw = inner.next_page;
+        let pending_byte_page = (0x4000_0000 / inner.page_size.get()) + 1;
+        if raw == pending_byte_page {
+            raw = raw.saturating_add(1);
+        }
+        inner.next_page = raw.saturating_add(1);
         drop(inner);
         let page = PageNumber::new(raw).ok_or_else(|| FrankenError::OutOfRange {
             what: "allocated page number".to_owned(),

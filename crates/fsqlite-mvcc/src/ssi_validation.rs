@@ -331,7 +331,7 @@ pub fn discover_incoming_edges(
 
         for write_key in write_keys {
             if let Some(page) = witness_key_page(write_key) {
-                if reader.pages.contains(&PageNumber::new(page).unwrap()) {
+                if reader.pages.contains(&page) {
                     if seen_sources.insert(reader.token) {
                         debug!(
                             bead_id = "bd-31bo",
@@ -436,7 +436,7 @@ pub fn discover_outgoing_edges(
 
         for read_key in read_keys {
             if let Some(page) = witness_key_page(read_key) {
-                if writer.pages.contains(&PageNumber::new(page).unwrap()) {
+                if writer.pages.contains(&page) {
                     if seen_targets.insert(writer.token) {
                         debug!(
                             bead_id = "bd-31bo",
@@ -468,13 +468,13 @@ pub fn discover_outgoing_edges(
 // ---------------------------------------------------------------------------
 
 /// Extract the page number from a witness key.
-pub(crate) fn witness_key_page(key: &WitnessKey) -> Option<u32> {
+pub(crate) fn witness_key_page(key: &WitnessKey) -> Option<PageNumber> {
     match key {
-        WitnessKey::Page(p) => Some(p.get()),
+        WitnessKey::Page(p) => Some(*p),
         WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. } => {
-            Some(btree_root.get())
+            Some(*btree_root)
         }
-        WitnessKey::ByteRange { page, .. } => Some(page.get()),
+        WitnessKey::ByteRange { page, .. } => Some(*page),
         WitnessKey::Custom { .. } => None,
     }
 }
@@ -650,6 +650,34 @@ pub fn ssi_validate_and_publish(
     // In a full implementation, cold-plane refinement would tighten witnesses
     // and potentially remove spurious edges.
 
+    // Keep edges deterministic for proof/evidence generation.
+    let mut in_edges = in_edges;
+    in_edges.sort_by(|a, b| {
+        a.from
+            .id
+            .get()
+            .cmp(&b.from.id.get())
+            .then_with(|| a.from.epoch.get().cmp(&b.from.epoch.get()))
+            .then_with(|| a.overlap_key.cmp(&b.overlap_key))
+    });
+
+    let mut out_edges = out_edges;
+    out_edges.sort_by(|a, b| {
+        a.to.id
+            .get()
+            .cmp(&b.to.id.get())
+            .then_with(|| a.to.epoch.get().cmp(&b.to.epoch.get()))
+            .then_with(|| a.overlap_key.cmp(&b.overlap_key))
+    });
+
+    if !out_edges.is_empty() {
+        debug!(
+            bead_id = "bd-31bo",
+            outgoing_edges = out_edges.len(),
+            "ssi_validate: outgoing edge propagation complete"
+        );
+    }
+
     // Step 5: Pivot rule (conservative).
     if state.has_in_rw && state.has_out_rw {
         let all_edges = build_dependency_edges(&in_edges, &out_edges, txn, commit_seq);
@@ -821,34 +849,6 @@ pub fn ssi_validate_and_publish(
         }
     }
 
-    // Keep edges deterministic for proof/evidence generation.
-    let mut in_edges = in_edges;
-    in_edges.sort_by(|a, b| {
-        a.from
-            .id
-            .get()
-            .cmp(&b.from.id.get())
-            .then_with(|| a.from.epoch.get().cmp(&b.from.epoch.get()))
-            .then_with(|| a.overlap_key.cmp(&b.overlap_key))
-    });
-
-    let mut out_edges = out_edges;
-    out_edges.sort_by(|a, b| {
-        a.to.id
-            .get()
-            .cmp(&b.to.id.get())
-            .then_with(|| a.to.epoch.get().cmp(&b.to.epoch.get()))
-            .then_with(|| a.overlap_key.cmp(&b.overlap_key))
-    });
-
-    if !out_edges.is_empty() {
-        debug!(
-            bead_id = "bd-31bo",
-            outgoing_edges = out_edges.len(),
-            "ssi_validate: outgoing edge propagation complete"
-        );
-    }
-
     // Step 7: Publish edges and build CommitProof.
     let all_edges = build_dependency_edges(&in_edges, &out_edges, txn, commit_seq);
     let discovered_edges: Vec<DiscoveredEdge> = in_edges
@@ -925,7 +925,7 @@ fn build_dependency_edges(
             to: edge.to,
             key_basis: EdgeKeyBasis {
                 level: 0,
-                range_prefix: witness_key_page(&edge.overlap_key).unwrap_or(0),
+                range_prefix: witness_key_page(&edge.overlap_key).map(|p| p.get()).unwrap_or(0),
                 refinement: Some(KeySummary::ExactKeys(vec![edge.overlap_key.clone()])),
             },
             observed_by: observer,
@@ -971,7 +971,7 @@ fn decision_outcome(decision_type: SsiDecisionType) -> &'static str {
 fn witness_keys_to_pages(keys: &[WitnessKey]) -> Vec<PageNumber> {
     let mut pages: Vec<PageNumber> = keys
         .iter()
-        .filter_map(|key| witness_key_page(key).and_then(PageNumber::new))
+        .filter_map(witness_key_page)
         .collect();
     pages.sort_by_key(|page| page.get());
     pages.dedup();
@@ -1001,7 +1001,7 @@ fn edge_conflicting_txns(txn: TxnToken, edges: &[DiscoveredEdge]) -> Vec<TxnToke
 fn edge_conflict_pages(edges: &[DiscoveredEdge]) -> Vec<PageNumber> {
     let mut pages: Vec<PageNumber> = edges
         .iter()
-        .filter_map(|edge| witness_key_page(&edge.overlap_key).and_then(PageNumber::new))
+        .filter_map(|edge| witness_key_page(&edge.overlap_key))
         .collect();
     pages.sort_by_key(|page| page.get());
     pages.dedup();
