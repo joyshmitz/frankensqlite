@@ -399,10 +399,12 @@ impl SharedPageLockTable {
         let mut occupied = active.occupied_count();
         let mut at_capacity = f64::from(occupied) / f64::from(self.capacity) > MAX_LOAD_FACTOR;
 
-        // If historical key accumulation pushed us past capacity while no
-        // locks are currently held, trigger a best-effort rebuild so released
-        // locks don't permanently block future acquisitions.
-        if at_capacity && active.locked_count() == 0 {
+        // If historical key accumulation pushed us past capacity, trigger a
+        // best-effort rebuild so released locks don't permanently block future acquisitions.
+        // We do NOT wait for `active.locked_count() == 0` because the rolling rebuild
+        // protocol is explicitly designed to handle active locks by moving them to the
+        // draining table.
+        if at_capacity {
             self.try_start_best_effort_rebuild();
             let refreshed_active_idx = self.active_table.load(Ordering::Acquire);
             active = &self.tables[refreshed_active_idx as usize];
