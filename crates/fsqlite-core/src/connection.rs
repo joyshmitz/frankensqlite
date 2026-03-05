@@ -14182,7 +14182,8 @@ fn type_name_to_affinity_char(name: &str) -> char {
 /// Format a `DefaultValue` AST node as SQL text for PRAGMA table_info output.
 fn format_default_value(dv: &DefaultValue) -> String {
     match dv {
-        DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr) => expr.to_string(),
+        DefaultValue::Expr(expr) => expr.to_string(),
+        DefaultValue::ParenExpr(expr) => format!("({})", expr),
     }
 }
 
@@ -34731,6 +34732,100 @@ mod pager_routing_tests {
         let stmt = conn.prepare("INSERT INTO prep_err VALUES (?1)").unwrap();
         // Standalone query() should error for DML.
         assert!(stmt.query().is_err());
+    }
+
+    // ── GH-13: PreparedStatement::execute_with_params for DML ──────────
+
+    #[test]
+    fn test_prepared_stmt_execute_with_params_insert() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ps_exec (id TEXT PRIMARY KEY, name TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO ps_exec (id, name) VALUES (?1, ?2)")
+            .unwrap();
+
+        // execute_with_params should work directly on the PreparedStatement.
+        let affected = stmt
+            .execute_with_params(&[
+                SqliteValue::Text("a".to_owned()),
+                SqliteValue::Text("Alice".to_owned()),
+            ])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let affected = stmt
+            .execute_with_params(&[
+                SqliteValue::Text("b".to_owned()),
+                SqliteValue::Text("Bob".to_owned()),
+            ])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = conn.query("SELECT name FROM ps_exec ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Bob".to_owned()));
+    }
+
+    #[test]
+    fn test_prepared_stmt_execute_with_params_update() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ps_upd (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO ps_upd VALUES (1, 'old');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("UPDATE ps_upd SET val = ?1 WHERE id = ?2")
+            .unwrap();
+
+        let affected = stmt
+            .execute_with_params(&[SqliteValue::Text("new".to_owned()), SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = conn.query("SELECT val FROM ps_upd WHERE id = 1").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".to_owned()));
+    }
+
+    #[test]
+    fn test_prepared_stmt_execute_with_params_delete() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ps_del (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO ps_del VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+            .unwrap();
+
+        let stmt = conn.prepare("DELETE FROM ps_del WHERE id = ?1").unwrap();
+
+        let affected = stmt
+            .execute_with_params(&[SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = conn.query("SELECT id FROM ps_del ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_prepared_stmt_execute_no_params_insert() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ps_exec2 (id INTEGER PRIMARY KEY, val TEXT DEFAULT 'x');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO ps_exec2 (id, val) VALUES (1, 'hello')")
+            .unwrap();
+
+        let affected = stmt.execute().unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = conn.query("SELECT val FROM ps_exec2 WHERE id = 1").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
     }
 
     #[test]

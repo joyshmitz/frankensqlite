@@ -368,6 +368,30 @@ pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
         if col.is_ipk {
             sql.push_str(" PRIMARY KEY");
         }
+        if col.notnull && !col.is_ipk {
+            sql.push_str(" NOT NULL");
+        }
+        if col.unique && !col.is_ipk {
+            sql.push_str(" UNIQUE");
+        }
+        if let Some(ref default) = col.default_value {
+            sql.push_str(" DEFAULT ");
+            sql.push_str(default);
+        }
+        if let Some(ref collation) = col.collation {
+            sql.push_str(" COLLATE ");
+            sql.push_str(collation);
+        }
+        if let Some(ref gen_expr) = col.generated_expr {
+            sql.push_str(" GENERATED ALWAYS AS (");
+            sql.push_str(gen_expr);
+            sql.push(')');
+            if col.generated_stored == Some(true) {
+                sql.push_str(" STORED");
+            } else {
+                sql.push_str(" VIRTUAL");
+            }
+        }
     }
     sql.push(')');
     if table.strict {
