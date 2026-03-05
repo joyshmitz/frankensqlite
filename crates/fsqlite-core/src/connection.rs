@@ -433,7 +433,7 @@ impl Row {
 }
 
 /// A prepared SQL statement.
-pub struct PreparedStatement {
+pub struct PreparedStatement<'conn> {
     program: VdbeProgram,
     func_registry: Option<Arc<FunctionRegistry>>,
     expression_postprocess: Option<ExpressionPostprocess>,
@@ -462,6 +462,11 @@ pub struct PreparedStatement {
     /// re-parsing.  `None` for SELECT statements (which use the compiled
     /// VdbeProgram directly).
     dml_statement: Option<Statement>,
+    /// Reference to the parent Connection that prepared this statement.
+    /// Used by `execute_with_params` to delegate DML execution through
+    /// the Connection's full execution pipeline (triggers, constraints,
+    /// autocommit).
+    conn: &'conn Connection,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -570,7 +575,7 @@ fn emit_compat_trace_event(trace: Option<&TraceRegistration>, event: TraceEvent)
     tracing::debug!(callback_type, "sqlite3_trace_v2 callback emitted");
 }
 
-impl std::fmt::Debug for PreparedStatement {
+impl std::fmt::Debug for PreparedStatement<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedStatement")
             .field("program", &self.program)
@@ -578,10 +583,9 @@ impl std::fmt::Debug for PreparedStatement {
     }
 }
 
-impl PreparedStatement {
+impl PreparedStatement<'_> {
     /// Returns `true` if this prepared statement is a DML statement
-    /// (INSERT/UPDATE/DELETE) that must be executed through
-    /// `Connection::execute_prepared` or `Connection::execute_prepared_with_params`.
+    /// (INSERT/UPDATE/DELETE).
     pub fn is_dml(&self) -> bool {
         self.dml_statement.is_some()
     }
@@ -714,12 +718,28 @@ impl PreparedStatement {
     }
 
     /// Execute and return affected/output row count.
+    ///
+    /// For DML statements (INSERT/UPDATE/DELETE), this delegates to the
+    /// parent Connection's execution pipeline, which handles triggers,
+    /// constraints, and autocommit.  For SELECT statements, this returns
+    /// the number of result rows.
     pub fn execute(&self) -> Result<usize> {
+        if self.dml_statement.is_some() {
+            return self.conn.execute_prepared(self);
+        }
         Ok(self.query()?.len())
     }
 
     /// Execute with bound SQL parameters and return affected/output row count.
+    ///
+    /// For DML statements (INSERT/UPDATE/DELETE), this delegates to the
+    /// parent Connection's execution pipeline, which handles triggers,
+    /// constraints, and autocommit.  For SELECT statements, this returns
+    /// the number of result rows.
     pub fn execute_with_params(&self, params: &[SqliteValue]) -> Result<usize> {
+        if self.dml_statement.is_some() {
+            return self.conn.execute_prepared_with_params(self, params);
+        }
         Ok(self.query_with_params(params)?.len())
     }
 
@@ -1875,7 +1895,7 @@ impl Connection {
     }
 
     /// Prepare SQL into a statement.
-    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         let statement = {
             let parse_span = tracing::span!(
                 target: "fsqlite.parse",
@@ -2023,14 +2043,14 @@ impl Connection {
     }
 
     /// Execute a prepared DML statement (INSERT/UPDATE/DELETE) with no parameters.
-    pub fn execute_prepared(&self, stmt: &PreparedStatement) -> Result<usize> {
+    pub fn execute_prepared(&self, stmt: &PreparedStatement<'_>) -> Result<usize> {
         self.execute_prepared_with_params(stmt, &[])
     }
 
     /// Execute a prepared DML statement (INSERT/UPDATE/DELETE) with bound parameters.
     pub fn execute_prepared_with_params(
         &self,
-        stmt: &PreparedStatement,
+        stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
     ) -> Result<usize> {
         if let Some(dml) = &stmt.dml_statement {
@@ -3332,7 +3352,7 @@ impl Connection {
     }
 
     /// Compile and wrap a statement into a `PreparedStatement`.
-    fn compile_and_wrap(&self, statement: &Statement) -> Result<PreparedStatement> {
+    fn compile_and_wrap(&self, statement: &Statement) -> Result<PreparedStatement<'_>> {
         let registry = Some(Arc::clone(&*self.func_registry.borrow()));
         match statement {
             Statement::Select(select) if is_expression_only_select(select) => {
@@ -3349,6 +3369,7 @@ impl Connection {
                     schema_cookie: self.schema_cookie(),
                     root_cx: self.root_cx.clone(),
                     dml_statement: None,
+                    conn: self,
                 })
             }
             Statement::Select(select) => {
@@ -3372,6 +3393,7 @@ impl Connection {
                     schema_cookie: self.schema_cookie(),
                     root_cx: self.root_cx.clone(),
                     dml_statement: None,
+                    conn: self,
                 })
             }
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
@@ -3393,6 +3415,7 @@ impl Connection {
                     schema_cookie: self.schema_cookie(),
                     root_cx: self.root_cx.clone(),
                     dml_statement: Some(statement.clone()),
+                    conn: self,
                 })
             }
             _ => Err(FrankenError::NotImplemented(
@@ -13663,7 +13686,12 @@ fn evaluate_having_value(
                 if let Ok(i) = txt.parse::<i64>() {
                     SqliteValue::Integer(i)
                 } else if let Ok(f) = txt.parse::<f64>() {
-                    SqliteValue::Float(f)
+                    // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
+                    if f.is_finite() {
+                        SqliteValue::Float(f)
+                    } else {
+                        SqliteValue::Text(txt)
+                    }
                 } else {
                     SqliteValue::Text(txt)
                 }
@@ -17506,6 +17534,9 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
             SqliteValue::Integer(n) => SqliteValue::Float(n as f64),
             SqliteValue::Text(ref s) => s
                 .parse::<f64>()
+                .ok()
+                // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
+                .filter(|f| f.is_finite())
                 .map_or(SqliteValue::Float(0.0), SqliteValue::Float),
             _ => SqliteValue::Float(0.0),
         },
