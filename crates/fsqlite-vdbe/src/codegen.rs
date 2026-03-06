@@ -3602,7 +3602,7 @@ fn collect_having_aggregates(
                         if let Some(ci) = resolve_column_index(&exprs[0], table) {
                             agg.arg_col_index == Some(ci)
                         } else if let Some(ref arg_expr) = agg.arg_expr {
-                            exprs.len() == 1 && *arg_expr == Box::new(exprs[0].clone())
+                            exprs.len() == 1 && **arg_expr == exprs[0]
                         } else {
                             false
                         }
@@ -6809,7 +6809,7 @@ fn emit_having_expr(
                         } else if let Some(ref arg_expr) = agg.arg_expr {
                             // Fall back to structural expression comparison
                             // for aggregates with expression arguments.
-                            exprs.len() == 1 && *arg_expr == Box::new(exprs[0].clone())
+                            exprs.len() == 1 && **arg_expr == exprs[0]
                         } else {
                             false
                         }
