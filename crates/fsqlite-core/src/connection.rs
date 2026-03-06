@@ -10609,7 +10609,6 @@ impl Connection {
         }
 
         // Step 6: Build result rows from groups.
-        let col_names: Vec<String> = col_map.iter().map(|(_, c)| c.clone()).collect();
         let mut result = Vec::with_capacity(groups.len());
         for (_key, group_rows) in &groups {
             let mut values = Vec::with_capacity(result_descriptors.len());
@@ -11220,13 +11219,6 @@ impl Connection {
                 ),
             })
             .collect::<Result<Vec<_>>>()?;
-
-        // Save column names for HAVING evaluation before dropping the schema borrow.
-        let col_names: Vec<String> = table_schema
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
 
         drop(schema);
 
@@ -42349,6 +42341,121 @@ mod pager_routing_tests {
             }
             panic!(
                 "{} fromless/having/scalar-agg conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// REPLACE, UPSERT (INSERT OR REPLACE/IGNORE), multi-value INSERT,
+    /// UPDATE with expressions, and DELETE edge cases.
+    #[test]
+    fn test_conformance_dml_upsert() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE kv (key TEXT PRIMARY KEY, val INTEGER);",
+            "INSERT INTO kv VALUES ('a', 1), ('b', 2), ('c', 3);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // REPLACE INTO
+            "REPLACE INTO kv VALUES ('a', 10)",
+            "SELECT * FROM kv ORDER BY key",
+            // INSERT OR REPLACE
+            "INSERT OR REPLACE INTO kv VALUES ('d', 4)",
+            "SELECT * FROM kv ORDER BY key",
+            // INSERT OR IGNORE (duplicate key)
+            "INSERT OR IGNORE INTO kv VALUES ('a', 999)",
+            "SELECT * FROM kv ORDER BY key",
+            // INSERT OR IGNORE (new key)
+            "INSERT OR IGNORE INTO kv VALUES ('e', 5)",
+            "SELECT * FROM kv ORDER BY key",
+            // UPDATE with expression
+            "UPDATE kv SET val = val * 2 WHERE key IN ('a', 'b')",
+            "SELECT * FROM kv ORDER BY key",
+            // DELETE with multiple conditions
+            "DELETE FROM kv WHERE val < 5 AND key != 'b'",
+            "SELECT * FROM kv ORDER BY key",
+            // UPDATE all rows
+            "UPDATE kv SET val = val + 1",
+            "SELECT * FROM kv ORDER BY key",
+            // DELETE all
+            "DELETE FROM kv",
+            "SELECT COUNT(*) FROM kv",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} DML/upsert conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Multi-table JOIN patterns, self-join, CROSS JOIN, and complex
+    /// WHERE conditions with subqueries and expressions.
+    #[test]
+    fn test_conformance_join_patterns() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, grp INTEGER);",
+            "INSERT INTO t1 VALUES (1, 'a', 1);",
+            "INSERT INTO t1 VALUES (2, 'b', 1);",
+            "INSERT INTO t1 VALUES (3, 'c', 2);",
+            "INSERT INTO t1 VALUES (4, 'd', 2);",
+            "INSERT INTO t1 VALUES (5, 'e', 3);",
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, t1_id INTEGER, score INTEGER);",
+            "INSERT INTO t2 VALUES (1, 1, 100);",
+            "INSERT INTO t2 VALUES (2, 2, 200);",
+            "INSERT INTO t2 VALUES (3, 3, 300);",
+            "INSERT INTO t2 VALUES (4, 1, 150);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Self-join
+            "SELECT a.val, b.val FROM t1 a, t1 b WHERE a.grp = b.grp AND a.id < b.id ORDER BY a.val, b.val",
+            // CROSS JOIN
+            "SELECT t1.val, t2.score FROM t1 CROSS JOIN t2 WHERE t1.id = 1 ORDER BY t2.score",
+            // Multiple JOINs
+            "SELECT t1.val, t2.score FROM t1 JOIN t2 ON t1.id = t2.t1_id ORDER BY t1.val, t2.score",
+            // LEFT JOIN with IS NULL (anti-join pattern)
+            "SELECT t1.val FROM t1 LEFT JOIN t2 ON t1.id = t2.t1_id WHERE t2.id IS NULL ORDER BY t1.val",
+            // Subquery in WHERE with multiple conditions
+            "SELECT val FROM t1 WHERE grp = (SELECT grp FROM t1 WHERE val = 'a') AND id > 1 ORDER BY val",
+            // EXISTS with correlated subquery
+            "SELECT val FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id AND t2.score > 150) ORDER BY val",
+            // NOT IN with subquery
+            "SELECT val FROM t1 WHERE id NOT IN (SELECT t1_id FROM t2) ORDER BY val",
+            // Aggregate with HAVING and ORDER BY alias
+            "SELECT grp, SUM(LENGTH(val)) AS total_len FROM t1 GROUP BY grp HAVING total_len > 1 ORDER BY grp",
+            // Subquery as derived table with alias
+            "SELECT sub.max_score FROM (SELECT t1_id, MAX(score) AS max_score FROM t2 GROUP BY t1_id) sub ORDER BY sub.max_score DESC",
+            // UNION of self-join results
+            "SELECT val FROM t1 WHERE grp = 1 UNION SELECT val FROM t1 WHERE grp = 2 ORDER BY 1",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} join patterns conformance mismatches found",
                 mismatches.len()
             );
         }
