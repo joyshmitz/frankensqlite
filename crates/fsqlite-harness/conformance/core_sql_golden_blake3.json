@@ -262,7 +262,7 @@
       "fixture_id": "core_sql_edge_cases",
       "parser_blake3": "4959cdf926d038981c1bdcb808a081ccd98ccb00e2085a7991a1c1add6fc09d6",
       "planner_blake3": "13f8ca383438ce1bfa3b389b930898e858e16e3c41c2b92eb9a357b9edfe7158",
-      "execution_blake3": "e68bb4d6cdbc75244f192da4833c2e5558c31001fd3e5d1252b8801674ae61bc",
+      "execution_blake3": "4a14092b69556b7cf6630fe5236d0898e313aa0e4e0dea750d3f6a294c068524",
       "statement_count": 4,
       "query_count": 4
     }

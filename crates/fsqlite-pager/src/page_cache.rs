@@ -277,6 +277,23 @@ impl PageCache {
         Ok(out)
     }
 
+    /// Directly insert an existing `PageBuf` into the cache.
+    pub fn insert_buffer(&mut self, page_no: PageNumber, buf: PageBuf) {
+        let admitted_new = match self.pages.entry(page_no) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(buf);
+                false
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(buf);
+                true
+            }
+        };
+        if admitted_new {
+            self.admits.set(self.admits.get().saturating_add(1));
+        }
+    }
+
     // --- Eviction ---
 
     /// Evict a page from the cache, returning its buffer to the pool.

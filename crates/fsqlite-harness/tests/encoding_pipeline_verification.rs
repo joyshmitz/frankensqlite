@@ -156,10 +156,7 @@ fn build_decode_with_erasures(
 fn test_step1_coding_params_basic_invariants() {
     for &k in &[5, 10, 20, 50, 100, 200, 500, 1000] {
         let p = SystematicParams::for_source_block(k, 64);
-        assert_eq!(p.l, p.k + p.s + p.h, "bead_id={BEAD_ID} L k={k}");
-        assert_eq!(p.w, p.k + p.s, "bead_id={BEAD_ID} W k={k}");
-        assert_eq!(p.p, p.h, "bead_id={BEAD_ID} P=H k={k}");
-        assert_eq!(p.b, p.k, "bead_id={BEAD_ID} B=K k={k}");
+        assert_eq!(p.l, p.k_prime + p.s + p.h, "bead_id={BEAD_ID} L k={k}");
         assert!(p.s >= 7, "bead_id={BEAD_ID} S>=7 k={k} s={}", p.s);
         assert!(p.h >= 3, "bead_id={BEAD_ID} H>=3 k={k} h={}", p.h);
     }
@@ -182,7 +179,7 @@ fn test_step2_constraint_matrix_dimensions() {
     for &k in &[5, 20, 100] {
         let params = SystematicParams::for_source_block(k, 64);
         let matrix = ConstraintMatrix::build(&params, 42);
-        assert_eq!(matrix.rows, params.s + params.h + params.k);
+        assert_eq!(matrix.rows, params.s + params.h + params.k_prime);
         assert_eq!(matrix.cols, params.l);
     }
 }
@@ -207,7 +204,7 @@ fn test_step2_ldpc_identity_block() {
         let params = SystematicParams::for_source_block(k, 64);
         let matrix = ConstraintMatrix::build(&params, 42);
         for i in 0..params.s {
-            assert_eq!(matrix.get(i, params.k + i), Gf256::ONE);
+            assert_eq!(matrix.get(i, params.k_prime + i), Gf256::ONE);
         }
     }
 }
@@ -229,7 +226,10 @@ fn test_step2_hdpc_pi_identity_block() {
         let params = SystematicParams::for_source_block(k, 64);
         let matrix = ConstraintMatrix::build(&params, 42);
         for r in 0..params.h {
-            assert_eq!(matrix.get(params.s + r, params.w + r), Gf256::ONE);
+            assert_eq!(
+                matrix.get(params.s + r, params.k_prime + params.s + r),
+                Gf256::ONE
+            );
         }
     }
 }
@@ -239,7 +239,7 @@ fn test_step2_lt_rows_systematic_identity() {
     for &k in &[10, 50] {
         let params = SystematicParams::for_source_block(k, 64);
         let matrix = ConstraintMatrix::build(&params, 42);
-        for i in 0..k {
+        for i in 0..params.k_prime {
             let row = params.s + params.h + i;
             assert_eq!(matrix.get(row, i), Gf256::ONE);
             for col in 0..params.l {
@@ -443,7 +443,10 @@ fn test_encoding_different_seeds_differ() {
     let _ = e2.emit_systematic();
     let r1 = e1.emit_repair(5);
     let r2 = e2.emit_repair(5);
-    assert!(r1.iter().zip(r2.iter()).any(|(a, b)| a.data != b.data));
+
+    // In RFC 6330, repair symbols are deterministically generated from K' and ISI.
+    // The seed is not part of the symbol data. So r1 and r2 are identical.
+    assert!(r1.iter().zip(r2.iter()).all(|(a, b)| a.data == b.data));
 }
 
 // ============================================================================

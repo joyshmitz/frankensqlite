@@ -760,8 +760,29 @@ impl ScalarFunction for SignFunc {
                     Ok(SqliteValue::Integer(0))
                 }
             }
+            SqliteValue::Text(s) => {
+                // In SQLite, sign() returns NULL if the string cannot be parsed as numeric at all.
+                // It does not coerce non-numeric strings to 0.0 like abs() does.
+                if s.trim().is_empty() {
+                    return Ok(SqliteValue::Null);
+                }
+
+                // Let's see if it's entirely non-numeric. We can check if it starts with a digit, +, -, or .
+                let first = s.trim().chars().next().unwrap_or(' ');
+                if !first.is_ascii_digit() && first != '+' && first != '-' && first != '.' {
+                    return Ok(SqliteValue::Null);
+                }
+
+                let f = args[0].to_float();
+                if f > 0.0 {
+                    Ok(SqliteValue::Integer(1))
+                } else if f < 0.0 {
+                    Ok(SqliteValue::Integer(-1))
+                } else {
+                    Ok(SqliteValue::Integer(0))
+                }
+            }
             other => {
-                // Coerce text/blob to numeric via prefix extraction.
                 let f = other.to_float();
                 if f > 0.0 {
                     Ok(SqliteValue::Integer(1))
@@ -2849,10 +2870,10 @@ mod tests {
 
     #[test]
     fn test_sign_non_numeric() {
-        // C SQLite: "abc" coerces to 0.0 via sqlite3_value_double, so sign = 0.
+        // C SQLite: math functions return NULL for strings that cannot be parsed as numeric.
         assert_eq!(
             invoke1(&SignFunc, SqliteValue::Text("abc".to_owned())).unwrap(),
-            SqliteValue::Integer(0)
+            SqliteValue::Null
         );
     }
 

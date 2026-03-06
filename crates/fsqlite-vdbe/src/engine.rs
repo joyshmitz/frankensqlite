@@ -6962,7 +6962,7 @@ fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
 
 // ── Arithmetic helpers ──────────────────────────────────────────────────────
 
-/// Mirrors C SQLite `numericType()` (vdbe.c:496): returns true if BOTH
+/// Mirrors C SQLite `numericType()` (SQLite VDBE:496): returns true if BOTH
 /// operands should be treated as integers for arithmetic purposes.
 /// Text/Blob that parse as i64 are integer-typed; Float is not.
 fn both_integer_numeric_type(a: &SqliteValue, b: &SqliteValue) -> bool {
@@ -6975,7 +6975,7 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if dividend.is_null() || divisor.is_null() {
         return SqliteValue::Null;
     }
-    // C SQLite numericType() coercion (vdbe.c:1932-1934): if both operands
+    // C SQLite numericType() coercion (SQLite VDBE:1932-1934): if both operands
     // are integer-typed (including text that parses as integer), use int math.
     let both_int = both_integer_numeric_type(dividend, divisor);
     if both_int {
@@ -6987,7 +6987,7 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
             match a.checked_div(b) {
                 Some(result) => SqliteValue::Integer(result),
                 // i64::MIN / -1 overflows; C SQLite promotes to float via
-                // `goto fp_math` (vdbe.c:1916), NOT wrapping.
+                // `goto fp_math` (SQLite VDBE:1916), NOT wrapping.
                 #[allow(clippy::cast_precision_loss)]
                 None => {
                     let result = a as f64 / b as f64;
@@ -7016,11 +7016,11 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
 
 /// SQL remainder with NULL propagation and division-by-zero handling.
 ///
-/// C SQLite (vdbe.c:1920): when both operands are MEM_Int, result is Integer.
+/// C SQLite (SQLite VDBE:1920): when both operands are MEM_Int, result is Integer.
 /// When either is Float/Text/Blob, fp_math path casts to integer for the
 /// modulo but stores the result as Float (MEM_Real).
 /// C SQLite `numericType()` coercion: text that parses as integer is treated
-/// as integer for the both-int check (vdbe.c:1932-1934).
+/// as integer for the both-int check (SQLite VDBE:1932-1934).
 #[allow(clippy::cast_precision_loss)]
 fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if dividend.is_null() || divisor.is_null() {

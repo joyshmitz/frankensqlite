@@ -481,11 +481,11 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
     split_top_level_csv_items(body)
         .into_iter()
         .filter_map(|col_def| {
-            if starts_with_unquoted_table_constraint(col_def) {
+            if starts_with_unquoted_table_constraint(&col_def) {
                 return None;
             }
 
-            let (name, remainder) = parse_column_name_and_remainder(col_def)?;
+            let (name, remainder) = parse_column_name_and_remainder(&col_def)?;
             let tokens: Vec<&str> = remainder.split_whitespace().collect();
             let type_decl = extract_type_declaration(&tokens);
             let affinity = type_to_affinity(&type_decl);
@@ -691,60 +691,94 @@ const COLUMN_CONSTRAINT_KEYWORDS: &[&str] = &[
     "AS",
 ];
 
-/// Split a comma-separated SQL list while respecting parentheses and quotes.
-fn split_top_level_csv_items(input: &str) -> Vec<&str> {
-    let bytes = input.as_bytes();
+/// Split a comma-separated SQL list while respecting parentheses, quotes,
+/// and top-level `-- ...` line comments.
+fn split_top_level_csv_items(input: &str) -> Vec<String> {
+    let mut chars = input.char_indices().peekable();
     let mut out = Vec::new();
-    let mut start = 0usize;
+    let mut current = String::new();
     let mut paren_depth = 0usize;
-    let mut quote: Option<u8> = None;
+    let mut quote: Option<char> = None;
     let mut in_brackets = false;
-    let mut i = 0usize;
 
-    while i < bytes.len() {
-        let byte = bytes[i];
+    while let Some((_, ch)) = chars.next() {
         if let Some(q) = quote {
-            if byte == q {
-                let escaped = i + 1 < bytes.len() && bytes[i + 1] == q;
-                if escaped {
-                    i += 1;
+            current.push(ch);
+            if ch == q {
+                if let Some(&(_, next_ch)) = chars.peek() {
+                    if next_ch == q {
+                        current.push(next_ch);
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
                 } else {
                     quote = None;
                 }
             }
-            i += 1;
             continue;
         }
 
         if in_brackets {
-            if byte == b']' {
+            current.push(ch);
+            if ch == ']' {
                 in_brackets = false;
             }
-            i += 1;
             continue;
         }
 
-        match byte {
-            b'\'' | b'"' | b'`' => quote = Some(byte),
-            b'[' => in_brackets = true,
-            b'(' => paren_depth = paren_depth.saturating_add(1),
-            b')' => paren_depth = paren_depth.saturating_sub(1),
-            b',' if paren_depth == 0 => {
-                let part = input[start..i].trim();
-                if !part.is_empty() {
-                    out.push(part);
-                }
-                start = i + 1;
+        match ch {
+            '\'' | '"' | '`' => {
+                quote = Some(ch);
+                current.push(ch);
             }
-            _ => {}
+            '[' => {
+                in_brackets = true;
+                current.push(ch);
+            }
+            '-' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') => {
+                chars.next();
+                let ends_with_whitespace = current.chars().last().is_some_and(char::is_whitespace);
+                if !current.trim_end().is_empty() && !ends_with_whitespace {
+                    current.push(' ');
+                }
+
+                while let Some((_, next_ch)) = chars.next() {
+                    if next_ch == '\n' {
+                        break;
+                    }
+                    if next_ch == '\r' {
+                        if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '\n') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            '(' => {
+                paren_depth = paren_depth.saturating_add(1);
+                current.push(ch);
+            }
+            ')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if paren_depth == 0 => {
+                let part = current.trim();
+                if !part.is_empty() {
+                    out.push(part.to_owned());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
         }
-        i += 1;
     }
 
-    let tail = input[start..].trim();
+    let tail = current.trim();
     if !tail.is_empty() {
-        out.push(tail);
+        out.push(tail.to_owned());
     }
+
     out
 }
 
@@ -757,11 +791,19 @@ fn starts_with_unquoted_table_constraint(def: &str) -> bool {
         b'"' | b'`' | b'[' => return false,
         _ => {}
     }
-    let first = trimmed.split_whitespace().next().unwrap_or_default();
-    matches!(
-        first.to_ascii_uppercase().as_str(),
-        "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
-    )
+    let upper = trimmed.to_ascii_uppercase();
+    upper.starts_with("CONSTRAINT ")
+        || upper.starts_with("PRIMARY KEY")
+        || upper == "PRIMARY"
+        || upper.starts_with("UNIQUE ")
+        || upper.starts_with("UNIQUE(")
+        || upper == "UNIQUE"
+        || upper.starts_with("CHECK ")
+        || upper.starts_with("CHECK(")
+        || upper == "CHECK"
+        || upper.starts_with("FOREIGN KEY")
+        || upper.starts_with("FOREIGN(")
+        || upper == "FOREIGN"
 }
 
 fn strip_identifier_quotes(token: &str) -> String {
@@ -1182,6 +1224,167 @@ mod tests {
         assert_eq!(cols[1].affinity, 'D');
         assert_eq!(cols[2].name, "role name");
         assert_eq!(cols[2].affinity, 'C');
+    }
+
+    #[test]
+    fn test_parse_columns_from_beads_style_multiline_create_table_sql() {
+        let cases = [
+            (
+                "labels",
+                r"CREATE TABLE labels (
+                    issue_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    PRIMARY KEY (issue_id, label),
+                    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                )",
+                &["issue_id", "label"][..],
+            ),
+            (
+                "comments",
+                r"CREATE TABLE comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_id TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                )",
+                &["id", "issue_id", "author", "text", "created_at"][..],
+            ),
+            (
+                "events",
+                r"CREATE TABLE events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL DEFAULT '',
+                    old_value TEXT,
+                    new_value TEXT,
+                    comment TEXT,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                )",
+                &[
+                    "id",
+                    "issue_id",
+                    "event_type",
+                    "actor",
+                    "old_value",
+                    "new_value",
+                    "comment",
+                    "created_at",
+                ][..],
+            ),
+            (
+                "config",
+                r"CREATE TABLE config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+                &["key", "value"][..],
+            ),
+            (
+                "blocked_issues_cache",
+                r"CREATE TABLE blocked_issues_cache (
+                    issue_id TEXT PRIMARY KEY,
+                    blocked_by TEXT NOT NULL,  -- JSON array of blocking issue IDs
+                    blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                )",
+                &["issue_id", "blocked_by", "blocked_at"][..],
+            ),
+            (
+                "issues",
+                r"CREATE TABLE issues (
+                    id TEXT PRIMARY KEY,
+                    content_hash TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    design TEXT NOT NULL DEFAULT '',
+                    acceptance_criteria TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'open',
+                    priority INTEGER NOT NULL DEFAULT 2,
+                    issue_type TEXT NOT NULL DEFAULT 'task',
+                    assignee TEXT,
+                    owner TEXT DEFAULT '',
+                    estimated_minutes INTEGER,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    created_by TEXT DEFAULT '',
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    closed_at DATETIME,
+                    close_reason TEXT DEFAULT '',
+                    closed_by_session TEXT DEFAULT '',
+                    due_at DATETIME,
+                    defer_until DATETIME,
+                    external_ref TEXT,
+                    source_system TEXT DEFAULT '',
+                    source_repo TEXT NOT NULL DEFAULT '.',
+                    deleted_at DATETIME,
+                    deleted_by TEXT DEFAULT '',
+                    delete_reason TEXT DEFAULT '',
+                    original_type TEXT DEFAULT '',
+                    compaction_level INTEGER DEFAULT 0,
+                    compacted_at DATETIME,
+                    compacted_at_commit TEXT,
+                    original_size INTEGER,
+                    sender TEXT DEFAULT '',
+                    ephemeral INTEGER DEFAULT 0,
+                    pinned INTEGER DEFAULT 0,
+                    is_template INTEGER DEFAULT 0,
+                    CHECK(length(title) <= 500),
+                    CHECK(priority >= 0 AND priority <= 4),
+                    CHECK((status = 'closed' AND closed_at IS NOT NULL) OR (status != 'closed'))
+                )",
+                &[
+                    "id",
+                    "content_hash",
+                    "title",
+                    "description",
+                    "design",
+                    "acceptance_criteria",
+                    "notes",
+                    "status",
+                    "priority",
+                    "issue_type",
+                    "assignee",
+                    "owner",
+                    "estimated_minutes",
+                    "created_at",
+                    "created_by",
+                    "updated_at",
+                    "closed_at",
+                    "close_reason",
+                    "closed_by_session",
+                    "due_at",
+                    "defer_until",
+                    "external_ref",
+                    "source_system",
+                    "source_repo",
+                    "deleted_at",
+                    "deleted_by",
+                    "delete_reason",
+                    "original_type",
+                    "compaction_level",
+                    "compacted_at",
+                    "compacted_at_commit",
+                    "original_size",
+                    "sender",
+                    "ephemeral",
+                    "pinned",
+                    "is_template",
+                ][..],
+            ),
+        ];
+
+        for (table_name, sql, expected_columns) in cases {
+            let cols = parse_columns_from_create_sql(sql);
+            let actual_names: Vec<&str> = cols.iter().map(|col| col.name.as_str()).collect();
+            assert_eq!(
+                actual_names, expected_columns,
+                "failed to parse Beads-style column list for table {table_name}"
+            );
+        }
     }
 
     #[test]

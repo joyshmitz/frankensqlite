@@ -4655,8 +4655,12 @@ impl Connection {
     }
 
     fn active_concurrent_txn_count(&self) -> u64 {
-        u64::try_from(lock_unpoisoned(&self.concurrent_registry).iter_active().count())
-            .unwrap_or(u64::MAX)
+        u64::try_from(
+            lock_unpoisoned(&self.concurrent_registry)
+                .iter_active()
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     fn wal_checkpoint_blocked_by_active_concurrent_txns(&self) -> bool {
@@ -9518,7 +9522,8 @@ impl Connection {
                     }]);
                 }
                 if self.wal_checkpoint_blocked_by_active_concurrent_txns() {
-                    let log_frames = i64::try_from(self.pager.wal_frame_count()).unwrap_or(i64::MAX);
+                    let log_frames =
+                        i64::try_from(self.pager.wal_frame_count()).unwrap_or(i64::MAX);
                     return Ok(vec![Row {
                         values: vec![
                             SqliteValue::Integer(1),
@@ -28306,6 +28311,29 @@ mod sqlite_master_btree_tests {
 
     /// Helper: read all sqlite_master rows from the page 1 B-tree.
     /// Returns Vec<(rowid, Vec<SqliteValue>)>.
+    pub(super) fn read_master_rowids(conn: &Connection) -> Vec<i64> {
+        let cx = Cx::new();
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let usable_size = fsqlite_types::PageSize::DEFAULT.get();
+        let mut cursor = fsqlite_btree::BtCursor::new(
+            TransactionPageIo::new(txn.as_mut()),
+            PageNumber::ONE,
+            usable_size,
+            true,
+        );
+        let mut rowids = Vec::new();
+        if cursor.first(&cx).unwrap() {
+            loop {
+                let rowid = cursor.rowid(&cx).unwrap();
+                rowids.push(rowid);
+                if !cursor.next(&cx).unwrap() {
+                    break;
+                }
+            }
+        }
+        rowids
+    }
+
     fn read_master_rows(conn: &Connection) -> Vec<(i64, Vec<SqliteValue>)> {
         let cx = Cx::new();
         let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
@@ -29130,6 +29158,38 @@ mod schema_cookie_tests {
 #[cfg(test)]
 mod schema_loading_tests {
     use super::*;
+    use fsqlite_btree::BtreeCursorOps;
+    use fsqlite_btree::cell::{BtreePageType, parse_page_header};
+    use fsqlite_btree::cursor::TransactionPageIo;
+    use fsqlite_pager::traits::TransactionMode;
+    use fsqlite_types::PageNumber;
+    use fsqlite_types::record::parse_record;
+
+    fn read_master_rows(conn: &Connection) -> Vec<(i64, Vec<SqliteValue>)> {
+        let cx = Cx::new();
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let usable_size = fsqlite_types::PageSize::DEFAULT.get();
+        let mut cursor = fsqlite_btree::BtCursor::new(
+            TransactionPageIo::new(txn.as_mut()),
+            PageNumber::ONE,
+            usable_size,
+            true,
+        );
+        let mut rows = Vec::new();
+        if cursor.first(&cx).unwrap() {
+            loop {
+                let rowid = cursor.rowid(&cx).unwrap();
+                let payload = cursor.payload(&cx).unwrap();
+                if let Some(values) = parse_record(&payload) {
+                    rows.push((rowid, values));
+                }
+                if !cursor.next(&cx).unwrap() {
+                    break;
+                }
+            }
+        }
+        rows
+    }
 
     #[test]
     fn test_open_existing_database_loads_schema() {
@@ -29184,6 +29244,214 @@ mod schema_loading_tests {
                     .iter()
                     .any(|idx| idx.name.eq_ignore_ascii_case("idx_t1_a")),
                 "index metadata should reload from sqlite_master"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reopen_reads_every_sqlite_master_row_when_page1_is_interior() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_load_many_master_rows.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        let expected_master_rows = {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            for i in 0..32 {
+                let table_name = format!("stress_table_{i:02}");
+                let index_name = format!("idx_{table_name}_slug");
+                let create_table = format!(
+                    "CREATE TABLE {table_name} (id INTEGER, slug TEXT, payload TEXT, note TEXT)"
+                );
+                let create_index = format!("CREATE INDEX {index_name} ON {table_name}(slug)");
+                rconn.execute(&create_table, []).unwrap();
+                rconn.execute(&create_index, []).unwrap();
+            }
+            rconn
+                .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+
+        assert!(
+            expected_master_rows >= 64,
+            "fixture must create enough sqlite_master rows to span multiple pages"
+        );
+
+        let conn = Connection::open(&db_str).unwrap();
+        let cx = Cx::new();
+        let txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let page1 = txn.get_page(&cx, PageNumber::ONE).unwrap();
+        let root_header = parse_page_header(page1.as_ref(), PageNumber::ONE).unwrap();
+        assert_eq!(
+            root_header.page_type,
+            BtreePageType::InteriorTable,
+            "test fixture must force sqlite_master onto an interior root page"
+        );
+
+        let master_rowids = super::sqlite_master_btree_tests::read_master_rowids(&conn);
+        assert_eq!(
+            i64::try_from(master_rowids.len()).unwrap(),
+            expected_master_rows,
+            "page-1 cursor scan should visit every sqlite_master row (last visited rowid: {:?})",
+            master_rowids.last()
+        );
+
+        let master_rows = read_master_rows(&conn);
+        let last_loaded_rowid = master_rows.last().map(|(rowid, _)| *rowid);
+        assert_eq!(
+            i64::try_from(master_rows.len()).unwrap(),
+            expected_master_rows,
+            "page-1 cursor payload decoding should reconstruct every sqlite_master row (last decoded rowid: {last_loaded_rowid:?})"
+        );
+
+        let schema = conn.schema.borrow();
+        assert!(
+            schema
+                .iter()
+                .any(|table| table.name.eq_ignore_ascii_case("stress_table_31")),
+            "schema reload should include tables from the rightmost sqlite_master subtree"
+        );
+    }
+
+    #[test]
+    fn test_reopen_preserves_columns_for_late_beads_style_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_load_late_beads_tables.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            for i in 0..12 {
+                let table_name = format!("prelude_table_{i:02}");
+                let idx_a = format!("idx_{table_name}_a");
+                let idx_b = format!("idx_{table_name}_b");
+                let create_table =
+                    format!("CREATE TABLE {table_name} (a INTEGER, b TEXT, c TEXT DEFAULT '')");
+                let create_idx_a = format!("CREATE INDEX {idx_a} ON {table_name}(a)");
+                let create_idx_b = format!("CREATE INDEX {idx_b} ON {table_name}(b)");
+                rconn.execute(&create_table, []).unwrap();
+                rconn.execute(&create_idx_a, []).unwrap();
+                rconn.execute(&create_idx_b, []).unwrap();
+            }
+
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE labels (
+                        issue_id TEXT NOT NULL,
+                        label TEXT NOT NULL,
+                        PRIMARY KEY (issue_id, label),
+                        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE comments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        issue_id TEXT NOT NULL,
+                        author TEXT NOT NULL,
+                        text TEXT NOT NULL,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        issue_id TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        actor TEXT NOT NULL DEFAULT '',
+                        old_value TEXT,
+                        new_value TEXT,
+                        comment TEXT,
+                        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE config (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                    CREATE TABLE metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                    CREATE TABLE dirty_issues (
+                        issue_id TEXT PRIMARY KEY,
+                        marked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE export_hashes (
+                        issue_id TEXT PRIMARY KEY,
+                        content_hash TEXT NOT NULL,
+                        exported_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE blocked_issues_cache (
+                        issue_id TEXT PRIMARY KEY,
+                        blocked_by TEXT NOT NULL,  -- JSON array of blocking issue IDs
+                        blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+                    );
+                    CREATE TABLE child_counters (
+                        parent_id TEXT PRIMARY KEY,
+                        last_child INTEGER NOT NULL DEFAULT 0,
+                        FOREIGN KEY (parent_id) REFERENCES issues(id) ON DELETE CASCADE
+                    );
+                    ",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db_str).unwrap();
+        let cx = Cx::new();
+        let txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
+        let page1 = txn.get_page(&cx, PageNumber::ONE).unwrap();
+        let root_header = parse_page_header(page1.as_ref(), PageNumber::ONE).unwrap();
+        assert_eq!(
+            root_header.page_type,
+            BtreePageType::InteriorTable,
+            "fixture must place the target tables in a later sqlite_master subtree"
+        );
+
+        let expected_columns = [
+            ("labels", vec!["issue_id", "label"]),
+            (
+                "comments",
+                vec!["id", "issue_id", "author", "text", "created_at"],
+            ),
+            (
+                "events",
+                vec![
+                    "id",
+                    "issue_id",
+                    "event_type",
+                    "actor",
+                    "old_value",
+                    "new_value",
+                    "comment",
+                    "created_at",
+                ],
+            ),
+            ("config", vec!["key", "value"]),
+            ("metadata", vec!["key", "value"]),
+            ("dirty_issues", vec!["issue_id", "marked_at"]),
+            (
+                "export_hashes",
+                vec!["issue_id", "content_hash", "exported_at"],
+            ),
+            (
+                "blocked_issues_cache",
+                vec!["issue_id", "blocked_by", "blocked_at"],
+            ),
+            ("child_counters", vec!["parent_id", "last_child"]),
+        ];
+
+        let schema = conn.schema.borrow();
+        for (table_name, expected) in &expected_columns {
+            let table = schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .unwrap_or_else(|| panic!("missing reloaded table {table_name}"));
+            let actual: Vec<&str> = table.columns.iter().map(|col| col.name.as_str()).collect();
+            assert_eq!(
+                actual, *expected,
+                "reloaded schema lost column metadata for table {table_name}"
             );
         }
     }

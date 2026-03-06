@@ -197,8 +197,14 @@ impl<F: VfsFile> PagerInner<F> {
             2
         };
         self.freelist = freelist;
-        self.commit_seq = CommitSeq::new(u64::from(header.change_counter));
-        self.cache.clear();
+
+        let new_commit_seq = CommitSeq::new(u64::from(header.change_counter));
+        // Only clear the cache if the database was modified by another connection.
+        // If the change_counter matches our last known commit_seq, our cache is still valid.
+        if new_commit_seq != self.commit_seq {
+            self.cache.clear();
+        }
+        self.commit_seq = new_commit_seq;
 
         Ok(wal_snapshot_initialized)
     }
@@ -1286,8 +1292,14 @@ where
             if self.mode != TransactionMode::Concurrent {
                 inner.writer_active = false;
             }
+
+            // Move newly written pages from the write_set directly into the read cache.
+            // This ensures subsequent readers see cache hits for newly committed data.
+            for (page_no, buf) in self.write_set.drain() {
+                inner.cache.insert_buffer(page_no, buf);
+            }
+
             drop(inner);
-            self.write_set.clear();
             self.committed = true;
             self.finished = true;
         } else {
@@ -4339,6 +4351,15 @@ mod tests {
         }
 
         let post_read = pager.cache_metrics_snapshot().unwrap();
+        println!(
+            "DEBUG_METRICS: hits={} misses={} admits={} evictions={} cached={}",
+            post_read.hits,
+            post_read.misses,
+            post_read.admits,
+            post_read.evictions,
+            post_read.cached_pages
+        );
+
         assert!(
             post_read.total_accesses() >= 20,
             "bead_id={BEAD_E2E} case=seq_read_accesses total={}",

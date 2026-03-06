@@ -433,7 +433,7 @@ impl SqliteValue {
         }
     }
 
-    /// Mirrors C SQLite's `numericType()` (vdbe.c:496): returns true if this
+    /// Mirrors C SQLite's `numericType()` (SQLite VDBE:496): returns true if this
     /// value should be treated as an integer for arithmetic purposes.
     ///
     /// Integer values are obviously integer-typed. Text/Blob values that parse
@@ -463,7 +463,7 @@ impl SqliteValue {
     /// - Any REAL operand: float addition.
     /// - NULL propagates (NULL + x = NULL).
     /// - Text/Blob coerced via `numericType()`: if both parse as integer,
-    ///   integer math is used (vdbe.c:1932-1934).
+    ///   integer math is used (SQLite VDBE:1932-1934).
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn sql_add(&self, other: &Self) -> Self {

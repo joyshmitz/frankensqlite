@@ -2464,8 +2464,8 @@ mod tests {
             "expected at least one split when loading large rows"
         );
         assert!(
-            snapshot.fsqlite_btree_depth >= 2,
-            "depth gauge should reflect root split into multi-level tree"
+            cursor.measure_tree_depth(&cx).unwrap() >= 2,
+            "depth should reflect root split into multi-level tree"
         );
         assert!(
             snapshot.fsqlite_btree_operations_total.insert

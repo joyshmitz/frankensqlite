@@ -1,22 +1,20 @@
 #[cfg(test)]
 mod tests {
-    use fsqlite_ast::Statement;
-    use fsqlite_types::TypeAffinity;
     use crate::parser::Parser;
     use crate::semantic::*;
+    use fsqlite_ast::Statement;
+    use fsqlite_types::TypeAffinity;
 
     fn make_schema() -> Schema {
         let mut schema = Schema::new();
         schema.add_table(TableDef {
             name: "users".to_owned(),
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_owned(),
-                    affinity: TypeAffinity::Integer,
-                    is_ipk: true,
-                    not_null: true,
-                },
-            ],
+            columns: vec![ColumnDef {
+                name: "id".to_owned(),
+                affinity: TypeAffinity::Integer,
+                is_ipk: true,
+                not_null: true,
+            }],
             without_rowid: false,
             strict: false,
         });

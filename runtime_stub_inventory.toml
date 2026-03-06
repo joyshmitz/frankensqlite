@@ -1,21 +1,3 @@
-# Runtime Stub Inventory v1.0.0
-#
-# Bead: bd-2yqp6.4.1
-# Purpose: exhaustive machine-readable catalog of parity-critical runtime
-# NotImplemented/Unsupported/TODO placeholder paths, with ownership and
-# closure strategy. Generated from live source scan on 2026-02-26.
-
-[meta]
-schema_version = "1.0.0"
-bead_id = "bd-2yqp6.4.1"
-track_id = "bd-2yqp6.4"
-sqlite_target = "3.52.0"
-generated_at = "2026-02-26"
-contract_owner = "track-d-engine-runtime"
-inventory_scope = "runtime-src-only-pre-cfgtest"
-source_patterns = ["FrankenError::NotImplemented(", "CodegenError::Unsupported(", "TODO: Apply collation from P4 if present."]
-parity_critical_severities = ["critical", "high"]
-
 [[runtime_stubs]]
 stub_id = "RSTUB-0006"
 file = "crates/fsqlite-core/src/connection.rs"
@@ -26,151 +8,631 @@ severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"CREATE VIRTUAL TABLE USING {} is not supported in this connection path\", create.module"
+anchor = "Err(FrankenError::NotImplemented("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0009"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 2884
+line = 982
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}(*) is not supported in GROUP BY+JOIN path\" )));"
+anchor = "Err(FrankenError::NotImplemented(_)) => Ok(true),"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0010"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 2941
+line = 3127
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}() with no args is not supported in GROUP BY+JOIN path\" )));"
+anchor = "_ => Err(FrankenError::NotImplemented("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0011"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 3246
+line = 3184
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}() with multiple args is not supported in GROUP BY+JOIN path\" )));"
+anchor = "return Err(FrankenError::NotImplemented("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0013"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 3421
+line = 3489
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"aggregate {name} requires an argument\" )));"
+anchor = "return Err(FrankenError::NotImplemented("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0019"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 3494
+line = 3664
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}(*) is not supported in this GROUP BY connection path\" )));"
+anchor = "_ => Err(FrankenError::NotImplemented("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0020"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 3584
+line = 3737
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}() with no args is not supported in this GROUP BY connection path\" )));"
+anchor = "return Err(FrankenError::NotImplemented("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0022"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 5928
+line = 3827
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}() with multiple args is not supported in this GROUP BY connection path\" )));"
+anchor = "Err(FrankenError::NotImplemented(format!("
 
 [[runtime_stubs]]
-stub_id = "RSTUB-0023"
+stub_id = "RSTUB-1000"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 6086
+line = 6197
 kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
+kind_description = "Auto-added stub"
+severity = "high"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"non-aggregate result column '{label}' must appear in GROUP BY\" )));"
+anchor = "return Err(FrankenError::NotImplemented("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0025"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 6560
+line = 6355
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"aggregate {name} requires an argument in this GROUP BY connection path\" )));"
+anchor = "return Err(FrankenError::NotImplemented(format!("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0029"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 9491
+line = 6829
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg), } }"
+anchor = "FrankenError::NotImplemented("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0039"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 9551
+line = 9788
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "_ => Err(FrankenError::NotImplemented(format!( \"expression form is not supported in this connection path: {expr:?}\", ))),"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-0"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 9848
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0044"
 file = "crates/fsqlite-core/src/connection.rs"
-line = 9560
+line = 9857
 kind = "not_implemented"
 kind_description = "FrankenError::NotImplemented runtime guard"
 severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "return Err(FrankenError::NotImplemented(format!( \"{op:?} operator is not yet supported\", )));"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-1"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 9896
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-2"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 9913
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(\"SELECT * with GROUP BY+JOIN\".to_owned()),"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-3"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 9988
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-4"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10087
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-6"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10101
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-7"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10107
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-8"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10121
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-5"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10127
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-10"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10220
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-9"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10229
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-11"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10284
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-13"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10305
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-12"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10312
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(\"SELECT * with GROUP BY\".to_owned()),"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-14"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10428
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-15"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10500
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-17"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10510
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-16"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10516
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-18"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11033
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-19"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11187
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-20"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11241
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-21"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 14680
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg),"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-1001"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 14680
+kind = "unsupported_codegen"
+kind_description = "Auto-added stub"
+severity = "high"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg),"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-23"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 14986
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-24"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 15042
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-25"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 15113
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-26"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 15747
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-28"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 15770
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-29"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 15775
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-30"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 15780
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-27"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 15785
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-31"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 15814
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-32"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 15881
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-33"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 16075
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented(format!("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-35"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 16246
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-34"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 16254
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-37"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 17209
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-GEN-B-36"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 17214
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-1002"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 17614
+kind = "not_implemented"
+kind_description = "Auto-added stub"
+severity = "high"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-1001"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 17709
+kind = "not_implemented"
+kind_description = "Auto-added stub"
+severity = "high"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "other => Err(FrankenError::NotImplemented(format!("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0047"
@@ -182,7 +644,7 @@ severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = ".ok_or_else(|| CodegenError::Unsupported(\"SELECT without FROM\".to_owned()))?;  let table_name = match &from_clause.source {"
+anchor = "return Err(CodegenError::Unsupported(\"VALUES in SELECT\".to_owned()));"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-0055"
@@ -194,548 +656,7 @@ severity = "critical"
 feature_id = "SURF-SQL-CORE-001"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = ".ok_or_else(|| CodegenError::Unsupported(\"INSERT ... SELECT without FROM\".to_owned()))?;  let src_table_name = match &from_clause.source {"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-0061"
-file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 319
-kind = "unsupported_codegen"
-kind_description = "CodegenError::Unsupported planner/VDBE guard"
-severity = "critical"
-feature_id = "SURF-SQL-CORE-001"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "return Err(CodegenError::Unsupported(unsupported_in_message())); } "
-
-[[runtime_stubs]]
-stub_id = "RSTUB-0062"
-file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 1057
-kind = "unsupported_codegen"
-kind_description = "CodegenError::Unsupported planner/VDBE guard"
-severity = "critical"
-feature_id = "SURF-SQL-CORE-001"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = ".ok_or_else(|| CodegenError::Unsupported(\"SELECT without FROM\".to_owned()))?;  let (table_name, table_alias) = match &from_clause.source {"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-0076"
-file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 1657
-kind = "unsupported_codegen"
-kind_description = "CodegenError::Unsupported planner/VDBE guard"
-severity = "critical"
-feature_id = "SURF-SQL-CORE-001"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = ".ok_or_else(|| CodegenError::Unsupported(\"empty VALUES\".to_owned()))? .len(); let rowid_reg = b.alloc_reg();"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-0079"
-file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 1917
-kind = "unsupported_codegen"
-kind_description = "CodegenError::Unsupported planner/VDBE guard"
-severity = "critical"
-feature_id = "SURF-SQL-CORE-001"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = ".ok_or_else(|| CodegenError::Unsupported(\"INSERT ... SELECT without FROM\".to_owned()))?;  if columns.iter().any(contains_unsupported_in_result_column)"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-0080"
-file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 2325
-kind = "unsupported_codegen"
-kind_description = "CodegenError::Unsupported planner/VDBE guard"
-severity = "critical"
-feature_id = "SURF-SQL-CORE-001"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "return Err(CodegenError::Unsupported(unsupported_in_message())); } "
-
-[[runtime_stubs]]
-stub_id = "RSTUB-0082"
-file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 2828
-kind = "unsupported_codegen"
-kind_description = "CodegenError::Unsupported planner/VDBE guard"
-severity = "critical"
-feature_id = "SURF-SQL-CORE-001"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "return Err(CodegenError::Unsupported(unsupported_in_message())); } "
-
-[[runtime_stubs]]
-stub_id = "RSTUB-0083"
-file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 2855
-kind = "unsupported_codegen"
-kind_description = "CodegenError::Unsupported planner/VDBE guard"
-severity = "critical"
-feature_id = "SURF-SQL-CORE-001"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "return Err(CodegenError::Unsupported(unsupported_in_message())); } "
-
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-0"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9599
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-1"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9616
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-2"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9691
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-3"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9790
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-4"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9804
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-5"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9810
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-6"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9824
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-7"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9830
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-8"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9923
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-9"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9932
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-10"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 9987
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-11"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 10008
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-12"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 10015
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-13"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 10131
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-14"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 10203
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-15"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 10213
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-16"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 10219
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-17"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 10736
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-18"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 10890
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-19"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 10944
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-20"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 14199
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-21"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 14503
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-22"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 14559
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-23"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 14630
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-24"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15264
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-25"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15287
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-26"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15292
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-27"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15297
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-28"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15302
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-29"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15331
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-30"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15398
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-31"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15592
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-32"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15763
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-33"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 15771
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-34"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 16726
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-35"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 16731
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-36"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 17131
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
-
-[[runtime_stubs]]
-stub_id = "RSTUB-GEN-B-37"
-file = "crates/fsqlite-core/src/connection.rs"
-line = 17226
-kind = "not_implemented"
-kind_description = "FrankenError::NotImplemented runtime guard"
-severity = "critical"
-feature_id = "SURF-EXT-FTS5-015"
-owner = "track-d-engine-runtime"
-closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-38"
@@ -747,7 +668,7 @@ severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-39"
@@ -759,328 +680,447 @@ severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "CodegenError::Unsupported(format!("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-40"
 file = "crates/fsqlite-planner/src/codegen.rs"
-line = 429
+line = 436
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-41"
 file = "crates/fsqlite-planner/src/codegen.rs"
-line = 508
+line = 515
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported(\"empty VALUES\".to_owned()));"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-42"
 file = "crates/fsqlite-planner/src/codegen.rs"
-line = 706
+line = 713
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-43"
 file = "crates/fsqlite-planner/src/codegen.rs"
-line = 749
+line = 756
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-44"
 file = "crates/fsqlite-planner/src/codegen.rs"
-line = 855
+line = 862
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-45"
 file = "crates/fsqlite-planner/src/codegen.rs"
-line = 971
+line = 978
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-46"
 file = "crates/fsqlite-planner/src/codegen.rs"
-line = 1017
+line = 1024
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "CodegenError::Unsupported(\"UPDATE currently supports only `WHERE rowid = ?`\".to_owned())"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-47"
 file = "crates/fsqlite-planner/src/codegen.rs"
-line = 1691
+line = 1705
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "_ => Err(CodegenError::Unsupported("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0061"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 320
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0062"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 1057
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0076"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 1657
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(\"negative output column count in DISTINCT SELECT\".to_owned())"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0079"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 1917
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(\"negative output column count in ordered SELECT\".to_owned())"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0080"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2326
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(\"empty VALUES\".to_owned()));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0082"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2832
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0083"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2859
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-48"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 3529
+line = 3535
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "CodegenError::Unsupported(\"result column not in GROUP BY clause\".to_owned())"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-49"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 3797
+line = 3803
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-50"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 4219
+line = 4226
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-51"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 4430
+line = 4437
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported(\"empty VALUES\".to_owned()));"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-52"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 4456
+line = 4463
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported(format!("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-53"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 4687
+line = 4695
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = ".ok_or_else(|| CodegenError::Unsupported(\"empty VALUES\".to_owned()))?"
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-54"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 4693
+line = 4701
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported(format!("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-55"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 4710
+line = 4718
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-56"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 5164
+line = 5174
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-57"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 5190
+line = 5200
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-58"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 5206
+line = 5216
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported(format!("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-59"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 5396
+line = 5420
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported(format!("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-60"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 5525
+line = 5552
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-61"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 5530
+line = 5571
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-62"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 5549
+line = 5861
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-63"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 5821
+line = 5867
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-64"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 6229
+line = 5894
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-65"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 6330
+line = 6184
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
 
 [[runtime_stubs]]
 stub_id = "RSTUB-GEN-B-66"
 file = "crates/fsqlite-vdbe/src/codegen.rs"
-line = 6995
+line = 6593
 kind = "unsupported_codegen"
 kind_description = "CodegenError::Unsupported compiler fallback"
 severity = "critical"
 feature_id = "SURF-EXT-FTS5-015"
 owner = "track-d-engine-runtime"
 closure_strategy = "implement"
-anchor = "GENERATED_STUB"
+anchor = "return Err(CodegenError::Unsupported("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-1002"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 6695
+kind = "unsupported_codegen"
+kind_description = "Auto-added stub"
+severity = "high"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported("
+
+[[runtime_stubs]]
+stub_id = "RSTUB-1003"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 7376
+kind = "unsupported_codegen"
+kind_description = "Auto-added stub"
+severity = "high"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported("
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-2yqp6.4.1"
+track_id = "bd-2yqp6.4"
+sqlite_target = "3.52.0"
+generated_at = "2026-02-26"
+contract_owner = "track-d-engine-runtime"
+inventory_scope = "runtime-src-only-pre-cfgtest"
+source_patterns = [ "FrankenError::NotImplemented(", "CodegenError::Unsupported(", "TODO: Apply collation from P4 if present.",]
+parity_critical_severities = [ "critical", "high",]
