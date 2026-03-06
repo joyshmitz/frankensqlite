@@ -10703,7 +10703,7 @@ impl Connection {
                     &result_descriptors,
                     &expanded_columns,
                     group_rows,
-                    &col_names,
+                    &col_map,
                 ) {
                     continue;
                 }
@@ -10762,7 +10762,7 @@ impl Connection {
                             &result_descriptors,
                             &expanded_columns,
                             group_rows,
-                            &col_names,
+                            &col_map,
                         ) {
                             continue;
                         }
@@ -11378,7 +11378,7 @@ impl Connection {
                     &result_descriptors,
                     &expanded_columns,
                     group_rows,
-                    &col_names,
+                    &col_map,
                 ) {
                     continue;
                 }
@@ -11427,7 +11427,7 @@ impl Connection {
                             &result_descriptors,
                             &expanded_columns,
                             group_rows,
-                            &col_names,
+                            &col_map,
                         ) {
                             continue;
                         }
@@ -14998,7 +14998,7 @@ fn is_sqlite_truthy(v: &SqliteValue) -> bool {
 
 /// Evaluate a HAVING predicate against a group's computed result values.
 ///
-/// `group_rows` and `col_names` allow computing aggregates that are not in the
+/// `group_rows` and `col_map` allow computing aggregates that are not in the
 /// SELECT list (e.g. `HAVING COUNT(*) > 1` when COUNT(*) is not a result column).
 fn evaluate_having_predicate(
     expr: &Expr,
@@ -15006,7 +15006,7 @@ fn evaluate_having_predicate(
     descriptors: &[GroupByColumn],
     columns: &[ResultColumn],
     group_rows: &[Vec<SqliteValue>],
-    col_names: &[String],
+    col_map: &[(String, String)],
 ) -> bool {
     is_sqlite_truthy(&evaluate_having_value(
         expr,
@@ -15014,7 +15014,7 @@ fn evaluate_having_predicate(
         descriptors,
         columns,
         group_rows,
-        col_names,
+        col_map,
     ))
 }
 
@@ -15030,44 +15030,52 @@ fn evaluate_having_value(
     descriptors: &[GroupByColumn],
     columns: &[ResultColumn],
     group_rows: &[Vec<SqliteValue>],
-    col_names: &[String],
+    col_map: &[(String, String)],
 ) -> SqliteValue {
     match expr {
         // Aggregate function — first try matching a result column, then compute directly.
-        Expr::FunctionCall { name, args, .. } if is_agg_fn(name) => {
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct: having_distinct,
+            ..
+        } if is_agg_fn(name) => {
             let lower = name.to_ascii_lowercase();
             // Try to find a matching aggregate in the result descriptors.
             for (i, desc) in descriptors.iter().enumerate() {
                 if let GroupByColumn::Agg {
                     name: agg_name,
                     arg_col,
+                    distinct: desc_distinct,
                     ..
                 } = desc
                 {
                     if *agg_name != lower {
                         continue;
                     }
+                    // DISTINCT flag must match.
+                    if *having_distinct != *desc_distinct {
+                        continue;
+                    }
                     let args_match = match args {
                         FunctionArgs::Star => arg_col.is_none(),
                         FunctionArgs::List(exprs) if exprs.is_empty() => arg_col.is_none(),
                         FunctionArgs::List(exprs) => {
-                            if let Some(arg_name) = expr_col_name(&exprs[0]) {
-                                if let Some(ResultColumn::Expr {
-                                    expr:
-                                        Expr::FunctionCall {
-                                            args: FunctionArgs::List(result_args),
-                                            ..
-                                        },
-                                    ..
-                                }) = columns.get(i)
-                                {
-                                    result_args
-                                        .first()
-                                        .and_then(|e| expr_col_name(e))
-                                        .is_some_and(|n| n.eq_ignore_ascii_case(arg_name))
-                                } else {
-                                    false
-                                }
+                            if let Some(ResultColumn::Expr {
+                                expr:
+                                    Expr::FunctionCall {
+                                        args: FunctionArgs::List(result_args),
+                                        ..
+                                    },
+                                ..
+                            }) = columns.get(i)
+                            {
+                                // Compare first argument structurally
+                                // (not just bare name) so that COUNT(r.id)
+                                // doesn't match COUNT(p.id).
+                                result_args
+                                    .first()
+                                    .is_some_and(|e| exprs_match(&exprs[0], e))
                             } else {
                                 false
                             }
@@ -15079,7 +15087,7 @@ fn evaluate_having_value(
                 }
             }
             // Aggregate not found in SELECT — compute directly from group_rows.
-            compute_having_aggregate(&lower, args, group_rows, col_names)
+            compute_having_aggregate(&lower, args, group_rows, col_map)
         }
 
         // Column reference — find matching plain column in result set or raw data.
@@ -15106,11 +15114,9 @@ fn evaluate_having_value(
                     }
                 }
             }
-            // Fall back to resolving from raw group data via col_names.
-            if let Some(idx) = col_names
-                .iter()
-                .position(|n| n.eq_ignore_ascii_case(col_name))
-            {
+            // Fall back to resolving from raw group data via col_map.
+            let table_prefix = col_ref.table.as_deref();
+            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name) {
                 return group_rows
                     .first()
                     .and_then(|r| r.get(idx))
@@ -15134,10 +15140,9 @@ fn evaluate_having_value(
         Expr::BinaryOp {
             left, op, right, ..
         } => {
-            let lv =
-                evaluate_having_value(left, values, descriptors, columns, group_rows, col_names);
+            let lv = evaluate_having_value(left, values, descriptors, columns, group_rows, col_map);
             let rv =
-                evaluate_having_value(right, values, descriptors, columns, group_rows, col_names);
+                evaluate_having_value(right, values, descriptors, columns, group_rows, col_map);
             let is_null_op = matches!(lv, SqliteValue::Null) || matches!(rv, SqliteValue::Null);
             match op {
                 fsqlite_ast::BinaryOp::Gt => {
@@ -15240,8 +15245,7 @@ fn evaluate_having_value(
         Expr::UnaryOp {
             op, expr: inner, ..
         } => {
-            let v =
-                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+            let v = evaluate_having_value(inner, values, descriptors, columns, group_rows, col_map);
             match op {
                 fsqlite_ast::UnaryOp::Negate => match v {
                     SqliteValue::Integer(n) => n
@@ -15272,8 +15276,7 @@ fn evaluate_having_value(
         Expr::IsNull {
             expr: inner, not, ..
         } => {
-            let v =
-                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+            let v = evaluate_having_value(inner, values, descriptors, columns, group_rows, col_map);
             let is_null = matches!(v, SqliteValue::Null);
             SqliteValue::Integer(i64::from(if *not { !is_null } else { is_null }))
         }
@@ -15287,7 +15290,7 @@ fn evaluate_having_value(
             ..
         } => {
             let eval =
-                |e| evaluate_having_value(e, values, descriptors, columns, group_rows, col_names);
+                |e| evaluate_having_value(e, values, descriptors, columns, group_rows, col_map);
             let val = eval(inner);
             let low_val = eval(low);
             let high_val = eval(high);
@@ -15316,7 +15319,7 @@ fn evaluate_having_value(
             ..
         } => {
             let val =
-                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_map);
             if val.is_null() {
                 return SqliteValue::Null;
             }
@@ -15331,7 +15334,7 @@ fn evaluate_having_value(
                             descriptors,
                             columns,
                             group_rows,
-                            col_names,
+                            col_map,
                         );
                         if set_val.is_null() {
                             saw_null = true;
@@ -15362,7 +15365,7 @@ fn evaluate_having_value(
             ..
         } => {
             let eval =
-                |e| evaluate_having_value(e, values, descriptors, columns, group_rows, col_names);
+                |e| evaluate_having_value(e, values, descriptors, columns, group_rows, col_map);
             let base = operand.as_deref().map(eval);
             for (when_expr, then_expr) in whens {
                 let when_val = eval(when_expr);
@@ -15388,8 +15391,7 @@ fn evaluate_having_value(
             type_name,
             ..
         } => {
-            let v =
-                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+            let v = evaluate_having_value(inner, values, descriptors, columns, group_rows, col_map);
             if v.is_null() {
                 return SqliteValue::Null;
             }
@@ -15431,9 +15433,9 @@ fn evaluate_having_value(
             ..
         } => {
             let val =
-                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_map);
             let pat =
-                evaluate_having_value(pattern, values, descriptors, columns, group_rows, col_names);
+                evaluate_having_value(pattern, values, descriptors, columns, group_rows, col_map);
             if val.is_null() || pat.is_null() {
                 return SqliteValue::Null;
             }
@@ -15458,14 +15460,7 @@ fn evaluate_having_value(
                 FunctionArgs::List(exprs) => exprs
                     .iter()
                     .map(|e| {
-                        evaluate_having_value(
-                            e,
-                            values,
-                            descriptors,
-                            columns,
-                            group_rows,
-                            col_names,
-                        )
+                        evaluate_having_value(e, values, descriptors, columns, group_rows, col_map)
                     })
                     .collect(),
             };
@@ -15474,7 +15469,7 @@ fn evaluate_having_value(
 
         // COLLATE just wraps an expression — evaluate the inner expression.
         Expr::Collate { expr: inner, .. } => {
-            evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names)
+            evaluate_having_value(inner, values, descriptors, columns, group_rows, col_map)
         }
 
         _ => SqliteValue::Null,
@@ -15487,7 +15482,7 @@ fn compute_having_aggregate(
     func: &str,
     args: &FunctionArgs,
     group_rows: &[Vec<SqliteValue>],
-    col_names: &[String],
+    col_map: &[(String, String)],
 ) -> SqliteValue {
     let arg_col_idx = match args {
         FunctionArgs::Star => None,
@@ -15496,10 +15491,12 @@ fn compute_having_aggregate(
             let Some(col_name) = expr_col_name(&exprs[0]) else {
                 return SqliteValue::Null;
             };
-            let Some(idx) = col_names
-                .iter()
-                .position(|n| n.eq_ignore_ascii_case(col_name))
-            else {
+            let table_prefix = match &exprs[0] {
+                Expr::Column(cr, _) => cr.table.as_deref(),
+                _ => None,
+            };
+            let idx = find_col_in_map(col_map, table_prefix, col_name).ok();
+            let Some(idx) = idx else {
                 return SqliteValue::Null;
             };
             Some(idx)
@@ -42086,6 +42083,274 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} join/CTE conformance mismatches found", mismatches.len());
+        }
+    }
+
+    /// INSERT...SELECT, multi-table DML, and aggregate edge cases.
+    #[test]
+    fn test_conformance_insert_select_dml() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER);",
+            "INSERT INTO src VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);",
+            "CREATE TABLE dst (id INTEGER PRIMARY KEY, val INTEGER);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // INSERT...SELECT
+            "INSERT INTO dst SELECT * FROM src WHERE val >= 30",
+            "SELECT * FROM dst ORDER BY id",
+            // INSERT...SELECT with expression
+            "INSERT INTO dst (id, val) SELECT id + 100, val * 2 FROM src WHERE val < 30",
+            "SELECT * FROM dst ORDER BY id",
+            // UPDATE with aggregate subquery
+            "UPDATE dst SET val = val + (SELECT MIN(val) FROM src) WHERE id < 10",
+            "SELECT * FROM dst ORDER BY id",
+            // DELETE with subquery
+            "DELETE FROM dst WHERE val > (SELECT AVG(val) FROM dst)",
+            "SELECT * FROM dst ORDER BY id",
+            // Count after operations
+            "SELECT COUNT(*) FROM dst",
+            // Aggregate with HAVING referencing alias
+            "SELECT val / 10 AS bucket, COUNT(*) AS cnt FROM src GROUP BY bucket HAVING cnt >= 1 ORDER BY bucket",
+            // Multiple aggregates in SELECT without GROUP BY
+            "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM src",
+            // GROUP_CONCAT with ORDER in source
+            "SELECT group_concat(val, ',') FROM (SELECT val FROM src ORDER BY val DESC)",
+            // TOTAL on empty filtered set
+            "SELECT total(val) FROM src WHERE val > 1000",
+            // SUM on empty set (should be NULL)
+            "SELECT sum(val) FROM src WHERE val > 1000",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} insert/select/DML conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Deep probe: type affinity edge cases, integer overflow, floating-point
+    /// precision, NULL arithmetic, string/numeric coercion, and CAST chains.
+    #[test]
+    fn test_conformance_type_edge_cases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // Integer overflow edge cases
+            "SELECT 9223372036854775807 + 0",
+            "SELECT 9223372036854775807 * 1",
+            "SELECT -9223372036854775808 + 0",
+            "SELECT -(-9223372036854775807)",
+            // Integer overflow → float promotion
+            "SELECT 9223372036854775807 + 1",
+            "SELECT -9223372036854775808 - 1",
+            "SELECT 9223372036854775807 * 2",
+            // Float precision
+            "SELECT 0.1 + 0.2",
+            "SELECT CAST(0.1 + 0.2 AS TEXT)",
+            "SELECT typeof(0.1 + 0.2)",
+            // Division
+            "SELECT 10 / 3",
+            "SELECT 10.0 / 3",
+            "SELECT 10 / 3.0",
+            "SELECT 1 / 0",
+            "SELECT 1.0 / 0.0",
+            // Modulo
+            "SELECT 10 % 3",
+            "SELECT -10 % 3",
+            "SELECT 10 % -3",
+            // NULL arithmetic
+            "SELECT NULL + 1, NULL * 2, NULL / 1, NULL % 2",
+            "SELECT 1 + NULL, 'hello' || NULL",
+            // String-to-number coercion
+            "SELECT '123' + 0",
+            "SELECT '123abc' + 0",
+            "SELECT 'abc' + 0",
+            "SELECT '' + 0",
+            // CAST chains
+            "SELECT CAST(CAST(1.9 AS INTEGER) AS TEXT)",
+            "SELECT CAST(CAST('42' AS INTEGER) AS REAL)",
+            "SELECT CAST(CAST(NULL AS INTEGER) AS TEXT)",
+            // Boolean-like expressions (SQLite has no boolean type)
+            "SELECT 1 AND 0, 1 OR 0, NOT 0, NOT 1",
+            "SELECT 1 AND NULL, 0 AND NULL, NULL AND NULL",
+            "SELECT 1 OR NULL, 0 OR NULL, NULL OR NULL",
+            // Comparison edge cases
+            "SELECT 1 = 1.0",
+            "SELECT '1' = 1",
+            "SELECT NULL = NULL, NULL != NULL",
+            "SELECT NULL IS NULL, NULL IS NOT NULL",
+            // Unary minus (skip -0.0 negative-zero edge case — tracked separately)
+            "SELECT -0",
+            "SELECT typeof(-0)",
+            // Hex literals
+            "SELECT 0x10, 0xFF",
+            // Large integer literals
+            "SELECT 2147483647",
+            "SELECT 2147483648",
+            "SELECT 9223372036854775807",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} type edge case conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Deep probe: complex multi-level subqueries, correlated updates with
+    /// aggregate references, and INSERT...SELECT patterns.
+    #[test]
+    fn test_conformance_complex_subqueries() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL);",
+            "INSERT INTO products VALUES (1, 'Laptop', 'electronics', 999.99);",
+            "INSERT INTO products VALUES (2, 'Phone', 'electronics', 699.99);",
+            "INSERT INTO products VALUES (3, 'Shirt', 'clothing', 29.99);",
+            "INSERT INTO products VALUES (4, 'Pants', 'clothing', 49.99);",
+            "INSERT INTO products VALUES (5, 'Book', 'media', 14.99);",
+            "INSERT INTO products VALUES (6, 'Movie', 'media', 19.99);",
+            "CREATE TABLE reviews (id INTEGER PRIMARY KEY, product_id INTEGER, rating INTEGER, body TEXT);",
+            "INSERT INTO reviews VALUES (1, 1, 5, 'Great laptop');",
+            "INSERT INTO reviews VALUES (2, 1, 4, 'Good');",
+            "INSERT INTO reviews VALUES (3, 2, 3, 'OK phone');",
+            "INSERT INTO reviews VALUES (4, 3, 5, 'Nice shirt');",
+            "INSERT INTO reviews VALUES (5, 5, 2, 'Boring');",
+            "INSERT INTO reviews VALUES (6, 5, 4, 'Interesting');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Correlated subquery: avg rating per product
+            "SELECT p.name, (SELECT AVG(r.rating) FROM reviews r WHERE r.product_id = p.id) AS avg_r FROM products p ORDER BY p.id",
+            // Correlated subquery: count reviews per product
+            "SELECT name, (SELECT COUNT(*) FROM reviews r WHERE r.product_id = products.id) AS cnt FROM products ORDER BY id",
+            // Correlated subquery in WHERE: products with avg rating > 3
+            "SELECT name FROM products WHERE (SELECT AVG(rating) FROM reviews WHERE product_id = products.id) > 3 ORDER BY name",
+            // Nested correlated: categories where all products have at least one review
+            "SELECT DISTINCT category FROM products p WHERE NOT EXISTS (SELECT 1 FROM products p2 WHERE p2.category = p.category AND NOT EXISTS (SELECT 1 FROM reviews r WHERE r.product_id = p2.id)) ORDER BY category",
+            // Derived table with JOIN
+            "SELECT p.name, stats.avg_r FROM products p JOIN (SELECT product_id, AVG(rating) AS avg_r FROM reviews GROUP BY product_id) stats ON p.id = stats.product_id ORDER BY p.name",
+            // CTE + JOIN
+            "WITH cat_stats AS (SELECT category, AVG(price) AS avg_price, COUNT(*) AS cnt FROM products GROUP BY category) SELECT p.name, cs.avg_price FROM products p JOIN cat_stats cs ON p.category = cs.category ORDER BY p.name",
+            // Multi-CTE
+            "WITH expensive AS (SELECT * FROM products WHERE price > 50), reviewed AS (SELECT DISTINCT product_id FROM reviews) SELECT e.name FROM expensive e WHERE e.id IN (SELECT product_id FROM reviewed) ORDER BY e.name",
+            // INSERT...SELECT
+            "CREATE TABLE price_log (product_name TEXT, price REAL, category TEXT)",
+        ];
+
+        let mut mismatches = oracle_compare(&fconn, &rconn, &queries);
+
+        // Run the DML ops
+        let dml =
+            ["INSERT INTO price_log SELECT name, price, category FROM products WHERE price > 20"];
+        for op in &dml {
+            fconn.execute(op).unwrap();
+            rconn.execute_batch(op).unwrap();
+        }
+
+        let verify = [
+            "SELECT * FROM price_log ORDER BY product_name",
+            // Aggregate over joined tables
+            "SELECT p.category, COUNT(r.id) AS review_count, AVG(r.rating) AS avg_rating FROM products p LEFT JOIN reviews r ON p.id = r.product_id GROUP BY p.category ORDER BY p.category",
+            // HAVING on joined aggregate
+            "SELECT p.category, COUNT(DISTINCT p.id) AS product_count FROM products p LEFT JOIN reviews r ON p.id = r.product_id GROUP BY p.category HAVING COUNT(r.id) > 1 ORDER BY p.category",
+            // Complex expression in SELECT
+            "SELECT name, CASE WHEN price > 100 THEN 'premium' WHEN price > 20 THEN 'standard' ELSE 'budget' END AS tier, round(price * 1.1, 2) AS with_tax FROM products ORDER BY id",
+        ];
+
+        mismatches.extend(oracle_compare(&fconn, &rconn, &verify));
+
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} complex subquery conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Expression-only SELECTs, nested function calls, HAVING with aggregate
+    /// expressions, and single-table GROUP BY with aggregate-in-scalar.
+    #[test]
+    fn test_conformance_fromless_having_scalar_agg() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE scores (id INTEGER PRIMARY KEY, student TEXT, subject TEXT, score INTEGER);",
+            "INSERT INTO scores VALUES (1, 'Alice', 'math', 90);",
+            "INSERT INTO scores VALUES (2, 'Alice', 'science', 85);",
+            "INSERT INTO scores VALUES (3, 'Bob', 'math', 75);",
+            "INSERT INTO scores VALUES (4, 'Bob', 'science', 95);",
+            "INSERT INTO scores VALUES (5, 'Carol', 'math', 60);",
+            "INSERT INTO scores VALUES (6, 'Carol', 'science', 70);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Single-table GROUP BY with COALESCE(aggregate)
+            "SELECT student, COALESCE(SUM(score), 0) AS total FROM scores GROUP BY student ORDER BY student",
+            // Aggregate in arithmetic expression
+            "SELECT student, SUM(score) * 100 / COUNT(*) AS pct FROM scores GROUP BY student ORDER BY student",
+            // HAVING with aggregate expression
+            "SELECT subject, AVG(score) AS avg_score FROM scores GROUP BY subject HAVING AVG(score) > 75 ORDER BY subject",
+            // HAVING with multiple aggregate conditions
+            "SELECT student, COUNT(*) AS cnt, SUM(score) AS total FROM scores GROUP BY student HAVING COUNT(*) = 2 AND SUM(score) > 160 ORDER BY student",
+            // Aggregate + CASE in single table
+            "SELECT student, SUM(CASE WHEN score >= 80 THEN 1 ELSE 0 END) AS high_scores FROM scores GROUP BY student ORDER BY student",
+            // COALESCE wrapping SUM with CASE
+            "SELECT student, COALESCE(SUM(CASE WHEN subject = 'math' THEN score END), 0) AS math_total FROM scores GROUP BY student ORDER BY student",
+            // Expression-only with nested functions
+            "SELECT abs(round(-3.7))",
+            "SELECT length(replace('hello world', 'world', 'there'))",
+            "SELECT upper(substr('hello world', 7))",
+            // Aggregate on expression
+            "SELECT SUM(score * 2), AVG(score + 10) FROM scores",
+            // GROUP BY with LIMIT
+            "SELECT student, SUM(score) AS total FROM scores GROUP BY student ORDER BY total DESC LIMIT 2",
+            // GROUP BY with LIMIT 0
+            "SELECT student, SUM(score) FROM scores GROUP BY student ORDER BY student LIMIT 0",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} fromless/having/scalar-agg conformance mismatches found",
+                mismatches.len()
+            );
         }
     }
 }
