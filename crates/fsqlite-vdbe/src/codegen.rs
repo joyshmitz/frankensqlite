@@ -9147,10 +9147,14 @@ fn emit_expr_with_fallback(
 fn resolve_column_in_ctx(col_ref: &ColumnRef, ctx: &ScanCtx<'_>) -> Option<usize> {
     // Qualified: table.column (case-insensitive per SQL standard)
     if let Some(ref table_name) = col_ref.table {
-        let table_match = table_name.eq_ignore_ascii_case(&ctx.table.name)
-            || ctx
-                .table_alias
-                .is_some_and(|alias| table_name.eq_ignore_ascii_case(alias));
+        // When the table has an alias, only the alias matches qualified
+        // references. This prevents `inventory.col` from resolving to
+        // `FROM inventory i2` — only `i2.col` should match.
+        let table_match = if let Some(alias) = ctx.table_alias {
+            table_name.eq_ignore_ascii_case(alias)
+        } else {
+            table_name.eq_ignore_ascii_case(&ctx.table.name)
+        };
         if table_match {
             return ctx
                 .table

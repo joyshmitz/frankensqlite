@@ -18726,6 +18726,16 @@ fn resolve_group_by_aliases(
     col_map: &[(String, String)],
 ) {
     for expr in group_by_exprs.iter_mut() {
+        // Numeric index: GROUP BY 1 → group by the first result column.
+        if let Expr::Literal(Literal::Integer(n), _) = expr {
+            let idx = usize::try_from(*n).unwrap_or(0);
+            if idx >= 1 && idx <= columns.len() {
+                if let ResultColumn::Expr { expr: col_expr, .. } = &columns[idx - 1] {
+                    *expr = col_expr.clone();
+                }
+            }
+            continue;
+        }
         if let Expr::Column(col_ref, _) = expr {
             if col_ref.table.is_some() {
                 continue; // Qualified reference — not an alias.
@@ -40738,6 +40748,255 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} GROUP BY alias+JOIN mismatches found", mismatches.len());
+        }
+    }
+
+    /// Broad conformance probe: DML, subquery patterns, type coercion,
+    /// complex expressions, and edge cases.
+    #[test]
+    fn test_conformance_broad_probe() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1 (a INTEGER PRIMARY KEY, b TEXT, c REAL, d BLOB);",
+            "INSERT INTO t1 VALUES (1, 'hello', 1.5, X'CAFE');",
+            "INSERT INTO t1 VALUES (2, 'world', 2.5, NULL);",
+            "INSERT INTO t1 VALUES (3, NULL, NULL, X'BABE');",
+            "INSERT INTO t1 VALUES (4, 'hello', 3.5, NULL);",
+            "INSERT INTO t1 VALUES (5, '', 0.0, X'');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Type coercion in comparisons
+            "SELECT a FROM t1 WHERE c = 1.5",
+            "SELECT a FROM t1 WHERE c = '1.5'",
+            "SELECT a FROM t1 WHERE b = b ORDER BY a",
+            // NULL comparisons
+            "SELECT a FROM t1 WHERE c IS NULL",
+            "SELECT a FROM t1 WHERE c IS NOT NULL ORDER BY a",
+            "SELECT a FROM t1 WHERE b IS NULL OR b = '' ORDER BY a",
+            // BETWEEN with NULL boundaries
+            "SELECT a FROM t1 WHERE c BETWEEN 1.0 AND 3.0 ORDER BY a",
+            // LIKE
+            "SELECT a FROM t1 WHERE b LIKE 'hel%' ORDER BY a",
+            "SELECT a FROM t1 WHERE b LIKE '%llo' ORDER BY a",
+            "SELECT a FROM t1 WHERE b LIKE '%' ORDER BY a",
+            // GLOB
+            "SELECT a FROM t1 WHERE b GLOB 'h*' ORDER BY a",
+            // typeof
+            "SELECT typeof(a), typeof(b), typeof(c), typeof(d) FROM t1 WHERE a = 1",
+            "SELECT typeof(NULL), typeof(1), typeof(1.0), typeof(''), typeof(X'00')",
+            // CAST
+            "SELECT CAST(c AS INTEGER) FROM t1 WHERE a = 1",
+            "SELECT CAST(a AS TEXT) FROM t1 WHERE a = 2",
+            "SELECT CAST('123abc' AS INTEGER)",
+            "SELECT CAST('' AS INTEGER)",
+            // abs, random seed
+            "SELECT abs(-42), abs(0), abs(42)",
+            "SELECT abs(NULL)",
+            // String functions
+            "SELECT upper('hello'), lower('HELLO')",
+            "SELECT substr('hello', 2, 3)",
+            "SELECT substr('hello', -2)",
+            "SELECT instr('hello world', 'world')",
+            "SELECT replace('aabbcc', 'bb', 'XX')",
+            // Arithmetic edge cases
+            "SELECT 1/0",
+            "SELECT 1.0/0.0",
+            "SELECT 0/0",
+            "SELECT 1 % 0",
+            // Unary minus
+            "SELECT -(-1), -(1.5), -NULL",
+            // Concatenation
+            "SELECT 'a' || 'b' || 'c'",
+            "SELECT 'a' || NULL",
+            "SELECT NULL || 'b'",
+            // IIF
+            "SELECT iif(1, 'yes', 'no'), iif(0, 'yes', 'no'), iif(NULL, 'yes', 'no')",
+            // NULLIF
+            "SELECT nullif(1, 1), nullif(1, 2), nullif(NULL, NULL)",
+            // Multi-column IN list
+            "SELECT a FROM t1 WHERE b IN ('hello', 'world') ORDER BY a",
+            "SELECT a FROM t1 WHERE a IN (1, 3, 5) ORDER BY a",
+            // NOT IN
+            "SELECT a FROM t1 WHERE a NOT IN (1, 3) ORDER BY a",
+            // Aggregate with WHERE
+            "SELECT count(*), sum(c), avg(c) FROM t1 WHERE c IS NOT NULL",
+            // Aggregate with empty result
+            "SELECT count(*), sum(c), avg(c) FROM t1 WHERE a > 100",
+            // GROUP BY with NULL values
+            "SELECT b, count(*) FROM t1 GROUP BY b ORDER BY b",
+            // ORDER BY with NULLs
+            "SELECT b FROM t1 ORDER BY b",
+            "SELECT c FROM t1 ORDER BY c DESC",
+            // Subquery scalar
+            "SELECT (SELECT max(c) FROM t1)",
+            "SELECT a, (SELECT count(*) FROM t1 WHERE t1.b = t.b) AS cnt FROM t1 t ORDER BY a",
+            // hex and zeroblob
+            "SELECT hex(X'CAFE')",
+            "SELECT hex(zeroblob(4))",
+            "SELECT length(zeroblob(10))",
+            // printf
+            "SELECT printf('%d items', 42)",
+            "SELECT printf('%.2f', 3.14159)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} broad probe mismatches found", mismatches.len());
+        }
+    }
+
+    /// DML + CTE + complex subquery conformance probe.
+    #[test]
+    fn test_conformance_dml_cte_probe() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE inventory (id INTEGER PRIMARY KEY, item TEXT, qty INTEGER, price REAL);",
+            "INSERT INTO inventory VALUES (1, 'widget', 100, 9.99);",
+            "INSERT INTO inventory VALUES (2, 'gadget', 50, 19.99);",
+            "INSERT INTO inventory VALUES (3, 'widget', 75, 9.99);",
+            "INSERT INTO inventory VALUES (4, 'doohickey', 200, 4.99);",
+            "INSERT INTO inventory VALUES (5, 'gadget', 30, 24.99);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // CTE basic
+            "WITH totals AS (SELECT item, SUM(qty) AS total_qty FROM inventory GROUP BY item) SELECT item, total_qty FROM totals ORDER BY total_qty DESC",
+            // CTE with aggregate + filter
+            "WITH expensive AS (SELECT * FROM inventory WHERE price > 10) SELECT count(*), sum(qty) FROM expensive",
+            // CTE with JOIN
+            "WITH item_stats AS (SELECT item, SUM(qty) AS total, AVG(price) AS avg_price FROM inventory GROUP BY item) SELECT s.item, s.total FROM item_stats s WHERE s.total > 50 ORDER BY s.item",
+            // Recursive CTE (simple counting)
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 5) SELECT x FROM cnt",
+            // Recursive CTE (fibonacci)
+            "WITH RECURSIVE fib(a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib",
+            // Subquery in SELECT list
+            "SELECT item, qty, (SELECT SUM(qty) FROM inventory i2 WHERE i2.item = inventory.item) AS total_item_qty FROM inventory ORDER BY id",
+            // Subquery in WHERE with correlated aggregate
+            "SELECT item, qty FROM inventory WHERE qty = (SELECT MAX(qty) FROM inventory i2 WHERE i2.item = inventory.item) ORDER BY id",
+            // DISTINCT with aggregate
+            "SELECT DISTINCT item FROM inventory ORDER BY item",
+            "SELECT COUNT(DISTINCT item) FROM inventory",
+            "SELECT item, COUNT(DISTINCT price) FROM inventory GROUP BY item ORDER BY item",
+            // GROUP_CONCAT with ORDER
+            "SELECT item, GROUP_CONCAT(CAST(qty AS TEXT), '+') FROM inventory GROUP BY item ORDER BY item",
+            // TOTAL vs SUM
+            "SELECT TOTAL(qty), SUM(qty) FROM inventory",
+            "SELECT TOTAL(qty), SUM(qty) FROM inventory WHERE qty > 1000",
+            // INSERT + SELECT back
+            "INSERT INTO inventory VALUES (6, 'gizmo', 10, 49.99)",
+            "SELECT count(*) FROM inventory",
+            // UPDATE with expression
+            "UPDATE inventory SET qty = qty * 2 WHERE item = 'gizmo'",
+            "SELECT qty FROM inventory WHERE item = 'gizmo' AND id = 6",
+            // DELETE with subquery condition
+            "DELETE FROM inventory WHERE id = 6",
+            "SELECT count(*) FROM inventory",
+            // Complex WHERE with multiple conditions
+            "SELECT id FROM inventory WHERE (qty > 50 AND price < 15) OR item = 'gadget' ORDER BY id",
+            // CASE in ORDER BY
+            "SELECT item, qty FROM inventory ORDER BY CASE item WHEN 'widget' THEN 1 WHEN 'gadget' THEN 2 ELSE 3 END, qty DESC",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} DML/CTE probe mismatches found", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle for expression evaluation edge cases.
+    #[test]
+    fn test_conformance_oracle_expressions() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL);",
+            "INSERT INTO t VALUES (1, 'hello', 10, 1.5);",
+            "INSERT INTO t VALUES (2, 'world', 20, 2.5);",
+            "INSERT INTO t VALUES (3, NULL, NULL, NULL);",
+            "INSERT INTO t VALUES (4, 'test', 0, 0.0);",
+            "INSERT INTO t VALUES (5, 'HELLO', -5, -1.5);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Scalar min/max with NULL (the bug we just fixed)
+            "SELECT min(1,2,3), max(1,2,3)",
+            "SELECT min(NULL, 1), max(NULL, 1)",
+            "SELECT min('a','b','c'), max('a','b','c')",
+            // ORDER BY alias with expressions
+            "SELECT a, b * c AS product FROM t WHERE b IS NOT NULL ORDER BY product DESC",
+            "SELECT a, length(a) AS alen FROM t WHERE a IS NOT NULL ORDER BY alen, a",
+            // CASE in GROUP BY result column
+            "SELECT CASE WHEN b > 0 THEN 'positive' WHEN b = 0 THEN 'zero' ELSE 'other' END AS sign, count(*) FROM t WHERE b IS NOT NULL GROUP BY sign ORDER BY sign",
+            // IN with subquery containing GROUP BY
+            "SELECT a FROM t WHERE a IN (SELECT a FROM t GROUP BY a HAVING count(*) = 1) ORDER BY a",
+            // Nested COALESCE/NULLIF
+            "SELECT COALESCE(NULLIF(a, 'hello'), 'default') FROM t ORDER BY id",
+            // IIF with column expressions
+            "SELECT IIF(b > 10, 'big', 'small') FROM t WHERE b IS NOT NULL ORDER BY id",
+            // Compound SELECT with ORDER BY
+            "SELECT 'x' AS v UNION SELECT 'y' UNION SELECT 'z' ORDER BY v",
+            "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 1 ORDER BY n",
+            // Aggregate over CASE
+            "SELECT SUM(CASE WHEN b > 0 THEN b ELSE 0 END) FROM t",
+            "SELECT COUNT(CASE WHEN a IS NOT NULL THEN 1 END) FROM t",
+            // GROUP BY with multiple columns
+            "SELECT CASE WHEN b > 0 THEN 'pos' ELSE 'other' END AS sign, count(*) FROM t GROUP BY 1 ORDER BY 1",
+            // LIKE patterns
+            "SELECT a FROM t WHERE a LIKE 'h%' ORDER BY a",
+            "SELECT a FROM t WHERE a LIKE '%llo' ORDER BY a",
+            "SELECT a FROM t WHERE a LIKE '_e%' ORDER BY a",
+            // GLOB
+            "SELECT a FROM t WHERE a GLOB '*ell*' ORDER BY a",
+            // Arithmetic edge cases
+            "SELECT 1/0, 0/0",
+            "SELECT 9223372036854775807 + 1",
+            // String concatenation
+            "SELECT 'hello' || ' ' || 'world'",
+            "SELECT NULL || 'test'",
+            // REPLACE function
+            "SELECT replace('hello world', 'world', 'there')",
+            "SELECT replace('aaa', 'a', 'bb')",
+            // INSTR
+            "SELECT instr('hello world', 'world'), instr('hello', 'xyz')",
+            // HEX/UNHEX
+            "SELECT hex('abc'), hex(123)",
+            // TYPEOF in expressions
+            "SELECT typeof(1+1), typeof(1.0+1), typeof('a'||'b')",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} expression conformance mismatches found",
+                mismatches.len()
+            );
         }
     }
 }
