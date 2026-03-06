@@ -40999,4 +40999,108 @@ mod pager_routing_tests {
             );
         }
     }
+
+    /// Probe compound SELECT, CTE, and edge-case patterns.
+    #[test]
+    fn test_conformance_compound_and_cte() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);",
+            "INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);",
+            "INSERT INTO t2 VALUES (2, 'b'), (3, 'c'), (4, 'd');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // UNION
+            "SELECT val FROM t1 UNION SELECT val FROM t2 ORDER BY 1",
+            // UNION ALL
+            "SELECT val FROM t1 UNION ALL SELECT val FROM t2 ORDER BY 1",
+            // INTERSECT
+            "SELECT val FROM t1 INTERSECT SELECT val FROM t2 ORDER BY 1",
+            // EXCEPT
+            "SELECT val FROM t1 EXCEPT SELECT val FROM t2",
+            // CTE
+            "WITH cte AS (SELECT id, val FROM t1 WHERE id > 1) SELECT * FROM cte ORDER BY id",
+            // Recursive CTE
+            "WITH RECURSIVE cnt(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM cnt WHERE x < 5) SELECT x FROM cnt",
+            // CTE with aggregate
+            "WITH summary AS (SELECT val, COUNT(*) AS c FROM (SELECT val FROM t1 UNION ALL SELECT val FROM t2) GROUP BY val) SELECT val, c FROM summary ORDER BY val",
+            // Nested UNION in CTE
+            "WITH combined AS (SELECT val FROM t1 UNION SELECT val FROM t2) SELECT COUNT(*) FROM combined",
+            // Multiple CTEs
+            "WITH a AS (SELECT val FROM t1), b AS (SELECT val FROM t2) SELECT a.val FROM a WHERE a.val IN (SELECT val FROM b) ORDER BY a.val",
+            // UNION with LIMIT
+            "SELECT val FROM t1 UNION SELECT val FROM t2 ORDER BY 1 LIMIT 3",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} compound/CTE mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Correlated subquery, self-join alias scoping, and UPDATE/DELETE patterns.
+    #[test]
+    fn test_conformance_correlated_update_probe() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary REAL);",
+            "INSERT INTO emp VALUES (1, 'Alice', 'eng', 100.0);",
+            "INSERT INTO emp VALUES (2, 'Bob', 'eng', 120.0);",
+            "INSERT INTO emp VALUES (3, 'Carol', 'sales', 90.0);",
+            "INSERT INTO emp VALUES (4, 'Dave', 'sales', 80.0);",
+            "INSERT INTO emp VALUES (5, 'Eve', 'eng', 110.0);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Correlated scalar subquery: per-dept max salary
+            "SELECT e.name, e.salary, (SELECT MAX(e2.salary) FROM emp e2 WHERE e2.dept = e.dept) AS dept_max FROM emp e ORDER BY e.id",
+            // Correlated subquery in WHERE: employees earning above dept avg
+            "SELECT e.name FROM emp e WHERE e.salary > (SELECT AVG(e2.salary) FROM emp e2 WHERE e2.dept = e.dept) ORDER BY e.name",
+            // Correlated EXISTS
+            "SELECT e.name FROM emp e WHERE EXISTS (SELECT 1 FROM emp e2 WHERE e2.dept = e.dept AND e2.salary > e.salary) ORDER BY e.name",
+            // NOT EXISTS: highest earner per dept
+            "SELECT e.name, e.dept FROM emp e WHERE NOT EXISTS (SELECT 1 FROM emp e2 WHERE e2.dept = e.dept AND e2.salary > e.salary) ORDER BY e.dept",
+            // Correlated subquery: count colleagues
+            "SELECT e.name, (SELECT COUNT(*) - 1 FROM emp e2 WHERE e2.dept = e.dept) AS colleagues FROM emp e ORDER BY e.id",
+            // Correlated subquery in HAVING (via CTE workaround)
+            "WITH dept_stats AS (SELECT dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept) SELECT e.name, e.salary FROM emp e WHERE e.salary > (SELECT avg_sal FROM dept_stats WHERE dept = e.dept) ORDER BY e.name",
+            // UPDATE with scalar subquery (non-correlated)
+            "UPDATE emp SET salary = salary + 10 WHERE dept = 'sales'",
+            "SELECT name, salary FROM emp WHERE dept = 'sales' ORDER BY name",
+            // DELETE with correlated subquery
+            "DELETE FROM emp WHERE salary < (SELECT AVG(salary) FROM emp)",
+            "SELECT name, salary FROM emp ORDER BY name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} correlated/update probe mismatches found",
+                mismatches.len()
+            );
+        }
+    }
 }
