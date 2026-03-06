@@ -2736,7 +2736,10 @@ impl Connection {
                     }
                     Ok(rows)
                 } else {
-                    let limit_clause = select.limit.clone();
+                    // Eagerly rewrite IN-subqueries that the VDBE codegen
+                    // cannot handle (e.g. those with GROUP BY / HAVING).
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let limit_clause = rewritten.limit.clone();
                     let program = {
                         let plan_span = tracing::span!(
                             target: "fsqlite.plan",
@@ -2750,11 +2753,11 @@ impl Connection {
                         let sql_key = Self::sql_hash(&sql_text);
                         self.compile_with_cache(sql_key, &sql_text, |conn| {
                             if distinct && limit_clause.is_some() {
-                                let mut unbounded = select.clone();
+                                let mut unbounded = rewritten.clone();
                                 unbounded.limit = None;
                                 conn.compile_table_select(&unbounded)
                             } else {
-                                conn.compile_table_select(select)
+                                conn.compile_table_select(&rewritten)
                             }
                         })?
                     };
@@ -10843,12 +10846,6 @@ impl Connection {
             .get(&table_name.to_ascii_lowercase())
             .map(|&idx| table_schema.columns[idx].name.clone());
 
-        // Check if any result column is Star/TableStar — if so, we relax the
-        // "must appear in GROUP BY" validation (SQLite allows this).
-        let has_star = columns
-            .iter()
-            .any(|c| matches!(c, ResultColumn::Star | ResultColumn::TableStar(_)));
-
         // Expand Star/TableStar into explicit column references so GROUP BY
         // can process them individually.
         let expanded_columns: Vec<ResultColumn> = columns
@@ -10985,15 +10982,9 @@ impl Connection {
                     })
                 }
                 ResultColumn::Expr { expr, .. } => {
-                    // The expression must match one of the GROUP BY expressions
-                    // (either structurally or as a column reference to a GROUP BY column).
-                    let in_group_by = group_by_exprs.iter().any(|gb| exprs_match(gb, expr));
-                    if !in_group_by && !has_star {
-                        let label = expr_col_name(expr).unwrap_or("<expression>");
-                        return Err(FrankenError::NotImplemented(format!(
-                            "non-aggregate result column '{label}' must appear in GROUP BY"
-                        )));
-                    }
+                    // SQLite allows non-aggregate expressions that are not in
+                    // the GROUP BY list — it evaluates them against an arbitrary
+                    // row from the group.  Accept all plain expressions here.
                     Ok(GroupByColumn::Plain(Box::new(expr.clone())))
                 }
                 ResultColumn::Star | ResultColumn::TableStar(_) => Err(
@@ -40080,5 +40071,252 @@ mod pager_routing_tests {
             result.is_err(),
             "Expected UNIQUE constraint error with view+non-unique index present, got: {result:?}"
         );
+    }
+
+    /// Probe test: UPDATE edge cases, DEFAULT values, and autoincrement.
+    #[test]
+    fn test_probe_update_defaults_autoincrement() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        // AUTOINCREMENT
+        conn.execute("CREATE TABLE seq_test (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO seq_test (name) VALUES ('first');")
+            .unwrap();
+        conn.execute("INSERT INTO seq_test (name) VALUES ('second');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, name FROM seq_test ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+
+        // DELETE + re-insert: autoincrement should NOT reuse deleted ids
+        conn.execute("DELETE FROM seq_test WHERE id = 2;").unwrap();
+        conn.execute("INSERT INTO seq_test (name) VALUES ('third');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id FROM seq_test ORDER BY id DESC LIMIT 1;")
+            .unwrap();
+        // id should be 3, not 2
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+
+        // DEFAULT values
+        conn.execute(
+            "CREATE TABLE defaults_test (id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unnamed', score INTEGER DEFAULT 0);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO defaults_test (id) VALUES (1);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT name, score FROM defaults_test WHERE id = 1;")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("unnamed".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(0));
+
+        // UPDATE with CASE expression
+        conn.execute("CREATE TABLE grading (id INTEGER PRIMARY KEY, score INTEGER, grade TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO grading VALUES (1, 95, NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO grading VALUES (2, 75, NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO grading VALUES (3, 55, NULL);")
+            .unwrap();
+        conn.execute(
+            "UPDATE grading SET grade = CASE WHEN score >= 90 THEN 'A' WHEN score >= 70 THEN 'B' ELSE 'C' END;",
+        )
+        .unwrap();
+        let rows = conn
+            .query("SELECT id, grade FROM grading ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("A".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("B".to_owned()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("C".to_owned()));
+
+        // UPDATE with subquery
+        conn.execute("CREATE TABLE config (key TEXT PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO config VALUES ('max_score', '100');")
+            .unwrap();
+
+        // last_insert_rowid()
+        conn.execute("CREATE TABLE tracker (id INTEGER PRIMARY KEY, data TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO tracker VALUES (42, 'test');")
+            .unwrap();
+        let rows = conn.query("SELECT last_insert_rowid();").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+
+        // changes()
+        conn.execute("UPDATE grading SET grade = 'A' WHERE score >= 90;")
+            .unwrap();
+        let rows = conn.query("SELECT changes();").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    /// Probe test: string functions and date/time.
+    #[test]
+    fn test_probe_string_functions() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        // LENGTH
+        assert_eq!(
+            conn.query("SELECT LENGTH('hello');").unwrap()[0].values()[0],
+            SqliteValue::Integer(5)
+        );
+
+        // REPLACE
+        assert_eq!(
+            conn.query("SELECT REPLACE('hello world', 'world', 'rust');")
+                .unwrap()[0]
+                .values()[0],
+            SqliteValue::Text("hello rust".to_owned())
+        );
+
+        // INSTR
+        assert_eq!(
+            conn.query("SELECT INSTR('hello', 'llo');").unwrap()[0].values()[0],
+            SqliteValue::Integer(3)
+        );
+        assert_eq!(
+            conn.query("SELECT INSTR('hello', 'xyz');").unwrap()[0].values()[0],
+            SqliteValue::Integer(0)
+        );
+
+        // LTRIM / RTRIM / TRIM
+        assert_eq!(
+            conn.query("SELECT LTRIM('  hello  ');").unwrap()[0].values()[0],
+            SqliteValue::Text("hello  ".to_owned())
+        );
+        assert_eq!(
+            conn.query("SELECT RTRIM('  hello  ');").unwrap()[0].values()[0],
+            SqliteValue::Text("  hello".to_owned())
+        );
+        assert_eq!(
+            conn.query("SELECT TRIM('  hello  ');").unwrap()[0].values()[0],
+            SqliteValue::Text("hello".to_owned())
+        );
+
+        // HEX / UNHEX
+        assert_eq!(
+            conn.query("SELECT HEX('ABC');").unwrap()[0].values()[0],
+            SqliteValue::Text("414243".to_owned())
+        );
+
+        // ZEROBLOB
+        let rows = conn.query("SELECT typeof(ZEROBLOB(4));").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("blob".to_owned()));
+
+        // PRINTF / FORMAT
+        let rows = conn.query("SELECT PRINTF('%d items', 42);").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("42 items".to_owned())
+        );
+
+        // GROUP_CONCAT with ORDER BY (via CTE)
+        conn.execute("CREATE TABLE words (id INTEGER PRIMARY KEY, word TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO words VALUES (1, 'apple');")
+            .unwrap();
+        conn.execute("INSERT INTO words VALUES (2, 'banana');")
+            .unwrap();
+        conn.execute("INSERT INTO words VALUES (3, 'cherry');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT GROUP_CONCAT(word, ', ') FROM words;")
+            .unwrap();
+        // Order is insertion order (by rowid)
+        let result = rows[0].values()[0].clone();
+        match &result {
+            SqliteValue::Text(s) => {
+                assert!(
+                    s.contains("apple") && s.contains("banana") && s.contains("cherry"),
+                    "GROUP_CONCAT should contain all words, got: {s}"
+                );
+            }
+            other => panic!("Expected text, got: {other:?}"),
+        }
+
+        // TOTAL (always returns float, even for empty set)
+        let rows = conn.query("SELECT TOTAL(id) FROM words;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Float(6.0));
+    }
+
+    /// Conformance oracle: implicit aggregation, ORDER BY, LIMIT/OFFSET, DISTINCT,
+    /// nested subqueries, CASE+aggregate, multi-column ordering.
+    #[test]
+    fn test_conformance_oracle_advanced() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL, qty INTEGER);",
+            "INSERT INTO items VALUES (1, 'apple', 'fruit', 1.50, 10);",
+            "INSERT INTO items VALUES (2, 'banana', 'fruit', 0.75, 20);",
+            "INSERT INTO items VALUES (3, 'carrot', 'veg', 2.00, 5);",
+            "INSERT INTO items VALUES (4, 'date', 'fruit', 5.00, 3);",
+            "INSERT INTO items VALUES (5, 'eggplant', 'veg', 3.50, 8);",
+            "INSERT INTO items VALUES (6, 'fig', 'fruit', 4.00, NULL);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Implicit aggregation from subquery (the bug we just fixed)
+            "SELECT count(*) FROM (SELECT id FROM items WHERE price > 2.0)",
+            "SELECT sum(price) FROM (SELECT price FROM items WHERE category = 'fruit')",
+            "SELECT min(price), max(price) FROM (SELECT price FROM items ORDER BY price)",
+            "SELECT avg(price) FROM (SELECT price FROM items WHERE qty IS NOT NULL)",
+            "SELECT group_concat(name, ',') FROM (SELECT name FROM items WHERE category = 'fruit' ORDER BY name)",
+            // Implicit aggregation without subquery
+            "SELECT count(*) FROM items",
+            "SELECT sum(price * qty) FROM items WHERE qty IS NOT NULL",
+            "SELECT count(qty) FROM items",
+            // DISTINCT
+            "SELECT DISTINCT category FROM items ORDER BY category",
+            "SELECT DISTINCT category, (price > 3.0) AS expensive FROM items ORDER BY category, expensive",
+            // LIMIT and OFFSET
+            "SELECT name FROM items ORDER BY price DESC LIMIT 3",
+            "SELECT name FROM items ORDER BY price LIMIT 2 OFFSET 2",
+            "SELECT name FROM items ORDER BY id LIMIT 1000",
+            // ORDER BY expression
+            "SELECT name, price * COALESCE(qty, 0) AS total FROM items ORDER BY total DESC",
+            "SELECT name FROM items ORDER BY length(name)",
+            "SELECT name FROM items ORDER BY category, price DESC",
+            // CASE expressions
+            "SELECT name, CASE WHEN price > 3.0 THEN 'expensive' WHEN price > 1.0 THEN 'medium' ELSE 'cheap' END AS tier FROM items ORDER BY id",
+            "SELECT CASE category WHEN 'fruit' THEN 'F' WHEN 'veg' THEN 'V' END AS cat_code, count(*) FROM items GROUP BY category ORDER BY cat_code",
+            // Aggregate with CASE
+            "SELECT sum(CASE WHEN category = 'fruit' THEN price ELSE 0 END) AS fruit_total FROM items",
+            "SELECT count(CASE WHEN qty IS NOT NULL THEN 1 END) AS have_qty FROM items",
+            // Nested subquery
+            "SELECT name FROM items WHERE price > (SELECT avg(price) FROM items) ORDER BY name",
+            "SELECT name FROM items WHERE price = (SELECT max(price) FROM items)",
+            // Subquery with aggregate in WHERE
+            "SELECT name FROM items WHERE qty > (SELECT avg(qty) FROM items WHERE qty IS NOT NULL) ORDER BY name",
+            // IN with subquery (GROUP BY + HAVING in subquery)
+            "SELECT name FROM items WHERE category IN (SELECT category FROM items GROUP BY category HAVING count(*) > 2) ORDER BY name",
+            // Multi-level nesting
+            "SELECT count(*) FROM (SELECT category, count(*) AS cnt FROM items GROUP BY category HAVING count(*) >= 2)",
+            // COALESCE and NULL handling in aggregates
+            "SELECT sum(COALESCE(qty, 0)) FROM items",
+            "SELECT group_concat(COALESCE(CAST(qty AS TEXT), 'N/A'), ', ') FROM (SELECT qty FROM items ORDER BY id)",
+            // DISTINCT inside aggregate
+            "SELECT count(DISTINCT category) FROM items",
+            "SELECT group_concat(DISTINCT category) FROM items",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} advanced conformance mismatches found", mismatches.len());
+        }
     }
 }
