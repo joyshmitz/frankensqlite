@@ -12,7 +12,7 @@
   <a href="https://github.com/Dicklesworthstone/frankensqlite/actions"><img src="https://img.shields.io/github/actions/workflow/status/Dicklesworthstone/frankensqlite/ci.yml?branch=main&label=CI" alt="CI"></a>
   <a href="https://github.com/Dicklesworthstone/frankensqlite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg" alt="License: MIT+Rider"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-nightly%20%7C%20edition%202024-orange.svg" alt="Rust"></a>
-  <a href="https://github.com/Dicklesworthstone/frankensqlite"><img src="https://img.shields.io/badge/unsafe-forbidden-success.svg" alt="unsafe forbidden"></a>
+  <a href="https://github.com/Dicklesworthstone/frankensqlite"><img src="https://img.shields.io/badge/unsafe-only%20in%20optional%20C%20ABI-blue.svg" alt="unsafe only in optional C ABI"></a>
 </p>
 
 ---
@@ -21,7 +21,7 @@
 
 **The Problem:** SQLite allows only one writer at a time. A single lock byte (`WAL_WRITE_LOCK` at `wal.c:3698`) serializes all writers. For write-heavy workloads, this bottleneck caps throughput regardless of how many cores you have. Torn writes and bit-flips can corrupt the database with no self-repair mechanism.
 
-**The Solution:** FrankenSQLite reimplements SQLite from scratch in safe Rust with two architectural innovations:
+**The Solution:** FrankenSQLite reimplements SQLite from scratch in Rust, with a safe engine core and two architectural innovations:
 
 1. **MVCC Concurrent Writers.** The single-writer lock is replaced with page-level Multi-Version Concurrency Control. Multiple writers commit simultaneously as long as they touch different pages. Serializable Snapshot Isolation (SSI) prevents write skew by default. A safe write-merge ladder (intent replay + structured page patches) resolves commuting same-page conflicts without row-level MVCC metadata; raw byte-range XOR merges are forbidden for SQLite structured pages.
 
@@ -36,8 +36,8 @@ The current runnable engine is already real, but still hybrid. Compatibility mod
 | Concurrent writers | 1 (file-level lock) | Many (page-level MVCC with SSI) |
 | Isolation level | SERIALIZABLE (by serializing) | SERIALIZABLE (SSI for concurrent mode) |
 | Concurrent readers | Many (WAL; 5 read-mark slots by default) | Many (Compat: same 5 read-mark slots; Native: bounded by txn-slot capacity, no WAL-index cap) |
-| Memory safety | Manual (C) | Guaranteed (`#[forbid(unsafe_code)]`) |
-| Data races | Possible (careful C) | Impossible (Rust ownership) |
+| Memory safety | Manual (C) | Core engine is safe Rust; the only current `unsafe` lives in the optional `fsqlite-c-api` shim |
+| Data races | Possible (careful C) | Prevented inside the Rust engine by ownership and type-system checks |
 | File format | SQLite 3.x | Compatibility mode targets SQLite 3.x parity; Native/ECS work is separate |
 | Self-healing storage | No | Yes (RaptorQ repair symbols) |
 | Page-level encryption | No (commercial SEE extension) | XChaCha20-Poly1305 (DEK/KEK envelope, Argon2id KEK derivation) |
@@ -62,9 +62,9 @@ Page-level versioning sits at the right point in the complexity/concurrency trad
 - **Table-level** would conflict on every write to a shared table
 - **Page-level** maps naturally to SQLite's B-tree structure. Writers to different leaf pages proceed in parallel. Conflicts only arise when two transactions modify the same physical page.
 
-### 3. Zero Unsafe Code
+### 3. Safe Rust Engine Core
 
-The entire workspace enforces `#[forbid(unsafe_code)]`. Every crate, every module, every line. Memory safety is a compile-time guarantee, not a testing target.
+Most of the workspace inherits `unsafe_code = "forbid"` from the root Cargo workspace lints, so the engine, pager, parser, VDBE, and surrounding Rust crates stay in safe Rust. The explicit exception is the optional `fsqlite-c-api` crate, where `unsafe` is required to expose a SQLite-compatible C ABI at the FFI boundary. If you use FrankenSQLite through the Rust crates or the CLI, you never need that shim at all. The design goal is to keep the boundary thin and keep the engine itself in safe Rust.
 
 ### 4. File Format Compatibility Is Non-Negotiable
 
@@ -129,7 +129,7 @@ FrankenSQLite is organized as a 26-member Cargo workspace with strict layered de
 | | `fsqlite-observability` | Metrics, tracing, latency telemetry, conflict observability |
 | | `fsqlite-e2e` | Differential testing, workload replay, fairness/benchmark execution |
 | | `fsqlite-harness` | Verification/conformance/orchestration platform around the engine |
-| | `fsqlite-c-api` | C ABI surface for embedding/integration |
+| | `fsqlite-c-api` | Optional C ABI shim for embedding/integration |
 
 There is also an experimental `crates/fsqlite-wasm/` directory in the repository, but it is not currently a workspace member.
 
@@ -2457,7 +2457,7 @@ FrankenSQLite deliberately omits several components of the C SQLite ecosystem. E
 ## Limitations
 
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
-- **Rust is still the primary supported surface.** A separate `fsqlite-c-api` crate now exists, but the main documented API and most verification effort are still centered on the Rust crates.
+- **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
 - **No WASM target yet.** The VFS trait abstracts all OS operations, and a `WasmVfs` implementation is planned but not yet built. Browser/edge deployment via WebAssembly is a future goal.
 - **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. ARC eviction and GC mitigate this but introduce background work.
@@ -2501,7 +2501,7 @@ A: In the current compatibility runtime, WAL is the durability mechanism while M
 A: If the page lock is held, the second writer gets `SQLITE_BUSY` immediately (no waiting, no deadlocks). If both reach commit on the same page, FCW detects base drift; commuting conflicts may be resolved by the safe merge ladder when enabled, otherwise the loser aborts/retries with `SQLITE_BUSY_SNAPSHOT`.
 
 **Q: Why not use `unsafe` for performance-critical paths?**
-A: Safe Rust with proper data structures is fast. The type system prevents entire categories of bugs that would require extensive testing to catch in C. The performance ceiling of safe Rust is more than sufficient for a database engine.
+A: The engine is intentionally written in safe Rust. The only current `unsafe` is in the optional `fsqlite-c-api` shim, because exposing a SQLite-compatible C ABI requires FFI boundary code. If you use the Rust API or CLI, you can ignore that crate entirely. This keeps the highest-risk surface small while still leaving plenty of room for performance work through data structures, layout, and algorithmic tuning.
 
 **Q: Why reimplement rather than fork?**
 A: SQLite's C codebase is well-engineered but carries 24 years of accumulated complexity (218K LOC in the amalgamation). An independent ground-up Rust reimplementation enables MVCC without fighting the existing architecture, provides compile-time memory safety, and produces a codebase that Rust developers can work with naturally.
@@ -2588,7 +2588,7 @@ frankensqlite/
 │   ├── fsqlite-harness/      # Verification/conformance harness
 │   ├── fsqlite-e2e/          # Differential/E2E runner crate
 │   ├── fsqlite-observability/ # Metrics and tracing helpers
-│   └── fsqlite-c-api/        # C ABI adapter
+│   └── fsqlite-c-api/        # Optional C ABI adapter
 ├── legacy_sqlite_code/
 │   └── sqlite/               # C SQLite reference (git submodule)
 ├── benches/                  # Criterion benchmarks
