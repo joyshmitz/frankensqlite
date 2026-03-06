@@ -2314,6 +2314,12 @@ struct AggColumn {
     /// all aggregates referenced by the wrapper expression.  Placeholder columns
     /// `__agg_0__`, `__agg_1__`, … map to these indices.
     multi_agg_indices: Vec<usize>,
+    /// Bare (non-aggregate) expression in an aggregate query without GROUP BY.
+    /// SQLite allows `SELECT max(x), y FROM t` — `y` takes its value from the
+    /// last row scanned.  When set, no AggStep/AggFinal is emitted; instead the
+    /// expression is evaluated on each scanned row and stored in the accumulator
+    /// register so it retains the value from the final row.
+    bare_expr: Option<Box<Expr>>,
 }
 
 /// Generate VDBE bytecode for a standalone `VALUES` clause.
@@ -2498,6 +2504,21 @@ fn codegen_select_aggregate(
         }
         let accum_reg = accum_base + i as i32;
 
+        // Bare (non-aggregate) column: evaluate expression on each row
+        // and store in the accumulator register.  No AggStep needed.
+        if let Some(ref bare) = agg.bare_expr {
+            let scan_ctx = ScanCtx {
+                cursor,
+                table,
+                table_alias,
+                schema: Some(schema),
+                register_base: None,
+                secondary: None,
+            };
+            emit_expr(b, bare, accum_reg, Some(&scan_ctx));
+            continue;
+        }
+
         // FILTER clause: evaluate and skip AggStep if false/NULL.
         let filter_skip_label = if let Some(ref filter_expr) = agg.filter {
             let skip_lbl = b.emit_label();
@@ -2612,6 +2633,10 @@ fn codegen_select_aggregate(
     for (i, agg) in agg_columns.iter().enumerate() {
         // Skip sentinel entries (multi-aggregate wrappers have no function).
         if agg.name.is_empty() && !agg.multi_agg_indices.is_empty() {
+            continue;
+        }
+        // Skip bare columns — they already hold the final row's value.
+        if agg.bare_expr.is_some() {
             continue;
         }
         let accum_reg = accum_base + i as i32;
@@ -2760,6 +2785,7 @@ fn parse_aggregate_columns(
                             wrapper_expr: None,
                             hidden: false,
                             multi_agg_indices: Vec::new(),
+                            bare_expr: None,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -2777,6 +2803,7 @@ fn parse_aggregate_columns(
                                 wrapper_expr: None,
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
+                                bare_expr: None,
                             });
                         } else {
                             // First argument: try column reference first,
@@ -2802,6 +2829,7 @@ fn parse_aggregate_columns(
                                 wrapper_expr: None,
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
+                                bare_expr: None,
                             });
                         }
                     }
@@ -2852,12 +2880,30 @@ fn parse_aggregate_columns(
                         wrapper_expr: Some(Box::new(wrapper)),
                         hidden: false,
                         multi_agg_indices: indices,
+                        bare_expr: None,
                     });
                 }
             }
-            _ => {
+            // Bare (non-aggregate) column in an aggregate query without GROUP BY.
+            ResultColumn::Expr { expr, .. } => {
+                agg_cols.push(AggColumn {
+                    name: String::new(),
+                    num_args: 0,
+                    arg_col_index: None,
+                    arg_is_rowid: false,
+                    distinct: false,
+                    arg_expr: None,
+                    extra_args: Vec::new(),
+                    filter: None,
+                    wrapper_expr: None,
+                    hidden: false,
+                    multi_agg_indices: Vec::new(),
+                    bare_expr: Some(Box::new(expr.clone())),
+                });
+            }
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
                 return Err(CodegenError::Unsupported(
-                    "mixed aggregate and non-aggregate columns without GROUP BY".to_owned(),
+                    "SELECT * in aggregate query without GROUP BY is not supported".to_owned(),
                 ));
             }
         }
@@ -3000,6 +3046,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     wrapper_expr: None,
                     hidden: false,
                     multi_agg_indices: Vec::new(),
+                    bare_expr: None,
                 },
                 FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
                     name: canon_name,
@@ -3013,6 +3060,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     wrapper_expr: None,
                     hidden: false,
                     multi_agg_indices: Vec::new(),
+                    bare_expr: None,
                 },
                 FunctionArgs::List(exprs) => {
                     let (col_idx, is_rowid, a_expr) =
@@ -3035,6 +3083,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                         wrapper_expr: None,
                         hidden: false,
                         multi_agg_indices: Vec::new(),
+                        bare_expr: None,
                     }
                 }
             };
@@ -3278,6 +3327,7 @@ fn rewrite_aggregates_recursive(
                     wrapper_expr: None,
                     hidden: true,
                     multi_agg_indices: Vec::new(),
+                    bare_expr: None,
                 },
                 FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
                     name: canon_name,
@@ -3291,6 +3341,7 @@ fn rewrite_aggregates_recursive(
                     wrapper_expr: None,
                     hidden: true,
                     multi_agg_indices: Vec::new(),
+                    bare_expr: None,
                 },
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 FunctionArgs::List(exprs) => {
@@ -3313,6 +3364,7 @@ fn rewrite_aggregates_recursive(
                         wrapper_expr: None,
                         hidden: true,
                         multi_agg_indices: Vec::new(),
+                        bare_expr: None,
                     }
                 }
             };
@@ -3474,6 +3526,7 @@ fn parse_group_by_output(
                             wrapper_expr: None,
                             hidden: false,
                             multi_agg_indices: Vec::new(),
+                            bare_expr: None,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -3490,6 +3543,7 @@ fn parse_group_by_output(
                                 wrapper_expr: None,
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
+                                bare_expr: None,
                             });
                         } else {
                             // Try column reference first, fall back to expression.
@@ -3513,6 +3567,7 @@ fn parse_group_by_output(
                                 wrapper_expr: None,
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
+                                bare_expr: None,
                             });
                         }
                     }
@@ -3626,6 +3681,7 @@ fn collect_having_aggregates(
                             wrapper_expr: None,
                             hidden: false,
                             multi_agg_indices: Vec::new(),
+                            bare_expr: None,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -3642,6 +3698,7 @@ fn collect_having_aggregates(
                                 wrapper_expr: None,
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
+                                bare_expr: None,
                             });
                         } else {
                             let (col_idx, is_rowid, arg_e) =
@@ -3664,6 +3721,7 @@ fn collect_having_aggregates(
                                 wrapper_expr: None,
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
+                                bare_expr: None,
                             });
                         }
                     }
@@ -6970,17 +7028,7 @@ fn emit_where_filter(
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
                 let cmp_p5 = column_cmp_p5(table, &resolved);
-                match resolved {
-                    SortKeySource::Column(idx) => {
-                        b.emit_op(Opcode::Column, cursor, idx as i32, col_reg, P4::None, 0);
-                    }
-                    SortKeySource::Rowid => {
-                        b.emit_op(Opcode::Rowid, cursor, col_reg, 0, P4::None, 0);
-                    }
-                    SortKeySource::Expression(expr) => {
-                        emit_expr(b, &expr, col_reg, Some(&scan));
-                    }
-                }
+                emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
                 emit_expr(b, right, val_reg, Some(&scan));
                 // SQL semantics: `col = NULL` is UNKNOWN (false in WHERE). If the
                 // value expression evaluates to NULL, skip the row unconditionally.
@@ -7000,17 +7048,7 @@ fn emit_where_filter(
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
                 let cmp_p5 = column_cmp_p5(table, &resolved);
-                match resolved {
-                    SortKeySource::Column(idx) => {
-                        b.emit_op(Opcode::Column, cursor, idx as i32, col_reg, P4::None, 0);
-                    }
-                    SortKeySource::Rowid => {
-                        b.emit_op(Opcode::Rowid, cursor, col_reg, 0, P4::None, 0);
-                    }
-                    SortKeySource::Expression(expr) => {
-                        emit_expr(b, &expr, col_reg, Some(&scan));
-                    }
-                }
+                emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
                 emit_expr(b, left, val_reg, Some(&scan));
                 // SQL semantics: `NULL = col` is UNKNOWN (false in WHERE).
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
@@ -7027,6 +7065,99 @@ fn emit_where_filter(
             } else {
                 // Neither side is a column ref (e.g. WHERE 1 = 0, WHERE length(name) = 5).
                 // Fall through to generic boolean evaluation.
+                let cond_reg = b.alloc_temp();
+                emit_expr(b, where_expr, cond_reg, Some(&scan));
+                b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
+                b.free_temp(cond_reg);
+            }
+        }
+        // Inequality comparisons: Ne, Lt, Le, Gt, Ge.
+        // Same structure as Eq but with the appropriate skip opcode and
+        // operand order so that column affinity p5 flags are applied.
+        Expr::BinaryOp {
+            left,
+            op:
+                op @ (fsqlite_ast::BinaryOp::Ne
+                | fsqlite_ast::BinaryOp::Lt
+                | fsqlite_ast::BinaryOp::Le
+                | fsqlite_ast::BinaryOp::Gt
+                | fsqlite_ast::BinaryOp::Ge),
+            right,
+            ..
+        } => {
+            let scan = ScanCtx {
+                cursor,
+                table,
+                table_alias,
+                schema: Some(schema),
+                register_base: None,
+                secondary: None,
+            };
+            let collation_p4 = extract_collation(left)
+                .or_else(|| extract_collation(right))
+                .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+
+            // Determine the skip opcode — the inverse of the comparison.
+            // If `col > val` is the condition, skip when `col <= val`, i.e. Le.
+            let skip_opcode = match op {
+                fsqlite_ast::BinaryOp::Ne => Opcode::Eq,
+                fsqlite_ast::BinaryOp::Lt => Opcode::Ge,
+                fsqlite_ast::BinaryOp::Le => Opcode::Gt,
+                fsqlite_ast::BinaryOp::Gt => Opcode::Le,
+                fsqlite_ast::BinaryOp::Ge => Opcode::Lt,
+                _ => unreachable!(),
+            };
+
+            if let Some(resolved) = resolve_column_ref(left, table, table_alias) {
+                let col_reg = b.alloc_temp();
+                let val_reg = b.alloc_temp();
+                let cmp_p5 = column_cmp_p5(table, &resolved);
+                emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
+                emit_expr(b, right, val_reg, Some(&scan));
+                b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                b.emit_jump_to_label(Opcode::IsNull, col_reg, 0, skip_label, P4::None, 0);
+                b.emit_jump_to_label(
+                    skip_opcode,
+                    val_reg,
+                    col_reg,
+                    skip_label,
+                    collation_p4,
+                    cmp_p5,
+                );
+                b.free_temp(val_reg);
+                b.free_temp(col_reg);
+            } else if let Some(resolved) = resolve_column_ref(right, table, table_alias) {
+                // col is on the right: `val op col` → swap operand order.
+                // `val < col` skip when `val >= col`, i.e. Ge(val, col).
+                // The skip opcode is the inverse of `val op col`.
+                let swapped_skip = match op {
+                    fsqlite_ast::BinaryOp::Ne => Opcode::Eq,
+                    fsqlite_ast::BinaryOp::Lt => Opcode::Ge,
+                    fsqlite_ast::BinaryOp::Le => Opcode::Gt,
+                    fsqlite_ast::BinaryOp::Gt => Opcode::Le,
+                    fsqlite_ast::BinaryOp::Ge => Opcode::Lt,
+                    _ => unreachable!(),
+                };
+                let col_reg = b.alloc_temp();
+                let val_reg = b.alloc_temp();
+                let cmp_p5 = column_cmp_p5(table, &resolved);
+                emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
+                emit_expr(b, left, val_reg, Some(&scan));
+                b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                b.emit_jump_to_label(Opcode::IsNull, col_reg, 0, skip_label, P4::None, 0);
+                // VDBE comparison: opcode P1=rhs P2=lhs. For `val < col` skip
+                // when NOT(val < col), i.e. val >= col → Ge(val_reg, col_reg).
+                b.emit_jump_to_label(
+                    swapped_skip,
+                    col_reg,
+                    val_reg,
+                    skip_label,
+                    collation_p4,
+                    cmp_p5,
+                );
+                b.free_temp(val_reg);
+                b.free_temp(col_reg);
+            } else {
                 let cond_reg = b.alloc_temp();
                 emit_expr(b, where_expr, cond_reg, Some(&scan));
                 b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
@@ -7097,6 +7228,28 @@ enum SortKeySource {
     Rowid,
     /// Arbitrary expression (e.g., `a + b`, `LENGTH(name)`, `CASE WHEN ...`).
     Expression(Expr),
+}
+
+/// Emit bytecode to load a resolved column reference into a register.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_resolved_column(
+    b: &mut ProgramBuilder,
+    resolved: &SortKeySource,
+    cursor: i32,
+    reg: i32,
+    scan: &ScanCtx<'_>,
+) {
+    match resolved {
+        SortKeySource::Column(idx) => {
+            b.emit_op(Opcode::Column, cursor, *idx as i32, reg, P4::None, 0);
+        }
+        SortKeySource::Rowid => {
+            b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+        }
+        SortKeySource::Expression(expr) => {
+            emit_expr(b, expr, reg, Some(scan));
+        }
+    }
 }
 
 /// Output source for a covering-index ordered scan.
@@ -12437,10 +12590,10 @@ mod tests {
         }
     }
 
-    // === Test 25: Mixed aggregate + non-aggregate rejected ===
+    // === Test 25: Bare column with aggregate (no GROUP BY) ===
     #[test]
-    fn test_codegen_select_mixed_agg_rejected() {
-        // SELECT count(*), a FROM t — should be rejected (no GROUP BY).
+    fn test_codegen_select_mixed_agg_bare_column() {
+        // SELECT count(*), a FROM t — SQLite allows bare columns without GROUP BY.
         let stmt = SelectStatement {
             with: None,
             body: SelectBody {
@@ -12478,12 +12631,32 @@ mod tests {
         let schema = test_schema();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
-            .expect_err("mixed aggregate/non-aggregate should fail");
-        assert!(
-            matches!(&err, CodegenError::Unsupported(msg) if msg.contains("mixed")),
-            "error should mention mixed columns, got: {err}"
-        );
+        codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect("bare column with aggregate should succeed");
+        let prog = b.finish().unwrap();
+
+        // Should have exactly 1 AggStep (for count(*)) and 1 AggFinal.
+        let step_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggStep)
+            .count();
+        assert_eq!(step_count, 1, "only count(*) should emit AggStep");
+
+        let final_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggFinal)
+            .count();
+        assert_eq!(final_count, 1, "only count(*) should emit AggFinal");
+
+        // ResultRow should cover 2 columns.
+        let rr = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::ResultRow)
+            .unwrap();
+        assert_eq!(rr.p2, 2, "ResultRow should output 2 columns");
     }
 
     // === Test 26: AVG aggregate ===

@@ -8552,6 +8552,8 @@ impl Connection {
         } else {
             // Full ROLLBACK: restore to transaction start.
             // 5D.2 (bd-1ene): Use pager rollback and reload from committed state.
+            // bd-2yqp6.4.3: SQLite errors on ROLLBACK outside a transaction,
+            // matching COMMIT behavior (vdbe.c:4056).
             if !*self.in_transaction.borrow() {
                 return Err(FrankenError::Internal(
                     "cannot rollback - no transaction is active".to_owned(),
@@ -8860,6 +8862,18 @@ impl Connection {
         } else {
             None
         };
+
+        // bd-2yqp6.4.3: SQLite silently ignores PRAGMA foreign_keys = X
+        // when a transaction is active (sqlite3.c pragma.c).  We must guard
+        // the setter here because `apply_connection_pragma` doesn't have
+        // access to connection transaction state.
+        if pragma_name == "foreign_keys" && pragma.value.is_some() && *self.in_transaction.borrow()
+        {
+            let current = self.pragma_state.borrow().foreign_keys;
+            return Ok(vec![Row {
+                values: vec![SqliteValue::Integer(i64::from(current))],
+            }]);
+        }
 
         let pragma_out = {
             let mut state = self.pragma_state.borrow_mut();
@@ -9994,7 +10008,7 @@ impl Connection {
             // Output: schema, name, type, ncol, wr, strict
             "table_list" => {
                 let schema = self.schema.borrow();
-                let rows = schema
+                let mut rows: Vec<Row> = schema
                     .iter()
                     .map(|t| {
                         let ncol = i64::try_from(t.columns.len()).unwrap_or(0);
@@ -10010,8 +10024,46 @@ impl Connection {
                         }
                     })
                     .collect();
+                drop(schema);
+                // bd-2yqp6.4.3: include views with type "view".
+                let views = self.views.borrow();
+                for v in views.iter() {
+                    let ncol = i64::try_from(v.columns.len()).unwrap_or(0);
+                    rows.push(Row {
+                        values: vec![
+                            SqliteValue::Text("main".to_owned()),
+                            SqliteValue::Text(v.name.clone()),
+                            SqliteValue::Text("view".to_owned()),
+                            SqliteValue::Integer(ncol),
+                            SqliteValue::Integer(0),
+                            SqliteValue::Integer(0),
+                        ],
+                    });
+                }
                 Ok(rows)
             }
+            // PRAGMA collation_list — return available collation sequences.
+            // Output: seq, name
+            "collation_list" => Ok(vec![
+                Row {
+                    values: vec![
+                        SqliteValue::Integer(0),
+                        SqliteValue::Text("BINARY".to_owned()),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("NOCASE".to_owned()),
+                    ],
+                },
+                Row {
+                    values: vec![
+                        SqliteValue::Integer(2),
+                        SqliteValue::Text("RTRIM".to_owned()),
+                    ],
+                },
+            ]),
             // Unrecognised pragmas are silently ignored (SQLite compatibility).
             _ => Ok(Vec::new()),
         }
@@ -38039,5 +38091,92 @@ mod pager_routing_tests {
             names.contains(&"bar".to_owned()),
             "expected bar in {names:?}"
         );
+    }
+
+    // bd-2yqp6.4.3: PRAGMA table_list reports "view" for views.
+    #[test]
+    fn test_pragma_table_list_reports_view_type() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE VIEW v1 AS SELECT id, val FROM t1;")
+            .unwrap();
+        let rows = conn.query("PRAGMA table_list;").unwrap();
+        let mut found_table = false;
+        let mut found_view = false;
+        for row in &rows {
+            let name = match &row.values()[1] {
+                SqliteValue::Text(s) => s.as_str(),
+                _ => continue,
+            };
+            let obj_type = match &row.values()[2] {
+                SqliteValue::Text(s) => s.as_str(),
+                _ => continue,
+            };
+            if name == "t1" {
+                assert_eq!(obj_type, "table", "t1 should be reported as table");
+                found_table = true;
+            }
+            if name == "v1" {
+                assert_eq!(obj_type, "view", "v1 should be reported as view");
+                found_view = true;
+            }
+        }
+        assert!(found_table, "t1 not found in table_list");
+        assert!(found_view, "v1 not found in table_list");
+    }
+
+    // bd-2yqp6.4.3: PRAGMA foreign_keys = X is silently ignored inside a txn.
+    #[test]
+    fn test_pragma_foreign_keys_ignored_inside_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Default is OFF.
+        let rows = conn.query("PRAGMA foreign_keys;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+
+        // Turn ON outside transaction — should work.
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        let rows = conn.query("PRAGMA foreign_keys;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+
+        // Attempt to turn OFF inside a transaction — should be silently ignored.
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("PRAGMA foreign_keys = OFF;").unwrap();
+        let rows = conn.query("PRAGMA foreign_keys;").unwrap();
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Integer(1),
+            "foreign_keys should still be ON inside txn"
+        );
+        conn.execute("COMMIT;").unwrap();
+
+        // After commit, still ON (the set was ignored, not deferred).
+        let rows = conn.query("PRAGMA foreign_keys;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+
+        // Outside transaction, can change again.
+        conn.execute("PRAGMA foreign_keys = OFF;").unwrap();
+        let rows = conn.query("PRAGMA foreign_keys;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn test_pragma_collation_list() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA collation_list;").unwrap();
+        assert_eq!(rows.len(), 3);
+        let names: Vec<_> = rows
+            .iter()
+            .filter_map(|r| {
+                if let SqliteValue::Text(s) = &r.values()[1] {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(names.contains(&"BINARY".to_owned()));
+        assert!(names.contains(&"NOCASE".to_owned()));
+        assert!(names.contains(&"RTRIM".to_owned()));
     }
 }
