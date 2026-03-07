@@ -12623,11 +12623,24 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let SelectCore::Select { columns, from, .. } = &select.body.select else {
+        let SelectCore::Select {
+            columns,
+            from,
+            windows,
+            ..
+        } = &select.body.select
+        else {
             return Err(FrankenError::NotImplemented(
                 "window functions on VALUES".to_owned(),
             ));
         };
+
+        // Build map of named windows from WINDOW clause so we can resolve
+        // `OVER w` references to their full specifications.
+        let named_windows: std::collections::HashMap<String, &WindowSpec> = windows
+            .iter()
+            .map(|wd| (wd.name.to_ascii_uppercase(), &wd.spec))
+            .collect();
 
         // Resolve table name and alias.
         let (table_name, table_alias) = match from {
@@ -12715,6 +12728,37 @@ impl Connection {
         let mut win_func_names: Vec<String> = Vec::new();
         let mut win_frame_specs: Vec<Option<FrameSpec>> = Vec::new();
 
+        // Helper: resolve a WindowSpec by merging base_window reference
+        // with the named window definitions from the WINDOW clause.
+        let resolve_window_spec = |spec: &WindowSpec| -> WindowSpec {
+            if let Some(ref base_name) = spec.base_window {
+                if let Some(base_spec) = named_windows.get(&base_name.to_ascii_uppercase()) {
+                    // Merge: local spec overrides base spec fields.
+                    // Partition: use local if non-empty, else base.
+                    let partition_by = if spec.partition_by.is_empty() {
+                        base_spec.partition_by.clone()
+                    } else {
+                        spec.partition_by.clone()
+                    };
+                    // Order: use local if non-empty, else base.
+                    let order_by = if spec.order_by.is_empty() {
+                        base_spec.order_by.clone()
+                    } else {
+                        spec.order_by.clone()
+                    };
+                    // Frame: use local if specified, else base.
+                    let frame = spec.frame.clone().or_else(|| base_spec.frame.clone());
+                    return WindowSpec {
+                        base_window: None,
+                        partition_by,
+                        order_by,
+                        frame,
+                    };
+                }
+            }
+            spec.clone()
+        };
+
         for col in &expanded_columns {
             match col {
                 ResultColumn::Expr {
@@ -12722,11 +12766,12 @@ impl Connection {
                         Expr::FunctionCall {
                             name,
                             args,
-                            over: Some(spec),
+                            over: Some(raw_spec),
                             ..
                         },
                     ..
                 } => {
+                    let spec = resolve_window_spec(raw_spec);
                     let arg_exprs = match args {
                         FunctionArgs::List(exprs) => exprs.clone(),
                         FunctionArgs::Star => vec![],
@@ -12749,14 +12794,6 @@ impl Connection {
                         })
                         .collect();
                     let pb = spec.partition_by.clone();
-                    // Functions that need two passes (step all, then
-                    // value+inverse):
-                    // - LEAD: reads ahead in the partition.
-                    // - NTILE, PERCENT_RANK, CUME_DIST: need partition size.
-                    // - FIRST_VALUE, LAST_VALUE, NTH_VALUE: frame-relative.
-                    // - Aggregate window functions (SUM, COUNT, AVG, etc.)
-                    //   without ORDER BY: default frame is the entire
-                    //   partition, so we must step all rows first.
                     let upper = name.to_ascii_uppercase();
                     let needs_full_partition = matches!(
                         upper.as_str(),
@@ -12785,12 +12822,13 @@ impl Connection {
                     // (e.g., ROUND(AVG(val) OVER (...), 2)).  Extract the
                     // inner window call, register it, and wrap the outer
                     // expression with a placeholder.
-                    let (inner_name, inner_args, inner_spec) = extract_inner_window_function(expr)
-                        .ok_or_else(|| {
+                    let (inner_name, inner_args, raw_inner_spec) =
+                        extract_inner_window_function(expr).ok_or_else(|| {
                             FrankenError::Internal(
                                 "expr_has_window_function=true but cannot extract".to_owned(),
                             )
                         })?;
+                    let inner_spec = resolve_window_spec(&raw_inner_spec);
                     let arg_exprs = match &inner_args {
                         FunctionArgs::List(exprs) => exprs.clone(),
                         FunctionArgs::Star => vec![],
@@ -23282,16 +23320,50 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                     .get(1)
                     .map_or(0, fsqlite_types::SqliteValue::to_integer)
                     .clamp(0, 30) as usize;
-                let rounded = if n == 0 {
-                    // n==0: round half away from zero via integer truncation
-                    // (matches C SQLite's (double)(sqlite_int64)(r+0.5)).
-                    #[allow(clippy::cast_possible_truncation)]
-                    let r = (*f + if *f < 0.0 { -0.5 } else { 0.5 }) as i64;
-                    r as f64
-                } else {
-                    // n>0: use string formatting to match C SQLite's printf-based
-                    // rounding and avoid intermediate float precision errors.
-                    format!("{f:.n$}").parse::<f64>().unwrap_or(*f)
+                // SQLite's custom printf uses "round half away from zero".
+                // Rust's format! uses "round half to even". They differ
+                // only on exact ties — detect those and adjust.
+                let rounded = {
+                    let prec = n + 15;
+                    let full = format!("{f:.prec$}");
+                    let dot = full.find('.').unwrap_or(full.len());
+                    let rd_idx = dot + 1 + n;
+                    if rd_idx >= full.len() {
+                        format!("{f:.n$}").parse::<f64>().unwrap_or(*f)
+                    } else {
+                        let rd = full.as_bytes()[rd_idx] - b'0';
+                        if rd != 5
+                            || !full[rd_idx + 1..].bytes().all(|b| b == b'0')
+                        {
+                            format!("{f:.n$}").parse::<f64>().unwrap_or(*f)
+                        } else {
+                            let mut trunc = full[..rd_idx].as_bytes().to_vec();
+                            if trunc.last() == Some(&b'.') {
+                                trunc.pop();
+                            }
+                            let start = usize::from(trunc.first() == Some(&b'-'));
+                            let mut carry = true;
+                            for b in trunc[start..].iter_mut().rev() {
+                                if *b == b'.' { continue; }
+                                if carry {
+                                    if *b == b'9' {
+                                        *b = b'0';
+                                    } else {
+                                        *b += 1;
+                                        carry = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if carry {
+                                trunc.insert(start, b'1');
+                            }
+                            String::from_utf8(trunc)
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(*f)
+                        }
+                    }
                 };
                 SqliteValue::Float(rounded)
             }
