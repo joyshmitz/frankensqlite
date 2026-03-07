@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::mismatch_minimizer::{minimize_workload, MinimizerConfig, ReproducibilityTest};
-use crate::oracle::{parse_slt, SltKind};
+use crate::mismatch_minimizer::{MinimizerConfig, ReproducibilityTest, minimize_workload};
+use crate::oracle::{SltKind, parse_slt};
 
 /// Bead identifier for log correlation.
 const BEAD_ID: &str = "bd-1dp9.2.1";

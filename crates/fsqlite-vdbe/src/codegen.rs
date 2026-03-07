@@ -9081,7 +9081,6 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             b.emit_op(Opcode::Integer, val, reg, 0, P4::None, 0);
         }
         Expr::Subquery(subquery, _) => {
-            eprintln!("[emit_expr] Subquery encountered, ctx_available={}, schema_available={}", ctx.is_some(), ctx.and_then(|c| c.schema).is_some());
             if let Some(scan_ctx) = ctx {
                 if let Some(schema) = scan_ctx.schema {
                     emit_scalar_subquery(b, subquery, reg, scan_ctx, schema);
@@ -9089,7 +9088,6 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 }
             }
             // No schema context — emit NULL.
-            eprintln!("[emit_expr] Subquery => EMIT NULL (no schema context)");
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         }
         Expr::JsonAccess {
@@ -9250,7 +9248,6 @@ fn emit_scalar_subquery(
     outer_ctx: &ScanCtx<'_>,
     schema: &[TableSchema],
 ) {
-    eprintln!("[emit_scalar_subquery] ENTER outer_table={} outer_alias={:?}", outer_ctx.table.name, outer_ctx.table_alias);
     let (columns, from, where_clause, group_by) = match &subquery.body.select {
         SelectCore::Select {
             columns,
@@ -9527,16 +9524,11 @@ fn emit_expr_with_fallback(
 ) {
     match expr {
         Expr::Column(col_ref, _) => {
-            let inner_resolved = resolve_column_in_ctx(col_ref, inner_ctx);
-            eprintln!("[emit_expr_with_fallback Column] col={:?}.{:?} inner_resolved={:?} outer_available={}", col_ref.table, col_ref.column, inner_resolved, outer_ctx.is_some());
-            if inner_resolved.is_some() {
+            if resolve_column_in_ctx(col_ref, inner_ctx).is_some() {
                 emit_expr(b, expr, reg, Some(inner_ctx));
             } else if let Some(outer) = outer_ctx {
-                let outer_resolved = resolve_column_in_ctx(col_ref, outer);
-                eprintln!("[emit_expr_with_fallback Column] -> outer_resolved={:?} outer_table={} outer_alias={:?}", outer_resolved, outer.table.name, outer.table_alias);
                 emit_expr(b, expr, reg, Some(outer));
             } else {
-                eprintln!("[emit_expr_with_fallback Column] -> EMIT NULL (no outer ctx)");
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             }
         }
@@ -9671,7 +9663,6 @@ fn emit_expr_with_fallback(
             op: like_op,
             ..
         } => {
-            eprintln!("[emit_expr_with_fallback LIKE] operand={operand:?}, pattern={pattern:?}");
             let func_name = match like_op {
                 fsqlite_ast::LikeOp::Like => "LIKE",
                 fsqlite_ast::LikeOp::Glob => "GLOB",

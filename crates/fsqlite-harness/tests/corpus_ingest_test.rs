@@ -13,14 +13,14 @@ use std::fs;
 use std::path::Path;
 
 use fsqlite_harness::corpus_ingest::{
-    classify_family, derive_entry_seed, generate_seed_corpus,
-    ingest_conformance_fixtures_with_report, ingest_slt_files_with_report,
-    intake_user_repro_fixture, render_user_repro_fixture_json, write_user_repro_fixture,
-    CorpusBuilder, CorpusSource, Family, UserReproIntakeRequest, CORPUS_SEED_BASE,
+    CORPUS_SEED_BASE, CorpusBuilder, CorpusSource, Family, UserReproIntakeRequest, classify_family,
+    derive_entry_seed, generate_seed_corpus, ingest_conformance_fixtures_with_report,
+    ingest_slt_files_with_report, intake_user_repro_fixture, render_user_repro_fixture_json,
+    write_user_repro_fixture,
 };
 use fsqlite_harness::differential_v2::{StatementDivergence, StmtOutcome};
 use fsqlite_harness::fixture_root_contract::{
-    load_fixture_root_contract, DEFAULT_FIXTURE_ROOT_MANIFEST_PATH,
+    DEFAULT_FIXTURE_ROOT_MANIFEST_PATH, load_fixture_root_contract,
 };
 use fsqlite_harness::mismatch_minimizer::MinimizerConfig;
 use proptest::prelude::*;
@@ -244,9 +244,11 @@ fn builder_link_features_attaches_ids() {
 
     let manifest = builder.build();
     assert_eq!(manifest.entries[0].taxonomy_features.len(), 2);
-    assert!(manifest.entries[0]
-        .taxonomy_features
-        .contains(&"F-FUN.5".to_owned()));
+    assert!(
+        manifest.entries[0]
+            .taxonomy_features
+            .contains(&"F-FUN.5".to_owned())
+    );
 }
 
 // ─── Coverage Report Tests ───────────────────────────────────────────────
@@ -266,22 +268,30 @@ fn coverage_reports_missing_families() {
     let manifest = builder.build();
 
     assert!(manifest.coverage.missing_families.len() >= 7);
-    assert!(manifest
-        .coverage
-        .missing_families
-        .contains(&"TXN".to_owned()));
-    assert!(manifest
-        .coverage
-        .missing_families
-        .contains(&"FUN".to_owned()));
-    assert!(manifest
-        .coverage
-        .missing_families
-        .contains(&"VDB".to_owned()));
-    assert!(!manifest
-        .coverage
-        .missing_families
-        .contains(&"SQL".to_owned()));
+    assert!(
+        manifest
+            .coverage
+            .missing_families
+            .contains(&"TXN".to_owned())
+    );
+    assert!(
+        manifest
+            .coverage
+            .missing_families
+            .contains(&"FUN".to_owned())
+    );
+    assert!(
+        manifest
+            .coverage
+            .missing_families
+            .contains(&"VDB".to_owned())
+    );
+    assert!(
+        !manifest
+            .coverage
+            .missing_families
+            .contains(&"SQL".to_owned())
+    );
 }
 
 #[test]
@@ -480,9 +490,11 @@ fn ingest_conformance_fixtures_reports_skipped_underspecified_files() {
     assert_eq!(report.sql_statements_ingested, 1);
     assert_eq!(report.skipped_files.len(), 1);
     assert_eq!(report.skipped_files[0].file, "empty.json");
-    assert!(report.skipped_files[0]
-        .reason
-        .contains("no ops[].sql statements"));
+    assert!(
+        report.skipped_files[0]
+            .reason
+            .contains("no ops[].sql statements")
+    );
 
     let manifest = builder.build();
     assert_eq!(manifest.entries.len(), 1);
@@ -557,9 +569,11 @@ CREATE TABLE t2(v INTEGER)
     assert_eq!(report.sql_statements_ingested, 1);
     assert_eq!(report.skipped_files.len(), 1);
     assert_eq!(report.skipped_files[0].file, "empty.test");
-    assert!(report.skipped_files[0]
-        .reason
-        .contains("no SLT entries parsed"));
+    assert!(
+        report.skipped_files[0]
+            .reason
+            .contains("no SLT entries parsed")
+    );
 }
 
 #[test]
