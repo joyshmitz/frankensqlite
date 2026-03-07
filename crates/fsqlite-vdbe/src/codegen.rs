@@ -6529,13 +6529,29 @@ pub fn codegen_delete(
     // Register table-to-index cursor metadata for REPLACE conflict resolution.
     register_table_index_meta(b, table, table_cursor);
 
-    // Reverse scan (Last/Prev) so that delete_at(pos) does not shift
-    // indices of rows we haven't visited yet.
-    let loop_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Last, table_cursor, 0, done_label, P4::None, 0);
+    // Two-pass DELETE (matches C SQLite behavior):
+    //   Pass 1: Scan table, evaluate WHERE, collect matching rowids into a RowSet.
+    //   Pass 2: Iterate collected rowids, seek, and delete.
+    // This prevents WHERE subqueries from seeing partially-deleted state.
+    let rowset_reg = b.alloc_reg();
+    let rowid_reg = b.alloc_reg();
 
-    // Evaluate WHERE condition (if any) and skip non-matching rows.
-    let skip_label = b.emit_label();
+    // Initialize rowset register to NULL.
+    b.emit_op(Opcode::Null, 0, rowset_reg, 0, P4::None, 0);
+
+    // --- Pass 1: collect matching rowids ---
+    let collect_done_label = b.emit_label();
+    let collect_start = b.current_addr();
+    b.emit_jump_to_label(
+        Opcode::Rewind,
+        table_cursor,
+        0,
+        collect_done_label,
+        P4::None,
+        0,
+    );
+
+    let collect_skip_label = b.emit_label();
     if let Some(where_expr) = &stmt.where_clause {
         emit_where_filter(
             b,
@@ -6544,9 +6560,43 @@ pub fn codegen_delete(
             table,
             stmt.table.alias.as_deref(),
             schema,
-            skip_label,
+            collect_skip_label,
         );
     }
+
+    // Get rowid of matching row and add to rowset.
+    b.emit_op(Opcode::Rowid, table_cursor, rowid_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+
+    b.resolve_label(collect_skip_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let collect_body = (collect_start + 1) as i32;
+    b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
+
+    b.resolve_label(collect_done_label);
+
+    // --- Pass 2: iterate rowset, seek, and delete ---
+    let delete_done_label = b.emit_label();
+    let delete_loop = b.current_addr();
+    b.emit_jump_to_label(
+        Opcode::RowSetRead,
+        rowset_reg,
+        rowid_reg,
+        delete_done_label,
+        P4::None,
+        0,
+    );
+
+    // Seek to the rowid.
+    let seek_miss_label = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekRowid,
+        table_cursor,
+        rowid_reg,
+        seek_miss_label,
+        P4::None,
+        0,
+    );
 
     // RETURNING clause: read columns before deletion (row is still present).
     if !stmt.returning.is_empty() {
@@ -6564,8 +6614,7 @@ pub fn codegen_delete(
         b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
     }
 
-    // Index maintenance: delete from each index before deleting the row (bd-34se).
-    // Must read column values while the row is still present.
+    // Index maintenance: delete from each index before deleting the row.
     emit_index_deletes(b, table, table_cursor);
 
     // Delete at cursor position.
@@ -6579,16 +6628,16 @@ pub fn codegen_delete(
         1,
     );
 
-    // Skip label for WHERE-filtered rows.
-    b.resolve_label(skip_label);
+    b.resolve_label(seek_miss_label);
 
-    // Prev: iterate backwards to avoid index-shift issues.
+    // Loop back to read next rowid from the set.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let loop_body = (loop_start + 1) as i32;
-    b.emit_op(Opcode::Prev, table_cursor, loop_body, 0, P4::None, 0);
+    let delete_loop_addr = delete_loop as i32;
+    b.emit_op(Opcode::Goto, 0, delete_loop_addr, 0, P4::None, 0);
 
-    // Done: Close table cursor.
-    b.resolve_label(done_label);
+    b.resolve_label(delete_done_label);
+
+    // Close table cursor.
     b.emit_op(Opcode::Close, table_cursor, 0, 0, P4::None, 0);
 
     // Close index cursors (bd-34se).
@@ -7384,13 +7433,15 @@ fn emit_where_filter(
             if let Some(resolved) = resolve_column_ref(left, table, table_alias) {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                let cmp_p5 = column_cmp_p5(table, &resolved);
+                // Use comparison_affinity_p5 to consider BOTH operands' affinities.
+                // This is critical for col_text = col_int where we need NUMERIC coercion.
+                let cmp_p5 = 0x80 | comparison_affinity_p5(left, right, Some(&scan));
                 emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
                 emit_expr(b, right, val_reg, Some(&scan));
                 // SQL semantics: `col = NULL` is UNKNOWN (false in WHERE). If the
                 // value expression evaluates to NULL, skip the row unconditionally.
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
-                // NULLEQ (0x80) | column affinity so the engine coerces correctly.
+                // NULLEQ (0x80) | comparison affinity so the engine coerces correctly.
                 b.emit_jump_to_label(
                     Opcode::Ne,
                     val_reg,
@@ -7404,7 +7455,7 @@ fn emit_where_filter(
             } else if let Some(resolved) = resolve_column_ref(right, table, table_alias) {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                let cmp_p5 = column_cmp_p5(table, &resolved);
+                let cmp_p5 = 0x80 | comparison_affinity_p5(left, right, Some(&scan));
                 emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
                 emit_expr(b, left, val_reg, Some(&scan));
                 // SQL semantics: `NULL = col` is UNKNOWN (false in WHERE).
@@ -7470,7 +7521,8 @@ fn emit_where_filter(
             if let Some(resolved) = resolve_column_ref(left, table, table_alias) {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                let cmp_p5 = column_cmp_p5(table, &resolved);
+                // Use comparison_affinity_p5 to consider both operands' affinities.
+                let cmp_p5 = 0x80 | comparison_affinity_p5(left, right, Some(&scan));
                 emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
                 emit_expr(b, right, val_reg, Some(&scan));
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
@@ -7499,7 +7551,7 @@ fn emit_where_filter(
                 };
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                let cmp_p5 = column_cmp_p5(table, &resolved);
+                let cmp_p5 = 0x80 | comparison_affinity_p5(left, right, Some(&scan));
                 emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
                 emit_expr(b, left, val_reg, Some(&scan));
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
@@ -9935,6 +9987,11 @@ fn emit_case_expr(
 }
 
 /// Determine the type affinity of an expression for comparison coercion.
+///
+/// Per SQLite §3.2 (comparisonAffinity): only column references and CAST
+/// expressions have affinity for comparison purposes. Literals and computed
+/// expressions have BLOB/NONE affinity (i.e., no coercion influence).
+///
 /// Returns SQLite affinity codes: A=BLOB, B=TEXT, C=NUMERIC, D=INTEGER, E=REAL.
 fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
     // Unwrap COLLATE to reach the underlying expression
@@ -9989,14 +10046,10 @@ fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
             }
             b'A' // BLOB/NONE affinity if not found
         }
-        Expr::Literal(lit, _) => match lit {
-            Literal::Integer(_) => b'D',
-            Literal::Float(_) => b'E',
-            Literal::String(_) => b'B',
-            _ => b'A',
-        },
+        // Literals have NO column affinity for comparison purposes.
+        // Per C SQLite: only TK_COLUMN and TK_CAST produce comparison affinity.
         Expr::Cast { type_name, .. } => type_name_to_affinity(type_name),
-        _ => b'A', // BLOB/NONE affinity for computed expressions
+        _ => b'A', // BLOB/NONE affinity for literals and computed expressions
     }
 }
 
