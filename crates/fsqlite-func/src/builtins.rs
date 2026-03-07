@@ -105,7 +105,9 @@ impl ScalarFunction for AbsFunc {
             }
             other => {
                 let f = other.to_float();
-                Ok(SqliteValue::Float(f.abs()))
+                // Match C SQLite: abs uses `x < 0 ? -x : x`.
+                // IEEE 754: -0.0 < 0.0 is false, so abs(-0.0) == -0.0.
+                Ok(SqliteValue::Float(if f < 0.0 { -f } else { f }))
             }
         }
     }

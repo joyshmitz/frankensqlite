@@ -18,6 +18,8 @@
 //! - `$[#]` append pseudo-index
 //! - `$[#-N]` reverse array index
 
+use std::borrow::Cow;
+
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
     ColumnContext, FunctionRegistry, IndexInfo, ScalarFunction, VirtualTable, VirtualTableCursor,
@@ -1746,6 +1748,57 @@ fn collect_path_args<'a>(
     Ok(out)
 }
 
+fn normalize_arrow_path_arg<'a>(
+    name: &str,
+    value: &'a SqliteValue,
+    index: usize,
+) -> Result<Cow<'a, str>> {
+    match value {
+        SqliteValue::Text(path) => {
+            if path.starts_with('$') || path.is_empty() {
+                Ok(Cow::Borrowed(path.as_str()))
+            } else {
+                let quoted = serde_json::to_string(path).map_err(|error| {
+                    FrankenError::function_error(format!(
+                        "{name} argument {} key encoding failed: {error}",
+                        index + 1
+                    ))
+                })?;
+                Ok(Cow::Owned(format!("$.{quoted}")))
+            }
+        }
+        SqliteValue::Integer(index_value) => {
+            if *index_value >= 0 {
+                Ok(Cow::Owned(format!("$[{index_value}]")))
+            } else {
+                Ok(Cow::Owned(format!("$[#-{}]", index_value.unsigned_abs())))
+            }
+        }
+        other => Err(FrankenError::function_error(format!(
+            "{name} argument {} must be TEXT or INTEGER, got {}",
+            index + 1,
+            other.typeof_str()
+        ))),
+    }
+}
+
+fn invoke_json_arrow(name: &str, args: &[SqliteValue], double_arrow: bool) -> Result<SqliteValue> {
+    if args.len() != 2 {
+        return Err(invalid_arity(name, "exactly 2 arguments", args.len()));
+    }
+    if args.iter().any(SqliteValue::is_null) {
+        return Ok(SqliteValue::Null);
+    }
+
+    let input = text_arg(name, args, 0)?;
+    let path = normalize_arrow_path_arg(name, &args[1], 1)?;
+    if double_arrow {
+        json_double_arrow(input, path.as_ref())
+    } else {
+        json_arrow(input, path.as_ref())
+    }
+}
+
 fn collect_path_value_pairs(
     name: &str,
     args: &[SqliteValue],
@@ -1877,6 +1930,38 @@ impl ScalarFunction for JsonExtractFunc {
 
     fn name(&self) -> &'static str {
         "json_extract"
+    }
+}
+
+pub struct JsonArrowFunc;
+
+impl ScalarFunction for JsonArrowFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        invoke_json_arrow(self.name(), args, false)
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "json_arrow"
+    }
+}
+
+pub struct JsonDoubleArrowFunc;
+
+impl ScalarFunction for JsonDoubleArrowFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        invoke_json_arrow(self.name(), args, true)
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "json_double_arrow"
     }
 }
 
@@ -2213,6 +2298,8 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(JsonValidFunc);
     registry.register_scalar(JsonTypeFunc);
     registry.register_scalar(JsonExtractFunc);
+    registry.register_scalar(JsonArrowFunc);
+    registry.register_scalar(JsonDoubleArrowFunc);
     registry.register_scalar(JsonArrayFunc);
     registry.register_scalar(JsonObjectFunc);
     registry.register_scalar(JsonQuoteFunc);
@@ -2241,6 +2328,8 @@ mod tests {
             "json_valid",
             "json_type",
             "json_extract",
+            "json_arrow",
+            "json_double_arrow",
             "json_set",
             "json_remove",
             "json_array",
@@ -2269,6 +2358,38 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(out, SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_registered_json_arrow_scalar_normalizes_label_shorthand() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let func = registry
+            .find_scalar("json_arrow", 2)
+            .expect("json_arrow should be registered");
+        let out = func
+            .invoke(&[
+                SqliteValue::Text(r#"{"a.b":1,"a":{"b":2}}"#.to_owned()),
+                SqliteValue::Text("a.b".to_owned()),
+            ])
+            .expect("json_arrow should normalize bare labels");
+        assert_eq!(out, SqliteValue::Text("1".to_owned()));
+    }
+
+    #[test]
+    fn test_registered_json_double_arrow_scalar_normalizes_integer_shorthand() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let func = registry
+            .find_scalar("json_double_arrow", 2)
+            .expect("json_double_arrow should be registered");
+        let out = func
+            .invoke(&[
+                SqliteValue::Text("[10,20,30]".to_owned()),
+                SqliteValue::Integer(1),
+            ])
+            .expect("json_double_arrow should normalize integer indexes");
+        assert_eq!(out, SqliteValue::Integer(20));
     }
 
     #[test]

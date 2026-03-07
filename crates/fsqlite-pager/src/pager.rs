@@ -4978,18 +4978,17 @@ mod tests {
 
         pager.reset_cache_metrics().unwrap();
         let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
-        let mut idx: usize = 0;
-        for _ in 0..200 {
+        for idx in 0..200usize {
             // 8 hot accesses.
             for h in hot {
                 let _ = txn2.get_page(&cx, *h).unwrap();
             }
             // 2 cold accesses (rotating through cold pages).
-            let cold_idx = (idx as usize * 2) % 45;
+            let cold_idx = (idx * 2) % 45;
             let _ = txn2.get_page(&cx, pages[5 + cold_idx]).unwrap();
             let _ = txn2.get_page(&cx, pages[5 + (cold_idx + 1) % 45]).unwrap();
-            idx += 1;
         }
+        drop(txn2);
 
         let metrics = pager.cache_metrics_snapshot().unwrap();
         let total = metrics.total_accesses();
@@ -5066,7 +5065,7 @@ mod tests {
         // Phase 1: Seed 30 pages.
         let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
         let mut pages = Vec::new();
-        for i in 0..30u32 {
+        for _ in 0..30u32 {
             let p = txn.allocate_page(&cx).unwrap();
             let mut data = vec![0u8; ps];
             // Unique fingerprint: page number in first 4 bytes.

@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use crate::{Label, ProgramBuilder};
 use fsqlite_ast::{
     AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FromClause,
-    FunctionArgs, InsertSource, InsertStatement, LimitClause, Literal, OrderingTerm,
+    FunctionArgs, InsertSource, InsertStatement, JsonArrow, LimitClause, Literal, OrderingTerm,
     QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, SortDirection, Statement,
     TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction,
     UpsertClause, UpsertTarget,
@@ -69,6 +69,13 @@ fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
         Some(ConflictAction::Fail) => OE_FAIL,
         Some(ConflictAction::Ignore) => OE_IGNORE,
         Some(ConflictAction::Replace) => OE_REPLACE,
+    }
+}
+
+fn json_access_func_name(arrow: &JsonArrow) -> &'static str {
+    match arrow {
+        JsonArrow::Arrow => "JSON_ARROW",
+        JsonArrow::DoubleArrow => "JSON_DOUBLE_ARROW",
     }
 }
 
@@ -717,7 +724,10 @@ fn emit_upsert_expr(
 
         // ── JSON access ────────────────────────────────────────────────
         Expr::JsonAccess {
-            expr: inner, path, ..
+            expr: inner,
+            path,
+            arrow,
+            ..
         } => {
             let arg_base = b.alloc_regs(2);
             emit_upsert_expr(b, inner, arg_base, existing_ctx, excluded_ctx, _table);
@@ -727,7 +737,7 @@ fn emit_upsert_expr(
                 0,
                 arg_base,
                 reg,
-                P4::FuncName("JSON_EXTRACT".to_owned()),
+                P4::FuncName(json_access_func_name(arrow).to_owned()),
                 2,
             );
         }
@@ -8977,12 +8987,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         }
         Expr::JsonAccess {
-            expr: inner, path, ..
+            expr: inner,
+            path,
+            arrow,
+            ..
         } => {
-            // Rewrite `expr -> path` and `expr ->> path` as json_extract(expr, path).
-            // Both arrow variants use json_extract; the subtle -> vs ->> distinction
-            // (JSON text vs SQL-native) is handled identically by our json_extract
-            // implementation which returns SQL-native values.
             let arg_base = b.alloc_regs(2);
             emit_expr(b, inner, arg_base, ctx);
             emit_expr(b, path, arg_base + 1, ctx);
@@ -8991,7 +9000,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 0,
                 arg_base,
                 reg,
-                P4::FuncName("JSON_EXTRACT".to_owned()),
+                P4::FuncName(json_access_func_name(arrow).to_owned()),
                 2,
             );
         }
