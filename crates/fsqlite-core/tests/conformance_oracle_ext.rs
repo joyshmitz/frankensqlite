@@ -14854,3 +14854,214 @@ fn test_conformance_foreign_key_cascade_s109() {
         panic!("{} FK cascade mismatches", m1.len());
     }
 }
+
+#[test]
+fn test_conformance_complex_join_predicates_s110() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE cjp_a(id INTEGER PRIMARY KEY, x INTEGER, tag TEXT)",
+        "CREATE TABLE cjp_b(id INTEGER PRIMARY KEY, y INTEGER, tag TEXT)",
+        "INSERT INTO cjp_a VALUES(1,10,'alpha'),(2,20,'beta'),(3,30,'alpha'),(4,40,'gamma')",
+        "INSERT INTO cjp_b VALUES(1,15,'alpha'),(2,25,'beta'),(3,35,'delta'),(4,10,'alpha')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // JOIN with expression in ON
+        "SELECT a.id, b.id FROM cjp_a a JOIN cjp_b b ON a.tag = b.tag AND a.x < b.y ORDER BY a.id, b.id",
+        // JOIN with OR in ON
+        "SELECT a.id, b.id FROM cjp_a a JOIN cjp_b b ON a.tag = b.tag OR a.x = b.y ORDER BY a.id, b.id",
+        // JOIN with BETWEEN
+        "SELECT a.id, b.id FROM cjp_a a JOIN cjp_b b ON b.y BETWEEN a.x AND a.x + 10 ORDER BY a.id, b.id",
+        // LEFT JOIN with aggregate filtering
+        "SELECT a.tag, COUNT(b.id) AS match_count FROM cjp_a a LEFT JOIN cjp_b b ON a.tag = b.tag GROUP BY a.tag ORDER BY a.tag",
+        // Self-referencing comparison
+        "SELECT a1.id, a2.id FROM cjp_a a1 JOIN cjp_a a2 ON a1.tag = a2.tag AND a1.id < a2.id ORDER BY a1.id, a2.id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} complex join predicate mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_group_by_having_no_select_s111() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE gbh(id INTEGER PRIMARY KEY, cat TEXT, val INTEGER)",
+        "INSERT INTO gbh VALUES(1,'A',10),(2,'A',20),(3,'B',30),(4,'B',40),(5,'C',50)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // HAVING with aggregate not in SELECT
+        "SELECT cat FROM gbh GROUP BY cat HAVING SUM(val) > 30 ORDER BY cat",
+        "SELECT cat FROM gbh GROUP BY cat HAVING COUNT(*) >= 2 ORDER BY cat",
+        "SELECT cat FROM gbh GROUP BY cat HAVING AVG(val) > 20 ORDER BY cat",
+        // Multiple HAVING conditions
+        "SELECT cat, COUNT(*) AS cnt FROM gbh GROUP BY cat HAVING cnt > 1 AND SUM(val) > 20 ORDER BY cat",
+        // HAVING with nested expression
+        "SELECT cat FROM gbh GROUP BY cat HAVING ABS(SUM(val) - 50) <= 20 ORDER BY cat",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} group by having no select mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_nested_aggregate_subquery_s112() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE nas_sales(id INTEGER PRIMARY KEY, region TEXT, product TEXT, amount REAL)",
+        "INSERT INTO nas_sales VALUES(1,'north','A',100),(2,'north','B',200),(3,'south','A',150),(4,'south','B',250),(5,'east','A',50)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // Aggregate of subquery result
+        "SELECT SUM(total) FROM (SELECT region, SUM(amount) AS total FROM nas_sales GROUP BY region)",
+        "SELECT MAX(total) FROM (SELECT region, SUM(amount) AS total FROM nas_sales GROUP BY region)",
+        // Percentage of total
+        "SELECT region, ROUND(SUM(amount) * 100.0 / (SELECT SUM(amount) FROM nas_sales), 1) AS pct FROM nas_sales GROUP BY region ORDER BY pct DESC",
+        // Regions above average
+        "SELECT region FROM (SELECT region, SUM(amount) AS total FROM nas_sales GROUP BY region) WHERE total > (SELECT AVG(amount) * 2 FROM nas_sales) ORDER BY region",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} nested aggregate subquery mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_complex_update_set_s113() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE cus(id INTEGER PRIMARY KEY, name TEXT, score INTEGER, grade TEXT)",
+        "INSERT INTO cus VALUES(1,'Alice',85,NULL),(2,'Bob',92,NULL),(3,'Carol',78,NULL),(4,'Dave',55,NULL),(5,'Eve',96,NULL)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    // UPDATE with CASE in SET
+    for s in &[
+        "UPDATE cus SET grade = CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' WHEN score >= 70 THEN 'C' ELSE 'F' END",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let q1 = ["SELECT id, name, score, grade FROM cus ORDER BY id"];
+    let m1 = oracle_compare(&fconn, &rconn, &q1);
+    if !m1.is_empty() {
+        for m in &m1 {
+            eprintln!("{m}\n");
+        }
+        panic!("{} complex update SET mismatches", m1.len());
+    }
+
+    // UPDATE with subquery in SET
+    for s in &["UPDATE cus SET score = score - (SELECT MIN(score) FROM cus) WHERE grade = 'F'"] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let q2 = ["SELECT id, name, score FROM cus ORDER BY id"];
+    let m2 = oracle_compare(&fconn, &rconn, &q2);
+    if !m2.is_empty() {
+        for m in &m2 {
+            eprintln!("{m}\n");
+        }
+        panic!("{} update with subquery SET mismatches", m2.len());
+    }
+}
+
+#[test]
+fn test_conformance_multiple_tables_same_column_s114() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE mtsc_t1(id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        "CREATE TABLE mtsc_t2(id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        "INSERT INTO mtsc_t1 VALUES(1,'a',10),(2,'b',20)",
+        "INSERT INTO mtsc_t2 VALUES(1,'c',30),(2,'d',40)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // Qualified column references
+        "SELECT t1.name, t2.name FROM mtsc_t1 t1 JOIN mtsc_t2 t2 ON t1.id = t2.id ORDER BY t1.id",
+        "SELECT t1.val + t2.val AS total FROM mtsc_t1 t1 JOIN mtsc_t2 t2 ON t1.id = t2.id ORDER BY t1.id",
+        "SELECT t1.name, t2.name FROM mtsc_t1 t1 JOIN mtsc_t2 t2 ON t1.val < t2.val ORDER BY t1.name, t2.name",
+        // Subquery with same column names
+        "SELECT a.name, b.name FROM (SELECT name FROM mtsc_t1) a, (SELECT name FROM mtsc_t2) b ORDER BY a.name, b.name",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!(
+            "{} multiple tables same column mismatches",
+            mismatches.len()
+        );
+    }
+}
+
+#[test]
+fn test_conformance_hex_blob_operations_s115() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries = [
+        "SELECT HEX(X'48656C6C6F')",
+        "SELECT TYPEOF(X'0102')",
+        "SELECT LENGTH(X'0102030405')",
+        "SELECT HEX(ZEROBLOB(4))",
+        "SELECT X'FF' > X'00'",
+        "SELECT X'00' = X'00'",
+        "SELECT HEX(X'')",
+        "SELECT TYPEOF(ZEROBLOB(0))",
+        "SELECT CAST(X'3432' AS TEXT)",
+        "SELECT QUOTE(X'DEADBEEF')",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} hex/blob operation mismatches", mismatches.len());
+    }
+}
