@@ -1159,14 +1159,16 @@ pub fn compute_wal_frame_checksum(
     big_endian_checksum_words: bool,
 ) -> Result<SqliteWalChecksum> {
     ensure_frame_len(frame, page_size)?;
-    let mut checksum_input = Vec::with_capacity(8 + page_size);
-    checksum_input.extend_from_slice(&frame[..8]);
-    checksum_input
-        .extend_from_slice(&frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + page_size]);
-    sqlite_wal_checksum(
-        &checksum_input,
+    let c1 = sqlite_wal_checksum(
+        &frame[..8],
         previous.s1,
         previous.s2,
+        big_endian_checksum_words,
+    )?;
+    sqlite_wal_checksum(
+        &frame[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + page_size],
+        c1.s1,
+        c1.s2,
         big_endian_checksum_words,
     )
 }
@@ -2230,21 +2232,21 @@ mod tests {
             salt1: 0x1234_5678,
             salt2: 0x9ABC_DEF0,
         };
-        let mut wal_header_buf = [0_u8; WAL_HEADER_SIZE];
-        wal_header_buf[..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
-        wal_header_buf[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
-        wal_header_buf[8..12].copy_from_slice(
+        let mut header_buf = [0_u8; WAL_HEADER_SIZE];
+        header_buf[..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+        header_buf[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
+        header_buf[8..12].copy_from_slice(
             &u32::try_from(PAGE_SIZE)
                 .expect("page size fits")
                 .to_be_bytes(),
         );
-        write_wal_header_salts(&mut wal_header_buf, salts).expect("write salts");
-        write_wal_header_checksum(&mut wal_header_buf, false).expect("write header checksum");
+        write_wal_header_salts(&mut header_buf, salts).expect("write salts");
+        write_wal_header_checksum(&mut header_buf, false).expect("write header checksum");
 
-        let mut running = read_wal_header_checksum(&wal_header_buf).expect("read header checksum");
+        let mut running = read_wal_header_checksum(&header_buf).expect("read header checksum");
 
         let mut wal_bytes = Vec::new();
-        wal_bytes.extend_from_slice(&wal_header_buf);
+        wal_bytes.extend_from_slice(&header_buf);
 
         // Write 5 frames, each a commit frame.
         for frame_idx in 0..5_u32 {
@@ -2255,8 +2257,9 @@ mod tests {
                 .expect("write frame salts");
 
             for (offset, byte) in frame[WAL_FRAME_HEADER_SIZE..].iter_mut().enumerate() {
-                let reduced = u8::try_from(offset % 251).expect("fits");
-                *byte = reduced ^ u8::try_from(frame_idx % 251).expect("fits");
+                let r = u8::try_from(offset % 251).unwrap();
+                let s = u8::try_from(frame_idx % 251).unwrap();
+                *byte = r ^ s;
             }
 
             running = write_wal_frame_checksum(&mut frame, PAGE_SIZE, running, false)
@@ -2297,7 +2300,11 @@ mod tests {
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         header_buf[..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
         header_buf[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
-        header_buf[8..12].copy_from_slice(&u32::try_from(PAGE_SIZE).expect("fits").to_be_bytes());
+        header_buf[8..12].copy_from_slice(
+            &u32::try_from(PAGE_SIZE)
+                .expect("page size fits")
+                .to_be_bytes(),
+        );
         write_wal_header_salts(&mut header_buf, salts).expect("write salts");
         write_wal_header_checksum(&mut header_buf, false).expect("write hdr cksum");
 
@@ -2370,8 +2377,8 @@ mod tests {
         let wal = build_valid_wal(5);
         let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
         // Truncate in the middle of frame 4 (index 3).
-        let cut_at = WAL_HEADER_SIZE + 3 * frame_size + frame_size / 2;
-        let torn = &wal[..cut_at];
+        let cut = WAL_HEADER_SIZE + 3 * frame_size + frame_size / 2;
+        let torn = &wal[..cut];
         let v = validate_wal_chain(torn, PAGE_SIZE, false).expect("validate");
         assert_eq!(
             v.valid_frames, 3,

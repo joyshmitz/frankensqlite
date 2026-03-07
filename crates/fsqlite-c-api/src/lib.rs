@@ -368,7 +368,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut Sqlite3) -> c_int {
 
     tracing::info!(target: "fsqlite.compat", "sqlite3_close");
 
-    let handle = Box::from_raw(db);
+    let mut handle = Box::from_raw(db);
     if handle.active_statement_count() != 0 {
         handle.set_error_message_and_code(
             "unable to close due to unfinalized statements",
@@ -377,11 +377,14 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut Sqlite3) -> c_int {
         let _ = Box::into_raw(handle);
         return SQLITE_BUSY;
     }
-    match handle.conn.close() {
+    match handle.conn.close_in_place() {
         Ok(()) => SQLITE_OK,
         Err(e) => {
             tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_close failed");
-            error_to_code(&e)
+            handle.set_error(&e);
+            let code = error_to_code(&e);
+            let _ = Box::into_raw(handle);
+            code
         }
     }
 }
@@ -1489,6 +1492,27 @@ mod tests {
             assert_eq!(sqlite3_column_int64(verify_stmt, 0), 2);
 
             sqlite3_finalize(verify_stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_prepare_rejects_adjacent_statements_without_separator() {
+        unsafe {
+            let db = open_memory();
+
+            let sql = CString::new("SELECT 1 SELECT 2").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut());
+            assert_ne!(rc, SQLITE_OK);
+            assert!(stmt.is_null());
+
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy();
+            assert!(
+                msg.contains("separator") || msg.contains("unexpected token"),
+                "unexpected error: {msg}"
+            );
+
             sqlite3_close(db);
         }
     }

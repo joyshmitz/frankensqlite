@@ -989,7 +989,7 @@ fn is_superficially_valid_jsonb(input: &[u8]) -> bool {
     let Ok(payload_len) = decode_jsonb_payload_len(&input[1..len_end]) else {
         return false;
     };
-    1 + len_size + payload_len <= input.len()
+    1 + len_size + payload_len == input.len()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3444,6 +3444,10 @@ mod tests {
         let mut blob = jsonb("42").unwrap();
         blob.push(0xFF); // trailing garbage
         assert!(json_from_jsonb(&blob).is_err());
+        assert_eq!(
+            json_valid_blob(&blob, Some(JSON_VALID_JSONB_SUPERFICIAL_FLAG)),
+            0
+        );
     }
 
     #[test]

@@ -271,6 +271,12 @@ fn sqlite_concat(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     if matches!(a, SqliteValue::Null) || matches!(b, SqliteValue::Null) {
         return SqliteValue::Null;
     }
+    if let (SqliteValue::Blob(ba), SqliteValue::Blob(bb)) = (a, b) {
+        let mut res = Vec::with_capacity(ba.len() + bb.len());
+        res.extend_from_slice(ba);
+        res.extend_from_slice(bb);
+        return SqliteValue::Blob(res);
+    }
     let sa = a.to_text();
     let sb = b.to_text();
     SqliteValue::Text(format!("{sa}{sb}"))
@@ -340,7 +346,7 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         RebaseBinaryOp::ShiftLeft => integer_bitop(&left, &right, |a, b| {
             let shift = b.unsigned_abs() as u32;
             if shift >= 64 {
-                0
+                if b < 0 && a < 0 { -1 } else { 0 }
             } else if b < 0 {
                 a >> shift
             } else {
@@ -351,7 +357,7 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         RebaseBinaryOp::ShiftRight => integer_bitop(&left, &right, |a, b| {
             let shift = b.unsigned_abs() as u32;
             if shift >= 64 {
-                0
+                if b >= 0 && a < 0 { -1 } else { 0 }
             } else if b < 0 {
                 a << shift
             } else {
@@ -481,7 +487,7 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
             let mut best: Option<&SqliteValue> = None;
             for a in args {
                 if matches!(a, SqliteValue::Null) {
-                    continue;
+                    return Ok(SqliteValue::Null);
                 }
                 if let Some(cur) = best {
                     if sqlite_value_compare(a, cur) == std::cmp::Ordering::Greater {
@@ -497,7 +503,7 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
             let mut best: Option<&SqliteValue> = None;
             for a in args {
                 if matches!(a, SqliteValue::Null) {
-                    continue;
+                    return Ok(SqliteValue::Null);
                 }
                 if let Some(cur) = best {
                     if sqlite_value_compare(a, cur) == std::cmp::Ordering::Less {
@@ -610,7 +616,8 @@ fn apply_collation(val: SqliteValue, collation: Collation) -> SqliteValue {
         }
         Collation::Rtrim => {
             if let SqliteValue::Text(s) = val {
-                SqliteValue::Text(s.trim_end().to_owned())
+                // SQLite RTRIM only ignores trailing spaces (ASCII 0x20), not all whitespace.
+                SqliteValue::Text(s.trim_end_matches(' ').to_owned())
             } else {
                 val
             }
@@ -1327,7 +1334,6 @@ mod tests {
             where_predicate: None,
             table_column_affinities: vec![TypeAffinity::Integer, TypeAffinity::Text],
         }];
-
         // Update from "hello" to "HELLO" — NOCASE means these are the SAME key.
         let updates = vec![(
             ColumnIdx::new(1),

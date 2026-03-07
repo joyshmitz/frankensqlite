@@ -227,6 +227,8 @@ struct SorterCursor {
     key_columns: usize,
     /// Per-key sort direction (length == key_columns).
     sort_key_orders: Vec<SortKeyOrder>,
+    /// Per-key collation sequence (e.g. "NOCASE"). `None` means BINARY.
+    collations: Vec<Option<String>>,
     /// Inserted records decoded from `MakeRecord` blobs.
     rows: Vec<Vec<SqliteValue>>,
     /// Current position after `SorterSort`/`SorterNext`.
@@ -310,7 +312,11 @@ struct SpillRun {
 }
 
 impl SorterCursor {
-    fn new(key_columns: usize, mut sort_key_orders: Vec<SortKeyOrder>) -> Self {
+    fn new(
+        key_columns: usize,
+        mut sort_key_orders: Vec<SortKeyOrder>,
+        collations: Vec<Option<String>>,
+    ) -> Self {
         let key_columns = key_columns.max(1);
         if sort_key_orders.len() < key_columns {
             sort_key_orders.resize(key_columns, SortKeyOrder::Asc);
@@ -319,6 +325,7 @@ impl SorterCursor {
         Self {
             key_columns,
             sort_key_orders,
+            collations,
             rows: Vec::new(),
             position: None,
             memory_used: 0,
@@ -365,8 +372,9 @@ impl SorterCursor {
         // Sort current batch
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
+        let colls = self.collations.clone();
         self.rows
-            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders));
+            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders, &colls));
 
         // Write to temp file.  We use `keep()` to detach the auto-delete
         // guard so the file persists until we explicitly remove it in
@@ -430,8 +438,9 @@ impl SorterCursor {
             // Pure in-memory sort — fast path.
             let key_columns = self.key_columns;
             let orders = self.sort_key_orders.clone();
+            let colls = self.collations.clone();
             self.rows
-                .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders));
+                .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders, &colls));
             self.rows_sorted_total += self.rows.len() as u64;
             return Ok(());
         }
@@ -439,8 +448,9 @@ impl SorterCursor {
         // Sort remaining in-memory rows as one more "run".
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
+        let colls = self.collations.clone();
         self.rows
-            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders));
+            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders, &colls));
 
         // Collect all runs: disk runs first, then in-memory remainder.
         let mut run_iters: Vec<RunIterator> = Vec::with_capacity(self.spill_runs.len() + 1);
@@ -470,7 +480,7 @@ impl SorterCursor {
                 };
                 if let Some(bi) = best_idx {
                     if let Some(best_row) = run_iters[bi].current() {
-                        if compare_sorter_rows(row, best_row, key_columns, &orders)
+                        if compare_sorter_rows(row, best_row, key_columns, &orders, &colls)
                             == Ordering::Less
                         {
                             best_idx = Some(i);
@@ -2989,20 +2999,14 @@ impl VdbeEngine {
                     // Move p3 registers from p1 to p2.
                     // To handle potential overlap correctly, we collect all source
                     // values into a temporary buffer before writing them to the destination.
-                    let p3_usize = op.p3.max(0) as usize;
-                    let mut temp = Vec::with_capacity(p3_usize);
+                    let count = usize::try_from(op.p3).unwrap_or(0);
+                    let mut temp = Vec::with_capacity(count);
 
-                    #[allow(clippy::cast_sign_loss)]
-                    for i in 0..op.p3.max(0) {
-                        let src_idx = (op.p1 + i) as usize;
-                        if src_idx < self.registers.len() {
-                            temp.push(std::mem::replace(
-                                &mut self.registers[src_idx],
-                                SqliteValue::Null,
-                            ));
-                        } else {
-                            temp.push(SqliteValue::Null);
-                        }
+                    for offset in 0..count {
+                        let value = Self::reg_with_offset(op.p1, offset)
+                            .map(|reg| self.take_reg(reg))
+                            .unwrap_or(SqliteValue::Null);
+                        temp.push(value);
                     }
 
                     for (i, val) in temp.into_iter().enumerate() {
@@ -3034,11 +3038,7 @@ impl VdbeEngine {
                 // ── Result Row ──────────────────────────────────────────
                 Opcode::ResultRow => {
                     // Output p2 registers starting at p1.
-                    let start = op.p1.max(0) as usize;
-                    let count = op.p2.max(0) as usize;
-                    let row: Vec<SqliteValue> = (start..start + count)
-                        .map(|r| self.get_reg(r as i32).clone())
-                        .collect();
+                    let row = self.collect_reg_range(op.p1, usize::try_from(op.p2).unwrap_or(0));
                     self.results.push(row);
                     pc += 1;
                 }
@@ -3509,11 +3509,9 @@ impl VdbeEngine {
                         None
                     };
                     if let Some(root_pgno) = root_pgno {
-                        let store =
-                            MemPageStore::with_empty_index(root_pgno, AUTOINDEX_PAGE_SIZE);
+                        let store = MemPageStore::with_empty_index(root_pgno, AUTOINDEX_PAGE_SIZE);
                         let cx = Cx::new();
-                        let cursor =
-                            BtCursor::new(store, root_pgno, AUTOINDEX_PAGE_SIZE, false);
+                        let cursor = BtCursor::new(store, root_pgno, AUTOINDEX_PAGE_SIZE, false);
                         self.cursors.remove(&cursor_id);
                         self.storage_cursors.insert(
                             cursor_id,
@@ -3546,22 +3544,48 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     self.pending_next_after_delete.remove(&cursor_id);
                     let key_columns = usize::try_from(op.p2.max(1)).unwrap_or(1);
-                    let sort_key_orders = match &op.p4 {
-                        P4::Str(order) => order
-                            .chars()
+                    // P4::Str format: ORDER_CHARS or ORDER_CHARS|COLL1,COLL2,...
+                    // where ORDER_CHARS are '+'/'-' per key column,
+                    // and COLL values are collation names (empty = BINARY).
+                    let (order_str, collation_str) = match &op.p4 {
+                        P4::Str(s) => {
+                            if let Some((orders, colls)) = s.split_once('|') {
+                                (orders.to_owned(), Some(colls.to_owned()))
+                            } else {
+                                (s.clone(), None)
+                            }
+                        }
+                        _ => (String::new(), None),
+                    };
+                    let sort_key_orders: Vec<SortKeyOrder> = order_str
+                        .chars()
+                        .take(key_columns)
+                        .map(|ch| {
+                            if ch == '-' {
+                                SortKeyOrder::Desc
+                            } else {
+                                SortKeyOrder::Asc
+                            }
+                        })
+                        .collect();
+                    let collations: Vec<Option<String>> = if let Some(cs) = collation_str {
+                        cs.split(',')
                             .take(key_columns)
-                            .map(|ch| {
-                                if ch == '-' {
-                                    SortKeyOrder::Desc
+                            .map(|c| {
+                                if c.is_empty() {
+                                    None
                                 } else {
-                                    SortKeyOrder::Asc
+                                    Some(c.to_owned())
                                 }
                             })
-                            .collect(),
-                        _ => vec![SortKeyOrder::Asc; key_columns],
+                            .collect()
+                    } else {
+                        Vec::new()
                     };
-                    self.sorters
-                        .insert(cursor_id, SorterCursor::new(key_columns, sort_key_orders));
+                    self.sorters.insert(
+                        cursor_id,
+                        SorterCursor::new(key_columns, sort_key_orders, collations),
+                    );
                     // A cursor id cannot be both table and sorter cursor.
                     self.cursors.remove(&cursor_id);
                     self.storage_cursors.remove(&cursor_id);
@@ -3983,9 +4007,7 @@ impl VdbeEngine {
                                 cursor.cursor.index_move_to(&cursor.cx, &key_bytes)?;
 
                             match op.opcode {
-                                Opcode::SeekGE => {
-                                    !cursor.cursor.eof()
-                                }
+                                Opcode::SeekGE => !cursor.cursor.eof(),
                                 Opcode::SeekGT => {
                                     if seek_result.is_found() {
                                         cursor.cursor.next(&cursor.cx)?
@@ -4699,7 +4721,12 @@ impl VdbeEngine {
                         if let Some(pos) = sorter.position {
                             if let Some(current) = sorter.rows.get(pos) {
                                 let probe = decode_record(self.get_reg(op.p3))?;
-                                !sorter_keys_equal(current, &probe, sorter.key_columns)
+                                !sorter_keys_equal(
+                                    current,
+                                    &probe,
+                                    sorter.key_columns,
+                                    &sorter.collations,
+                                )
                             } else {
                                 true
                             }
@@ -4748,15 +4775,9 @@ impl VdbeEngine {
                 // ── Record building (SQLite record format) ──────────────
                 Opcode::MakeRecord => {
                     // Build a record from registers p1..p1+p2-1 into register p3.
-                    #[allow(clippy::cast_sign_loss)]
-                    let s = op.p1 as usize;
-                    #[allow(clippy::cast_sign_loss)]
-                    let c = op.p2 as usize;
                     let target = op.p3;
-                    if s + c > self.registers.len() {
-                        self.registers.resize(s + c, SqliteValue::Null);
-                    }
-                    let blob = encode_record(&self.registers[s..s + c]);
+                    let values = self.collect_reg_range(op.p1, usize::try_from(op.p2).unwrap_or(0));
+                    let blob = encode_record(&values);
                     self.set_reg(target, SqliteValue::Blob(blob));
                     pc += 1;
                 }
@@ -5220,7 +5241,7 @@ impl VdbeEngine {
                         probe_fields.len()
                     };
 
-                    let cmp = compare_sorter_keys(&cursor_fields, &probe_fields, n_compare);
+                    let cmp = compare_sorter_keys(&cursor_fields, &probe_fields, n_compare, &[]);
 
                     let condition_met = match op.opcode {
                         Opcode::IdxLE => cmp != Ordering::Greater,
@@ -5563,12 +5584,8 @@ impl VdbeEngine {
                             ))
                         })?;
 
-                    #[allow(clippy::cast_sign_loss)]
-                    let s = first_arg_reg as usize;
-                    if s + arg_count > self.registers.len() {
-                        self.registers.resize(s + arg_count, SqliteValue::Null);
-                    }
-                    let result = func.invoke(&self.registers[s..s + arg_count])?;
+                    let args = self.collect_reg_range(first_arg_reg, arg_count);
+                    let result = func.invoke(&args)?;
 
                     if self.trace_opcodes {
                         let result_type = match &result {
@@ -6191,9 +6208,35 @@ impl VdbeEngine {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
-    #[allow(clippy::cast_sign_loss)]
     fn get_reg(&self, r: i32) -> &SqliteValue {
-        self.registers.get(r as usize).unwrap_or(&SqliteValue::Null)
+        usize::try_from(r)
+            .ok()
+            .and_then(|idx| self.registers.get(idx))
+            .unwrap_or(&SqliteValue::Null)
+    }
+
+    fn reg_with_offset(start: i32, offset: usize) -> Option<i32> {
+        i32::try_from(offset)
+            .ok()
+            .and_then(|delta| start.checked_add(delta))
+    }
+
+    fn collect_reg_range(&self, start: i32, count: usize) -> Vec<SqliteValue> {
+        (0..count)
+            .map(|offset| {
+                Self::reg_with_offset(start, offset)
+                    .map_or(SqliteValue::Null, |reg| self.get_reg(reg).clone())
+            })
+            .collect()
+    }
+
+    fn take_reg(&mut self, r: i32) -> SqliteValue {
+        usize::try_from(r)
+            .ok()
+            .and_then(|idx| self.registers.get_mut(idx))
+            .map_or(SqliteValue::Null, |slot| {
+                std::mem::replace(slot, SqliteValue::Null)
+            })
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -6384,8 +6427,7 @@ impl VdbeEngine {
                 }
             };
             let hdr_offset = header_offset_for_page(root_pgno);
-            let parsed_header =
-                BtreePageHeader::parse(&page_data, hdr_offset).ok();
+            let parsed_header = BtreePageHeader::parse(&page_data, hdr_offset).ok();
             // A page is a valid B-tree if the header parses successfully.
             // Legacy fallback: synthetic test pages with non-zero first byte
             // but unparseable header are also accepted, but we infer
@@ -6874,11 +6916,21 @@ fn decode_record(val: &SqliteValue) -> Result<Vec<SqliteValue>> {
     parse_record(bytes).ok_or_else(|| FrankenError::internal("malformed SQLite record blob"))
 }
 
-fn sorter_keys_equal(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: usize) -> bool {
-    compare_sorter_keys(lhs, rhs, key_columns) == Ordering::Equal
+fn sorter_keys_equal(
+    lhs: &[SqliteValue],
+    rhs: &[SqliteValue],
+    key_columns: usize,
+    collations: &[Option<String>],
+) -> bool {
+    compare_sorter_keys(lhs, rhs, key_columns, collations) == Ordering::Equal
 }
 
-fn compare_sorter_keys(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: usize) -> Ordering {
+fn compare_sorter_keys(
+    lhs: &[SqliteValue],
+    rhs: &[SqliteValue],
+    key_columns: usize,
+    collations: &[Option<String>],
+) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
         let Some(lhs_value) = lhs.get(idx) else {
@@ -6892,7 +6944,8 @@ fn compare_sorter_keys(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: us
             return Ordering::Greater;
         };
 
-        match lhs_value.partial_cmp(rhs_value).unwrap_or(Ordering::Equal) {
+        let coll = collations.get(idx).and_then(|c| c.as_deref());
+        match cmp_values_collated(lhs_value, rhs_value, coll) {
             Ordering::Equal => {}
             non_equal => return non_equal,
         }
@@ -6900,11 +6953,28 @@ fn compare_sorter_keys(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: us
     Ordering::Equal
 }
 
+/// Compare two `SqliteValue`s with an optional collation sequence.
+/// When `collation` is `Some("NOCASE")`, text values are compared
+/// case-insensitively.
+fn cmp_values_collated(
+    lhs: &SqliteValue,
+    rhs: &SqliteValue,
+    collation: Option<&str>,
+) -> Ordering {
+    if let (Some(coll), SqliteValue::Text(lt), SqliteValue::Text(rt)) = (collation, lhs, rhs) {
+        if coll.eq_ignore_ascii_case("NOCASE") {
+            return lt.to_ascii_lowercase().cmp(&rt.to_ascii_lowercase());
+        }
+    }
+    lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
+}
+
 fn compare_sorter_rows(
     lhs: &[SqliteValue],
     rhs: &[SqliteValue],
     key_columns: usize,
     sort_key_orders: &[SortKeyOrder],
+    collations: &[Option<String>],
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
@@ -6930,7 +7000,8 @@ fn compare_sorter_rows(
             };
         };
 
-        let mut ord = lhs_value.partial_cmp(rhs_value).unwrap_or(Ordering::Equal);
+        let coll = collations.get(idx).and_then(|c| c.as_deref());
+        let mut ord = cmp_values_collated(lhs_value, rhs_value, coll);
         if ord == Ordering::Equal {
             continue;
         }
@@ -7395,8 +7466,11 @@ fn char_to_affinity(ch: char) -> fsqlite_types::TypeAffinity {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::ProgramBuilder;
+    use fsqlite_func::{FunctionRegistry, register_builtins};
     use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 
     /// Build and execute a program, returning results.
@@ -7420,6 +7494,22 @@ mod tests {
         let prog = b.finish().expect("program should build");
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.set_bindings(bindings);
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        engine.take_results()
+    }
+
+    /// Build and execute a program with the builtin function registry attached.
+    fn run_program_with_functions(
+        build: impl FnOnce(&mut ProgramBuilder),
+    ) -> Vec<Vec<SqliteValue>> {
+        let mut b = ProgramBuilder::new();
+        build(&mut b);
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        engine.set_function_registry(Arc::new(registry));
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         engine.take_results()
@@ -10476,6 +10566,80 @@ mod tests {
     }
 
     #[test]
+    fn test_make_record_negative_source_register_stays_null() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_record = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 777, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, -1, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_record, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        let decoded = decode_record(&rows[0][0]).expect("record should decode");
+        assert_eq!(decoded, vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn test_function_negative_argument_register_stays_null() {
+        let rows = run_program_with_functions(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 777, 0, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::Function,
+                0,
+                -1,
+                r_out,
+                P4::FuncName("typeof".to_owned()),
+                1,
+            );
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Text("null".to_owned())]]);
+    }
+
+    #[test]
+    fn test_result_row_negative_start_register_stays_null() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            b.emit_op(Opcode::Integer, 777, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, -1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Null]]);
+    }
+
+    #[test]
+    fn test_move_negative_source_register_stays_null() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_dest = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 777, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Move, -1, r_dest, 1, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_dest, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Null]]);
+    }
+
+    #[test]
     fn test_complex_expression_chain() {
         // Test: ((10 + 20) * 3 - 5) / 2 = (90 - 5) / 2 = 85 / 2 = 42
         let rows = run_program(|b| {
@@ -11950,7 +12114,7 @@ mod tests {
         // correct sorted output.
 
         // Build the sorter cursor directly to test spill logic.
-        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
         // Set threshold to 1 byte to force immediate spill on first insert.
         sorter.spill_threshold = 1;
 
@@ -11995,7 +12159,7 @@ mod tests {
     #[test]
     fn test_sorter_reset_cleans_spill_state() {
         // Verify that reset() clears in-memory rows, position, and spill runs.
-        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
         sorter.spill_threshold = 1;
 
         for value in [3i64, 1, 2] {
@@ -12017,7 +12181,7 @@ mod tests {
     fn test_sorter_desc_key_order_with_external_merge() {
         // Verify that DESC sort order works correctly through the external
         // merge path.
-        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Desc]);
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Desc], Vec::new());
         sorter.spill_threshold = 1;
 
         for value in [10i64, 50, 30, 20, 40] {
@@ -12035,7 +12199,7 @@ mod tests {
     #[test]
     fn test_sorter_multi_column_key_with_mixed_order() {
         // Test sorting with 2 key columns: first ASC, second DESC.
-        let mut sorter = SorterCursor::new(2, vec![SortKeyOrder::Asc, SortKeyOrder::Desc]);
+        let mut sorter = SorterCursor::new(2, vec![SortKeyOrder::Asc, SortKeyOrder::Desc], Vec::new());
 
         // Insert rows: (group, value)
         for (group, value) in [(1i64, 30i64), (2, 10), (1, 20), (2, 40), (1, 10)] {
@@ -12062,7 +12226,7 @@ mod tests {
     #[test]
     fn test_sorter_memory_estimation() {
         // Verify memory tracking increases with row insertions.
-        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
         assert_eq!(sorter.memory_used, 0);
 
         sorter
@@ -12084,7 +12248,7 @@ mod tests {
     #[test]
     fn test_sorter_empty_sort() {
         // Sorting an empty sorter should succeed and leave rows empty.
-        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
         sorter.sort().expect("empty sort should succeed");
         assert!(sorter.rows.is_empty());
     }
@@ -12092,7 +12256,7 @@ mod tests {
     #[test]
     fn test_sorter_pure_inmemory_sort_path() {
         // Verify the fast in-memory path works when no spill occurs.
-        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
         // Default threshold is 100 MiB — won't spill.
 
         for value in [5i64, 3, 1, 4, 2] {

@@ -25,7 +25,7 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
 
     // Read the header size.
     let (header_size_u64, hdr_varint_len) = read_varint(data)?;
-    let header_size = header_size_u64 as usize;
+    let header_size = usize::try_from(header_size_u64).unwrap_or(usize::MAX);
 
     if header_size > data.len() || header_size < hdr_varint_len {
         return None;
@@ -45,15 +45,18 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
     let mut values = Vec::with_capacity(serial_types.len());
 
     for &st in &serial_types {
-        let value_len = serial_type_len(st)? as usize;
-        if body_offset + value_len > data.len() {
+        let value_len_u64 = serial_type_len(st)?;
+        let value_len = usize::try_from(value_len_u64).unwrap_or(usize::MAX);
+        
+        let end_offset = body_offset.checked_add(value_len);
+        if end_offset.is_none() || end_offset.unwrap() > data.len() {
             return None;
         }
 
-        let value_bytes = &data[body_offset..body_offset + value_len];
+        let value_bytes = &data[body_offset..end_offset.unwrap()];
         let value = decode_value(st, value_bytes)?;
         values.push(value);
-        body_offset += value_len;
+        body_offset = end_offset.unwrap();
     }
 
     Some(values)

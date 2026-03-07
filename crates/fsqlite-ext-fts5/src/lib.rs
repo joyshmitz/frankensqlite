@@ -394,7 +394,7 @@ fn step1b_fixup(s: &mut String) {
         let bytes = s.as_bytes();
         let last = bytes[bytes.len() - 1];
         let prev = bytes[bytes.len() - 2];
-        if last == prev && !matches!(last, b'l' | b's' | b'z') {
+        if last == prev && last.is_ascii_lowercase() && !matches!(last, b'l' | b's' | b'z') {
             s.pop();
         }
     }

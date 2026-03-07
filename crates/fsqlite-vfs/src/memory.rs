@@ -226,18 +226,19 @@ impl MemoryFile {
 
         let info = {
             let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
-            Arc::clone(
+            let info_arc = Arc::clone(
                 inner
                     .shm
                     .entry(self.shm_path.clone())
                     .or_insert_with(|| Arc::new(Mutex::new(MemoryShmInfo::new()))),
-            )
+            );
+            
+            {
+                let mut guard = info_arc.lock().map_err(|_| lock_err())?;
+                *guard.owner_refs.entry(self.shm_owner_id).or_insert(0) += 1;
+            }
+            info_arc
         };
-
-        {
-            let mut guard = info.lock().map_err(|_| lock_err())?;
-            *guard.owner_refs.entry(self.shm_owner_id).or_insert(0) += 1;
-        }
 
         self.shm_info = Some(Arc::clone(&info));
         Ok(info)
@@ -248,6 +249,7 @@ impl MemoryFile {
             return Ok(());
         };
 
+        let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
         let orphaned = {
             let mut info = info_arc.lock().map_err(|_| lock_err())?;
 
@@ -270,7 +272,6 @@ impl MemoryFile {
         };
 
         if orphaned {
-            let mut inner = self.vfs.lock().map_err(|_| lock_err())?;
             inner.shm.remove(&self.shm_path);
         }
 

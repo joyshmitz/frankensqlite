@@ -911,7 +911,10 @@ impl Parser {
             None
         };
         let columns = if self.check(&TokenKind::LeftParen)
-            && !matches!(self.peek_nth(1), TokenKind::KwSelect | TokenKind::KwWith)
+            && !matches!(
+                self.peek_nth(1),
+                TokenKind::KwSelect | TokenKind::KwWith | TokenKind::KwValues
+            )
         {
             self.advance();
             let cols = self.parse_comma_sep(Self::parse_identifier)?;
@@ -2034,10 +2037,13 @@ pub fn parse_first_statement_with_tail(
             .tokens
             .get(parser.pos.saturating_sub(1))
             .map_or(sql.len(), |token| token.span.end as usize)
+    } else if parser.at_eof() {
+        sql.len()
     } else {
-        parser
-            .current()
-            .map_or(sql.len(), |token| token.span.start as usize)
+        return Err(ParseError::at(
+            "unexpected token after end of statement; expected ';' separator",
+            parser.current(),
+        ));
     };
 
     Ok(Some((statement, tail_offset)))
@@ -2213,6 +2219,30 @@ mod tests {
             parser.depth,
             MAX_PARSE_DEPTH - 1,
             "depth must remain stable across repeated recursion-limit errors"
+        );
+    }
+
+    #[test]
+    fn test_parse_first_statement_with_tail_consumes_full_trigger_body() {
+        let sql = "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES('first'); INSERT INTO audit VALUES('second'); END; SELECT 1;";
+        let Some((statement, tail_offset)) =
+            parse_first_statement_with_tail(sql).expect("trigger statement should parse")
+        else {
+            panic!("expected a trigger statement");
+        };
+
+        assert!(matches!(statement, Statement::CreateTrigger(_)));
+        assert_eq!(&sql[tail_offset..], " SELECT 1;");
+    }
+
+    #[test]
+    fn test_parse_first_statement_with_tail_rejects_adjacent_statements_without_separator() {
+        let error = parse_first_statement_with_tail("SELECT 1 SELECT 2")
+            .expect_err("adjacent statements without a semicolon must be rejected");
+
+        assert!(
+            error.message.contains("expected ';' separator"),
+            "unexpected error: {error:?}"
         );
     }
 

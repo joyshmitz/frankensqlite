@@ -35,6 +35,11 @@ pub enum VectorizedScanError {
         payload_len: usize,
     },
     SelectionIndexOverflow(usize),
+    SelectionIndexOutOfBounds {
+        column: String,
+        row_idx: usize,
+        row_count: usize,
+    },
     OffsetOutOfBounds {
         column: String,
         row_idx: usize,
@@ -69,6 +74,15 @@ impl fmt::Display for VectorizedScanError {
             Self::SelectionIndexOverflow(idx) => write!(
                 f,
                 "selection index {idx} does not fit into u16 selection vector entry"
+            ),
+            Self::SelectionIndexOutOfBounds {
+                column,
+                row_idx,
+                row_count,
+            } => write!(
+                f,
+                "selection index {row_idx} is out of bounds for column {column} \
+                 (row_count={row_count})"
             ),
             Self::OffsetOutOfBounds {
                 column,
@@ -369,6 +383,14 @@ pub fn materialize_selected_rows(batch: &Batch) -> ScanResult<Vec<Vec<SqliteValu
 }
 
 fn column_value_at(column: &Column, row_idx: usize) -> ScanResult<SqliteValue> {
+    if row_idx >= column.len() {
+        return Err(VectorizedScanError::SelectionIndexOutOfBounds {
+            column: column.spec.name.clone(),
+            row_idx,
+            row_count: column.len(),
+        });
+    }
+
     if !column.validity.is_valid(row_idx) {
         return Ok(SqliteValue::Null);
     }
@@ -754,5 +776,27 @@ mod tests {
             !hinted_pages.is_empty(),
             "bead_id={BEAD_ID} expected page-reader prefetch hints"
         );
+    }
+
+    #[test]
+    fn column_value_at_reports_out_of_bounds_selection_index() {
+        let column = Column {
+            spec: ColumnSpec::new("c0", ColumnVectorType::Int64),
+            data: ColumnData::Int64(
+                crate::vectorized::AlignedValues::from_vec(vec![7_i64], 8)
+                    .expect("aligned values should build"),
+            ),
+            validity: crate::vectorized::NullBitmap::all_valid(1),
+        };
+
+        let err = column_value_at(&column, 3).expect_err("out-of-bounds row index should error");
+        assert!(matches!(
+            err,
+            VectorizedScanError::SelectionIndexOutOfBounds {
+                column,
+                row_idx: 3,
+                row_count: 1,
+            } if column == "c0"
+        ));
     }
 }

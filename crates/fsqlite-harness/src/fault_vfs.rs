@@ -523,7 +523,7 @@ impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
         cx: &Cx,
         path: Option<&Path>,
         flags: VfsOpenFlags,
-    ) -> Result<(Self::File, VfsOpenFlags)> {
+    ) -> Result<(<Self as Vfs>::File, VfsOpenFlags)> {
         self.check_power()?;
         let (inner_file, out_flags) = self.inner.open(cx, path, flags)?;
         let file_path = self.resolve_open_path(path);

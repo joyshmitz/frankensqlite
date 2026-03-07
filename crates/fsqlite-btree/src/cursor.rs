@@ -2646,6 +2646,49 @@ mod tests {
         page
     }
 
+    /// Helper: build an interior index page.
+    ///
+    /// `children` is a list of `(left_child, key)` pairs plus a final right_child.
+    fn build_interior_index(children: &[(PageNumber, &[u8])], right_child: PageNumber) -> Vec<u8> {
+        let mut page = vec![0u8; USABLE as usize];
+        let header_size = 12usize; // interior
+
+        let mut cell_end = USABLE as usize;
+        let mut cell_offsets: Vec<u16> = Vec::new();
+
+        for &(left_child, key) in children {
+            // Interior index cell: [left_child: u32 BE] [payload_size varint] [payload]
+            let mut cell = Vec::new();
+            cell.extend_from_slice(&left_child.get().to_be_bytes());
+            let mut vbuf = [0u8; 9];
+            let n = write_varint(&mut vbuf, key.len() as u64);
+            cell.extend_from_slice(&vbuf[..n]);
+            cell.extend_from_slice(key);
+
+            cell_end -= cell.len();
+            page[cell_end..cell_end + cell.len()].copy_from_slice(&cell);
+            cell_offsets.push(cell_end as u16);
+        }
+
+        page[0] = 0x02; // InteriorIndex
+        page[1..3].copy_from_slice(&0u16.to_be_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        let cell_count = children.len() as u16;
+        page[3..5].copy_from_slice(&cell_count.to_be_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        let content_offset = cell_end as u16;
+        page[5..7].copy_from_slice(&content_offset.to_be_bytes());
+        page[7] = 0;
+        page[8..12].copy_from_slice(&right_child.get().to_be_bytes());
+
+        for (i, &off) in cell_offsets.iter().enumerate() {
+            let ptr_offset = header_size + i * 2;
+            page[ptr_offset..ptr_offset + 2].copy_from_slice(&off.to_be_bytes());
+        }
+
+        page
+    }
+
     /// Helper: build a leaf index page with sorted key payloads.
     fn build_leaf_index(entries: &[&[u8]]) -> Vec<u8> {
         let mut page = vec![0u8; USABLE as usize];
@@ -2931,6 +2974,71 @@ mod tests {
 
         assert!(cursor.index_move_to(&cx, b"banana").unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), b"banana");
+    }
+
+    #[test]
+    fn test_cursor_index_next_visits_interior_separator_cells() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
+        store.pages.insert(3, build_leaf_index(&[b"a"]));
+        store.pages.insert(4, build_leaf_index(&[b"c"]));
+        store.pages.insert(5, build_leaf_index(&[b"e"]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        assert!(cursor.first(&cx).unwrap());
+        let mut seen = vec![cursor.payload(&cx).unwrap()];
+        while cursor.next(&cx).unwrap() {
+            seen.push(cursor.payload(&cx).unwrap());
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+            ]
+        );
+        assert!(cursor.eof());
+    }
+
+    #[test]
+    fn test_cursor_index_prev_visits_interior_separator_cells() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
+        store.pages.insert(3, build_leaf_index(&[b"a"]));
+        store.pages.insert(4, build_leaf_index(&[b"c"]));
+        store.pages.insert(5, build_leaf_index(&[b"e"]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        assert!(cursor.last(&cx).unwrap());
+        let mut seen = vec![cursor.payload(&cx).unwrap()];
+        while cursor.prev(&cx).unwrap() {
+            seen.push(cursor.payload(&cx).unwrap());
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                b"e".to_vec(),
+                b"d".to_vec(),
+                b"c".to_vec(),
+                b"b".to_vec(),
+                b"a".to_vec(),
+            ]
+        );
     }
 
     #[test]

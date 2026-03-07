@@ -1679,12 +1679,39 @@ fn codegen_select_distinct_scan(
 
     // Open sorter with all output columns as sort keys (ascending).
     let sort_order: String = "+".repeat(num_data_cols);
+    // Build per-column collation info for DISTINCT comparison.
+    let sort_collations: Vec<String> = columns
+        .iter()
+        .map(|col| {
+            if let ResultColumn::Expr { expr, .. } = col {
+                // Explicit COLLATE on the expression takes priority.
+                if let Some(coll) = extract_collation(expr) {
+                    return coll.to_owned();
+                }
+                // Inherit column-level collation from table schema.
+                if let Expr::Column(cr, _) = expr {
+                    if let Some(idx) = table.column_index(&cr.column) {
+                        if let Some(coll) = table.columns.get(idx).and_then(|c| c.collation.as_deref()) {
+                            return coll.to_owned();
+                        }
+                    }
+                }
+            }
+            String::new()
+        })
+        .collect();
+    let has_collation = sort_collations.iter().any(|c| !c.is_empty());
+    let p4_str = if has_collation {
+        format!("{sort_order}|{}", sort_collations.join(","))
+    } else {
+        sort_order
+    };
     b.emit_op(
         Opcode::SorterOpen,
         sorter_cursor,
         out_col_count,
         0,
-        P4::Str(sort_order),
+        P4::Str(p4_str),
         0,
     );
 
@@ -1813,7 +1840,7 @@ fn codegen_select_distinct_scan(
         );
     }
 
-    // DISTINCT: pack output into a record and compare with previous row.
+    // DISTINCT: pack output into a record for tracking previous row.
     b.emit_op(
         Opcode::MakeRecord,
         out_regs,
@@ -1823,8 +1850,21 @@ fn codegen_select_distinct_scan(
         0,
     );
 
-    // If current record equals previous, skip (duplicate).
-    b.emit_jump_to_label(Opcode::Eq, prev_rec, cur_rec, dup_skip, P4::None, 0);
+    // Use SorterCompare for collation-aware dedup: compares current sorter
+    // row with prev_rec using the sorter's per-column collation info.
+    // Jumps to not_dup when keys differ (not a duplicate).
+    let not_dup = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SorterCompare,
+        sorter_cursor,
+        prev_rec,
+        not_dup,
+        P4::None,
+        0,
+    );
+    // Fall through = keys equal = duplicate, skip to dup_skip.
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, dup_skip, P4::None, 0);
+    b.resolve_label(not_dup);
 
     // Update previous record to current for next comparison.
     b.emit_op(Opcode::Copy, cur_rec, prev_rec, 0, P4::None, 0);
@@ -1955,7 +1995,7 @@ fn codegen_select_ordered_scan(
     // Sorter cursor is separate from the table cursor.
     let sorter_cursor = cursor + 1;
 
-    // Open sorter: p2 = number of key columns, p4 = sort order string.
+    // Open sorter: p2 = number of key columns, p4 = sort order + collation.
     let sort_order: String = order_by
         .iter()
         .map(|term| {
@@ -1966,13 +2006,37 @@ fn codegen_select_ordered_scan(
             }
         })
         .collect();
+    // Build per-key collation info from the resolved sort keys.
+    let sort_collations: Vec<String> = sort_keys
+        .iter()
+        .zip(order_by.iter())
+        .map(|(sk, term)| {
+            // Explicit COLLATE on the ORDER BY term takes priority.
+            if let fsqlite_ast::Expr::Collate { collation, .. } = &term.expr {
+                return collation.clone();
+            }
+            // Otherwise, inherit the column's declared collation.
+            if let SortKeySource::Column(idx) = sk {
+                if let Some(coll) = table.columns.get(*idx).and_then(|c| c.collation.as_deref()) {
+                    return coll.to_owned();
+                }
+            }
+            String::new()
+        })
+        .collect();
+    let has_collation = sort_collations.iter().any(|c| !c.is_empty());
+    let p4_str = if has_collation {
+        format!("{sort_order}|{}", sort_collations.join(","))
+    } else {
+        sort_order
+    };
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     b.emit_op(
         Opcode::SorterOpen,
         sorter_cursor,
         num_sort_keys as i32,
         0,
-        P4::Str(sort_order),
+        P4::Str(p4_str),
         0,
     );
 
@@ -9533,6 +9597,11 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// Extract explicit COLLATE from an ORDER BY term's expression.
+fn extract_collation_from_ordering_term(term: &OrderingTerm) -> Option<&str> {
+    extract_collation(&term.expr)
+}
+
 /// Get the column-level collation for an expression from the table schema.
 /// Only checks schema-declared collation (e.g. `TEXT COLLATE NOCASE`), NOT
 /// explicit COLLATE wrappers on the expression — use `extract_collation` for that.
@@ -10888,7 +10957,8 @@ mod tests {
 
         // DISTINCT scan uses sorter: SorterOpen, Rewind/Next scan,
         // SorterInsert, SorterSort, SorterData, MakeRecord (for dedup),
-        // Eq (compare), Copy (update prev), ResultRow, SorterNext.
+        // SorterCompare + Goto (collation-aware dedup), Copy (update prev),
+        // ResultRow, SorterNext.
         assert!(has_opcodes(
             &prog,
             &[
@@ -10908,7 +10978,8 @@ mod tests {
                 Opcode::Column,
                 Opcode::Column,
                 Opcode::MakeRecord,
-                Opcode::Eq,
+                Opcode::SorterCompare,
+                Opcode::Goto,
                 Opcode::Copy,
                 Opcode::ResultRow,
                 Opcode::SorterNext,
@@ -10944,18 +11015,18 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        let eq_pos = prog
+        let cmp_pos = prog
             .ops()
             .iter()
-            .position(|op| op.opcode == Opcode::Eq)
-            .expect("missing DISTINCT Eq opcode");
+            .position(|op| op.opcode == Opcode::SorterCompare)
+            .expect("missing DISTINCT SorterCompare opcode");
         let ifpos_pos = prog
             .ops()
             .iter()
             .position(|op| op.opcode == Opcode::IfPos)
             .expect("missing OFFSET IfPos opcode");
         assert!(
-            eq_pos < ifpos_pos,
+            cmp_pos < ifpos_pos,
             "DISTINCT dedup must run before OFFSET filtering"
         );
         assert!(
@@ -10996,7 +11067,8 @@ mod tests {
 
         // ORDER BY + DISTINCT: uses ordered scan with dedup.
         // Should include SorterOpen, Rewind scan, SorterInsert, SorterSort,
-        // then SorterData + Column reads + MakeRecord + Eq + Copy + ResultRow.
+        // then SorterData + Column reads + MakeRecord + SorterCompare + Goto
+        // + Copy + ResultRow.
         assert!(has_opcodes(
             &prog,
             &[
@@ -11009,7 +11081,8 @@ mod tests {
                 Opcode::SorterSort,
                 Opcode::SorterData,
                 Opcode::MakeRecord,
-                Opcode::Eq,
+                Opcode::SorterCompare,
+                Opcode::Goto,
                 Opcode::Copy,
                 Opcode::ResultRow,
                 Opcode::SorterNext,
@@ -11049,18 +11122,18 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        let eq_pos = prog
+        let cmp_pos = prog
             .ops()
             .iter()
-            .position(|op| op.opcode == Opcode::Eq)
-            .expect("missing DISTINCT Eq opcode");
+            .position(|op| op.opcode == Opcode::SorterCompare)
+            .expect("missing DISTINCT SorterCompare opcode");
         let ifpos_pos = prog
             .ops()
             .iter()
             .position(|op| op.opcode == Opcode::IfPos)
             .expect("missing OFFSET IfPos opcode");
         assert!(
-            eq_pos < ifpos_pos,
+            cmp_pos < ifpos_pos,
             "DISTINCT dedup must run before OFFSET filtering"
         );
         assert!(

@@ -299,14 +299,35 @@ impl BtreeCursorOps for MockBtreeCursor {
     }
 
     fn index_insert(&mut self, _cx: &Cx, key: &[u8]) -> Result<()> {
-        let next_rowid = self.entries.last().map_or(1, |e| e.0 + 1);
-        self.entries.push((next_rowid, key.to_vec()));
+        let next_rowid = self.entries.iter().map(|e| e.0).max().unwrap_or(0) + 1;
+        let pos = self
+            .entries
+            .binary_search_by(|e| e.1.as_slice().cmp(key))
+            .unwrap_or_else(|e| e);
+        // Replace if exists, otherwise insert
+        if pos < self.entries.len() && self.entries[pos].1 == key {
+            self.entries[pos] = (next_rowid, key.to_vec());
+        } else {
+            self.entries.insert(pos, (next_rowid, key.to_vec()));
+        }
+        self.current_rowid = next_rowid;
+        self.pos = pos;
+        self.at_eof = false;
         Ok(())
     }
 
     fn table_insert(&mut self, _cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
-        self.entries.push((rowid, data.to_vec()));
+        let pos = self
+            .entries
+            .binary_search_by_key(&rowid, |e| e.0)
+            .unwrap_or_else(|e| e);
+        if pos < self.entries.len() && self.entries[pos].0 == rowid {
+            self.entries[pos] = (rowid, data.to_vec());
+        } else {
+            self.entries.insert(pos, (rowid, data.to_vec()));
+        }
         self.current_rowid = rowid;
+        self.pos = pos;
         self.at_eof = false;
         Ok(())
     }

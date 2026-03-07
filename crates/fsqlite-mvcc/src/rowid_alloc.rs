@@ -162,8 +162,8 @@ impl RangeReservation {
 pub struct LocalRowIdCache {
     /// Current position within the reserved range.
     next: i64,
-    /// End of the reserved range (exclusive).
-    end: i64,
+    /// Number of rowids remaining in the cache.
+    remaining: u32,
     /// Table key for re-reservation.
     key: AllocatorKey,
 }
@@ -174,7 +174,7 @@ impl LocalRowIdCache {
     pub fn new(reservation: RangeReservation, key: AllocatorKey) -> Self {
         Self {
             next: reservation.start_rowid.get(),
-            end: reservation.start_rowid.get() + i64::from(reservation.count),
+            remaining: reservation.count,
             key,
         }
     }
@@ -183,9 +183,10 @@ impl LocalRowIdCache {
     ///
     /// Returns `None` if the cache is exhausted (caller should reserve a new range).
     pub fn allocate(&mut self) -> Option<RowId> {
-        if self.next < self.end {
+        if self.remaining > 0 {
             let rowid = RowId::new(self.next);
-            self.next += 1;
+            self.next = self.next.wrapping_add(1);
+            self.remaining -= 1;
             Some(rowid)
         } else {
             None
@@ -194,10 +195,8 @@ impl LocalRowIdCache {
 
     /// Number of remaining rowids in the cache.
     #[must_use]
-    pub fn remaining(&self) -> u32 {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let r = (self.end - self.next).max(0) as u32;
-        r
+    pub const fn remaining(&self) -> u32 {
+        self.remaining
     }
 
     /// The allocator key this cache is associated with.
@@ -317,7 +316,7 @@ impl ConcurrentRowIdAllocator {
 
         // Update AUTOINCREMENT high-water (last allocated rowid in range).
         if state.mode == RowIdMode::AutoIncrement {
-            let last_in_range = start + count_i64 - 1;
+            let last_in_range = start + (count_i64 - 1);
             state.autoincrement_high_water = state.autoincrement_high_water.max(last_in_range);
         }
 

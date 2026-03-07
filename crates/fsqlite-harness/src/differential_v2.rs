@@ -1627,10 +1627,7 @@ fn classify_error_category(message: &str) -> ErrorCategory {
     if contains_any(&normalized, &["busy", "busy_snapshot"]) {
         return ErrorCategory::Busy;
     }
-    if contains_any(
-        &normalized,
-        &["readonly", "read-only", "attempt to write a readonly"],
-    ) {
+    if contains_any(&normalized, &["readonly", "read-only", "attempt to write a readonly"]) {
         return ErrorCategory::ReadOnly;
     }
     if contains_any(&normalized, &["datatype mismatch", "type mismatch"]) {
@@ -1746,7 +1743,7 @@ fn row_values_match(
 fn value_match(a: &NormalizedValue, b: &NormalizedValue, rules: &CanonicalizationRules) -> bool {
     match (a, b) {
         (NormalizedValue::Null, NormalizedValue::Null) => true,
-        (NormalizedValue::Integer(x), NormalizedValue::Integer(y)) => x == y,
+        (NormalizedValue::Integer(i), NormalizedValue::Integer(j)) => i == j,
         (NormalizedValue::Real(x), NormalizedValue::Real(y)) => {
             let tol: f64 = rules.float_tolerance.parse().unwrap_or(1e-12);
             floats_match(*x, *y, tol)

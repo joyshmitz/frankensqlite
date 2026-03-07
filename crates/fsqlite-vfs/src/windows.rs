@@ -165,27 +165,19 @@ impl WindowsShmTable {
     }
 
     fn remove_if_orphaned(&self, path: &Path) -> Result<()> {
-        let state = {
-            let map = self
-                .map
-                .lock()
-                .map_err(|_| lock_poisoned("windows shm table"))?;
-            map.get(path).cloned()
-        };
-        let Some(state) = state else {
-            return Ok(());
-        };
-        let orphaned = state
+        let mut map = self
+            .map
             .lock()
-            .map_err(|_| lock_poisoned("windows shm state"))?
-            .owner_refs
-            .is_empty();
-        if orphaned {
-            let mut map = self
-                .map
+            .map_err(|_| lock_poisoned("windows shm table"))?;
+        if let Some(state) = map.get(path) {
+            let orphaned = state
                 .lock()
-                .map_err(|_| lock_poisoned("windows shm table"))?;
-            map.remove(path);
+                .map_err(|_| lock_poisoned("windows shm state"))?
+                .owner_refs
+                .is_empty();
+            if orphaned {
+                map.remove(path);
+            }
         }
         Ok(())
     }

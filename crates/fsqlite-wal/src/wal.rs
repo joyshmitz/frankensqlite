@@ -571,10 +571,16 @@ impl<F: VfsFile> WalFile<F> {
         frames_written: usize,
         new_running_checksum: SqliteWalChecksum,
     ) -> Result<()> {
-        self.frame_count = self
+        let new_count = self
             .frame_count
             .checked_add(frames_written)
             .ok_or(FrankenError::DatabaseFull)?;
+
+        if new_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+
+        self.frame_count = new_count;
         self.running_checksum = new_running_checksum;
         crate::metrics::GLOBAL_WAL_METRICS
             .set_wal_frames_current(u64::try_from(self.frame_count).unwrap_or(u64::MAX));
@@ -594,6 +600,10 @@ impl<F: VfsFile> WalFile<F> {
         page_data: &[u8],
         db_size_if_commit: u32,
     ) -> Result<()> {
+        if self.frame_count >= usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+
         if page_data.len() != self.page_size {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -1003,7 +1013,8 @@ mod tests {
 
         // Append some frames.
         for i in 0..3u8 {
-            wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), 0)
+            let db_size = if i == 2 { 3 } else { 0 };
+            wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), db_size)
                 .expect("append");
         }
         assert_eq!(wal.frame_count(), 3);
@@ -1529,8 +1540,9 @@ mod tests {
                 WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
 
             for i in 0..10u8 {
+                let page = sample_page(i);
                 let db_size = if i == 9 { 10 } else { 0 };
-                wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), db_size)
+                wal.append_frame(&cx, u32::from(i) + 1, &page, db_size)
                     .expect("append");
                 checksums.push(wal.running_checksum());
             }
@@ -1655,11 +1667,25 @@ mod tests {
         assert_eq!(wal.frame_count(), 6);
         wal.close(&cx).expect("close");
 
-        // Reopen: all 6 should survive (3 commits).
+        // Reopen and verify all frames are valid (checksum chain intact).
         let file2 = open_wal_file(&vfs, &cx);
         let mut wal2 = WalFile::open(&cx, file2).expect("reopen");
         assert_eq!(wal2.frame_count(), 6);
 
+        // Verify each frame's content.
+        for i in 0..6u32 {
+            let (header, data) = wal2
+                .read_frame(&cx, usize::try_from(i).unwrap())
+                .expect("read frame");
+            assert_eq!(header.page_number, i + 1);
+            let expected = sample_page(u8::try_from(i + 1).expect("fits"));
+            assert_eq!(data, expected);
+        }
+
+        // Last frame should be commit.
+        let last_header = wal2.read_frame_header(&cx, 5).expect("read header");
+        assert!(last_header.is_commit());
+        assert_eq!(last_header.db_size, 6);
         let last = wal2.last_commit_frame(&cx).expect("query");
         assert_eq!(last, Some(5), "last commit is frame 6 (index 5)");
 
@@ -1687,7 +1713,7 @@ mod tests {
 
         // Each frame should contain its unique version of the page.
         for v in 0..versions {
-            let (header, data) = wal.read_frame(&cx, usize::from(v)).expect("read");
+            let (header, data) = wal.read_frame(&cx, usize::from(v)).expect("read frame");
             assert_eq!(header.page_number, page_num);
             assert_eq!(data, sample_page(v), "frame {v} data mismatch");
         }
@@ -2037,6 +2063,7 @@ mod tests {
         // Also test partial-frame truncation at various byte offsets.
         for partial in 0..20usize {
             let (vfs, _) = build_two_txn_wal();
+            let cx = test_cx();
 
             let cut_byte = WAL_HEADER_SIZE + partial * frame_size / 3;
             let mut f = open_wal_file(&vfs, &cx);
@@ -2169,10 +2196,10 @@ mod tests {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let file = open_wal_file(&vfs, &cx);
+
         let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
         wal.append_frame(&cx, 1, &sample_page(1), 1)
             .expect("append");
-        // Truncate to leave partial frame.
         let partial_size = WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 10;
         wal.file_mut()
             .truncate(&cx, u64::try_from(partial_size).unwrap())

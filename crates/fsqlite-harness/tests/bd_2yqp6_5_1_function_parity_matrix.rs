@@ -19,7 +19,10 @@
     clippy::needless_pass_by_value
 )]
 
+use std::collections::BTreeSet;
+
 use fsqlite::Connection;
+use fsqlite_harness::builtin_function_parity_matrix::BuiltinFunctionParityMatrix;
 use fsqlite_types::value::SqliteValue;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -73,6 +76,62 @@ fn compare_with_tables(
     (pass, fs_val, rs_val)
 }
 
+/// Compare full rowsets for multi-column / multi-row queries.
+fn compare_query_rows(
+    fs_conn: &Connection,
+    rs_conn: &rusqlite::Connection,
+    sql: &str,
+) -> (bool, Vec<Vec<String>>, Vec<Vec<String>>) {
+    let fs_rows = match fs_conn.query(sql) {
+        Ok(rows) => rows
+            .iter()
+            .map(|row| row.values().iter().map(format_sqlite_value).collect())
+            .collect(),
+        Err(e) => vec![vec![format!("ERR:{e}")]],
+    };
+
+    let rs_rows = match rs_conn.prepare(sql) {
+        Ok(mut stmt) => {
+            let column_count = stmt.column_count();
+            match stmt.query([]) {
+                Ok(mut rows) => {
+                    let mut out = Vec::new();
+                    loop {
+                        match rows.next() {
+                            Ok(Some(row)) => {
+                                let mut values = Vec::with_capacity(column_count);
+                                for idx in 0..column_count {
+                                    match rusqlite_value_to_string(row, idx) {
+                                        Ok(v) => values.push(v),
+                                        Err(e) => {
+                                            out.clear();
+                                            out.push(vec![format!("ERR:{e}")]);
+                                            return (false, fs_rows, out);
+                                        }
+                                    }
+                                }
+                                out.push(values);
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                out.clear();
+                                out.push(vec![format!("ERR:{e}")]);
+                                break;
+                            }
+                        }
+                    }
+                    out
+                }
+                Err(e) => vec![vec![format!("ERR:{e}")]],
+            }
+        }
+        Err(e) => vec![vec![format!("ERR:{e}")]],
+    };
+
+    let pass = rows_match(&fs_rows, &rs_rows);
+    (pass, fs_rows, rs_rows)
+}
+
 fn format_sqlite_value(v: &SqliteValue) -> String {
     match v {
         SqliteValue::Null => "NULL".to_string(),
@@ -123,6 +182,20 @@ fn values_match(a: &str, b: &str) -> bool {
         return diff <= tol;
     }
     false
+}
+
+fn rows_match(left: &[Vec<String>], right: &[Vec<String>]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.iter().zip(right.iter()).all(|(lrow, rrow)| {
+        lrow.len() == rrow.len()
+            && lrow
+                .iter()
+                .zip(rrow.iter())
+                .all(|(lval, rval)| values_match(lval, rval))
+    })
 }
 
 struct CompatTest {
@@ -1057,6 +1130,210 @@ fn test_expression_edge_cases() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// ── Planner hints + random contracts ────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_probability_hint_and_random_contracts() {
+    let tests = vec![
+        CompatTest {
+            name: "likely_false",
+            sql: "SELECT likely(0)",
+        },
+        CompatTest {
+            name: "likely_true",
+            sql: "SELECT likely(1)",
+        },
+        CompatTest {
+            name: "likely_null",
+            sql: "SELECT likely(NULL)",
+        },
+        CompatTest {
+            name: "unlikely_false",
+            sql: "SELECT unlikely(0)",
+        },
+        CompatTest {
+            name: "unlikely_text",
+            sql: "SELECT unlikely('abc')",
+        },
+        CompatTest {
+            name: "random_type",
+            sql: "SELECT typeof(random())",
+        },
+        CompatTest {
+            name: "randomblob_len",
+            sql: "SELECT length(randomblob(4))",
+        },
+    ];
+
+    run_compat_suite("planner_hint_random", &tests);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// ── Stateful meta functions ─────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_stateful_meta_function_parity() {
+    let fs = open_mem();
+    let rs = open_rusqlite();
+
+    for sql in &[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)",
+        "INSERT INTO t (data) VALUES ('alpha')",
+        "INSERT INTO t (data) VALUES ('beta')",
+        "UPDATE t SET data = 'beta2' WHERE id = 2",
+    ] {
+        fs.execute(sql).unwrap();
+        rs.execute(sql, []).unwrap();
+    }
+
+    let tests = vec![
+        CompatTest {
+            name: "last_insert_rowid_after_update",
+            sql: "SELECT last_insert_rowid()",
+        },
+        CompatTest {
+            name: "changes_after_update",
+            sql: "SELECT changes()",
+        },
+        CompatTest {
+            name: "total_changes_after_update",
+            sql: "SELECT total_changes()",
+        },
+    ];
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut failures = Vec::new();
+
+    for test in &tests {
+        let (ok, fs_val, rs_val) = compare_with_tables(&fs, &rs, test.sql);
+        if ok {
+            passed += 1;
+        } else {
+            failed += 1;
+            failures.push(format!(
+                "  FAIL {}: fsqlite={} rusqlite={} sql={}",
+                test.name, fs_val, rs_val, test.sql
+            ));
+        }
+    }
+
+    let total = passed + failed;
+    println!("[stateful_meta] {passed}/{total} passed");
+    for failure in &failures {
+        println!("{failure}");
+    }
+    assert_eq!(failed, 0, "stateful meta mismatches: {failed}/{total}");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// ── Window function differential parity ────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_window_function_parity() {
+    let fs = open_mem();
+    let rs = open_rusqlite();
+
+    for sql in &[
+        "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)",
+        "INSERT INTO emp VALUES (1, 'Alice', 'eng', 120)",
+        "INSERT INTO emp VALUES (2, 'Bob', 'eng', 100)",
+        "INSERT INTO emp VALUES (3, 'Carol', 'sales', 100)",
+        "INSERT INTO emp VALUES (4, 'Dave', 'sales', 80)",
+        "INSERT INTO emp VALUES (5, 'Eve', 'hr', 110)",
+        "INSERT INTO emp VALUES (6, 'Frank', 'hr', 95)",
+    ] {
+        fs.execute(sql).unwrap();
+        rs.execute(sql, []).unwrap();
+    }
+
+    let tests = [
+        (
+            "row_number_global",
+            "SELECT name, row_number() OVER (ORDER BY salary DESC) AS rn FROM emp ORDER BY rn",
+        ),
+        (
+            "row_number_partition",
+            "SELECT name, dept, row_number() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM emp ORDER BY dept, rn",
+        ),
+        (
+            "rank_global",
+            "SELECT name, rank() OVER (ORDER BY salary DESC) AS rnk FROM emp ORDER BY rnk, name",
+        ),
+        (
+            "dense_rank_global",
+            "SELECT name, dense_rank() OVER (ORDER BY salary DESC) AS drnk FROM emp ORDER BY drnk, name",
+        ),
+        (
+            "ntile_three",
+            "SELECT name, ntile(3) OVER (ORDER BY salary DESC) AS bucket FROM emp ORDER BY salary DESC, name",
+        ),
+        (
+            "lag_defaulted",
+            "SELECT name, lag(salary, 1, -1) OVER (ORDER BY salary DESC) AS prev_sal FROM emp ORDER BY salary DESC, name",
+        ),
+        (
+            "lead_defaulted",
+            "SELECT name, lead(salary, 1, -1) OVER (ORDER BY salary DESC) AS next_sal FROM emp ORDER BY salary DESC, name",
+        ),
+        (
+            "first_value_running",
+            "SELECT name, first_value(name) OVER (ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS fv FROM emp ORDER BY salary DESC, name",
+        ),
+        (
+            "last_value_full_frame",
+            "SELECT name, last_value(name) OVER (ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv FROM emp ORDER BY salary DESC, name",
+        ),
+        (
+            "nth_value_two",
+            "SELECT name, nth_value(name, 2) OVER (ORDER BY salary DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS nv FROM emp ORDER BY salary DESC, name",
+        ),
+        (
+            "cume_dist_global",
+            "SELECT name, cume_dist() OVER (ORDER BY salary DESC) AS cd FROM emp ORDER BY salary DESC, name",
+        ),
+        (
+            "percent_rank_global",
+            "SELECT name, percent_rank() OVER (ORDER BY salary DESC) AS pr FROM emp ORDER BY salary DESC, name",
+        ),
+    ];
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut failures = Vec::new();
+    let mut observed_failure_names = BTreeSet::new();
+
+    for (name, sql) in tests {
+        let (ok, fs_rows, rs_rows) = compare_query_rows(&fs, &rs, sql);
+        if ok {
+            passed += 1;
+        } else {
+            failed += 1;
+            observed_failure_names.insert(name);
+            failures.push(format!(
+                "  FAIL {name}: fsqlite={fs_rows:?} rusqlite={rs_rows:?} sql={sql}"
+            ));
+        }
+    }
+
+    let expected_failure_names =
+        BTreeSet::from(["first_value_running", "nth_value_two", "cume_dist_global"]);
+    let total = passed + failed;
+    println!("[window_parity] {passed}/{total} passed");
+    for failure in &failures {
+        println!("{failure}");
+    }
+    assert_eq!(
+        observed_failure_names, expected_failure_names,
+        "window parity gaps changed unexpectedly"
+    );
+    assert_eq!(failed, expected_failure_names.len());
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // ── SQLite version/compile option functions ───────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════
 
@@ -1099,6 +1376,13 @@ fn test_sqlite_meta_functions() {
 
 #[test]
 fn test_parity_matrix_summary() {
+    let matrix = BuiltinFunctionParityMatrix::canonical();
+    let diagnostics = matrix.validate();
+    assert!(
+        diagnostics.is_empty(),
+        "builtin parity matrix validation failed: {diagnostics:?}"
+    );
+
     // Gather counts from all suites above for a final summary.
     // Each suite already asserts on failure, so this is just the summary report.
     let suites = [
@@ -1112,16 +1396,28 @@ fn test_parity_matrix_summary() {
         "numeric_edge",
         "aggregate_extended",
         "expression_edge",
+        "planner_hint_random",
+        "stateful_meta",
+        "window_parity",
     ];
 
     // Count: we track test counts manually since suites run independently.
-    // The precise count is: 41 + 19 + 12 + 16 + 13 + 12 + 20 + 12 + 9 + 18 = 172
-    let total_cases = 172;
+    // The precise count is:
+    //   41 + 19 + 12 + 16 + 13 + 12 + 20 + 12 + 9 + 18 + 7 + 3 + 12 = 194
+    let total_cases = 194;
+    let matrix_summary = matrix.summary();
 
     println!("\n=== bd-2yqp6.5.1: Function Parity Matrix Summary ===");
     println!("  Suites: {}", suites.len());
     println!("  Total differential test cases: {total_cases}");
-    println!("  Status: ALL PASSING (suites assert on failure)");
+    println!(
+        "  Canonical matrix rows/features: {}/{}",
+        matrix_summary.total_variants, matrix_summary.total_features
+    );
+    println!("  Recorded verification statuses:");
+    for (status, count) in &matrix_summary.variants_by_status {
+        println!("    - {status}: {count}");
+    }
     println!("  Coverage areas:");
     println!("    - DateTime functions (date/time/datetime/julianday/unixepoch/strftime)");
     println!("    - format/printf with format specifiers");
@@ -1133,4 +1429,12 @@ fn test_parity_matrix_summary() {
     println!("    - Numeric function edge cases");
     println!("    - Aggregate function edge cases");
     println!("    - Expression evaluation edge cases");
+    println!("    - likely()/unlikely() planner-hint passthrough");
+    println!("    - random()/randomblob() deterministic surface contracts");
+    println!("    - changes()/total_changes()/last_insert_rowid() stateful meta functions");
+    println!("    - Window functions (ranking, offsets, value access, distribution)");
+    println!("  Recorded differential gaps:");
+    println!("    - first_value() running-frame retention");
+    println!("    - nth_value() full-frame positional stability");
+    println!("    - cume_dist() peer-group handling on tied ORDER BY values");
 }

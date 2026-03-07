@@ -110,7 +110,7 @@ pub fn check_sheaf_consistency(
                 // agreeing pages are not part of the obstruction.
                 for (page, ver_a, ver_b) in overlap_pages {
                     let disagrees = if let Some(order_fn) = version_order {
-                        !order_fn(ver_a, ver_b) && !order_fn(ver_b, ver_a)
+                        !order_fn(ver_a, ver_b) || !order_fn(ver_b, ver_a)
                     } else {
                         ver_a != ver_b
                     };

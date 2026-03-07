@@ -502,7 +502,7 @@ impl WriteCoordinator {
         );
 
         // Step 1-2: Validate and allocate atomically.
-        let commit_seq = {
+        let (commit_seq, wal_offset) = {
             let mut index = self.commit_page_index.write();
             let mut conflict_pages = Vec::new();
             let mut conflict_seq = CommitSeq::new(0);
@@ -541,16 +541,17 @@ impl WriteCoordinator {
             for &pgno in &page_set {
                 index.insert(pgno, seq);
             }
-            seq
-        };
 
-        // Step 3: WAL Append — compute offset and record it.
-        // In the full implementation, this writes page frames to the WAL file.
-        // Frame size per page: 24-byte header + page_size bytes.
-        let frame_header_size = 24_u64;
-        let page_size = Self::infer_page_size(&req.write_set);
-        let batch_bytes = page_numbers.len() as u64 * (frame_header_size + page_size);
-        let wal_offset = self.wal_offset.fetch_add(batch_bytes, Ordering::SeqCst);
+            // Step 3: WAL Append — compute offset and record it.
+            // This MUST be inside the index lock to ensure that the physical WAL
+            // order strictly matches the logical commit sequence.
+            let frame_header_size = 24_u64;
+            let page_size = Self::infer_page_size(&req.write_set);
+            let batch_bytes = page_numbers.len() as u64 * (frame_header_size + page_size);
+            let offset = self.wal_offset.fetch_add(batch_bytes, Ordering::SeqCst);
+
+            (seq, offset)
+        };
 
         // Step 4: "sync" — fsync placeholder. In the full implementation,
         // this is the group commit fsync point.

@@ -192,13 +192,11 @@ impl Parser {
                 // promotion to Float.  C SQLite folds this at parse time.
                 if let Expr::Literal(Literal::Float(f), _) = &inner {
                     let neg = -f;
-                    // Don't fold -0.0 to integer 0; it must stay as float.
-                    if neg != 0.0 {
-                        #[allow(clippy::cast_possible_truncation)]
-                        let as_i64 = neg as i64;
-                        if (as_i64 as f64) == neg {
-                            return Ok(Expr::Literal(Literal::Integer(as_i64), span));
-                        }
+                    // Constant-fold ONLY the critical case of exactly i64::MIN.
+                    // This handles `-9223372036854775808` which the lexer promotes to Float.
+                    // We must NOT fold other floats like `-10.0` as they should remain REAL.
+                    if neg == (i64::MIN as f64) {
+                        return Ok(Expr::Literal(Literal::Integer(i64::MIN), span));
                     }
                 }
                 Ok(Expr::UnaryOp {

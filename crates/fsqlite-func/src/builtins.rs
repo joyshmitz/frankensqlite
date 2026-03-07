@@ -87,41 +87,6 @@ fn null_propagate(args: &[SqliteValue]) -> Option<SqliteValue> {
     }
 }
 
-/// Try to interpret a value as a numeric (integer preferred, then float).
-fn coerce_numeric(v: &SqliteValue) -> SqliteValue {
-    match v {
-        SqliteValue::Integer(_) | SqliteValue::Float(_) => v.clone(),
-        SqliteValue::Text(s) => {
-            // Try exact integer parse first.
-            let t = s.trim();
-            if let Ok(i) = t.parse::<i64>() {
-                return SqliteValue::Integer(i);
-            }
-            // Try exact float parse.
-            if let Ok(f) = t.parse::<f64>() {
-                if f.is_finite() {
-                    return SqliteValue::Float(f);
-                }
-            }
-            // Fall back to prefix extraction (matches sqlite3_value_int64 behavior).
-            let f = v.to_float();
-            if f == 0.0 {
-                SqliteValue::Integer(0)
-            } else {
-                let i = v.to_integer();
-                #[allow(clippy::cast_precision_loss)]
-                if i as f64 == f {
-                    SqliteValue::Integer(i)
-                } else {
-                    SqliteValue::Float(f)
-                }
-            }
-        }
-        SqliteValue::Null => SqliteValue::Null,
-        SqliteValue::Blob(_) => SqliteValue::Integer(v.to_integer()),
-    }
-}
-
 // ── abs(X) ────────────────────────────────────────────────────────────────
 
 pub struct AbsFunc;
@@ -131,15 +96,17 @@ impl ScalarFunction for AbsFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        match coerce_numeric(&args[0]) {
+        match &args[0] {
             SqliteValue::Integer(i) => {
-                if i == i64::MIN {
+                if *i == i64::MIN {
                     return Err(FrankenError::IntegerOverflow);
                 }
                 Ok(SqliteValue::Integer(i.abs()))
             }
-            SqliteValue::Float(f) => Ok(SqliteValue::Float(f.abs())),
-            other => Ok(other),
+            other => {
+                let f = other.to_float();
+                Ok(SqliteValue::Float(f.abs()))
+            }
         }
     }
 
@@ -2341,15 +2308,18 @@ mod tests {
 
     #[test]
     fn test_abs_whitespace_padded_text() {
-        // Regression: ABS('  42  ') must return 42, not 0.
-        // coerce_numeric must trim text before parsing.
+        // SQLite's abs() casts non-integers to REAL, even if they parse cleanly as integers
         assert_eq!(
             invoke1(&AbsFunc, SqliteValue::Text("  42  ".to_owned())).unwrap(),
-            SqliteValue::Integer(42)
+            SqliteValue::Float(42.0)
         );
         assert_eq!(
             invoke1(&AbsFunc, SqliteValue::Text("  -7.5  ".to_owned())).unwrap(),
             SqliteValue::Float(7.5)
+        );
+        assert_eq!(
+            invoke1(&AbsFunc, SqliteValue::Text("abc".to_owned())).unwrap(),
+            SqliteValue::Float(0.0)
         );
     }
 

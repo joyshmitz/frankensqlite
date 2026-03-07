@@ -346,15 +346,23 @@ pub const fn ptrmap_entry_offset(
     usable_size: u32,
     page_size: u32,
 ) -> Option<u32> {
+    let pending_byte_page = (PENDING_BYTE_OFFSET / page_size) + 1;
+    if pgno.get() == pending_byte_page {
+        return None;
+    }
+
     let Some(ptrmap_page) = ptrmap_page_for(pgno, usable_size, page_size) else {
         return None;
     };
     if pgno.get() <= ptrmap_page.get() {
-        // This handles the pending byte page: its computed ptrmap_page is P+1,
-        // so pgno (P) < ptrmap_page. The pending byte page has no entry.
+        // This handles the edge case where the pending byte page pushes the
+        // pointer map page forward by one page.
         return None;
     }
-    let index = pgno.get() - ptrmap_page.get() - 1;
+    let mut index = pgno.get() - ptrmap_page.get() - 1;
+    if ptrmap_page.get() < pending_byte_page && pgno.get() > pending_byte_page {
+        index -= 1;
+    }
     Some(index * PTRMAP_ENTRY_SIZE_BYTES)
 }
 
@@ -677,6 +685,38 @@ mod tests {
                 page_size
             ),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn test_ptrmap_entry_offset_skips_pending_byte_inside_group() {
+        // For 4096-byte pages, the pending byte page lands in the middle of
+        // the pointer-map group that starts at page 261582. Pages after the
+        // pending byte but before the next pointer-map page must have their
+        // entry index shifted down by one.
+        let usable_size = 4096;
+        let page_size = 4096;
+        let pending_byte_pgno = (PENDING_BYTE_OFFSET / page_size) + 1;
+
+        // The pending byte page itself has no pointer map entry.
+        assert!(
+            ptrmap_entry_offset(
+                PageNumber::new(pending_byte_pgno).unwrap(),
+                usable_size,
+                page_size
+            )
+            .is_none()
+        );
+
+        let pgno = PageNumber::new(pending_byte_pgno + 1).unwrap();
+
+        assert_eq!(
+            ptrmap_page_for(pgno, usable_size, page_size).unwrap().get(),
+            261_582
+        );
+        assert_eq!(
+            ptrmap_entry_offset(pgno, usable_size, page_size),
+            Some(562 * PTRMAP_ENTRY_SIZE_BYTES)
         );
     }
 

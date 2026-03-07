@@ -428,11 +428,11 @@ impl StreamingHistogram {
                     return self.boundaries[i];
                 }
                 // Overflow bucket — return max observed.
-                return self.max;
+                return self.max();
             }
         }
 
-        self.max
+        self.max() // fallback
     }
 
     /// Number of bucket boundaries (not including overflow).
@@ -541,6 +541,8 @@ pub struct SlidingWindowHistogram {
     slot_obs: Vec<u64>,
     /// Per-slot sum.
     slot_sum: Vec<u64>,
+    /// Per-slot maximum value.
+    slot_max: Vec<u64>,
     /// Timestamp (µs) when each slot was last written.
     slot_timestamps: Vec<u64>,
     /// Current head slot index.
@@ -573,7 +575,7 @@ impl SlidingWindowHistogram {
             .map(|_| vec![0u64; num_buckets])
             .collect();
         let mem_bytes = (config.num_slots * num_buckets * 8
-            + config.num_slots * 8 * 3
+            + config.num_slots * 8 * 4
             + boundaries.len() * 8) as u64;
         record_memory_add(mem_bytes);
 
@@ -592,6 +594,7 @@ impl SlidingWindowHistogram {
             slot_counts,
             slot_obs: vec![0; config.num_slots],
             slot_sum: vec![0; config.num_slots],
+            slot_max: vec![0; config.num_slots],
             slot_timestamps: vec![0; config.num_slots],
             head: 0,
             last_ts: 0,
@@ -620,6 +623,7 @@ impl SlidingWindowHistogram {
             self.slot_counts[idx].fill(0);
             self.slot_obs[idx] = 0;
             self.slot_sum[idx] = 0;
+            self.slot_max[idx] = 0;
             self.slot_timestamps[idx] = 0;
         }
         self.head = (self.head + slots_elapsed) % self.config.num_slots;
@@ -636,6 +640,7 @@ impl SlidingWindowHistogram {
         self.slot_counts[self.head][bucket] = self.slot_counts[self.head][bucket].saturating_add(1);
         self.slot_obs[self.head] = self.slot_obs[self.head].saturating_add(1);
         self.slot_sum[self.head] = self.slot_sum[self.head].saturating_add(value);
+        self.slot_max[self.head] = self.slot_max[self.head].max(value);
         self.slot_timestamps[self.head] = now_us;
 
         record_observation();
@@ -692,7 +697,13 @@ impl SlidingWindowHistogram {
                 break;
             }
         }
-        0 // fallback
+        self.max() // fallback
+    }
+
+    /// Maximum observed value across all active slots.
+    #[must_use]
+    pub fn max(&self) -> u64 {
+        self.slot_max.iter().copied().max().unwrap_or(0)
     }
 
     /// Mean across all active slots.
@@ -730,7 +741,7 @@ impl SlidingWindowHistogram {
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         self.config.num_slots * (self.boundaries.len() + 1) * 8
-            + self.config.num_slots * 8 * 3
+            + self.config.num_slots * 8 * 4
             + self.boundaries.len() * 8
     }
 }
@@ -1722,8 +1733,8 @@ mod tests {
         };
         let swh = SlidingWindowHistogram::new(&[10, 50, 100], config);
         let mem = swh.memory_bytes();
-        // 4 slots * 4 buckets * 8 bytes + 4 slots * 3 vecs * 8 bytes + 3 boundaries * 8 bytes
-        let expected = 4 * 4 * 8 + 4 * 8 * 3 + 3 * 8;
+        // 4 slots * 4 buckets * 8 bytes + 4 slots * 4 vecs * 8 bytes + 3 boundaries * 8 bytes
+        let expected = 4 * 4 * 8 + 4 * 8 * 4 + 3 * 8;
         assert_eq!(
             mem, expected,
             "memory_bytes should be {expected}, got {mem}"

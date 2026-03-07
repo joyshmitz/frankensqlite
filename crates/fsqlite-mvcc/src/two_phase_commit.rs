@@ -486,10 +486,14 @@ impl TwoPhaseCoordinator {
 
     /// Abort the 2PC protocol.
     ///
-    /// Can be called at any point before `Committed`.  Rolls back all
-    /// participants (WAL frames without index updates are ignored by readers).
+    /// Can be called at any point before the global commit marker is written.
+    /// Rolls back all participants (WAL frames without index updates are ignored by readers).
+    /// Once the marker is written, the decision is final and cannot be aborted.
     pub fn abort(&mut self) -> Result<(), TwoPhaseError> {
-        if self.state == TwoPhaseState::Committed {
+        if matches!(
+            self.state,
+            TwoPhaseState::MarkerWritten | TwoPhaseState::Committing | TwoPhaseState::Committed
+        ) {
             return Err(TwoPhaseError::InvalidState(self.state));
         }
         self.state = TwoPhaseState::Aborted;
@@ -1055,9 +1059,35 @@ mod tests {
             )
             .unwrap();
 
-        // Abort: valid at any state before Committed.
+        // Abort: valid before marker is written.
         coord.abort().expect("abort should succeed");
         assert!(coord.is_aborted());
         assert!(coord.commit_marker().is_none());
+    }
+
+    #[test]
+    fn test_2pc_abort_after_marker_rejected() {
+        let mut coord = TwoPhaseCoordinator::new(15);
+        coord
+            .add_participant(MAIN_DB_ID, "main".to_owned(), true)
+            .unwrap();
+        coord
+            .prepare_participant(
+                MAIN_DB_ID,
+                PrepareResult::Ok {
+                    wal_offset: 4096,
+                    frame_count: 1,
+                },
+            )
+            .unwrap();
+        coord.check_all_prepared().unwrap();
+        coord.write_commit_marker(CommitSeq::new(1), 0).unwrap();
+
+        // Marker is written, abort must be rejected.
+        let err = coord.abort();
+        assert!(matches!(
+            err,
+            Err(TwoPhaseError::InvalidState(TwoPhaseState::MarkerWritten))
+        ));
     }
 }
