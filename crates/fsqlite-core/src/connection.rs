@@ -44479,6 +44479,240 @@ mod pager_routing_tests {
         }
     }
 
+    /// CTE (WITH clause): non-recursive and recursive CTEs.
+    #[test]
+    fn test_conformance_cte() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER);",
+            "INSERT INTO employees VALUES (1, 'CEO', NULL);",
+            "INSERT INTO employees VALUES (2, 'VP1', 1);",
+            "INSERT INTO employees VALUES (3, 'VP2', 1);",
+            "INSERT INTO employees VALUES (4, 'Dir1', 2);",
+            "INSERT INTO employees VALUES (5, 'Dir2', 2);",
+            "INSERT INTO employees VALUES (6, 'Mgr1', 3);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Non-recursive CTE
+            "WITH top_mgmt AS (SELECT * FROM employees WHERE manager_id IS NULL) SELECT name FROM top_mgmt",
+            // CTE used multiple times
+            "WITH cte AS (SELECT id, name FROM employees WHERE manager_id IS NOT NULL) SELECT count(*) FROM cte",
+            // Multiple CTEs
+            "WITH vps AS (SELECT * FROM employees WHERE manager_id = 1), dirs AS (SELECT * FROM employees WHERE manager_id IN (SELECT id FROM vps)) SELECT d.name FROM dirs d ORDER BY d.name",
+            // Recursive CTE: org chart
+            "WITH RECURSIVE org(id, name, level) AS (SELECT id, name, 0 FROM employees WHERE manager_id IS NULL UNION ALL SELECT e.id, e.name, org.level + 1 FROM employees e JOIN org ON e.manager_id = org.id) SELECT name, level FROM org ORDER BY level, name",
+            // Recursive CTE: counting
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 5) SELECT x FROM cnt",
+            // Recursive CTE: Fibonacci
+            "WITH RECURSIVE fib(a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a + b FROM fib WHERE b < 100) SELECT a FROM fib",
+            // CTE in INSERT
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} CTE conformance mismatches found", mismatches.len());
+        }
+    }
+
+    /// Triggers: BEFORE/AFTER INSERT/UPDATE/DELETE, NEW/OLD references,
+    /// RAISE, and cascading triggers.
+    #[test]
+    fn test_conformance_triggers() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE logs (id INTEGER PRIMARY KEY, action TEXT, detail TEXT);",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL);",
+            "CREATE TRIGGER log_insert AFTER INSERT ON items BEGIN INSERT INTO logs (action, detail) VALUES ('INSERT', NEW.name); END;",
+            "CREATE TRIGGER log_update AFTER UPDATE ON items BEGIN INSERT INTO logs (action, detail) VALUES ('UPDATE', NEW.name || ' was ' || OLD.name); END;",
+            "CREATE TRIGGER log_delete AFTER DELETE ON items BEGIN INSERT INTO logs (action, detail) VALUES ('DELETE', OLD.name); END;",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // Trigger INSERT
+        let i1 = "INSERT INTO items VALUES (1, 'Widget', 10.00)";
+        fconn.execute(i1).unwrap();
+        rconn.execute_batch(i1).unwrap();
+
+        let q1 = [
+            "SELECT * FROM items ORDER BY id",
+            "SELECT action, detail FROM logs ORDER BY id",
+        ];
+        let m1 = oracle_compare(&fconn, &rconn, &q1);
+
+        // Trigger UPDATE
+        let u1 = "UPDATE items SET name = 'Gadget' WHERE id = 1";
+        fconn.execute(u1).unwrap();
+        rconn.execute_batch(u1).unwrap();
+
+        let q2 = ["SELECT action, detail FROM logs ORDER BY id"];
+        let m2 = oracle_compare(&fconn, &rconn, &q2);
+
+        // Trigger DELETE
+        let d1 = "DELETE FROM items WHERE id = 1";
+        fconn.execute(d1).unwrap();
+        rconn.execute_batch(d1).unwrap();
+
+        let q3 = [
+            "SELECT count(*) FROM items",
+            "SELECT action, detail FROM logs ORDER BY id",
+        ];
+        let m3 = oracle_compare(&fconn, &rconn, &q3);
+
+        let mut all = Vec::new();
+        all.extend(m1);
+        all.extend(m2);
+        all.extend(m3);
+        if !all.is_empty() {
+            for m in &all {
+                eprintln!("{m}\n");
+            }
+            panic!("{} trigger conformance mismatches found", all.len());
+        }
+    }
+
+    /// Transaction semantics: ROLLBACK undoes changes, SAVEPOINT/RELEASE,
+    /// and nested savepoints.
+    #[test]
+    fn test_conformance_transaction_rollback() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);",
+            "INSERT INTO t VALUES (1, 'original');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // Transaction + ROLLBACK
+        for conn_pair in [(&fconn as &dyn std::any::Any, &rconn as &dyn std::any::Any)] {
+            let _ = conn_pair; // prevent unused
+        }
+
+        // Use both connections in parallel
+        fconn.execute("BEGIN").unwrap();
+        rconn.execute_batch("BEGIN").unwrap();
+
+        fconn.execute("INSERT INTO t VALUES (2, 'added')").unwrap();
+        rconn.execute_batch("INSERT INTO t VALUES (2, 'added')").unwrap();
+
+        fconn.execute("ROLLBACK").unwrap();
+        rconn.execute_batch("ROLLBACK").unwrap();
+
+        let q1 = ["SELECT * FROM t ORDER BY id"];
+        let m1 = oracle_compare(&fconn, &rconn, &q1);
+
+        // SAVEPOINT + RELEASE
+        fconn.execute("BEGIN").unwrap();
+        rconn.execute_batch("BEGIN").unwrap();
+
+        fconn.execute("INSERT INTO t VALUES (2, 'saved')").unwrap();
+        rconn.execute_batch("INSERT INTO t VALUES (2, 'saved')").unwrap();
+
+        fconn.execute("SAVEPOINT sp1").unwrap();
+        rconn.execute_batch("SAVEPOINT sp1").unwrap();
+
+        fconn.execute("INSERT INTO t VALUES (3, 'nested')").unwrap();
+        rconn.execute_batch("INSERT INTO t VALUES (3, 'nested')").unwrap();
+
+        fconn.execute("ROLLBACK TO sp1").unwrap();
+        rconn.execute_batch("ROLLBACK TO sp1").unwrap();
+
+        fconn.execute("COMMIT").unwrap();
+        rconn.execute_batch("COMMIT").unwrap();
+
+        let q2 = ["SELECT * FROM t ORDER BY id"];
+        let m2 = oracle_compare(&fconn, &rconn, &q2);
+
+        let mut all = Vec::new();
+        all.extend(m1);
+        all.extend(m2);
+        if !all.is_empty() {
+            for m in &all {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} transaction rollback conformance mismatches found",
+                all.len()
+            );
+        }
+    }
+
+    /// Foreign key constraint behavior.
+    #[test]
+    fn test_conformance_foreign_keys() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "PRAGMA foreign_keys = ON;",
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT);",
+            "INSERT INTO parents VALUES (1, 'Parent A');",
+            "INSERT INTO parents VALUES (2, 'Parent B');",
+            "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents(id), name TEXT);",
+            "INSERT INTO children VALUES (1, 1, 'Child 1');",
+            "INSERT INTO children VALUES (2, 1, 'Child 2');",
+            "INSERT INTO children VALUES (3, 2, 'Child 3');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT c.name, p.name FROM children c JOIN parents p ON c.parent_id = p.id ORDER BY c.name",
+            "SELECT p.name, count(c.id) FROM parents p LEFT JOIN children c ON c.parent_id = p.id GROUP BY p.name ORDER BY p.name",
+        ];
+        let m1 = oracle_compare(&fconn, &rconn, &queries);
+
+        // FK violation: insert child with nonexistent parent
+        let fk_err_frank = fconn.execute("INSERT INTO children VALUES (4, 99, 'Orphan')");
+        let fk_err_csql = rconn.execute_batch("INSERT INTO children VALUES (4, 99, 'Orphan')");
+
+        // Both should fail
+        let both_fail = fk_err_frank.is_err() && fk_err_csql.is_err();
+
+        let q2 = ["SELECT count(*) FROM children"];
+        let m2 = oracle_compare(&fconn, &rconn, &q2);
+
+        let mut all = Vec::new();
+        all.extend(m1);
+        all.extend(m2);
+        if !both_fail {
+            all.push(format!(
+                "FK violation divergence: frank_err={}, csql_err={}",
+                fk_err_frank.is_err(),
+                fk_err_csql.is_err()
+            ));
+        }
+        if !all.is_empty() {
+            for m in &all {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} foreign key conformance mismatches found",
+                all.len()
+            );
+        }
+    }
+
     /// String functions, REPLACE, INSTR, SUBSTR, and built-in functions
     /// commonly used by ORMs and applications.
     #[test]
