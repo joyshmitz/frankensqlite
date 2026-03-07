@@ -7,10 +7,14 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["native"]
+native = ["dep:asupersync"]
+
 [dependencies]
 bitflags = { workspace = true }
 blake3 = { workspace = true }
-asupersync = { workspace = true }
+asupersync = { workspace = true, optional = true }
 fsqlite-error = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
