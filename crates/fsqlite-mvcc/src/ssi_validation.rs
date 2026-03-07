@@ -1218,16 +1218,6 @@ mod tests {
         WitnessKey::Page(PageNumber::new(pgno).unwrap())
     }
 
-    fn keys_to_pages(keys: &[WitnessKey]) -> Vec<PageNumber> {
-        let mut pages = Vec::new();
-        for key in keys {
-            if let WitnessKey::Page(page) = key {
-                pages.push(*page);
-            }
-        }
-        pages
-    }
-
     // -- §5.7.3 test 1: Read-only skip --
 
     #[test]
@@ -2348,13 +2338,13 @@ mod tests {
                     begin_seq,
                     commit_seq: CommitSeq::new(2),
                     had_in_rw: ok.ssi_state.has_in_rw,
-                    keys: v1.reads.to_vec(),
+                    keys: v1.reads.clone(),
                 });
                 committed_writers.push(CommittedWriterInfo {
                     token: t1,
                     commit_seq: CommitSeq::new(2),
                     had_out_rw: ok.ssi_state.has_out_rw,
-                    keys: v1.writes.to_vec(),
+                    keys: v1.writes.clone(),
                 });
             }
             Err(_) => aborts += 1,
@@ -2382,13 +2372,13 @@ mod tests {
                     begin_seq,
                     commit_seq: CommitSeq::new(3),
                     had_in_rw: ok.ssi_state.has_in_rw,
-                    keys: v2.reads.to_vec(),
+                    keys: v2.reads.clone(),
                 });
                 committed_writers.push(CommittedWriterInfo {
                     token: t2,
                     commit_seq: CommitSeq::new(3),
                     had_out_rw: ok.ssi_state.has_out_rw,
-                    keys: v2.writes.to_vec(),
+                    keys: v2.writes.clone(),
                 });
             }
             Err(_) => aborts += 1,
@@ -2522,13 +2512,13 @@ mod tests {
                         begin_seq,
                         commit_seq,
                         had_in_rw: ok.ssi_state.has_in_rw,
-                        keys: current.reads.to_vec(),
+                        keys: current.reads.clone(),
                     });
                     committed_writers.push(CommittedWriterInfo {
                         token: current.token,
                         commit_seq,
                         had_out_rw: ok.ssi_state.has_out_rw,
-                        keys: current.writes.to_vec(),
+                        keys: current.writes.clone(),
                     });
                 }
                 Err(_) => abort_count += 1,

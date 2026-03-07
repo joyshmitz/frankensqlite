@@ -81,14 +81,17 @@ fn test_count_zero_args() {
 #[test]
 fn test_update_returning_from_clause() {
     let schema = make_schema();
+    // SQLite's RETURNING clause CANNOT reference tables from the FROM clause.
+    // It can ONLY reference the target table being modified.
     let stmt = parse_one(
         "UPDATE users SET id = 1 FROM orders WHERE users.id = orders.id RETURNING orders.id",
     );
     let mut resolver = Resolver::new(&schema);
     let errors = resolver.resolve_statement(&stmt);
+    assert_eq!(errors.len(), 1, "Expected exactly 1 error");
     assert!(
-        errors.is_empty(),
-        "SQLite allows RETURNING from FROM clause tables, got errors: {errors:?}"
+        matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
+        "Expected UnresolvedColumn error for orders.id, got {:?}", errors[0]
     );
 }
 
@@ -99,4 +102,72 @@ fn test_order_by_select_alias() {
     let mut resolver = Resolver::new(&schema);
     let errors = resolver.resolve_statement(&stmt);
     assert!(errors.is_empty(), "Expected no errors, got {:?}", errors);
+}
+
+#[test]
+fn test_upsert_excluded_unqualified_column() {
+    let schema = make_schema();
+    // In UPSERT, unqualified columns in the SET and WHERE clauses should resolve 
+    // to the target table (users), NOT the `excluded` pseudo-table.
+    // The query should pass semantic analysis without 'AmbiguousColumn' errors.
+    let stmt = parse_one(
+        "INSERT INTO users (id, name) VALUES (1, 'alice') ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE id > 0"
+    );
+    let mut resolver = Resolver::new(&schema);
+    let errors = resolver.resolve_statement(&stmt);
+    assert!(errors.is_empty(), "Expected no errors for UPSERT, got {:?}", errors);
+}
+
+#[test]
+fn test_insert_values_cannot_see_target_table() {
+    let schema = make_schema();
+    // The VALUES clause cannot reference the target table columns
+    let stmt = parse_one("INSERT INTO users (id, name) VALUES (id, 'alice')");
+    let mut resolver = Resolver::new(&schema);
+    let errors = resolver.resolve_statement(&stmt);
+    assert_eq!(errors.len(), 1, "Expected exactly 1 error");
+    assert!(
+        matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
+        "Expected UnresolvedColumn error, got {:?}", errors[0]
+    );
+}
+
+#[test]
+fn test_insert_select_cannot_see_target_table() {
+    let schema = make_schema();
+    // The SELECT clause cannot implicitly reference the target table columns
+    let stmt = parse_one("INSERT INTO users (id, name) SELECT id, 'alice'");
+    let mut resolver = Resolver::new(&schema);
+    let errors = resolver.resolve_statement(&stmt);
+    assert_eq!(errors.len(), 1, "Expected exactly 1 error");
+    assert!(
+        matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
+        "Expected UnresolvedColumn error, got {:?}", errors[0]
+    );
+}
+
+#[test]
+fn test_update_limit_cannot_see_target_table() {
+    let schema = make_schema();
+    let stmt = parse_one("UPDATE users SET id = 2 LIMIT id");
+    let mut resolver = Resolver::new(&schema);
+    let errors = resolver.resolve_statement(&stmt);
+    assert_eq!(errors.len(), 1, "Expected exactly 1 error");
+    assert!(
+        matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
+        "Expected UnresolvedColumn error, got {:?}", errors[0]
+    );
+}
+
+#[test]
+fn test_delete_limit_cannot_see_target_table() {
+    let schema = make_schema();
+    let stmt = parse_one("DELETE FROM users LIMIT id");
+    let mut resolver = Resolver::new(&schema);
+    let errors = resolver.resolve_statement(&stmt);
+    assert_eq!(errors.len(), 1, "Expected exactly 1 error");
+    assert!(
+        matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
+        "Expected UnresolvedColumn error, got {:?}", errors[0]
+    );
 }

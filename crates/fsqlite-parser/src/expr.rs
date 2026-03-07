@@ -1909,7 +1909,30 @@ mod tests {
     }
 
     #[test]
-    fn test_pratt_level7_tighter_than_bitwise() {
+    fn test_pratt_level7_add_sub_left_assoc_reverse() {
+        // a - b + c → (a - b) + c
+        let expr = parse("a - b + c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Add,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Subtract,
+                        ..
+                    }
+                ),
+                "add/sub should be left-associative"
+            ),
+            other => unreachable!("expected Add(Sub(a,b), c), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pratt_level9_concat_tighter_than_mul() {
         // a * b || c → a * (b || c)
         let expr = parse("a * b || c");
         match &expr {
@@ -2003,25 +2026,25 @@ mod tests {
     }
 
     #[test]
-    fn test_pratt_level9_tighter_than_mul() {
-        // a * b || c → a * (b || c)
-        let expr = parse("a * b || c");
+    fn test_pratt_level9_concat_left_assoc_reverse() {
+        // a || b || c → (a || b) || c
+        let expr = parse("a || b || c");
         match &expr {
             Expr::BinaryOp {
-                op: BinaryOp::Multiply,
-                right,
+                op: BinaryOp::Concat,
+                left,
                 ..
             } => assert!(
                 matches!(
-                    right.as_ref(),
+                    left.as_ref(),
                     Expr::BinaryOp {
                         op: BinaryOp::Concat,
                         ..
                     }
                 ),
-                "concat should bind tighter than multiply"
+                "concatenation should be left-associative"
             ),
-            other => unreachable!("expected Mul(a, Concat(b,c)), got {other:?}"),
+            other => unreachable!("expected Concat(Concat(a,b), c), got {other:?}"),
         }
     }
 

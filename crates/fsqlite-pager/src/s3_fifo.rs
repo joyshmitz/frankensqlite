@@ -703,6 +703,13 @@ impl S3Fifo {
         self.posterior_alpha = self.posterior_alpha.saturating_add(alpha_update);
         self.posterior_beta = self.posterior_beta.saturating_add(beta_update);
 
+        // Decay posterior counts to prevent saturation and maintain relative proportions.
+        // If the sum approaches u64::MAX, halve both values.
+        if self.posterior_alpha.saturating_add(self.posterior_beta) > (u64::MAX / 2) {
+            self.posterior_alpha = (self.posterior_alpha / 2).max(1);
+            self.posterior_beta = (self.posterior_beta / 2).max(1);
+        }
+
         let denominator = self.posterior_alpha.saturating_add(self.posterior_beta);
         if denominator == 0 {
             return;

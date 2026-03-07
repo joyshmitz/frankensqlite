@@ -30,7 +30,7 @@ use std::fmt::Write as FmtWrite;
 
 use serde::{Deserialize, Serialize};
 
-use crate::e2e_log_schema::{self, LOG_SCHEMA_VERSION, LogEventSchema, LogEventType};
+use crate::e2e_log_schema::{self, LogEventSchema, LogEventType, LOG_SCHEMA_VERSION};
 
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-1dp9.7.6";
@@ -174,7 +174,11 @@ fn redact_path(value: &str) -> String {
         .split(',')
         .map(|p| {
             let trimmed = p.trim();
-            if let Some(pos) = trimmed.rfind('/') {
+            let separator_pos = trimmed
+                .char_indices()
+                .rev()
+                .find_map(|(idx, ch)| matches!(ch, '/' | '\\').then_some(idx));
+            if let Some(pos) = separator_pos {
                 format!("[...]{}", &trimmed[pos..])
             } else {
                 trimmed.to_owned()
@@ -605,7 +609,7 @@ fn extract_field_from_error(msg: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::e2e_log_schema::{LogEventType, LogPhase, canonical_event_examples};
+    use crate::e2e_log_schema::{canonical_event_examples, LogEventType, LogPhase};
 
     fn make_valid_event() -> LogEventSchema {
         let mut context = BTreeMap::new();
@@ -770,6 +774,27 @@ mod tests {
     }
 
     #[test]
+    fn artifact_paths_redacted_to_basename_windows_paths() {
+        let mut event = make_valid_event();
+        event.context.insert(
+            "artifact_paths".to_owned(),
+            r"C:\Users\alice\frankensqlite\artifacts\events.jsonl".to_owned(),
+        );
+
+        let redacted = redact_event(&event, 42);
+        let redacted_paths = redacted.context.get("artifact_paths").unwrap();
+
+        assert!(
+            !redacted_paths.contains(r"C:\Users\alice"),
+            "artifact_paths should strip Windows directory prefixes, got: {redacted_paths}",
+        );
+        assert!(
+            redacted_paths.contains(r"[...]\events.jsonl"),
+            "artifact_paths should preserve the Windows basename, got: {redacted_paths}",
+        );
+    }
+
+    #[test]
     fn sensitive_context_keys_redacted() {
         let mut event = make_valid_event();
         event
@@ -788,6 +813,13 @@ mod tests {
         let result = redact_path("/home/user/data/file1.json, /opt/logs/file2.jsonl");
         assert!(result.contains("[...]/file1.json"));
         assert!(result.contains("[...]/file2.jsonl"));
+    }
+
+    #[test]
+    fn path_redaction_handles_windows_paths() {
+        let result = redact_path(r"C:\Users\alice\data\file1.json, D:\logs\archive\file2.jsonl");
+        assert!(result.contains(r"[...]\file1.json"));
+        assert!(result.contains(r"[...]\file2.jsonl"));
     }
 
     #[test]

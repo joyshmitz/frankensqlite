@@ -177,11 +177,13 @@ impl Vfs for MemoryVfs {
     }
 
     fn delete(&self, _cx: &Cx, path: &Path, _sync_dir: bool) -> Result<()> {
-        self.inner
-            .lock()
-            .map_err(|_| lock_err())?
-            .files
-            .remove(path);
+        let mut inner = self.inner.lock().map_err(|_| lock_err())?;
+        inner.files.remove(path);
+        // `xDelete` may target either the main database path or the explicit
+        // `*-shm` sidecar. Clear both the exact path and the derived SHM sidecar
+        // key so delete/recreate cycles do not inherit stale SHM regions/locks.
+        inner.shm.remove(path);
+        inner.shm.remove(&sqlite_shm_path(path));
         Ok(())
     }
 
@@ -1245,6 +1247,54 @@ mod tests {
         let vfs = make_vfs();
         // Deleting a path that doesn't exist should not error (HashMap::remove is a no-op).
         vfs.delete(&cx, Path::new("ghost.db"), false).unwrap();
+    }
+
+    #[test]
+    fn delete_shm_path_clears_shm_state() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("shm_delete.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        let shm_path = sqlite_shm_path(path);
+        let _region = file.shm_map(&cx, 0, 64, true).unwrap();
+        assert!(
+            vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "mapping SHM should register per-path SHM state"
+        );
+
+        vfs.delete(&cx, &shm_path, false).unwrap();
+        assert!(
+            !vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "explicit SHM delete should clear the SHM state table entry"
+        );
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn delete_db_path_clears_derived_shm_state() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("db_delete.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        let shm_path = sqlite_shm_path(path);
+        let _region = file.shm_map(&cx, 0, 64, true).unwrap();
+        assert!(
+            vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "mapping SHM should register per-path SHM state"
+        );
+
+        vfs.delete(&cx, path, false).unwrap();
+        assert!(
+            !vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "deleting the main database path should also clear the derived SHM state entry"
+        );
+
+        file.close(&cx).unwrap();
     }
 
     #[test]

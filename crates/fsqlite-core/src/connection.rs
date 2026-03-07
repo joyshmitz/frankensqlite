@@ -31,10 +31,11 @@ use fsqlite_ast::{
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_func::builtins::{ChangeTrackingState, set_change_tracking_state};
 use fsqlite_func::vtab::{ErasedVtabInstance, VtabModuleFactory};
 use fsqlite_func::{
     ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
-    get_total_changes, reset_total_changes, set_last_changes, set_last_insert_rowid,
+    get_total_changes,
 };
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{CheckpointMode, JournalMode, PageCacheMetricsSnapshot, SimplePager};
@@ -422,7 +423,7 @@ where
         return false;
     }
 
-    let open_flags = VfsOpenFlags::WAL;
+    let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
     let Ok((mut file, _)) = vfs.open(cx, Some(wal_path), open_flags) else {
         return false;
     };
@@ -670,7 +671,7 @@ impl PreparedStatement<'_> {
         // that exact execution path so prepared reads observe the connection's
         // uncommitted writes, concurrent session state, and MVCC snapshot.
         if self.conn.active_txn.borrow().is_some() {
-            let (rows, _) = self.conn.execute_table_program(&self.program, params)?;
+            let (rows, _, _) = self.conn.execute_table_program(&self.program, params)?;
             return Ok(rows);
         }
 
@@ -702,7 +703,7 @@ impl PreparedStatement<'_> {
         if let Some(ref mut txn) = txn_back {
             txn.commit(op_cx)?;
         }
-        result.map(|(rows, _)| rows)
+        result.map(|(rows, ..)| rows)
     }
 
     /// Execute as a query and return all result rows.
@@ -714,6 +715,7 @@ impl PreparedStatement<'_> {
                     .to_owned(),
             ));
         }
+        self.conn.sync_change_tracking_context();
         let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
         self.ensure_schema_unchanged(&op_cx)?;
         let mut rows = if self.db.is_some() {
@@ -744,6 +746,7 @@ impl PreparedStatement<'_> {
                     .to_owned(),
             ));
         }
+        self.conn.sync_change_tracking_context();
         let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
         self.ensure_schema_unchanged(&op_cx)?;
         let mut rows = if self.db.is_some() {
@@ -1316,6 +1319,10 @@ pub struct Connection {
     checkpoint_advisor_state: RefCell<CheckpointAdvisorState>,
     /// Number of rows affected by the most recent DML statement.
     last_changes: RefCell<usize>,
+    /// Rowid from the most recent successful INSERT on this connection.
+    last_insert_rowid: RefCell<i64>,
+    /// Cumulative number of rows changed on this connection.
+    total_changes: RefCell<usize>,
     /// Tracks nested internal statement savepoints so one top-level write
     /// statement can protect all nested trigger/FK work without per-substatement
     /// savepoint churn.
@@ -1509,6 +1516,8 @@ impl Connection {
             txn_lifecycle_metrics: RefCell::new(TxnLifecycleMetrics::default()),
             checkpoint_advisor_state: RefCell::new(CheckpointAdvisorState::default()),
             last_changes: RefCell::new(0),
+            last_insert_rowid: RefCell::new(0),
+            total_changes: RefCell::new(0),
             internal_statement_savepoint_depth: Cell::new(0),
             implicit_txn: RefCell::new(false),
             concurrent_txn: RefCell::new(false),
@@ -1564,19 +1573,50 @@ impl Connection {
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
         };
-        // Reset cumulative total_changes counter for this new connection.
-        reset_total_changes();
         conn.bootstrap_journal_mode_from_storage();
         conn.apply_current_journal_mode_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
         // The pager already opened the database file; we load schema + data from it.
         conn.reload_memdb_from_pager(&conn.op_cx())?;
+        conn.sync_change_tracking_context();
         Ok(conn)
     }
 
     /// Returns the configured database path.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    fn sync_change_tracking_context(&self) {
+        let state = ChangeTrackingState {
+            last_insert_rowid: *self.last_insert_rowid.borrow(),
+            last_changes: i64::try_from(*self.last_changes.borrow()).unwrap_or(i64::MAX),
+            total_changes: i64::try_from(*self.total_changes.borrow()).unwrap_or(i64::MAX),
+        };
+        set_change_tracking_state(state);
+    }
+
+    fn current_last_insert_rowid(&self) -> i64 {
+        *self.last_insert_rowid.borrow()
+    }
+
+    fn reset_statement_change_count(&self) {
+        *self.last_changes.borrow_mut() = 0;
+        self.sync_change_tracking_context();
+    }
+
+    fn record_last_insert_rowid(&self, rowid: i64) {
+        *self.last_insert_rowid.borrow_mut() = rowid;
+        self.sync_change_tracking_context();
+    }
+
+    fn record_statement_changes(&self, changes: usize) {
+        *self.last_changes.borrow_mut() = changes;
+        {
+            let mut total_changes = self.total_changes.borrow_mut();
+            *total_changes = total_changes.saturating_add(changes);
+        }
+        self.sync_change_tracking_context();
     }
 
     /// Enable parity-certification mode (bd-2ttd8.1).
@@ -2493,6 +2533,7 @@ impl Connection {
         statement: Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        self.sync_change_tracking_context();
         let statement_kind = match &statement {
             Statement::Select(_) => "select",
             Statement::Insert(_) => "insert",
@@ -2806,6 +2847,13 @@ impl Connection {
                     // cannot handle (e.g. those with GROUP BY / HAVING).
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let limit_clause = rewritten.limit.clone();
+                    let compiled_select = if distinct && limit_clause.is_some() {
+                        let mut unbounded = rewritten.clone();
+                        unbounded.limit = None;
+                        unbounded
+                    } else {
+                        rewritten.clone()
+                    };
                     let program = {
                         let plan_span = tracing::span!(
                             target: "fsqlite.plan",
@@ -2815,20 +2863,17 @@ impl Connection {
                         );
                         record_trace_span_created();
                         let _plan_guard = plan_span.enter();
-                        let sql_text = statement.to_string();
+                        // Cache the actual compiled SELECT shape, not the original
+                        // SQL text, because eager subquery rewriting can inline
+                        // parameter-sensitive literal lists before codegen.
+                        let sql_text = Statement::Select(compiled_select.clone()).to_string();
                         let sql_key = Self::sql_hash(&sql_text);
                         self.compile_with_cache(sql_key, &sql_text, |conn| {
-                            if distinct && limit_clause.is_some() {
-                                let mut unbounded = rewritten.clone();
-                                unbounded.limit = None;
-                                conn.compile_table_select(&unbounded)
-                            } else {
-                                conn.compile_table_select(&rewritten)
-                            }
+                            conn.compile_table_select(&compiled_select)
                         })?
                     };
 
-                    let (mut rows, _) = self.execute_table_program(&program, params)?;
+                    let (mut rows, _, _) = self.execute_table_program(&program, params)?;
                     if distinct {
                         dedup_rows(&mut rows);
                         if let Some(limit_clause) = limit_clause.as_ref() {
@@ -2843,7 +2888,7 @@ impl Connection {
                 //   INSERT INTO <table>(<table>) VALUES('optimize')
                 // is treated as a no-op in this compatibility path.
                 if is_fts5_optimize_noop_insert(insert) {
-                    *self.last_changes.borrow_mut() = 0;
+                    self.reset_statement_change_count();
                     return Ok(Vec::new());
                 }
 
@@ -2885,7 +2930,7 @@ impl Connection {
                 };
                 if skip_dml {
                     // RAISE(IGNORE) was called - skip the INSERT.
-                    *self.last_changes.borrow_mut() = 0;
+                    self.reset_statement_change_count();
                     return Ok(Vec::new());
                 }
 
@@ -2910,7 +2955,7 @@ impl Connection {
                             let tbl_key = table_name.to_ascii_lowercase();
                             if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key)
                             {
-                                let last_rowid = get_last_insert_rowid();
+                                let last_rowid = self.current_last_insert_rowid();
                                 let count = trigger_new_rows.len();
                                 for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
                                     if ipk_idx < new_row.len()
@@ -2935,9 +2980,7 @@ impl Connection {
                             }
                         }
                         // 5D.4: Persistence now handled by pager WAL, not compat_persist.
-                        *self.last_changes.borrow_mut() = affected;
-                        #[allow(clippy::cast_possible_wrap)]
-                        set_last_changes(affected as i64);
+                        self.record_statement_changes(affected);
                         return Ok(Vec::new());
                     }
                 }
@@ -2968,7 +3011,7 @@ impl Connection {
                         conn.compile_table_insert(insert)
                     })?
                 };
-                let (rows, affected) = self.execute_table_program(&program, params)?;
+                let (rows, affected, _) = self.execute_table_program(&program, params)?;
 
                 // bd-thqgm: FK constraint checking on INSERT.
                 if self.fk_enforcement_enabled() {
@@ -2980,7 +3023,7 @@ impl Connection {
                 if has_after_insert && !trigger_new_rows.is_empty() {
                     let tbl_key = table_name.to_ascii_lowercase();
                     if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key) {
-                        let last_rowid = get_last_insert_rowid();
+                        let last_rowid = self.current_last_insert_rowid();
                         let count = trigger_new_rows.len();
                         for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
                             if ipk_idx < new_row.len() && new_row[ipk_idx] == SqliteValue::Null {
@@ -3011,9 +3054,7 @@ impl Connection {
                 }
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
-                *self.last_changes.borrow_mut() = affected;
-                #[allow(clippy::cast_possible_wrap)]
-                set_last_changes(affected as i64);
+                self.record_statement_changes(affected);
                 if insert.returning.is_empty() {
                     Ok(Vec::new())
                 } else {
@@ -3075,7 +3116,7 @@ impl Connection {
                     false
                 };
                 if skip_dml {
-                    *self.last_changes.borrow_mut() = 0;
+                    self.reset_statement_change_count();
                     return Ok(Vec::new());
                 }
 
@@ -3131,7 +3172,7 @@ impl Connection {
                         conn.compile_table_update(&effective_update)
                     })?
                 };
-                let (rows, _) = self.execute_table_program(&program, params)?;
+                let (rows, _, _) = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {
@@ -3146,9 +3187,7 @@ impl Connection {
                 }
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
-                *self.last_changes.borrow_mut() = affected;
-                #[allow(clippy::cast_possible_wrap)]
-                set_last_changes(affected as i64);
+                self.record_statement_changes(affected);
                 if effective_update.returning.is_empty() {
                     Ok(Vec::new())
                 } else {
@@ -3201,7 +3240,7 @@ impl Connection {
                     false
                 };
                 if skip_dml {
-                    *self.last_changes.borrow_mut() = 0;
+                    self.reset_statement_change_count();
                     return Ok(Vec::new());
                 }
 
@@ -3248,7 +3287,7 @@ impl Connection {
                         conn.compile_table_delete(&effective_delete)
                     })?
                 };
-                let (rows, _) = self.execute_table_program(&program, params)?;
+                let (rows, _, _) = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
@@ -3263,9 +3302,7 @@ impl Connection {
                 }
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
-                *self.last_changes.borrow_mut() = affected;
-                #[allow(clippy::cast_possible_wrap)]
-                set_last_changes(affected as i64);
+                self.record_statement_changes(affected);
                 if effective_delete.returning.is_empty() {
                     Ok(Vec::new())
                 } else {
@@ -3857,7 +3894,7 @@ impl Connection {
                             ))
                         })?;
                         table.insert_row(rowid, col_values);
-                        set_last_insert_rowid(rowid);
+                        self.record_last_insert_rowid(rowid);
                         affected += 1;
                     }
                     ConflictAction::Ignore => {
@@ -3868,7 +3905,7 @@ impl Connection {
                                 ))
                             })?;
                             table.insert_row(rowid, col_values);
-                            set_last_insert_rowid(rowid);
+                            self.record_last_insert_rowid(rowid);
                             affected += 1;
                         }
                         // else: silently skip this row
@@ -3885,7 +3922,7 @@ impl Connection {
                             ))
                         })?;
                         table.insert_row(rowid, col_values);
-                        set_last_insert_rowid(rowid);
+                        self.record_last_insert_rowid(rowid);
                         affected += 1;
                     }
                 }
@@ -3897,7 +3934,7 @@ impl Connection {
                 })?;
                 let new_rowid = table.alloc_rowid();
                 table.insert_row(new_rowid, col_values);
-                set_last_insert_rowid(new_rowid);
+                self.record_last_insert_rowid(new_rowid);
                 affected += 1;
             }
         }
@@ -12309,7 +12346,7 @@ impl Connection {
         // Compile and execute a raw SELECT * scan (no aggregates, no GROUP BY).
         let raw_select = build_raw_scan_select(select);
         let program = self.compile_table_select(&raw_select)?;
-        let (raw_rows, _) = self.execute_table_program(&program, params)?;
+        let (raw_rows, _, _) = self.execute_table_program(&program, params)?;
 
         // Build per-GROUP-BY-key collation info for collation-aware grouping.
         let group_collations: Vec<Option<String>> = group_by_exprs
@@ -12895,7 +12932,7 @@ impl Connection {
         // Execute raw SELECT * scan.
         let raw_select = build_raw_scan_select(select);
         let program = self.compile_table_select(&raw_select)?;
-        let (raw_rows, _) = self.execute_table_program(&program, params)?;
+        let (raw_rows, _, _) = self.execute_table_program(&program, params)?;
 
         let row_values: Vec<Vec<SqliteValue>> =
             raw_rows.iter().map(|r| r.values().to_vec()).collect();
@@ -14775,7 +14812,7 @@ impl Connection {
         &self,
         program: &VdbeProgram,
         params: Option<&[SqliteValue]>,
-    ) -> Result<(Vec<Row>, usize)> {
+    ) -> Result<(Vec<Row>, usize, i64)> {
         let execution_span = tracing::span!(
             target: "fsqlite.execution",
             tracing::Level::DEBUG,
@@ -14784,6 +14821,7 @@ impl Connection {
         );
         record_trace_span_created();
         let _execution_guard = execution_span.enter();
+        self.sync_change_tracking_context();
         // Collect column defaults BEFORE taking the active transaction.
         // `column_defaults_by_root_page()` calls `evaluate_column_default_value()`
         // which uses `execute_statement` internally.  If `active_txn` were already
@@ -14831,6 +14869,11 @@ impl Connection {
         // Always restore the transaction handle, even on error.
         if let Some(txn) = txn_back {
             *self.active_txn.borrow_mut() = Some(txn);
+        }
+        if let Ok((_, _, last_insert_rowid)) = result.as_ref()
+            && *last_insert_rowid != 0
+        {
+            self.record_last_insert_rowid(*last_insert_rowid);
         }
         result
     }
@@ -19738,7 +19781,7 @@ struct ConcurrentExecContext {
     busy_timeout_ms: u64,
 }
 
-type TableProgramExecResult = Result<(Vec<Row>, usize)>;
+type TableProgramExecResult = Result<(Vec<Row>, usize, i64)>;
 type TableProgramExecOutcome = (TableProgramExecResult, Option<Box<dyn TransactionHandle>>);
 
 #[allow(clippy::too_many_arguments)]
@@ -19817,11 +19860,7 @@ fn execute_table_program_with_db(
     if exec_res.is_err() || matches!(exec_res, Ok(ExecOutcome::Error { .. })) {
         record_trace_export_error();
     }
-    // Track the last inserted rowid from the VDBE engine.
     let engine_rowid = engine.last_insert_rowid();
-    if engine_rowid != 0 {
-        set_last_insert_rowid(engine_rowid);
-    }
 
     if let Some(db_value) = engine.take_database() {
         *db.borrow_mut() = db_value;
@@ -19840,6 +19879,7 @@ fn execute_table_program_with_db(
                 .map(|values| Row { values })
                 .collect(),
             changes,
+            engine_rowid,
         )),
         Ok(ExecOutcome::Error { code, message }) => Err(FrankenError::Internal(format!(
             "VDBE halted with code {code}: {message}",
@@ -24710,6 +24750,55 @@ mod tests {
             .unwrap();
 
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_query_with_params_select_in_subquery_cache_is_param_sensitive() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, payload TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE filters (item_id INTEGER, threshold INTEGER)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO items (id, payload) VALUES
+             (1, 'alpha'),
+             (2, 'beta'),
+             (3, 'gamma')",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO filters (item_id, threshold) VALUES
+             (1, 10),
+             (2, 20),
+             (3, 30)",
+        )
+        .unwrap();
+
+        let sql = "SELECT payload FROM items WHERE id IN (SELECT item_id FROM filters WHERE threshold >= ?1) ORDER BY id";
+
+        let first = conn
+            .query_with_params(sql, &[SqliteValue::Integer(20)])
+            .unwrap();
+        assert_eq!(
+            first.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Text("beta".to_owned())],
+                vec![SqliteValue::Text("gamma".to_owned())],
+            ]
+        );
+
+        let second = conn
+            .query_with_params(sql, &[SqliteValue::Integer(30)])
+            .unwrap();
+        assert_eq!(
+            second.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Text("gamma".to_owned())]]
+        );
+
+        let third = conn
+            .query_with_params(sql, &[SqliteValue::Integer(99)])
+            .unwrap();
+        assert!(third.is_empty());
     }
 
     #[test]
@@ -64079,6 +64168,98 @@ mod pager_routing_tests {
         }
     }
 
+    #[test]
+    fn test_failed_insert_preserves_last_insert_rowid_and_total_changes() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO t(v) VALUES(1);").unwrap();
+
+        let err = conn.execute("INSERT INTO t(v) VALUES(1);").unwrap_err();
+        assert!(
+            matches!(err, FrankenError::UniqueViolation { .. }),
+            "unexpected error: {err}"
+        );
+
+        let rows = conn
+            .query("SELECT last_insert_rowid(), total_changes();")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_change_tracking_is_connection_scoped() {
+        let conn1 = Connection::open(":memory:").unwrap();
+        conn1
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn1.execute("INSERT INTO t(v) VALUES(10);").unwrap();
+
+        let conn1_rows = conn1
+            .query("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        assert_eq!(conn1_rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(conn1_rows[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(conn1_rows[0].values()[2], SqliteValue::Integer(1));
+
+        let conn2 = Connection::open(":memory:").unwrap();
+        let conn2_initial = conn2
+            .query("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        assert_eq!(conn2_initial[0].values()[0], SqliteValue::Integer(0));
+        assert_eq!(conn2_initial[0].values()[1], SqliteValue::Integer(0));
+        assert_eq!(conn2_initial[0].values()[2], SqliteValue::Integer(0));
+
+        conn2
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn2.execute("INSERT INTO t(v) VALUES(20);").unwrap();
+
+        let conn1_again = conn1
+            .query("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        assert_eq!(conn1_again[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(conn1_again[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(conn1_again[0].values()[2], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_prepared_change_tracking_is_connection_scoped() {
+        let conn1 = Connection::open(":memory:").unwrap();
+        conn1
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn1.execute("INSERT INTO t(v) VALUES(10);").unwrap();
+
+        let stmt1 = conn1
+            .prepare("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        let conn1_rows = stmt1.query().unwrap();
+        assert_eq!(conn1_rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(conn1_rows[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(conn1_rows[0].values()[2], SqliteValue::Integer(1));
+
+        let conn2 = Connection::open(":memory:").unwrap();
+        let stmt2 = conn2
+            .prepare("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        let conn2_initial = stmt2.query().unwrap();
+        assert_eq!(conn2_initial[0].values()[0], SqliteValue::Integer(0));
+        assert_eq!(conn2_initial[0].values()[1], SqliteValue::Integer(0));
+        assert_eq!(conn2_initial[0].values()[2], SqliteValue::Integer(0));
+
+        conn2
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn2.execute("INSERT INTO t(v) VALUES(20);").unwrap();
+
+        let conn1_again = stmt1.query().unwrap();
+        assert_eq!(conn1_again[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(conn1_again[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(conn1_again[0].values()[2], SqliteValue::Integer(1));
+    }
+
     /// Conformance oracle: multiple ORDER BY expressions.
     #[test]
     fn test_conformance_multi_order_by_exprs() {
@@ -66120,7 +66301,7 @@ mod pager_routing_tests {
 
     /// Oracle: Window functions (ROW_NUMBER, RANK, SUM OVER, etc.).
     #[test]
-    #[ignore] // Window functions not yet wired through VDBE codegen
+    #[ignore = "Window functions not yet wired through VDBE codegen"]
     fn test_conformance_window_func_basic() {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -66660,7 +66841,7 @@ mod pager_routing_tests {
     /// Oracle: Views — creation, querying, interaction with underlying data changes.
     /// Known gap: VDBE root page tracking breaks for views after DML on underlying table.
     #[test]
-    #[ignore]
+    #[ignore = "not yet supported"]
     fn test_conformance_view_live_data() {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -67852,10 +68033,9 @@ mod pager_routing_tests {
         }
 
         // REPLACE conflicts on UNIQUE name
-        for s in &["REPLACE INTO t(name, score) VALUES('Bob', 999)"] {
-            fconn.execute(s).unwrap();
-            rconn.execute_batch(s).unwrap();
-        }
+        let s = "REPLACE INTO t(name, score) VALUES('Bob', 999)";
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
 
         let queries2 = [
             "SELECT * FROM t ORDER BY id",
@@ -68800,10 +68980,9 @@ mod pager_routing_tests {
         }
 
         // INSERT OR REPLACE conflicting on composite UNIQUE
-        for s in &["INSERT OR REPLACE INTO t VALUES(4, 'x', 'y', 99)"] {
-            fconn.execute(s).unwrap();
-            rconn.execute_batch(s).unwrap();
-        }
+        let s = "INSERT OR REPLACE INTO t VALUES(4, 'x', 'y', 99)";
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
 
         let queries = [
             "SELECT * FROM t ORDER BY id",

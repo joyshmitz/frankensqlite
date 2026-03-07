@@ -43,6 +43,21 @@ thread_local! {
     static TOTAL_CHANGES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
+/// Connection-scoped change-tracking state projected into builtin execution context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChangeTrackingState {
+    pub last_insert_rowid: i64,
+    pub last_changes: i64,
+    pub total_changes: i64,
+}
+
+/// Replace the full builtin change-tracking context.
+pub fn set_change_tracking_state(state: ChangeTrackingState) {
+    LAST_INSERT_ROWID.set(state.last_insert_rowid);
+    LAST_CHANGES.set(state.last_changes);
+    TOTAL_CHANGES.set(state.total_changes);
+}
+
 /// Set the last insert rowid (called by Connection after INSERT).
 pub fn set_last_insert_rowid(rowid: i64) {
     LAST_INSERT_ROWID.set(rowid);

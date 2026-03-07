@@ -184,7 +184,10 @@ impl FrameStack {
 
         // Check Cx memory budget BEFORE allocating.
         let frame_mem = frame.estimated_memory();
-        let new_total = self.current_memory + frame_mem;
+        let new_total = self
+            .current_memory
+            .checked_add(frame_mem)
+            .ok_or(FrankenError::OutOfMemory)?;
         if new_total > self.cx_memory_budget {
             return Err(FrankenError::OutOfMemory);
         }
@@ -604,6 +607,24 @@ mod tests {
             stack.top().unwrap().registers[0],
             SqliteValue::Null
         ));
+    }
+
+    #[test]
+    fn test_push_frame_rejects_accounting_overflow() {
+        let frame = make_frame(0, 1, 0, 0, "trg_overflow");
+        let frame_mem = frame.estimated_memory();
+        assert!(frame_mem > 0);
+
+        let preloaded_memory = usize::MAX - (frame_mem - 1);
+        let mut stack = FrameStack::new(SQLITE_MAX_TRIGGER_DEPTH, usize::MAX);
+        stack.current_memory = preloaded_memory;
+
+        let err = stack
+            .push_frame(frame)
+            .expect_err("overflowed memory accounting must fail cleanly");
+        assert!(matches!(err, FrankenError::OutOfMemory));
+        assert_eq!(stack.depth(), 0);
+        assert_eq!(stack.current_memory(), preloaded_memory);
     }
 
     #[test]

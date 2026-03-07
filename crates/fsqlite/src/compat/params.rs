@@ -25,7 +25,7 @@ macro_rules! params {
 
 /// Wrapper around `SqliteValue` that provides additional `From` impls needed
 /// by the `params!` macro (bool, u32, u64, usize, `Option<T>`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParamValue(pub SqliteValue);
 
 impl ParamValue {

@@ -91,3 +91,7 @@ harness = false
 [[bench]]
 name = "operation_baseline_bench"
 harness = false
+
+[[bin]]
+name = "comprehensive-bench"
+path = "src/bin/comprehensive_bench.rs"

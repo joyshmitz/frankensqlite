@@ -159,6 +159,8 @@ pub struct Scope {
     pub using_columns: HashSet<String>,
     /// CTE names visible in this scope.
     ctes: HashSet<String>,
+    /// Aliases that can only be referenced by qualified names (e.g. UPSERT's "excluded").
+    qualified_only: HashSet<String>,
     /// Parent scope (for subquery nesting).
     parent: Option<Box<Self>>,
 }
@@ -172,6 +174,7 @@ impl Scope {
             columns: HashMap::new(),
             using_columns: HashSet::new(),
             ctes: HashSet::new(),
+            qualified_only: HashSet::new(),
             parent: None,
         }
     }
@@ -184,6 +187,7 @@ impl Scope {
             columns: HashMap::new(),
             using_columns: HashSet::new(),
             ctes: HashSet::new(),
+            qualified_only: HashSet::new(),
             parent: Some(Box::new(parent)),
         }
     }
@@ -198,6 +202,17 @@ impl Scope {
             self.aliases.insert(key.clone(), table_name.to_owned());
             self.columns.insert(key, columns);
         }
+    }
+
+    /// Register an alias that does not participate in unqualified column resolution.
+    pub fn add_qualified_only_alias(
+        &mut self,
+        alias: &str,
+        table_name: &str,
+        columns: Option<HashSet<String>>,
+    ) {
+        self.add_alias(alias, table_name, columns);
+        self.qualified_only.insert(alias.to_ascii_lowercase());
     }
 
     /// Register a CTE name.
@@ -276,6 +291,9 @@ impl Scope {
         let mut unknown_matches = Vec::new();
 
         for (alias, cols) in &self.columns {
+            if self.qualified_only.contains(alias) {
+                continue;
+            }
             if self.aliases.get(alias).map(String::as_str) == Some("<AMBIGUOUS>") {
                 continue; // Do not resolve unqualified columns from ambiguous aliases
             }
@@ -501,11 +519,10 @@ impl<'a> Resolver<'a> {
                 if let Some(ref with) = insert.with {
                     self.resolve_with_clause(with, scope);
                 }
+
+                // Resolve the data source (VALUES or SELECT).
+                // The target table is NOT visible to the body.
                 match &insert.source {
-                    fsqlite_ast::InsertSource::Select(select) => {
-                        let mut source_scope = scope.clone();
-                        self.resolve_select(select, &mut source_scope);
-                    }
                     fsqlite_ast::InsertSource::Values(rows) => {
                         for row in rows {
                             for expr in row {
@@ -513,14 +530,34 @@ impl<'a> Resolver<'a> {
                             }
                         }
                     }
+                    fsqlite_ast::InsertSource::Select(select) => {
+                        let mut source_scope = scope.clone();
+                        self.resolve_select(select, &mut source_scope);
+                    }
                     fsqlite_ast::InsertSource::DefaultValues => {}
                 }
 
+                // Bind the target table so RETURNING or UPSERT can reference it.
                 self.bind_table_to_scope(&insert.table.name, None, scope);
-                for col in &insert.columns {
-                    self.resolve_unqualified_column(col, scope, false);
+
+                // Scope strictly for target column checks
+                let mut target_scope = Scope::root();
+                if scope.has_cte(&insert.table.name) {
+                    target_scope.add_alias(&insert.table.name, &insert.table.name, None);
+                } else if let Some(table_def) = self.schema.find_table(&insert.table.name) {
+                    let col_set: HashSet<String> = table_def
+                        .columns
+                        .iter()
+                        .map(|c| c.name.to_ascii_lowercase())
+                        .collect();
+                    target_scope.add_alias(&insert.table.name, &insert.table.name, Some(col_set));
                 }
 
+                for col in &insert.columns {
+                    self.resolve_unqualified_column(col, &target_scope, false);
+                }
+
+                // Resolve UPSERT.
                 for upsert in &insert.upsert {
                     if let Some(target) = &upsert.target {
                         for col in &target.columns {
@@ -543,7 +580,7 @@ impl<'a> Resolver<'a> {
                                     .iter()
                                     .map(|c| c.name.to_ascii_lowercase())
                                     .collect();
-                                upsert_scope.add_alias(
+                                upsert_scope.add_qualified_only_alias(
                                     "excluded",
                                     &insert.table.name,
                                     Some(col_set.clone()),
@@ -554,18 +591,18 @@ impl<'a> Resolver<'a> {
                                     Some(col_set),
                                 );
                             } else {
-                                upsert_scope.add_alias("excluded", "<pseudo>", None);
+                                upsert_scope.add_qualified_only_alias("excluded", "<pseudo>", None);
                                 upsert_scope.add_alias(alias_name, "<pseudo>", None);
                             }
 
                             for assignment in assignments {
                                 match &assignment.target {
                                     fsqlite_ast::AssignmentTarget::Column(col) => {
-                                        self.resolve_unqualified_column(col, scope, false);
+                                        self.resolve_unqualified_column(col, &target_scope, false);
                                     }
                                     fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
                                         for col in cols {
-                                            self.resolve_unqualified_column(col, scope, false);
+                                            self.resolve_unqualified_column(col, &target_scope, false);
                                         }
                                     }
                                 }
@@ -587,19 +624,36 @@ impl<'a> Resolver<'a> {
                 if let Some(ref with) = update.with {
                     self.resolve_with_clause(with, scope);
                 }
+                
+                // LIMIT and OFFSET cannot reference target or FROM tables.
+                let limit_scope = scope.clone();
+                
                 self.bind_table_to_scope(
                     &update.table.name.name,
                     update.table.alias.as_deref(),
                     scope,
                 );
+
+                // Scope strictly for target column checks
+                let mut target_scope = Scope::root();
+                self.bind_table_to_scope(
+                    &update.table.name.name,
+                    update.table.alias.as_deref(),
+                    &mut target_scope,
+                );
+
+                // The RETURNING clause can ONLY see the target table (and outer scopes/CTEs).
+                // It CANNOT see tables from the FROM clause.
+                let returning_scope = scope.clone();
+
                 for assignment in &update.assignments {
                     match &assignment.target {
                         fsqlite_ast::AssignmentTarget::Column(col) => {
-                            self.resolve_unqualified_column(col, scope, false);
+                            self.resolve_unqualified_column(col, &target_scope, false);
                         }
                         fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
                             for col in cols {
-                                self.resolve_unqualified_column(col, scope, false);
+                                self.resolve_unqualified_column(col, &target_scope, false);
                             }
                         }
                     }
@@ -614,15 +668,15 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(where_clause, scope);
                 }
                 for ret in &update.returning {
-                    self.resolve_result_column(ret, scope);
+                    self.resolve_result_column(ret, &returning_scope);
                 }
                 for term in &update.order_by {
                     self.resolve_expr(&term.expr, scope);
                 }
                 if let Some(limit) = &update.limit {
-                    self.resolve_expr(&limit.limit, scope);
+                    self.resolve_expr(&limit.limit, &limit_scope);
                     if let Some(offset) = &limit.offset {
-                        self.resolve_expr(offset, scope);
+                        self.resolve_expr(offset, &limit_scope);
                     }
                 }
             }
@@ -631,6 +685,10 @@ impl<'a> Resolver<'a> {
                 if let Some(ref with) = delete.with {
                     self.resolve_with_clause(with, scope);
                 }
+                
+                // LIMIT and OFFSET cannot reference the target table.
+                let limit_scope = scope.clone();
+                
                 self.bind_table_to_scope(
                     &delete.table.name.name,
                     delete.table.alias.as_deref(),
@@ -646,9 +704,9 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(&term.expr, scope);
                 }
                 if let Some(limit) = &delete.limit {
-                    self.resolve_expr(&limit.limit, scope);
+                    self.resolve_expr(&limit.limit, &limit_scope);
                     if let Some(offset) = &limit.offset {
-                        self.resolve_expr(offset, scope);
+                        self.resolve_expr(offset, &limit_scope);
                     }
                 }
             }
@@ -1858,5 +1916,19 @@ mod tests {
             errors_glob[0].kind,
             SemanticErrorKind::FunctionArityMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn test_update_assignment_target_strict() {
+        let schema = make_schema();
+        // The outer query has a table `orders` with `amount`.
+        // The inner query updates `users`.
+        // `users` does not have `amount`.
+        // If the assignment target incorrectly resolves against the outer scope, no error is emitted.
+        // It SHOULD emit an error because `amount` is not in `users`.
+        let stmt = parse_one("WITH cte(amount) AS (SELECT 1) UPDATE users SET amount = 1 FROM cte");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert_eq!(errors.len(), 1, "Should report amount as unresolved for users table, instead got: {:?}", errors);
     }
 }

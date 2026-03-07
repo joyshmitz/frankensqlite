@@ -1641,12 +1641,8 @@ where
         }
 
         let new_page_count = inner.db_size;
-        let seq_plus_one = inner.commit_seq.get().wrapping_add(1);
-        let new_change_counter = seq_plus_one as u32;
 
-        page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
         page1[28..32].copy_from_slice(&new_page_count.to_be_bytes());
-        page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
         inner.db_file.write(cx, &page1, 0)?;
         inner.cache.evict(PageNumber::ONE);
         Ok(())

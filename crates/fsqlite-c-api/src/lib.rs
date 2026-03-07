@@ -990,6 +990,15 @@ pub unsafe extern "C" fn sqlite3_column_blob(
 pub unsafe extern "C" fn sqlite3_column_bytes(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_int {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
+    if stmt.is_null() || i_col < 0 {
+        return 0;
+    }
+
+    let s = &*stmt;
+    if let Some(Some(text)) = s.text_cache.get(i_col as usize) {
+        return c_int::try_from(text.as_bytes().len()).unwrap_or(c_int::MAX);
+    }
+
     match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Blob(b)) => b.len() as c_int,
         Some(SqliteValue::Text(s)) => s.len() as c_int,
@@ -1722,6 +1731,26 @@ mod tests {
 
             assert_eq!(sqlite3_column_bytes(stmt, 0), 5); // "hello" = 5 bytes
             assert_eq!(sqlite3_column_bytes(stmt, 1), 4); // X'DEADBEEF' = 4 bytes
+
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_column_bytes_matches_text_coercion_for_blob() {
+        unsafe {
+            let db = open_memory();
+
+            let sql = CString::new("SELECT X'CAFE';").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut());
+            sqlite3_step(stmt);
+
+            let text = sqlite3_column_text(stmt, 0);
+            assert!(!text.is_null());
+            assert_eq!(CStr::from_ptr(text).to_str().unwrap(), "CAFE");
+            assert_eq!(sqlite3_column_bytes(stmt, 0), 4);
 
             sqlite3_finalize(stmt);
             sqlite3_close(db);

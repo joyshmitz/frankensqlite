@@ -97,8 +97,9 @@ pub use agg_builtins::register_aggregate_builtins;
 pub use aggregate::{AggregateAdapter, AggregateFunction};
 pub use authorizer::{AuthAction, AuthResult, Authorizer, AuthorizerAction, AuthorizerDecision};
 pub use builtins::{
-    get_last_changes, get_last_insert_rowid, get_total_changes, register_builtins,
-    reset_total_changes, set_last_changes, set_last_insert_rowid,
+    ChangeTrackingState, get_last_changes, get_last_insert_rowid, get_total_changes,
+    register_builtins, reset_total_changes, set_change_tracking_state, set_last_changes,
+    set_last_insert_rowid,
 };
 pub use collation::{
     BinaryCollation, CollationAnnotation, CollationFunction, CollationRegistry, CollationSource,

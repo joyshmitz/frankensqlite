@@ -67,3 +67,33 @@ fn test_index_delete_interior() {
     );
     assert!(cursor.eof(), "cursor must remain at EOF for empty tree");
 }
+
+#[test]
+fn test_index_delete_interior_needs_rebalance() {
+    let cx = Cx::new();
+    let root = PageNumber::new(2).unwrap();
+    // 512 byte pages so it splits quickly
+    let store = MemPageStore::with_empty_index(root, 512);
+    let mut cursor = BtCursor::new(store, root, 512, false);
+
+    // Let's explicitly construct the case.
+    // Insert 10 (size 10), 20 (size 10), 30 (size 10)
+    // 40 (size 10), 50 (size 10), 60 (size 10).
+    // Let's just insert 0..100 with alternating sizes!
+    // If i == 20, size = 10 (interior maybe?)
+    // If i == 21, size = 200 (successor)
+    for i in 0..100_u32 {
+        let mut key = vec![0u8; if i % 2 == 0 { 10 } else { 200 }];
+        key[0..4].copy_from_slice(&i.to_be_bytes());
+        cursor.index_insert(&cx, &key).unwrap();
+    }
+    
+    // Now delete everything!
+    for i in 0..100_u32 {
+        let mut key = vec![0u8; if i % 2 == 0 { 10 } else { 200 }];
+        key[0..4].copy_from_slice(&i.to_be_bytes());
+        if cursor.index_move_to(&cx, &key).unwrap().is_found() {
+            cursor.delete(&cx).unwrap();
+        }
+    }
+}
