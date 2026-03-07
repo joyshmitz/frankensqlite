@@ -10544,7 +10544,7 @@ impl Connection {
                             ..
                         },
                     ..
-                } if is_agg_fn(name) => {
+                } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
                     let func = name.to_ascii_lowercase();
                     let mut arg_expr = None;
                     let mut separator = None;
@@ -10931,7 +10931,7 @@ impl Connection {
         let empty_col_map: Vec<(String, String)> = Vec::new();
 
         // If there is a WHERE clause that evaluates to false/NULL, the
-        // implicit single row is excluded — aggregates return empty-set
+        // implicit single row is excluded -- aggregates return empty-set
         // defaults (COUNT→0, SUM/AVG/etc.→NULL, TOTAL→0.0).
         let row_included = if let Some(wh) = where_clause {
             let val = eval_join_expr(wh, &empty_row, &empty_col_map).unwrap_or(SqliteValue::Null);
@@ -10953,10 +10953,10 @@ impl Connection {
                             ..
                         },
                     ..
-                } if is_agg_fn(name) => {
+                } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
                     let func = name.to_ascii_lowercase();
                     if !row_included {
-                        // WHERE excluded the implicit row — empty-set defaults.
+                        // WHERE excluded the implicit row -- aggregates return empty-set defaults.
                         values.push(empty_aggregate_default(&func));
                         continue;
                     }
@@ -11160,7 +11160,7 @@ impl Connection {
                             ..
                         },
                     ..
-                } if is_agg_fn(name) => {
+                } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
                     let func = name.to_ascii_lowercase();
                     let mut arg_expr = None;
                     let mut separator = None;
@@ -13579,10 +13579,10 @@ fn expr_has_aggregate(expr: &Expr) -> bool {
             over: None,
             ..
         } => {
-            if is_agg_fn(name) {
+            if is_agg_fn(name) && !is_scalar_max_min(name, args) {
                 return true;
             }
-            // Non-aggregate function — check arguments recursively
+            // Non-aggregate function -- check arguments recursively
             match args {
                 FunctionArgs::List(exprs) => exprs.iter().any(expr_has_aggregate),
                 FunctionArgs::Star => false,
@@ -15017,11 +15017,17 @@ fn is_agg_fn(name: &str) -> bool {
     AGG_NAMES.iter().any(|&n| n == lower)
 }
 
+/// Returns true if this is a scalar max/min call (2+ arguments), not aggregate.
+fn is_scalar_max_min(name: &str, args: &FunctionArgs) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower == "max" || lower == "min") && matches!(args, FunctionArgs::List(a) if a.len() >= 2)
+}
+
 /// Check whether an expression tree contains any aggregate function calls.
 fn expr_contains_agg(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { name, args, .. } => {
-            if is_agg_fn(name) {
+            if is_agg_fn(name) && !is_scalar_max_min(name, args) {
                 return true;
             }
             match args {
@@ -15070,7 +15076,7 @@ fn eval_group_agg_join_expr(
             args,
             distinct,
             ..
-        } if is_agg_fn(name) => {
+        } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
             let func = name.to_ascii_lowercase();
             match args {
                 FunctionArgs::Star => {
@@ -15538,9 +15544,9 @@ fn evaluate_having_predicate(
 
 /// Evaluate a HAVING expression to a `SqliteValue`.
 ///
-/// First tries to resolve from the already-computed result `values` (matching against
-/// `descriptors`/`columns`). Falls back to computing aggregates directly from
-/// `group_rows` for HAVING expressions that reference aggregates not in SELECT.
+/// First tries to resolve from the already-computed result values (matching against
+/// descriptors/columns). Falls back to computing aggregates directly from
+/// group_rows for HAVING expressions that reference aggregates not in SELECT.
 #[allow(clippy::too_many_lines)]
 fn evaluate_having_value(
     expr: &Expr,
@@ -15551,13 +15557,13 @@ fn evaluate_having_value(
     col_map: &[(String, String)],
 ) -> SqliteValue {
     match expr {
-        // Aggregate function — first try matching a result column, then compute directly.
+        // Aggregate function -- first try matching a result column, then compute directly.
         Expr::FunctionCall {
             name,
             args,
             distinct: having_distinct,
             ..
-        } if is_agg_fn(name) => {
+        } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
             let lower = name.to_ascii_lowercase();
             // Try to find a matching aggregate in the result descriptors.
             for (i, desc) in descriptors.iter().enumerate() {
@@ -44297,6 +44303,178 @@ mod pager_routing_tests {
             panic!(
                 "{} schema introspection conformance mismatches found",
                 all.len()
+            );
+        }
+    }
+
+    /// REPLACE INTO, INSERT...SELECT, and multi-row INSERT edge cases.
+    #[test]
+    fn test_conformance_replace_and_insert_select() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE config (key TEXT PRIMARY KEY, val TEXT);",
+            "INSERT INTO config VALUES ('host', 'localhost');",
+            "INSERT INTO config VALUES ('port', '8080');",
+            "INSERT INTO config VALUES ('debug', 'false');",
+            "CREATE TABLE backup (key TEXT PRIMARY KEY, val TEXT);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // REPLACE INTO existing key
+        let r1 = "REPLACE INTO config VALUES ('host', '0.0.0.0')";
+        fconn.execute(r1).unwrap();
+        rconn.execute_batch(r1).unwrap();
+
+        // REPLACE INTO new key
+        let r2 = "REPLACE INTO config VALUES ('timeout', '30')";
+        fconn.execute(r2).unwrap();
+        rconn.execute_batch(r2).unwrap();
+
+        let q1 = ["SELECT key, val FROM config ORDER BY key"];
+        let m1 = oracle_compare(&fconn, &rconn, &q1);
+
+        // INSERT INTO...SELECT
+        let ins = "INSERT INTO backup SELECT * FROM config";
+        fconn.execute(ins).unwrap();
+        rconn.execute_batch(ins).unwrap();
+
+        let q2 = ["SELECT key, val FROM backup ORDER BY key"];
+        let m2 = oracle_compare(&fconn, &rconn, &q2);
+
+        // INSERT with multiple VALUES
+        let multi = "INSERT INTO config VALUES ('a', '1'), ('b', '2'), ('c', '3')";
+        fconn.execute(multi).unwrap();
+        rconn.execute_batch(multi).unwrap();
+
+        let q3 = ["SELECT count(*) FROM config"];
+        let m3 = oracle_compare(&fconn, &rconn, &q3);
+
+        let mut all = Vec::new();
+        all.extend(m1);
+        all.extend(m2);
+        all.extend(m3);
+        if !all.is_empty() {
+            for m in &all {
+                eprintln!("{m}\n");
+            }
+            panic!("{} REPLACE/INSERT conformance mismatches found", all.len());
+        }
+    }
+
+    /// Index-ordered queries: ORDER BY on indexed column should produce
+    /// correct results regardless of index scan vs table scan.
+    #[test]
+    fn test_conformance_index_ordered_queries() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL);",
+            "CREATE INDEX idx_items_name ON items (name);",
+            "CREATE INDEX idx_items_cat_price ON items (category, price);",
+            "INSERT INTO items VALUES (1, 'cherry', 'fruit', 3.00);",
+            "INSERT INTO items VALUES (2, 'apple', 'fruit', 1.50);",
+            "INSERT INTO items VALUES (3, 'banana', 'fruit', 0.75);",
+            "INSERT INTO items VALUES (4, 'drill', 'tool', 29.99);",
+            "INSERT INTO items VALUES (5, 'hammer', 'tool', 12.99);",
+            "INSERT INTO items VALUES (6, 'saw', 'tool', 19.99);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // ORDER BY indexed column
+            "SELECT name FROM items ORDER BY name",
+            "SELECT name FROM items ORDER BY name DESC",
+            // WHERE + ORDER BY on same index
+            "SELECT name, price FROM items WHERE category = 'fruit' ORDER BY price",
+            "SELECT name, price FROM items WHERE category = 'tool' ORDER BY price DESC",
+            // Covering index query
+            "SELECT category, price FROM items ORDER BY category, price",
+            // WHERE on indexed column
+            "SELECT id, name FROM items WHERE name = 'apple'",
+            "SELECT id, name FROM items WHERE name > 'c' ORDER BY name",
+            "SELECT id, name FROM items WHERE name BETWEEN 'b' AND 'd' ORDER BY name",
+            // Aggregate with index
+            "SELECT category, min(price), max(price) FROM items GROUP BY category ORDER BY category",
+            // DISTINCT on indexed column
+            "SELECT DISTINCT category FROM items ORDER BY category",
+            // Count with WHERE on index
+            "SELECT count(*) FROM items WHERE category = 'fruit'",
+            "SELECT count(*) FROM items WHERE name LIKE 'a%'",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} index-ordered query conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Numeric edge cases: integer overflow, float precision, division by zero,
+    /// very large/small numbers, and mixed-type arithmetic.
+    #[test]
+    fn test_conformance_numeric_edge_cases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // Integer boundaries
+            "SELECT 9223372036854775807",
+            "SELECT -9223372036854775808",
+            // Integer overflow wraps to float in SQLite
+            "SELECT 9223372036854775807 + 1",
+            "SELECT -9223372036854775808 - 1",
+            // Division
+            "SELECT 10 / 3",
+            "SELECT 10.0 / 3.0",
+            "SELECT 1 / 0",
+            "SELECT 1.0 / 0.0",
+            "SELECT 0 / 0",
+            // Modulo
+            "SELECT 10 % 3",
+            "SELECT -10 % 3",
+            "SELECT 10 % -3",
+            // Float precision
+            "SELECT 0.1 + 0.2",
+            "SELECT CAST(0.1 + 0.2 AS TEXT)",
+            // Very small/large floats
+            "SELECT 1e308",
+            "SELECT 1e-308",
+            // Comparisons across types
+            "SELECT 42 = 42.0",
+            "SELECT 42 = '42'",
+            "SELECT 42.0 = '42.0'",
+            // abs edge cases
+            "SELECT abs(-9223372036854775808)",
+            // round edge cases
+            "SELECT round(2.5)",
+            "SELECT round(3.5)",
+            "SELECT round(-2.5)",
+            "SELECT round(0.5)",
+            "SELECT round(1.5)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} numeric edge case conformance mismatches found",
+                mismatches.len()
             );
         }
     }
