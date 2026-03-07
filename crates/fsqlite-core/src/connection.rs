@@ -43571,9 +43571,7 @@ mod pager_routing_tests {
         }
 
         // INSERT...SELECT
-        let dml = [
-            "INSERT INTO dst SELECT * FROM src WHERE score >= 20",
-        ];
+        let dml = ["INSERT INTO dst SELECT * FROM src WHERE score >= 20"];
         for s in &dml {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -44164,6 +44162,146 @@ mod pager_routing_tests {
             }
             panic!(
                 "{} window function conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe CREATE TABLE AS SELECT, INSERT OR REPLACE, INSERT OR IGNORE,
+    /// and schema-modifying DDL followed by queries.
+    #[test]
+    fn test_conformance_ddl_and_upsert_patterns() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE source (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
+            "INSERT INTO source VALUES (1, 'Alice', 95);",
+            "INSERT INTO source VALUES (2, 'Bob', 80);",
+            "INSERT INTO source VALUES (3, 'Carol', 90);",
+            "INSERT INTO source VALUES (4, 'Dave', 85);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let mut mismatches = Vec::new();
+
+        // CREATE TABLE AS SELECT
+        let ctas = ["CREATE TABLE top_scorers AS SELECT * FROM source WHERE score >= 90"];
+        for op in &ctas {
+            fconn.execute(op).unwrap();
+            rconn.execute_batch(op).unwrap();
+        }
+
+        let verify1 = [
+            "SELECT * FROM top_scorers ORDER BY id",
+            "SELECT COUNT(*) FROM top_scorers",
+        ];
+        mismatches.extend(oracle_compare(&fconn, &rconn, &verify1));
+
+        // INSERT OR IGNORE + INSERT OR REPLACE
+        let upsert_setup = [
+            "CREATE TABLE kv (key TEXT PRIMARY KEY, val INTEGER);",
+            "INSERT INTO kv VALUES ('a', 1);",
+            "INSERT INTO kv VALUES ('b', 2);",
+            "INSERT OR IGNORE INTO kv VALUES ('a', 99);",
+            "INSERT OR REPLACE INTO kv VALUES ('b', 20);",
+            "INSERT OR IGNORE INTO kv VALUES ('c', 3);",
+        ];
+        for op in &upsert_setup {
+            fconn.execute(op).unwrap();
+            rconn.execute_batch(op).unwrap();
+        }
+
+        let verify2 = [
+            "SELECT * FROM kv ORDER BY key",
+            // Multiple tables after DDL
+            "SELECT s.name, k.val FROM source s JOIN kv k ON lower(substr(s.name, 1, 1)) = k.key ORDER BY s.name",
+        ];
+        mismatches.extend(oracle_compare(&fconn, &rconn, &verify2));
+
+        // ALTER TABLE ADD COLUMN
+        let alter = [
+            "ALTER TABLE source ADD COLUMN grade TEXT DEFAULT 'ungraded'",
+            "UPDATE source SET grade = 'A' WHERE score >= 90",
+            "UPDATE source SET grade = 'B' WHERE score < 90",
+        ];
+        for op in &alter {
+            fconn.execute(op).unwrap();
+            rconn.execute_batch(op).unwrap();
+        }
+
+        let verify3 = [
+            "SELECT * FROM source ORDER BY id",
+            "SELECT grade, COUNT(*) FROM source GROUP BY grade ORDER BY grade",
+        ];
+        mismatches.extend(oracle_compare(&fconn, &rconn, &verify3));
+
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} DDL/upsert conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe GROUP BY with complex expressions, multi-column aggregates,
+    /// and aggregate functions on computed expressions.
+    #[test]
+    fn test_conformance_group_by_complex() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, ts TEXT, type TEXT, amount REAL);",
+            "INSERT INTO events VALUES (1, '2024-01-15', 'sale', 100.0);",
+            "INSERT INTO events VALUES (2, '2024-01-15', 'refund', -50.0);",
+            "INSERT INTO events VALUES (3, '2024-01-16', 'sale', 200.0);",
+            "INSERT INTO events VALUES (4, '2024-01-16', 'sale', 150.0);",
+            "INSERT INTO events VALUES (5, '2024-02-01', 'sale', 300.0);",
+            "INSERT INTO events VALUES (6, '2024-02-01', 'refund', -75.0);",
+            "INSERT INTO events VALUES (7, '2024-02-15', 'sale', 50.0);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // GROUP BY substr expression (month extraction)
+            "SELECT substr(ts, 1, 7) AS month, SUM(amount) FROM events GROUP BY substr(ts, 1, 7) ORDER BY month",
+            // GROUP BY with CASE expression
+            "SELECT CASE WHEN amount > 0 THEN 'positive' ELSE 'negative' END AS sign, COUNT(*) FROM events GROUP BY 1 ORDER BY sign",
+            // GROUP BY with HAVING on different aggregate
+            "SELECT type, COUNT(*) AS cnt, SUM(amount) AS total FROM events GROUP BY type HAVING SUM(amount) > 0 ORDER BY type",
+            // Multiple aggregates
+            "SELECT type, MIN(amount), MAX(amount), AVG(amount), COUNT(*) FROM events GROUP BY type ORDER BY type",
+            // GROUP BY with computed expression in SELECT
+            "SELECT substr(ts, 1, 7) AS month, COUNT(*) AS events, SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END) AS revenue, SUM(CASE WHEN amount < 0 THEN amount ELSE 0 END) AS refunds FROM events GROUP BY 1 ORDER BY month",
+            // GROUP_CONCAT
+            "SELECT type, group_concat(CAST(id AS TEXT), ',') FROM events GROUP BY type ORDER BY type",
+            // Aggregate with WHERE filter
+            "SELECT COUNT(*) FROM events WHERE amount > 0",
+            "SELECT SUM(amount) FROM events WHERE type = 'sale'",
+            // DISTINCT aggregate
+            "SELECT COUNT(DISTINCT type) FROM events",
+            "SELECT COUNT(DISTINCT substr(ts, 1, 7)) FROM events",
+            // Empty group aggregate
+            "SELECT type, SUM(amount) FROM events WHERE id > 100 GROUP BY type ORDER BY type",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} GROUP BY complex conformance mismatches found",
                 mismatches.len()
             );
         }
