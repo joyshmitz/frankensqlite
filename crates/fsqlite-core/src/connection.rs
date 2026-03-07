@@ -2858,7 +2858,7 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &insert_event,
                 );
-                let trigger_new_rows = if has_before_insert || has_after_insert {
+                let mut trigger_new_rows = if has_before_insert || has_after_insert {
                     self.collect_insert_trigger_rows(insert, params)?
                 } else {
                     Vec::new()
@@ -2904,6 +2904,24 @@ impl Connection {
                         )?;
                         let affected =
                             self.execute_insert_select_fallback(insert, select_stmt, params)?;
+                        // Patch trigger NEW rows with actual rowids (same as VDBE path).
+                        if has_after_insert && !trigger_new_rows.is_empty() {
+                            let tbl_key = table_name.to_ascii_lowercase();
+                            if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key)
+                            {
+                                let last_rowid = get_last_insert_rowid();
+                                let count = trigger_new_rows.len();
+                                for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
+                                    if ipk_idx < new_row.len()
+                                        && new_row[ipk_idx] == SqliteValue::Null
+                                    {
+                                        #[allow(clippy::cast_possible_wrap)]
+                                        let rowid = last_rowid - (count as i64 - 1) + i as i64;
+                                        new_row[ipk_idx] = SqliteValue::Integer(rowid);
+                                    }
+                                }
+                            }
+                        }
                         // Phase 5G.3: Fire AFTER INSERT triggers.
                         if has_after_insert {
                             for new_values in &trigger_new_rows {
@@ -2954,6 +2972,23 @@ impl Connection {
                 // bd-thqgm: FK constraint checking on INSERT.
                 if self.fk_enforcement_enabled() {
                     self.enforce_fk_on_insert(insert, table_name, params)?;
+                }
+
+                // Patch trigger NEW rows: fill in auto-assigned INTEGER
+                // PRIMARY KEY rowids that were NULL at pre-computation time.
+                if has_after_insert && !trigger_new_rows.is_empty() {
+                    let tbl_key = table_name.to_ascii_lowercase();
+                    if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key) {
+                        let last_rowid = get_last_insert_rowid();
+                        let count = trigger_new_rows.len();
+                        for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
+                            if ipk_idx < new_row.len() && new_row[ipk_idx] == SqliteValue::Null {
+                                #[allow(clippy::cast_possible_wrap)]
+                                let rowid = last_rowid - (count as i64 - 1) + i as i64;
+                                new_row[ipk_idx] = SqliteValue::Integer(rowid);
+                            }
+                        }
+                    }
                 }
 
                 // Phase 5G.3: Fire AFTER INSERT triggers.
@@ -11403,8 +11438,19 @@ impl Connection {
                 }
             }
             if let Some(having) = having_expr {
+                let resolved_having;
+                let effective_having = if expr_has_any_subquery(having) {
+                    if let Some(rep) = group_rows.first() {
+                        resolved_having = self.resolve_having_subqueries(having, rep, &col_map)?;
+                        &resolved_having
+                    } else {
+                        having
+                    }
+                } else {
+                    having
+                };
                 if !evaluate_having_predicate(
-                    having,
+                    effective_having,
                     &values,
                     &result_descriptors,
                     &expanded_columns,
@@ -11448,6 +11494,18 @@ impl Connection {
                 for (_key, group_rows) in &groups {
                     // Reproduce HAVING check to stay in sync.
                     if let Some(having) = having_expr {
+                        let resolved_having;
+                        let effective_having = if expr_has_any_subquery(having) {
+                            if let Some(rep) = group_rows.first() {
+                                resolved_having =
+                                    self.resolve_having_subqueries(having, rep, &col_map)?;
+                                &resolved_having
+                            } else {
+                                having
+                            }
+                        } else {
+                            having
+                        };
                         let check_vals: Vec<SqliteValue> = result_descriptors
                             .iter()
                             .map(|desc| match desc {
@@ -11468,7 +11526,7 @@ impl Connection {
                             })
                             .collect();
                         if !evaluate_having_predicate(
-                            having,
+                            effective_having,
                             &check_vals,
                             &result_descriptors,
                             &expanded_columns,
@@ -12387,8 +12445,19 @@ impl Connection {
             }
             // Apply HAVING filter: skip groups that don't satisfy the predicate.
             if let Some(having) = having_expr {
+                let resolved_having;
+                let effective_having = if expr_has_any_subquery(having) {
+                    if let Some(rep) = group_rows.first() {
+                        resolved_having = self.resolve_having_subqueries(having, rep, &col_map)?;
+                        &resolved_having
+                    } else {
+                        having
+                    }
+                } else {
+                    having
+                };
                 if !evaluate_having_predicate(
-                    having,
+                    effective_having,
                     &values,
                     &result_descriptors,
                     &expanded_columns,
@@ -12422,6 +12491,18 @@ impl Connection {
                 let mut result_idx = 0;
                 for (_key, group_rows) in &groups {
                     if let Some(having) = having_expr {
+                        let resolved_having;
+                        let effective_having = if expr_has_any_subquery(having) {
+                            if let Some(rep) = group_rows.first() {
+                                resolved_having =
+                                    self.resolve_having_subqueries(having, rep, &col_map)?;
+                                &resolved_having
+                            } else {
+                                having
+                            }
+                        } else {
+                            having
+                        };
                         let check_vals: Vec<SqliteValue> = result_descriptors
                             .iter()
                             .map(|desc| match desc {
@@ -12442,7 +12523,7 @@ impl Connection {
                             })
                             .collect();
                         if !evaluate_having_predicate(
-                            having,
+                            effective_having,
                             &check_vals,
                             &result_descriptors,
                             &expanded_columns,
@@ -12918,19 +12999,82 @@ impl Connection {
                     }
                 } else {
                     // Single-pass: step then value per row.
-                    // For RANGE frame (default with ORDER BY), aggregate
+                    // For RANGE/GROUPS frame (default with ORDER BY), aggregate
                     // functions must treat peer groups (rows with equal ORDER
                     // BY keys) as sharing the same accumulated value.
                     // Numbering/positional functions (row_number, rank,
                     // dense_rank, lag) always produce per-row values.
                     let is_numbering_or_positional =
                         matches!(fname.as_str(), "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG");
-                    let is_range_frame = has_order
+                    let is_range_or_groups_frame = has_order
                         && !is_numbering_or_positional
-                        && frame
-                            .as_ref()
-                            .is_none_or(|f| matches!(f.frame_type, FrameType::Range));
-                    if is_range_frame {
+                        && frame.as_ref().is_none_or(|f| {
+                            matches!(f.frame_type, FrameType::Range | FrameType::Groups)
+                        });
+                    // Detect numeric offset bounds (N PRECEDING / N FOLLOWING)
+                    // for RANGE or GROUPS frames — these need per-row
+                    // recomputation instead of running accumulation.
+                    let has_numeric_offset = frame.as_ref().is_some_and(|f| {
+                        matches!(f.start, FrameBound::Preceding(_) | FrameBound::Following(_))
+                            || f.end.as_ref().is_some_and(|e| {
+                                matches!(e, FrameBound::Preceding(_) | FrameBound::Following(_))
+                            })
+                    });
+                    if is_range_or_groups_frame && has_numeric_offset {
+                        // RANGE/GROUPS with offset: sliding recomputation.
+                        let fspec = frame.as_ref().unwrap();
+                        let peer_groups = build_peer_groups(
+                            partition_indices,
+                            &win_order_by[wi],
+                            &row_values,
+                            &col_map,
+                        );
+                        if matches!(fspec.frame_type, FrameType::Groups) {
+                            // GROUPS with offset: bounds refer to group indices.
+                            for (gi, group) in peer_groups.iter().enumerate() {
+                                let (gs, ge) = groups_frame_bounds(gi, peer_groups.len(), fspec);
+                                let mut gs_state = func.initial_state();
+                                for slot_gi in gs..ge {
+                                    for &ri in &peer_groups[slot_gi] {
+                                        let args = build_window_args(
+                                            &win_args[wi],
+                                            &win_order_by[wi],
+                                            &row_values[ri],
+                                            &col_map,
+                                        )?;
+                                        func.step(&mut gs_state, &args)?;
+                                    }
+                                }
+                                let val = func.value(&gs_state)?;
+                                for _ in group {
+                                    func_vals.push(val.clone());
+                                }
+                            }
+                        } else {
+                            // RANGE with offset: bounds refer to ORDER BY values.
+                            for (pos, _ri) in partition_indices.iter().enumerate() {
+                                let (fs, fe) = range_value_frame_bounds(
+                                    pos,
+                                    partition_indices,
+                                    &win_order_by[wi],
+                                    &row_values,
+                                    &col_map,
+                                    fspec,
+                                );
+                                let mut rs_state = func.initial_state();
+                                for &slot_ri in &partition_indices[fs..fe] {
+                                    let args = build_window_args(
+                                        &win_args[wi],
+                                        &win_order_by[wi],
+                                        &row_values[slot_ri],
+                                        &col_map,
+                                    )?;
+                                    func.step(&mut rs_state, &args)?;
+                                }
+                                func_vals.push(func.value(&rs_state)?);
+                            }
+                        }
+                    } else if is_range_or_groups_frame {
                         let psize = partition_indices.len();
                         let mut pos = 0;
                         while pos < psize {
@@ -14095,6 +14239,147 @@ impl Connection {
                 Ok(Expr::Cast {
                     expr: Box::new(inlined),
                     type_name: type_name.clone(),
+                    span: *span,
+                })
+            }
+            _ => Ok(expr.clone()),
+        }
+    }
+
+    /// Resolve EXISTS / scalar Subquery nodes inside a HAVING expression by
+    /// substituting outer column references from the group's representative
+    /// row and executing each subquery eagerly.  Returns a rewritten
+    /// expression with those nodes replaced by literal values.
+    fn resolve_having_subqueries(
+        &self,
+        expr: &Expr,
+        row: &[SqliteValue],
+        col_map: &[(String, String)],
+    ) -> Result<Expr> {
+        match expr {
+            Expr::Exists {
+                subquery,
+                not,
+                span,
+            } => {
+                let inner_tables = collect_subquery_inner_tables(subquery);
+                let mut sub_clone = subquery.as_ref().clone();
+                substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
+                let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                let exists = !rows.is_empty();
+                let truth = if *not { !exists } else { exists };
+                Ok(Expr::Literal(Literal::Integer(i64::from(truth)), *span))
+            }
+            Expr::Subquery(sub, span) => {
+                let inner_tables = collect_subquery_inner_tables(sub);
+                let mut sub_clone = sub.as_ref().clone();
+                substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
+                let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                let val = rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.values.into_iter().next())
+                    .unwrap_or(SqliteValue::Null);
+                Ok(Expr::Literal(sqlite_value_to_literal(&val), *span))
+            }
+            Expr::BinaryOp {
+                left,
+                op,
+                right,
+                span,
+            } => {
+                let l = self.resolve_having_subqueries(left, row, col_map)?;
+                let r = self.resolve_having_subqueries(right, row, col_map)?;
+                Ok(Expr::BinaryOp {
+                    left: Box::new(l),
+                    op: *op,
+                    right: Box::new(r),
+                    span: *span,
+                })
+            }
+            Expr::UnaryOp {
+                op,
+                expr: inner,
+                span,
+            } => {
+                let inlined = self.resolve_having_subqueries(inner, row, col_map)?;
+                Ok(Expr::UnaryOp {
+                    op: *op,
+                    expr: Box::new(inlined),
+                    span: *span,
+                })
+            }
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+                order_by,
+                filter,
+                over,
+                span,
+            } => {
+                let new_args = match args {
+                    FunctionArgs::List(exprs) => {
+                        let new_exprs: Result<Vec<_>> = exprs
+                            .iter()
+                            .map(|e| self.resolve_having_subqueries(e, row, col_map))
+                            .collect();
+                        FunctionArgs::List(new_exprs?)
+                    }
+                    FunctionArgs::Star => FunctionArgs::Star,
+                };
+                Ok(Expr::FunctionCall {
+                    name: name.clone(),
+                    args: new_args,
+                    distinct: *distinct,
+                    order_by: order_by.clone(),
+                    filter: filter
+                        .as_ref()
+                        .map(|f| self.resolve_having_subqueries(f, row, col_map))
+                        .transpose()?
+                        .map(Box::new),
+                    over: over.clone(),
+                    span: *span,
+                })
+            }
+            Expr::In {
+                expr: inner,
+                set,
+                not,
+                span,
+            } => {
+                let new_inner = self.resolve_having_subqueries(inner, row, col_map)?;
+                let new_set = match set {
+                    InSet::Subquery(sub) => {
+                        let inner_tables = collect_subquery_inner_tables(sub);
+                        let mut sub_clone = sub.as_ref().clone();
+                        substitute_outer_refs_in_select(
+                            &mut sub_clone,
+                            row,
+                            col_map,
+                            &inner_tables,
+                        );
+                        let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                        let literals: Vec<Expr> = rows
+                            .into_iter()
+                            .filter_map(|r| r.values.into_iter().next())
+                            .map(value_to_literal_expr)
+                            .collect();
+                        InSet::List(literals)
+                    }
+                    InSet::List(exprs) => {
+                        let new_exprs: Result<Vec<_>> = exprs
+                            .iter()
+                            .map(|e| self.resolve_having_subqueries(e, row, col_map))
+                            .collect();
+                        InSet::List(new_exprs?)
+                    }
+                    other => other.clone(),
+                };
+                Ok(Expr::In {
+                    expr: Box::new(new_inner),
+                    set: new_set,
+                    not: *not,
                     span: *span,
                 })
             }
@@ -17129,6 +17414,145 @@ fn is_rows_sliding_frame(frame: Option<&FrameSpec>) -> bool {
     });
     // At least one bound is not UNBOUNDED.
     start_explicit || end_explicit
+}
+
+/// Build peer groups from a sorted partition: groups of row indices where
+/// all rows in a group have equal ORDER BY key values.
+fn build_peer_groups(
+    partition_indices: &[usize],
+    order_by: &[(Expr, bool)],
+    row_values: &[Vec<SqliteValue>],
+    col_map: &[(String, String)],
+) -> Vec<Vec<usize>> {
+    if partition_indices.is_empty() {
+        return Vec::new();
+    }
+    let mut groups: Vec<Vec<usize>> = vec![vec![partition_indices[0]]];
+    for &ri in &partition_indices[1..] {
+        let prev_ri = *groups.last().unwrap().last().unwrap();
+        let same = order_by.iter().all(|(oexpr, _)| {
+            let va =
+                eval_join_expr(oexpr, &row_values[prev_ri], col_map).unwrap_or(SqliteValue::Null);
+            let vb = eval_join_expr(oexpr, &row_values[ri], col_map).unwrap_or(SqliteValue::Null);
+            cmp_sqlite_values(&va, &vb) == std::cmp::Ordering::Equal
+        });
+        if same {
+            groups.last_mut().unwrap().push(ri);
+        } else {
+            groups.push(vec![ri]);
+        }
+    }
+    groups
+}
+
+/// Compute GROUPS frame bounds (start group index, end group index exclusive).
+fn groups_frame_bounds(group_pos: usize, num_groups: usize, frame: &FrameSpec) -> (usize, usize) {
+    let start = match &frame.start {
+        FrameBound::UnboundedPreceding => 0,
+        FrameBound::CurrentRow => group_pos,
+        FrameBound::Preceding(expr) => {
+            let n = resolve_frame_bound_offset(&FrameBound::Preceding(expr.clone())).unwrap_or(0);
+            group_pos.saturating_sub(n)
+        }
+        FrameBound::Following(expr) => {
+            let n = resolve_frame_bound_offset(&FrameBound::Following(expr.clone())).unwrap_or(0);
+            (group_pos + n).min(num_groups)
+        }
+        FrameBound::UnboundedFollowing => num_groups,
+    };
+    let end_inclusive = match frame.end.as_ref().unwrap_or(&FrameBound::CurrentRow) {
+        FrameBound::UnboundedFollowing => num_groups.saturating_sub(1),
+        FrameBound::CurrentRow => group_pos,
+        FrameBound::Following(expr) => {
+            let n = resolve_frame_bound_offset(&FrameBound::Following(expr.clone())).unwrap_or(0);
+            (group_pos + n).min(num_groups.saturating_sub(1))
+        }
+        FrameBound::Preceding(expr) => {
+            let n = resolve_frame_bound_offset(&FrameBound::Preceding(expr.clone())).unwrap_or(0);
+            group_pos.saturating_sub(n)
+        }
+        FrameBound::UnboundedPreceding => 0,
+    };
+    (start, end_inclusive + 1)
+}
+
+/// Compute RANGE frame bounds based on ORDER BY values.
+/// Returns `(start_row_idx, end_row_idx_exclusive)` within the partition.
+fn range_value_frame_bounds(
+    pos: usize,
+    partition_indices: &[usize],
+    order_by: &[(Expr, bool)],
+    row_values: &[Vec<SqliteValue>],
+    col_map: &[(String, String)],
+    frame: &FrameSpec,
+) -> (usize, usize) {
+    // Extract current row's ORDER BY value as f64 for arithmetic comparison.
+    let current_ri = partition_indices[pos];
+    let current_val = order_by
+        .first()
+        .and_then(|(oexpr, _)| eval_join_expr(oexpr, &row_values[current_ri], col_map).ok())
+        .and_then(|v| match v {
+            SqliteValue::Integer(n) => Some(n as f64),
+            SqliteValue::Float(f) => Some(f),
+            _ => None,
+        })
+        .unwrap_or(0.0);
+
+    let bound_offset_f64 = |bound: &FrameBound| -> f64 {
+        match bound {
+            FrameBound::Preceding(expr) | FrameBound::Following(expr) => match expr.as_ref() {
+                Expr::Literal(Literal::Integer(n), _) => *n as f64,
+                Expr::Literal(Literal::Float(f), _) => *f,
+                _ => 0.0,
+            },
+            _ => 0.0,
+        }
+    };
+
+    let low = match &frame.start {
+        FrameBound::UnboundedPreceding => f64::NEG_INFINITY,
+        FrameBound::CurrentRow => current_val,
+        FrameBound::Preceding(e) => {
+            current_val - bound_offset_f64(&FrameBound::Preceding(e.clone()))
+        }
+        FrameBound::Following(e) => {
+            current_val + bound_offset_f64(&FrameBound::Following(e.clone()))
+        }
+        FrameBound::UnboundedFollowing => f64::INFINITY,
+    };
+    let high = match frame.end.as_ref().unwrap_or(&FrameBound::CurrentRow) {
+        FrameBound::UnboundedFollowing => f64::INFINITY,
+        FrameBound::CurrentRow => current_val,
+        FrameBound::Preceding(e) => {
+            current_val - bound_offset_f64(&FrameBound::Preceding(e.clone()))
+        }
+        FrameBound::Following(e) => {
+            current_val + bound_offset_f64(&FrameBound::Following(e.clone()))
+        }
+        FrameBound::UnboundedPreceding => f64::NEG_INFINITY,
+    };
+
+    let psize = partition_indices.len();
+    let mut start = 0;
+    let mut end = psize;
+    for (i, &ri) in partition_indices.iter().enumerate() {
+        let v = order_by
+            .first()
+            .and_then(|(oexpr, _)| eval_join_expr(oexpr, &row_values[ri], col_map).ok())
+            .and_then(|v| match v {
+                SqliteValue::Integer(n) => Some(n as f64),
+                SqliteValue::Float(f) => Some(f),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        if v < low {
+            start = i + 1;
+        }
+        if v > high && end == psize {
+            end = i;
+        }
+    }
+    (start, end)
 }
 
 fn build_window_args(
