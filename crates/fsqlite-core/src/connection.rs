@@ -8671,6 +8671,35 @@ impl Connection {
                                 &snapshot.write_pages,
                             ),
                         ),
+                        FcwResult::Abort { reason } => match reason {
+                            fsqlite_mvcc::ssi_validation::SsiAbortReason::Pivot => (
+                                SsiDecisionType::AbortWriteSkew,
+                                "pivot_abort_dangerous_structure".to_owned(),
+                                Self::merge_conflict_pages(
+                                    Vec::new(),
+                                    active_conflicts.conflict_pages.clone(),
+                                    &snapshot.write_pages,
+                                ),
+                            ),
+                            fsqlite_mvcc::ssi_validation::SsiAbortReason::MarkedForAbort => (
+                                SsiDecisionType::AbortCycle,
+                                "marked_for_abort_by_pivot_rule".to_owned(),
+                                Self::merge_conflict_pages(
+                                    Vec::new(),
+                                    active_conflicts.conflict_pages.clone(),
+                                    &snapshot.write_pages,
+                                ),
+                            ),
+                            fsqlite_mvcc::ssi_validation::SsiAbortReason::CommittedPivot => (
+                                SsiDecisionType::AbortCycle,
+                                "committed_pivot_abort".to_owned(),
+                                Self::merge_conflict_pages(
+                                    Vec::new(),
+                                    active_conflicts.conflict_pages.clone(),
+                                    &snapshot.write_pages,
+                                ),
+                            ),
+                        },
                     };
 
                     let primary_conflict_page = conflict_pages.first().map_or(0, |page| page.get());
@@ -12681,7 +12710,7 @@ impl Connection {
         &self,
         with: Option<&fsqlite_ast::WithClause>,
         params: Option<&[SqliteValue]>,
-        mut temp_names: &mut Vec<String>,
+        temp_names: &mut Vec<String>,
     ) -> Result<()> {
         let with_clause = with.ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
         let is_recursive = with_clause.recursive;

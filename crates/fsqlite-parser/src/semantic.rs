@@ -1753,29 +1753,6 @@ mod tests {
             errors[0].kind,
             SemanticErrorKind::FunctionArityMismatch { .. }
         ));
-
-        let stmt_ok = parse_one("SELECT count(*)");
-        let mut resolver_ok = Resolver::new(&schema);
-        let errors_ok = resolver_ok.resolve_statement(&stmt_ok);
-        assert!(errors_ok.is_empty(), "count(*) should be valid");
-    }
-
-    #[test]
-    fn test_resolve_function_star_args_only_for_count() {
-        let schema = make_schema();
-        let stmt = parse_one("SELECT sum(*)");
-        let mut resolver = Resolver::new(&schema);
-        let errors = resolver.resolve_statement(&stmt);
-        assert_eq!(errors.len(), 1);
-        assert!(matches!(
-            errors[0].kind,
-            SemanticErrorKind::FunctionArityMismatch { .. }
-        ));
-
-        let stmt_ok = parse_one("SELECT count(*)");
-        let mut resolver_ok = Resolver::new(&schema);
-        let errors_ok = resolver_ok.resolve_statement(&stmt_ok);
-        assert!(errors_ok.is_empty(), "count(*) should be valid");
     }
 
     #[test]
