@@ -970,7 +970,6 @@ impl<'a> Resolver<'a> {
                 // Suppress this error if we already reported an UnresolvedTable
                 // error — the missing star target is a cascading consequence.
                 if scope.alias_count() == 0
-                    && scope.parent.is_none()
                     && !self
                         .errors
                         .iter()
@@ -1646,6 +1645,19 @@ mod tests {
         let errors = resolver.resolve_statement(&stmt);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(resolver.tables_resolved, 1);
+    }
+
+    #[test]
+    fn test_resolve_star_in_subquery_without_tables() {
+        let schema = make_schema();
+        let stmt = parse_one("SELECT (SELECT *) FROM users");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0].kind,
+            SemanticErrorKind::NoTablesSpecifiedForStar
+        ));
     }
 
     #[test]

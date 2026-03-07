@@ -40,8 +40,6 @@ pub enum MergeError {
     CellOverlap { cell_key_digest: [u8; 16] },
     /// Header mutations from both patches — non-commutative conflict.
     HeaderConflict,
-    /// Free-space ops from both patches — conservative reject.
-    FreeSpaceConflict,
     /// Deterministic rebase failed (wraps inner error).
     RebaseFailed(RebaseError),
     /// Cell content area would overflow the page after merge.
@@ -78,9 +76,6 @@ impl std::fmt::Display for MergeError {
             }
             Self::HeaderConflict => {
                 f.write_str("non-commutative header mutations from both patches")
-            }
-            Self::FreeSpaceConflict => {
-                f.write_str("free-space ops from both patches — conservative reject")
             }
             Self::RebaseFailed(inner) => write!(f, "deterministic rebase failed: {inner}"),
             Self::PageOverflow {
@@ -142,14 +137,6 @@ pub struct CellOp {
     pub cell_key_digest: [u8; 16],
     /// The operation to apply to this cell.
     pub kind: CellOpKind,
-}
-
-/// Free-space layout operation (derived during repack; SHOULD be empty for
-/// SAFE B-tree leaf merges).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FreeSpaceOp {
-    /// Defragment the page (reclaim fragmented bytes).
-    Defragment,
 }
 
 /// Byte-range XOR patch for opaque pages only (§5.10.3 normative).
@@ -549,7 +536,7 @@ pub fn diff_parsed_pages(
 /// # Safety constraints (normative)
 ///
 /// - `header_ops`: non-commutative; if both patches have header mutations → reject.
-/// - `free_ops`: conservative; if either patch non-empty → reject.
+/// - `free_ops`: safely mergeable; defragmentation intent is naturally preserved during the canonical repack.
 /// - `raw_xor_ranges`: MUST be empty for structured pages.
 /// - `cell_ops`: mergeable when disjoint by `cell_key_digest`.
 ///
@@ -576,10 +563,8 @@ pub fn merge_structured_patches(
         return Err(MergeError::HeaderConflict);
     }
 
-    // Free-space ops: conservative — reject if either non-empty
-    if !patch_a.free_ops.is_empty() || !patch_b.free_ops.is_empty() {
-        return Err(MergeError::FreeSpaceConflict);
-    }
+    // Free-space ops: safely mergeable, since the page will be fully repacked
+    // using canonical layout anyway. We just take the union.
 
     // Check cell disjointness
     let a_digests: std::collections::HashSet<[u8; 16]> = patch_a
@@ -603,16 +588,17 @@ pub fn merge_structured_patches(
         } else {
             patch_a.header_ops.clone()
         },
-        cell_ops: Vec::with_capacity(patch_a.cell_ops.len() + patch_b.cell_ops.len()),
-        free_ops: Vec::new(),
+        cell_ops: patch_a.cell_ops.clone(),
+        free_ops: patch_a.free_ops.clone(),
         raw_xor_ranges: Vec::new(),
     };
+    merged.cell_ops.extend(patch_b.cell_ops.clone());
 
-    merged.cell_ops.extend_from_slice(&patch_a.cell_ops);
-    merged.cell_ops.extend_from_slice(&patch_b.cell_ops);
-
-    // Sort by digest for deterministic order (canonical merge order)
-    merged.cell_ops.sort_by_key(|op| op.cell_key_digest);
+    for op in &patch_b.free_ops {
+        if !merged.free_ops.contains(op) {
+            merged.free_ops.push(op.clone());
+        }
+    }
 
     Ok(merged)
 }

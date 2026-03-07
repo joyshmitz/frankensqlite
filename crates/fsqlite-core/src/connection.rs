@@ -12599,14 +12599,14 @@ impl Connection {
     ) -> Result<Vec<Row>> {
         let prev_reject = *self.reject_mem_fallback.borrow();
         self.set_reject_mem_fallback(false);
+        let mut temp_names = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
-            let temp_names = self.materialize_with_clause(select.with.as_ref(), params)?;
+            self.materialize_with_clause(select.with.as_ref(), params, &mut temp_names)?;
             let mut stripped = select.clone();
             stripped.with = None;
-            let result = self.execute_statement(Statement::Select(stripped), params);
-            self.cleanup_cte_tables(&temp_names);
-            result
+            self.execute_statement(Statement::Select(stripped), params)
         })();
+        self.cleanup_cte_tables(&temp_names);
         self.set_reject_mem_fallback(prev_reject);
         result
     }
@@ -12620,14 +12620,14 @@ impl Connection {
     ) -> Result<Vec<Row>> {
         let prev_reject = *self.reject_mem_fallback.borrow();
         self.set_reject_mem_fallback(false);
+        let mut temp_names = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
-            let temp_names = self.materialize_with_clause(delete.with.as_ref(), params)?;
+            self.materialize_with_clause(delete.with.as_ref(), params, &mut temp_names)?;
             let mut stripped = delete.clone();
             stripped.with = None;
-            let result = self.execute_statement(Statement::Delete(stripped), params);
-            self.cleanup_cte_tables(&temp_names);
-            result
+            self.execute_statement(Statement::Delete(stripped), params)
         })();
+        self.cleanup_cte_tables(&temp_names);
         self.set_reject_mem_fallback(prev_reject);
         result
     }
@@ -12641,14 +12641,14 @@ impl Connection {
     ) -> Result<Vec<Row>> {
         let prev_reject = *self.reject_mem_fallback.borrow();
         self.set_reject_mem_fallback(false);
+        let mut temp_names = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
-            let temp_names = self.materialize_with_clause(update.with.as_ref(), params)?;
+            self.materialize_with_clause(update.with.as_ref(), params, &mut temp_names)?;
             let mut stripped = update.clone();
             stripped.with = None;
-            let result = self.execute_statement(Statement::Update(stripped), params);
-            self.cleanup_cte_tables(&temp_names);
-            result
+            self.execute_statement(Statement::Update(stripped), params)
         })();
+        self.cleanup_cte_tables(&temp_names);
         self.set_reject_mem_fallback(prev_reject);
         result
     }
@@ -12660,11 +12660,11 @@ impl Connection {
         &self,
         with: Option<&fsqlite_ast::WithClause>,
         params: Option<&[SqliteValue]>,
-    ) -> Result<Vec<String>> {
+        temp_names: &mut Vec<String>,
+    ) -> Result<()> {
         let with_clause = with.ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
         let is_recursive = with_clause.recursive;
         let ctes = &with_clause.ctes;
-        let mut temp_names: Vec<String> = Vec::with_capacity(ctes.len());
         for cte in ctes {
             let cte_name = &cte.name;
             let has_self_ref = is_recursive
@@ -12731,7 +12731,7 @@ impl Connection {
                 }
             }
         }
-        Ok(temp_names)
+        Ok(())
     }
 
     /// Clean up temporary CTE tables by name.
