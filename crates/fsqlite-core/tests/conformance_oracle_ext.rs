@@ -14292,7 +14292,9 @@ fn test_conformance_implicit_type_conversion_s94() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} implicit type conversion mismatches", mismatches.len());
     }
 }
@@ -14302,9 +14304,7 @@ fn test_conformance_aggregate_empty_table_s95() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    for s in &[
-        "CREATE TABLE aet(id INTEGER PRIMARY KEY, val INTEGER, grp TEXT)",
-    ] {
+    for s in &["CREATE TABLE aet(id INTEGER PRIMARY KEY, val INTEGER, grp TEXT)"] {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -14329,7 +14329,9 @@ fn test_conformance_aggregate_empty_table_s95() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} aggregate empty table mismatches", mismatches.len());
     }
 }
@@ -14356,7 +14358,9 @@ fn test_conformance_update_returning_like_s96() {
     let q1 = ["SELECT id, name, score FROM ur ORDER BY id"];
     let m1 = oracle_compare(&fconn, &rconn, &q1);
     if !m1.is_empty() {
-        for m in &m1 { eprintln!("{m}\n"); }
+        for m in &m1 {
+            eprintln!("{m}\n");
+        }
         panic!("{} update multi-row mismatches", m1.len());
     }
 
@@ -14369,7 +14373,9 @@ fn test_conformance_update_returning_like_s96() {
     let q2 = ["SELECT id, name FROM ur WHERE id = 1"];
     let m2 = oracle_compare(&fconn, &rconn, &q2);
     if !m2.is_empty() {
-        for m in &m2 { eprintln!("{m}\n"); }
+        for m in &m2 {
+            eprintln!("{m}\n");
+        }
         panic!("{} update expression mismatches", m2.len());
     }
 }
@@ -14396,20 +14402,29 @@ fn test_conformance_delete_patterns_s97() {
     let q1 = ["SELECT id, category, val FROM dp ORDER BY id"];
     let m1 = oracle_compare(&fconn, &rconn, &q1);
     if !m1.is_empty() {
-        for m in &m1 { eprintln!("{m}\n"); }
+        for m in &m1 {
+            eprintln!("{m}\n");
+        }
         panic!("{} delete with IN subquery mismatches", m1.len());
     }
 
     // DELETE with complex WHERE
-    for s in &["DELETE FROM dp WHERE category = 'A' AND val = (SELECT MAX(val) FROM dp WHERE category = 'A')"] {
+    for s in &[
+        "DELETE FROM dp WHERE category = 'A' AND val = (SELECT MAX(val) FROM dp WHERE category = 'A')",
+    ] {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
 
-    let q2 = ["SELECT id, category, val FROM dp ORDER BY id", "SELECT COUNT(*) FROM dp"];
+    let q2 = [
+        "SELECT id, category, val FROM dp ORDER BY id",
+        "SELECT COUNT(*) FROM dp",
+    ];
     let m2 = oracle_compare(&fconn, &rconn, &q2);
     if !m2.is_empty() {
-        for m in &m2 { eprintln!("{m}\n"); }
+        for m in &m2 {
+            eprintln!("{m}\n");
+        }
         panic!("{} delete complex where mismatches", m2.len());
     }
 }
@@ -14442,8 +14457,13 @@ fn test_conformance_distinct_group_by_interaction_s98() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
-        panic!("{} distinct/group by interaction mismatches", mismatches.len());
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!(
+            "{} distinct/group by interaction mismatches",
+            mismatches.len()
+        );
     }
 }
 
@@ -14473,7 +14493,9 @@ fn test_conformance_lateral_column_alias_s99() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} lateral column alias mismatches", mismatches.len());
     }
 }
@@ -14504,7 +14526,9 @@ fn test_conformance_savepoint_s100() {
     let q1 = ["SELECT id, val FROM sp ORDER BY id"];
     let m1 = oracle_compare(&fconn, &rconn, &q1);
     if !m1.is_empty() {
-        for m in &m1 { eprintln!("{m}\n"); }
+        for m in &m1 {
+            eprintln!("{m}\n");
+        }
         panic!("{} savepoint release mismatches", m1.len());
     }
 
@@ -14519,10 +14543,15 @@ fn test_conformance_savepoint_s100() {
         rconn.execute_batch(s).unwrap();
     }
 
-    let q2 = ["SELECT id, val FROM sp ORDER BY id", "SELECT COUNT(*) FROM sp"];
+    let q2 = [
+        "SELECT id, val FROM sp ORDER BY id",
+        "SELECT COUNT(*) FROM sp",
+    ];
     let m2 = oracle_compare(&fconn, &rconn, &q2);
     if !m2.is_empty() {
-        for m in &m2 { eprintln!("{m}\n"); }
+        for m in &m2 {
+            eprintln!("{m}\n");
+        }
         panic!("{} savepoint rollback mismatches", m2.len());
     }
 }
@@ -14551,7 +14580,9 @@ fn test_conformance_default_values_s101() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} default value mismatches", mismatches.len());
     }
 }
