@@ -12727,6 +12727,7 @@ impl Connection {
         let mut win_two_pass: Vec<bool> = Vec::new();
         let mut win_func_names: Vec<String> = Vec::new();
         let mut win_frame_specs: Vec<Option<FrameSpec>> = Vec::new();
+        let mut win_filters: Vec<Option<Expr>> = Vec::new();
 
         // Helper: resolve a WindowSpec by merging base_window reference
         // with the named window definitions from the WINDOW clause.
@@ -12766,6 +12767,7 @@ impl Connection {
                         Expr::FunctionCall {
                             name,
                             args,
+                            filter,
                             over: Some(raw_spec),
                             ..
                         },
@@ -12815,6 +12817,7 @@ impl Connection {
                     win_two_pass.push(two_pass);
                     win_func_names.push(upper);
                     win_frame_specs.push(spec.frame.clone());
+                    win_filters.push(filter.as_deref().cloned());
                     col_kinds.push(ColKind::Window(idx));
                 }
                 ResultColumn::Expr { expr, .. } if expr_has_window_function(expr) => {
@@ -12822,7 +12825,7 @@ impl Connection {
                     // (e.g., ROUND(AVG(val) OVER (...), 2)).  Extract the
                     // inner window call, register it, and wrap the outer
                     // expression with a placeholder.
-                    let (inner_name, inner_args, raw_inner_spec) =
+                    let (inner_name, inner_args, raw_inner_spec, inner_filter) =
                         extract_inner_window_function(expr).ok_or_else(|| {
                             FrankenError::Internal(
                                 "expr_has_window_function=true but cannot extract".to_owned(),
@@ -12873,6 +12876,7 @@ impl Connection {
                     win_two_pass.push(two_pass);
                     win_func_names.push(upper);
                     win_frame_specs.push(inner_spec.frame.clone());
+                    win_filters.push(inner_filter);
                     // Replace the inner window call with a placeholder in the outer expr.
                     let outer_with_placeholder = replace_window_with_placeholder(expr);
                     col_kinds.push(ColKind::WrappedWindow(idx, outer_with_placeholder));
@@ -12988,6 +12992,19 @@ impl Connection {
                 // running-frame path which never calls inverse().
                 let uses_inverse_counter = matches!(fname.as_str(), "NTILE" | "LEAD");
 
+                // FILTER clause: if present, only step rows matching the filter.
+                let win_filter = win_filters[wi].as_ref();
+                let row_passes_filter = |ri: usize| -> bool {
+                    if let Some(filter_expr) = win_filter {
+                        match eval_join_expr(filter_expr, &row_values[ri], &col_map) {
+                            Ok(v) => is_sqlite_truthy(&v),
+                            Err(_) => false,
+                        }
+                    } else {
+                        true
+                    }
+                };
+
                 // ROWS sliding frame: recompute aggregate per row over the
                 // explicit numeric frame bounds.
                 let sliding = is_rows_sliding_frame(frame.as_ref());
@@ -12998,6 +13015,9 @@ impl Connection {
                         let (fs, fe) = rows_frame_bounds(pos, psize, fspec);
                         let mut sliding_state = func.initial_state();
                         for &slot_ri in &partition_indices[fs..fe] {
+                            if !row_passes_filter(slot_ri) {
+                                continue;
+                            }
                             let args = build_window_args(
                                 &win_args[wi],
                                 &win_order_by[wi],
@@ -13012,6 +13032,9 @@ impl Connection {
                 } else if win_two_pass[wi] {
                     // Two-pass: step all rows first.
                     for &ri in partition_indices {
+                        if !row_passes_filter(ri) {
+                            continue;
+                        }
                         let args = build_window_args(
                             &win_args[wi],
                             &win_order_by[wi],
@@ -13088,13 +13111,15 @@ impl Connection {
                         // Re-initialize and step row-by-row for running frame.
                         let mut running_state = func.initial_state();
                         for &ri in partition_indices {
-                            let args = build_window_args(
-                                &win_args[wi],
-                                &win_order_by[wi],
-                                &row_values[ri],
-                                &col_map,
-                            )?;
-                            func.step(&mut running_state, &args)?;
+                            if row_passes_filter(ri) {
+                                let args = build_window_args(
+                                    &win_args[wi],
+                                    &win_order_by[wi],
+                                    &row_values[ri],
+                                    &col_map,
+                                )?;
+                                func.step(&mut running_state, &args)?;
+                            }
                             func_vals.push(func.value(&running_state)?);
                         }
                     } else {
@@ -13143,6 +13168,9 @@ impl Connection {
                                 let mut gs_state = func.initial_state();
                                 for group_rows in &peer_groups[gs..ge] {
                                     for &ri in group_rows {
+                                        if !row_passes_filter(ri) {
+                                            continue;
+                                        }
                                         let args = build_window_args(
                                             &win_args[wi],
                                             &win_order_by[wi],
@@ -13170,6 +13198,9 @@ impl Connection {
                                 );
                                 let mut rs_state = func.initial_state();
                                 for &slot_ri in &partition_indices[fs..fe] {
+                                    if !row_passes_filter(slot_ri) {
+                                        continue;
+                                    }
                                     let args = build_window_args(
                                         &win_args[wi],
                                         &win_order_by[wi],
@@ -13203,6 +13234,9 @@ impl Connection {
                             }
                             // Step all peers in this group.
                             for &ri in &partition_indices[pos..peer_end] {
+                                if !row_passes_filter(ri) {
+                                    continue;
+                                }
                                 let args = build_window_args(
                                     &win_args[wi],
                                     &win_order_by[wi],
@@ -13219,13 +13253,15 @@ impl Connection {
                         }
                     } else {
                         for &ri in partition_indices {
-                            let args = build_window_args(
-                                &win_args[wi],
-                                &win_order_by[wi],
-                                &row_values[ri],
-                                &col_map,
-                            )?;
-                            func.step(&mut state, &args)?;
+                            if row_passes_filter(ri) {
+                                let args = build_window_args(
+                                    &win_args[wi],
+                                    &win_order_by[wi],
+                                    &row_values[ri],
+                                    &col_map,
+                                )?;
+                                func.step(&mut state, &args)?;
+                            }
                             func_vals.push(func.value(&state)?);
                         }
                     }
@@ -15521,15 +15557,23 @@ fn expr_has_window_function(expr: &Expr) -> bool {
 }
 
 /// Extract the first window function found nested inside an expression.
-/// Returns `(function_name, args, window_def)`.
-fn extract_inner_window_function(expr: &Expr) -> Option<(String, FunctionArgs, WindowSpec)> {
+/// Returns `(function_name, args, window_spec, filter)`.
+fn extract_inner_window_function(
+    expr: &Expr,
+) -> Option<(String, FunctionArgs, WindowSpec, Option<Expr>)> {
     match expr {
         Expr::FunctionCall {
             name,
             args,
+            filter,
             over: Some(spec),
             ..
-        } => Some((name.clone(), args.clone(), spec.clone())),
+        } => Some((
+            name.clone(),
+            args.clone(),
+            spec.clone(),
+            filter.as_deref().cloned(),
+        )),
         Expr::FunctionCall { args, filter, .. } => {
             if let FunctionArgs::List(exprs) = args {
                 for e in exprs {
