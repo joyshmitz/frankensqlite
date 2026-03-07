@@ -456,6 +456,27 @@ impl SqliteValue {
         }
     }
 
+    /// Returns true if this value should be treated as a float for arithmetic.
+    /// A value is "float numeric type" only if it has a numeric prefix
+    /// containing '.', 'e', or 'E'. Non-numeric text/blob is NOT float
+    /// (it coerces to integer 0 in C SQLite's OP_Add/Sub/Mul).
+    fn is_float_numeric_type(&self) -> bool {
+        fn text_is_float(s: &str) -> bool {
+            let trimmed = s.trim_start();
+            let end = scan_numeric_prefix(trimmed.as_bytes());
+            end > 0
+                && trimmed.as_bytes()[..end]
+                    .iter()
+                    .any(|byte| matches!(*byte, b'.' | b'e' | b'E'))
+        }
+        match self {
+            Self::Float(_) => true,
+            Self::Integer(_) | Self::Null => false,
+            Self::Text(s) => text_is_float(s),
+            Self::Blob(b) => text_is_float(&String::from_utf8_lossy(b)),
+        }
+    }
+
     /// Add two values following SQLite's overflow semantics.
     ///
     /// - Integer + Integer: checked add; overflows promote to REAL.
@@ -472,7 +493,10 @@ impl SqliteValue {
                 Some(result) => Self::Integer(result),
                 None => Self::float_result_or_null(*a as f64 + *b as f64),
             },
-            _ if self.is_integer_numeric_type() && other.is_integer_numeric_type() => {
+            // If neither operand is a float-type (i.e. both are integer,
+            // integer-text, or non-numeric text/blob), use integer arithmetic.
+            // Non-numeric text like "hello" coerces to integer 0, not float 0.0.
+            _ if !self.is_float_numeric_type() && !other.is_float_numeric_type() => {
                 let a = self.to_integer();
                 let b = other.to_integer();
                 match a.checked_add(b) {
@@ -496,7 +520,7 @@ impl SqliteValue {
                 Some(result) => Self::Integer(result),
                 None => Self::float_result_or_null(*a as f64 - *b as f64),
             },
-            _ if self.is_integer_numeric_type() && other.is_integer_numeric_type() => {
+            _ if !self.is_float_numeric_type() && !other.is_float_numeric_type() => {
                 let a = self.to_integer();
                 let b = other.to_integer();
                 match a.checked_sub(b) {
@@ -520,7 +544,7 @@ impl SqliteValue {
                 Some(result) => Self::Integer(result),
                 None => Self::float_result_or_null(*a as f64 * *b as f64),
             },
-            _ if self.is_integer_numeric_type() && other.is_integer_numeric_type() => {
+            _ if !self.is_float_numeric_type() && !other.is_float_numeric_type() => {
                 let a = self.to_integer();
                 let b = other.to_integer();
                 match a.checked_mul(b) {
