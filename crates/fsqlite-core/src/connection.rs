@@ -18205,19 +18205,19 @@ fn emit_unary_expr(
         }
         UnaryOp::Negate => {
             let source_reg = builder.alloc_temp();
-            let zero_reg = builder.alloc_temp();
+            let neg_one_reg = builder.alloc_temp();
             emit_expr(builder, expr, source_reg, bind_state)?;
-            builder.emit_op(Opcode::Integer, 0, zero_reg, 0, P4::None, 0);
-            // target = 0 - source
+            builder.emit_op(Opcode::Integer, -1, neg_one_reg, 0, P4::None, 0);
+            // target = source * (-1)  (preserves IEEE 754 negative zero)
             builder.emit_op(
-                Opcode::Subtract,
+                Opcode::Multiply,
+                neg_one_reg,
                 source_reg,
-                zero_reg,
                 target_reg,
                 P4::None,
                 0,
             );
-            builder.free_temp(zero_reg);
+            builder.free_temp(neg_one_reg);
             builder.free_temp(source_reg);
             Ok(())
         }
@@ -49343,6 +49343,232 @@ mod pager_routing_tests {
             }
             panic!(
                 "{} larger dataset conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Multi-column UNIQUE constraint behavior.
+    #[test]
+    fn test_conformance_multi_column_unique() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE edges (src TEXT, dst TEXT, weight REAL, UNIQUE(src, dst));",
+            "INSERT INTO edges VALUES ('A', 'B', 1.0);",
+            "INSERT INTO edges VALUES ('A', 'C', 2.0);",
+            "INSERT INTO edges VALUES ('B', 'A', 1.5);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // INSERT OR IGNORE duplicate
+        fconn
+            .execute("INSERT OR IGNORE INTO edges VALUES ('A', 'B', 9.9)")
+            .unwrap();
+        rconn
+            .execute_batch("INSERT OR IGNORE INTO edges VALUES ('A', 'B', 9.9)")
+            .unwrap();
+
+        // INSERT OR REPLACE duplicate
+        fconn
+            .execute("INSERT OR REPLACE INTO edges VALUES ('A', 'C', 5.0)")
+            .unwrap();
+        rconn
+            .execute_batch("INSERT OR REPLACE INTO edges VALUES ('A', 'C', 5.0)")
+            .unwrap();
+
+        let queries = [
+            "SELECT * FROM edges ORDER BY src, dst",
+            "SELECT count(*) FROM edges",
+            // A-B should still be 1.0 (IGNORE)
+            "SELECT weight FROM edges WHERE src = 'A' AND dst = 'B'",
+            // A-C should be 5.0 (REPLACE)
+            "SELECT weight FROM edges WHERE src = 'A' AND dst = 'C'",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} multi-column UNIQUE conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// NOT NULL constraint and DEFAULT interaction.
+    #[test]
+    fn test_conformance_not_null_default() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, required TEXT NOT NULL, optional TEXT, has_default TEXT NOT NULL DEFAULT 'none');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let dml = [
+            "INSERT INTO t (id, required) VALUES (1, 'hello')",
+            "INSERT INTO t (id, required, optional) VALUES (2, 'world', 'yes')",
+            "INSERT INTO t VALUES (3, 'test', NULL, 'custom')",
+        ];
+        for s in &dml {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT * FROM t ORDER BY id",
+            "SELECT id, has_default FROM t ORDER BY id",
+            "SELECT count(*) FROM t WHERE optional IS NULL",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} NOT NULL/DEFAULT conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Expressions in GROUP BY: GROUP BY expression must be evaluated
+    /// correctly for grouping.
+    #[test]
+    fn test_conformance_group_by_expression() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE log (id INTEGER PRIMARY KEY, ts TEXT, level TEXT, msg TEXT);",
+            "INSERT INTO log VALUES (1, '2024-01-15 10:30:00', 'error', 'fail1');",
+            "INSERT INTO log VALUES (2, '2024-01-15 14:20:00', 'warn', 'slow');",
+            "INSERT INTO log VALUES (3, '2024-01-16 09:00:00', 'error', 'fail2');",
+            "INSERT INTO log VALUES (4, '2024-01-16 11:30:00', 'info', 'ok');",
+            "INSERT INTO log VALUES (5, '2024-01-17 08:00:00', 'error', 'fail3');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // GROUP BY expression
+            "SELECT substr(ts, 1, 10) AS day, count(*) FROM log GROUP BY substr(ts, 1, 10) ORDER BY day",
+            // GROUP BY CASE
+            "SELECT CASE WHEN level = 'error' THEN 'critical' ELSE 'other' END AS severity, count(*) FROM log GROUP BY severity ORDER BY severity",
+            // GROUP BY with function
+            "SELECT upper(level) AS lev, count(*) FROM log GROUP BY upper(level) ORDER BY lev",
+            // GROUP BY with arithmetic
+            "SELECT id / 2 AS bucket, count(*) FROM log GROUP BY bucket ORDER BY bucket",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} GROUP BY expression conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Implicit type conversion in comparisons and operations.
+    #[test]
+    fn test_conformance_implicit_conversion() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // String to number in arithmetic
+            "SELECT '10' + 5",
+            "SELECT '10.5' + 5",
+            "SELECT '10abc' + 5",
+            "SELECT 'abc' + 5",
+            // String to number in comparison
+            "SELECT '10' > 5",
+            "SELECT '10' = 10",
+            // Number to string in concatenation
+            "SELECT 42 || ' items'",
+            "SELECT 3.14 || ' pi'",
+            // CAST behavior
+            "SELECT CAST('42' AS INTEGER) + 8",
+            "SELECT CAST(3.7 AS INTEGER)",
+            "SELECT CAST(3.2 AS INTEGER)",
+            "SELECT CAST(-3.7 AS INTEGER)",
+            "SELECT CAST(-3.2 AS INTEGER)",
+            // typeof after operations
+            "SELECT typeof('10' + 5)",
+            "SELECT typeof(42 || '')",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} implicit conversion conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// CREATE TABLE with various column constraints and types.
+    #[test]
+    fn test_conformance_column_types_and_constraints() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE types (
+                id INTEGER PRIMARY KEY,
+                i INTEGER,
+                r REAL,
+                t TEXT,
+                b BLOB,
+                n NUMERIC,
+                bool_col BOOLEAN,
+                ts DATETIME
+            );",
+            "INSERT INTO types VALUES (1, 42, 3.14, 'hello', x'CAFE', '100', 1, '2024-01-15 10:30:00');",
+            "INSERT INTO types VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
+            "INSERT INTO types VALUES (3, 0, 0.0, '', x'', 0, 0, '');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT typeof(i), typeof(r), typeof(t), typeof(b), typeof(n), typeof(bool_col), typeof(ts) FROM types WHERE id = 1",
+            "SELECT typeof(i), typeof(r), typeof(t), typeof(b), typeof(n), typeof(bool_col), typeof(ts) FROM types WHERE id = 2",
+            "SELECT * FROM types ORDER BY id",
+            "SELECT id FROM types WHERE i IS NOT NULL ORDER BY id",
+            "SELECT id FROM types WHERE t = '' ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} column types/constraints conformance mismatches found",
                 mismatches.len()
             );
         }
