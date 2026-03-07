@@ -17068,6 +17068,156 @@ fn substitute_outer_refs_in_expr(
             not: *not,
             span: *span,
         },
+        Expr::Like {
+            expr: operand,
+            pattern,
+            escape,
+            op: like_op,
+            not,
+            span,
+        } => Expr::Like {
+            expr: Box::new(substitute_outer_refs_in_expr(
+                operand,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            pattern: Box::new(substitute_outer_refs_in_expr(
+                pattern,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            escape: escape.as_ref().map(|e| {
+                Box::new(substitute_outer_refs_in_expr(
+                    e,
+                    row,
+                    outer_col_map,
+                    inner_tables,
+                ))
+            }),
+            op: *like_op,
+            not: *not,
+            span: *span,
+        },
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not,
+            span,
+        } => Expr::Between {
+            expr: Box::new(substitute_outer_refs_in_expr(
+                operand,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            low: Box::new(substitute_outer_refs_in_expr(
+                low,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            high: Box::new(substitute_outer_refs_in_expr(
+                high,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            not: *not,
+            span: *span,
+        },
+        Expr::In {
+            expr: operand,
+            set,
+            not,
+            span,
+        } => {
+            let new_set = match set {
+                fsqlite_ast::InSet::List(items) => fsqlite_ast::InSet::List(
+                    items
+                        .iter()
+                        .map(|e| {
+                            substitute_outer_refs_in_expr(e, row, outer_col_map, inner_tables)
+                        })
+                        .collect(),
+                ),
+                other => other.clone(),
+            };
+            Expr::In {
+                expr: Box::new(substitute_outer_refs_in_expr(
+                    operand,
+                    row,
+                    outer_col_map,
+                    inner_tables,
+                )),
+                set: new_set,
+                not: *not,
+                span: *span,
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            span,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|e| {
+                Box::new(substitute_outer_refs_in_expr(
+                    e,
+                    row,
+                    outer_col_map,
+                    inner_tables,
+                ))
+            }),
+            whens: whens
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        substitute_outer_refs_in_expr(w, row, outer_col_map, inner_tables),
+                        substitute_outer_refs_in_expr(t, row, outer_col_map, inner_tables),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr.as_ref().map(|e| {
+                Box::new(substitute_outer_refs_in_expr(
+                    e,
+                    row,
+                    outer_col_map,
+                    inner_tables,
+                ))
+            }),
+            span: *span,
+        },
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            span,
+        } => Expr::Cast {
+            expr: Box::new(substitute_outer_refs_in_expr(
+                inner,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            type_name: type_name.clone(),
+            span: *span,
+        },
+        Expr::Collate {
+            expr: inner,
+            collation,
+            span,
+        } => Expr::Collate {
+            expr: Box::new(substitute_outer_refs_in_expr(
+                inner,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            collation: collation.clone(),
+            span: *span,
+        },
         _ => expr.clone(),
     }
 }
@@ -23433,7 +23583,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                         if rd != 5 || !full[rd_idx + 1..].bytes().all(|b| b == b'0') {
                             format!("{f:.n$}").parse::<f64>().unwrap_or(*f)
                         } else {
-                            let mut trunc = full[..rd_idx].as_bytes().to_vec();
+                            let mut trunc = full.as_bytes()[..rd_idx].to_vec();
                             if trunc.last() == Some(&b'.') {
                                 trunc.pop();
                             }

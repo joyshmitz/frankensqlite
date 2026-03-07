@@ -717,7 +717,7 @@ impl ScalarFunction for RoundFunc {
                 } else {
                     // Exact tie — round half away from zero by incrementing
                     // the truncated string's last digit.
-                    let mut trunc = full[..rd_idx].as_bytes().to_vec();
+                    let mut trunc = full.as_bytes()[..rd_idx].to_vec();
                     // Strip trailing '.' for n==0
                     if trunc.last() == Some(&b'.') {
                         trunc.pop();

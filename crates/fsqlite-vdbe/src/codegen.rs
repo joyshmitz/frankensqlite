@@ -6488,7 +6488,7 @@ pub fn codegen_delete(
     let table_cursor = 0_i32;
 
     let end_label = b.emit_label();
-    let done_label = b.emit_label();
+    let _done_label = b.emit_label();
 
     if !stmt.order_by.is_empty() || stmt.limit.is_some() {
         return Err(CodegenError::Unsupported(
@@ -7778,6 +7778,7 @@ fn resolve_column_ref(
 ///
 /// Encodes NULLEQ (0x80) and the column's type affinity so the VDBE engine
 /// applies correct text↔numeric coercion during comparison (§3.2).
+#[allow(dead_code)]
 fn column_cmp_p5(table: &TableSchema, resolved: &SortKeySource) -> u16 {
     let affinity: u16 = match resolved {
         SortKeySource::Column(idx) => u16::from(table.columns[*idx].affinity as u8),
@@ -9080,6 +9081,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             b.emit_op(Opcode::Integer, val, reg, 0, P4::None, 0);
         }
         Expr::Subquery(subquery, _) => {
+            eprintln!("[emit_expr] Subquery encountered, ctx_available={}, schema_available={}", ctx.is_some(), ctx.and_then(|c| c.schema).is_some());
             if let Some(scan_ctx) = ctx {
                 if let Some(schema) = scan_ctx.schema {
                     emit_scalar_subquery(b, subquery, reg, scan_ctx, schema);
@@ -9087,6 +9089,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 }
             }
             // No schema context — emit NULL.
+            eprintln!("[emit_expr] Subquery => EMIT NULL (no schema context)");
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         }
         Expr::JsonAccess {
@@ -9247,6 +9250,7 @@ fn emit_scalar_subquery(
     outer_ctx: &ScanCtx<'_>,
     schema: &[TableSchema],
 ) {
+    eprintln!("[emit_scalar_subquery] ENTER outer_table={} outer_alias={:?}", outer_ctx.table.name, outer_ctx.table_alias);
     let (columns, from, where_clause, group_by) = match &subquery.body.select {
         SelectCore::Select {
             columns,
@@ -9523,11 +9527,16 @@ fn emit_expr_with_fallback(
 ) {
     match expr {
         Expr::Column(col_ref, _) => {
-            if resolve_column_in_ctx(col_ref, inner_ctx).is_some() {
+            let inner_resolved = resolve_column_in_ctx(col_ref, inner_ctx);
+            eprintln!("[emit_expr_with_fallback Column] col={:?}.{:?} inner_resolved={:?} outer_available={}", col_ref.table, col_ref.column, inner_resolved, outer_ctx.is_some());
+            if inner_resolved.is_some() {
                 emit_expr(b, expr, reg, Some(inner_ctx));
             } else if let Some(outer) = outer_ctx {
+                let outer_resolved = resolve_column_in_ctx(col_ref, outer);
+                eprintln!("[emit_expr_with_fallback Column] -> outer_resolved={:?} outer_table={} outer_alias={:?}", outer_resolved, outer.table.name, outer.table_alias);
                 emit_expr(b, expr, reg, Some(outer));
             } else {
+                eprintln!("[emit_expr_with_fallback Column] -> EMIT NULL (no outer ctx)");
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             }
         }
@@ -9619,7 +9628,230 @@ fn emit_expr_with_fallback(
                 }
             }
         }
-        // For other expression types, use the inner context.
+        // ── BETWEEN ─────────────────────────────────────────────────────
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not,
+            ..
+        } => {
+            let r_operand = b.alloc_temp();
+            let r_low = b.alloc_temp();
+            let r_high = b.alloc_temp();
+            emit_expr_with_fallback(b, operand, r_operand, inner_ctx, outer_ctx);
+            emit_expr_with_fallback(b, low, r_low, inner_ctx, outer_ctx);
+            emit_expr_with_fallback(b, high, r_high, inner_ctx, outer_ctx);
+            let false_label = b.emit_label();
+            let null_label = b.emit_label();
+            let done_label = b.emit_label();
+            b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Lt, r_low, r_operand, false_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IsNull, r_low, 0, null_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IsNull, r_high, 0, null_label, P4::None, 0);
+            b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            b.resolve_label(false_label);
+            b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            b.resolve_label(null_label);
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            b.resolve_label(done_label);
+            b.free_temp(r_high);
+            b.free_temp(r_low);
+            b.free_temp(r_operand);
+        }
+        // ── LIKE / GLOB ────────────────────────────────────────────────
+        Expr::Like {
+            expr: operand,
+            pattern,
+            not,
+            escape,
+            op: like_op,
+            ..
+        } => {
+            eprintln!("[emit_expr_with_fallback LIKE] operand={operand:?}, pattern={pattern:?}");
+            let func_name = match like_op {
+                fsqlite_ast::LikeOp::Like => "LIKE",
+                fsqlite_ast::LikeOp::Glob => "GLOB",
+                fsqlite_ast::LikeOp::Match => "MATCH",
+                fsqlite_ast::LikeOp::Regexp => "REGEXP",
+            };
+            let nargs: u16 = if escape.is_some() { 3 } else { 2 };
+            let arg_base = b.alloc_regs(i32::from(nargs));
+            // like(pattern, string [, escape])
+            emit_expr_with_fallback(b, pattern, arg_base, inner_ctx, outer_ctx);
+            emit_expr_with_fallback(b, operand, arg_base + 1, inner_ctx, outer_ctx);
+            if let Some(esc) = escape {
+                emit_expr_with_fallback(b, esc, arg_base + 2, inner_ctx, outer_ctx);
+            }
+            b.emit_op(
+                Opcode::PureFunc,
+                0,
+                arg_base,
+                reg,
+                P4::FuncName(func_name.to_owned()),
+                nargs,
+            );
+            if *not {
+                b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
+            }
+        }
+        // ── Function call ──────────────────────────────────────────────
+        Expr::FunctionCall { name, args, .. } => {
+            let canon = name.to_ascii_uppercase();
+            match args {
+                fsqlite_ast::FunctionArgs::Star => {
+                    b.emit_op(Opcode::PureFunc, 0, 0, reg, P4::FuncName(canon), 0);
+                }
+                fsqlite_ast::FunctionArgs::List(arg_list) => {
+                    let Ok(nargs) = u16::try_from(arg_list.len()) else {
+                        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                        return;
+                    };
+                    let arg_base = b.alloc_regs(i32::from(nargs));
+                    for (i, arg_expr) in arg_list.iter().enumerate() {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        emit_expr_with_fallback(
+                            b,
+                            arg_expr,
+                            arg_base + i as i32,
+                            inner_ctx,
+                            outer_ctx,
+                        );
+                    }
+                    b.emit_op(
+                        Opcode::PureFunc,
+                        0,
+                        arg_base,
+                        reg,
+                        P4::FuncName(canon),
+                        nargs,
+                    );
+                }
+            }
+        }
+        // ── CASE ───────────────────────────────────────────────────────
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let done_label = b.emit_label();
+            if let Some(op_expr) = operand {
+                let r_op = b.alloc_temp();
+                emit_expr_with_fallback(b, op_expr, r_op, inner_ctx, outer_ctx);
+                for (when_expr, then_expr) in whens {
+                    let r_when = b.alloc_temp();
+                    emit_expr_with_fallback(b, when_expr, r_when, inner_ctx, outer_ctx);
+                    let next = b.emit_label();
+                    b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next, P4::None, 0);
+                    b.free_temp(r_when);
+                    emit_expr_with_fallback(b, then_expr, reg, inner_ctx, outer_ctx);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(next);
+                }
+                b.free_temp(r_op);
+            } else {
+                for (when_expr, then_expr) in whens {
+                    let r_when = b.alloc_temp();
+                    emit_expr_with_fallback(b, when_expr, r_when, inner_ctx, outer_ctx);
+                    let next = b.emit_label();
+                    b.emit_jump_to_label(Opcode::IfNot, r_when, 0, next, P4::None, 0);
+                    b.free_temp(r_when);
+                    emit_expr_with_fallback(b, then_expr, reg, inner_ctx, outer_ctx);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(next);
+                }
+            }
+            if let Some(el) = else_expr {
+                emit_expr_with_fallback(b, el, reg, inner_ctx, outer_ctx);
+            } else {
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            }
+            b.resolve_label(done_label);
+        }
+        // ── IN (list) ──────────────────────────────────────────────────
+        Expr::In {
+            expr: operand,
+            set,
+            not,
+            ..
+        } => {
+            if let fsqlite_ast::InSet::List(values) = set {
+                if values.is_empty() {
+                    b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+                } else {
+                    let r_op = b.alloc_temp();
+                    emit_expr_with_fallback(b, operand, r_op, inner_ctx, outer_ctx);
+                    let found_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    let null_label = b.emit_label();
+                    b.emit_jump_to_label(Opcode::IsNull, r_op, 0, null_label, P4::None, 0);
+                    for val in values {
+                        let r_val = b.alloc_temp();
+                        emit_expr_with_fallback(b, val, r_val, inner_ctx, outer_ctx);
+                        b.emit_jump_to_label(Opcode::IsNull, r_val, 0, null_label, P4::None, 0);
+                        b.emit_jump_to_label(Opcode::Eq, r_val, r_op, found_label, P4::None, 0);
+                        b.free_temp(r_val);
+                    }
+                    b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(found_label);
+                    b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(null_label);
+                    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                    b.free_temp(r_op);
+                }
+            } else {
+                // Subquery / table IN — delegate to inner context.
+                emit_expr(b, expr, reg, Some(inner_ctx));
+            }
+        }
+        // ── CAST ───────────────────────────────────────────────────────
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            ..
+        } => {
+            emit_expr_with_fallback(b, inner, reg, inner_ctx, outer_ctx);
+            let affinity = type_name_to_affinity(type_name);
+            if affinity != 0 {
+                b.emit_op(
+                    Opcode::Affinity,
+                    reg,
+                    1,
+                    0,
+                    P4::Str(String::from(affinity as char)),
+                    0,
+                );
+            }
+        }
+        // ── IS [NOT] NULL ──────────────────────────────────────────────
+        Expr::IsNull {
+            expr: inner, not, ..
+        } => {
+            emit_expr_with_fallback(b, inner, reg, inner_ctx, outer_ctx);
+            let lbl_null = b.emit_label();
+            let lbl_done = b.emit_label();
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, lbl_null, P4::None, 0);
+            let val_not_null = i32::from(*not);
+            let val_null = i32::from(!*not);
+            b.emit_op(Opcode::Integer, val_not_null, reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_done, P4::None, 0);
+            b.resolve_label(lbl_null);
+            b.emit_op(Opcode::Integer, val_null, reg, 0, P4::None, 0);
+            b.resolve_label(lbl_done);
+        }
+        // ── Collate ────────────────────────────────────────────────────
+        Expr::Collate { expr: inner, .. } => {
+            emit_expr_with_fallback(b, inner, reg, inner_ctx, outer_ctx);
+        }
+        // ── Remaining types: delegate to inner context ─────────────────
         _ => {
             emit_expr(b, expr, reg, Some(inner_ctx));
         }
