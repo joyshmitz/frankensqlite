@@ -9,9 +9,9 @@ use std::cell::RefCell;
 use crate::{Label, ProgramBuilder};
 use fsqlite_ast::{
     AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FromClause,
-    FunctionArgs, InsertSource, InsertStatement, JsonArrow, LimitClause, Literal, OrderingTerm,
-    QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, SortDirection, Statement,
-    TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction,
+    FunctionArgs, InsertSource, InsertStatement, JsonArrow, LimitClause, Literal, NullsOrder,
+    OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, SortDirection,
+    Statement, TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction,
     UpsertClause, UpsertTarget,
 };
 use fsqlite_parser::Parser as SqlParser;
@@ -1149,9 +1149,17 @@ pub fn codegen_select(
             let idx_cursor = 1_i32;
             index_cursor_to_close = Some(idx_cursor);
             let full_scan_fallback = b.emit_label();
+            let duplicate_run_done = b.emit_label();
 
             let param_reg = b.alloc_reg();
             b.emit_op(Opcode::Variable, *param_idx, param_reg, 0, P4::None, 0);
+
+            // SQL semantics: `WHERE col = NULL` is UNKNOWN (filters out all rows).
+            // If the bound parameter is NULL, skip the index scan entirely.
+            b.emit_jump_to_label(Opcode::IsNull, param_reg, 0, done_label, P4::None, 0);
+
+            let saw_index_match_reg = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
 
             // Build probe key: [bound_value, i64::MIN] so SeekGE lands on the
             // first duplicate for the bound value.
@@ -1204,7 +1212,7 @@ pub fn codegen_select(
                 Opcode::Ne,
                 param_reg,
                 idx_key_reg,
-                full_scan_fallback,
+                duplicate_run_done,
                 P4::None,
                 0,
             );
@@ -1227,6 +1235,7 @@ pub fn codegen_select(
 
             // ResultRow.
             b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
 
             // Advance to next index entry and loop back.
             b.resolve_label(idx_skip_label);
@@ -1235,6 +1244,13 @@ pub fn codegen_select(
             let idx_loop_body = idx_loop_top as i32;
             b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+            // A mismatched key after at least one verified hit means the
+            // duplicate run ended normally. Only fall back to a full scan if
+            // the index never yielded a verified match at all.
+            b.resolve_label(duplicate_run_done);
+            b.emit_jump_to_label(Opcode::If, saw_index_match_reg, 0, done_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, full_scan_fallback, P4::None, 0);
 
             // Safety fallback: if index probe cannot produce a verified row
             // (e.g. unavailable/stale index backend), run a full table scan.
@@ -2010,13 +2026,22 @@ fn codegen_select_ordered_scan(
     let sorter_cursor = cursor + 1;
 
     // Open sorter: p2 = number of key columns, p4 = sort order + collation.
+    // Sort order chars: '+' = ASC (nulls first), '-' = DESC (nulls last),
+    // '>' = ASC NULLS LAST, '<' = DESC NULLS FIRST.
     let sort_order: String = order_by
         .iter()
         .map(|term| {
-            if term.direction == Some(SortDirection::Desc) {
-                '-'
-            } else {
-                '+'
+            let is_desc = term.direction == Some(SortDirection::Desc);
+            let nulls_last = match term.nulls {
+                Some(NullsOrder::Last) => true,
+                Some(NullsOrder::First) => false,
+                None => is_desc, // SQLite default: ASC→nulls first, DESC→nulls last
+            };
+            match (is_desc, nulls_last) {
+                (false, false) => '+', // ASC NULLS FIRST (default)
+                (false, true) => '>',  // ASC NULLS LAST
+                (true, true) => '-',   // DESC NULLS LAST (default)
+                (true, false) => '<',  // DESC NULLS FIRST
             }
         })
         .collect();
@@ -11769,6 +11794,22 @@ mod tests {
             .find(|op| op.opcode == Opcode::Next)
             .expect("index equality path must iterate duplicates");
         assert_eq!(next.p1, 1, "Next should advance the index cursor");
+
+        let ne = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Ne)
+            .expect("duplicate-run equality guard should compare the index key");
+        let if_addr = prog
+            .ops()
+            .iter()
+            .position(|op| op.opcode == Opcode::If)
+            .expect("normal duplicate-run exit should branch through a match gate");
+        assert_eq!(
+            usize::try_from(ne.p2).unwrap(),
+            if_addr,
+            "duplicate-run boundary must not jump directly into the full-scan fallback"
+        );
     }
 
     #[test]

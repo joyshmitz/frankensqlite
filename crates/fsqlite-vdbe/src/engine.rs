@@ -247,8 +247,14 @@ struct SorterCursor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortKeyOrder {
+    /// ASC with NULLS FIRST (SQLite default for ASC).
     Asc,
+    /// DESC with NULLS LAST (SQLite default for DESC).
     Desc,
+    /// ASC with NULLS LAST (explicit NULLS LAST).
+    AscNullsLast,
+    /// DESC with NULLS FIRST (explicit NULLS FIRST).
+    DescNullsFirst,
 }
 
 /// Default spill threshold: 100 MiB.
@@ -3576,12 +3582,11 @@ impl VdbeEngine {
                     let sort_key_orders: Vec<SortKeyOrder> = order_str
                         .chars()
                         .take(key_columns)
-                        .map(|ch| {
-                            if ch == '-' {
-                                SortKeyOrder::Desc
-                            } else {
-                                SortKeyOrder::Asc
-                            }
+                        .map(|ch| match ch {
+                            '-' => SortKeyOrder::Desc,
+                            '>' => SortKeyOrder::AscNullsLast,
+                            '<' => SortKeyOrder::DescNullsFirst,
+                            _ => SortKeyOrder::Asc,
                         })
                         .collect();
                     let collations: Vec<Option<String>> = if let Some(cs) = collation_str {
@@ -7006,10 +7011,14 @@ fn compare_sorter_rows(
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
-        let is_desc = sort_key_orders.get(idx) == Some(&SortKeyOrder::Desc);
+        let order = sort_key_orders
+            .get(idx)
+            .copied()
+            .unwrap_or(SortKeyOrder::Asc);
+        let is_desc = matches!(order, SortKeyOrder::Desc | SortKeyOrder::DescNullsFirst);
+        let nulls_last = matches!(order, SortKeyOrder::Desc | SortKeyOrder::AscNullsLast);
         let Some(lhs_value) = lhs.get(idx) else {
             return if rhs.get(idx).is_some() {
-                // Missing lhs, present rhs — respect DESC ordering.
                 if is_desc {
                     Ordering::Greater
                 } else {
@@ -7020,13 +7029,30 @@ fn compare_sorter_rows(
             };
         };
         let Some(rhs_value) = rhs.get(idx) else {
-            // Present lhs, missing rhs — respect DESC ordering.
             return if is_desc {
                 Ordering::Less
             } else {
                 Ordering::Greater
             };
         };
+
+        // Handle NULLs with explicit NULLS FIRST/LAST ordering.
+        let l_null = lhs_value.is_null();
+        let r_null = rhs_value.is_null();
+        if l_null || r_null {
+            if l_null && r_null {
+                continue;
+            }
+            // l_null + nulls_last → Greater (NULL at end)
+            // l_null + !nulls_last → Less (NULL at start)
+            // !l_null + nulls_last → Less (non-NULL before NULL)
+            // !l_null + !nulls_last → Greater (non-NULL after NULL)
+            return if l_null == nulls_last {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
 
         let coll = collations.get(idx).and_then(|c| c.as_deref());
         let mut ord = cmp_values_collated(lhs_value, rhs_value, coll);

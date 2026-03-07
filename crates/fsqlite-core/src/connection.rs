@@ -17455,7 +17455,7 @@ fn sort_rows_by_order_terms(
     columns: &[ResultColumn],
     col_collations: &[Option<String>],
 ) -> Result<()> {
-    let resolved: Vec<(usize, bool)> = order_by
+    let resolved: Vec<(usize, bool, NullsOrder)> = order_by
         .iter()
         .map(|term| {
             // Try integer position reference first (ORDER BY 1, 2).
@@ -17507,14 +17507,35 @@ fn sort_rows_by_order_terms(
                 FrankenError::Internal("ORDER BY expression not found in SELECT list".to_owned())
             })?;
             let desc = matches!(term.direction, Some(SortDirection::Desc));
-            Ok((idx, desc))
+            let nulls = term
+                .nulls
+                .unwrap_or_else(|| default_nulls_order(term.direction));
+            Ok((idx, desc, nulls))
         })
         .collect::<Result<Vec<_>>>()?;
 
     rows.sort_by(|a, b| {
-        for &(idx, desc) in &resolved {
+        for &(idx, desc, nulls) in &resolved {
+            let av = &a.values()[idx];
+            let bv = &b.values()[idx];
+            let a_null = av.is_null();
+            let b_null = bv.is_null();
+            if a_null || b_null {
+                if a_null && b_null {
+                    continue;
+                }
+                let ord = match (a_null, nulls) {
+                    (true, NullsOrder::First) | (false, NullsOrder::Last) => {
+                        std::cmp::Ordering::Less
+                    }
+                    (true, NullsOrder::Last) | (false, NullsOrder::First) => {
+                        std::cmp::Ordering::Greater
+                    }
+                };
+                return ord;
+            }
             let coll = col_collations.get(idx).and_then(|c| c.as_deref());
-            let ord = cmp_sqlite_values_collated(&a.values()[idx], &b.values()[idx], coll);
+            let ord = cmp_sqlite_values_collated(av, bv, coll);
             let ord = if desc { ord.reverse() } else { ord };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
@@ -58734,6 +58755,795 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} JOIN edge case mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: GROUP_CONCAT ordering, separator, DISTINCT
+    #[test]
+    fn test_conformance_group_concat_variations() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE tags(item TEXT, tag TEXT)",
+            "INSERT INTO tags VALUES('A','x')",
+            "INSERT INTO tags VALUES('A','y')",
+            "INSERT INTO tags VALUES('A','x')",
+            "INSERT INTO tags VALUES('B','z')",
+            "INSERT INTO tags VALUES('B','w')",
+            "INSERT INTO tags VALUES('C', NULL)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT item, GROUP_CONCAT(tag) FROM tags GROUP BY item ORDER BY item",
+            "SELECT item, GROUP_CONCAT(tag, '; ') FROM tags GROUP BY item ORDER BY item",
+            "SELECT item, GROUP_CONCAT(DISTINCT tag) FROM tags GROUP BY item ORDER BY item",
+            "SELECT GROUP_CONCAT(tag) FROM tags WHERE item = 'C'",
+            "SELECT GROUP_CONCAT(tag, '-') FROM tags WHERE 1 = 0",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} GROUP_CONCAT mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: printf/format extended patterns
+    #[test]
+    fn test_conformance_printf_format_extended() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "SELECT printf('%d', 42)",
+            "SELECT printf('%05d', 42)",
+            "SELECT printf('%s', 'hello')",
+            "SELECT printf('%.3f', 3.14159)",
+            "SELECT printf('%10s', 'hi')",
+            "SELECT printf('%-10s|', 'hi')",
+            "SELECT printf('%x', 255)",
+            "SELECT printf('%o', 8)",
+            "SELECT printf('%%')",
+            "SELECT printf('%d + %d = %d', 1, 2, 3)",
+            "SELECT printf('%Q', 'it''s')",
+            "SELECT printf('%Q', NULL)",
+            "SELECT printf('%w', 'col name')",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} printf/format mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: HAVING with various aggregate expressions
+    #[test]
+    fn test_conformance_having_complex() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE orders(customer TEXT, product TEXT, qty INTEGER, price REAL)",
+            "INSERT INTO orders VALUES('Alice','Widget',5,10.0)",
+            "INSERT INTO orders VALUES('Alice','Gadget',2,25.0)",
+            "INSERT INTO orders VALUES('Bob','Widget',10,10.0)",
+            "INSERT INTO orders VALUES('Bob','Widget',3,10.0)",
+            "INSERT INTO orders VALUES('Charlie','Gadget',1,25.0)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT customer, SUM(qty) FROM orders GROUP BY customer HAVING SUM(qty) > 5 ORDER BY customer",
+            "SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) > 1 ORDER BY customer",
+            "SELECT customer, SUM(qty * price) AS total FROM orders GROUP BY customer HAVING total > 50 ORDER BY customer",
+            "SELECT product, AVG(qty) FROM orders GROUP BY product HAVING AVG(qty) >= 3 ORDER BY product",
+            "SELECT customer, COUNT(DISTINCT product) AS prods FROM orders GROUP BY customer HAVING prods > 1 ORDER BY customer",
+            "SELECT customer, MIN(qty), MAX(qty) FROM orders GROUP BY customer HAVING MAX(qty) - MIN(qty) > 0 ORDER BY customer",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} HAVING complex mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: nested subqueries in various positions
+    #[test]
+    fn test_conformance_nested_subqueries_deep() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)",
+            "INSERT INTO t1 VALUES(1,10)",
+            "INSERT INTO t1 VALUES(2,20)",
+            "INSERT INTO t1 VALUES(3,30)",
+            "INSERT INTO t1 VALUES(4,40)",
+            "INSERT INTO t1 VALUES(5,50)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Subquery in FROM
+            "SELECT * FROM (SELECT id, val * 2 AS doubled FROM t1) ORDER BY id",
+            // Nested subqueries in FROM
+            "SELECT * FROM (SELECT * FROM (SELECT id, val FROM t1 WHERE val > 20)) ORDER BY id",
+            // Subquery in WHERE with aggregate
+            "SELECT id FROM t1 WHERE val > (SELECT AVG(val) FROM t1) ORDER BY id",
+            // Subquery result as column
+            "SELECT id, (SELECT SUM(val) FROM t1) AS total FROM t1 WHERE id <= 2 ORDER BY id",
+            // Multiple subqueries
+            "SELECT id, val, (SELECT MIN(val) FROM t1) AS min_val, (SELECT MAX(val) FROM t1) AS max_val FROM t1 ORDER BY id",
+            // IN subquery
+            "SELECT id FROM t1 WHERE val IN (SELECT val FROM t1 WHERE val > 30) ORDER BY id",
+            // Subquery with LIMIT
+            "SELECT * FROM (SELECT id, val FROM t1 ORDER BY val DESC LIMIT 3) ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} nested subquery mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: REPLACE and INSERT OR REPLACE semantics
+    #[test]
+    fn test_conformance_replace_semantics() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+            "CREATE TABLE t2(a TEXT UNIQUE, b INTEGER)",
+            "INSERT INTO t1 VALUES(1,'alice',10)",
+            "INSERT INTO t1 VALUES(2,'bob',20)",
+            "INSERT INTO t1 VALUES(3,'carol',30)",
+            "INSERT INTO t2 VALUES('x',1)",
+            "INSERT INTO t2 VALUES('y',2)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let mutations = [
+            // REPLACE on PK conflict
+            "REPLACE INTO t1 VALUES(2,'bob_replaced',25)",
+            // INSERT OR REPLACE on UNIQUE conflict
+            "INSERT OR REPLACE INTO t2 VALUES('x',99)",
+            // REPLACE with no conflict (insert)
+            "REPLACE INTO t1 VALUES(4,'dave',40)",
+            // INSERT OR REPLACE no conflict
+            "INSERT OR REPLACE INTO t2 VALUES('z',3)",
+        ];
+        for s in &mutations {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT * FROM t1 ORDER BY id",
+            "SELECT * FROM t2 ORDER BY a",
+            "SELECT COUNT(*) FROM t1",
+            "SELECT COUNT(*) FROM t2",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} REPLACE semantics mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: BETWEEN, NOT BETWEEN, and range predicates
+    #[test]
+    fn test_conformance_between_and_ranges() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER, name TEXT)",
+            "INSERT INTO t1 VALUES(1,10,'a')",
+            "INSERT INTO t1 VALUES(2,20,'b')",
+            "INSERT INTO t1 VALUES(3,30,'c')",
+            "INSERT INTO t1 VALUES(4,40,'d')",
+            "INSERT INTO t1 VALUES(5,50,'e')",
+            "INSERT INTO t1 VALUES(6,NULL,'f')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT id FROM t1 WHERE val BETWEEN 20 AND 40 ORDER BY id",
+            "SELECT id FROM t1 WHERE val NOT BETWEEN 20 AND 40 ORDER BY id",
+            "SELECT id FROM t1 WHERE name BETWEEN 'b' AND 'd' ORDER BY id",
+            "SELECT id FROM t1 WHERE val BETWEEN 10 AND 10 ORDER BY id",
+            "SELECT id FROM t1 WHERE val BETWEEN 50 AND 10 ORDER BY id",
+            // NULL handling
+            "SELECT id FROM t1 WHERE val BETWEEN NULL AND 30 ORDER BY id",
+            "SELECT id FROM t1 WHERE val BETWEEN 20 AND NULL ORDER BY id",
+            // Expression bounds
+            "SELECT id FROM t1 WHERE val BETWEEN 10+5 AND 50-5 ORDER BY id",
+            // BETWEEN in CASE
+            "SELECT id, CASE WHEN val BETWEEN 20 AND 40 THEN 'mid' ELSE 'out' END AS bucket FROM t1 ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} BETWEEN mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: compound SELECT (UNION ALL, INTERSECT, EXCEPT) v2
+    #[test]
+    fn test_conformance_compound_select_ops_v2() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER, val TEXT)",
+            "CREATE TABLE t2(id INTEGER, val TEXT)",
+            "INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d')",
+            "INSERT INTO t2 VALUES(3,'c'),(4,'d'),(5,'e'),(6,'f')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // UNION (dedup)
+            "SELECT id FROM t1 UNION SELECT id FROM t2 ORDER BY id",
+            // UNION ALL (no dedup)
+            "SELECT id FROM t1 UNION ALL SELECT id FROM t2 ORDER BY id",
+            // INTERSECT
+            "SELECT id FROM t1 INTERSECT SELECT id FROM t2 ORDER BY id",
+            // EXCEPT
+            "SELECT id FROM t1 EXCEPT SELECT id FROM t2 ORDER BY id",
+            // Compound with expressions
+            "SELECT id, val FROM t1 WHERE id < 3 UNION ALL SELECT id, val FROM t2 WHERE id > 4 ORDER BY id",
+            // Multiple UNIONs
+            "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 ORDER BY n",
+            // UNION with NULL
+            "SELECT NULL AS x UNION SELECT NULL UNION SELECT 1 ORDER BY x",
+            // Compound with aggregate subquery
+            "SELECT MAX(id) AS m FROM t1 UNION ALL SELECT MAX(id) FROM t2 ORDER BY m",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} compound SELECT mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: EXISTS and NOT EXISTS subqueries
+    #[test]
+    fn test_conformance_exists_subqueries() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT)",
+            "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL)",
+            "INSERT INTO customers VALUES(1,'alice'),(2,'bob'),(3,'carol')",
+            "INSERT INTO orders VALUES(1,1,100.0),(2,1,200.0),(3,2,50.0)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // EXISTS - customers with orders
+            "SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id) ORDER BY name",
+            // NOT EXISTS - customers without orders
+            "SELECT name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id) ORDER BY name",
+            // EXISTS with condition
+            "SELECT name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 100) ORDER BY name",
+            // EXISTS in CASE
+            "SELECT name, CASE WHEN EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id) THEN 'yes' ELSE 'no' END AS has_orders FROM customers c ORDER BY name",
+            // Double NOT EXISTS
+            "SELECT name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 500) ORDER BY name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} EXISTS mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: CAST edge cases and type coercion v2
+    #[test]
+    fn test_conformance_cast_edge_cases_v2() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "SELECT CAST(42 AS TEXT)",
+            "SELECT CAST('123' AS INTEGER)",
+            "SELECT CAST('3.14' AS REAL)",
+            "SELECT CAST(3.14 AS INTEGER)",
+            "SELECT CAST(NULL AS INTEGER)",
+            "SELECT CAST(NULL AS TEXT)",
+            "SELECT CAST(0 AS TEXT)",
+            "SELECT CAST('' AS INTEGER)",
+            "SELECT CAST('abc' AS INTEGER)",
+            "SELECT CAST('abc' AS REAL)",
+            "SELECT CAST(9223372036854775807 AS TEXT)",
+            "SELECT CAST(-9223372036854775808 AS TEXT)",
+            "SELECT CAST(1.0 AS INTEGER)",
+            "SELECT CAST(X'48454C4C4F' AS TEXT)",
+            "SELECT typeof(CAST(42 AS TEXT))",
+            "SELECT typeof(CAST('42' AS INTEGER))",
+            "SELECT typeof(CAST('42' AS REAL))",
+            "SELECT typeof(CAST(NULL AS TEXT))",
+            // CAST in expressions
+            "SELECT CAST(10 AS REAL) / 3",
+            "SELECT CAST('5' AS INTEGER) + CAST('3' AS INTEGER)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} CAST mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: complex DELETE and UPDATE with subqueries
+    #[test]
+    fn test_conformance_delete_update_complex() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, category TEXT, price REAL)",
+            "INSERT INTO items VALUES(1,'A',10.0),(2,'A',20.0),(3,'B',30.0),(4,'B',40.0),(5,'C',50.0)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // DELETE with subquery
+        let del = "DELETE FROM items WHERE price < (SELECT AVG(price) FROM items)";
+        fconn.execute(del).unwrap();
+        rconn.execute_batch(del).unwrap();
+
+        let q1 = ["SELECT * FROM items ORDER BY id"];
+        let mismatches = oracle_compare(&fconn, &rconn, &q1);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} DELETE subquery mismatches", mismatches.len());
+        }
+
+        // UPDATE with expression
+        let upd = "UPDATE items SET price = price * 1.1 WHERE category = 'B'";
+        fconn.execute(upd).unwrap();
+        rconn.execute_batch(upd).unwrap();
+
+        let q2 = ["SELECT * FROM items ORDER BY id"];
+        let mismatches = oracle_compare(&fconn, &rconn, &q2);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} UPDATE expression mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: ORDER BY with expressions, multiple keys, NULLs
+    #[test]
+    fn test_conformance_order_by_expressions() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
+            "INSERT INTO t1 VALUES(1,30,'z'),(2,10,'a'),(3,20,'m'),(4,NULL,'b'),(5,10,'c')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT * FROM t1 ORDER BY a ASC, b ASC",
+            "SELECT * FROM t1 ORDER BY a DESC, b ASC",
+            "SELECT * FROM t1 ORDER BY a ASC NULLS FIRST, b",
+            "SELECT * FROM t1 ORDER BY a ASC NULLS LAST, b",
+            "SELECT * FROM t1 ORDER BY a * -1 DESC",
+            "SELECT * FROM t1 ORDER BY length(b)",
+            "SELECT * FROM t1 ORDER BY CASE WHEN a IS NULL THEN 999 ELSE a END",
+            "SELECT a, COUNT(*) AS cnt FROM t1 GROUP BY a ORDER BY cnt DESC, a",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} ORDER BY expression mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: INSERT...SELECT with various patterns
+    #[test]
+    fn test_conformance_insert_select_patterns() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE src(id INTEGER PRIMARY KEY, val INTEGER)",
+            "CREATE TABLE dst(id INTEGER PRIMARY KEY, val INTEGER, label TEXT DEFAULT 'none')",
+            "INSERT INTO src VALUES(1,10),(2,20),(3,30),(4,40)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let mutations = [
+            "INSERT INTO dst(id, val) SELECT id, val FROM src WHERE val <= 20",
+            "INSERT INTO dst(id, val, label) SELECT id + 100, val * 2, 'doubled' FROM src WHERE val > 20",
+        ];
+        for s in &mutations {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT * FROM dst ORDER BY id",
+            "SELECT COUNT(*) FROM dst",
+            "SELECT label, COUNT(*) FROM dst GROUP BY label ORDER BY label",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} INSERT...SELECT mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: DISTINCT with various patterns
+    #[test]
+    fn test_conformance_distinct_patterns() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER, cat TEXT, val INTEGER)",
+            "INSERT INTO t1 VALUES(1,'a',10),(2,'b',20),(3,'a',10),(4,'b',30),(5,'c',10),(6,NULL,NULL)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT DISTINCT cat FROM t1 ORDER BY cat",
+            "SELECT DISTINCT val FROM t1 ORDER BY val",
+            "SELECT DISTINCT cat, val FROM t1 ORDER BY cat, val",
+            "SELECT COUNT(DISTINCT cat) FROM t1",
+            "SELECT COUNT(DISTINCT val) FROM t1",
+            // DISTINCT with expression
+            "SELECT DISTINCT cat || '-' || val FROM t1 WHERE cat IS NOT NULL ORDER BY 1",
+            // DISTINCT with NULL
+            "SELECT DISTINCT cat FROM t1 ORDER BY cat",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} DISTINCT mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: triggers and side effects
+    #[test]
+    fn test_conformance_trigger_basic() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)",
+            "CREATE TABLE log(action TEXT, old_val INTEGER, new_val INTEGER)",
+            "CREATE TRIGGER t1_insert AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('INSERT', NULL, NEW.val); END",
+            "CREATE TRIGGER t1_update AFTER UPDATE ON t1 BEGIN INSERT INTO log VALUES('UPDATE', OLD.val, NEW.val); END",
+            "CREATE TRIGGER t1_delete AFTER DELETE ON t1 BEGIN INSERT INTO log VALUES('DELETE', OLD.val, NULL); END",
+            "INSERT INTO t1 VALUES(1,10)",
+            "INSERT INTO t1 VALUES(2,20)",
+            "UPDATE t1 SET val = 15 WHERE id = 1",
+            "DELETE FROM t1 WHERE id = 2",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT * FROM t1 ORDER BY id",
+            "SELECT * FROM log ORDER BY rowid",
+            "SELECT COUNT(*) FROM log",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} trigger mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: COALESCE/NULLIF/IIF with complex args
+    #[test]
+    fn test_conformance_null_functions_complex() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT)",
+            "INSERT INTO t1 VALUES(1,NULL,NULL,NULL)",
+            "INSERT INTO t1 VALUES(2,10,NULL,'x')",
+            "INSERT INTO t1 VALUES(3,NULL,20,'y')",
+            "INSERT INTO t1 VALUES(4,10,20,'z')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT id, COALESCE(a, b, 0) FROM t1 ORDER BY id",
+            "SELECT id, COALESCE(a, b, c) FROM t1 ORDER BY id",
+            "SELECT id, NULLIF(a, 10) FROM t1 ORDER BY id",
+            "SELECT id, NULLIF(a, b) FROM t1 ORDER BY id",
+            "SELECT id, IIF(a IS NOT NULL, a, -1) FROM t1 ORDER BY id",
+            "SELECT id, IIF(a > 5 AND b > 10, 'both', 'no') FROM t1 ORDER BY id",
+            // Nested
+            "SELECT id, COALESCE(NULLIF(a, 10), b, -1) FROM t1 ORDER BY id",
+            "SELECT id, IIF(COALESCE(a, 0) > 0, 'pos', 'zero_or_null') FROM t1 ORDER BY id",
+            // IFNULL
+            "SELECT id, IFNULL(a, -1) FROM t1 ORDER BY id",
+            "SELECT id, IFNULL(a, IFNULL(b, -1)) FROM t1 ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} null function mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: multiple JOINs and self-joins
+    #[test]
+    fn test_conformance_multi_join_patterns() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, mgr_id INTEGER)",
+            "CREATE TABLE departments(id INTEGER PRIMARY KEY, dname TEXT)",
+            "INSERT INTO departments VALUES(1,'Engineering'),(2,'Sales'),(3,'HR')",
+            "INSERT INTO employees VALUES(1,'Alice',1,NULL),(2,'Bob',1,1),(3,'Carol',2,1),(4,'Dave',2,3),(5,'Eve',NULL,NULL)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // INNER JOIN
+            "SELECT e.name, d.dname FROM employees e INNER JOIN departments d ON e.dept_id = d.id ORDER BY e.name",
+            // LEFT JOIN (includes Eve with NULL dept)
+            "SELECT e.name, d.dname FROM employees e LEFT JOIN departments d ON e.dept_id = d.id ORDER BY e.name",
+            // Self-join (employee + manager)
+            "SELECT e.name AS emp, m.name AS mgr FROM employees e LEFT JOIN employees m ON e.mgr_id = m.id ORDER BY e.name",
+            // Three-table join
+            "SELECT e.name, d.dname, m.name AS mgr FROM employees e LEFT JOIN departments d ON e.dept_id = d.id LEFT JOIN employees m ON e.mgr_id = m.id ORDER BY e.name",
+            // JOIN with aggregation
+            "SELECT d.dname, COUNT(e.id) AS cnt FROM departments d LEFT JOIN employees e ON e.dept_id = d.id GROUP BY d.dname ORDER BY d.dname",
+            // JOIN with subquery
+            "SELECT e.name FROM employees e WHERE e.dept_id IN (SELECT id FROM departments WHERE dname = 'Engineering') ORDER BY e.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} multi-join mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: expressions in SELECT without FROM
+    #[test]
+    fn test_conformance_expression_select() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "SELECT 1+2",
+            "SELECT 10/3, 10%3",
+            "SELECT 10.0/3",
+            "SELECT -5",
+            "SELECT abs(-42)",
+            "SELECT max(1,2,3)",
+            "SELECT min(5,3,8)",
+            "SELECT typeof(1), typeof(1.0), typeof('a'), typeof(NULL), typeof(X'00')",
+            "SELECT length('hello')",
+            "SELECT upper('hello'), lower('WORLD')",
+            "SELECT substr('hello',2,3)",
+            "SELECT replace('hello world','world','earth')",
+            "SELECT instr('hello world','world')",
+            "SELECT hex(X'DEADBEEF')",
+            "SELECT quote(NULL), quote(42), quote('it''s'), quote(X'00')",
+            "SELECT unicode('A'), unicode('Z')",
+            "SELECT char(65), char(90)",
+            "SELECT 1 IN (1,2,3), 4 IN (1,2,3)",
+            "SELECT 1 NOT IN (1,2,3), 4 NOT IN (1,2,3)",
+            "SELECT COALESCE(NULL, NULL, 42)",
+            "SELECT NULLIF(1,1), NULLIF(1,2)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} expression SELECT mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: INTEGER overflow and edge arithmetic
+    #[test]
+    fn test_conformance_integer_overflow_arithmetic() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "SELECT 9223372036854775807 + 1",
+            "SELECT -9223372036854775808 - 1",
+            "SELECT 9223372036854775807 * 2",
+            "SELECT 9223372036854775807 + 0",
+            "SELECT -9223372036854775808 + 0",
+            "SELECT -(-9223372036854775807)",
+            "SELECT typeof(9223372036854775807 + 1)",
+            "SELECT typeof(9223372036854775807)",
+            "SELECT 9223372036854775807 / -1",
+            "SELECT -9223372036854775808 / -1",
+            "SELECT 1 / 0",
+            "SELECT 1 % 0",
+            "SELECT 0 / 0",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} integer overflow mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: LIKE with special patterns
+    #[test]
+    fn test_conformance_like_patterns() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, s TEXT)",
+            "INSERT INTO t1 VALUES(1,'hello'),(2,'HELLO'),(3,'world'),(4,'he%lo'),(5,'he_lo'),(6,''),(7,NULL)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT id FROM t1 WHERE s LIKE 'hello' ORDER BY id",
+            "SELECT id FROM t1 WHERE s LIKE 'HELLO' ORDER BY id",
+            "SELECT id FROM t1 WHERE s LIKE 'h%' ORDER BY id",
+            "SELECT id FROM t1 WHERE s LIKE '%lo' ORDER BY id",
+            "SELECT id FROM t1 WHERE s LIKE 'he_lo' ORDER BY id",
+            "SELECT id FROM t1 WHERE s LIKE '' ORDER BY id",
+            "SELECT id FROM t1 WHERE s NOT LIKE 'hello' ORDER BY id",
+            // NULL LIKE
+            "SELECT id FROM t1 WHERE s LIKE NULL ORDER BY id",
+            "SELECT id FROM t1 WHERE NULL LIKE s ORDER BY id",
+            // Case sensitivity (default LIKE is case-insensitive for ASCII)
+            "SELECT 'ABC' LIKE 'abc'",
+            "SELECT 'abc' LIKE 'ABC'",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} LIKE mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: GROUP BY with multiple columns and expressions
+    #[test]
+    fn test_conformance_group_by_multi() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE sales(id INTEGER PRIMARY KEY, region TEXT, product TEXT, qty INTEGER, price REAL)",
+            "INSERT INTO sales VALUES(1,'N','A',10,5.0),(2,'N','B',20,3.0),(3,'S','A',15,5.0),(4,'S','B',25,3.0),(5,'N','A',5,5.0),(6,'S','A',10,5.0)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT region, SUM(qty) FROM sales GROUP BY region ORDER BY region",
+            "SELECT region, product, SUM(qty) FROM sales GROUP BY region, product ORDER BY region, product",
+            "SELECT region, product, SUM(qty * price) AS revenue FROM sales GROUP BY region, product ORDER BY revenue DESC",
+            "SELECT region, COUNT(*), SUM(qty), AVG(price) FROM sales GROUP BY region ORDER BY region",
+            // GROUP BY expression
+            "SELECT qty > 10 AS big, COUNT(*) FROM sales GROUP BY qty > 10 ORDER BY big",
+            // GROUP BY with HAVING
+            "SELECT region, SUM(qty) AS total FROM sales GROUP BY region HAVING total > 30 ORDER BY region",
+            "SELECT product, COUNT(*) AS cnt FROM sales GROUP BY product HAVING cnt >= 3 ORDER BY product",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} GROUP BY multi mismatches", mismatches.len());
         }
     }
 }
