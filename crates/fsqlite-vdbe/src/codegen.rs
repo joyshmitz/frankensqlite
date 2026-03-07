@@ -8820,15 +8820,25 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             emit_expr(b, operand, r_operand, ctx);
             emit_expr(b, low, r_low, ctx);
             emit_expr(b, high, r_high, ctx);
+            // Resolve collation from the operand (e.g. column-level NOCASE).
+            let collation_p4 = effective_collation_ctx(operand, ctx)
+                .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
             let false_label = b.emit_label();
             let null_label = b.emit_label();
             let done_label = b.emit_label();
             // If operand is NULL, short-circuit to NULL result.
             b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
             // Jump to false if operand < low (NULL low → no jump, handled below).
-            b.emit_jump_to_label(Opcode::Lt, r_low, r_operand, false_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Lt,
+                r_low,
+                r_operand,
+                false_label,
+                collation_p4.clone(),
+                0,
+            );
             // Jump to false if operand > high (NULL high → no jump, handled below).
-            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, collation_p4, 0);
             // Passed both comparisons.  If either bound was NULL the comparison
             // silently fell through instead of confirming the range, so the
             // correct three-valued result is NULL, not TRUE.
@@ -8867,6 +8877,9 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 //   v IN (...) hit           → TRUE
                 let r_operand = b.alloc_temp();
                 emit_expr(b, operand, r_operand, ctx);
+                // Resolve collation from the operand (e.g. column-level NOCASE).
+                let collation_p4 = effective_collation_ctx(operand, ctx)
+                    .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
                 let null_label = b.emit_label();
                 let true_label = b.emit_label();
                 let done_label = b.emit_label();
@@ -8878,7 +8891,14 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 let r_val = b.alloc_temp();
                 for val_expr in values {
                     emit_expr(b, val_expr, r_val, ctx);
-                    b.emit_jump_to_label(Opcode::Eq, r_val, r_operand, true_label, P4::None, 0);
+                    b.emit_jump_to_label(
+                        Opcode::Eq,
+                        r_val,
+                        r_operand,
+                        true_label,
+                        collation_p4.clone(),
+                        0,
+                    );
                     // Eq with NULL never jumps.  If this value was NULL, flag it.
                     let next_val = b.emit_label();
                     let set_flag = b.emit_label();
