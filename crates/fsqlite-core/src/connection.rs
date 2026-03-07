@@ -43385,6 +43385,73 @@ mod pager_routing_tests {
         }
     }
 
+    /// Single-table SELECT edge cases: GROUP BY with expressions, ORDER BY
+    /// on computed columns, WHERE with BETWEEN/IN/LIKE, and DISTINCT.
+    #[test]
+    fn test_conformance_single_table_select_edge_cases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL, stock INTEGER, active INTEGER DEFAULT 1);",
+            "INSERT INTO products VALUES (1, 'Widget A', 'tools', 19.99, 50, 1);",
+            "INSERT INTO products VALUES (2, 'Widget B', 'tools', 29.99, 30, 1);",
+            "INSERT INTO products VALUES (3, 'Gadget X', 'electronics', 99.99, 10, 1);",
+            "INSERT INTO products VALUES (4, 'Gadget Y', 'electronics', 149.99, 5, 0);",
+            "INSERT INTO products VALUES (5, 'Part Z', 'hardware', 4.99, 200, 1);",
+            "INSERT INTO products VALUES (6, 'Part W', 'hardware', 2.99, 500, 1);",
+            "INSERT INTO products VALUES (7, 'Cable', 'electronics', 9.99, 100, 1);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // BETWEEN
+            "SELECT name FROM products WHERE price BETWEEN 10 AND 100 ORDER BY name",
+            // NOT BETWEEN
+            "SELECT name FROM products WHERE price NOT BETWEEN 10 AND 100 ORDER BY name",
+            // IN list
+            "SELECT name FROM products WHERE category IN ('tools', 'hardware') ORDER BY name",
+            // NOT IN list
+            "SELECT name FROM products WHERE category NOT IN ('tools', 'hardware') ORDER BY name",
+            // LIKE
+            "SELECT name FROM products WHERE name LIKE 'Widget%' ORDER BY name",
+            "SELECT name FROM products WHERE name LIKE '%get%' ORDER BY name",
+            "SELECT name FROM products WHERE name LIKE 'Part _' ORDER BY name",
+            // GLOB
+            "SELECT name FROM products WHERE name GLOB 'Widget*' ORDER BY name",
+            // DISTINCT
+            "SELECT DISTINCT category FROM products ORDER BY category",
+            // GROUP BY with expression
+            "SELECT CASE WHEN price > 50 THEN 'expensive' ELSE 'cheap' END AS tier, count(*) AS cnt FROM products GROUP BY CASE WHEN price > 50 THEN 'expensive' ELSE 'cheap' END ORDER BY tier",
+            // ORDER BY computed column (not in SELECT)
+            "SELECT name FROM products ORDER BY price * stock DESC LIMIT 3",
+            // Multiple conditions with AND/OR
+            "SELECT name FROM products WHERE (category = 'tools' OR category = 'hardware') AND active = 1 AND stock > 30 ORDER BY name",
+            // IS NULL / IS NOT NULL
+            "SELECT count(*) FROM products WHERE name IS NOT NULL",
+            // Aggregate with WHERE filter
+            "SELECT category, sum(price * stock) AS inventory_value FROM products WHERE active = 1 GROUP BY category ORDER BY category",
+            // GROUP BY with HAVING on computed expression
+            "SELECT category, count(*) AS cnt FROM products GROUP BY category HAVING count(*) > 1 ORDER BY category",
+            // DISTINCT with ORDER BY
+            "SELECT DISTINCT category FROM products ORDER BY category DESC",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} single-table SELECT edge case mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
     /// String functions, REPLACE, INSTR, SUBSTR, and built-in functions
     /// commonly used by ORMs and applications.
     #[test]
