@@ -157,7 +157,7 @@ pub struct TriageSession {
     pub bead_id: String,
     /// Original manifest from CI gate run.
     pub manifest_summary: ManifestSummary,
-    /// Schema validation result.
+    /// Combined log validation result across decode + schema validation.
     pub validation_passed: bool,
     /// Total events decoded from logs.
     pub total_events: usize,
@@ -210,6 +210,7 @@ impl ManifestSummary {
 pub fn build_triage_session(manifest: &ArtifactManifest, jsonl_content: &str) -> TriageSession {
     let decoded: DecodedStream = decode_jsonl_stream(jsonl_content);
     let report: ValidationReport = validate_event_stream(&decoded.events);
+    let decode_errors = decoded.errors.len();
 
     let divergences = extract_divergences(&decoded.events);
     let failures = extract_failures(&decoded.events);
@@ -251,9 +252,9 @@ pub fn build_triage_session(manifest: &ArtifactManifest, jsonl_content: &str) ->
     TriageSession {
         bead_id: manifest.bead_id.clone(),
         manifest_summary: ManifestSummary::from_manifest(manifest),
-        validation_passed: report.passed,
+        validation_passed: report.passed && decode_errors == 0,
         total_events: decoded.events.len(),
-        decode_errors: decoded.errors.len(),
+        decode_errors,
         divergences,
         failure_indices,
         replay_config,
@@ -275,13 +276,20 @@ impl TriageSession {
         } else {
             "FAIL"
         };
+        let schema_status = if self.validation_passed {
+            "PASS"
+        } else {
+            "FAIL"
+        };
         format!(
-            "bead_id={} lane={} run_id={} gate={} events={} divergences={} failures={} errors={} warnings={}",
+            "bead_id={} lane={} run_id={} gate={} schema={} events={} decode_errors={} divergences={} failures={} errors={} warnings={}",
             self.bead_id,
             self.manifest_summary.lane,
             self.manifest_summary.run_id,
             status,
+            schema_status,
             self.total_events,
+            self.decode_errors,
             self.divergences.len(),
             self.failure_indices.len(),
             self.validation_errors,
@@ -393,15 +401,36 @@ impl TriageSession {
 
         // Verdict
         let _ = writeln!(out, "\n--- Verdict ---");
-        if self.divergences.is_empty() && self.failure_indices.is_empty() {
-            let _ = writeln!(out, "  No divergences or failures detected. Gate passed.");
-        } else {
+        if !self.needs_investigation() {
             let _ = writeln!(
                 out,
-                "  {} divergence(s), {} failure(s) detected. Investigation required.",
-                self.divergences.len(),
-                self.failure_indices.len(),
+                "  No divergences, failures, or log-integrity issues detected. Gate passed.",
             );
+        } else {
+            if self.decode_errors > 0 || !self.validation_passed {
+                let _ = writeln!(
+                    out,
+                    "  Log stream integrity failed: {} decode error(s), schema={}.",
+                    self.decode_errors,
+                    if self.validation_passed {
+                        "PASS"
+                    } else {
+                        "FAIL"
+                    },
+                );
+            }
+            if !self.divergences.is_empty() || !self.failure_indices.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  {} divergence(s), {} failure(s) detected.",
+                    self.divergences.len(),
+                    self.failure_indices.len(),
+                );
+            }
+            if !self.manifest_summary.gate_passed {
+                let _ = writeln!(out, "  CI gate reported FAIL.");
+            }
+            let _ = writeln!(out, "  Investigation required.");
         }
 
         out
@@ -410,7 +439,9 @@ impl TriageSession {
     /// Whether the session indicates actionable failures.
     #[must_use]
     pub fn needs_investigation(&self) -> bool {
-        !self.divergences.is_empty()
+        self.decode_errors > 0
+            || !self.validation_passed
+            || !self.divergences.is_empty()
             || !self.failure_indices.is_empty()
             || !self.manifest_summary.gate_passed
     }
@@ -646,8 +677,14 @@ impl ReplayTriageReport {
     #[must_use]
     pub fn triage_line(&self) -> String {
         format!(
-            "{}: divergences={} failures={} repro={}/5 events={}",
+            "{}: schema={} decode_errors={} divergences={} failures={} repro={}/5 events={}",
             self.verdict,
+            if self.session.validation_passed {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+            self.session.decode_errors,
             self.session.divergences.len(),
             self.session.failure_indices.len(),
             self.reproducibility_score,
@@ -708,8 +745,14 @@ pub fn run_replay_triage_workflow(
 
     // Step 6: Build summary.
     let summary = format!(
-        "Replay triage for run {}: {} divergence(s), {} failure(s), repro {}/5, verdict={}",
+        "Replay triage for run {}: schema={}, decode_errors={}, divergence(s)={}, failure(s)={}, repro {}/5, verdict={}",
         session.manifest_summary.run_id,
+        if session.validation_passed {
+            "PASS"
+        } else {
+            "FAIL"
+        },
+        session.decode_errors,
         session.divergences.len(),
         session.failure_indices.len(),
         reproducibility_score,
@@ -1828,8 +1871,49 @@ mod tests {
 
         let summary = session.summary_line();
         assert!(summary.contains("FAIL"), "should contain FAIL");
+        assert!(summary.contains("schema=PASS"));
         assert!(summary.contains("divergences=1"));
         assert!(summary.contains("failures=1"));
+    }
+
+    #[test]
+    fn malformed_jsonl_requires_investigation() {
+        let manifest = build_test_manifest(false);
+        let jsonl = format!("{valid}{{not-json}}\n", valid = build_clean_jsonl());
+        let session = build_triage_session(&manifest, &jsonl);
+
+        assert_eq!(session.total_events, 2);
+        assert_eq!(session.decode_errors, 1);
+        assert!(!session.validation_passed);
+        assert!(
+            session.needs_investigation(),
+            "malformed log streams must not be treated as clean triage sessions",
+        );
+
+        let summary = session.summary_line();
+        assert!(summary.contains("schema=FAIL"));
+        assert!(summary.contains("decode_errors=1"));
+    }
+
+    #[test]
+    fn schema_invalid_events_require_investigation() {
+        let manifest = build_test_manifest(false);
+        let jsonl = format!(
+            concat!(
+                "{valid}",
+                "{{\"run_id\":\"\",\"timestamp\":\"bad-timestamp\",\"phase\":\"Validate\",",
+                "\"event_type\":\"Pass\",\"scenario_id\":\"INFRA-1\",\"seed\":42,",
+                "\"backend\":\"fsqlite\",\"artifact_hash\":null,\"context\":{{}}}}\n"
+            ),
+            valid = build_clean_jsonl()
+        );
+        let session = build_triage_session(&manifest, &jsonl);
+
+        assert_eq!(session.decode_errors, 0);
+        assert_eq!(session.total_events, 3);
+        assert!(!session.validation_passed);
+        assert!(session.validation_errors > 0);
+        assert!(session.needs_investigation());
     }
 
     #[test]
@@ -1895,9 +1979,20 @@ mod tests {
 
         let report = session.render_triage_report();
         assert!(
-            report.contains("No divergences or failures detected"),
+            report.contains("No divergences, failures, or log-integrity issues detected"),
             "bead_id={BEAD_ID} case=clean_verdict",
         );
+    }
+
+    #[test]
+    fn triage_report_calls_out_log_integrity_failures() {
+        let manifest = build_test_manifest(false);
+        let jsonl = format!("{valid}{{not-json}}\n", valid = build_clean_jsonl());
+        let session = build_triage_session(&manifest, &jsonl);
+
+        let report = session.render_triage_report();
+        assert!(report.contains("Log stream integrity failed"));
+        assert!(report.contains("decode error(s), schema=FAIL"));
     }
 
     // ---- Divergence Context Tests ----

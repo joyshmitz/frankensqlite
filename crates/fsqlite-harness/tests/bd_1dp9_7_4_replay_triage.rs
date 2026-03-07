@@ -171,6 +171,22 @@ fn build_clean_jsonl() -> String {
     encode_jsonl_stream(&events).unwrap()
 }
 
+fn build_clean_jsonl_with_decode_error() -> String {
+    format!("{valid}{{not-json}}\n", valid = build_clean_jsonl())
+}
+
+fn build_clean_jsonl_with_schema_error() -> String {
+    format!(
+        concat!(
+            "{valid}",
+            "{{\"run_id\":\"\",\"timestamp\":\"bad-timestamp\",\"phase\":\"Validate\",",
+            "\"event_type\":\"Pass\",\"scenario_id\":\"INFRA-1\",\"seed\":42,",
+            "\"backend\":\"fsqlite\",\"artifact_hash\":null,\"context\":{{}}}}\n"
+        ),
+        valid = build_clean_jsonl()
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Full workflow — failing run
 // ---------------------------------------------------------------------------
@@ -332,6 +348,51 @@ fn workflow_clean_run_no_repro() {
     assert_eq!(
         report.reproducibility_score, 0,
         "bead_id={BEAD_ID} case=zero_repro_score"
+    );
+}
+
+#[test]
+fn workflow_decode_errors_do_not_pass_clean_manifest() {
+    let manifest = build_clean_manifest();
+    let jsonl = build_clean_jsonl_with_decode_error();
+    let config = ReplayTriageConfig::default();
+    let report = run_replay_triage_workflow(&manifest, &jsonl, &config);
+
+    assert_eq!(
+        report.verdict,
+        ReplayTriageVerdict::Warning,
+        "bead_id={BEAD_ID} case=decode_errors_warning"
+    );
+    assert_eq!(report.session.decode_errors, 1);
+    assert!(!report.session.validation_passed);
+    assert!(report.session.needs_investigation());
+    assert!(
+        report
+            .triage_report_text
+            .contains("Log stream integrity failed"),
+        "bead_id={BEAD_ID} case=decode_errors_verdict_text"
+    );
+}
+
+#[test]
+fn workflow_schema_errors_do_not_pass_clean_manifest() {
+    let manifest = build_clean_manifest();
+    let jsonl = build_clean_jsonl_with_schema_error();
+    let config = ReplayTriageConfig::default();
+    let report = run_replay_triage_workflow(&manifest, &jsonl, &config);
+
+    assert_eq!(
+        report.verdict,
+        ReplayTriageVerdict::Warning,
+        "bead_id={BEAD_ID} case=schema_errors_warning"
+    );
+    assert_eq!(report.session.decode_errors, 0);
+    assert!(!report.session.validation_passed);
+    assert!(report.session.validation_errors > 0);
+    assert!(report.session.needs_investigation());
+    assert!(
+        report.summary.contains("schema=FAIL"),
+        "bead_id={BEAD_ID} case=schema_errors_summary"
     );
 }
 

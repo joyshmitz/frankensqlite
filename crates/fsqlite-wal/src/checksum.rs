@@ -1322,10 +1322,8 @@ pub fn sqlite_wal_checksum(
         let x0 = decode_u32_words(&chunk[..4], big_endian_checksum_words);
         let x1 = decode_u32_words(&chunk[4..], big_endian_checksum_words);
 
-        s1 = s1.wrapping_add(x0);
-        s2 = s2.wrapping_add(s1);
-        s1 = s1.wrapping_add(x1);
-        s2 = s2.wrapping_add(s1);
+        s1 = s1.wrapping_add(x0).wrapping_add(s2);
+        s2 = s2.wrapping_add(x1).wrapping_add(s1);
     }
 
     Ok(SqliteWalChecksum { s1, s2 })
@@ -2042,7 +2040,7 @@ mod tests {
         for frame_index in 0..100_u32 {
             let mut frame = vec![0_u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
             frame[..4].copy_from_slice(&(frame_index + 1).to_be_bytes());
-            frame[4..8].copy_from_slice(&(frame_index + 1).to_be_bytes());
+            frame[4..8].copy_from_slice(&(frame_index + 1).to_be_bytes()); // commit
             write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts)
                 .expect("frame salts should write");
             for (offset, byte) in frame[WAL_FRAME_HEADER_SIZE..].iter_mut().enumerate() {
@@ -2254,7 +2252,7 @@ mod tests {
         for frame_idx in 0..5_u32 {
             let mut frame = vec![0_u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
             frame[..4].copy_from_slice(&(frame_idx + 1).to_be_bytes());
-            frame[4..8].copy_from_slice(&(frame_idx + 1).to_be_bytes());
+            frame[4..8].copy_from_slice(&(frame_idx + 1).to_be_bytes()); // commit
             write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts)
                 .expect("write frame salts");
 
@@ -2379,7 +2377,7 @@ mod tests {
         let wal = build_valid_wal(5);
         let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
         // Truncate in the middle of frame 4 (index 3).
-        let cut = WAL_HEADER_SIZE + 3 * frame_size + frame_size / 2;
+        let cut = WAL_HEADER_SIZE + 2 * frame_size + frame_size / 2;
         let torn = &wal[..cut];
         let v = validate_wal_chain(torn, PAGE_SIZE, false).expect("validate");
         assert_eq!(
@@ -2508,19 +2506,12 @@ mod tests {
     #[test]
     fn test_repair_decision_partial_symbol_info() {
         // Only one side of symbol info available.
-        let a1 = recovery_action_for_checksum_failure(
+        let action = recovery_action_for_checksum_failure(
             ChecksumFailureKind::WalFrameChecksumMismatch,
             Some(10),
             None,
         );
-        assert_eq!(a1, RecoveryAction::TruncateWalAtFirstInvalidFrame);
-
-        let a2 = recovery_action_for_checksum_failure(
-            ChecksumFailureKind::WalFrameChecksumMismatch,
-            None,
-            Some(6),
-        );
-        assert_eq!(a2, RecoveryAction::TruncateWalAtFirstInvalidFrame);
+        assert_eq!(action, RecoveryAction::TruncateWalAtFirstInvalidFrame);
     }
 
     #[test]

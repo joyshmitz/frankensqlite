@@ -792,53 +792,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Lex `:name`.
-    fn lex_colon_param(&mut self) -> TokenKind {
-        self.advance(); // skip :
-        let name_start = self.pos;
-        while self.pos < self.src.len() {
-            let ch = self.src[self.pos];
-            if ch.is_ascii_alphanumeric() || ch == b'_' || ch >= 0x80 {
-                self.advance();
-            } else if ch == b':' && self.peek_at(1) == Some(b':') {
-                self.advance();
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if self.pos == name_start {
-            return TokenKind::Error("empty parameter name after ':'".to_owned());
-        }
-        let name = String::from_utf8_lossy(&self.src[name_start..self.pos]).into_owned();
-        TokenKind::ColonParam(name)
-    }
-
-    /// Lex `@name`.
-    fn lex_at_param(&mut self) -> TokenKind {
-        self.advance(); // skip @
-        let name_start = self.pos;
-        while self.pos < self.src.len() {
-            let ch = self.src[self.pos];
-            if ch.is_ascii_alphanumeric() || ch == b'_' || ch >= 0x80 {
-                self.advance();
-            } else if ch == b':' && self.peek_at(1) == Some(b':') {
-                self.advance();
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if self.pos == name_start {
-            return TokenKind::Error("empty parameter name after '@'".to_owned());
-        }
-        let name = String::from_utf8_lossy(&self.src[name_start..self.pos]).into_owned();
-        TokenKind::AtParam(name)
-    }
-
-    /// Lex `$name`.
-    fn lex_dollar_param(&mut self) -> TokenKind {
-        self.advance(); // skip $
+    fn lex_alpha_param(&mut self, prefix: char, constructor: fn(String) -> TokenKind) -> TokenKind {
+        self.advance(); // skip prefix
         let name_start = self.pos;
         while self.pos < self.src.len() {
             let ch = self.src[self.pos];
@@ -854,7 +809,7 @@ impl<'a> Lexer<'a> {
                 }
                 if self.pos >= self.src.len() || self.src[self.pos] != b')' {
                     let name = String::from_utf8_lossy(&self.src[name_start..self.pos]);
-                    return TokenKind::Error(format!("unrecognized token: \"${name}\""));
+                    return TokenKind::Error(format!("unrecognized token: \"{prefix}{name}\""));
                 }
                 self.advance();
                 break; // Tcl array variable parameters end after the closing paren.
@@ -863,10 +818,25 @@ impl<'a> Lexer<'a> {
             }
         }
         if self.pos == name_start {
-            return TokenKind::Error("empty parameter name after '$'".to_owned());
+            return TokenKind::Error(format!("empty parameter name after '{prefix}'"));
         }
         let name = String::from_utf8_lossy(&self.src[name_start..self.pos]).into_owned();
-        TokenKind::DollarParam(name)
+        constructor(name)
+    }
+
+    /// Lex `:name`.
+    fn lex_colon_param(&mut self) -> TokenKind {
+        self.lex_alpha_param(':', TokenKind::ColonParam)
+    }
+
+    /// Lex `@name`.
+    fn lex_at_param(&mut self) -> TokenKind {
+        self.lex_alpha_param('@', TokenKind::AtParam)
+    }
+
+    /// Lex `$name`.
+    fn lex_dollar_param(&mut self) -> TokenKind {
+        self.lex_alpha_param('$', TokenKind::DollarParam)
     }
 
     // -----------------------------------------------------------------------

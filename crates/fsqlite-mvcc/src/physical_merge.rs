@@ -1413,11 +1413,11 @@ mod tests {
         let ps = default_page_size();
         let tid = table_id_1();
 
-        let base = build_leaf_table_page(&[(1, b"orig")], ps);
+        let base = build_leaf_table_page(&[(1, b"orig"), (2, b"orig2")], ps);
         // T1: modified row 1
-        let committed = build_leaf_table_page(&[(1, b"from_t1")], ps);
-        // T2: also modified row 1
-        let txn = build_leaf_table_page(&[(1, b"from_t2")], ps);
+        let committed = build_leaf_table_page(&[(1, b"from_t1"), (2, b"orig2")], ps);
+        // T2: modified row 2
+        let txn = build_leaf_table_page(&[(1, b"orig"), (2, b"from_t2")], ps);
 
         let result = evaluate_merge_ladder(
             WriteMergePolicy::Safe,
@@ -1447,10 +1447,11 @@ mod tests {
                     fsqlite_types::BtreeRef::Table(tid),
                 )
                 .unwrap();
-                assert_eq!(parsed.cells.len(), 1, "merged page should have 1 cell");
+                assert_eq!(parsed.cells.len(), 2, "merged page should have 2 cells");
                 // Verify all rowids present
                 let rowids: Vec<i64> = parsed.cells.iter().filter_map(|c| c.rowid).collect();
                 assert!(rowids.contains(&1));
+                assert!(rowids.contains(&2));
             }
             other => panic!("expected StructuredMergeSucceeded, got {other:?}"),
         }

@@ -91,7 +91,8 @@ fn test_update_returning_from_clause() {
     assert_eq!(errors.len(), 1, "Expected exactly 1 error");
     assert!(
         matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
-        "Expected UnresolvedColumn error for orders.id, got {:?}", errors[0]
+        "Expected UnresolvedColumn error for orders.id, got {:?}",
+        errors[0]
     );
 }
 
@@ -107,15 +108,19 @@ fn test_order_by_select_alias() {
 #[test]
 fn test_upsert_excluded_unqualified_column() {
     let schema = make_schema();
-    // In UPSERT, unqualified columns in the SET and WHERE clauses should resolve 
+    // In UPSERT, unqualified columns in the SET and WHERE clauses should resolve
     // to the target table (users), NOT the `excluded` pseudo-table.
     // The query should pass semantic analysis without 'AmbiguousColumn' errors.
     let stmt = parse_one(
-        "INSERT INTO users (id, name) VALUES (1, 'alice') ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE id > 0"
+        "INSERT INTO users (id, name) VALUES (1, 'alice') ON CONFLICT (id) DO UPDATE SET name = excluded.name WHERE id > 0",
     );
     let mut resolver = Resolver::new(&schema);
     let errors = resolver.resolve_statement(&stmt);
-    assert!(errors.is_empty(), "Expected no errors for UPSERT, got {:?}", errors);
+    assert!(
+        errors.is_empty(),
+        "Expected no errors for UPSERT, got {:?}",
+        errors
+    );
 }
 
 #[test]
@@ -128,7 +133,8 @@ fn test_insert_values_cannot_see_target_table() {
     assert_eq!(errors.len(), 1, "Expected exactly 1 error");
     assert!(
         matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
-        "Expected UnresolvedColumn error, got {:?}", errors[0]
+        "Expected UnresolvedColumn error, got {:?}",
+        errors[0]
     );
 }
 
@@ -142,7 +148,8 @@ fn test_insert_select_cannot_see_target_table() {
     assert_eq!(errors.len(), 1, "Expected exactly 1 error");
     assert!(
         matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
-        "Expected UnresolvedColumn error, got {:?}", errors[0]
+        "Expected UnresolvedColumn error, got {:?}",
+        errors[0]
     );
 }
 
@@ -155,7 +162,8 @@ fn test_update_limit_cannot_see_target_table() {
     assert_eq!(errors.len(), 1, "Expected exactly 1 error");
     assert!(
         matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
-        "Expected UnresolvedColumn error, got {:?}", errors[0]
+        "Expected UnresolvedColumn error, got {:?}",
+        errors[0]
     );
 }
 
@@ -168,6 +176,7 @@ fn test_delete_limit_cannot_see_target_table() {
     assert_eq!(errors.len(), 1, "Expected exactly 1 error");
     assert!(
         matches!(errors[0].kind, SemanticErrorKind::UnresolvedColumn { .. }),
-        "Expected UnresolvedColumn error, got {:?}", errors[0]
+        "Expected UnresolvedColumn error, got {:?}",
+        errors[0]
     );
 }

@@ -2,11 +2,11 @@ pub mod memory;
 pub mod metrics;
 pub mod shm;
 pub mod traits;
-#[cfg(unix)]
+#[cfg(all(feature = "native", unix))]
 pub mod unix;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native", target_os = "linux"))]
 pub mod uring;
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "native", target_os = "windows"))]
 pub mod windows;
 
 /// Host filesystem helpers that are allowed to use `std::fs`.
@@ -14,6 +14,7 @@ pub mod windows;
 /// The ambient-authority audit gate (`fsqlite-types::cx::tests::test_ambient_authority_audit_gate`)
 /// forbids `std::fs::` usage outside the VFS boundary. Test harness crates should depend on these
 /// helpers rather than calling `std::fs` directly.
+#[cfg(feature = "native")]
 pub mod host_fs {
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
@@ -87,9 +88,9 @@ pub use memory::{MemoryFile, MemoryVfs};
 pub use metrics::{GLOBAL_VFS_METRICS, TracingFile, VfsMetrics};
 pub use shm::ShmRegion;
 pub use traits::{Vfs, VfsFile};
-#[cfg(unix)]
+#[cfg(all(feature = "native", unix))]
 pub use unix::{UnixFile, UnixVfs};
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "native", target_os = "linux"))]
 pub use uring::{IoUringFile, IoUringVfs};
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "native", target_os = "windows"))]
 pub use windows::{WindowsFile, WindowsVfs};

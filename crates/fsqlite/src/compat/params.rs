@@ -100,13 +100,22 @@ impl From<u32> for ParamValue {
 
 impl From<u64> for ParamValue {
     fn from(v: u64) -> Self {
-        Self(SqliteValue::Integer(i64::try_from(v).unwrap_or(i64::MAX)))
+        // SQLite integer storage is signed 64-bit. Preserve out-of-range
+        // unsigned values exactly as TEXT rather than silently clamping.
+        match i64::try_from(v) {
+            Ok(i) => Self(SqliteValue::Integer(i)),
+            Err(_) => Self(SqliteValue::Text(v.to_string())),
+        }
     }
 }
 
 impl From<usize> for ParamValue {
     fn from(v: usize) -> Self {
-        Self(SqliteValue::Integer(i64::try_from(v).unwrap_or(i64::MAX)))
+        // Keep parity with u64 handling to avoid lossy saturation.
+        match i64::try_from(v) {
+            Ok(i) => Self(SqliteValue::Integer(i)),
+            Err(_) => Self(SqliteValue::Text(v.to_string())),
+        }
     }
 }
 
@@ -174,6 +183,27 @@ mod tests {
         assert_eq!(ParamValue::from(42_u32).0, SqliteValue::Integer(42));
         assert_eq!(ParamValue::from(100_u64).0, SqliteValue::Integer(100));
         assert_eq!(ParamValue::from(200_usize).0, SqliteValue::Integer(200));
+    }
+
+    #[test]
+    fn param_value_large_u64_preserves_exact_value() {
+        let value = u64::MAX;
+        assert_eq!(
+            ParamValue::from(value).0,
+            SqliteValue::Text(value.to_string())
+        );
+    }
+
+    #[test]
+    fn param_value_large_usize_preserves_exact_value() {
+        let value = usize::MAX;
+        match i64::try_from(value) {
+            Ok(int) => assert_eq!(ParamValue::from(value).0, SqliteValue::Integer(int)),
+            Err(_) => assert_eq!(
+                ParamValue::from(value).0,
+                SqliteValue::Text(value.to_string())
+            ),
+        }
     }
 
     #[test]

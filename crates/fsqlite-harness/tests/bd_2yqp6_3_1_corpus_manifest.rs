@@ -54,7 +54,9 @@ struct CategoryFloor {
 struct FixtureRoots {
     schema_version: String,
     fixtures_dir: String,
+    fixtures_dir_aliases: Vec<String>,
     slt_dir: String,
+    slt_dir_aliases: Vec<String>,
     min_fixture_json_files: usize,
     min_fixture_entries: usize,
     min_fixture_sql_statements: usize,
@@ -351,7 +353,9 @@ fn fixture_roots_contract_is_present_and_positive() {
     let fixture_roots = &manifest.fixture_roots;
     assert_eq!(fixture_roots.schema_version, "1.0.0");
     assert!(!fixture_roots.fixtures_dir.trim().is_empty());
+    assert!(!fixture_roots.fixtures_dir_aliases.is_empty());
     assert!(!fixture_roots.slt_dir.trim().is_empty());
+    assert!(!fixture_roots.slt_dir_aliases.is_empty());
     assert!(fixture_roots.min_fixture_json_files > 0);
     assert!(fixture_roots.min_fixture_entries > 0);
     assert!(fixture_roots.min_fixture_sql_statements > 0);
@@ -359,6 +363,18 @@ fn fixture_roots_contract_is_present_and_positive() {
     assert!(fixture_roots.min_slt_entries > 0);
     assert!(fixture_roots.min_slt_sql_statements > 0);
     assert!(!fixture_roots.required_category_families.is_empty());
+    assert!(
+        fixture_roots
+            .fixtures_dir_aliases
+            .iter()
+            .all(|alias| !alias.trim().is_empty())
+    );
+    assert!(
+        fixture_roots
+            .slt_dir_aliases
+            .iter()
+            .all(|alias| !alias.trim().is_empty())
+    );
 }
 
 #[test]

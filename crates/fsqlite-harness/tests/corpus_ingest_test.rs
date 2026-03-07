@@ -679,6 +679,14 @@ fn canonical_slt_corpus_root_satisfies_manifest_contract() {
         "canonical slt_dir is missing: {}",
         contract.slt_dir.display()
     );
+    assert!(
+        !contract.fixtures_dir_aliases.is_empty(),
+        "canonical fixtures_dir aliases are missing"
+    );
+    assert!(
+        !contract.slt_dir_aliases.is_empty(),
+        "canonical slt_dir aliases are missing"
+    );
 
     let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
     let report = ingest_slt_files_with_report(&contract.slt_dir, &mut builder)

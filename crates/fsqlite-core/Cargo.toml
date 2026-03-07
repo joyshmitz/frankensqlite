@@ -8,12 +8,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = []
+default = ["native", "linux-asupersync-uring"]
+native = ["fsqlite-types/native", "fsqlite-vfs/native"]
+wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm"]
+linux-asupersync-uring = ["native", "fsqlite-vfs/linux-asupersync-uring"]
 
 [dependencies]
-fsqlite-types = { workspace = true, features = ["native"] }
+fsqlite-types = { version = "0.1.1", path = "../fsqlite-types", default-features = false }
 fsqlite-error = { workspace = true }
-fsqlite-vfs = { workspace = true }
+fsqlite-vfs = { version = "0.1.2", path = "../fsqlite-vfs", default-features = false }
 fsqlite-pager = { workspace = true }
 fsqlite-wal = { workspace = true }
 fsqlite-mvcc = { workspace = true }

@@ -3340,7 +3340,9 @@ fn test_conformance_view_query_s55h() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} view query mismatches", mismatches.len());
     }
 }
@@ -3365,11 +3367,17 @@ fn test_conformance_trigger_with_new_old_s55h() {
     fconn.execute(setup).unwrap();
     rconn.execute_batch(setup).unwrap();
 
-    fconn.execute("UPDATE items SET val = 150 WHERE id = 1").unwrap();
-    rconn.execute_batch("UPDATE items SET val = 150 WHERE id = 1").unwrap();
+    fconn
+        .execute("UPDATE items SET val = 150 WHERE id = 1")
+        .unwrap();
+    rconn
+        .execute_batch("UPDATE items SET val = 150 WHERE id = 1")
+        .unwrap();
 
     fconn.execute("DELETE FROM items WHERE id = 2").unwrap();
-    rconn.execute_batch("DELETE FROM items WHERE id = 2").unwrap();
+    rconn
+        .execute_batch("DELETE FROM items WHERE id = 2")
+        .unwrap();
 
     let queries = [
         "SELECT action, item_id, old_val, new_val FROM audit ORDER BY rowid",
@@ -3378,7 +3386,9 @@ fn test_conformance_trigger_with_new_old_s55h() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} trigger with NEW/OLD mismatches", mismatches.len());
     }
 }
@@ -3396,19 +3406,25 @@ fn test_conformance_alter_table_add_column_s55h() {
     fconn.execute(setup).unwrap();
     rconn.execute_batch(setup).unwrap();
 
-    fconn.execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 0").unwrap();
-    rconn.execute_batch("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 0").unwrap();
+    fconn
+        .execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 0")
+        .unwrap();
+    rconn
+        .execute_batch("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 0")
+        .unwrap();
 
     fconn.execute("INSERT INTO t VALUES (3, 'c', 42)").unwrap();
-    rconn.execute_batch("INSERT INTO t VALUES (3, 'c', 42)").unwrap();
+    rconn
+        .execute_batch("INSERT INTO t VALUES (3, 'c', 42)")
+        .unwrap();
 
-    let queries = [
-        "SELECT id, val, extra FROM t ORDER BY id",
-    ];
+    let queries = ["SELECT id, val, extra FROM t ORDER BY id"];
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} ALTER TABLE ADD COLUMN mismatches", mismatches.len());
     }
 }
@@ -3434,13 +3450,13 @@ fn test_conformance_upsert_do_update_set_s55h() {
     fconn.execute("INSERT INTO kv VALUES ('z', 3, 0) ON CONFLICT(key) DO UPDATE SET val = excluded.val, updated = 1").unwrap();
     rconn.execute_batch("INSERT INTO kv VALUES ('z', 3, 0) ON CONFLICT(key) DO UPDATE SET val = excluded.val, updated = 1").unwrap();
 
-    let queries = [
-        "SELECT key, val, updated FROM kv ORDER BY key",
-    ];
+    let queries = ["SELECT key, val, updated FROM kv ORDER BY key"];
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} UPSERT DO UPDATE SET mismatches", mismatches.len());
     }
 }
@@ -3469,8 +3485,13 @@ fn test_conformance_aggregate_with_filter_expression_s55h() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
-        panic!("{} aggregate with filter expression mismatches", mismatches.len());
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!(
+            "{} aggregate with filter expression mismatches",
+            mismatches.len()
+        );
     }
 }
 
@@ -3501,7 +3522,9 @@ fn test_conformance_multiple_indexes_s55h() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} multiple indexes mismatches", mismatches.len());
     }
 }
@@ -3533,7 +3556,9 @@ fn test_conformance_nested_aggregate_subquery_s55h() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} nested aggregate subquery mismatches", mismatches.len());
     }
 }
@@ -3553,20 +3578,28 @@ fn test_conformance_multicolumn_unique_s55h() {
     rconn.execute_batch(setup).unwrap();
 
     // INSERT OR IGNORE with multi-column unique
-    fconn.execute("INSERT OR IGNORE INTO t VALUES (1, 1, 'dup')").unwrap();
-    rconn.execute_batch("INSERT OR IGNORE INTO t VALUES (1, 1, 'dup')").unwrap();
+    fconn
+        .execute("INSERT OR IGNORE INTO t VALUES (1, 1, 'dup')")
+        .unwrap();
+    rconn
+        .execute_batch("INSERT OR IGNORE INTO t VALUES (1, 1, 'dup')")
+        .unwrap();
 
     // INSERT OR REPLACE with multi-column unique
-    fconn.execute("INSERT OR REPLACE INTO t VALUES (1, 2, 'replaced')").unwrap();
-    rconn.execute_batch("INSERT OR REPLACE INTO t VALUES (1, 2, 'replaced')").unwrap();
+    fconn
+        .execute("INSERT OR REPLACE INTO t VALUES (1, 2, 'replaced')")
+        .unwrap();
+    rconn
+        .execute_batch("INSERT OR REPLACE INTO t VALUES (1, 2, 'replaced')")
+        .unwrap();
 
-    let queries = [
-        "SELECT a, b, c FROM t ORDER BY a, b",
-    ];
+    let queries = ["SELECT a, b, c FROM t ORDER BY a, b"];
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} multicolumn UNIQUE mismatches", mismatches.len());
     }
 }

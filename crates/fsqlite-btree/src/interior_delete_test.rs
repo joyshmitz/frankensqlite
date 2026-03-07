@@ -87,7 +87,7 @@ fn test_index_delete_interior_needs_rebalance() {
         key[0..4].copy_from_slice(&i.to_be_bytes());
         cursor.index_insert(&cx, &key).unwrap();
     }
-    
+
     // Now delete everything!
     for i in 0..100_u32 {
         let mut key = vec![0u8; if i % 2 == 0 { 10 } else { 200 }];

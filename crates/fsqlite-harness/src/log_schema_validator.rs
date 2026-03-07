@@ -30,7 +30,7 @@ use std::fmt::Write as FmtWrite;
 
 use serde::{Deserialize, Serialize};
 
-use crate::e2e_log_schema::{self, LogEventSchema, LogEventType, LOG_SCHEMA_VERSION};
+use crate::e2e_log_schema::{self, LOG_SCHEMA_VERSION, LogEventSchema, LogEventType};
 
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-1dp9.7.6";
@@ -609,7 +609,7 @@ fn extract_field_from_error(msg: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::e2e_log_schema::{canonical_event_examples, LogEventType, LogPhase};
+    use crate::e2e_log_schema::{LogEventType, LogPhase, canonical_event_examples};
 
     fn make_valid_event() -> LogEventSchema {
         let mut context = BTreeMap::new();

@@ -35,6 +35,130 @@ use asupersync::Cx as NativeCx;
 #[cfg(feature = "native")]
 use asupersync::types::{CancelKind as NativeCancelKind, CancelReason as NativeCancelReason};
 
+#[cfg(not(feature = "native"))]
+mod native_cx_shim {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NativeCancelKind {
+        User,
+        Timeout,
+        Deadline,
+        PollQuota,
+        CostBudget,
+        FailFast,
+        RaceLost,
+        ParentCancelled,
+        Shutdown,
+        LinkedExit,
+        ResourceUnavailable,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NativeCancelReason {
+        pub kind: NativeCancelKind,
+    }
+
+    impl NativeCancelReason {
+        #[must_use]
+        pub const fn timeout() -> Self {
+            Self {
+                kind: NativeCancelKind::Timeout,
+            }
+        }
+
+        #[must_use]
+        pub fn user(_message: impl Into<String>) -> Self {
+            Self {
+                kind: NativeCancelKind::User,
+            }
+        }
+
+        #[must_use]
+        pub const fn parent_cancelled() -> Self {
+            Self {
+                kind: NativeCancelKind::ParentCancelled,
+            }
+        }
+
+        #[must_use]
+        pub const fn resource_unavailable() -> Self {
+            Self {
+                kind: NativeCancelKind::ResourceUnavailable,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct NativeCheckpointError;
+
+    #[derive(Debug, Default)]
+    struct NativeCxInner {
+        cancel_requested: AtomicBool,
+        cancel_reason: Mutex<Option<NativeCancelReason>>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct NativeCx {
+        inner: Arc<NativeCxInner>,
+    }
+
+    impl NativeCx {
+        #[must_use]
+        pub fn for_testing() -> Self {
+            Self::default()
+        }
+
+        pub fn set_cancel_requested(&self, requested: bool) {
+            self.inner
+                .cancel_requested
+                .store(requested, Ordering::Release);
+            if !requested {
+                *self
+                    .inner
+                    .cancel_reason
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
+        }
+
+        pub fn set_cancel_reason(&self, reason: NativeCancelReason) {
+            *self
+                .inner
+                .cancel_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+            self.inner.cancel_requested.store(true, Ordering::Release);
+        }
+
+        #[must_use]
+        pub fn is_cancel_requested(&self) -> bool {
+            self.inner.cancel_requested.load(Ordering::Acquire)
+        }
+
+        #[must_use]
+        pub fn cancel_reason(&self) -> Option<NativeCancelReason> {
+            self.inner
+                .cancel_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        pub fn checkpoint(&self) -> std::result::Result<(), NativeCheckpointError> {
+            if self.is_cancel_requested() {
+                Err(NativeCheckpointError)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "native"))]
+use native_cx_shim::{NativeCancelKind, NativeCancelReason, NativeCx};
+
 use crate::eprocess::EProcessOracle;
 
 /// SQLite error code for `SQLITE_INTERRUPT`.

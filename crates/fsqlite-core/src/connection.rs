@@ -22,7 +22,7 @@ use serde_json::json;
 use crate::attach::SchemaRegistry;
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
-    DefaultValue, Distinctness, DropObjectType, Expr, FrameBound, FrameSpec, FrameType,
+    DefaultValue, Distinctness, DropObjectType, Expr, FrameBound, FrameSpec, FrameType, FromClause,
     FunctionArgs, GeneratedStorage, InSet, JoinConstraint, JoinKind, LikeOp, LimitClause, Literal,
     NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, ResultColumn, SelectBody, SelectCore,
     SelectStatement, SortDirection, Span, Statement, TableConstraintKind, TableOrSubquery, UnaryOp,
@@ -517,6 +517,9 @@ pub struct PreparedStatement<'conn> {
     /// depend on connection-level fallback routing or parameter-sensitive
     /// subquery rewriting, store the AST and re-dispatch at execution time.
     deferred_query_statement: Option<Statement>,
+    /// Cached column count for deferred SELECT statements whose placeholder
+    /// program does not contain a `ResultRow` opcode.
+    deferred_query_column_count: Option<usize>,
     /// Reference to the parent Connection that prepared this statement.
     /// Used by `execute_with_params` to delegate DML execution through
     /// the Connection's full execution pipeline (triggers, constraints,
@@ -791,6 +794,9 @@ impl PreparedStatement<'_> {
     /// Return the number of columns this statement will produce per row.
     #[must_use]
     pub fn column_count(&self) -> usize {
+        if let Some(column_count) = self.deferred_query_column_count {
+            return column_count;
+        }
         self.program
             .ops()
             .iter()
@@ -4019,6 +4025,9 @@ impl Connection {
                     root_cx: self.root_cx.clone(),
                     dml_statement: None,
                     deferred_query_statement: Some(statement.clone()),
+                    deferred_query_column_count: Some(
+                        self.prepared_statement_column_count(statement),
+                    ),
                     conn: self,
                 })
             }
@@ -4037,6 +4046,7 @@ impl Connection {
                     root_cx: self.root_cx.clone(),
                     dml_statement: None,
                     deferred_query_statement: None,
+                    deferred_query_column_count: None,
                     conn: self,
                 })
             }
@@ -4062,6 +4072,7 @@ impl Connection {
                     root_cx: self.root_cx.clone(),
                     dml_statement: None,
                     deferred_query_statement: None,
+                    deferred_query_column_count: None,
                     conn: self,
                 })
             }
@@ -4095,6 +4106,7 @@ impl Connection {
                         root_cx: self.root_cx.clone(),
                         dml_statement: Some(statement.clone()),
                         deferred_query_statement: None,
+                        deferred_query_column_count: None,
                         conn: self,
                     })
                 } else {
@@ -4114,6 +4126,7 @@ impl Connection {
                         root_cx: self.root_cx.clone(),
                         dml_statement: Some(statement.clone()),
                         deferred_query_statement: None,
+                        deferred_query_column_count: None,
                         conn: self,
                     })
                 }
@@ -4136,6 +4149,7 @@ impl Connection {
                     root_cx: self.root_cx.clone(),
                     dml_statement: Some(statement.clone()),
                     deferred_query_statement: None,
+                    deferred_query_column_count: None,
                     conn: self,
                 })
             }
@@ -4156,6 +4170,7 @@ impl Connection {
 
         statement_contains_rewritable_subquery(statement)
             || select.with.is_some()
+            || self.has_view_references(select)
             || self.has_sqlite_schema_references(select)
             || !select.body.compounds.is_empty()
             || (expression_only && has_implicit_aggregation(select))
@@ -4166,6 +4181,163 @@ impl Connection {
             || select_contains_match_operator(select)
             || has_join_like_source
             || select_has_correlated_join_subquery(select)
+    }
+
+    fn prepared_statement_column_count(&self, statement: &Statement) -> usize {
+        let Statement::Select(select) = statement else {
+            return 0;
+        };
+        self.select_result_column_count(select, &[], &mut Vec::new())
+    }
+
+    fn select_result_column_count(
+        &self,
+        select: &SelectStatement,
+        outer_ctes: &[fsqlite_ast::Cte],
+        active_ctes: &mut Vec<String>,
+    ) -> usize {
+        let mut visible_ctes = outer_ctes.to_vec();
+        if let Some(with) = &select.with {
+            visible_ctes.extend(with.ctes.clone());
+        }
+
+        match &select.body.select {
+            SelectCore::Values(rows) => rows.first().map_or(0, Vec::len),
+            SelectCore::Select { columns, from, .. } => columns
+                .iter()
+                .map(|column| match column {
+                    ResultColumn::Expr { .. } => 1,
+                    ResultColumn::Star => from.as_ref().map_or(1, |from_clause| {
+                        self.from_clause_result_column_count(
+                            from_clause,
+                            &visible_ctes,
+                            active_ctes,
+                        )
+                    }),
+                    ResultColumn::TableStar(name) => from.as_ref().map_or(1, |from_clause| {
+                        self.named_source_result_column_count(
+                            from_clause,
+                            name,
+                            &visible_ctes,
+                            active_ctes,
+                        )
+                    }),
+                })
+                .sum(),
+        }
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    fn from_clause_result_column_count(
+        &self,
+        from: &FromClause,
+        visible_ctes: &[fsqlite_ast::Cte],
+        active_ctes: &mut Vec<String>,
+    ) -> usize {
+        let mut total =
+            self.table_or_subquery_result_column_count(&from.source, visible_ctes, active_ctes);
+        for join in &from.joins {
+            total +=
+                self.table_or_subquery_result_column_count(&join.table, visible_ctes, active_ctes);
+        }
+        total
+    }
+
+    fn named_source_result_column_count(
+        &self,
+        from: &FromClause,
+        source_name: &str,
+        visible_ctes: &[fsqlite_ast::Cte],
+        active_ctes: &mut Vec<String>,
+    ) -> usize {
+        std::iter::once(&from.source)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .find(|source| source_matches_name(source, source_name))
+            .map_or(1, |source| {
+                self.table_or_subquery_result_column_count(source, visible_ctes, active_ctes)
+            })
+    }
+
+    fn table_or_subquery_result_column_count(
+        &self,
+        source: &TableOrSubquery,
+        visible_ctes: &[fsqlite_ast::Cte],
+        active_ctes: &mut Vec<String>,
+    ) -> usize {
+        match source {
+            TableOrSubquery::Table { name, .. } => {
+                self.named_relation_result_column_count(&name.name, visible_ctes, active_ctes)
+            }
+            TableOrSubquery::Subquery { query, .. } => self
+                .select_result_column_count(query, visible_ctes, active_ctes)
+                .max(infer_select_column_names(query).len())
+                .max(1),
+            TableOrSubquery::TableFunction { .. } => 1,
+            TableOrSubquery::ParenJoin(from) => {
+                self.from_clause_result_column_count(from, visible_ctes, active_ctes)
+            }
+        }
+    }
+
+    fn named_relation_result_column_count(
+        &self,
+        relation_name: &str,
+        visible_ctes: &[fsqlite_ast::Cte],
+        active_ctes: &mut Vec<String>,
+    ) -> usize {
+        if let Some(table) = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(relation_name))
+        {
+            return table.columns.len();
+        }
+
+        if let Some(cte) = visible_ctes
+            .iter()
+            .rev()
+            .find(|cte| cte.name.eq_ignore_ascii_case(relation_name))
+        {
+            return self.cte_result_column_count(cte, visible_ctes, active_ctes);
+        }
+
+        if let Some(view) = self
+            .views
+            .borrow()
+            .iter()
+            .find(|view| view.name.eq_ignore_ascii_case(relation_name))
+        {
+            return self
+                .select_result_column_count(&view.query, visible_ctes, active_ctes)
+                .max(1);
+        }
+
+        1
+    }
+
+    fn cte_result_column_count(
+        &self,
+        cte: &fsqlite_ast::Cte,
+        visible_ctes: &[fsqlite_ast::Cte],
+        active_ctes: &mut Vec<String>,
+    ) -> usize {
+        if !cte.columns.is_empty() {
+            return cte.columns.len();
+        }
+        if active_ctes
+            .iter()
+            .any(|active_name| active_name.eq_ignore_ascii_case(&cte.name))
+        {
+            return infer_select_column_names(&cte.query).len().max(1);
+        }
+
+        active_ctes.push(cte.name.clone());
+        let column_count = self
+            .select_result_column_count(&cte.query, visible_ctes, active_ctes)
+            .max(1);
+        active_ctes.pop();
+        column_count
     }
 
     /// Count the number of rows in `table_name` matching an optional WHERE
@@ -12751,25 +12923,60 @@ impl Connection {
             .map(|wd| (wd.name.to_ascii_uppercase(), &wd.spec))
             .collect();
 
-        // Resolve table name and alias.
-        let (table_name, table_alias) = match from {
-            Some(from) => match &from.source {
-                TableOrSubquery::Table { name, alias, .. } => (name.name.clone(), alias.clone()),
-                _ => {
+        // Detect whether the FROM clause has JOINs.
+        let has_join = from.as_ref().is_some_and(|f| !f.joins.is_empty());
+
+        // Build column map and expand Star/TableStar.
+        // When JOINs are present, use build_join_col_map for all sources.
+        let (col_map, expanded_columns) = if has_join {
+            let cmap = self.build_join_col_map(select);
+            let expanded: Vec<ResultColumn> = columns
+                .iter()
+                .flat_map(|col| match col {
+                    ResultColumn::Star => cmap
+                        .iter()
+                        .map(|(tbl, c)| ResultColumn::Expr {
+                            expr: Expr::Column(
+                                ColumnRef::qualified(tbl.clone(), c.clone()),
+                                Span::new(0, 0),
+                            ),
+                            alias: None,
+                        })
+                        .collect::<Vec<_>>(),
+                    ResultColumn::TableStar(tbl) => cmap
+                        .iter()
+                        .filter(|(t, _)| t.eq_ignore_ascii_case(tbl))
+                        .map(|(t, c)| ResultColumn::Expr {
+                            expr: Expr::Column(
+                                ColumnRef::qualified(t.clone(), c.clone()),
+                                Span::new(0, 0),
+                            ),
+                            alias: None,
+                        })
+                        .collect::<Vec<_>>(),
+                    other => vec![other.clone()],
+                })
+                .collect();
+            (cmap, expanded)
+        } else {
+            // Single-table path (original logic).
+            let (table_name, table_alias) = match from {
+                Some(from) => match &from.source {
+                    TableOrSubquery::Table { name, alias, .. } => {
+                        (name.name.clone(), alias.clone())
+                    }
+                    _ => {
+                        return Err(FrankenError::NotImplemented(
+                            "window functions with non-table source".to_owned(),
+                        ));
+                    }
+                },
+                None => {
                     return Err(FrankenError::NotImplemented(
-                        "window functions with non-table source".to_owned(),
+                        "window functions without FROM".to_owned(),
                     ));
                 }
-            },
-            None => {
-                return Err(FrankenError::NotImplemented(
-                    "window functions without FROM".to_owned(),
-                ));
-            }
-        };
-
-        // Build column map and expand Star/TableStar under schema borrow.
-        let (col_map, expanded_columns) = {
+            };
             let schema = self.schema.borrow();
             let table_schema = schema
                 .iter()
@@ -13002,9 +13209,16 @@ impl Connection {
         }
 
         // Execute raw SELECT * scan.
+        // When JOINs are present, use execute_join_select to materialize
+        // rows from all joined tables; otherwise use single-table path.
         let raw_select = build_raw_scan_select(select);
-        let program = self.compile_table_select(&raw_select)?;
-        let (raw_rows, _, _) = self.execute_table_program(&program, params)?;
+        let raw_rows = if has_join {
+            self.execute_join_select(&raw_select, params)?
+        } else {
+            let program = self.compile_table_select(&raw_select)?;
+            let (rows, _, _) = self.execute_table_program(&program, params)?;
+            rows
+        };
 
         let row_values: Vec<Vec<SqliteValue>> =
             raw_rows.iter().map(|r| r.values().to_vec()).collect();
@@ -16626,6 +16840,23 @@ fn collect_table_names_from_source(source: &TableOrSubquery, out: &mut Vec<Strin
             }
         }
         TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => {}
+    }
+}
+
+fn source_matches_name(source: &TableOrSubquery, target: &str) -> bool {
+    match source {
+        TableOrSubquery::Table { name, alias, .. } => {
+            alias
+                .as_ref()
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(target))
+                || name.name.eq_ignore_ascii_case(target)
+        }
+        TableOrSubquery::Subquery { alias, .. } | TableOrSubquery::TableFunction { alias, .. } => {
+            alias
+                .as_ref()
+                .is_some_and(|alias| alias.eq_ignore_ascii_case(target))
+        }
+        TableOrSubquery::ParenJoin(_) => false,
     }
 }
 
@@ -24546,6 +24777,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let stmt = conn.prepare("SELECT (SELECT ?1) + 1;").unwrap();
 
+        assert_eq!(stmt.column_count(), 1);
         let rows = stmt.query_with_params(&[SqliteValue::Integer(41)]).unwrap();
 
         assert_eq!(rows.len(), 1);
@@ -24559,10 +24791,28 @@ mod tests {
             .prepare("WITH base(val) AS (SELECT 7) SELECT val + ?1 FROM base;")
             .unwrap();
 
+        assert_eq!(stmt.column_count(), 1);
         let rows = stmt.query_with_params(&[SqliteValue::Integer(5)]).unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(12)]);
+    }
+
+    #[test]
+    fn test_prepared_statement_view_query_uses_dispatch_path() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIEW prep_view AS SELECT 7 AS a, 9 AS b;")
+            .unwrap();
+
+        let stmt = conn.prepare("SELECT * FROM prep_view;").unwrap();
+
+        assert_eq!(stmt.column_count(), 2);
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(7), SqliteValue::Integer(9)]
+        );
     }
 
     #[test]

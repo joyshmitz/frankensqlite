@@ -495,7 +495,13 @@ fn test_conformance_summary() {
             })
         })
         .collect();
-    let pass_concurrent = handles.into_iter().all(|h| h.join().is_ok());
+
+    let mut pass_concurrent = true;
+    for h in handles {
+        if h.join().is_err() {
+            pass_concurrent = false;
+        }
+    }
 
     let checks = [
         pass_cas,

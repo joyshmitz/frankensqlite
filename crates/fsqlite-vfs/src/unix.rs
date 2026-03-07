@@ -149,10 +149,8 @@ fn sqlite_wal_checksum_native_8byte_chunks(data: &[u8]) -> Result<(u32, u32)> {
     for chunk in data.chunks_exact(8) {
         let w1 = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let w2 = u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-        s1 = s1.wrapping_add(w1);
-        s2 = s2.wrapping_add(s1);
-        s1 = s1.wrapping_add(w2);
-        s2 = s2.wrapping_add(s1);
+        s1 = s1.wrapping_add(w1).wrapping_add(s2);
+        s2 = s2.wrapping_add(w2).wrapping_add(s1);
     }
     Ok((s1, s2))
 }
@@ -1296,6 +1294,12 @@ impl UnixFile {
             1,
             SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
         ) {
+            let _ = self.shm_lock(
+                cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            );
             let _ = self.compat_shm_release_dms_shared(cx);
             let _ = self.unlock(cx, LockLevel::None);
             return Err(err);
@@ -1415,6 +1419,7 @@ impl UnixFile {
         let header = build_empty_sqlite_wal_shm_header(page_size, n_page)?;
         let mut written = 0_usize;
         while written < header.len() {
+            #[allow(clippy::cast_possible_truncation)]
             let offset = u64::try_from(written).expect("header write offset fits u64");
             let n = shm_file
                 .write_at(&header[written..], offset)

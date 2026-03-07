@@ -18,19 +18,21 @@ fn scan_numeric_prefix(bytes: &[u8]) -> usize {
         i += 1;
     }
 
-    let digit_start = i;
+    let mut has_digit = false;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
+        has_digit = true;
         i += 1;
     }
 
     if i < bytes.len() && bytes[i] == b'.' {
         i += 1;
         while i < bytes.len() && bytes[i].is_ascii_digit() {
+            has_digit = true;
             i += 1;
         }
     }
 
-    if i == digit_start {
+    if !has_digit {
         return 0;
     }
 
@@ -988,8 +990,12 @@ pub fn format_sqlite_float(f: f64) -> String {
     // - Strip trailing zeros (but keep at least one digit after decimal point)
     let abs = f.abs();
     let s = if abs == 0.0 {
-        // Zero: just "0.0"
-        "0.0".to_owned()
+        // Zero: preserve sign for -0.0 (C SQLite: printf("%!.15g", -0.0) → "-0.0")
+        if f.is_sign_negative() {
+            "-0.0".to_owned()
+        } else {
+            "0.0".to_owned()
+        }
     } else {
         // Determine which format is shorter: fixed vs scientific.
         // C's %g uses scientific if exponent < -4 or >= precision.
@@ -1888,10 +1894,47 @@ mod tests {
     }
 
     #[test]
+    fn test_format_sqlite_float_negative_zero() {
+        // C SQLite: printf("%!.15g", -0.0) → "-0.0"
+        assert_eq!(format_sqlite_float(-0.0), "-0.0");
+        assert_eq!(format_sqlite_float(0.0), "0.0");
+    }
+
+    #[test]
     fn test_float_to_text_includes_decimal_point() {
         let v = SqliteValue::Float(100.0);
         assert_eq!(v.to_text(), "100.0");
         let v = SqliteValue::Float(3.14);
         assert_eq!(v.to_text(), "3.14");
+    }
+
+    // ── scan_numeric_prefix ──────────────────────────────────────────
+
+    #[test]
+    fn test_scan_numeric_prefix_bare_dot() {
+        // A bare "." has no digits — not a numeric prefix.
+        assert_eq!(scan_numeric_prefix(b"."), 0);
+        assert_eq!(scan_numeric_prefix(b"-."), 0);
+        assert_eq!(scan_numeric_prefix(b"+."), 0);
+        assert_eq!(scan_numeric_prefix(b"..1"), 0);
+    }
+
+    #[test]
+    fn test_scan_numeric_prefix_valid() {
+        assert_eq!(scan_numeric_prefix(b"123"), 3);
+        assert_eq!(scan_numeric_prefix(b"3.14"), 4);
+        assert_eq!(scan_numeric_prefix(b".5"), 2);
+        assert_eq!(scan_numeric_prefix(b"1e10"), 4);
+        assert_eq!(scan_numeric_prefix(b"-42abc"), 3);
+        assert_eq!(scan_numeric_prefix(b"+.5x"), 3);
+        assert_eq!(scan_numeric_prefix(b"0.0"), 3);
+    }
+
+    #[test]
+    fn test_scan_numeric_prefix_empty_and_non_numeric() {
+        assert_eq!(scan_numeric_prefix(b""), 0);
+        assert_eq!(scan_numeric_prefix(b"abc"), 0);
+        assert_eq!(scan_numeric_prefix(b"+"), 0);
+        assert_eq!(scan_numeric_prefix(b"-"), 0);
     }
 }

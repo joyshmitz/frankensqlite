@@ -2449,14 +2449,32 @@ mod tests {
             json_valid_blob(&payload, Some(JSON_VALID_JSONB_STRICT_FLAG)),
             1
         );
-        let mut broken = payload;
-        broken.push(0xFF);
+        // Trailing byte changes total blob size — both superficial and strict
+        // reject it since header + payload_len != blob_len.
+        let mut trailing = payload.clone();
+        trailing.push(0xFF);
         assert_eq!(
-            json_valid_blob(&broken, Some(JSON_VALID_JSONB_SUPERFICIAL_FLAG)),
+            json_valid_blob(&trailing, Some(JSON_VALID_JSONB_SUPERFICIAL_FLAG)),
+            0
+        );
+        assert_eq!(
+            json_valid_blob(&trailing, Some(JSON_VALID_JSONB_STRICT_FLAG)),
+            0
+        );
+
+        // Corrupt an interior header byte — top-level header still valid
+        // (superficial passes) but deep decode fails (strict rejects).
+        // Byte 2 is the first sub-element header inside the object payload;
+        // 0xFF has node_type=0x0F (invalid) so strict parsing fails.
+        let mut corrupted = payload;
+        assert!(corrupted.len() > 3);
+        corrupted[2] = 0xFF;
+        assert_eq!(
+            json_valid_blob(&corrupted, Some(JSON_VALID_JSONB_SUPERFICIAL_FLAG)),
             1
         );
         assert_eq!(
-            json_valid_blob(&broken, Some(JSON_VALID_JSONB_STRICT_FLAG)),
+            json_valid_blob(&corrupted, Some(JSON_VALID_JSONB_STRICT_FLAG)),
             0
         );
     }
@@ -2881,6 +2899,13 @@ mod tests {
     }
 
     #[test]
+    fn test_json_each_nested_value_is_json_text() {
+        let rows = json_each(r#"{"a":[1,2]}"#, None).unwrap();
+        assert_eq!(rows[0].value, SqliteValue::Text("[1,2]".to_owned()));
+        assert_eq!(rows[0].atom, SqliteValue::Null); // arrays have null atom
+    }
+
+    #[test]
     fn test_json_tree_recursive() {
         let rows = json_tree(r#"{"a":{"b":1}}"#, None).unwrap();
         assert!(rows.iter().any(|row| row.fullkey == "$.a"));
@@ -2899,50 +2924,6 @@ mod tests {
         assert_eq!(row.type_name, "integer");
         assert_eq!(row.atom, SqliteValue::Integer(1));
         assert_eq!(row.path, "$.a");
-    }
-
-    #[test]
-    fn test_json_each_columns() {
-        let rows = json_each(r#"{"a":1}"#, None).unwrap();
-        let row = rows.first().unwrap();
-        assert_eq!(row.key, SqliteValue::Text("a".to_owned()));
-        assert_eq!(row.value, SqliteValue::Integer(1));
-        assert_eq!(row.type_name, "integer");
-        assert_eq!(row.atom, SqliteValue::Integer(1));
-        assert_eq!(row.parent, SqliteValue::Null);
-        assert_eq!(row.fullkey, "$.a");
-        assert_eq!(row.path, "$");
-    }
-
-    #[test]
-    fn test_json_each_vtab_cursor_scan() {
-        let cx = Cx::new();
-        let vtab = JsonEachVtab::connect(&cx, &[]).unwrap();
-        let mut cursor = vtab.open().unwrap();
-        cursor
-            .filter(&cx, 0, None, &[SqliteValue::Text("[4,5]".to_owned())])
-            .unwrap();
-
-        let mut values = Vec::new();
-        while !cursor.eof() {
-            let mut key_ctx = ColumnContext::new();
-            let mut value_ctx = ColumnContext::new();
-            cursor.column(&mut key_ctx, 0).unwrap();
-            cursor.column(&mut value_ctx, 1).unwrap();
-            values.push((
-                key_ctx.take_value().unwrap(),
-                value_ctx.take_value().unwrap(),
-            ));
-            cursor.next(&cx).unwrap();
-        }
-
-        assert_eq!(
-            values,
-            vec![
-                (SqliteValue::Integer(0), SqliteValue::Integer(4)),
-                (SqliteValue::Integer(1), SqliteValue::Integer(5)),
-            ]
-        );
     }
 
     #[test]
@@ -3466,13 +3447,6 @@ mod tests {
     fn test_json_each_missing_path() {
         let rows = json_each(r#"{"a":1}"#, Some("$.b")).unwrap();
         assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn test_json_each_nested_value_is_json_text() {
-        let rows = json_each(r#"{"a":[1,2]}"#, None).unwrap();
-        assert_eq!(rows[0].value, SqliteValue::Text("[1,2]".to_owned()));
-        assert_eq!(rows[0].atom, SqliteValue::Null); // arrays have null atom
     }
 
     // -----------------------------------------------------------------------

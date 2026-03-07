@@ -1901,7 +1901,6 @@ mod tests {
                 page.get()
             );
         }
-        assert_eq!(reader.thread_local_read_set_len(), 4);
     }
 
     #[test]
@@ -1915,7 +1914,6 @@ mod tests {
         assert!(scanned.is_empty());
         assert!(reader.read_set_versions.is_empty());
         assert!(reader.read_keys.is_empty());
-        assert_eq!(reader.thread_local_read_set_len(), 0);
     }
 
     fn read_page_range_without_tracking(

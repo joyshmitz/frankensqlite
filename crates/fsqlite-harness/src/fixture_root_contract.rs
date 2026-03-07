@@ -24,8 +24,12 @@ pub struct FixtureRootContract {
     pub manifest_sha256: String,
     /// Absolute fixtures directory.
     pub fixtures_dir: PathBuf,
+    /// Explicit fixture directory aliases accepted by runners.
+    pub fixtures_dir_aliases: Vec<PathBuf>,
     /// Absolute SLT directory.
     pub slt_dir: PathBuf,
+    /// Explicit SLT directory aliases accepted by runners.
+    pub slt_dir_aliases: Vec<PathBuf>,
     /// Minimum fixture JSON files required.
     pub min_fixture_json_files: usize,
     /// Minimum fixture entries required.
@@ -53,7 +57,11 @@ struct CorpusManifestDocument {
 struct FixtureRootsSection {
     schema_version: String,
     fixtures_dir: String,
+    #[serde(default)]
+    fixtures_dir_aliases: Vec<String>,
     slt_dir: String,
+    #[serde(default)]
+    slt_dir_aliases: Vec<String>,
     min_fixture_json_files: usize,
     min_fixture_entries: usize,
     min_fixture_sql_statements: usize,
@@ -125,6 +133,16 @@ pub fn load_fixture_root_contract(
 
     let fixtures_dir = non_empty_string("fixture_roots.fixtures_dir", &section.fixtures_dir)?;
     let slt_dir = non_empty_string("fixture_roots.slt_dir", &section.slt_dir)?;
+    let fixtures_dir_aliases = normalize_path_aliases(
+        "fixture_roots.fixtures_dir_aliases",
+        workspace_root,
+        section.fixtures_dir_aliases,
+    )?;
+    let slt_dir_aliases = normalize_path_aliases(
+        "fixture_roots.slt_dir_aliases",
+        workspace_root,
+        section.slt_dir_aliases,
+    )?;
     require_positive(
         "fixture_roots.min_fixture_json_files",
         section.min_fixture_json_files,
@@ -152,7 +170,9 @@ pub fn load_fixture_root_contract(
         manifest_path,
         manifest_sha256,
         fixtures_dir: resolve_workspace_path(workspace_root, Path::new(&fixtures_dir)),
+        fixtures_dir_aliases,
         slt_dir: resolve_workspace_path(workspace_root, Path::new(&slt_dir)),
+        slt_dir_aliases,
         min_fixture_json_files: section.min_fixture_json_files,
         min_fixture_entries: section.min_fixture_entries,
         min_fixture_sql_statements: section.min_fixture_sql_statements,
@@ -181,14 +201,18 @@ pub fn enforce_fixture_contract_alignment(
     min_slt_sql_statements: usize,
 ) -> Result<(), String> {
     let mut mismatches = Vec::new();
-    if !same_path(fixtures_dir, &contract.fixtures_dir) {
+    if !matches_path_or_alias(
+        fixtures_dir,
+        &contract.fixtures_dir,
+        &contract.fixtures_dir_aliases,
+    ) {
         mismatches.push(format!(
             "fixtures_dir mismatch expected={} observed={}",
             contract.fixtures_dir.display(),
             fixtures_dir.display()
         ));
     }
-    if !same_path(slt_dir, &contract.slt_dir) {
+    if !matches_path_or_alias(slt_dir, &contract.slt_dir, &contract.slt_dir_aliases) {
         mismatches.push(format!(
             "slt_dir mismatch expected={} observed={}",
             contract.slt_dir.display(),
@@ -298,6 +322,29 @@ fn normalize_required_categories(values: Vec<String>) -> Result<Vec<String>, Str
     Ok(normalized)
 }
 
+fn normalize_path_aliases(
+    field_name: &str,
+    workspace_root: &Path,
+    values: Vec<String>,
+) -> Result<Vec<PathBuf>, String> {
+    if values.is_empty() {
+        return Err(format!("{field_name} must be non-empty"));
+    }
+
+    let mut aliases = Vec::with_capacity(values.len());
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(format!("{field_name} contains empty value"));
+        }
+        if seen.insert(trimmed.to_owned()) {
+            aliases.push(resolve_workspace_path(workspace_root, Path::new(trimmed)));
+        }
+    }
+    Ok(aliases)
+}
+
 fn non_empty_string(field_name: &str, value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -320,6 +367,10 @@ fn same_path(left: &Path, right: &Path) -> bool {
         (Ok(left_path), Ok(right_path)) => left_path == right_path,
         _ => left == right,
     }
+}
+
+fn matches_path_or_alias(path: &Path, canonical: &Path, aliases: &[PathBuf]) -> bool {
+    same_path(path, canonical) || aliases.iter().any(|alias| same_path(path, alias))
 }
 
 fn resolve_workspace_path(workspace_root: &Path, path: &Path) -> PathBuf {

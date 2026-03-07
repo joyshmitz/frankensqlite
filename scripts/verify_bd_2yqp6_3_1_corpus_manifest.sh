@@ -85,6 +85,13 @@ if fixture_roots.get("schema_version") != "1.0.0":
 for key in ("fixtures_dir", "slt_dir"):
     if not str(fixture_roots.get(key, "")).strip():
         raise SystemExit(f"fixture_roots.{key} must be non-empty")
+for key in ("fixtures_dir_aliases", "slt_dir_aliases"):
+    aliases = fixture_roots.get(key, [])
+    if not aliases:
+        raise SystemExit(f"fixture_roots.{key} must be non-empty")
+    for alias in aliases:
+        if not str(alias).strip():
+            raise SystemExit(f"fixture_roots.{key} contains empty value")
 for key in (
     "min_fixture_json_files",
     "min_fixture_entries",

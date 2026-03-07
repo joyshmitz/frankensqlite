@@ -602,7 +602,11 @@ impl<'a> Resolver<'a> {
                                     }
                                     fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
                                         for col in cols {
-                                            self.resolve_unqualified_column(col, &target_scope, false);
+                                            self.resolve_unqualified_column(
+                                                col,
+                                                &target_scope,
+                                                false,
+                                            );
                                         }
                                     }
                                 }
@@ -624,10 +628,10 @@ impl<'a> Resolver<'a> {
                 if let Some(ref with) = update.with {
                     self.resolve_with_clause(with, scope);
                 }
-                
+
                 // LIMIT and OFFSET cannot reference target or FROM tables.
                 let limit_scope = scope.clone();
-                
+
                 self.bind_table_to_scope(
                     &update.table.name.name,
                     update.table.alias.as_deref(),
@@ -685,10 +689,10 @@ impl<'a> Resolver<'a> {
                 if let Some(ref with) = delete.with {
                     self.resolve_with_clause(with, scope);
                 }
-                
+
                 // LIMIT and OFFSET cannot reference the target table.
                 let limit_scope = scope.clone();
-                
+
                 self.bind_table_to_scope(
                     &delete.table.name.name,
                     delete.table.alias.as_deref(),
@@ -1929,6 +1933,11 @@ mod tests {
         let stmt = parse_one("WITH cte(amount) AS (SELECT 1) UPDATE users SET amount = 1 FROM cte");
         let mut resolver = Resolver::new(&schema);
         let errors = resolver.resolve_statement(&stmt);
-        assert_eq!(errors.len(), 1, "Should report amount as unresolved for users table, instead got: {:?}", errors);
+        assert_eq!(
+            errors.len(),
+            1,
+            "Should report amount as unresolved for users table, instead got: {:?}",
+            errors
+        );
     }
 }

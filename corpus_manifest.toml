@@ -16,7 +16,9 @@ root_seed = 3520
 [fixture_roots]
 schema_version = "1.0.0"
 fixtures_dir = "crates/fsqlite-harness/conformance"
+fixtures_dir_aliases = ["./crates/fsqlite-harness/conformance"]
 slt_dir = "conformance/slt"
+slt_dir_aliases = ["./conformance/slt"]
 min_fixture_json_files = 8
 min_fixture_entries = 8
 min_fixture_sql_statements = 40

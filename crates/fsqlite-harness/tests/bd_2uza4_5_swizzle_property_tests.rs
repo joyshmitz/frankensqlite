@@ -345,7 +345,14 @@ fn test_conformance_summary() {
                 })
             })
             .collect();
-        handles.into_iter().all(|h| h.join().is_ok()) && reg.swizzled_count() == 20
+
+        let mut all_ok = true;
+        for h in handles {
+            if h.join().is_err() {
+                all_ok = false;
+            }
+        }
+        all_ok && reg.swizzled_count() == 20
     };
 
     let checks = [

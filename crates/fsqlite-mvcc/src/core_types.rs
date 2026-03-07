@@ -7,7 +7,6 @@
 //! Foundation types (TxnId, CommitSeq, Snapshot, etc.) live in
 //! [`fsqlite_types::glossary`]; this module builds the runtime machinery on top.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -919,15 +918,6 @@ impl ReadSetBloom {
     }
 }
 
-thread_local! {
-    static THREAD_LOCAL_READ_SET_VERSIONS: RefCell<
-        HashMap<TxnToken, HashMap<PageNumber, CommitSeq, PageNumberBuildHasher>>
-    > = RefCell::new(HashMap::new());
-    static THREAD_LOCAL_WRITE_SET_VERSIONS: RefCell<
-        HashMap<TxnToken, HashMap<PageNumber, WriteVersionEntry, PageNumberBuildHasher>>
-    > = RefCell::new(HashMap::new());
-}
-
 /// A running MVCC transaction.
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -1065,21 +1055,6 @@ impl Transaction {
             })
             .or_insert(version);
         self.read_keys.insert(WitnessKey::Page(page));
-        let token = self.token();
-        THREAD_LOCAL_READ_SET_VERSIONS.with(|store| {
-            let mut store = store.borrow_mut();
-            let entry = store
-                .entry(token)
-                .or_insert_with(|| HashMap::with_hasher(PageNumberBuildHasher::default()));
-            entry
-                .entry(page)
-                .and_modify(|existing| {
-                    if version > *existing {
-                        *existing = version;
-                    }
-                })
-                .or_insert(version);
-        });
     }
 
     /// Record a range-scan witness set for predicate-style tracking.
@@ -1099,16 +1074,6 @@ impl Transaction {
             .entry(page)
             .or_insert_with(|| WriteVersionEntry::new(old_version));
         self.write_keys.insert(WitnessKey::Page(page));
-        let token = self.token();
-        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
-            let mut store = store.borrow_mut();
-            let entry = store
-                .entry(token)
-                .or_insert_with(|| HashMap::with_hasher(PageNumberBuildHasher::default()));
-            entry
-                .entry(page)
-                .or_insert_with(|| WriteVersionEntry::new(old_version));
-        });
     }
 
     /// Attach the assigned commit sequence to a written page entry.
@@ -1116,16 +1081,6 @@ impl Transaction {
         if let Some(entry) = self.write_set_versions.get_mut(&page) {
             entry.new_version = Some(new_version);
         }
-        let token = self.token();
-        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
-            if let Some(entry) = store
-                .borrow_mut()
-                .get_mut(&token)
-                .and_then(|versions| versions.get_mut(&page))
-            {
-                entry.new_version = Some(new_version);
-            }
-        });
     }
 
     /// Lookup tracked read version for a page.
@@ -1153,53 +1108,8 @@ impl Transaction {
 
     /// Read page version from this thread's per-transaction mirror.
     #[must_use]
-    pub fn thread_local_read_version_for_page(&self, page: PageNumber) -> Option<CommitSeq> {
-        let token = self.token();
-        THREAD_LOCAL_READ_SET_VERSIONS.with(|store| {
-            store
-                .borrow()
-                .get(&token)
-                .and_then(|versions| versions.get(&page).copied())
-        })
-    }
-
-    /// Write page version metadata from this thread's per-transaction mirror.
-    #[must_use]
-    pub fn thread_local_write_version_for_page(
-        &self,
-        page: PageNumber,
-    ) -> Option<WriteVersionEntry> {
-        let token = self.token();
-        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
-            store
-                .borrow()
-                .get(&token)
-                .and_then(|versions| versions.get(&page).copied())
-        })
-    }
-
-    /// Number of read-set entries in the current thread-local mirror.
-    #[must_use]
-    pub fn thread_local_read_set_len(&self) -> usize {
-        let token = self.token();
-        THREAD_LOCAL_READ_SET_VERSIONS.with(|store| {
-            store
-                .borrow()
-                .get(&token)
-                .map_or(0_usize, std::collections::HashMap::len)
-        })
-    }
-
-    /// Number of write-set entries in the current thread-local mirror.
-    #[must_use]
-    pub fn thread_local_write_set_len(&self) -> usize {
-        let token = self.token();
-        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
-            store
-                .borrow()
-                .get(&token)
-                .map_or(0_usize, std::collections::HashMap::len)
-        })
+    pub fn thread_local_read_version_for_page(&self, _page: PageNumber) -> Option<CommitSeq> {
+        None
     }
 
     /// Clear read/write tracking ledgers (called on txn finalization).
@@ -1209,13 +1119,6 @@ impl Transaction {
         if let Some(bloom) = self.read_set_bloom.as_mut() {
             bloom.clear();
         }
-        let token = self.token();
-        THREAD_LOCAL_READ_SET_VERSIONS.with(|store| {
-            store.borrow_mut().remove(&token);
-        });
-        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
-            store.borrow_mut().remove(&token);
-        });
     }
 
     /// Transition to committed state. Panics if not active.
@@ -2412,74 +2315,6 @@ mod tests {
                 "range-scan recording must include page witness keys"
             );
         }
-    }
-
-    #[test]
-    fn test_transaction_thread_local_mirrors_track_and_clear() {
-        let txn_id = TxnId::new(71).unwrap();
-        let snap = Snapshot::new(CommitSeq::new(5), SchemaEpoch::ZERO);
-        let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snap, TransactionMode::Concurrent);
-        let p_read = PageNumber::new(90).unwrap();
-        let p_write = PageNumber::new(91).unwrap();
-
-        txn.record_page_read(p_read, CommitSeq::new(5));
-        txn.record_page_write(p_write, Some(CommitSeq::new(5)));
-        txn.mark_page_write_committed(p_write, CommitSeq::new(6));
-
-        assert_eq!(txn.thread_local_read_set_len(), 1);
-        assert_eq!(txn.thread_local_write_set_len(), 1);
-        assert_eq!(
-            txn.thread_local_read_version_for_page(p_read),
-            Some(CommitSeq::new(5))
-        );
-        let entry = txn.thread_local_write_version_for_page(p_write).unwrap();
-        assert_eq!(entry.old_version, Some(CommitSeq::new(5)));
-        assert_eq!(entry.new_version, Some(CommitSeq::new(6)));
-
-        txn.clear_page_access_tracking();
-        assert_eq!(txn.thread_local_read_set_len(), 0);
-        assert_eq!(txn.thread_local_write_set_len(), 0);
-    }
-
-    #[test]
-    fn test_transaction_thread_local_mirrors_are_thread_isolated() {
-        let page = PageNumber::new(100).unwrap();
-        let mut main_txn = Transaction::new(
-            TxnId::new(81).unwrap(),
-            TxnEpoch::new(0),
-            Snapshot::new(CommitSeq::new(10), SchemaEpoch::ZERO),
-            TransactionMode::Concurrent,
-        );
-        main_txn.record_page_read(page, CommitSeq::new(10));
-        assert_eq!(
-            main_txn.thread_local_read_version_for_page(page),
-            Some(CommitSeq::new(10))
-        );
-
-        std::thread::spawn(move || {
-            let mut thread_txn = Transaction::new(
-                TxnId::new(82).unwrap(),
-                TxnEpoch::new(0),
-                Snapshot::new(CommitSeq::new(11), SchemaEpoch::ZERO),
-                TransactionMode::Concurrent,
-            );
-            thread_txn.record_page_read(page, CommitSeq::new(11));
-            assert_eq!(thread_txn.thread_local_read_set_len(), 1);
-            assert_eq!(
-                thread_txn.thread_local_read_version_for_page(page),
-                Some(CommitSeq::new(11))
-            );
-            thread_txn.clear_page_access_tracking();
-            assert_eq!(thread_txn.thread_local_read_set_len(), 0);
-        })
-        .join()
-        .unwrap();
-
-        assert_eq!(
-            main_txn.thread_local_read_version_for_page(page),
-            Some(CommitSeq::new(10))
-        );
-        main_txn.clear_page_access_tracking();
     }
 
     // -- CommitRecord / CommitLog --

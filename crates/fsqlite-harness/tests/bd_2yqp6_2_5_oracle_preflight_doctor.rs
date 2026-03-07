@@ -62,7 +62,9 @@ generated_at = "2026-02-27T00:00:00Z"
 [fixture_roots]
 schema_version = "1.0.0"
 fixtures_dir = "crates/fsqlite-harness/conformance"
+fixtures_dir_aliases = ["./crates/fsqlite-harness/conformance"]
 slt_dir = "conformance/slt"
+slt_dir_aliases = ["./conformance/slt"]
 min_fixture_json_files = 1
 min_fixture_entries = 1
 min_fixture_sql_statements = 2
@@ -130,12 +132,8 @@ min_entries = 1
 #[cfg(unix)]
 fn base_config(workspace_root: &Path, sqlite_binary: PathBuf) -> DoctorConfig {
     let mut config = DoctorConfig::new(workspace_root.to_path_buf());
-    config.fixtures_dir = workspace_root.join("crates/fsqlite-harness/conformance");
     config.fixture_manifest_path = workspace_root.join("corpus_manifest.toml");
     config.oracle_binary_override = Some(sqlite_binary);
-    config.min_fixture_json_files = 1;
-    config.min_fixture_entries = 1;
-    config.min_fixture_sql_statements = 2;
     TARGET_SQLITE_VERSION.clone_into(&mut config.expected_sqlite_version_prefix);
     config.run_id = format!("{BEAD_ID}-test-run");
     "trace-bd-2yqp6.2.5-test".clone_into(&mut config.trace_id);
@@ -157,6 +155,9 @@ fn doctor_reports_green_for_ready_configuration() {
     let report = run_oracle_preflight_doctor(&config);
     assert_eq!(report.outcome, DoctorOutcome::Green);
     assert!(report.certifying);
+    assert!(report.replay_command.contains("--fixture-manifest-path"));
+    assert!(!report.replay_command.contains("--fixtures-dir"));
+    assert!(!report.replay_command.contains("--min-fixture-json-files"));
     assert!(
         report.findings.is_empty(),
         "expected no findings in healthy config, got {:?}",
