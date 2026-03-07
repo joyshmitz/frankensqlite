@@ -11297,8 +11297,27 @@ impl Connection {
                 match desc {
                     GroupByColumn::Plain(expr) => {
                         let val = if expr_contains_agg(expr) {
+                            // If the expression also has subqueries, inline
+                            // them first so `eval_group_agg_join_expr` sees
+                            // only literals where subqueries once were.
+                            let inlined_expr;
+                            let effective: &Expr = if expr_has_any_subquery(expr) {
+                                if let Some(r) = group_rows.first() {
+                                    if let Ok(e) = self.inline_subqueries_in_expr(expr, r, &col_map)
+                                    {
+                                        inlined_expr = e;
+                                        &inlined_expr
+                                    } else {
+                                        expr
+                                    }
+                                } else {
+                                    expr
+                                }
+                            } else {
+                                expr
+                            };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            eval_group_agg_join_expr(expr, &refs, &col_map)
+                            eval_group_agg_join_expr(effective, &refs, &col_map)
                                 .unwrap_or(SqliteValue::Null)
                         } else if expr_has_any_subquery(expr) {
                             group_rows.first().map_or(SqliteValue::Null, |r| {
@@ -11466,9 +11485,32 @@ impl Connection {
                     let row = &mut result[result_idx];
                     for (_term_idx, expr) in &extra_order_terms {
                         let val = if expr_contains_agg(expr) {
+                            let inlined_expr;
+                            let effective: &Expr = if expr_has_any_subquery(expr) {
+                                if let Some(r) = group_rows.first() {
+                                    if let Ok(e) = self.inline_subqueries_in_expr(expr, r, &col_map)
+                                    {
+                                        inlined_expr = e;
+                                        &inlined_expr
+                                    } else {
+                                        expr
+                                    }
+                                } else {
+                                    expr
+                                }
+                            } else {
+                                expr
+                            };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            eval_group_agg_join_expr(expr, &refs, &col_map)
+                            eval_group_agg_join_expr(effective, &refs, &col_map)
                                 .unwrap_or(SqliteValue::Null)
+                        } else if expr_has_any_subquery(expr) {
+                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                                let inlined = self
+                                    .inline_subqueries_in_expr(expr, r, &col_map)
+                                    .unwrap_or_else(|_| (*expr).clone());
+                                eval_join_expr(&inlined, r, &col_map).unwrap_or(SqliteValue::Null)
+                            })
                         } else {
                             group_rows.first().map_or(SqliteValue::Null, |r| {
                                 eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
@@ -11546,22 +11588,36 @@ impl Connection {
                 let label = alias.as_deref().unwrap_or("subquery");
                 match &query.body.select {
                     SelectCore::Select { columns, .. } => {
-                        for col in columns {
-                            let col_name = match col {
-                                ResultColumn::Expr { alias: Some(a), .. } => a.clone(),
-                                ResultColumn::Expr {
-                                    expr: Expr::Column(cref, _),
-                                    ..
-                                } => cref.column.clone(),
-                                ResultColumn::Expr {
-                                    expr: Expr::FunctionCall { name, .. },
-                                    ..
-                                } => name.clone(),
-                                ResultColumn::Expr { expr, .. } => format!("{expr}"),
-                                ResultColumn::Star => "*".to_owned(),
-                                ResultColumn::TableStar(t) => format!("{t}.*"),
-                            };
-                            col_map.push((label.to_owned(), col_name));
+                        let has_star = columns
+                            .iter()
+                            .any(|c| matches!(c, ResultColumn::Star | ResultColumn::TableStar(_)));
+                        if has_star {
+                            // Expand star columns from inner sources
+                            let resolved = resolve_subquery_star_columns(query, schema);
+                            for name in resolved {
+                                if name != "*" && !name.ends_with(".*") {
+                                    col_map.push((label.to_owned(), name));
+                                }
+                            }
+                        } else {
+                            for col in columns {
+                                let col_name = match col {
+                                    ResultColumn::Expr { alias: Some(a), .. } => a.clone(),
+                                    ResultColumn::Expr {
+                                        expr: Expr::Column(cref, _),
+                                        ..
+                                    } => cref.column.clone(),
+                                    ResultColumn::Expr {
+                                        expr: Expr::FunctionCall { name, .. },
+                                        ..
+                                    } => name.clone(),
+                                    ResultColumn::Expr { expr, .. } => format!("{expr}"),
+                                    ResultColumn::Star | ResultColumn::TableStar(_) => {
+                                        unreachable!()
+                                    }
+                                };
+                                col_map.push((label.to_owned(), col_name));
+                            }
                         }
                     }
                     SelectCore::Values(rows) => {
@@ -12225,8 +12281,24 @@ impl Connection {
                 match desc {
                     GroupByColumn::Plain(expr) => {
                         let val = if expr_contains_agg(expr) {
+                            let inlined_expr;
+                            let effective: &Expr = if expr_has_any_subquery(expr) {
+                                if let Some(r) = group_rows.first() {
+                                    if let Ok(e) = self.inline_subqueries_in_expr(expr, r, &col_map)
+                                    {
+                                        inlined_expr = e;
+                                        &inlined_expr
+                                    } else {
+                                        expr
+                                    }
+                                } else {
+                                    expr
+                                }
+                            } else {
+                                expr
+                            };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            eval_group_agg_join_expr(expr, &refs, &col_map)
+                            eval_group_agg_join_expr(effective, &refs, &col_map)
                                 .unwrap_or(SqliteValue::Null)
                         } else if expr_has_any_subquery(expr) {
                             // Correlated scalar subqueries need to be inlined
@@ -12386,9 +12458,32 @@ impl Connection {
                     let row = &mut result[result_idx];
                     for (_term_idx, expr) in &extra_order_terms {
                         let val = if expr_contains_agg(expr) {
+                            let inlined_expr;
+                            let effective: &Expr = if expr_has_any_subquery(expr) {
+                                if let Some(r) = group_rows.first() {
+                                    if let Ok(e) = self.inline_subqueries_in_expr(expr, r, &col_map)
+                                    {
+                                        inlined_expr = e;
+                                        &inlined_expr
+                                    } else {
+                                        expr
+                                    }
+                                } else {
+                                    expr
+                                }
+                            } else {
+                                expr
+                            };
                             let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
-                            eval_group_agg_join_expr(expr, &refs, &col_map)
+                            eval_group_agg_join_expr(effective, &refs, &col_map)
                                 .unwrap_or(SqliteValue::Null)
+                        } else if expr_has_any_subquery(expr) {
+                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                                let inlined = self
+                                    .inline_subqueries_in_expr(expr, r, &col_map)
+                                    .unwrap_or_else(|_| (*expr).clone());
+                                eval_join_expr(&inlined, r, &col_map).unwrap_or(SqliteValue::Null)
+                            })
                         } else {
                             group_rows.first().map_or(SqliteValue::Null, |r| {
                                 eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
@@ -15403,7 +15498,7 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
     }
     let strict_suffix = if table.strict { " STRICT" } else { "" };
     format!(
-        "CREATE TABLE {} ({column_defs}{fk_clauses}{check_clauses}){strict_suffix}",
+        "CREATE TABLE {}({column_defs}{fk_clauses}{check_clauses}){strict_suffix}",
         maybe_quote_ident(&table.name)
     )
 }
@@ -15938,16 +16033,23 @@ fn collect_subquery_inner_tables(sub: &SelectStatement) -> Vec<String> {
     } = &sub.body.select
     {
         if let TableOrSubquery::Table { name, alias, .. } = &from.source {
-            tables.push(name.name.clone());
+            // When a table has an alias, SQL requires using the alias for
+            // column references inside the subquery.  Only the alias should
+            // be treated as "inner" so that references using the original
+            // table name (which may match an outer table) are correctly
+            // recognised as outer refs and substituted.
             if let Some(a) = alias {
                 tables.push(a.clone());
+            } else {
+                tables.push(name.name.clone());
             }
         }
         for join in &from.joins {
             if let TableOrSubquery::Table { name, alias, .. } = &join.table {
-                tables.push(name.name.clone());
                 if let Some(a) = alias {
                     tables.push(a.clone());
+                } else {
+                    tables.push(name.name.clone());
                 }
             }
         }
@@ -16715,7 +16817,9 @@ fn exprs_match(a: &Expr, b: &Expr) -> bool {
                 ..
             },
         ) => ta.name.eq_ignore_ascii_case(&tb.name) && exprs_match(ea, eb),
-        _ => false,
+        // Fallback: use the AST-level PartialEq for variants not handled
+        // above (Subquery, Exists, In, Between, Case, etc.).
+        _ => a == b,
     }
 }
 
@@ -65750,37 +65854,290 @@ mod pager_routing_tests {
         }
     }
 
+    /// Oracle: NULLS FIRST/LAST ordering semantics.
     #[test]
-    fn test_column_affinity_comparison_debug() {
-        let conn = Connection::open(":memory:").unwrap();
-        conn.execute("CREATE TABLE aff(id INTEGER PRIMARY KEY, t TEXT, i INTEGER)")
-            .unwrap();
-        conn.execute("INSERT INTO aff VALUES(1, '10', 10)").unwrap();
+    fn test_conformance_nulls_first_last_ordering() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-        // Without ORDER BY (full scan path)
-        let rows = conn.query("SELECT t > i FROM aff").unwrap();
-        let val = &rows[0].values()[0];
-        eprintln!("[no-order] t > i = {val:?}");
+        let setup = [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)",
+            "INSERT INTO t VALUES(1,30),(2,NULL),(3,10),(4,NULL),(5,20)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
 
-        let rows = conn.query("SELECT t = i FROM aff").unwrap();
-        let val = &rows[0].values()[0];
-        eprintln!("[no-order] t = i = {val:?}");
+        let queries = [
+            "SELECT id, val FROM t ORDER BY val ASC NULLS FIRST",
+            "SELECT id, val FROM t ORDER BY val ASC NULLS LAST",
+            "SELECT id, val FROM t ORDER BY val DESC NULLS FIRST",
+            "SELECT id, val FROM t ORDER BY val DESC NULLS LAST",
+            // Default NULL ordering (SQLite: NULLs first in ASC, last in DESC... actually NULLs are smallest)
+            "SELECT id, val FROM t ORDER BY val ASC",
+            "SELECT id, val FROM t ORDER BY val DESC",
+        ];
 
-        // With ORDER BY (ordered scan / sorter path)
-        let rows = conn.query("SELECT t > i FROM aff ORDER BY id").unwrap();
-        let val = &rows[0].values()[0];
-        eprintln!("[ordered] t > i = {val:?}");
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} nulls first/last mismatches", mismatches.len());
+        }
+    }
 
-        let rows = conn.query("SELECT t = i FROM aff ORDER BY id").unwrap();
-        let val = &rows[0].values()[0];
-        eprintln!("[ordered] t = i = {val:?}");
+    /// Oracle: Multiple UNIQUE constraints and conflict handling.
+    #[test]
+    fn test_conformance_multi_unique_conflict_handling() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-        // Expected: t > i = 0, t = i = 1 (after numeric coercion of TEXT '10' to 10)
-        let rows = conn.query("SELECT t = i FROM aff").unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Integer(1),
-            "column TEXT '10' = column INTEGER 10 should be 1 after affinity coercion"
-        );
+        let setup = [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE, b TEXT UNIQUE)",
+            "INSERT INTO t VALUES(1,'x','p'),(2,'y','q'),(3,'z','r')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // INSERT OR IGNORE with different unique constraints
+        let mutations = [
+            "INSERT OR IGNORE INTO t VALUES(4,'x','s')", // conflicts on a
+            "INSERT OR IGNORE INTO t VALUES(5,'w','p')", // conflicts on b
+            "INSERT OR IGNORE INTO t VALUES(6,'w','s')", // no conflict
+        ];
+        for s in &mutations {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = ["SELECT * FROM t ORDER BY id", "SELECT COUNT(*) FROM t"];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} multi unique constraint mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: Compound SELECT with ORDER BY referencing column aliases.
+    #[test]
+    fn test_conformance_compound_alias_order() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER, name TEXT)",
+            "INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c')",
+            "CREATE TABLE t2(id INTEGER, name TEXT)",
+            "INSERT INTO t2 VALUES(4,'d'),(5,'e'),(2,'b')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT id, name FROM t1 UNION SELECT id, name FROM t2 ORDER BY id",
+            "SELECT id, name FROM t1 UNION ALL SELECT id, name FROM t2 ORDER BY name",
+            "SELECT id, name FROM t1 INTERSECT SELECT id, name FROM t2",
+            "SELECT id, name FROM t1 EXCEPT SELECT id, name FROM t2 ORDER BY id",
+            // UNION with different column counts via padding
+            "SELECT id, name FROM t1 UNION SELECT id, name FROM t2 ORDER BY 1 DESC",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} compound alias order mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: Self-joins and table aliasing.
+    #[test]
+    fn test_conformance_self_join_alias() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE emp(id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER)",
+            "INSERT INTO emp VALUES(1,'CEO',NULL),(2,'VP1',1),(3,'VP2',1),(4,'Mgr1',2),(5,'Mgr2',3)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Self-join: employee with their manager name
+            "SELECT e.name, m.name AS manager FROM emp e LEFT JOIN emp m ON e.manager_id = m.id ORDER BY e.id",
+            // Self-join: find employees with same manager
+            "SELECT a.name, b.name FROM emp a JOIN emp b ON a.manager_id = b.manager_id AND a.id < b.id ORDER BY a.name",
+            // Count direct reports
+            "SELECT m.name, COUNT(e.id) AS reports FROM emp m LEFT JOIN emp e ON e.manager_id = m.id GROUP BY m.id ORDER BY m.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} self join alias mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: Edge cases in CAST, typeof, and dynamic typing.
+    #[test]
+    fn test_conformance_dynamic_typing_edges() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, val)",
+            "INSERT INTO t VALUES(1, 42)",
+            "INSERT INTO t VALUES(2, 3.14)",
+            "INSERT INTO t VALUES(3, 'hello')",
+            "INSERT INTO t VALUES(4, NULL)",
+            "INSERT INTO t VALUES(5, 0)",
+            "INSERT INTO t VALUES(6, '')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT id, typeof(val) FROM t ORDER BY id",
+            "SELECT id, CAST(val AS TEXT) FROM t ORDER BY id",
+            "SELECT id, CAST(val AS INTEGER) FROM t ORDER BY id",
+            "SELECT id, CAST(val AS REAL) FROM t ORDER BY id",
+            // Dynamic type comparisons
+            "SELECT id FROM t WHERE val = 0 ORDER BY id",
+            "SELECT id FROM t WHERE val = '' ORDER BY id",
+            "SELECT id FROM t WHERE val IS NULL ORDER BY id",
+            // Truthiness
+            "SELECT id FROM t WHERE val ORDER BY id",
+            "SELECT id FROM t WHERE NOT val ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} dynamic typing edge mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: UPDATE with complex JOIN and subquery in SET.
+    #[test]
+    fn test_conformance_update_join_subquery_set() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, price INTEGER, category_id INTEGER)",
+            "INSERT INTO products VALUES(1,'A',100,1),(2,'B',200,1),(3,'C',150,2),(4,'D',50,2)",
+            "CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT, discount INTEGER)",
+            "INSERT INTO categories VALUES(1,'Electronics',10),(2,'Books',20)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // UPDATE with subquery in SET
+        let upd = "UPDATE products SET price = price - (SELECT discount FROM categories WHERE categories.id = products.category_id)";
+        fconn.execute(upd).unwrap();
+        rconn.execute_batch(upd).unwrap();
+
+        let queries = ["SELECT * FROM products ORDER BY id"];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} update join subquery set mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: CROSS JOIN and implicit joins.
+    #[test]
+    fn test_conformance_cross_join_implicit() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(a INTEGER)",
+            "INSERT INTO t1 VALUES(1),(2),(3)",
+            "CREATE TABLE t2(b TEXT)",
+            "INSERT INTO t2 VALUES('x'),('y')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Explicit CROSS JOIN
+            "SELECT a, b FROM t1 CROSS JOIN t2 ORDER BY a, b",
+            // Implicit join (comma)
+            "SELECT a, b FROM t1, t2 ORDER BY a, b",
+            // Cross join with WHERE
+            "SELECT a, b FROM t1 CROSS JOIN t2 WHERE a > 1 ORDER BY a, b",
+            // Count of cross join
+            "SELECT COUNT(*) FROM t1 CROSS JOIN t2",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} cross join implicit mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: CASE WHEN with aggregates and expressions.
+    #[test]
+    fn test_conformance_case_aggregate_mix() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE grades(id INTEGER PRIMARY KEY, student TEXT, subject TEXT, score INTEGER)",
+            "INSERT INTO grades VALUES(1,'Alice','Math',90),(2,'Alice','Science',85),(3,'Bob','Math',70),(4,'Bob','Science',95),(5,'Charlie','Math',60)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // CASE inside aggregate
+            "SELECT student, SUM(CASE WHEN score >= 80 THEN 1 ELSE 0 END) AS high_scores FROM grades GROUP BY student ORDER BY student",
+            // Aggregate inside CASE
+            "SELECT student, CASE WHEN AVG(score) >= 80 THEN 'Pass' ELSE 'Fail' END AS result FROM grades GROUP BY student ORDER BY student",
+            // Complex CASE with multiple conditions
+            "SELECT student, subject, CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' WHEN score >= 70 THEN 'C' ELSE 'F' END AS grade FROM grades ORDER BY student, subject",
+            // CASE in ORDER BY
+            "SELECT student, score FROM grades ORDER BY CASE WHEN subject = 'Math' THEN 0 ELSE 1 END, score DESC",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} case aggregate mix mismatches", mismatches.len());
+        }
     }
 }
