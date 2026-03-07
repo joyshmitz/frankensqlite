@@ -9056,3 +9056,207 @@ fn test_conformance_left_join_complex() {
         panic!("{} left join complex mismatches", mismatches.len());
     }
 }
+
+#[test]
+fn test_conformance_subquery_in_having() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE orders_sh (id INTEGER PRIMARY KEY, cust TEXT, amount REAL)",
+        "INSERT INTO orders_sh VALUES (1,'A',100),(2,'A',200),(3,'B',50),(4,'B',75),(5,'C',300)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // HAVING with scalar subquery
+        "SELECT cust, SUM(amount) AS total FROM orders_sh GROUP BY cust HAVING SUM(amount) > (SELECT AVG(amount) FROM orders_sh) ORDER BY cust",
+        // HAVING with COUNT comparison to scalar
+        "SELECT cust, COUNT(*) FROM orders_sh GROUP BY cust HAVING COUNT(*) >= (SELECT 2) ORDER BY cust",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} subquery in having mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_update_multiple_rows() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE umr (id INTEGER PRIMARY KEY, status TEXT, count INTEGER)",
+        "INSERT INTO umr VALUES (1,'pending',5),(2,'active',10),(3,'pending',3),(4,'active',8),(5,'done',1)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    // Update multiple matching rows
+    fconn
+        .execute("UPDATE umr SET status = 'processed' WHERE status = 'pending'")
+        .unwrap();
+    rconn
+        .execute_batch("UPDATE umr SET status = 'processed' WHERE status = 'pending'")
+        .unwrap();
+
+    // Update with expression
+    fconn
+        .execute("UPDATE umr SET count = count * 2 WHERE status = 'active'")
+        .unwrap();
+    rconn
+        .execute_batch("UPDATE umr SET count = count * 2 WHERE status = 'active'")
+        .unwrap();
+
+    let queries = [
+        "SELECT * FROM umr ORDER BY id",
+        "SELECT status, SUM(count) FROM umr GROUP BY status ORDER BY status",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} update multiple rows mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_printf_format() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries = [
+        "SELECT PRINTF('%d', 42)",
+        "SELECT PRINTF('%05d', 42)",
+        "SELECT PRINTF('%s', 'hello')",
+        "SELECT PRINTF('%-10s|', 'left')",
+        "SELECT PRINTF('%10s|', 'right')",
+        "SELECT PRINTF('%.3f', 3.14159)",
+        "SELECT PRINTF('%e', 12345.6789)",
+        "SELECT PRINTF('%x', 255)",
+        "SELECT PRINTF('%o', 255)",
+        "SELECT PRINTF('%%')",
+        "SELECT PRINTF('%d + %d = %d', 2, 3, 5)",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} printf format mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_date_time_functions() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries = [
+        "SELECT DATE('2024-01-15')",
+        "SELECT TIME('14:30:00')",
+        "SELECT DATETIME('2024-01-15 14:30:00')",
+        "SELECT DATE('2024-01-15', '+1 month')",
+        "SELECT DATE('2024-01-15', '+1 year')",
+        "SELECT DATE('2024-01-15', '-7 days')",
+        "SELECT DATE('2024-01-15', 'start of month')",
+        "SELECT DATE('2024-03-15', 'start of year')",
+        "SELECT STRFTIME('%Y', '2024-01-15')",
+        "SELECT STRFTIME('%m', '2024-06-15')",
+        "SELECT STRFTIME('%d', '2024-01-20')",
+        "SELECT STRFTIME('%H:%M', '2024-01-15 14:30:00')",
+        "SELECT JULIANDAY('2024-01-01')",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} date time function mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_table_alias_in_join() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE t1_aj (id INTEGER PRIMARY KEY, val TEXT)",
+        "INSERT INTO t1_aj VALUES (1,'a'),(2,'b'),(3,'c')",
+        "CREATE TABLE t2_aj (id INTEGER PRIMARY KEY, t1_id INTEGER, info TEXT)",
+        "INSERT INTO t2_aj VALUES (1,1,'x'),(2,2,'y'),(3,2,'z')",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // Aliases in JOINs
+        "SELECT a.val, b.info FROM t1_aj a JOIN t2_aj b ON a.id = b.t1_id ORDER BY a.val, b.info",
+        // Self-join with aliases
+        "SELECT a.val AS v1, b.val AS v2 FROM t1_aj a, t1_aj b WHERE a.id < b.id ORDER BY a.id, b.id",
+        // Alias in subquery
+        "SELECT a.val, (SELECT COUNT(*) FROM t2_aj b WHERE b.t1_id = a.id) AS cnt FROM t1_aj a ORDER BY a.val",
+        // Multiple aliases in compound query
+        "SELECT a.val FROM t1_aj a WHERE a.id IN (SELECT t1_id FROM t2_aj) ORDER BY a.val",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} table alias join mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_in_subquery_with_group() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE items_isp (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER)",
+        "INSERT INTO items_isp VALUES (1,'A',10),(2,'B',20),(3,'A',30),(4,'C',40),(5,'B',50)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // IN with subquery
+        "SELECT * FROM items_isp WHERE cat IN (SELECT cat FROM items_isp GROUP BY cat HAVING COUNT(*) > 1) ORDER BY id",
+        // NOT IN with subquery
+        "SELECT * FROM items_isp WHERE cat NOT IN (SELECT cat FROM items_isp WHERE val > 25) ORDER BY id",
+        // IN with values
+        "SELECT * FROM items_isp WHERE val IN (10, 30, 50) ORDER BY id",
+        // IN with expression
+        "SELECT * FROM items_isp WHERE val * 2 IN (20, 60, 100) ORDER BY id",
+        // Nested IN
+        "SELECT * FROM items_isp WHERE cat IN ('A', 'B') AND val IN (10, 20, 30) ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} in subquery pattern mismatches", mismatches.len());
+    }
+}
