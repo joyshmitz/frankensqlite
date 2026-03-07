@@ -555,7 +555,13 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
                     result.push_str(&format!("{h12:02}"));
                 }
                 'j' => result.push_str(&format!("{doy:03}")),
-                'J' => result.push_str(&format!("{jdn:.6}")),
+                'J' => {
+                    // C SQLite uses %.15g which strips trailing zeros.
+                    let s = format!("{jdn:.15}");
+                    let s = s.trim_end_matches('0');
+                    let s = s.strip_suffix('.').unwrap_or(s);
+                    result.push_str(s);
+                }
                 'k' => {
                     // Space-padded 24-hour.
                     result.push_str(&format!("{h:>2}"));

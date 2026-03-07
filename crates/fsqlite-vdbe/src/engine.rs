@@ -115,7 +115,7 @@ impl MemTable {
     /// Allocate a new unique rowid.
     pub fn alloc_rowid(&mut self) -> i64 {
         let id = self.next_rowid;
-        self.next_rowid += 1;
+        self.next_rowid = self.next_rowid.saturating_add(1);
         id
     }
 
@@ -123,7 +123,7 @@ impl MemTable {
     fn insert(&mut self, rowid: i64, values: Vec<SqliteValue>) {
         // Update next_rowid if needed.
         if rowid >= self.next_rowid {
-            self.next_rowid = rowid + 1;
+            self.next_rowid = rowid.saturating_add(1);
         }
         // Replace if rowid already exists (UPSERT semantics).
         match self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
@@ -1436,8 +1436,8 @@ impl MemDatabase {
         if let Some(table) = self.tables.get_mut(&root_page) {
             let prev_next_rowid = table.next_rowid;
             let max_visible = table.rows.iter().map(|r| r.rowid).max().unwrap_or(0);
-            let rowid = max_visible + 1;
-            table.next_rowid = rowid + 1;
+            let rowid = max_visible.saturating_add(1);
+            table.next_rowid = rowid.saturating_add(1);
             self.push_undo(MemDbUndoOp::BumpRowid {
                 root_page,
                 prev_next_rowid,
@@ -3330,9 +3330,7 @@ impl VdbeEngine {
                     let result = if a.is_null() {
                         SqliteValue::Null
                     } else {
-                        // C SQLite uses sqlite3VdbeIntValue (integer truncation),
-                        // not float comparison. NOT 0.5 → 1 (0.5 truncates to 0).
-                        SqliteValue::Integer(i64::from(a.to_integer() == 0))
+                        SqliteValue::Integer(i64::from(!vdbe_real_is_truthy(a)))
                     };
                     self.set_reg(op.p2, result);
                     pc += 1;
@@ -3342,13 +3340,13 @@ impl VdbeEngine {
                 Opcode::If => {
                     // Jump to p2 if p1 is true (non-zero, non-NULL).
                     // If p1 is NULL, jump iff p3 != 0 (SQLite semantics).
-                    // C SQLite uses sqlite3VdbeIntValue() which truncates to
-                    // integer, so 0.5 is falsy (truncates to 0).
+                    // C SQLite uses sqlite3VdbeRealValue() != 0.0 (NOT integer
+                    // truncation), so 0.1 and 0.5 are truthy.
                     let val = self.get_reg(op.p1);
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        val.to_integer() != 0
+                        vdbe_real_is_truthy(val)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -3360,12 +3358,12 @@ impl VdbeEngine {
                 Opcode::IfNot => {
                     // Jump to p2 if p1 is false (zero).
                     // If p1 is NULL, jump iff p3 != 0 (SQLite semantics).
-                    // C SQLite uses sqlite3VdbeIntValue() — integer truncation.
+                    // C SQLite uses sqlite3VdbeRealValue() != 0.0.
                     let val = self.get_reg(op.p1);
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        val.to_integer() == 0
+                        !vdbe_real_is_truthy(val)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -4902,8 +4900,7 @@ impl VdbeEngine {
                     if val.is_null() {
                         self.set_reg(op.p2, SqliteValue::Integer(i64::from(op.p3 ^ p4_val)));
                     } else {
-                        // SQLite uses sqlite3VdbeMemIntegerify for truthiness.
-                        let v = i32::from(val.to_integer() != 0);
+                        let v = i32::from(vdbe_real_is_truthy(val));
                         self.set_reg(op.p2, SqliteValue::Integer(i64::from((v ^ p4_val) & 1)));
                     }
                     pc += 1;
@@ -5767,7 +5764,7 @@ impl VdbeEngine {
                 Opcode::IfNotZero => {
                     let val = self.get_reg(op.p1).to_integer();
                     if val != 0 {
-                        self.set_reg(op.p1, SqliteValue::Integer(val - 1));
+                        self.set_reg(op.p1, SqliteValue::Integer(val.wrapping_sub(1)));
                         pc = op.p2 as usize;
                     } else {
                         pc += 1;
@@ -6714,6 +6711,23 @@ const SQLITE_AFF_NUMERIC: u16 = 0x43; // 'C'
 /// numeric-class affinity (>= NUMERIC / 0x43).  When p5 is 0 or carries
 /// BLOB affinity (0x41), no coercion is performed — values compare using
 /// their native storage classes (NULL < numeric < text < blob).
+/// C SQLite OP_If/OP_IfNot truthiness: uses `sqlite3VdbeRealValue() != 0.0`,
+/// which means 0.1, 0.5, -0.1 etc. are all truthy (unlike integer truncation).
+fn vdbe_real_is_truthy(val: &SqliteValue) -> bool {
+    match val {
+        SqliteValue::Null => false,
+        SqliteValue::Integer(n) => *n != 0,
+        SqliteValue::Float(f) => *f != 0.0,
+        SqliteValue::Text(_) | SqliteValue::Blob(_) => {
+            let i = val.to_integer();
+            if i != 0 {
+                return true;
+            }
+            val.to_float() != 0.0
+        }
+    }
+}
+
 fn coerce_for_comparison<'a>(
     lhs: &'a SqliteValue,
     rhs: &'a SqliteValue,
@@ -7273,17 +7287,17 @@ fn sql_shift_right(val: i64, amount: i64) -> SqliteValue {
 
 /// Three-valued SQL AND.
 fn sql_and(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
-    // SQLite uses integer truncation for truthiness in And/Or (sqlite3VdbeIntValue),
-    // NOT float comparison. This matches the Not opcode behavior.
+    // C SQLite compiles AND/OR using OP_If/OP_IfNot which use
+    // sqlite3VdbeRealValue() != 0.0, so 0.5 is truthy.
     let a_val = if a.is_null() {
         None
     } else {
-        Some(a.to_integer() != 0)
+        Some(vdbe_real_is_truthy(a))
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(b.to_integer() != 0)
+        Some(vdbe_real_is_truthy(b))
     };
 
     match (a_val, b_val) {
@@ -7295,17 +7309,15 @@ fn sql_and(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
 
 /// Three-valued SQL OR.
 fn sql_or(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
-    // SQLite uses integer truncation for truthiness in And/Or (sqlite3VdbeIntValue),
-    // NOT float comparison. This matches the Not opcode behavior.
     let a_val = if a.is_null() {
         None
     } else {
-        Some(a.to_integer() != 0)
+        Some(vdbe_real_is_truthy(a))
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(b.to_integer() != 0)
+        Some(vdbe_real_is_truthy(b))
     };
 
     match (a_val, b_val) {

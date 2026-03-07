@@ -297,13 +297,17 @@ pub struct IifFunc;
 
 impl ScalarFunction for IifFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        // NOTE: Real short-circuit happens at VDBE level.
         let cond = &args[0];
-        // C SQLite uses integer truncation for truthiness (sqlite3VdbeIntValue):
-        // 0.5 is falsy (truncates to 0), 1.5 is truthy (truncates to 1).
+        // C SQLite evaluates IIF condition with sqlite3VdbeRealValue != 0.0,
+        // so 0.5 is truthy (non-zero real).
         let is_true = match cond {
             SqliteValue::Null => false,
-            v => v.to_integer() != 0,
+            SqliteValue::Integer(n) => *n != 0,
+            SqliteValue::Float(f) => *f != 0.0,
+            SqliteValue::Text(_) | SqliteValue::Blob(_) => {
+                let i = cond.to_integer();
+                if i != 0 { true } else { cond.to_float() != 0.0 }
+            }
         };
         if is_true {
             Ok(args[1].clone())
