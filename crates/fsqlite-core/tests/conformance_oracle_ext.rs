@@ -11493,3 +11493,164 @@ fn test_conformance_savepoint() {
         panic!("{} savepoint mismatches", mismatches.len());
     }
 }
+
+/// WHERE with TEXT column compared to INTEGER literal (affinity in VDBE WHERE)
+#[test]
+fn test_conformance_where_text_vs_int_vdbe() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE codes(id INTEGER PRIMARY KEY, code TEXT, priority INTEGER)",
+        "INSERT INTO codes VALUES(1, '100', 5)",
+        "INSERT INTO codes VALUES(2, '200', 3)",
+        "INSERT INTO codes VALUES(3, '50', 8)",
+        "INSERT INTO codes VALUES(4, 'ABC', 1)",
+        "INSERT INTO codes VALUES(5, '75', 6)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT id FROM codes WHERE code = 100 ORDER BY id",
+        "SELECT id FROM codes WHERE code > 75 ORDER BY id",
+        "SELECT id FROM codes WHERE code < 200 ORDER BY id",
+        "SELECT id FROM codes WHERE code >= 50 AND code <= 200 ORDER BY id",
+        "SELECT id FROM codes WHERE code BETWEEN 50 AND 200 ORDER BY id",
+        "SELECT id FROM codes WHERE code > 999 ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} where text vs int vdbe mismatches", mismatches.len());
+    }
+}
+
+/// Affinity coercion in ORDER BY (column types matter)
+#[test]
+fn test_conformance_order_by_affinity() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE nums_oa(id INTEGER PRIMARY KEY, str_num TEXT)",
+        "INSERT INTO nums_oa VALUES(1, '9'),(2, '10'),(3, '100'),(4, '2'),(5, '11')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT str_num FROM nums_oa ORDER BY str_num",
+        "SELECT str_num FROM nums_oa ORDER BY CAST(str_num AS INTEGER)",
+        "SELECT str_num, CAST(str_num AS INTEGER) AS num FROM nums_oa ORDER BY num",
+        "SELECT MAX(CAST(str_num AS INTEGER)), MIN(CAST(str_num AS INTEGER)) FROM nums_oa",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} order by affinity mismatches", mismatches.len());
+    }
+}
+
+/// Nested subqueries (correlated + aggregate)
+#[test]
+fn test_conformance_nested_subquery_correlated() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE items_nsc(id INTEGER PRIMARY KEY, cat TEXT, val INTEGER)",
+        "INSERT INTO items_nsc VALUES(1,'A',10),(2,'B',20),(3,'A',30),(4,'C',40),(5,'B',50)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT cat, val FROM items_nsc WHERE val > (SELECT AVG(val) FROM items_nsc) ORDER BY val",
+        "SELECT cat, val, (SELECT MAX(val) FROM items_nsc WHERE cat = i.cat) AS cat_max FROM items_nsc i ORDER BY cat, val",
+        "SELECT * FROM (SELECT cat, SUM(val) AS total FROM items_nsc GROUP BY cat) WHERE total > 20 ORDER BY cat",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} nested subquery correlated mismatches", mismatches.len());
+    }
+}
+
+/// Multi-row INSERT with DEFAULT and expression values
+#[test]
+fn test_conformance_insert_default_expr() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE iv(id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unknown', val REAL DEFAULT 0.0)",
+        "INSERT INTO iv VALUES(1, 'a', 10.0),(2, 'b', 20.0),(3, 'c', 30.0)",
+        "INSERT INTO iv(id) VALUES(4)",
+        "INSERT INTO iv(id, name) VALUES(5, 'Alice')",
+        "INSERT INTO iv VALUES(6, 'hello' || ' ' || 'world', ABS(-42))",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT * FROM iv ORDER BY id",
+        "SELECT COUNT(*) FROM iv",
+        "SELECT name, val FROM iv WHERE val = 0.0 ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} insert variations mismatches", mismatches.len());
+    }
+}
+
+/// LIMIT -1, LIMIT 0, OFFSET beyond rows
+#[test]
+fn test_conformance_limit_negative_zero() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE lo_e(id INTEGER PRIMARY KEY, val TEXT)",
+        "INSERT INTO lo_e VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT val FROM lo_e ORDER BY id LIMIT 3",
+        "SELECT val FROM lo_e ORDER BY id LIMIT 3 OFFSET 2",
+        "SELECT val FROM lo_e ORDER BY id LIMIT 0",
+        "SELECT val FROM lo_e ORDER BY id LIMIT 100",
+        "SELECT val FROM lo_e ORDER BY id LIMIT 2 OFFSET 10",
+        "SELECT val FROM lo_e ORDER BY id LIMIT -1",
+        "SELECT val FROM lo_e ORDER BY id LIMIT 3 OFFSET 0",
+        "SELECT COUNT(*) FROM lo_e LIMIT 1",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} limit offset edge mismatches", mismatches.len());
+    }
+}
