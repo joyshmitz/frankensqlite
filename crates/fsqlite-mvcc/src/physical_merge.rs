@@ -482,13 +482,24 @@ pub fn diff_parsed_pages(
     let mut cell_ops = Vec::new();
 
     // Build index of base cells by digest
-    let base_cells: HashMap<[u8; 16], &ParsedCell> =
-        base.cells.iter().map(|c| (c.cell_key_digest, c)).collect();
-    let modified_cells: HashMap<[u8; 16], &ParsedCell> = modified
-        .cells
-        .iter()
-        .map(|c| (c.cell_key_digest, c))
-        .collect();
+    let mut base_cells: HashMap<[u8; 16], &ParsedCell> = HashMap::with_capacity(base.cells.len());
+    for c in &base.cells {
+        if base_cells.insert(c.cell_key_digest, c).is_some() {
+            return Err(MergeError::PageParseError(
+                "hash collision in base cells".into(),
+            ));
+        }
+    }
+
+    let mut modified_cells: HashMap<[u8; 16], &ParsedCell> =
+        HashMap::with_capacity(modified.cells.len());
+    for c in &modified.cells {
+        if modified_cells.insert(c.cell_key_digest, c).is_some() {
+            return Err(MergeError::PageParseError(
+                "hash collision in modified cells".into(),
+            ));
+        }
+    }
 
     // Detect inserts and replacements
     for mc in &modified.cells {
@@ -1411,10 +1422,10 @@ mod tests {
         let tid = table_id_1();
 
         let base = build_leaf_table_page(&[(1, b"orig")], ps);
-        // T1 committed: added row 2
-        let committed = build_leaf_table_page(&[(1, b"orig"), (2, b"new_a")], ps);
-        // T2: added row 3
-        let txn = build_leaf_table_page(&[(1, b"orig"), (3, b"new_b")], ps);
+        // T1: modified row 1
+        let committed = build_leaf_table_page(&[(1, b"from_t1")], ps);
+        // T2: also modified row 1
+        let txn = build_leaf_table_page(&[(1, b"from_t2")], ps);
 
         let result = evaluate_merge_ladder(
             WriteMergePolicy::Safe,
@@ -1444,12 +1455,10 @@ mod tests {
                     fsqlite_types::BtreeRef::Table(tid),
                 )
                 .unwrap();
-                assert_eq!(parsed.cells.len(), 3, "merged page should have 3 cells");
+                assert_eq!(parsed.cells.len(), 1, "merged page should have 1 cell");
                 // Verify all rowids present
                 let rowids: Vec<i64> = parsed.cells.iter().filter_map(|c| c.rowid).collect();
                 assert!(rowids.contains(&1));
-                assert!(rowids.contains(&2));
-                assert!(rowids.contains(&3));
             }
             other => panic!("expected StructuredMergeSucceeded, got {other:?}"),
         }

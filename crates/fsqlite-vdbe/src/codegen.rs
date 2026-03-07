@@ -1691,7 +1691,9 @@ fn codegen_select_distinct_scan(
                 // Inherit column-level collation from table schema.
                 if let Expr::Column(cr, _) = expr {
                     if let Some(idx) = table.column_index(&cr.column) {
-                        if let Some(coll) = table.columns.get(idx).and_then(|c| c.collation.as_deref()) {
+                        if let Some(coll) =
+                            table.columns.get(idx).and_then(|c| c.collation.as_deref())
+                        {
                             return coll.to_owned();
                         }
                     }
@@ -6752,7 +6754,10 @@ fn emit_not_null_constraints(
                     SQLITE_CONSTRAINT,
                     0,
                     0,
-                    P4::Str(format!("NOT NULL constraint failed: {}.{}", table.name, col.name)),
+                    P4::Str(format!(
+                        "NOT NULL constraint failed: {}.{}",
+                        table.name, col.name
+                    )),
                     0,
                 );
             }

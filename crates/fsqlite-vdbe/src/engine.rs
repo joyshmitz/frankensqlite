@@ -6956,11 +6956,7 @@ fn compare_sorter_keys(
 /// Compare two `SqliteValue`s with an optional collation sequence.
 /// When `collation` is `Some("NOCASE")`, text values are compared
 /// case-insensitively.
-fn cmp_values_collated(
-    lhs: &SqliteValue,
-    rhs: &SqliteValue,
-    collation: Option<&str>,
-) -> Ordering {
+fn cmp_values_collated(lhs: &SqliteValue, rhs: &SqliteValue, collation: Option<&str>) -> Ordering {
     if let (Some(coll), SqliteValue::Text(lt), SqliteValue::Text(rt)) = (collation, lhs, rhs) {
         if coll.eq_ignore_ascii_case("NOCASE") {
             return lt.to_ascii_lowercase().cmp(&rt.to_ascii_lowercase());
@@ -12199,7 +12195,8 @@ mod tests {
     #[test]
     fn test_sorter_multi_column_key_with_mixed_order() {
         // Test sorting with 2 key columns: first ASC, second DESC.
-        let mut sorter = SorterCursor::new(2, vec![SortKeyOrder::Asc, SortKeyOrder::Desc], Vec::new());
+        let mut sorter =
+            SorterCursor::new(2, vec![SortKeyOrder::Asc, SortKeyOrder::Desc], Vec::new());
 
         // Insert rows: (group, value)
         for (group, value) in [(1i64, 30i64), (2, 10), (1, 20), (2, 40), (1, 10)] {

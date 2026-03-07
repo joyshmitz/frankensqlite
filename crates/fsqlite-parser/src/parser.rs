@@ -914,8 +914,7 @@ impl Parser {
             && !matches!(
                 self.peek_nth(1),
                 TokenKind::KwSelect | TokenKind::KwWith | TokenKind::KwValues
-            )
-        {
+            ) {
             self.advance();
             let cols = self.parse_comma_sep(Self::parse_identifier)?;
             self.expect_token(&TokenKind::RightParen)?;

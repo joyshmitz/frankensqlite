@@ -9329,18 +9329,15 @@ impl Connection {
         quick: bool,
     ) -> Result<()> {
         let schema = self.schema.borrow().clone();
-        let without_rowid_tables: HashSet<String> = master_rows
-            .iter()
-            .filter_map(|row| {
-                let (entry_type, name, _, _) = sqlite_master_signature(row).ok()?;
-                if entry_type != "table" {
-                    return None;
-                }
-                sqlite_master_sql_text(row)?
-                    .filter(|sql| is_without_rowid_table_sql(sql))
-                    .map(|_| name)
-            })
-            .collect();
+        let mut without_rowid_tables = HashSet::new();
+        for row in master_rows {
+            let (entry_type, name, _, _) = sqlite_master_signature(row)?;
+            if entry_type == "table"
+                && sqlite_master_sql_text(row)?.is_some_and(is_without_rowid_table_sql)
+            {
+                without_rowid_tables.insert(name.to_ascii_lowercase());
+            }
+        }
         for table in &schema {
             let uses_index_btree = without_rowid_tables.contains(&table.name.to_ascii_lowercase());
             let root_page = page_number_from_schema_root(table.root_page, &table.name, "table")?;
@@ -11624,7 +11621,9 @@ impl Connection {
         let table_schema = schema
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(&table_name))
+            .cloned()
             .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
+        drop(schema);
 
         // Build a column map for expression evaluation: (table_label, col_name).
         // Use the alias as the table label when present so that alias-qualified
@@ -11687,7 +11686,7 @@ impl Connection {
             .iter()
             .map(|col| {
                 if let ResultColumn::Expr { expr, .. } = col {
-                    expr_effective_collation_for_table(expr, table_schema)
+                    expr_effective_collation_for_table(expr, &table_schema)
                 } else {
                     None
                 }
@@ -11809,8 +11808,6 @@ impl Connection {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        drop(schema);
-
         // Rewrite rowid/_rowid_/oid aliases in GROUP BY and result column
         // expressions so that the expression evaluator can resolve them
         // against the col_map (which only contains declared column names).
@@ -11851,7 +11848,7 @@ impl Connection {
         // Build per-GROUP-BY-key collation info for collation-aware grouping.
         let group_collations: Vec<Option<String>> = group_by_exprs
             .iter()
-            .map(|expr| expr_effective_collation_for_table(expr, table_schema))
+            .map(|expr| expr_effective_collation_for_table(expr, &table_schema))
             .collect();
 
         // Group rows by evaluating GROUP BY expressions for each row.
@@ -12331,11 +12328,13 @@ impl Connection {
                 let has_order = !win_order_by[wi].is_empty();
                 // Default frame: with ORDER BY → RANGE UNBOUNDED PRECEDING TO CURRENT ROW,
                 // without ORDER BY → RANGE UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING.
-                let frame_start_unbounded = frame.as_ref().map_or(true, |f| {
-                    matches!(f.start, FrameBound::UnboundedPreceding)
-                });
+                let frame_start_unbounded = frame
+                    .as_ref()
+                    .map_or(true, |f| matches!(f.start, FrameBound::UnboundedPreceding));
                 let frame_end_unbounded = frame.as_ref().map_or(!has_order, |f| {
-                    f.end.as_ref().map_or(false, |e| matches!(e, FrameBound::UnboundedFollowing))
+                    f.end
+                        .as_ref()
+                        .map_or(false, |e| matches!(e, FrameBound::UnboundedFollowing))
                 });
                 // Peer-group functions: cume_dist and percent_rank use RANGE semantics
                 // where rows with equal ORDER BY keys share the same value.
@@ -13967,7 +13966,7 @@ impl Connection {
             }
 
             // Parse the CREATE TABLE to extract column info.
-            let columns = crate::compat_persist::parse_columns_from_create_sql(&create_sql);
+            let columns = crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql);
             let num_columns = columns.len();
             let is_autoincrement = crate::compat_persist::is_autoincrement_table_sql(&create_sql);
 
@@ -32824,12 +32823,16 @@ mod schema_loading_tests {
 
         let conn = Connection::open(&db_str).unwrap();
         let schema = conn.schema.borrow();
-        assert!(
-            schema
-                .iter()
-                .any(|table| table.name.eq_ignore_ascii_case("docs")),
-            "materialized virtual table should survive schema reload"
-        );
+        let table = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("docs"))
+            .expect("materialized virtual table should survive schema reload");
+        let column_names: Vec<&str> = table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(column_names, vec!["subject", "body"]);
         drop(schema);
 
         let rows = conn
@@ -42043,6 +42046,21 @@ mod pager_routing_tests {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, code TEXT);")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'alice@example.com', 'alpha');")
+            .unwrap();
+
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+    }
+
+    #[test]
+    fn test_pragma_integrity_check_accepts_mixed_case_without_rowid_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            r#"CREATE TABLE "CamelCase" (id INTEGER PRIMARY KEY, name TEXT) WITHOUT ROWID;"#,
+        )
+        .unwrap();
+        conn.execute(r#"INSERT INTO "CamelCase" VALUES (1, 'Alice');"#)
             .unwrap();
 
         let rows = conn.query("PRAGMA integrity_check;").unwrap();

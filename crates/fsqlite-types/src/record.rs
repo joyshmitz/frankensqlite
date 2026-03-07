@@ -47,7 +47,7 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
     for &st in &serial_types {
         let value_len_u64 = serial_type_len(st)?;
         let value_len = usize::try_from(value_len_u64).unwrap_or(usize::MAX);
-        
+
         let end_offset = body_offset.checked_add(value_len);
         if end_offset.is_none() || end_offset.unwrap() > data.len() {
             return None;

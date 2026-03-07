@@ -1627,7 +1627,10 @@ fn classify_error_category(message: &str) -> ErrorCategory {
     if contains_any(&normalized, &["busy", "busy_snapshot"]) {
         return ErrorCategory::Busy;
     }
-    if contains_any(&normalized, &["readonly", "read-only", "attempt to write a readonly"]) {
+    if contains_any(
+        &normalized,
+        &["readonly", "read-only", "attempt to write a readonly"],
+    ) {
         return ErrorCategory::ReadOnly;
     }
     if contains_any(&normalized, &["datatype mismatch", "type mismatch"]) {

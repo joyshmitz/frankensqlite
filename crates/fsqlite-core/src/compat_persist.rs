@@ -12,11 +12,12 @@
 
 use std::path::Path;
 
-use fsqlite_ast::SortDirection;
+use fsqlite_ast::{SortDirection, Statement};
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
+use fsqlite_parser::Parser;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
@@ -38,6 +39,7 @@ const DEFAULT_PAGE_SIZE: PageSize = PageSize::DEFAULT;
 // ── Public API ──────────────────────────────────────────────────────────
 
 /// State loaded from a real SQLite file.
+#[derive(Debug)]
 pub struct LoadedState {
     /// Reconstructed table schemas.
     pub schema: Vec<TableSchema>,
@@ -261,20 +263,26 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
             _ => continue,
         };
 
-        // Virtual tables (FTS5, rtree, etc.) have rootpage=0 in
-        // sqlite_master.  These cannot be loaded as regular B-tree tables
-        // — skip them gracefully instead of crashing.  (Issue #15)
+        // Stock SQLite virtual tables (FTS5, rtree, etc.) have
+        // rootpage=0 and CREATE SQL beginning with CREATE VIRTUAL TABLE.
+        // Skip only that combination: FrankenSQLite may preserve virtual-table
+        // SQL text while still materializing the table onto a real root page.
         let is_virtual = root_page_num == 0
-            || create_sql
+            && create_sql
                 .trim_start()
                 .to_ascii_uppercase()
                 .starts_with("CREATE VIRTUAL TABLE");
         if is_virtual {
             continue;
         }
+        if root_page_num == 0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("table `{name}` has invalid rootpage 0 in sqlite_master"),
+            });
+        }
 
         // Parse the CREATE TABLE to extract column info.
-        let columns = parse_columns_from_create_sql(&create_sql);
+        let columns = parse_columns_from_sqlite_master_sql(&create_sql);
         let num_columns = columns.len();
 
         // Use the REAL root page from sqlite_master (5A.4: bd-1soh).
@@ -552,6 +560,88 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
             })
         })
         .collect()
+}
+
+/// Extract column metadata from sqlite_master SQL for both ordinary and
+/// materialized virtual tables.
+#[must_use]
+pub fn parse_columns_from_sqlite_master_sql(sql: &str) -> Vec<ColumnInfo> {
+    if is_virtual_table_sql(sql) {
+        return parse_virtual_table_columns_from_sql(sql)
+            .unwrap_or_else(|| parse_columns_from_create_sql(sql));
+    }
+    parse_columns_from_create_sql(sql)
+}
+
+fn is_virtual_table_sql(sql: &str) -> bool {
+    sql.trim_start()
+        .to_ascii_uppercase()
+        .starts_with("CREATE VIRTUAL TABLE")
+}
+
+fn parse_virtual_table_columns_from_sql(sql: &str) -> Option<Vec<ColumnInfo>> {
+    let mut parser = Parser::from_sql(sql);
+    match parser.parse_statement().ok()? {
+        Statement::CreateVirtualTable(create) => {
+            Some(parse_virtual_table_column_infos(&create.args))
+        }
+        _ => None,
+    }
+}
+
+fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
+    let mut columns = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+
+    for arg in args {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.contains('=') {
+            continue;
+        }
+        let raw_name = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'));
+        if raw_name.is_empty() {
+            continue;
+        }
+        let key = raw_name.to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        columns.push(ColumnInfo {
+            name: raw_name.to_owned(),
+            affinity: 'C',
+            is_ipk: false,
+            type_name: None,
+            notnull: false,
+            unique: false,
+            default_value: None,
+            strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
+            collation: None,
+        });
+    }
+
+    if columns.is_empty() {
+        columns.push(ColumnInfo {
+            name: "content".to_owned(),
+            affinity: 'C',
+            is_ipk: false,
+            type_name: None,
+            notnull: false,
+            unique: false,
+            default_value: None,
+            strict_type: None,
+            generated_expr: None,
+            generated_stored: None,
+            collation: None,
+        });
+    }
+
+    columns
 }
 
 /// Return true when CREATE TABLE SQL declares the table as STRICT.
@@ -1468,6 +1558,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_columns_from_sqlite_master_sql_ignores_virtual_table_options() {
+        let sql =
+            "CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter', prefix='2 3')";
+        let cols = parse_columns_from_sqlite_master_sql(sql);
+        let names: Vec<&str> = cols.iter().map(|column| column.name.as_str()).collect();
+        assert_eq!(names, vec!["subject", "body"]);
+    }
+
+    #[test]
     fn test_type_to_affinity_mapping() {
         assert_eq!(type_to_affinity("INTEGER"), 'D');
         assert_eq!(type_to_affinity("INT"), 'D');
@@ -1522,5 +1621,80 @@ mod tests {
 
         let loaded = load_from_sqlite(&db_path).unwrap();
         assert!(loaded.schema.is_empty());
+    }
+
+    #[test]
+    fn test_load_from_sqlite_keeps_materialized_virtual_tables_with_real_root_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("materialized_vtab_load.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = crate::connection::Connection::open(&db_str).unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO docs(rowid, subject, body) VALUES (1, 'Hello', 'Rust world')",
+            )
+            .unwrap();
+            conn.execute("INSERT INTO docs(rowid, subject, body) VALUES (2, 'Other', 'Nothing')")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        let loaded = load_from_sqlite(&db_path).unwrap();
+        let table = loaded
+            .schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("docs"))
+            .expect("materialized virtual table should survive direct load");
+        let column_names: Vec<&str> = table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(column_names, vec!["subject", "body"]);
+        let mem_table = loaded
+            .db
+            .get_table(table.root_page)
+            .expect("loaded table should exist in MemDatabase");
+        let rows: Vec<_> = mem_table.iter_rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1[0], SqliteValue::Text("Hello".to_owned()));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("Rust world".to_owned()));
+        assert_eq!(rows[1].0, 2);
+        assert_eq!(rows[1].1[0], SqliteValue::Text("Other".to_owned()));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("Nothing".to_owned()));
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_non_virtual_table_with_rootpage_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_rootpage_zero.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                INSERT INTO docs VALUES (1, 'hello');
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master SET rootpage = 0 WHERE name = 'docs';
+                PRAGMA writable_schema = OFF;
+                ",
+            )
+            .unwrap();
+        }
+
+        let err = match load_from_sqlite(&db_path) {
+            Ok(_) => panic!("corrupt rootpage should fail load"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("rootpage 0") || message.contains("root page"),
+            "unexpected load error: {message}"
+        );
     }
 }

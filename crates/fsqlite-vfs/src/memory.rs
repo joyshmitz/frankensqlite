@@ -232,7 +232,7 @@ impl MemoryFile {
                     .entry(self.shm_path.clone())
                     .or_insert_with(|| Arc::new(Mutex::new(MemoryShmInfo::new()))),
             );
-            
+
             {
                 let mut guard = info_arc.lock().map_err(|_| lock_err())?;
                 *guard.owner_refs.entry(self.shm_owner_id).or_insert(0) += 1;

@@ -1323,9 +1323,11 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
         "coalesce" | "json_extract" | "json_remove" => Some(FunctionArity::VariadicMin(2)),
         "json_insert" | "json_replace" | "json_set" => Some(FunctionArity::VariadicMin(3)),
         // Variadic: aggregates, scalars, date/time, and JSON functions
-        "min" | "max" | "printf" | "format" | "date" | "time" | "datetime" | "julianday"
-        | "strftime" | "unixepoch" | "json" | "json_type" | "json_valid" => {
+        "min" | "max" | "printf" | "format" | "strftime" | "json" | "json_type" | "json_valid" => {
             Some(FunctionArity::VariadicMin(1))
+        }
+        "date" | "time" | "datetime" | "julianday" | "unixepoch" => {
+            Some(FunctionArity::VariadicMin(0))
         }
         "char" | "json_array" | "json_object" => Some(FunctionArity::Variadic),
 

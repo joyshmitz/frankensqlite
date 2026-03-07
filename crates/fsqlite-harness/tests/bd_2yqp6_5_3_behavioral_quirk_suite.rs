@@ -30,8 +30,7 @@ use sha2::{Digest, Sha256};
 
 const BEAD_ID: &str = "bd-2yqp6.5.3";
 const BASE_SEED: u64 = 3_530;
-const REPLAY_COMMAND: &str =
-    "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_5_3_behavioral_quirk_suite -- --nocapture";
+const REPLAY_COMMAND: &str = "rch exec -- cargo test -p fsqlite-harness --test bd_2yqp6_5_3_behavioral_quirk_suite -- --nocapture";
 
 #[derive(Debug, Clone)]
 struct QuirkScenario {
@@ -146,8 +145,9 @@ fn inline_empty_string_fixture() -> TestFixture {
 fn inline_rtrim_collation_fixture() -> TestFixture {
     TestFixture {
         id: "e3_rtrim_collation".to_owned(),
-        description: "RTRIM collation ignores trailing spaces while BINARY still distinguishes them"
-            .to_owned(),
+        description:
+            "RTRIM collation ignores trailing spaces while BINARY still distinguishes them"
+                .to_owned(),
         ops: vec![
             FixtureOp::Open {
                 path: ":memory:".to_owned(),
@@ -316,13 +316,21 @@ fn quirk_scenarios() -> Vec<QuirkScenario> {
             "020_integer_overflow_semantics.json",
             "QUIRK-C4-020_integer_overflow_semantics",
             "overflow",
-            &["Type coercion", "Integer storage classes", "Real (IEEE 754)"],
+            &[
+                "Type coercion",
+                "Integer storage classes",
+                "Real (IEEE 754)",
+            ],
         ),
         QuirkScenario {
             id: "e3_sum_overflow_error".to_owned(),
             corpus_scenario_id: "QUIRK-C4-sum_overflow_error",
             category: "overflow",
-            feature_titles: &["Type coercion", "Integer storage classes", "Real (IEEE 754)"],
+            feature_titles: &[
+                "Type coercion",
+                "Integer storage classes",
+                "Real (IEEE 754)",
+            ],
             fixture_path: None,
             fixture: inline_sum_overflow_fixture(),
         },
@@ -354,7 +362,11 @@ fn quirk_scenarios() -> Vec<QuirkScenario> {
             id: "e3_mul_div_overflow_promotes_real".to_owned(),
             corpus_scenario_id: "QUIRK-C4-mul_div_overflow_promotes_real",
             category: "overflow",
-            feature_titles: &["Type coercion", "Integer storage classes", "Real (IEEE 754)"],
+            feature_titles: &[
+                "Type coercion",
+                "Integer storage classes",
+                "Real (IEEE 754)",
+            ],
             fixture_path: None,
             fixture: inline_mul_div_overflow_fixture(),
         },
@@ -404,8 +416,12 @@ fn scenario_source_bytes(scenario: &QuirkScenario) -> Result<Vec<u8>, String> {
             .map_err(|error| format!("fixture_read_failed path={} error={error}", path.display()));
     }
 
-    serde_json::to_vec_pretty(&scenario.fixture)
-        .map_err(|error| format!("inline_fixture_serialize_failed id={} error={error}", scenario.id))
+    serde_json::to_vec_pretty(&scenario.fixture).map_err(|error| {
+        format!(
+            "inline_fixture_serialize_failed id={} error={error}",
+            scenario.id
+        )
+    })
 }
 
 fn canonical_sql_statement(sql: &str) -> String {
