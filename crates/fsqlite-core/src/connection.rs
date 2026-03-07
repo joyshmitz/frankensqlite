@@ -44306,4 +44306,158 @@ mod pager_routing_tests {
             );
         }
     }
+
+    /// Probe indexed queries, WHERE clause optimization, and multi-index
+    /// lookups that exercise the planner and VDBE index scan paths.
+    #[test]
+    fn test_conformance_index_and_where() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, active INTEGER DEFAULT 1);",
+            "INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', 30, 1);",
+            "INSERT INTO users VALUES (2, 'Bob', 'bob@example.com', 25, 0);",
+            "INSERT INTO users VALUES (3, 'Carol', 'carol@example.com', 35, 1);",
+            "INSERT INTO users VALUES (4, 'Dave', 'dave@example.com', 28, 1);",
+            "INSERT INTO users VALUES (5, 'Eve', 'eve@example.com', 40, 0);",
+            "INSERT INTO users VALUES (6, 'Frank', 'frank@example.com', 22, 1);",
+            "CREATE INDEX idx_age ON users(age);",
+            "CREATE INDEX idx_name ON users(name);",
+            "CREATE INDEX idx_active_age ON users(active, age);",
+            "CREATE UNIQUE INDEX idx_email ON users(email);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // PK lookup
+            "SELECT name FROM users WHERE id = 3",
+            // Index range scan
+            "SELECT name FROM users WHERE age >= 30 ORDER BY name",
+            "SELECT name FROM users WHERE age BETWEEN 25 AND 35 ORDER BY name",
+            // UNIQUE index lookup
+            "SELECT name FROM users WHERE email = 'carol@example.com'",
+            // Composite index
+            "SELECT name FROM users WHERE active = 1 AND age > 25 ORDER BY name",
+            // OR condition (may or may not use index)
+            "SELECT name FROM users WHERE age < 25 OR age > 35 ORDER BY name",
+            // NOT
+            "SELECT name FROM users WHERE NOT active ORDER BY name",
+            // IS NULL / IS NOT NULL
+            "SELECT COUNT(*) FROM users WHERE email IS NOT NULL",
+            // LIKE with index
+            "SELECT name FROM users WHERE name LIKE 'A%' ORDER BY name",
+            "SELECT name FROM users WHERE name LIKE '%e' ORDER BY name",
+            // IN with index
+            "SELECT name FROM users WHERE id IN (1, 3, 5) ORDER BY name",
+            "SELECT name FROM users WHERE age IN (25, 30, 40) ORDER BY name",
+            // ORDER BY with index
+            "SELECT name FROM users ORDER BY age",
+            "SELECT name FROM users ORDER BY age DESC",
+            // LIMIT with index scan
+            "SELECT name FROM users ORDER BY age LIMIT 3",
+            "SELECT name FROM users ORDER BY age DESC LIMIT 2",
+            // Complex WHERE with AND/OR precedence
+            "SELECT name FROM users WHERE (active = 1 AND age > 30) OR (active = 0 AND age < 30) ORDER BY name",
+            // Negative test: no matching rows
+            "SELECT name FROM users WHERE age > 100",
+            "SELECT COUNT(*) FROM users WHERE age > 100",
+            // DELETE with indexed WHERE
+            "DELETE FROM users WHERE id = 6",
+        ];
+
+        let mut mismatches = oracle_compare(&fconn, &rconn, &queries);
+
+        // Run DELETE on both
+        fconn.execute("DELETE FROM users WHERE id = 6").ok();
+        rconn.execute_batch("DELETE FROM users WHERE id = 6").ok();
+
+        let verify = [
+            "SELECT COUNT(*) FROM users",
+            "SELECT name FROM users ORDER BY name",
+            // Verify index still works after delete
+            "SELECT name FROM users WHERE age > 30 ORDER BY name",
+        ];
+        mismatches.extend(oracle_compare(&fconn, &rconn, &verify));
+
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} index/WHERE conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe edge cases in NULL handling: three-valued logic, NULL in
+    /// aggregates, NULL in CASE, NULL in COALESCE chains, NULL ordering.
+    #[test]
+    fn test_conformance_null_semantics_deep() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE nulls (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL);",
+            "INSERT INTO nulls VALUES (1, 10, 'x', 1.5);",
+            "INSERT INTO nulls VALUES (2, NULL, 'y', 2.5);",
+            "INSERT INTO nulls VALUES (3, 30, NULL, 3.5);",
+            "INSERT INTO nulls VALUES (4, NULL, NULL, NULL);",
+            "INSERT INTO nulls VALUES (5, 50, 'z', NULL);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // NULL in comparisons
+            "SELECT id FROM nulls WHERE a IS NULL ORDER BY id",
+            "SELECT id FROM nulls WHERE a IS NOT NULL ORDER BY id",
+            "SELECT id FROM nulls WHERE a = NULL ORDER BY id",
+            "SELECT id FROM nulls WHERE a != NULL ORDER BY id",
+            "SELECT id FROM nulls WHERE a > 20 ORDER BY id",
+            "SELECT id FROM nulls WHERE NOT (a > 20) ORDER BY id",
+            // NULL in CASE
+            "SELECT id, CASE WHEN a IS NULL THEN 'null' WHEN a > 20 THEN 'big' ELSE 'small' END FROM nulls ORDER BY id",
+            "SELECT id, CASE a WHEN 10 THEN 'ten' WHEN 30 THEN 'thirty' ELSE 'other' END FROM nulls ORDER BY id",
+            // COALESCE chains with NULL
+            "SELECT id, COALESCE(a, -1) FROM nulls ORDER BY id",
+            "SELECT id, COALESCE(b, CAST(a AS TEXT), 'none') FROM nulls ORDER BY id",
+            "SELECT COALESCE(NULL, NULL, NULL, 42)",
+            // NULL in aggregates
+            "SELECT COUNT(*), COUNT(a), COUNT(b), COUNT(c) FROM nulls",
+            "SELECT SUM(a), SUM(c), AVG(a), AVG(c) FROM nulls",
+            "SELECT MIN(a), MAX(a), MIN(b), MAX(b) FROM nulls",
+            "SELECT TOTAL(a), TOTAL(c) FROM nulls",
+            // NULL in GROUP BY
+            "SELECT a, COUNT(*) FROM nulls GROUP BY a ORDER BY a IS NULL, a",
+            "SELECT b, COUNT(*) FROM nulls GROUP BY b ORDER BY b IS NULL, b",
+            // NULL in DISTINCT
+            "SELECT DISTINCT a FROM nulls ORDER BY a IS NULL, a",
+            // NULL in ORDER BY (NULLs should come first in ASC)
+            "SELECT id, a FROM nulls ORDER BY a, id",
+            "SELECT id, a FROM nulls ORDER BY a DESC, id",
+            // NULLIF
+            "SELECT NULLIF(a, 10) FROM nulls WHERE id = 1",
+            "SELECT NULLIF(a, 10) FROM nulls WHERE id = 2",
+            // IIF with NULL
+            "SELECT IIF(a IS NULL, 'yes', 'no') FROM nulls ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} NULL semantics conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
 }
