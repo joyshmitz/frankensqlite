@@ -1290,6 +1290,19 @@ impl MemDatabase {
         count
     }
 
+    /// Allocate and return the next root page number without creating a table.
+    ///
+    /// Used by `OpenAutoindex` which needs a unique page number for a
+    /// `MemPageStore`-backed index cursor but must NOT pollute `self.tables`
+    /// (a spurious `MemTable` entry would cause `get_table()` to return
+    /// `Some`, misleading `open_storage_cursor` into treating the page as a
+    /// table B-tree).
+    pub fn allocate_root_page(&mut self) -> i32 {
+        let root_page = self.next_root_page;
+        self.next_root_page += 1;
+        root_page
+    }
+
     /// Create a table and return its root page number.
     pub fn create_table(&mut self, num_columns: usize) -> i32 {
         let prev_next_root_page = self.next_root_page;
@@ -3490,7 +3503,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     self.pending_next_after_delete.remove(&cursor_id);
                     let root_pgno = if let Some(db) = self.db.as_mut() {
-                        let rp = db.create_table(op.p2.max(1) as usize);
+                        let rp = db.allocate_root_page();
                         PageNumber::new(rp as u32)
                     } else {
                         None
