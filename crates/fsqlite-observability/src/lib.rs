@@ -16,10 +16,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-
+use fsqlite_types::sync_primitives::{Duration, Instant, Mutex};
 use fsqlite_types::{CommitSeq, PageNumber, TxnId, TxnToken};
-use parking_lot::Mutex;
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------

@@ -236,6 +236,37 @@ pub use wasm_sync::{
 };
 
 // ---------------------------------------------------------------------------
+// Time polyfill — Instant / Duration
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use std::time::{Duration, Instant};
+
+#[cfg(target_arch = "wasm32")]
+pub use std::time::Duration;
+
+/// Monotonic instant polyfill for wasm32.
+///
+/// On `wasm32-unknown-unknown` there is no reliable monotonic clock without
+/// `web-sys` (which requires a JS host). This stub always reports zero
+/// elapsed time — acceptable because observability metrics on the wasm32
+/// target are purely diagnostic and the runtime is single-threaded.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone, Copy)]
+pub struct Instant(());
+
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+    pub fn now() -> Self {
+        Self(())
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        Duration::ZERO
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Thread ID polyfill
 // ---------------------------------------------------------------------------
 

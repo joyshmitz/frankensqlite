@@ -8,10 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-fsqlite-types = { workspace = true, features = ["native"] }
-parking_lot = { workspace = true }
+fsqlite-types = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
