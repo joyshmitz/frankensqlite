@@ -99,7 +99,7 @@ fn oracle_compare(
 #[test]
 fn test_conformance_hex_bitwise_cast_bool() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE nums (id INTEGER PRIMARY KEY, val INTEGER, txt TEXT);",
@@ -154,7 +154,7 @@ fn test_conformance_hex_bitwise_cast_bool() {
 #[test]
 fn test_conformance_total_count_distinct() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE vals (id INTEGER PRIMARY KEY, x REAL, cat TEXT);",
@@ -199,7 +199,7 @@ fn test_conformance_total_count_distinct() {
 #[test]
 fn test_conformance_like_escape_glob() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE words (id INTEGER PRIMARY KEY, w TEXT);",
@@ -246,7 +246,7 @@ fn test_conformance_like_escape_glob() {
 #[test]
 fn test_conformance_math_abs_typeof() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // abs edge cases
@@ -289,7 +289,7 @@ fn test_conformance_math_abs_typeof() {
 #[test]
 fn test_conformance_except_intersect_chains() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE s1 (v INTEGER);",
@@ -337,7 +337,7 @@ fn test_conformance_except_intersect_chains() {
 #[test]
 fn test_conformance_update_self_ref_case() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE counters (id INTEGER PRIMARY KEY, val INTEGER, label TEXT);",
@@ -378,7 +378,7 @@ fn test_conformance_update_self_ref_case() {
 #[test]
 fn test_conformance_left_join_is_null_count() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT);",
@@ -417,7 +417,7 @@ fn test_conformance_left_join_is_null_count() {
 #[test]
 fn test_conformance_replace_stmt() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE kv (key TEXT PRIMARY KEY, val INTEGER);",
@@ -458,7 +458,7 @@ fn test_conformance_replace_stmt() {
 #[test]
 fn test_conformance_savepoint_rollback_release() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE sp (id INTEGER PRIMARY KEY, val TEXT);",
@@ -499,7 +499,7 @@ fn test_conformance_savepoint_rollback_release() {
 #[test]
 fn test_conformance_default_value_expressions() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE defs (id INTEGER PRIMARY KEY, val INTEGER DEFAULT 42, txt TEXT DEFAULT 'hello', flag INTEGER DEFAULT (1 + 1));",
@@ -531,7 +531,7 @@ fn test_conformance_default_value_expressions() {
 #[test]
 fn test_conformance_string_functions_edge() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // substr edge cases
@@ -581,7 +581,7 @@ fn test_conformance_string_functions_edge() {
 #[test]
 fn test_conformance_numeric_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // Integer overflow → float promotion
@@ -624,7 +624,7 @@ fn test_conformance_numeric_edges() {
 #[test]
 fn test_conformance_complex_where() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT);",
@@ -672,7 +672,7 @@ fn test_conformance_complex_where() {
 #[test]
 fn test_conformance_alter_table() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);",
@@ -724,7 +724,7 @@ fn test_conformance_alter_table() {
 #[test]
 fn test_conformance_subquery_patterns() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary REAL);",
@@ -769,7 +769,7 @@ fn test_conformance_subquery_patterns() {
 #[test]
 fn test_conformance_insert_variations() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE src (id INTEGER PRIMARY KEY, val TEXT);",
@@ -810,7 +810,7 @@ fn test_conformance_insert_variations() {
 #[test]
 fn test_conformance_delete_patterns() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE logs (id INTEGER PRIMARY KEY, level TEXT, msg TEXT);",
@@ -858,7 +858,7 @@ fn test_conformance_delete_patterns() {
 #[test]
 fn test_conformance_dml_sequence() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let ops = [
         "CREATE TABLE ledger (id INTEGER PRIMARY KEY, acct TEXT, amount REAL)",
@@ -894,7 +894,7 @@ fn test_conformance_dml_sequence() {
 #[test]
 fn test_conformance_recursive_cte_advanced() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE org (id INTEGER PRIMARY KEY, name TEXT, mgr_id INTEGER);",
@@ -933,7 +933,7 @@ fn test_conformance_recursive_cte_advanced() {
 #[test]
 fn test_conformance_multi_join_aggregate() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, cat_id INTEGER, price REAL);",
@@ -976,7 +976,7 @@ fn test_conformance_multi_join_aggregate() {
 #[test]
 fn test_conformance_order_by_advanced() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE sortme (id INTEGER PRIMARY KEY, val INTEGER, txt TEXT);",
@@ -1021,7 +1021,7 @@ fn test_conformance_order_by_advanced() {
 #[test]
 fn test_conformance_upsert_advanced() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE upsert_t (id INTEGER PRIMARY KEY, name TEXT, counter INTEGER DEFAULT 0);",
@@ -1064,7 +1064,7 @@ fn test_conformance_upsert_advanced() {
 #[test]
 fn test_conformance_case_expression_variants() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE scores (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
@@ -1107,7 +1107,7 @@ fn test_conformance_case_expression_variants() {
 #[test]
 fn test_conformance_index_queries() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE indexed_t (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL);",
@@ -1174,7 +1174,7 @@ fn test_conformance_index_queries() {
 #[test]
 fn test_conformance_sum_precision_kbn() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE prices (id INTEGER PRIMARY KEY, val REAL);",
@@ -1211,7 +1211,7 @@ fn test_conformance_sum_precision_kbn() {
 #[test]
 fn test_conformance_group_concat_advanced() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE tags (id INTEGER PRIMARY KEY, item TEXT, tag TEXT);",
@@ -1248,7 +1248,7 @@ fn test_conformance_group_concat_advanced() {
 #[test]
 fn test_conformance_triggers() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE audit (id INTEGER PRIMARY KEY, action TEXT, ts TEXT DEFAULT 'now');",
@@ -1290,7 +1290,7 @@ fn test_conformance_triggers() {
 #[test]
 fn test_conformance_foreign_keys() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "PRAGMA foreign_keys = ON;",
@@ -1322,7 +1322,7 @@ fn test_conformance_foreign_keys() {
 #[test]
 fn test_conformance_datetime_functions() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // Basic date functions with fixed input
@@ -1364,7 +1364,7 @@ fn test_conformance_datetime_functions() {
 #[test]
 fn test_conformance_type_coercion_comparisons() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE tc (id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, b BLOB, n NUMERIC);",
@@ -1424,7 +1424,7 @@ fn test_conformance_type_coercion_comparisons() {
 #[test]
 fn test_conformance_coalesce_iif_nullif_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE vals (id INTEGER PRIMARY KEY, a, b, c);",
@@ -1474,7 +1474,7 @@ fn test_conformance_coalesce_iif_nullif_edges() {
 #[test]
 fn test_conformance_compound_select_order_limit() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t1 (x INTEGER, y TEXT);",
@@ -1524,7 +1524,7 @@ fn test_conformance_compound_select_order_limit() {
 #[test]
 fn test_conformance_group_by_expressions() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE sales (id INTEGER PRIMARY KEY, product TEXT, amount REAL, qty INTEGER, region TEXT);",
@@ -1576,7 +1576,7 @@ fn test_conformance_group_by_expressions() {
 #[test]
 fn test_conformance_subquery_positions() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary REAL);",
@@ -1629,7 +1629,7 @@ fn test_conformance_subquery_positions() {
 #[test]
 fn test_conformance_join_varieties() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);",
@@ -1680,7 +1680,7 @@ fn test_conformance_join_varieties() {
 #[test]
 fn test_conformance_ctas_and_value_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE src (id INTEGER PRIMARY KEY, val TEXT, num REAL);",
@@ -1718,7 +1718,7 @@ fn test_conformance_ctas_and_value_edges() {
 #[test]
 fn test_conformance_expression_eval_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // Operator precedence
@@ -1765,7 +1765,7 @@ fn test_conformance_expression_eval_edges() {
 #[test]
 fn test_conformance_update_patterns() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE inventory (id INTEGER PRIMARY KEY, item TEXT, qty INTEGER, price REAL);",
@@ -1814,7 +1814,7 @@ fn test_conformance_update_patterns() {
 #[test]
 fn test_conformance_views() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT);",
@@ -1857,7 +1857,7 @@ fn test_conformance_views() {
 #[test]
 fn test_conformance_null_handling_comprehensive() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE nulltest (id INTEGER PRIMARY KEY, a, b, c);",
@@ -1912,7 +1912,7 @@ fn test_conformance_null_handling_comprehensive() {
 #[test]
 fn test_conformance_implicit_type_conversion() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE typed (id INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, n NUMERIC);",
@@ -1958,7 +1958,7 @@ fn test_conformance_implicit_type_conversion() {
 #[test]
 fn test_conformance_float_formatting() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT 0.1 + 0.2",
@@ -1997,7 +1997,7 @@ fn test_conformance_float_formatting() {
 #[test]
 fn test_conformance_collate_nocase() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE words (id INTEGER PRIMARY KEY, word TEXT COLLATE NOCASE);",
@@ -2042,7 +2042,7 @@ fn test_conformance_collate_nocase() {
 #[test]
 fn test_conformance_complex_where_advanced() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL, qty INTEGER, active INTEGER);",
@@ -2093,7 +2093,7 @@ fn test_conformance_complex_where_advanced() {
 #[test]
 fn test_conformance_dml_complex() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT, balance REAL);",
@@ -2134,7 +2134,7 @@ fn test_conformance_dml_complex() {
 #[test]
 fn test_conformance_printf_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT printf('%d', 42)",
@@ -2169,7 +2169,7 @@ fn test_conformance_printf_edges() {
 #[test]
 fn test_conformance_cte_advanced() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER);",
@@ -2216,7 +2216,7 @@ fn test_conformance_cte_advanced() {
 #[test]
 fn test_conformance_aggregate_expressions() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE scores (id INTEGER PRIMARY KEY, student TEXT, subject TEXT, score INTEGER);",
@@ -2267,7 +2267,7 @@ fn test_conformance_aggregate_expressions() {
 #[test]
 fn test_conformance_unique_constraints() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT);",
@@ -2312,7 +2312,7 @@ fn test_conformance_unique_constraints() {
 #[test]
 fn test_conformance_multi_index_queries() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL, in_stock INTEGER);",
@@ -2359,7 +2359,7 @@ fn test_conformance_multi_index_queries() {
 #[test]
 fn test_conformance_exists_subquery() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE departments(id INTEGER PRIMARY KEY, name TEXT)",
@@ -2400,7 +2400,7 @@ fn test_conformance_exists_subquery() {
 #[test]
 fn test_conformance_case_null_nested() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // Simple CASE with NULL
@@ -2433,7 +2433,7 @@ fn test_conformance_case_null_nested() {
 #[test]
 fn test_conformance_type_affinity_comparison() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, txt TEXT, num NUMERIC, rl REAL, intcol INTEGER)",
@@ -2477,7 +2477,7 @@ fn test_conformance_type_affinity_comparison() {
 #[test]
 fn test_conformance_correlated_subquery() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL)",
@@ -2518,7 +2518,7 @@ fn test_conformance_correlated_subquery() {
 #[test]
 fn test_conformance_nullif_iif_nested() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT NULLIF(1, 1)",
@@ -2553,7 +2553,7 @@ fn test_conformance_nullif_iif_nested() {
 #[test]
 fn test_conformance_insert_defaults() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unknown', score INTEGER DEFAULT 0, active INTEGER DEFAULT 1)",
@@ -2601,7 +2601,7 @@ fn test_conformance_insert_defaults() {
 #[test]
 fn test_conformance_replace_behavior() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
@@ -2643,7 +2643,7 @@ fn test_conformance_replace_behavior() {
 #[test]
 fn test_conformance_compound_order_limit() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT 3 AS n UNION SELECT 1 UNION SELECT 2 ORDER BY n",
@@ -2671,7 +2671,7 @@ fn test_conformance_compound_order_limit() {
 #[test]
 fn test_conformance_self_join_multiway() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE emp(id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER)",
@@ -2704,7 +2704,7 @@ fn test_conformance_self_join_multiway() {
 #[test]
 fn test_conformance_aggregate_filter() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE sales(id INTEGER PRIMARY KEY, region TEXT, amount REAL, status TEXT)",
@@ -2735,7 +2735,7 @@ fn test_conformance_aggregate_filter() {
 #[test]
 fn test_conformance_having_no_group_by() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)",
@@ -2768,7 +2768,7 @@ fn test_conformance_having_no_group_by() {
 #[test]
 fn test_conformance_rowid_aliases() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(name TEXT, val INTEGER)",
@@ -2801,7 +2801,7 @@ fn test_conformance_rowid_aliases() {
 #[test]
 fn test_conformance_update_set_subquery() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)",
@@ -2837,7 +2837,7 @@ fn test_conformance_update_set_subquery() {
 #[test]
 fn test_conformance_delete_subquery_where() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t1(id INTEGER PRIMARY KEY, category TEXT, val INTEGER)",
@@ -2877,7 +2877,7 @@ fn test_conformance_delete_subquery_where() {
 #[test]
 fn test_conformance_arithmetic_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // Integer division
@@ -2917,7 +2917,7 @@ fn test_conformance_arithmetic_edges() {
 #[test]
 fn test_conformance_string_functions_extended() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT instr('hello world', 'world')",
@@ -2953,7 +2953,7 @@ fn test_conformance_string_functions_extended() {
 #[test]
 fn test_conformance_group_concat_separator() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(grp TEXT, val TEXT)",
@@ -2989,7 +2989,7 @@ fn test_conformance_group_concat_separator() {
 #[test]
 fn test_conformance_cast_types() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT CAST(3.14 AS INTEGER)",
@@ -3023,7 +3023,7 @@ fn test_conformance_cast_types() {
 #[test]
 fn test_conformance_savepoint_nested() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
@@ -3064,7 +3064,7 @@ fn test_conformance_savepoint_nested() {
 #[test]
 fn test_conformance_implicit_coercion_where() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val)",
@@ -3103,7 +3103,7 @@ fn test_conformance_implicit_coercion_where() {
 #[test]
 fn test_conformance_like_escape() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
@@ -3140,7 +3140,7 @@ fn test_conformance_like_escape() {
 #[test]
 fn test_conformance_multi_cte() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, category TEXT, val INTEGER)",
@@ -3173,7 +3173,7 @@ fn test_conformance_multi_cte() {
 #[test]
 fn test_conformance_recursive_cte_patterns() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // Generate integers 1..10
@@ -3197,7 +3197,7 @@ fn test_conformance_recursive_cte_patterns() {
 #[test]
 fn test_conformance_derived_table_agg() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -3232,7 +3232,7 @@ fn test_conformance_derived_table_agg() {
 #[test]
 fn test_conformance_between_types() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT 5 BETWEEN 1 AND 10",
@@ -3261,7 +3261,7 @@ fn test_conformance_between_types() {
 #[test]
 fn test_conformance_order_by_expressions() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
@@ -3299,7 +3299,7 @@ fn test_conformance_order_by_expressions() {
 #[test]
 fn test_conformance_insert_select() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE src(id INTEGER PRIMARY KEY, val TEXT)",
@@ -3342,7 +3342,7 @@ fn test_conformance_insert_select() {
 #[test]
 fn test_conformance_aggregate_empty_table() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = ["CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)"];
     for s in &setup {
@@ -3378,7 +3378,7 @@ fn test_conformance_aggregate_empty_table() {
 #[test]
 fn test_conformance_cross_type_column_compare() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, txt TEXT, num INTEGER, rl REAL)",
@@ -3420,7 +3420,7 @@ fn test_conformance_cross_type_column_compare() {
 #[test]
 fn test_conformance_unary_operators() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT NOT 1",
@@ -3451,7 +3451,7 @@ fn test_conformance_unary_operators() {
 #[test]
 fn test_conformance_bitwise_operators() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT 5 & 3",
@@ -3480,7 +3480,7 @@ fn test_conformance_bitwise_operators() {
 #[test]
 fn test_conformance_update_from_join() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)",
@@ -3516,7 +3516,7 @@ fn test_conformance_update_from_join() {
 #[test]
 fn test_conformance_multi_row_insert() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = ["CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)"];
     for s in &setup {
@@ -3551,7 +3551,7 @@ fn test_conformance_multi_row_insert() {
 #[test]
 fn test_conformance_nested_subquery_positions() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -3586,7 +3586,7 @@ fn test_conformance_nested_subquery_positions() {
 #[test]
 fn test_conformance_boolean_logic() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT 1 AND 1",
@@ -3619,7 +3619,7 @@ fn test_conformance_boolean_logic() {
 #[test]
 fn test_conformance_glob_operator() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)",
@@ -3652,7 +3652,7 @@ fn test_conformance_glob_operator() {
 #[test]
 fn test_conformance_coalesce_variations() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT COALESCE(NULL, NULL, NULL, 'found')",
@@ -3679,7 +3679,7 @@ fn test_conformance_coalesce_variations() {
 #[test]
 fn test_conformance_cross_join() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE a(x INTEGER)",
@@ -3712,7 +3712,7 @@ fn test_conformance_cross_join() {
 #[test]
 fn test_conformance_on_conflict_clauses() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT UNIQUE, val INTEGER)",
@@ -3762,7 +3762,7 @@ fn test_conformance_on_conflict_clauses() {
 #[test]
 fn test_conformance_null_safe_comparisons() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT NULL = NULL",
@@ -3794,7 +3794,7 @@ fn test_conformance_null_safe_comparisons() {
 #[test]
 fn test_conformance_math_functions() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT abs(-42)",
@@ -3831,7 +3831,7 @@ fn test_conformance_math_functions() {
 #[test]
 fn test_conformance_window_ranking() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE scores (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);",
@@ -3867,7 +3867,7 @@ fn test_conformance_window_ranking() {
 #[test]
 fn test_conformance_window_aggregates() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE sales (id INTEGER PRIMARY KEY, month INTEGER, revenue REAL);",
@@ -3908,7 +3908,7 @@ fn test_conformance_window_aggregates() {
 #[test]
 fn test_conformance_window_lag_lead() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE ts (id INTEGER PRIMARY KEY, val INTEGER);",
@@ -3940,7 +3940,7 @@ fn test_conformance_window_lag_lead() {
 #[test]
 fn test_conformance_complex_mixed_queries() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL);",
@@ -3988,7 +3988,7 @@ fn test_conformance_complex_mixed_queries() {
 #[test]
 fn test_conformance_upsert_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE kv (key TEXT PRIMARY KEY, value INTEGER, updated INTEGER DEFAULT 0);",
@@ -4027,7 +4027,7 @@ fn test_conformance_upsert_edges() {
 #[test]
 fn test_conformance_transaction_savepoint_complex() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);",
@@ -4072,7 +4072,7 @@ fn test_conformance_transaction_savepoint_complex() {
 #[test]
 fn test_conformance_dml_subquery_complex() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE source (id INTEGER PRIMARY KEY, category TEXT, value INTEGER);",
@@ -4121,7 +4121,7 @@ fn test_conformance_dml_subquery_complex() {
 #[test]
 fn test_conformance_conversion_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // typeof after operations
@@ -4161,7 +4161,7 @@ fn test_conformance_conversion_edges() {
 #[test]
 fn test_conformance_cte_chained() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL);",
@@ -4194,7 +4194,7 @@ fn test_conformance_cte_chained() {
 #[test]
 fn test_conformance_distinct_order_by_different_col() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER);",
@@ -4227,7 +4227,7 @@ fn test_conformance_distinct_order_by_different_col() {
 #[test]
 fn test_conformance_integer_overflow_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         // Max int
@@ -4268,7 +4268,7 @@ fn test_conformance_integer_overflow_edges() {
 #[test]
 fn test_conformance_case_aggregate_complex() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT, amount REAL, status TEXT);",
@@ -4309,7 +4309,7 @@ fn test_conformance_case_aggregate_complex() {
 #[test]
 fn test_conformance_left_join_null_propagation() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);",
@@ -4348,7 +4348,7 @@ fn test_conformance_left_join_null_propagation() {
 #[test]
 fn test_conformance_schema_introspection() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT NOT NULL, value REAL DEFAULT 0.0);",
@@ -4387,7 +4387,7 @@ fn test_conformance_schema_introspection() {
 #[test]
 fn test_conformance_order_by_complex() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL);",
@@ -4432,7 +4432,7 @@ fn test_conformance_order_by_complex() {
 #[test]
 fn test_conformance_between_in_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL, name TEXT);",
@@ -4479,7 +4479,7 @@ fn test_conformance_between_in_edges() {
 #[test]
 fn test_conformance_aggregate_distinct() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -4512,7 +4512,7 @@ fn test_conformance_aggregate_distinct() {
 #[test]
 fn test_conformance_deeply_nested_derived() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)",
@@ -4542,7 +4542,7 @@ fn test_conformance_deeply_nested_derived() {
 #[test]
 fn test_conformance_in_subquery_patterns() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT)",
@@ -4574,7 +4574,7 @@ fn test_conformance_in_subquery_patterns() {
 #[test]
 fn test_conformance_having_complex_expr() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -4606,7 +4606,7 @@ fn test_conformance_having_complex_expr() {
 #[test]
 fn test_conformance_order_by_mixed_direction() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score INTEGER, grade TEXT)",
@@ -4637,7 +4637,7 @@ fn test_conformance_order_by_mixed_direction() {
 #[test]
 fn test_conformance_trigger_when_clause() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)",
@@ -4672,7 +4672,7 @@ fn test_conformance_trigger_when_clause() {
 #[test]
 fn test_conformance_join_using() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
@@ -4704,7 +4704,7 @@ fn test_conformance_join_using() {
 #[test]
 fn test_conformance_group_by_nulls() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -4734,7 +4734,7 @@ fn test_conformance_group_by_nulls() {
 #[test]
 fn test_conformance_fk_cascade() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "PRAGMA foreign_keys = ON",
@@ -4772,7 +4772,7 @@ fn test_conformance_fk_cascade() {
 #[test]
 fn test_conformance_limit_offset_edges() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)",
@@ -4807,7 +4807,7 @@ fn test_conformance_limit_offset_edges() {
 #[test]
 fn test_conformance_multi_column_pk() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(a INTEGER, b INTEGER, val TEXT, PRIMARY KEY(a, b))",
@@ -4845,7 +4845,7 @@ fn test_conformance_multi_column_pk() {
 #[test]
 fn test_conformance_insert_expr_values() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = ["CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, txt TEXT)"];
     for s in &setup {
@@ -4878,7 +4878,7 @@ fn test_conformance_insert_expr_values() {
 #[test]
 fn test_conformance_mixed_storage_types() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val)",
@@ -4914,7 +4914,7 @@ fn test_conformance_mixed_storage_types() {
 #[test]
 fn test_conformance_typeof_all_classes() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let queries = [
         "SELECT typeof(42)",
@@ -4943,7 +4943,7 @@ fn test_conformance_typeof_all_classes() {
 #[test]
 fn test_conformance_last_insert_rowid_changes() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
@@ -4984,7 +4984,7 @@ fn test_conformance_last_insert_rowid_changes() {
 #[test]
 fn test_conformance_having_complex_expressions() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE sales2 (id INTEGER PRIMARY KEY, product TEXT, amount REAL, region TEXT);",
@@ -5027,7 +5027,7 @@ fn test_conformance_having_complex_expressions() {
 #[test]
 fn test_conformance_group_by_coalesce() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE grp_t (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER);",
@@ -5066,7 +5066,7 @@ fn test_conformance_group_by_coalesce() {
 #[test]
 fn test_conformance_sequential_updates() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE ledger (id INTEGER PRIMARY KEY, account TEXT, balance REAL);",
@@ -5109,7 +5109,7 @@ fn test_conformance_sequential_updates() {
 #[test]
 fn test_conformance_derived_table_complex() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE events (id INTEGER PRIMARY KEY, type TEXT, value INTEGER, ts TEXT);",
@@ -5147,7 +5147,7 @@ fn test_conformance_derived_table_complex() {
 #[test]
 fn test_conformance_window_multi_spec() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE sales(id INTEGER PRIMARY KEY, region TEXT, month INTEGER, revenue INTEGER)",
@@ -5179,7 +5179,7 @@ fn test_conformance_window_multi_spec() {
 #[test]
 fn test_conformance_correlated_subquery_group_by() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT, amount REAL)",
@@ -5204,7 +5204,10 @@ fn test_conformance_correlated_subquery_group_by() {
         for m in &mismatches {
             eprintln!("{m}\n");
         }
-        panic!("{} correlated subquery GROUP BY mismatches", mismatches.len());
+        panic!(
+            "{} correlated subquery GROUP BY mismatches",
+            mismatches.len()
+        );
     }
 }
 
@@ -5212,7 +5215,7 @@ fn test_conformance_correlated_subquery_group_by() {
 #[test]
 fn test_conformance_subquery_order_by() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -5241,7 +5244,7 @@ fn test_conformance_subquery_order_by() {
 #[test]
 fn test_conformance_update_delete_complex_where() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
@@ -5253,19 +5256,28 @@ fn test_conformance_update_delete_complex_where() {
     }
 
     // UPDATE with complex WHERE
-    fconn.execute("UPDATE t SET val = val * 2 WHERE grp IN ('A', 'B') AND val > 15").unwrap();
-    rconn.execute_batch("UPDATE t SET val = val * 2 WHERE grp IN ('A', 'B') AND val > 15").unwrap();
+    fconn
+        .execute("UPDATE t SET val = val * 2 WHERE grp IN ('A', 'B') AND val > 15")
+        .unwrap();
+    rconn
+        .execute_batch("UPDATE t SET val = val * 2 WHERE grp IN ('A', 'B') AND val > 15")
+        .unwrap();
 
     let q1 = oracle_compare(&fconn, &rconn, &["SELECT * FROM t ORDER BY id"]);
 
     // DELETE with complex WHERE
-    fconn.execute("DELETE FROM t WHERE val > (SELECT AVG(val) FROM t)").unwrap();
-    rconn.execute_batch("DELETE FROM t WHERE val > (SELECT AVG(val) FROM t)").unwrap();
+    fconn
+        .execute("DELETE FROM t WHERE val > (SELECT AVG(val) FROM t)")
+        .unwrap();
+    rconn
+        .execute_batch("DELETE FROM t WHERE val > (SELECT AVG(val) FROM t)")
+        .unwrap();
 
-    let q2 = oracle_compare(&fconn, &rconn, &[
-        "SELECT * FROM t ORDER BY id",
-        "SELECT COUNT(*) FROM t",
-    ]);
+    let q2 = oracle_compare(
+        &fconn,
+        &rconn,
+        &["SELECT * FROM t ORDER BY id", "SELECT COUNT(*) FROM t"],
+    );
 
     let all: Vec<_> = [q1, q2].concat();
     if !all.is_empty() {
@@ -5280,7 +5292,7 @@ fn test_conformance_update_delete_complex_where() {
 #[test]
 fn test_conformance_multi_table_subquery_delete() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT)",
@@ -5315,7 +5327,10 @@ fn test_conformance_multi_table_subquery_delete() {
         for m in &mismatches {
             eprintln!("{m}\n");
         }
-        panic!("{} multi-table subquery DELETE mismatches", mismatches.len());
+        panic!(
+            "{} multi-table subquery DELETE mismatches",
+            mismatches.len()
+        );
     }
 }
 
@@ -5323,7 +5338,7 @@ fn test_conformance_multi_table_subquery_delete() {
 #[test]
 fn test_conformance_multi_join_agg_complex() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE students(id INTEGER PRIMARY KEY, name TEXT)",
@@ -5362,7 +5377,7 @@ fn test_conformance_multi_join_agg_complex() {
 #[test]
 fn test_conformance_ctas() {
     let fconn = Connection::open(":memory:").unwrap();
-    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
     let setup = [
         "CREATE TABLE src(id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
@@ -5373,8 +5388,14 @@ fn test_conformance_ctas() {
         rconn.execute_batch(s).unwrap();
     }
 
-    fconn.execute("CREATE TABLE dst AS SELECT name, val * 2 AS doubled FROM src WHERE val > 10").unwrap();
-    rconn.execute_batch("CREATE TABLE dst AS SELECT name, val * 2 AS doubled FROM src WHERE val > 10").unwrap();
+    fconn
+        .execute("CREATE TABLE dst AS SELECT name, val * 2 AS doubled FROM src WHERE val > 10")
+        .unwrap();
+    rconn
+        .execute_batch(
+            "CREATE TABLE dst AS SELECT name, val * 2 AS doubled FROM src WHERE val > 10",
+        )
+        .unwrap();
 
     let queries = [
         "SELECT * FROM dst ORDER BY name",
@@ -5387,5 +5408,786 @@ fn test_conformance_ctas() {
             eprintln!("{m}\n");
         }
         panic!("{} CTAS mismatches", mismatches.len());
+    }
+}
+
+/// GROUP_CONCAT with ORDER BY, separator, DISTINCT
+#[test]
+fn test_conformance_group_concat_variants() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE gc(grp TEXT, val TEXT)",
+        "INSERT INTO gc VALUES('a','cherry'),('a','apple'),('a','banana'),('b','dog'),('b','cat'),('a','apple')",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        "SELECT group_concat(val) FROM gc WHERE grp='a'",
+        "SELECT group_concat(val, ';') FROM gc WHERE grp='a'",
+        "SELECT group_concat(DISTINCT val) FROM gc WHERE grp='a'",
+        "SELECT grp, group_concat(val, ', ') FROM gc GROUP BY grp ORDER BY grp",
+        "SELECT group_concat(val) FROM gc WHERE 1=0",
+        "SELECT group_concat(val, '-') FROM gc GROUP BY grp ORDER BY grp",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} group_concat mismatches", mismatches.len());
+    }
+}
+
+/// COALESCE chains, nested COALESCE, COALESCE with aggregates
+#[test]
+fn test_conformance_coalesce_chains() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE cn(a INTEGER, b INTEGER, c INTEGER, d INTEGER)",
+        "INSERT INTO cn VALUES(NULL, NULL, NULL, 4)",
+        "INSERT INTO cn VALUES(NULL, NULL, 3, 4)",
+        "INSERT INTO cn VALUES(NULL, 2, 3, 4)",
+        "INSERT INTO cn VALUES(1, 2, 3, 4)",
+        "INSERT INTO cn VALUES(NULL, NULL, NULL, NULL)",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        "SELECT COALESCE(a, b, c, d) FROM cn ORDER BY rowid",
+        "SELECT COALESCE(a, COALESCE(b, c), d) FROM cn ORDER BY rowid",
+        "SELECT COALESCE(NULL, NULL, NULL)",
+        "SELECT COALESCE(NULL, 'hello')",
+        "SELECT COALESCE(1, 2, 3)",
+        "SELECT IFNULL(a, 99) FROM cn ORDER BY rowid",
+        "SELECT IIF(a IS NOT NULL, a, IIF(b IS NOT NULL, b, c)) FROM cn ORDER BY rowid",
+        "SELECT NULLIF(COALESCE(a, 0), 0) FROM cn ORDER BY rowid",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} coalesce chain mismatches", mismatches.len());
+    }
+}
+
+/// Multi-table DELETE with subquery and correlated conditions
+#[test]
+fn test_conformance_delete_complex() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, status TEXT)",
+        "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, active INTEGER)",
+        "INSERT INTO customers VALUES(1,'Alice',1),(2,'Bob',0),(3,'Carol',1)",
+        "INSERT INTO orders VALUES(1,1,100.0,'pending'),(2,2,200.0,'pending'),(3,1,50.0,'completed'),(4,3,75.0,'pending'),(5,2,300.0,'completed')",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        // Delete orders from inactive customers
+        "DELETE FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE active = 0)",
+        "SELECT * FROM orders ORDER BY id",
+        "SELECT COUNT(*) FROM orders",
+        // Delete orders where amount is below average of remaining
+        "DELETE FROM orders WHERE amount < (SELECT AVG(amount) FROM orders)",
+        "SELECT * FROM orders ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} delete complex mismatches", mismatches.len());
+    }
+}
+
+/// CAST between all type pairs
+#[test]
+fn test_conformance_cast_all_pairs() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    let queries = &[
+        "SELECT CAST(123 AS TEXT)",
+        "SELECT CAST(123 AS REAL)",
+        "SELECT CAST(123 AS BLOB)",
+        "SELECT CAST('456' AS INTEGER)",
+        "SELECT CAST('456.78' AS REAL)",
+        "SELECT CAST('hello' AS INTEGER)",
+        "SELECT CAST('hello' AS REAL)",
+        "SELECT CAST(3.14 AS INTEGER)",
+        "SELECT CAST(3.14 AS TEXT)",
+        "SELECT CAST(NULL AS INTEGER)",
+        "SELECT CAST(NULL AS TEXT)",
+        "SELECT CAST(NULL AS REAL)",
+        "SELECT CAST(0 AS TEXT)",
+        "SELECT CAST('' AS INTEGER)",
+        "SELECT CAST('' AS REAL)",
+        "SELECT CAST(X'48454C4C4F' AS TEXT)",
+        "SELECT CAST(0.0 AS INTEGER)",
+        "SELECT CAST(-0.0 AS INTEGER)",
+        "SELECT CAST(9999999999999999 AS REAL)",
+        "SELECT CAST(1.9 AS INTEGER)",
+        "SELECT CAST(-1.9 AS INTEGER)",
+        "SELECT typeof(CAST('123' AS INTEGER))",
+        "SELECT typeof(CAST(123 AS TEXT))",
+        "SELECT typeof(CAST(123 AS REAL))",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} cast pairs mismatches", mismatches.len());
+    }
+}
+
+/// Nested CTE with multiple references to same CTE
+#[test]
+fn test_conformance_cte_multi_reference() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    let queries = &[
+        // Multiple CTEs where one references another
+        "WITH \
+           base AS (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3), \
+           doubled AS (SELECT x, x*2 AS x2 FROM base) \
+         SELECT * FROM doubled ORDER BY x",
+        // Simple CTE with aggregation
+        "WITH data AS (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5) \
+         SELECT SUM(v), AVG(v), MIN(v), MAX(v) FROM data",
+        // CTE with WHERE filter
+        "WITH data AS (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5) \
+         SELECT v FROM data WHERE v > 2 ORDER BY v",
+        // NOTE: CTE self-join (same CTE referenced twice via aliases) is a known gap — not tested here
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} CTE multi-reference mismatches", mismatches.len());
+    }
+}
+
+/// String operations: length, upper, lower, ltrim, rtrim, trim with chars
+#[test]
+fn test_conformance_string_ops_extended() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    let queries = &[
+        "SELECT length('')",
+        "SELECT length(NULL)",
+        "SELECT length('hello')",
+        "SELECT length(X'0102')",
+        "SELECT upper('hello WORLD')",
+        "SELECT lower('HELLO world')",
+        "SELECT ltrim('   hello')",
+        "SELECT rtrim('hello   ')",
+        "SELECT trim('  hello  ')",
+        "SELECT ltrim('xxxhello', 'x')",
+        "SELECT rtrim('helloyyy', 'y')",
+        "SELECT trim('xyhelloxy', 'xy')",
+        "SELECT replace('hello world', 'world', 'there')",
+        "SELECT replace('aaa', 'a', 'bb')",
+        "SELECT replace('hello', '', 'x')",
+        "SELECT substr('hello', 2, 3)",
+        "SELECT substr('hello', -2)",
+        "SELECT substr('hello', 0)",
+        "SELECT substr('hello', 1, 100)",
+        "SELECT instr('hello world', 'world')",
+        "SELECT instr('hello world', 'xyz')",
+        "SELECT instr('hello', '')",
+        "SELECT printf('%d', 42)",
+        "SELECT printf('%.2f', 3.14159)",
+        "SELECT printf('%05d', 42)",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} string ops extended mismatches", mismatches.len());
+    }
+}
+
+/// Aggregate functions with empty tables and NULL-only tables
+#[test]
+fn test_conformance_aggregate_empty_null() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE empty_t(x INTEGER)",
+        "CREATE TABLE null_t(x INTEGER)",
+        "INSERT INTO null_t VALUES(NULL),(NULL),(NULL)",
+        "CREATE TABLE mixed(x INTEGER)",
+        "INSERT INTO mixed VALUES(1),(NULL),(3),(NULL),(5)",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        // Empty table aggregates
+        "SELECT COUNT(*) FROM empty_t",
+        "SELECT COUNT(x) FROM empty_t",
+        "SELECT SUM(x) FROM empty_t",
+        "SELECT AVG(x) FROM empty_t",
+        "SELECT MIN(x) FROM empty_t",
+        "SELECT MAX(x) FROM empty_t",
+        "SELECT total(x) FROM empty_t",
+        // NULL-only table aggregates
+        "SELECT COUNT(*) FROM null_t",
+        "SELECT COUNT(x) FROM null_t",
+        "SELECT SUM(x) FROM null_t",
+        "SELECT AVG(x) FROM null_t",
+        "SELECT MIN(x) FROM null_t",
+        "SELECT MAX(x) FROM null_t",
+        "SELECT total(x) FROM null_t",
+        // Mixed NULLs
+        "SELECT COUNT(*) FROM mixed",
+        "SELECT COUNT(x) FROM mixed",
+        "SELECT SUM(x) FROM mixed",
+        "SELECT AVG(x) FROM mixed",
+        "SELECT MIN(x) FROM mixed",
+        "SELECT MAX(x) FROM mixed",
+        "SELECT total(x) FROM mixed",
+        // Aggregate with WHERE that matches nothing
+        "SELECT COUNT(*), SUM(x), AVG(x), MIN(x), MAX(x), total(x) FROM mixed WHERE x > 100",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} aggregate empty/null mismatches", mismatches.len());
+    }
+}
+
+/// UPDATE with complex expressions: CASE, subquery, arithmetic
+#[test]
+fn test_conformance_update_complex_expressions() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE inventory(id INTEGER PRIMARY KEY, name TEXT, qty INTEGER, price REAL)",
+        "INSERT INTO inventory VALUES(1,'Widget',10,5.99),(2,'Gadget',0,12.50),(3,'Doohickey',25,3.75),(4,'Thingamajig',5,8.00)",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        // CASE in SET
+        "UPDATE inventory SET price = CASE WHEN qty = 0 THEN price * 0.5 WHEN qty < 10 THEN price * 0.9 ELSE price END",
+        "SELECT name, price FROM inventory ORDER BY id",
+        // Arithmetic in SET
+        "UPDATE inventory SET qty = qty + 10 WHERE qty < 10",
+        "SELECT name, qty FROM inventory ORDER BY id",
+        // Self-referencing UPDATE
+        "UPDATE inventory SET price = price * 1.1, qty = qty - 1",
+        "SELECT name, qty, price FROM inventory ORDER BY id",
+        // UPDATE with subquery in WHERE
+        "UPDATE inventory SET qty = 0 WHERE price > (SELECT AVG(price) FROM inventory)",
+        "SELECT name, qty FROM inventory ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} update complex expr mismatches", mismatches.len());
+    }
+}
+
+/// INSERT with DEFAULT values and ON CONFLICT
+#[test]
+fn test_conformance_insert_default_conflict() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE dfl(id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'unknown', score INTEGER DEFAULT 0, created TEXT DEFAULT 'now')",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        "INSERT INTO dfl(name) VALUES('Alice')",
+        "INSERT INTO dfl(name, score) VALUES('Bob', 95)",
+        "SELECT * FROM dfl ORDER BY id",
+        // INSERT OR IGNORE with duplicate
+        "INSERT OR IGNORE INTO dfl(id, name) VALUES(1, 'Charlie')",
+        "SELECT * FROM dfl ORDER BY id",
+        // INSERT OR REPLACE
+        "INSERT OR REPLACE INTO dfl(id, name, score) VALUES(1, 'Charlie', 100)",
+        "SELECT * FROM dfl ORDER BY id",
+        "SELECT COUNT(*) FROM dfl",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} insert default/conflict mismatches", mismatches.len());
+    }
+}
+
+/// Compound SELECT: UNION vs UNION ALL, ordering, LIMIT
+#[test]
+fn test_conformance_compound_select_ordering() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE t1(a INTEGER, b TEXT)",
+        "CREATE TABLE t2(a INTEGER, b TEXT)",
+        "INSERT INTO t1 VALUES(1,'one'),(2,'two'),(3,'three')",
+        "INSERT INTO t2 VALUES(2,'two'),(3,'three'),(4,'four')",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        "SELECT a, b FROM t1 UNION SELECT a, b FROM t2 ORDER BY a",
+        "SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2 ORDER BY a, b",
+        "SELECT a FROM t1 INTERSECT SELECT a FROM t2 ORDER BY a",
+        "SELECT a FROM t1 EXCEPT SELECT a FROM t2 ORDER BY a",
+        // UNION with LIMIT
+        "SELECT a, b FROM t1 UNION SELECT a, b FROM t2 ORDER BY a LIMIT 3",
+        // UNION ALL with LIMIT and OFFSET
+        "SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2 ORDER BY a LIMIT 3 OFFSET 2",
+        // Chained compound
+        "SELECT a FROM t1 UNION SELECT a FROM t2 EXCEPT SELECT 3 ORDER BY a",
+        // Column count matching
+        "SELECT a, b FROM t1 UNION SELECT a, b FROM t2 ORDER BY b",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} compound select ordering mismatches", mismatches.len());
+    }
+}
+
+/// Expression-only SELECTs with complex nesting
+#[test]
+fn test_conformance_expression_only_complex() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    let queries = &[
+        "SELECT 1+2*3",
+        "SELECT (1+2)*3",
+        "SELECT 10/3",
+        "SELECT 10%3",
+        "SELECT -(-5)",
+        "SELECT 1<<4",
+        "SELECT 16>>2",
+        "SELECT 5|3",
+        "SELECT 5&3",
+        "SELECT ~0",
+        "SELECT 1=1, 1=0, 1!=1, 1!=0",
+        "SELECT 1<2, 2<1, 1<=1, 1<=0",
+        "SELECT 1>0, 0>1, 1>=1, 0>=1",
+        "SELECT 'abc' < 'abd'",
+        "SELECT 'abc' = 'ABC'",
+        "SELECT 'abc' LIKE 'ABC'",
+        "SELECT NULL IS NULL",
+        "SELECT NULL IS NOT NULL",
+        "SELECT 1 IS NULL",
+        "SELECT 1 IS NOT NULL",
+        "SELECT 1 BETWEEN 0 AND 2",
+        "SELECT 3 BETWEEN 0 AND 2",
+        "SELECT 1 IN (1, 2, 3)",
+        "SELECT 4 IN (1, 2, 3)",
+        "SELECT NULL IN (1, 2, 3)",
+        "SELECT 1 IN (1, NULL, 3)",
+        "SELECT 2 IN (1, NULL, 3)",
+        "SELECT NOT 1",
+        "SELECT NOT 0",
+        "SELECT NOT NULL",
+        "SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END",
+        "SELECT CASE WHEN 0 THEN 'zero' WHEN 1 THEN 'one' END",
+        "SELECT abs(-5), abs(5), abs(0)",
+        "SELECT max(1,2,3), min(1,2,3)",
+        "SELECT unicode('A'), unicode('a')",
+        "SELECT char(65, 66, 67)",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} expression-only complex mismatches", mismatches.len());
+    }
+}
+
+/// Multiple JOINs with different join types in same query
+#[test]
+fn test_conformance_multi_join_types() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE departments(id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)",
+        "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT, lead_id INTEGER)",
+        "INSERT INTO departments VALUES(1,'Engineering'),(2,'Sales'),(3,'HR')",
+        "INSERT INTO employees VALUES(1,'Alice',1),(2,'Bob',2),(3,'Carol',1),(4,'Dave',NULL)",
+        "INSERT INTO projects VALUES(1,'Alpha',1),(2,'Beta',2),(3,'Gamma',99)",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        // INNER JOIN
+        "SELECT e.name, d.name FROM employees e JOIN departments d ON e.dept_id = d.id ORDER BY e.name",
+        // LEFT JOIN
+        "SELECT e.name, d.name FROM employees e LEFT JOIN departments d ON e.dept_id = d.id ORDER BY e.name",
+        // Multiple JOINs
+        "SELECT e.name, d.name, p.name FROM employees e \
+         LEFT JOIN departments d ON e.dept_id = d.id \
+         LEFT JOIN projects p ON p.lead_id = e.id \
+         ORDER BY e.name",
+        // JOIN with aggregation
+        "SELECT d.name, COUNT(e.id) FROM departments d \
+         LEFT JOIN employees e ON e.dept_id = d.id \
+         GROUP BY d.name ORDER BY d.name",
+        // Self join
+        "SELECT a.name, b.name FROM employees a, employees b \
+         WHERE a.dept_id = b.dept_id AND a.id < b.id ORDER BY a.name, b.name",
+        // Cross join implicit
+        "SELECT d.name, p.name FROM departments d, projects p ORDER BY d.name, p.name",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} multi join type mismatches", mismatches.len());
+    }
+}
+
+/// Subqueries in different positions: SELECT list, FROM, WHERE, HAVING
+#[test]
+fn test_conformance_subquery_positions_extended() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL)",
+        "INSERT INTO products VALUES(1,'Widget','A',10.0),(2,'Gadget','A',20.0),(3,'Doohickey','B',15.0),(4,'Gizmo','B',25.0),(5,'Thingamajig','A',30.0)",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        // Scalar subquery in SELECT
+        "SELECT name, price, (SELECT AVG(price) FROM products) AS avg_price FROM products ORDER BY name",
+        // Correlated scalar subquery in SELECT
+        "SELECT name, price, (SELECT COUNT(*) FROM products p2 WHERE p2.category = products.category) AS cat_count FROM products ORDER BY name",
+        // Derived table (subquery in FROM)
+        "SELECT sq.category, sq.total FROM (SELECT category, SUM(price) AS total FROM products GROUP BY category) sq ORDER BY sq.category",
+        // EXISTS in WHERE
+        "SELECT name FROM products p WHERE EXISTS (SELECT 1 FROM products p2 WHERE p2.category = p.category AND p2.price > p.price) ORDER BY name",
+        // NOT EXISTS
+        "SELECT name FROM products p WHERE NOT EXISTS (SELECT 1 FROM products p2 WHERE p2.category = p.category AND p2.price > p.price) ORDER BY name",
+        // IN subquery
+        "SELECT name FROM products WHERE category IN (SELECT category FROM products GROUP BY category HAVING COUNT(*) > 2) ORDER BY name",
+        // Subquery comparison
+        "SELECT name FROM products WHERE price > (SELECT AVG(price) FROM products) ORDER BY name",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!(
+            "{} subquery positions extended mismatches",
+            mismatches.len()
+        );
+    }
+}
+
+/// HAVING with complex expressions: multiple aggregates, CASE, arithmetic
+#[test]
+fn test_conformance_having_complex() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE sales(id INTEGER PRIMARY KEY, rep TEXT, region TEXT, amount REAL)",
+        "INSERT INTO sales VALUES(1,'Alice','East',100),(2,'Alice','East',200),(3,'Bob','West',150),(4,'Bob','West',50),(5,'Carol','East',300),(6,'Carol','West',100)",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        "SELECT rep, SUM(amount) FROM sales GROUP BY rep HAVING SUM(amount) > 200 ORDER BY rep",
+        "SELECT rep, COUNT(*) FROM sales GROUP BY rep HAVING COUNT(*) >= 2 ORDER BY rep",
+        "SELECT rep, AVG(amount) FROM sales GROUP BY rep HAVING AVG(amount) > 100 ORDER BY rep",
+        "SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region HAVING SUM(amount) > 300 ORDER BY region",
+        // HAVING with multiple conditions
+        "SELECT rep, SUM(amount), COUNT(*) FROM sales GROUP BY rep HAVING SUM(amount) > 150 AND COUNT(*) > 1 ORDER BY rep",
+        // HAVING with CASE
+        "SELECT rep, SUM(CASE WHEN region='East' THEN amount ELSE 0 END) AS east_total FROM sales GROUP BY rep HAVING east_total > 0 ORDER BY rep",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} HAVING complex mismatches", mismatches.len());
+    }
+}
+
+/// NULL comparison edge cases across operators
+#[test]
+fn test_conformance_null_comparison_edges() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    let queries = &[
+        "SELECT NULL = NULL",
+        "SELECT NULL != NULL",
+        "SELECT NULL < NULL",
+        "SELECT NULL > NULL",
+        "SELECT NULL <= NULL",
+        "SELECT NULL >= NULL",
+        "SELECT NULL AND 1",
+        "SELECT NULL AND 0",
+        "SELECT NULL OR 1",
+        "SELECT NULL OR 0",
+        "SELECT NULL AND NULL",
+        "SELECT NULL OR NULL",
+        "SELECT NOT NULL",
+        "SELECT NULL + 1",
+        "SELECT NULL * 5",
+        "SELECT NULL || 'hello'",
+        "SELECT COALESCE(NULL, NULL, NULL)",
+        "SELECT NULLIF(NULL, NULL)",
+        "SELECT NULLIF(1, 1)",
+        "SELECT NULLIF(1, 2)",
+        "SELECT NULL BETWEEN 1 AND 10",
+        "SELECT 5 BETWEEN NULL AND 10",
+        "SELECT 5 BETWEEN 1 AND NULL",
+        "SELECT NULL LIKE '%'",
+        "SELECT 'hello' LIKE NULL",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} null comparison edge mismatches", mismatches.len());
+    }
+}
+
+/// CREATE INDEX + query optimization correctness
+#[test]
+fn test_conformance_index_correctness() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE indexed_t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL)",
+        "INSERT INTO indexed_t VALUES(1,10,'apple',1.5),(2,20,'banana',2.5),(3,10,'cherry',3.5),(4,30,'date',4.5),(5,20,'elderberry',5.5)",
+        "CREATE INDEX idx_a ON indexed_t(a)",
+        "CREATE INDEX idx_b ON indexed_t(b)",
+        "CREATE INDEX idx_ab ON indexed_t(a, b)",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        // Point lookups
+        "SELECT * FROM indexed_t WHERE a = 10 ORDER BY id",
+        "SELECT * FROM indexed_t WHERE b = 'banana'",
+        // Range queries
+        "SELECT * FROM indexed_t WHERE a >= 20 ORDER BY a, id",
+        "SELECT * FROM indexed_t WHERE a BETWEEN 10 AND 20 ORDER BY a, id",
+        // Composite index
+        "SELECT * FROM indexed_t WHERE a = 10 AND b = 'cherry'",
+        "SELECT * FROM indexed_t WHERE a = 10 ORDER BY b",
+        // Index with aggregate
+        "SELECT a, COUNT(*) FROM indexed_t GROUP BY a ORDER BY a",
+        "SELECT MIN(a), MAX(a) FROM indexed_t",
+        // LIKE with index (prefix optimization)
+        "SELECT * FROM indexed_t WHERE b LIKE 'b%' ORDER BY id",
+        // Verify results are same with and without index
+        "SELECT id, a, b FROM indexed_t WHERE a IN (10, 30) ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} index correctness mismatches", mismatches.len());
+    }
+}
+
+/// ORDER BY with expressions, multiple columns, DESC, NULLS handling
+#[test]
+fn test_conformance_order_by_complex_extended() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE ob(id INTEGER PRIMARY KEY, name TEXT, score INTEGER, grade TEXT)",
+        "INSERT INTO ob VALUES(1,'Alice',90,'A'),(2,'Bob',NULL,'B'),(3,'Carol',85,'A'),(4,'Dave',90,'B'),(5,'Eve',NULL,'A')",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        "SELECT * FROM ob ORDER BY score",
+        "SELECT * FROM ob ORDER BY score DESC",
+        "SELECT * FROM ob ORDER BY grade, name",
+        "SELECT * FROM ob ORDER BY grade DESC, name ASC",
+        // ORDER BY expression
+        "SELECT name, score FROM ob ORDER BY score IS NULL, score DESC",
+        "SELECT name, score FROM ob ORDER BY CASE WHEN score IS NULL THEN 1 ELSE 0 END, score DESC",
+        // ORDER BY column number
+        "SELECT name, score FROM ob ORDER BY 2, 1",
+        "SELECT name, score FROM ob ORDER BY 2 DESC, 1",
+        // ORDER BY with LIMIT
+        "SELECT name, score FROM ob ORDER BY score DESC LIMIT 3",
+        "SELECT name FROM ob ORDER BY name LIMIT 2 OFFSET 2",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} order by complex extended mismatches", mismatches.len());
+    }
+}
+
+/// ALTER TABLE edge cases
+#[test]
+fn test_conformance_alter_table_edges() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE alt_t(id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO alt_t VALUES(1,'Alice'),(2,'Bob')",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        // Add column with default
+        "ALTER TABLE alt_t ADD COLUMN age INTEGER DEFAULT 0",
+        "SELECT * FROM alt_t ORDER BY id",
+        // Insert after alter
+        "INSERT INTO alt_t(name, age) VALUES('Carol', 30)",
+        "SELECT * FROM alt_t ORDER BY id",
+        // Add another column
+        "ALTER TABLE alt_t ADD COLUMN email TEXT DEFAULT ''",
+        "SELECT * FROM alt_t ORDER BY id",
+        // Update the new column
+        "UPDATE alt_t SET email = name || '@example.com'",
+        "SELECT name, email FROM alt_t ORDER BY id",
+        // ALTER TABLE RENAME
+        "ALTER TABLE alt_t RENAME TO alt_renamed",
+        "SELECT * FROM alt_renamed ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} alter table edge mismatches", mismatches.len());
+    }
+}
+
+/// Recursive CTE: hierarchical data, path accumulation, cycle detection
+#[test]
+fn test_conformance_recursive_cte_hierarchy() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open(":memory:").unwrap();
+
+    for setup in &[
+        "CREATE TABLE org(id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER REFERENCES org(id))",
+        "INSERT INTO org VALUES(1,'CEO',NULL),(2,'VP-Eng',1),(3,'VP-Sales',1),(4,'Dev-Lead',2),(5,'Dev-Sr',4),(6,'Sales-Rep',3)",
+    ] {
+        fconn.execute(setup).unwrap();
+        rconn.execute_batch(setup).unwrap();
+    }
+
+    let queries = &[
+        // Find all reports under CEO
+        "WITH RECURSIVE reports AS ( \
+           SELECT id, name, manager_id, 0 AS depth FROM org WHERE manager_id IS NULL \
+           UNION ALL \
+           SELECT o.id, o.name, o.manager_id, r.depth + 1 FROM org o JOIN reports r ON o.manager_id = r.id \
+         ) SELECT name, depth FROM reports ORDER BY depth, name",
+        // Path accumulation
+        "WITH RECURSIVE chain AS ( \
+           SELECT id, name, name AS path FROM org WHERE manager_id IS NULL \
+           UNION ALL \
+           SELECT o.id, o.name, chain.path || '/' || o.name FROM org o JOIN chain ON o.manager_id = chain.id \
+         ) SELECT name, path FROM chain ORDER BY name",
+        // Count at each level
+        "WITH RECURSIVE levels AS ( \
+           SELECT id, 0 AS lvl FROM org WHERE manager_id IS NULL \
+           UNION ALL \
+           SELECT o.id, levels.lvl + 1 FROM org o JOIN levels ON o.manager_id = levels.id \
+         ) SELECT lvl, COUNT(*) FROM levels GROUP BY lvl ORDER BY lvl",
+        // Leaf nodes (no reports)
+        "SELECT name FROM org WHERE id NOT IN (SELECT DISTINCT manager_id FROM org WHERE manager_id IS NOT NULL) ORDER BY name",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} recursive CTE hierarchy mismatches", mismatches.len());
     }
 }

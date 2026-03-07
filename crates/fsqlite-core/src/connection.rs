@@ -2299,6 +2299,15 @@ impl Connection {
             .and_then(|entry| (entry.sql == sql).then_some(entry.program.clone()))
     }
 
+    /// Remove a cached compiled program by SQL text, if present.
+    fn invalidate_compiled_cache(&self, sql: &str) {
+        let key = Self::sql_hash(sql);
+        let mut cache = self.compiled_cache.borrow_mut();
+        if cache.get(&key).is_some_and(|e| e.sql == sql) {
+            cache.remove(&key);
+        }
+    }
+
     /// Store a compiled VdbeProgram in the schema-scoped cache.
     fn insert_compiled_cache(&self, key: u64, sql: &str, program: &VdbeProgram) {
         let mut cache = self.compiled_cache.borrow_mut();
@@ -5566,6 +5575,7 @@ impl Connection {
         if !was_auto {
             return Ok(());
         }
+        eprintln!("[DEBUG resolve_autocommit_txn] was_auto=true, TAKING active_txn to commit/rollback");
         let cx = self.op_cx();
         let mut txn = {
             let mut guard = self.active_txn.borrow_mut();
@@ -13400,6 +13410,10 @@ impl Connection {
             } else {
                 // Named table: scan from database.
                 let scan_sql = format!("SELECT * FROM \"{}\"", src.table_name.replace('"', "\"\""));
+                // Invalidate the compile cache for this scan SQL so that CTE
+                // temp tables whose root page changes between materializations
+                // don't get a stale compiled program from a previous CTE.
+                self.invalidate_compiled_cache(&scan_sql);
                 let rows = self.query(&scan_sql)?;
                 table_rows.push(rows.iter().map(|r| r.values().to_vec()).collect());
             }
@@ -64124,6 +64138,221 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} recursive CTE mismatches", mismatches.len());
+        }
+    }
+
+    /// Probe: multi-table JOINs with aggregates and subqueries.
+    #[test]
+    fn test_conformance_multi_join_agg_subquery_probe() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT)",
+            "INSERT INTO categories VALUES(1,'Electronics'),(2,'Books'),(3,'Clothing')",
+            "CREATE TABLE products(id INTEGER PRIMARY KEY, cat_id INTEGER, name TEXT, price REAL)",
+            "INSERT INTO products VALUES(1,1,'Phone',999),(2,1,'Laptop',1500),(3,2,'Novel',15),(4,2,'Textbook',80),(5,3,'Shirt',25)",
+            "CREATE TABLE orders(id INTEGER PRIMARY KEY, prod_id INTEGER, qty INTEGER, customer TEXT)",
+            "INSERT INTO orders VALUES(1,1,2,'Alice'),(2,2,1,'Bob'),(3,3,5,'Alice'),(4,1,1,'Charlie'),(5,4,3,'Bob'),(6,5,2,'Alice')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Three-table JOIN with GROUP BY
+            "SELECT c.name AS category, SUM(o.qty * p.price) AS total_revenue FROM categories c JOIN products p ON p.cat_id = c.id JOIN orders o ON o.prod_id = p.id GROUP BY c.name ORDER BY total_revenue DESC",
+            // Two-table JOIN with HAVING
+            "SELECT p.name, SUM(o.qty) AS total_qty FROM products p JOIN orders o ON o.prod_id = p.id GROUP BY p.name HAVING SUM(o.qty) > 1 ORDER BY p.name",
+            // Subquery in FROM with JOIN
+            "SELECT sub.customer, sub.total_orders, p.name FROM (SELECT customer, COUNT(*) AS total_orders FROM orders GROUP BY customer) sub JOIN orders o ON o.customer = sub.customer JOIN products p ON p.id = o.prod_id WHERE sub.total_orders > 1 ORDER BY sub.customer, p.name",
+            // LEFT JOIN with aggregate producing NULLs
+            "SELECT c.name, COUNT(o.id) AS order_count FROM categories c LEFT JOIN products p ON p.cat_id = c.id LEFT JOIN orders o ON o.prod_id = p.id GROUP BY c.name ORDER BY c.name",
+            // Nested aggregate expression in JOIN
+            "SELECT c.name, COALESCE(SUM(o.qty), 0) AS total_qty FROM categories c LEFT JOIN products p ON p.cat_id = c.id LEFT JOIN orders o ON o.prod_id = p.id GROUP BY c.name ORDER BY c.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} multi-join agg mismatches", mismatches.len());
+        }
+    }
+
+    /// Probe: INSERT...SELECT with transformation, multi-row VALUES, DEFAULT.
+    #[test]
+    fn test_conformance_insert_select_transform_probe() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE source(id INTEGER PRIMARY KEY, val INTEGER, label TEXT)",
+            "INSERT INTO source VALUES(1,10,'a'),(2,20,'b'),(3,30,'a'),(4,40,'c'),(5,50,'b')",
+            "CREATE TABLE dest(id INTEGER PRIMARY KEY, total INTEGER DEFAULT 0, label TEXT)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // INSERT...SELECT with GROUP BY
+        let ins =
+            "INSERT INTO dest(label, total) SELECT label, SUM(val) FROM source GROUP BY label";
+        fconn.execute(ins).unwrap();
+        rconn.execute_batch(ins).unwrap();
+
+        let queries = [
+            "SELECT label, total FROM dest ORDER BY label",
+            // Multi-row VALUES
+            "SELECT * FROM (VALUES (1,'x'),(2,'y'),(3,'z')) ORDER BY 1",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} insert select transform mismatches", mismatches.len());
+        }
+    }
+
+    /// Probe: complex WHERE with multiple conditions, OR, parentheses.
+    #[test]
+    fn test_conformance_complex_where_probe() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, price REAL, qty INTEGER, active INTEGER)",
+            "INSERT INTO items VALUES(1,'Widget',10.5,100,1),(2,'Gadget',25.0,50,1),(3,'Doohickey',5.0,200,0),(4,'Thingamajig',100.0,10,1),(5,'Whatchamacallit',NULL,NULL,NULL)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Complex AND/OR with parentheses
+            "SELECT name FROM items WHERE (price > 10 AND qty < 100) OR (active = 0) ORDER BY name",
+            // NOT with parenthesized OR
+            "SELECT name FROM items WHERE NOT (price > 20 OR qty > 100) AND active IS NOT NULL ORDER BY name",
+            // NULL-safe comparisons
+            "SELECT name FROM items WHERE price IS NULL ORDER BY name",
+            "SELECT name FROM items WHERE price IS NOT NULL AND qty > 0 ORDER BY name",
+            // BETWEEN with column calculations
+            "SELECT name FROM items WHERE price * qty BETWEEN 500 AND 5000 ORDER BY name",
+            // IN with mixed types
+            "SELECT name FROM items WHERE id IN (1, 3, 5) ORDER BY name",
+            // Subquery IN
+            "SELECT name FROM items WHERE id IN (SELECT id FROM items WHERE active = 1) ORDER BY name",
+            // LIKE with wildcards
+            "SELECT name FROM items WHERE name LIKE '%a%' ORDER BY name",
+            // Complex expression in WHERE
+            "SELECT name FROM items WHERE CAST(price AS INTEGER) = 10 ORDER BY name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} complex WHERE mismatches", mismatches.len());
+        }
+    }
+
+    /// Probe: UPDATE with JOIN-like subquery, DELETE with subquery, RETURNING.
+    #[test]
+    fn test_conformance_dml_advanced_probe() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE accounts(id INTEGER PRIMARY KEY, name TEXT, balance REAL)",
+            "INSERT INTO accounts VALUES(1,'Alice',1000),(2,'Bob',500),(3,'Charlie',750)",
+            "CREATE TABLE transfers(id INTEGER PRIMARY KEY, from_id INTEGER, to_id INTEGER, amount REAL)",
+            "INSERT INTO transfers VALUES(1,1,2,100),(2,1,3,50),(3,2,3,200)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // DELETE with complex subquery
+        let del = "DELETE FROM transfers WHERE amount > (SELECT AVG(amount) FROM transfers)";
+        fconn.execute(del).unwrap();
+        rconn.execute_batch(del).unwrap();
+
+        let queries = [
+            "SELECT * FROM transfers ORDER BY id",
+            "SELECT COUNT(*) FROM transfers",
+        ];
+
+        // INSERT...RETURNING
+        let ins_ret = "INSERT INTO accounts VALUES(4,'Diana',2000) RETURNING id, name, balance";
+        let frank_ret = fconn.query(ins_ret);
+        let rconn_ret: std::result::Result<Vec<Vec<String>>, String> = (|| {
+            let mut stmt = rconn.prepare(ins_ret).map_err(|e| format!("{e}"))?;
+            let col_count = stmt.column_count();
+            let rows: Vec<Vec<String>> = stmt
+                .query_map([], |row| {
+                    let mut vals = Vec::new();
+                    for i in 0..col_count {
+                        let v: rusqlite::types::Value = row.get_unwrap(i);
+                        let s = match v {
+                            rusqlite::types::Value::Null => "NULL".to_owned(),
+                            rusqlite::types::Value::Integer(n) => n.to_string(),
+                            rusqlite::types::Value::Real(f) => format!("{f}"),
+                            rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                            rusqlite::types::Value::Blob(b) => format!(
+                                "X'{}'",
+                                b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                            ),
+                        };
+                        vals.push(s);
+                    }
+                    Ok(vals)
+                })
+                .map_err(|e| format!("{e}"))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| format!("{e}"))?;
+            Ok(rows)
+        })();
+
+        let mut all_mismatches = oracle_compare(&fconn, &rconn, &queries);
+
+        // Check RETURNING results match
+        match (&frank_ret, &rconn_ret) {
+            (Ok(fr), Ok(rr)) => {
+                let frank_rows: Vec<Vec<String>> = fr
+                    .iter()
+                    .map(|r| r.values().iter().map(|v| format!("{v}")).collect())
+                    .collect();
+                let csql_rows: Vec<Vec<String>> = rr.clone();
+                if frank_rows != csql_rows {
+                    all_mismatches.push(format!(
+                        "INSERT RETURNING mismatch: frank={frank_rows:?} csql={csql_rows:?}"
+                    ));
+                }
+            }
+            (Err(e), Ok(_)) => all_mismatches.push(format!("INSERT RETURNING frank error: {e}")),
+            (Ok(_), Err(e)) => all_mismatches.push(format!("INSERT RETURNING csql error: {e}")),
+            (Err(fe), Err(re)) => {
+                if !format!("{fe}").contains(&format!("{re}")) {
+                    all_mismatches.push(format!(
+                        "INSERT RETURNING both errored: frank={fe} csql={re}"
+                    ));
+                }
+            }
+        }
+
+        if !all_mismatches.is_empty() {
+            for m in &all_mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} DML advanced mismatches", all_mismatches.len());
         }
     }
 }
