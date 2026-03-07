@@ -765,7 +765,9 @@ name = "fsqlite-c-api"
 version = "0.1.1"
 dependencies = [
  "fsqlite",
+ "fsqlite-ast",
  "fsqlite-error",
+ "fsqlite-parser",
  "fsqlite-types",
  "tempfile",
  "tracing",

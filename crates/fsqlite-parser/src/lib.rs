@@ -14,7 +14,8 @@ pub use lexer::{
     tokenize_metrics_snapshot,
 };
 pub use parser::{
-    ParseError, ParseMetricsSnapshot, Parser, parse_metrics_snapshot, reset_parse_metrics,
+    ParseError, ParseMetricsSnapshot, Parser, parse_first_statement_with_tail,
+    parse_metrics_snapshot, reset_parse_metrics,
 };
 pub use semantic::{
     ColumnDef as SemanticColumnDef, FunctionArity, ResolveResult, Resolver, Schema, Scope,

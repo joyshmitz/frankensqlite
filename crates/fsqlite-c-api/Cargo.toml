@@ -12,7 +12,9 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 fsqlite = { workspace = true }
+fsqlite-ast = { workspace = true }
 fsqlite-error = { workspace = true }
+fsqlite-parser = { workspace = true }
 fsqlite-types = { workspace = true }
 tracing = { workspace = true }
 

@@ -22,10 +22,12 @@ use std::fmt::Write as _;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use fsqlite::Connection;
+use fsqlite_ast::Statement;
 use fsqlite_error::{ErrorCode, FrankenError};
+use fsqlite_parser::parse_first_statement_with_tail;
 use fsqlite_types::value::SqliteValue;
 
 // ── SQLite result codes ─────────────────────────────────────────────
@@ -132,6 +134,7 @@ pub struct Sqlite3 {
     last_error: Mutex<CString>,
     last_error_code: AtomicI32,
     last_changes: AtomicI32,
+    active_statements: AtomicUsize,
 }
 
 impl Sqlite3 {
@@ -141,6 +144,7 @@ impl Sqlite3 {
             last_error: Mutex::new(CString::new(DEFAULT_ERROR_MESSAGE).expect("static")),
             last_error_code: AtomicI32::new(SQLITE_OK),
             last_changes: AtomicI32::new(0),
+            active_statements: AtomicUsize::new(0),
         }
     }
 
@@ -176,15 +180,38 @@ impl Sqlite3 {
             .unwrap_or(0);
         self.last_changes.store(changes, Ordering::Relaxed);
     }
+
+    fn register_statement(&self) {
+        self.active_statements.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn release_statement(&self) {
+        let _ =
+            self.active_statements
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    Some(count.saturating_sub(1))
+                });
+    }
+
+    fn active_statement_count(&self) -> usize {
+        self.active_statements.load(Ordering::Relaxed)
+    }
 }
 
 /// Opaque prepared statement handle exposed via C FFI.
 ///
 /// Wraps the SQL string, the parent connection, and a row cursor so
 /// that `sqlite3_step` can return one row at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreparedStepMode {
+    Query,
+    Execute,
+}
+
 pub struct Sqlite3Stmt {
     db: *mut Sqlite3,
     sql: String,
+    step_mode: PreparedStepMode,
     /// Cached rows from last execution.  `None` means not yet stepped.
     rows: Option<Vec<fsqlite::Row>>,
     /// Current row index (0-based, incremented by each `sqlite3_step`).
@@ -210,6 +237,58 @@ fn i64_to_c_int_saturating(value: i64) -> c_int {
     } else {
         value as c_int
     }
+}
+
+fn can_prepare_statement(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+    )
+}
+
+fn prepared_step_mode(statement: &Statement) -> PreparedStepMode {
+    match statement {
+        Statement::Insert(stmt) if stmt.returning.is_empty() => PreparedStepMode::Execute,
+        Statement::Update(stmt) if stmt.returning.is_empty() => PreparedStepMode::Execute,
+        Statement::Delete(stmt) if stmt.returning.is_empty() => PreparedStepMode::Execute,
+        _ => PreparedStepMode::Query,
+    }
+}
+
+struct PreparedSqlInfo {
+    consumed_sql: String,
+    tail_offset: usize,
+    step_mode: PreparedStepMode,
+    column_count: c_int,
+}
+
+fn validate_and_classify_prepared_sql(
+    conn: &Connection,
+    sql: &str,
+) -> Result<Option<PreparedSqlInfo>, FrankenError> {
+    let Some((statement, tail_offset)) =
+        parse_first_statement_with_tail(sql).map_err(|err| FrankenError::ParseError {
+            offset: err.span.start as usize,
+            detail: err.message,
+        })?
+    else {
+        return Ok(None);
+    };
+    let consumed_sql = &sql[..tail_offset];
+    let step_mode = prepared_step_mode(&statement);
+    let column_count = if can_prepare_statement(&statement) {
+        let prepared = conn.prepare(consumed_sql)?;
+        c_int::try_from(prepared.column_count()).unwrap_or(c_int::MAX)
+    } else {
+        0
+    };
+
+    Ok(Some(PreparedSqlInfo {
+        consumed_sql: consumed_sql.to_owned(),
+        tail_offset,
+        step_mode,
+        column_count,
+    }))
 }
 
 unsafe fn write_error_message(errmsg: *mut *mut c_char, message: &str) {
@@ -290,6 +369,14 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut Sqlite3) -> c_int {
     tracing::info!(target: "fsqlite.compat", "sqlite3_close");
 
     let handle = Box::from_raw(db);
+    if handle.active_statement_count() != 0 {
+        handle.set_error_message_and_code(
+            "unable to close due to unfinalized statements",
+            SQLITE_BUSY,
+        );
+        let _ = Box::into_raw(handle);
+        return SQLITE_BUSY;
+    }
     match handle.conn.close() {
         Ok(()) => SQLITE_OK,
         Err(e) => {
@@ -504,65 +591,63 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         *pz_tail = std::ptr::null();
     }
 
-    let sql_str = if n_byte < 0 {
+    let handle = &*db;
+    let source = if n_byte < 0 {
         if let Ok(s) = CStr::from_ptr(sql).to_str() {
-            s.to_owned()
+            s
         } else {
             let err = FrankenError::ParseError {
                 offset: 0,
                 detail: "SQL text is not valid UTF-8".to_owned(),
             };
-            (&*db).set_error(&err);
+            handle.set_error(&err);
             return error_to_code(&err);
         }
     } else {
         let slice = std::slice::from_raw_parts(sql.cast::<u8>(), n_byte as usize);
-        // Find the first nul if present, otherwise take the whole slice.
         let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
         if let Ok(s) = std::str::from_utf8(&slice[..end]) {
-            s.to_owned()
+            s
         } else {
             let err = FrankenError::ParseError {
                 offset: 0,
                 detail: "SQL text is not valid UTF-8".to_owned(),
             };
-            (&*db).set_error(&err);
+            handle.set_error(&err);
             return error_to_code(&err);
         }
     };
 
-    if sql_str.trim().is_empty() {
-        (&*db).clear_error();
-        return SQLITE_OK;
-    }
-
-    tracing::info!(target: "fsqlite.compat", sql = %sql_str, "sqlite3_prepare_v2");
-
-    // Validate the SQL by preparing it through the Rust API.
-    let handle = &*db;
-    match handle.conn.prepare(&sql_str) {
-        Ok(_prepared) => {
+    let source_len = source.len();
+    match validate_and_classify_prepared_sql(&handle.conn, source) {
+        Ok(Some(info)) => {
+            tracing::info!(
+                target: "fsqlite.compat",
+                sql = %info.consumed_sql,
+                "sqlite3_prepare_v2"
+            );
             handle.clear_error();
             let stmt = Box::new(Sqlite3Stmt {
                 db,
-                sql: sql_str,
+                sql: info.consumed_sql,
+                step_mode: info.step_mode,
                 rows: None,
                 cursor: 0,
-                column_count: 0,
+                column_count: info.column_count,
                 text_cache: Vec::new(),
             });
+            handle.register_statement();
             *pp_stmt = Box::into_raw(stmt);
-
-            // Set pz_tail to point past the end of the consumed SQL.
             if !pz_tail.is_null() {
-                // For simplicity, we consume the entire input.
-                if n_byte < 0 {
-                    *pz_tail = sql.add(CStr::from_ptr(sql).to_bytes().len());
-                } else {
-                    *pz_tail = sql.add(n_byte as usize);
-                }
+                *pz_tail = sql.add(info.tail_offset);
             }
-
+            SQLITE_OK
+        }
+        Ok(None) => {
+            handle.clear_error();
+            if !pz_tail.is_null() {
+                *pz_tail = sql.add(source_len);
+            }
             SQLITE_OK
         }
         Err(e) => {
@@ -598,28 +683,45 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
     if s.rows.is_none() {
         tracing::info!(target: "fsqlite.compat", sql = %s.sql, "sqlite3_step (first call)");
 
-        match db.conn.query(&s.sql) {
-            Ok(rows) => {
-                db.clear_error();
-                db.refresh_last_changes();
-                if let Some(first) = rows.first() {
-                    s.column_count = first.values().len() as c_int;
+        match s.step_mode {
+            PreparedStepMode::Query => match db.conn.query(&s.sql) {
+                Ok(rows) => {
+                    db.clear_error();
+                    db.refresh_last_changes();
+                    if s.column_count == 0 {
+                        if let Some(first) = rows.first() {
+                            s.column_count = first.values().len() as c_int;
+                        }
+                    }
+                    s.rows = Some(rows);
+                    s.cursor = 0;
                 }
-                s.rows = Some(rows);
-                s.cursor = 0;
-            }
-            Err(ref e) if matches!(e, FrankenError::QueryReturnedNoRows) => {
-                db.clear_error();
-                db.refresh_last_changes();
-                s.rows = Some(Vec::new());
-                s.cursor = 0;
-                s.column_count = 0;
-            }
-            Err(e) => {
-                tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_step failed");
-                db.set_error(&e);
-                return error_to_code(&e);
-            }
+                Err(ref e) if matches!(e, FrankenError::QueryReturnedNoRows) => {
+                    db.clear_error();
+                    db.refresh_last_changes();
+                    s.rows = Some(Vec::new());
+                    s.cursor = 0;
+                }
+                Err(e) => {
+                    tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_step failed");
+                    db.set_error(&e);
+                    return error_to_code(&e);
+                }
+            },
+            PreparedStepMode::Execute => match db.conn.execute(&s.sql) {
+                Ok(_) => {
+                    db.clear_error();
+                    db.refresh_last_changes();
+                    s.rows = Some(Vec::new());
+                    s.cursor = 0;
+                    s.text_cache.clear();
+                }
+                Err(e) => {
+                    tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_step failed");
+                    db.set_error(&e);
+                    return error_to_code(&e);
+                }
+            },
         }
     }
 
@@ -662,7 +764,11 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut Sqlite3Stmt) -> c_int {
 
     tracing::info!(target: "fsqlite.compat", "sqlite3_finalize");
 
-    drop(Box::from_raw(stmt));
+    let stmt = Box::from_raw(stmt);
+    if !stmt.db.is_null() {
+        (&*stmt.db).release_statement();
+    }
+    drop(stmt);
     SQLITE_OK
 }
 
@@ -681,7 +787,6 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut Sqlite3Stmt) -> c_int {
     let s = &mut *stmt;
     s.rows = None;
     s.cursor = 0;
-    s.column_count = 0;
     s.text_cache.clear();
     SQLITE_OK
 }
@@ -1318,6 +1423,77 @@ mod tests {
     }
 
     #[test]
+    fn test_prepare_uses_first_statement_and_sets_tail() {
+        unsafe {
+            let db = open_memory();
+
+            let sql = CString::new("SELECT 99; SELECT 100;").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            let mut tail: *const c_char = ptr::null();
+            let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, &mut tail);
+            assert_eq!(rc, SQLITE_OK);
+            assert!(!stmt.is_null());
+            assert!(!tail.is_null());
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 99);
+            assert_eq!(CStr::from_ptr(tail).to_str().unwrap(), " SELECT 100;");
+
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_prepare_trigger_consumes_full_trigger_statement() {
+        unsafe {
+            let db = open_memory();
+
+            let setup =
+                CString::new("CREATE TABLE t(id INTEGER); CREATE TABLE audit(msg TEXT);").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let sql = CString::new(
+                "CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO audit VALUES('first'); INSERT INTO audit VALUES('second'); END; SELECT 1;",
+            )
+            .unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            let mut tail: *const c_char = ptr::null();
+            assert_eq!(
+                sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, &mut tail),
+                SQLITE_OK
+            );
+            assert!(!stmt.is_null());
+            assert!(!tail.is_null());
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(CStr::from_ptr(tail).to_str().unwrap(), " SELECT 1;");
+            sqlite3_finalize(stmt);
+
+            let fire = CString::new("INSERT INTO t VALUES(1);").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, fire.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let verify = CString::new("SELECT COUNT(*) FROM audit;").unwrap();
+            let mut verify_stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, verify.as_ptr(), -1, &mut verify_stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(verify_stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(verify_stmt, 0), 2);
+
+            sqlite3_finalize(verify_stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
     fn test_prepare_with_n_byte() {
         unsafe {
             let db = open_memory();
@@ -1337,6 +1513,94 @@ mod tests {
             assert_eq!(sqlite3_column_int64(stmt, 0), 99);
 
             sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_close_with_unfinalized_statement_returns_busy() {
+        unsafe {
+            let db = open_memory();
+
+            let sql = CString::new("SELECT 1;").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert!(!stmt.is_null());
+
+            let rc = sqlite3_close(db);
+            assert_eq!(rc, SQLITE_BUSY);
+            assert_eq!(sqlite3_errcode(db), SQLITE_BUSY);
+            let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
+            assert!(msg.contains("unfinalized statements"));
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 1);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_column_count_preserved_for_empty_result_and_reset() {
+        unsafe {
+            let db = open_memory();
+
+            let sql = CString::new("SELECT 1 WHERE 0;").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert!(!stmt.is_null());
+
+            assert_eq!(sqlite3_column_count(stmt), 1);
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_column_count(stmt), 1);
+
+            assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_column_count(stmt), 1);
+
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_prepared_insert_steps_through_execute_path() {
+        unsafe {
+            let db = open_memory();
+
+            let setup = CString::new("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);").unwrap();
+            assert_eq!(
+                sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let sql = CString::new("INSERT INTO t VALUES(1, 'a');").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert!(!stmt.is_null());
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_changes(db), 1);
+            sqlite3_finalize(stmt);
+
+            let verify = CString::new("SELECT COUNT(*) FROM t;").unwrap();
+            let mut verify_stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, verify.as_ptr(), -1, &mut verify_stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(verify_stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(verify_stmt, 0), 1);
+
+            sqlite3_finalize(verify_stmt);
             sqlite3_close(db);
         }
     }

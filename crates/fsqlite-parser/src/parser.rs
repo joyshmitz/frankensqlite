@@ -2011,6 +2011,38 @@ impl Parser {
     }
 }
 
+/// Parse only the first top-level SQL statement from `sql` and report the byte
+/// offset immediately after the consumed statement text.
+///
+/// Returns `Ok(None)` when the input contains no statement text (for example
+/// whitespace, comments, or empty statements only). The returned tail offset is
+/// suitable for `sqlite3_prepare_v2`-style APIs that must leave any remaining
+/// SQL untouched.
+pub fn parse_first_statement_with_tail(
+    sql: &str,
+) -> Result<Option<(Statement, usize)>, ParseError> {
+    let mut parser = Parser::from_sql(sql);
+
+    while parser.eat(&TokenKind::Semicolon) {}
+    if parser.at_eof() {
+        return Ok(None);
+    }
+
+    let statement = parser.parse_statement()?;
+    let tail_offset = if parser.eat(&TokenKind::Semicolon) {
+        parser
+            .tokens
+            .get(parser.pos.saturating_sub(1))
+            .map_or(sql.len(), |token| token.span.end as usize)
+    } else {
+        parser
+            .current()
+            .map_or(sql.len(), |token| token.span.start as usize)
+    };
+
+    Ok(Some((statement, tail_offset)))
+}
+
 // ---------------------------------------------------------------------------
 // Keyword classification helper
 // ---------------------------------------------------------------------------
