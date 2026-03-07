@@ -28,6 +28,7 @@ members = [
     "crates/fsqlite-e2e",
     "crates/fsqlite-observability",
     "crates/fsqlite-c-api",
+    "crates/fsqlite-wasm",
 ]
 
 [workspace.package]
@@ -108,7 +109,7 @@ unnecessary_literal_bound = { level = "allow", priority = 1 }
 
 [workspace.dependencies]
 # Internal crates
-fsqlite-types = { version = "0.1.1", path = "crates/fsqlite-types" }
+fsqlite-types = { version = "0.1.1", path = "crates/fsqlite-types", default-features = false }
 fsqlite-error = { version = "0.1.1", path = "crates/fsqlite-error" }
 fsqlite-vfs = { version = "0.1.2", path = "crates/fsqlite-vfs" }
 fsqlite-pager = { version = "0.1.1", path = "crates/fsqlite-pager" }
@@ -134,6 +135,7 @@ fsqlite-harness = { version = "0.1.0", path = "crates/fsqlite-harness" }
 fsqlite-e2e = { version = "0.1.0", path = "crates/fsqlite-e2e" }
 fsqlite-observability = { version = "0.1.1", path = "crates/fsqlite-observability" }
 fsqlite-c-api = { version = "0.1.1", path = "crates/fsqlite-c-api" }
+fsqlite-wasm = { version = "0.1.0", path = "crates/fsqlite-wasm" }
 
 # External dependencies
 ftui = { version = "0.2.1" }

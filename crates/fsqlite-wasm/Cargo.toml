@@ -1,6 +1,22 @@
 [package]
 name = "fsqlite-wasm"
 version = "0.1.0"
-edition = "2024"
+description = "WebAssembly bindings for FrankenSQLite"
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+fsqlite-types = { workspace = true }
+fsqlite-error = { workspace = true }
+fsqlite-ast = { workspace = true }
+fsqlite-parser = { workspace = true }
+fsqlite-planner = { workspace = true }
+fsqlite-func = { workspace = true }
+
+[lints]
+workspace = true

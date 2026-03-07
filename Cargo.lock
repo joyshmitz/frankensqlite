@@ -1123,6 +1123,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fsqlite-wasm"
+version = "0.1.0"
+dependencies = [
+ "fsqlite-ast",
+ "fsqlite-error",
+ "fsqlite-func",
+ "fsqlite-parser",
+ "fsqlite-planner",
+ "fsqlite-types",
+]
+
+[[package]]
 name = "ftui"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

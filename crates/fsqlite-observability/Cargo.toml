@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-fsqlite-types = { workspace = true }
+fsqlite-types = { workspace = true, features = ["native"] }
 parking_lot = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }

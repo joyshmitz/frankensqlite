@@ -11,7 +11,7 @@ rust-version.workspace = true
 default = []
 
 [dependencies]
-fsqlite-types = { workspace = true }
+fsqlite-types = { workspace = true, features = ["native"] }
 fsqlite-error = { workspace = true }
 fsqlite-vfs = { workspace = true }
 fsqlite-pager = { workspace = true }

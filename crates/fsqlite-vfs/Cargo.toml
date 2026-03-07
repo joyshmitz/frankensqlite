@@ -14,7 +14,7 @@ linux-asupersync-uring = ["dep:asupersync", "dep:pollster"]
 linux-uring-fs = ["dep:uring-fs", "dep:pollster"]
 
 [dependencies]
-fsqlite-types = { workspace = true }
+fsqlite-types = { workspace = true, features = ["native"] }
 fsqlite-error = { workspace = true }
 fsqlite-observability = { workspace = true }
 asupersync = { workspace = true, optional = true, features = ["io-uring"] }

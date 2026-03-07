@@ -30,7 +30,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+#[cfg(feature = "native")]
 use asupersync::Cx as NativeCx;
+#[cfg(feature = "native")]
 use asupersync::types::{CancelKind as NativeCancelKind, CancelReason as NativeCancelReason};
 
 use crate::eprocess::EProcessOracle;
@@ -298,6 +300,7 @@ struct CxInner {
     children: Mutex<Vec<Weak<Self>>>,
     last_checkpoint_msg: Mutex<Option<String>>,
     eprocess_oracle: std::sync::OnceLock<Arc<EProcessOracle>>,
+    #[cfg(feature = "native")]
     native_cx: std::sync::OnceLock<NativeCx>,
     // Deterministic clock: milliseconds since epoch for tests.
     unix_millis: AtomicU64,
@@ -313,12 +316,14 @@ impl CxInner {
             children: Mutex::new(Vec::new()),
             last_checkpoint_msg: Mutex::new(None),
             eprocess_oracle: std::sync::OnceLock::new(),
+            #[cfg(feature = "native")]
             native_cx: std::sync::OnceLock::new(),
             unix_millis: AtomicU64::new(0),
         }
     }
 }
 
+#[cfg(feature = "native")]
 #[must_use]
 fn local_reason_to_native(reason: CancelReason) -> NativeCancelReason {
     match reason {
@@ -329,6 +334,7 @@ fn local_reason_to_native(reason: CancelReason) -> NativeCancelReason {
     }
 }
 
+#[cfg(feature = "native")]
 #[must_use]
 fn native_reason_to_local(reason: &NativeCancelReason) -> CancelReason {
     match reason.kind {
@@ -346,6 +352,7 @@ fn native_reason_to_local(reason: &NativeCancelReason) -> CancelReason {
     }
 }
 
+#[cfg(feature = "native")]
 fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
     if let Some(native) = inner.native_cx.get() {
         native.set_cancel_reason(local_reason_to_native(reason));
@@ -385,6 +392,7 @@ fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
 
     // Keep attached native asupersync context in sync so downstream combinators
     // observe equivalent cancellation semantics.
+    #[cfg(feature = "native")]
     sync_native_cx_cancel(inner, reason);
 
     // Collect children (release lock before recursing).
@@ -654,6 +662,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     }
 
     /// Attach a native asupersync context used by [`Self::checkpoint`].
+    #[cfg(feature = "native")]
     pub fn set_native_cx(&self, native_cx: NativeCx) {
         if let Some(reason) = self.cancel_reason() {
             native_cx.set_cancel_reason(local_reason_to_native(reason));
@@ -664,6 +673,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     }
 
     /// Remove the currently attached native asupersync context.
+    #[cfg(feature = "native")]
     pub fn clear_native_cx(&self) {
         // OnceLock cannot be easily cleared. We just leave it as is.
     }
@@ -680,6 +690,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         false
     }
 
+    #[cfg(feature = "native")]
     #[must_use]
     fn maybe_cancel_via_native_cx(&self, masked: bool) -> bool {
         let Some(native) = self.inner.native_cx.get() else {
@@ -722,9 +733,14 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         let masked = self.inner.mask_depth.load(Ordering::Acquire) > 0;
 
         // Fast path: not cancelled and no oracle-based shedding signal.
+        #[cfg(feature = "native")]
+        let native_cancel = self.maybe_cancel_via_native_cx(masked);
+        #[cfg(not(feature = "native"))]
+        let native_cancel = false;
+
         if !self.inner.cancel_requested.load(Ordering::Acquire)
             && !self.maybe_cancel_via_eprocess()
-            && !self.maybe_cancel_via_native_cx(masked)
+            && !native_cancel
         {
             return Ok(());
         }
@@ -1194,6 +1210,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Cancelled);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn test_cx_checkpoint_native_cx_cancellation_maps_reason() {
         let cx = Cx::<FullCaps>::new();
@@ -1206,6 +1223,7 @@ mod tests {
         assert_eq!(cx.cancel_reason(), Some(CancelReason::Timeout));
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn test_cx_cancel_reason_propagates_to_native_cx() {
         let cx = Cx::<FullCaps>::new();
@@ -1219,6 +1237,7 @@ mod tests {
         assert_eq!(reason.kind, NativeCancelKind::ParentCancelled);
     }
 
+    #[cfg(feature = "native")]
     #[test]
     fn test_cx_checkpoint_native_cx_respects_local_masking() {
         let cx = Cx::<FullCaps>::new();

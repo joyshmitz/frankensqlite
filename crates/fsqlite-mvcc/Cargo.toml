@@ -10,7 +10,7 @@ rust-version.workspace = true
 [dependencies]
 blake3 = { workspace = true }
 crossbeam-epoch = { workspace = true }
-fsqlite-types = { workspace = true }
+fsqlite-types = { workspace = true, features = ["native"] }
 fsqlite-error = { workspace = true }
 fsqlite-observability = { workspace = true }
 fsqlite-pager = { workspace = true }

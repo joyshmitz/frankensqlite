@@ -12,7 +12,7 @@ rust-version.workspace = true
 asupersync.workspace = true
 fsqlite = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-types = { workspace = true }
+fsqlite-types = { workspace = true, features = ["native"] }
 fsqlite-vfs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -44,7 +44,7 @@ fsqlite-mvcc = { workspace = true }
 fsqlite-pager = { workspace = true }
 fsqlite-parser = { workspace = true }
 fsqlite-planner = { workspace = true }
-fsqlite-types = { workspace = true }
+fsqlite-types = { workspace = true, features = ["native"] }
 fsqlite-vdbe = { workspace = true }
 fsqlite-wal = { workspace = true }
 
