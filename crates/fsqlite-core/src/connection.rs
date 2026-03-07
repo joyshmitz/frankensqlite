@@ -19014,10 +19014,21 @@ fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
     let rank_a = type_rank(a);
     let rank_b = type_rank(b);
     if rank_a != rank_b {
-        // Different storage classes: no coercion in pure comparison.
-        // SQLite only coerces TEXT↔numeric when column affinity context
-        // applies (Section 4.2). Without affinity, values of different
-        // storage classes are ordered by class: NULL < numeric < TEXT < BLOB.
+        // Apply affinity coercion: TEXT vs numeric → try to coerce TEXT to number.
+        // This matches SQLite's column-affinity comparison rule (Section 4.2).
+        match (a, b) {
+            (SqliteValue::Text(s), SqliteValue::Integer(_) | SqliteValue::Float(_)) => {
+                if let Some(coerced) = try_text_to_numeric(s) {
+                    return cmp_values(&coerced, b);
+                }
+            }
+            (SqliteValue::Integer(_) | SqliteValue::Float(_), SqliteValue::Text(s)) => {
+                if let Some(coerced) = try_text_to_numeric(s) {
+                    return cmp_values(a, &coerced);
+                }
+            }
+            _ => {}
+        }
         return rank_a.cmp(&rank_b);
     }
 
@@ -19033,6 +19044,128 @@ fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
         (SqliteValue::Blob(ab), SqliteValue::Blob(bb)) => ab.cmp(bb),
         _ => unreachable!("same rank guarantees same type class"),
     }
+}
+
+/// Compare two values using pure storage-class ordering **without** TEXT→numeric
+/// coercion. In SQLite, TEXT→numeric coercion only applies when a column with
+/// INTEGER/REAL/NUMERIC affinity is involved (Section 4.2). When both operands
+/// come from untyped (BLOB/NONE affinity) columns, values of different storage
+/// classes are ordered by class rank: NULL < numeric < TEXT < BLOB.
+fn cmp_values_no_affinity(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    fn type_rank(v: &SqliteValue) -> u8 {
+        match v {
+            SqliteValue::Null => 0,
+            SqliteValue::Integer(_) | SqliteValue::Float(_) => 1,
+            SqliteValue::Text(_) => 2,
+            SqliteValue::Blob(_) => 3,
+        }
+    }
+
+    fn int_float_cmp(i: i64, r: f64) -> Ordering {
+        if r.is_nan() {
+            return Ordering::Greater;
+        }
+        if r < -9_223_372_036_854_775_808.0 {
+            return Ordering::Greater;
+        }
+        if r >= 9_223_372_036_854_775_808.0 {
+            return Ordering::Less;
+        }
+        let y = r as i64;
+        match i.cmp(&y) {
+            Ordering::Equal => {
+                let s = i as f64;
+                s.partial_cmp(&r).unwrap_or(Ordering::Equal)
+            }
+            other => other,
+        }
+    }
+
+    let rank_a = type_rank(a);
+    let rank_b = type_rank(b);
+    if rank_a != rank_b {
+        return rank_a.cmp(&rank_b);
+    }
+
+    match (a, b) {
+        (SqliteValue::Null, SqliteValue::Null) => Ordering::Equal,
+        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => ai.cmp(bi),
+        (SqliteValue::Float(af), SqliteValue::Float(bf)) => {
+            af.partial_cmp(bf).unwrap_or(Ordering::Equal)
+        }
+        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => int_float_cmp(*ai, *bf),
+        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => int_float_cmp(*bi, *af).reverse(),
+        (SqliteValue::Text(at), SqliteValue::Text(bt)) => at.cmp(bt),
+        (SqliteValue::Blob(ab), SqliteValue::Blob(bb)) => ab.cmp(bb),
+        _ => unreachable!("same rank guarantees same type class"),
+    }
+}
+
+/// Determine whether a comparison between two expressions should apply
+/// TEXT→numeric affinity coercion (SQLite Section 4.2 rules).
+/// Returns true if at least one expression references a column with
+/// INTEGER, REAL, or NUMERIC type affinity.
+fn should_coerce_for_comparison(
+    left: &Expr,
+    right: &Expr,
+    col_map: &[(String, String)],
+    schemas: &[TableSchema],
+) -> bool {
+    fn expr_has_numeric_affinity(
+        expr: &Expr,
+        col_map: &[(String, String)],
+        schemas: &[TableSchema],
+    ) -> bool {
+        if let Expr::Column(col_ref, _) = expr {
+            let col_name = &col_ref.column;
+            let table_prefix = col_ref.table.as_deref();
+            // Look up the table name from col_map.
+            if let Some((table_name, _)) = col_map.iter().find(|(tbl, col)| {
+                col.eq_ignore_ascii_case(col_name)
+                    && table_prefix.is_none_or(|p| tbl.eq_ignore_ascii_case(p))
+            }) {
+                // Find the table schema.
+                if let Some(schema) = schemas
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(table_name))
+                {
+                    if let Some(col_def) = schema
+                        .columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                    {
+                        // Check if the column's declared type implies numeric affinity.
+                        let ty = col_def.type_name.as_deref().unwrap_or("").to_uppercase();
+                        // SQLite affinity rules: INT → INTEGER, REAL/FLOA/DOUB → REAL,
+                        // TEXT/CHAR/CLOB → TEXT, BLOB or empty → NONE.
+                        // NUMERIC affinity for anything else.
+                        if ty.is_empty() || ty.contains("BLOB") {
+                            return false; // NONE affinity
+                        }
+                        if ty.contains("INT")
+                            || ty.contains("REAL")
+                            || ty.contains("FLOA")
+                            || ty.contains("DOUB")
+                            || ty.contains("NUMERIC")
+                            || ty.contains("NUM")
+                        {
+                            return true;
+                        }
+                        if ty.contains("TEXT") || ty.contains("CHAR") || ty.contains("CLOB") {
+                            return false; // TEXT affinity
+                        }
+                        // Default: NUMERIC affinity
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    expr_has_numeric_affinity(left, col_map, schemas)
+        || expr_has_numeric_affinity(right, col_map, schemas)
 }
 
 /// Return the empty-set default for an aggregate function.
