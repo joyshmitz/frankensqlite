@@ -26,6 +26,7 @@ use fsqlite_ast::{
     FunctionArgs, GeneratedStorage, InSet, JoinConstraint, JoinKind, LikeOp, LimitClause, Literal,
     NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, ResultColumn, SelectBody, SelectCore,
     SelectStatement, SortDirection, Span, Statement, TableConstraintKind, TableOrSubquery, UnaryOp,
+    WindowSpec,
 };
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
@@ -12694,6 +12695,11 @@ impl Connection {
         enum ColKind {
             Plain(Expr),
             Window(usize),
+            /// Outer expression wrapping a window function.  The `usize` is the
+            /// index into `win_funcs`, and the `Expr` is the outer expression
+            /// with the inner window call replaced by a placeholder column ref
+            /// `__win_result__`.
+            WrappedWindow(usize, Expr),
         }
         let registry = self.func_registry.borrow().clone();
         let mut col_kinds = Vec::with_capacity(expanded_columns.len());
@@ -12769,6 +12775,65 @@ impl Connection {
                     win_func_names.push(upper);
                     win_frame_specs.push(spec.frame.clone());
                     col_kinds.push(ColKind::Window(idx));
+                }
+                ResultColumn::Expr { expr, .. } if expr_has_window_function(expr) => {
+                    // The expression contains a nested window function
+                    // (e.g., ROUND(AVG(val) OVER (...), 2)).  Extract the
+                    // inner window call, register it, and wrap the outer
+                    // expression with a placeholder.
+                    let (inner_name, inner_args, inner_spec) = extract_inner_window_function(expr)
+                        .ok_or_else(|| {
+                            FrankenError::Internal(
+                                "expr_has_window_function=true but cannot extract".to_owned(),
+                            )
+                        })?;
+                    let arg_exprs = match &inner_args {
+                        FunctionArgs::List(exprs) => exprs.clone(),
+                        FunctionArgs::Star => vec![],
+                    };
+                    #[allow(clippy::cast_possible_wrap)]
+                    let num_args = arg_exprs.len() as i32;
+                    let func = registry.find_window(&inner_name, num_args).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "no such window function: {inner_name}/{num_args}"
+                        ))
+                    })?;
+                    let ob: Vec<(Expr, bool)> = inner_spec
+                        .order_by
+                        .iter()
+                        .map(|t| {
+                            (
+                                t.expr.clone(),
+                                matches!(t.direction, Some(SortDirection::Desc)),
+                            )
+                        })
+                        .collect();
+                    let pb = inner_spec.partition_by.clone();
+                    let upper = inner_name.to_ascii_uppercase();
+                    let needs_full_partition = matches!(
+                        upper.as_str(),
+                        "LEAD"
+                            | "NTILE"
+                            | "PERCENT_RANK"
+                            | "CUME_DIST"
+                            | "FIRST_VALUE"
+                            | "LAST_VALUE"
+                            | "NTH_VALUE"
+                    );
+                    let aggregate_no_order =
+                        !needs_full_partition && inner_spec.order_by.is_empty();
+                    let two_pass = needs_full_partition || aggregate_no_order;
+                    let idx = win_funcs.len();
+                    win_funcs.push(func);
+                    win_args.push(arg_exprs);
+                    win_order_by.push(ob);
+                    win_partition_by.push(pb);
+                    win_two_pass.push(two_pass);
+                    win_func_names.push(upper);
+                    win_frame_specs.push(inner_spec.frame.clone());
+                    // Replace the inner window call with a placeholder in the outer expr.
+                    let outer_with_placeholder = replace_window_with_placeholder(expr);
+                    col_kinds.push(ColKind::WrappedWindow(idx, outer_with_placeholder));
                 }
                 ResultColumn::Expr { expr, .. } => {
                     col_kinds.push(ColKind::Plain(expr.clone()));
@@ -13176,6 +13241,17 @@ impl Connection {
                             &mut window_results[*wi][ri],
                             SqliteValue::Null,
                         ));
+                    }
+                    ColKind::WrappedWindow(wi, outer_expr) => {
+                        // Substitute the window result into the placeholder
+                        // column and evaluate the outer expression.
+                        let win_val =
+                            std::mem::replace(&mut window_results[*wi][ri], SqliteValue::Null);
+                        let substituted = substitute_placeholder_value(outer_expr, &win_val);
+                        values.push(
+                            eval_join_expr(&substituted, row, &col_map)
+                                .unwrap_or(SqliteValue::Null),
+                        );
                     }
                 }
             }
@@ -15360,13 +15436,240 @@ fn has_window_functions(select: &SelectStatement) -> bool {
 fn expr_has_window_function(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { over: Some(_), .. } => true,
+        Expr::FunctionCall { args, filter, .. } => {
+            let in_args = match args {
+                FunctionArgs::List(exprs) => exprs.iter().any(expr_has_window_function),
+                FunctionArgs::Star => false,
+            };
+            in_args || filter.as_deref().is_some_and(expr_has_window_function)
+        }
         Expr::BinaryOp { left, right, .. } => {
             expr_has_window_function(left) || expr_has_window_function(right)
         }
         Expr::UnaryOp { expr: inner, .. } | Expr::Cast { expr: inner, .. } => {
             expr_has_window_function(inner)
         }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_has_window_function)
+                || whens
+                    .iter()
+                    .any(|(w, t)| expr_has_window_function(w) || expr_has_window_function(t))
+                || else_expr.as_deref().is_some_and(expr_has_window_function)
+        }
         _ => false,
+    }
+}
+
+/// Extract the first window function found nested inside an expression.
+/// Returns `(function_name, args, window_def)`.
+fn extract_inner_window_function(expr: &Expr) -> Option<(String, FunctionArgs, WindowSpec)> {
+    match expr {
+        Expr::FunctionCall {
+            name,
+            args,
+            over: Some(spec),
+            ..
+        } => Some((name.clone(), args.clone(), spec.clone())),
+        Expr::FunctionCall { args, filter, .. } => {
+            if let FunctionArgs::List(exprs) = args {
+                for e in exprs {
+                    if let Some(result) = extract_inner_window_function(e) {
+                        return Some(result);
+                    }
+                }
+            }
+            filter.as_deref().and_then(extract_inner_window_function)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            extract_inner_window_function(left).or_else(|| extract_inner_window_function(right))
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::Cast { expr: inner, .. } => {
+            extract_inner_window_function(inner)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(op) = operand {
+                if let Some(r) = extract_inner_window_function(op) {
+                    return Some(r);
+                }
+            }
+            for (w, t) in whens {
+                if let Some(r) = extract_inner_window_function(w) {
+                    return Some(r);
+                }
+                if let Some(r) = extract_inner_window_function(t) {
+                    return Some(r);
+                }
+            }
+            else_expr.as_deref().and_then(extract_inner_window_function)
+        }
+        _ => None,
+    }
+}
+
+/// Replace the first window function call in `expr` with a placeholder
+/// column reference `__win_result__`.
+fn replace_window_with_placeholder(expr: &Expr) -> Expr {
+    match expr {
+        Expr::FunctionCall { over: Some(_), .. } => Expr::Column(
+            ColumnRef::bare("__win_result__".to_owned()),
+            Span::new(0, 0),
+        ),
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            span,
+        } => {
+            let new_args = match args {
+                FunctionArgs::List(exprs) => {
+                    let mut found = false;
+                    let new_exprs: Vec<Expr> = exprs
+                        .iter()
+                        .map(|e| {
+                            if !found && expr_has_window_function(e) {
+                                found = true;
+                                replace_window_with_placeholder(e)
+                            } else {
+                                e.clone()
+                            }
+                        })
+                        .collect();
+                    FunctionArgs::List(new_exprs)
+                }
+                FunctionArgs::Star => FunctionArgs::Star,
+            };
+            Expr::FunctionCall {
+                name: name.clone(),
+                args: new_args,
+                distinct: *distinct,
+                order_by: order_by.clone(),
+                filter: filter.clone(),
+                over: over.clone(),
+                span: *span,
+            }
+        }
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => {
+            if expr_has_window_function(left) {
+                Expr::BinaryOp {
+                    left: Box::new(replace_window_with_placeholder(left)),
+                    op: *op,
+                    right: right.clone(),
+                    span: *span,
+                }
+            } else {
+                Expr::BinaryOp {
+                    left: left.clone(),
+                    op: *op,
+                    right: Box::new(replace_window_with_placeholder(right)),
+                    span: *span,
+                }
+            }
+        }
+        Expr::UnaryOp {
+            op,
+            expr: inner,
+            span,
+        } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(replace_window_with_placeholder(inner)),
+            span: *span,
+        },
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            span,
+        } => Expr::Cast {
+            expr: Box::new(replace_window_with_placeholder(inner)),
+            type_name: type_name.clone(),
+            span: *span,
+        },
+        _ => expr.clone(),
+    }
+}
+
+/// Substitute the `__win_result__` placeholder in an expression with a literal
+/// value computed from the window function.
+fn substitute_placeholder_value(expr: &Expr, val: &SqliteValue) -> Expr {
+    match expr {
+        Expr::Column(cr, _) if cr.column == "__win_result__" => {
+            Expr::Literal(sqlite_value_to_literal(val), Span::new(0, 0))
+        }
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            span,
+        } => {
+            let new_args = match args {
+                FunctionArgs::List(exprs) => FunctionArgs::List(
+                    exprs
+                        .iter()
+                        .map(|e| substitute_placeholder_value(e, val))
+                        .collect(),
+                ),
+                FunctionArgs::Star => FunctionArgs::Star,
+            };
+            Expr::FunctionCall {
+                name: name.clone(),
+                args: new_args,
+                distinct: *distinct,
+                order_by: order_by.clone(),
+                filter: filter.clone(),
+                over: over.clone(),
+                span: *span,
+            }
+        }
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Expr::BinaryOp {
+            left: Box::new(substitute_placeholder_value(left, val)),
+            op: *op,
+            right: Box::new(substitute_placeholder_value(right, val)),
+            span: *span,
+        },
+        Expr::UnaryOp {
+            op,
+            expr: inner,
+            span,
+        } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(substitute_placeholder_value(inner, val)),
+            span: *span,
+        },
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            span,
+        } => Expr::Cast {
+            expr: Box::new(substitute_placeholder_value(inner, val)),
+            type_name: type_name.clone(),
+            span: *span,
+        },
+        _ => expr.clone(),
     }
 }
 
@@ -67056,10 +67359,7 @@ mod pager_routing_tests {
             rconn.execute_batch(s).unwrap();
         }
 
-        let queries = [
-            "SELECT * FROM t ORDER BY id",
-            "SELECT COUNT(*) FROM t",
-        ];
+        let queries = ["SELECT * FROM t ORDER BY id", "SELECT COUNT(*) FROM t"];
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
@@ -67087,10 +67387,7 @@ mod pager_routing_tests {
             for m in &mismatches2 {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} replace unique conflict mismatches",
-                mismatches2.len()
-            );
+            panic!("{} replace unique conflict mismatches", mismatches2.len());
         }
     }
 
@@ -67228,9 +67525,7 @@ mod pager_routing_tests {
         fconn.execute(dml).unwrap();
         rconn.execute_batch(dml).unwrap();
 
-        let queries = [
-            "SELECT product, qty FROM inventory ORDER BY product",
-        ];
+        let queries = ["SELECT product, qty FROM inventory ORDER BY product"];
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
@@ -67419,9 +67714,7 @@ mod pager_routing_tests {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let setup = [
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)",
-        ];
+        let setup = ["CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)"];
         for s in &setup {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -67443,10 +67736,7 @@ mod pager_routing_tests {
             rconn.execute_batch(s).unwrap();
         }
 
-        let queries = [
-            "SELECT * FROM t ORDER BY id",
-            "SELECT COUNT(*) FROM t",
-        ];
+        let queries = ["SELECT * FROM t ORDER BY id", "SELECT COUNT(*) FROM t"];
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
@@ -67533,10 +67823,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} case complex agg subquery mismatches",
-                mismatches.len()
-            );
+            panic!("{} case complex agg subquery mismatches", mismatches.len());
         }
     }
 
@@ -67628,10 +67915,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} string func comprehensive mismatches",
-                mismatches.len()
-            );
+            panic!("{} string func comprehensive mismatches", mismatches.len());
         }
     }
 
@@ -67700,10 +67984,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} cast comprehensive matrix mismatches",
-                mismatches.len()
-            );
+            panic!("{} cast comprehensive matrix mismatches", mismatches.len());
         }
     }
 
@@ -67768,10 +68049,7 @@ mod pager_routing_tests {
         fconn.execute(dml).unwrap();
         rconn.execute_batch(dml).unwrap();
 
-        let queries = [
-            "SELECT * FROM t1 ORDER BY id",
-            "SELECT COUNT(*) FROM t1",
-        ];
+        let queries = ["SELECT * FROM t1 ORDER BY id", "SELECT COUNT(*) FROM t1"];
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
@@ -67806,9 +68084,7 @@ mod pager_routing_tests {
         fconn.execute(dml).unwrap();
         rconn.execute_batch(dml).unwrap();
 
-        let queries = [
-            "SELECT name, price FROM products ORDER BY id",
-        ];
+        let queries = ["SELECT name, price FROM products ORDER BY id"];
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
@@ -67860,9 +68136,7 @@ mod pager_routing_tests {
             .execute_batch("UPDATE t SET c = 'updated' WHERE a = 1 AND b = 1")
             .unwrap();
 
-        let queries2 = [
-            "SELECT * FROM t ORDER BY a, b",
-        ];
+        let queries2 = ["SELECT * FROM t ORDER BY a, b"];
 
         let mismatches2 = oracle_compare(&fconn, &rconn, &queries2);
         if !mismatches2.is_empty() {
