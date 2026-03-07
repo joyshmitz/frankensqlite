@@ -1368,11 +1368,6 @@ impl MemDatabase {
         self.tables.get_mut(&root_page)
     }
 
-    /// Return root pages of all tables (debug helper).
-    pub fn table_root_pages(&self) -> Vec<i32> {
-        self.tables.iter().map(|(k, _)| *k).collect()
-    }
-
     fn push_undo(&mut self, op: MemDbUndoOp) {
         if self.undo_enabled {
             self.undo_log.push(op);
@@ -6461,10 +6456,6 @@ impl VdbeEngine {
             let is_valid_btree =
                 parsed_header.is_some() || (!page_data.is_empty() && page_data[0] != 0x00);
             let is_zero_page = page_data.iter().all(|&byte| byte == 0);
-            let has_mem_table_early = self
-                .db
-                .as_ref()
-                .is_some_and(|db| db.get_table(root_page).is_some());
 
             if is_valid_btree {
                 // Real B-tree backed by pager: infer table-vs-index from the

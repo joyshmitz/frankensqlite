@@ -5568,6 +5568,9 @@ fn test_conformance_cte_multi_reference() {
         // CTE referenced multiple times in the same query (self-join) — cross-join syntax
         "WITH nums AS (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3) \
          SELECT a.n, b.n FROM nums a, nums b WHERE a.n < b.n ORDER BY a.n, b.n",
+        // CTE self-join via explicit JOIN ON (was failing due to stale root_page in VDBE cache)
+        "WITH nums AS (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5) \
+         SELECT a.v, b.v FROM nums a JOIN nums b ON a.v + b.v = 6 ORDER BY a.v",
         // Multiple CTEs where one references another
         "WITH \
            base AS (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3), \
@@ -5599,10 +5602,13 @@ fn test_conformance_cte_self_join_explicit() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
-    // Test with just 3 values first
     let queries = &[
+        // 3-value CTE self-join
         "WITH nums AS (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3) \
          SELECT a.v, b.v FROM nums a JOIN nums b ON a.v + b.v = 4 ORDER BY a.v",
+        // 5-value CTE self-join (was failing before fix #83)
+        "WITH nums AS (SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5) \
+         SELECT a.v, b.v FROM nums a JOIN nums b ON a.v + b.v = 6 ORDER BY a.v",
     ];
 
     let mismatches = oracle_compare(&fconn, &rconn, queries);
@@ -6295,13 +6301,11 @@ fn test_conformance_case_aggregate_null() {
     }
 
     let queries = [
-        // Known bug: CASE + AVG in GROUP BY returns NULL for partial-NULL groups
-        // "SELECT student, CASE WHEN AVG(score) >= 80 THEN 'Pass' WHEN AVG(score) IS NOT NULL THEN 'Fail' ELSE 'No scores' END AS status FROM scores GROUP BY student ORDER BY student",
+        "SELECT student, CASE WHEN AVG(score) >= 80 THEN 'Pass' WHEN AVG(score) IS NOT NULL THEN 'Fail' ELSE 'No scores' END AS status FROM scores GROUP BY student ORDER BY student",
         "SELECT student, COUNT(score), COUNT(*) FROM scores GROUP BY student ORDER BY student",
         "SELECT student, COALESCE(SUM(score), 0) AS total FROM scores GROUP BY student ORDER BY student",
         "SELECT subject, MIN(score), MAX(score), AVG(score) FROM scores GROUP BY subject ORDER BY subject",
-        // Known bug: AVG in CASE WHEN in GROUP BY returns NULL
-        // "SELECT student, CASE WHEN COUNT(score) > 0 THEN AVG(score) ELSE -1 END AS avg_or_default FROM scores GROUP BY student ORDER BY student",
+        "SELECT student, CASE WHEN COUNT(score) > 0 THEN AVG(score) ELSE -1 END AS avg_or_default FROM scores GROUP BY student ORDER BY student",
     ];
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);

@@ -3365,6 +3365,17 @@ impl Connection {
                 // materialization inside execute_with_ctes.
                 Ok(statement)
             }
+            Statement::Select(ref select)
+                if is_expression_only_select(select) && expression_only_has_subquery(select) =>
+            {
+                // Expression-only SELECTs with scalar subqueries in result
+                // columns are handled by execute_expression_only_with_subqueries
+                // in dispatch.  Skip the eager rewrite here — evaluating each
+                // subquery via execute_statement would create nested autocommit
+                // transactions that can trigger reload_memdb_from_pager,
+                // destroying CTE temp tables between subquery evaluations.
+                Ok(statement)
+            }
             Statement::Select(select) => {
                 let rewritten = self.rewrite_subqueries(&select, params)?;
                 Ok(Statement::Select(rewritten))
@@ -16357,6 +16368,69 @@ fn eval_group_agg_join_expr(
             } else {
                 Ok(SqliteValue::Null)
             }
+        }
+        Expr::IsNull { expr, not, .. } => {
+            let val = eval_group_agg_join_expr(expr, group_rows, col_map)?;
+            let result = if *not { !val.is_null() } else { val.is_null() };
+            Ok(if result {
+                SqliteValue::Integer(1)
+            } else {
+                SqliteValue::Integer(0)
+            })
+        }
+        Expr::UnaryOp { op, expr, .. } => {
+            let val = eval_group_agg_join_expr(expr, group_rows, col_map)?;
+            match op {
+                UnaryOp::Negate => match &val {
+                    SqliteValue::Integer(n) => Ok(SqliteValue::Integer(n.wrapping_neg())),
+                    SqliteValue::Float(f) => Ok(SqliteValue::Float(-f)),
+                    _ => Ok(SqliteValue::Null),
+                },
+                UnaryOp::Plus => Ok(val),
+                UnaryOp::Not => Ok(SqliteValue::Integer(i64::from(!is_sqlite_truthy(&val)))),
+                UnaryOp::BitNot => match &val {
+                    SqliteValue::Integer(n) => Ok(SqliteValue::Integer(!n)),
+                    _ => Ok(SqliteValue::Null),
+                },
+            }
+        }
+        Expr::In {
+            expr,
+            set: InSet::List(list),
+            not,
+            ..
+        } => {
+            let val = eval_group_agg_join_expr(expr, group_rows, col_map)?;
+            if val.is_null() {
+                return Ok(SqliteValue::Null);
+            }
+            let list_vals: Vec<SqliteValue> = list
+                .iter()
+                .map(|e| eval_group_agg_join_expr(e, group_rows, col_map))
+                .collect::<Result<Vec<_>>>()?;
+            let found = list_vals.iter().any(|lv: &SqliteValue| {
+                !lv.is_null() && cmp_values(&val, lv) == std::cmp::Ordering::Equal
+            });
+            let result = if *not { !found } else { found };
+            Ok(SqliteValue::Integer(i64::from(result)))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            not,
+            ..
+        } => {
+            let val = eval_group_agg_join_expr(expr, group_rows, col_map)?;
+            let lo = eval_group_agg_join_expr(low, group_rows, col_map)?;
+            let hi = eval_group_agg_join_expr(high, group_rows, col_map)?;
+            if val.is_null() || lo.is_null() || hi.is_null() {
+                return Ok(SqliteValue::Null);
+            }
+            let in_range = cmp_values(&val, &lo) != std::cmp::Ordering::Less
+                && cmp_values(&val, &hi) != std::cmp::Ordering::Greater;
+            let result = if *not { !in_range } else { in_range };
+            Ok(SqliteValue::Integer(i64::from(result)))
         }
         // No aggregate sub-expressions: delegate to per-row eval on first row.
         other => {
