@@ -7115,9 +7115,12 @@ fn emit_where_filter(
                 register_base: None,
                 secondary: None,
             };
-            // Check for COLLATE on either operand.
+            // Explicit COLLATE on either operand takes priority, then
+            // column-level collation from the schema (e.g. TEXT COLLATE NOCASE).
             let collation_p4 = extract_collation(left)
                 .or_else(|| extract_collation(right))
+                .or_else(|| column_collation(left, table, table_alias))
+                .or_else(|| column_collation(right, table, table_alias))
                 .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
 
             if let Some(resolved) = resolve_column_ref(left, table, table_alias) {
@@ -7191,6 +7194,8 @@ fn emit_where_filter(
             };
             let collation_p4 = extract_collation(left)
                 .or_else(|| extract_collation(right))
+                .or_else(|| column_collation(left, table, table_alias))
+                .or_else(|| column_collation(right, table, table_alias))
                 .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
 
             // Determine the skip opcode — the inverse of the comparison.
@@ -9394,6 +9399,43 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// Get the column-level collation for an expression from the table schema.
+/// Only checks schema-declared collation (e.g. `TEXT COLLATE NOCASE`), NOT
+/// explicit COLLATE wrappers on the expression — use `extract_collation` for that.
+/// Returns `None` for BINARY (the default) or when the expression is not a column ref.
+fn column_collation<'a>(
+    expr: &'a Expr,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+) -> Option<&'a str> {
+    // Unwrap COLLATE to reach the underlying column ref
+    let inner = if let Expr::Collate { expr: inner, .. } = expr {
+        inner.as_ref()
+    } else {
+        expr
+    };
+    if let Expr::Column(col_ref, _) = inner {
+        if let Some(qualifier) = &col_ref.table {
+            if !matches_table_or_alias(qualifier, table, table_alias) {
+                return None;
+            }
+        }
+        if let Some(idx) = table.column_index(&col_ref.column) {
+            return table.columns[idx].collation.as_deref();
+        }
+    }
+    None
+}
+
+/// Get effective collation via `ScanCtx`: explicit COLLATE first, then column-level.
+fn effective_collation_ctx<'a>(expr: &'a Expr, ctx: Option<&'a ScanCtx<'a>>) -> Option<&'a str> {
+    if let Some(coll) = extract_collation(expr) {
+        return Some(coll);
+    }
+    let ctx = ctx?;
+    column_collation(expr, ctx.table, ctx.table_alias)
+}
+
 /// Emit a comparison expression that produces 1 (true) or 0 (false).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_comparison(
@@ -9425,9 +9467,9 @@ fn emit_comparison(
         return;
     };
 
-    // Check for COLLATE on either operand and propagate to comparison opcode.
-    let p4 = extract_collation(left)
-        .or_else(|| extract_collation(right))
+    // Check for COLLATE on either operand, then column-level collation.
+    let p4 = effective_collation_ctx(left, ctx)
+        .or_else(|| effective_collation_ctx(right, ctx))
         .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
 
     // SQL three-valued logic: if either operand is NULL, the result is NULL.

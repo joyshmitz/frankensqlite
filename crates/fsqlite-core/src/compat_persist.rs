@@ -414,6 +414,7 @@ pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
 
 /// Indexed term metadata used to reconstruct `CREATE INDEX` SQL.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) struct CreateIndexSqlTerm<'a> {
     pub(crate) column_name: &'a str,
     pub(crate) collation: Option<&'a str>,
@@ -421,6 +422,7 @@ pub(crate) struct CreateIndexSqlTerm<'a> {
 }
 
 /// Reconstruct a `CREATE INDEX` statement from index metadata.
+#[allow(dead_code)]
 pub(crate) fn build_create_index_sql(
     index_name: &str,
     table_name: &str,
