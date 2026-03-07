@@ -9767,8 +9767,11 @@ fn emit_comparison(
     b.emit_jump_to_label(Opcode::IsNull, r_left, 0, null_label, P4::None, 0);
     b.emit_jump_to_label(Opcode::IsNull, r_right, 0, null_label, P4::None, 0);
 
+    // Compute comparison affinity for TEXT↔numeric coercion (SQLite §4.2).
+    let cmp_aff = comparison_affinity_p5(left, right, ctx);
+
     // Comparison: p1=rhs_reg, p2=jump_target (label), p3=lhs_reg
-    b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, p4, 0);
+    b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, p4, cmp_aff);
     b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
     b.resolve_label(true_label);
@@ -9929,6 +9932,111 @@ fn emit_case_expr(
     if let Some(r_op) = r_operand {
         b.free_temp(r_op);
     }
+}
+
+/// Determine the type affinity of an expression for comparison coercion.
+/// Returns SQLite affinity codes: A=BLOB, B=TEXT, C=NUMERIC, D=INTEGER, E=REAL.
+fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
+    // Unwrap COLLATE to reach the underlying expression
+    let inner = if let Expr::Collate { expr: inner, .. } = expr {
+        inner.as_ref()
+    } else {
+        expr
+    };
+    match inner {
+        Expr::Column(col_ref, _) => {
+            // Look up column type in the table schema
+            if let Some(ctx) = ctx {
+                // Check primary table
+                let check_table = |table: &TableSchema, alias: Option<&str>| -> Option<u8> {
+                    if let Some(qualifier) = &col_ref.table {
+                        if !matches_table_or_alias(qualifier, table, alias) {
+                            return None;
+                        }
+                    }
+                    table.column_index(&col_ref.column).map(|idx| {
+                        table.columns[idx]
+                            .type_name
+                            .as_deref()
+                            .map_or(b'A', column_type_to_affinity)
+                    })
+                };
+                if let Some(aff) = check_table(ctx.table, ctx.table_alias) {
+                    return aff;
+                }
+                // Check secondary table (UPDATE ... FROM)
+                if let Some(sec) = &ctx.secondary {
+                    if let Some(aff) = check_table(sec.table, sec.table_alias) {
+                        return aff;
+                    }
+                }
+                // Check full schema
+                if let Some(schema) = ctx.schema {
+                    for table in schema {
+                        if let Some(qualifier) = &col_ref.table {
+                            if !table.name.eq_ignore_ascii_case(qualifier) {
+                                continue;
+                            }
+                        }
+                        if let Some(idx) = table.column_index(&col_ref.column) {
+                            return table.columns[idx]
+                                .type_name
+                                .as_deref()
+                                .map_or(b'A', column_type_to_affinity);
+                        }
+                    }
+                }
+            }
+            b'A' // BLOB/NONE affinity if not found
+        }
+        Expr::Literal(lit, _) => match lit {
+            Literal::Integer(_) => b'D',
+            Literal::Float(_) => b'E',
+            Literal::String(_) => b'B',
+            _ => b'A',
+        },
+        Expr::Cast { type_name, .. } => type_name_to_affinity(type_name),
+        _ => b'A', // BLOB/NONE affinity for computed expressions
+    }
+}
+
+/// Determine the column type affinity from a column type string.
+fn column_type_to_affinity(type_name: &str) -> u8 {
+    let name = type_name.to_uppercase();
+    if name.contains("INT") {
+        b'D'
+    } else if name.contains("CHAR") || name.contains("TEXT") || name.contains("CLOB") {
+        b'B'
+    } else if name.contains("BLOB") || name.is_empty() {
+        b'A'
+    } else if name.contains("REAL") || name.contains("FLOA") || name.contains("DOUB") {
+        b'E'
+    } else {
+        b'C'
+    }
+}
+
+/// Compute the comparison affinity P5 value for a binary comparison.
+/// Implements SQLite's Section 4.2 type conversion rules.
+fn comparison_affinity_p5(left: &Expr, right: &Expr, ctx: Option<&ScanCtx<'_>>) -> u16 {
+    let l_aff = expr_affinity(left, ctx);
+    let r_aff = expr_affinity(right, ctx);
+
+    let is_numeric = |a: u8| matches!(a, b'C' | b'D' | b'E');
+
+    // If one has numeric affinity (C/D/E) and the other has TEXT (B) or BLOB (A),
+    // apply NUMERIC affinity to coerce TEXT → number.
+    if is_numeric(l_aff) && matches!(r_aff, b'A' | b'B') {
+        return u16::from(b'C'); // NUMERIC
+    }
+    if is_numeric(r_aff) && matches!(l_aff, b'A' | b'B') {
+        return u16::from(b'C'); // NUMERIC
+    }
+    // If one has TEXT (B) and the other BLOB/NONE (A), apply TEXT affinity.
+    if (l_aff == b'B' && r_aff == b'A') || (l_aff == b'A' && r_aff == b'B') {
+        return u16::from(b'B'); // TEXT
+    }
+    0 // No affinity coercion needed
 }
 
 /// Convert a SQL type name to an affinity character code.
