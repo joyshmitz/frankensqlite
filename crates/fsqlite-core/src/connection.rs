@@ -1077,6 +1077,7 @@ struct DbSnapshot {
     rowid_alias_columns: HashMap<String, usize>,
     autoincrement_tables: HashSet<String>,
     sqlite_sequence_cache: HashMap<String, i64>,
+    original_ddl_sql: HashMap<String, String>,
     next_master_rowid: i64,
     schema_cookie: u32,
 }
@@ -1323,6 +1324,11 @@ pub struct Connection {
     /// `INTEGER PRIMARY KEY` column, which is an alias for `rowid`.
     /// Used by fallback paths (GROUP BY, JOIN) to resolve rowid/\_rowid\_/oid.
     rowid_alias_columns: RefCell<HashMap<String, usize>>,
+    /// Original CREATE TABLE/INDEX/VIEW SQL text, keyed by lowercased
+    /// object name.  Used by `build_sqlite_master_rows` so that
+    /// `SELECT sql FROM sqlite_master` returns the text as written by the user,
+    /// not a regenerated form with gratuitous identifier quoting.
+    original_ddl_sql: RefCell<HashMap<String, String>>,
     /// Set of table names (lowercased) declared as
     /// `INTEGER PRIMARY KEY AUTOINCREMENT`.
     autoincrement_tables: RefCell<HashSet<String>>,
@@ -1495,6 +1501,7 @@ impl Connection {
             concurrent_mode_default: RefCell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
             rowid_alias_columns: RefCell::new(HashMap::new()),
+            original_ddl_sql: RefCell::new(HashMap::new()),
             autoincrement_tables: RefCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             next_master_rowid: RefCell::new(1),
@@ -5731,7 +5738,12 @@ impl Connection {
                 SqliteValue::Text(sql.to_owned()),
             ]);
             cursor.table_insert(cx, rowid, &record)
-        })
+        })?;
+        // Cache original DDL text for sqlite_master sql column queries.
+        self.original_ddl_sql
+            .borrow_mut()
+            .insert(name.to_ascii_lowercase(), sql.to_owned());
+        Ok(())
     }
 
     /// Delete the sqlite_master row whose `name` column matches the given
@@ -6447,7 +6459,7 @@ impl Connection {
                     foreign_keys: fk_defs,
                     check_constraints: check_defs,
                 };
-                let create_sql = render_create_table_sql(&table_schema, is_autoincrement);
+                let create_sql = create.to_string();
                 let rp = table_schema.root_page;
                 let tbl_name = table_schema.name.clone();
                 self.schema.borrow_mut().push(table_schema);
@@ -6834,6 +6846,9 @@ impl Connection {
             }
         };
         if dropped {
+            self.original_ddl_sql
+                .borrow_mut()
+                .remove(&obj_name.to_ascii_lowercase());
             self.increment_schema_cookie();
         }
         Ok(())
@@ -7146,21 +7161,7 @@ impl Connection {
         }
 
         // Phase 6: Persist to sqlite_master
-        let create_sql_terms: Vec<crate::compat_persist::CreateIndexSqlTerm<'_>> = indexed_terms
-            .iter()
-            .map(|term| crate::compat_persist::CreateIndexSqlTerm {
-                column_name: term.column_name.as_str(),
-                collation: term.collation.as_deref(),
-                direction: term.direction,
-            })
-            .collect();
-        let create_sql = crate::compat_persist::build_create_index_sql(
-            &index_name,
-            table_name,
-            stmt.unique,
-            &create_sql_terms,
-            stmt.where_clause.as_ref(),
-        );
+        let create_sql = stmt.to_string();
         self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)?;
 
         self.increment_schema_cookie();
@@ -8133,6 +8134,7 @@ impl Connection {
         let schema = self.schema.borrow();
         let views = self.views.borrow();
         let triggers = self.triggers.borrow();
+        let ddl_cache = self.original_ddl_sql.borrow();
         let mut rows = Vec::new();
 
         for table in schema.iter() {
@@ -8148,32 +8150,47 @@ impl Connection {
                 .borrow()
                 .contains(&table.name.to_ascii_lowercase());
 
+            // Prefer cached original SQL; fall back to regenerated form.
+            let table_sql = ddl_cache
+                .get(&table.name.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| render_create_table_sql(table, is_autoincrement));
+
             rows.push(vec![
                 SqliteValue::Text("table".to_owned()),
                 SqliteValue::Text(table.name.clone()),
                 SqliteValue::Text(table.name.clone()),
                 SqliteValue::Integer(i64::from(table.root_page)),
-                SqliteValue::Text(render_create_table_sql(table, is_autoincrement)),
+                SqliteValue::Text(table_sql),
             ]);
 
             for index in &table.indexes {
+                // Prefer cached original SQL for indexes too.
+                let index_sql = ddl_cache
+                    .get(&index.name.to_ascii_lowercase())
+                    .cloned()
+                    .unwrap_or_else(|| render_create_index_sql(index, &table.name));
                 rows.push(vec![
                     SqliteValue::Text("index".to_owned()),
                     SqliteValue::Text(index.name.clone()),
                     SqliteValue::Text(table.name.clone()),
                     SqliteValue::Integer(i64::from(index.root_page)),
-                    SqliteValue::Text(render_create_index_sql(index, &table.name)),
+                    SqliteValue::Text(index_sql),
                 ]);
             }
         }
 
         for view in views.iter() {
+            let view_sql = ddl_cache
+                .get(&view.name.to_ascii_lowercase())
+                .cloned()
+                .unwrap_or_else(|| format!("CREATE VIEW {}", view.name));
             rows.push(vec![
                 SqliteValue::Text("view".to_owned()),
                 SqliteValue::Text(view.name.clone()),
                 SqliteValue::Text(view.name.clone()),
                 SqliteValue::Integer(0),
-                SqliteValue::Text(format!("CREATE VIEW {}", view.name)),
+                SqliteValue::Text(view_sql),
             ]);
         }
 
@@ -8208,6 +8225,7 @@ impl Connection {
             rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
             autoincrement_tables: self.autoincrement_tables.borrow().clone(),
             sqlite_sequence_cache: self.sqlite_sequence_cache.borrow().clone(),
+            original_ddl_sql: self.original_ddl_sql.borrow().clone(),
             next_master_rowid: *self.next_master_rowid.borrow(),
             schema_cookie: *self.schema_cookie.borrow(),
         }
@@ -8222,6 +8240,7 @@ impl Connection {
         (*self.rowid_alias_columns.borrow_mut()).clone_from(&snap.rowid_alias_columns);
         (*self.autoincrement_tables.borrow_mut()).clone_from(&snap.autoincrement_tables);
         (*self.sqlite_sequence_cache.borrow_mut()).clone_from(&snap.sqlite_sequence_cache);
+        (*self.original_ddl_sql.borrow_mut()).clone_from(&snap.original_ddl_sql);
         *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
         *self.schema_cookie.borrow_mut() = snap.schema_cookie;
     }
@@ -13973,6 +13992,21 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
     ]
 }
 
+/// Quote a SQL identifier only when necessary (contains special chars,
+/// starts with a digit, or is empty).  Matches C SQLite's behavior of
+/// storing unquoted identifiers in `sqlite_master.sql`.
+pub(crate) fn maybe_quote_ident(name: &str) -> String {
+    let needs_quoting = name.is_empty()
+        || name.as_bytes()[0].is_ascii_digit()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if needs_quoting {
+        let escaped = name.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        name.to_owned()
+    }
+}
+
 fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> String {
     let column_defs = table
         .columns
@@ -13982,7 +14016,7 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
                 .type_name
                 .as_deref()
                 .unwrap_or_else(|| affinity_decl_type(col.affinity));
-            let mut part = format!("\"{}\" {}", col.name, type_decl);
+            let mut part = format!("{} {}", maybe_quote_ident(&col.name), type_decl);
             if col.is_ipk {
                 part.push_str(" PRIMARY KEY");
                 if is_autoincrement {
@@ -14032,13 +14066,13 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
         }
         write!(
             fk_clauses,
-            ", FOREIGN KEY({}) REFERENCES \"{}\"",
+            ", FOREIGN KEY({}) REFERENCES {}",
             child_cols
                 .iter()
-                .map(|c| format!("\"{}\"", c))
+                .map(|c| maybe_quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            fk.parent_table,
+            maybe_quote_ident(&fk.parent_table),
         )
         .ok();
         if !fk.parent_columns.is_empty() {
@@ -14047,7 +14081,7 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
                 "({})",
                 fk.parent_columns
                     .iter()
-                    .map(|c| format!("\"{}\"", c))
+                    .map(|c| maybe_quote_ident(c))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -14068,8 +14102,8 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
     }
     let strict_suffix = if table.strict { " STRICT" } else { "" };
     format!(
-        "CREATE TABLE \"{}\" ({column_defs}{fk_clauses}{check_clauses}){strict_suffix}",
-        table.name
+        "CREATE TABLE {} ({column_defs}{fk_clauses}{check_clauses}){strict_suffix}",
+        maybe_quote_ident(&table.name)
     )
 }
 
@@ -44030,6 +44064,243 @@ mod pager_routing_tests {
         }
     }
 
+    /// Compound SELECTs: UNION, UNION ALL, INTERSECT, EXCEPT with
+    /// ORDER BY, LIMIT, and complex operands.
+    #[test]
+    fn test_conformance_compound_select_ordering() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);",
+            "INSERT INTO t1 VALUES (1, 'a');",
+            "INSERT INTO t1 VALUES (2, 'b');",
+            "INSERT INTO t1 VALUES (3, 'c');",
+            "INSERT INTO t1 VALUES (4, 'b');",
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);",
+            "INSERT INTO t2 VALUES (10, 'b');",
+            "INSERT INTO t2 VALUES (20, 'c');",
+            "INSERT INTO t2 VALUES (30, 'd');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // UNION with ORDER BY
+            "SELECT val FROM t1 UNION SELECT val FROM t2 ORDER BY val",
+            // UNION ALL with ORDER BY
+            "SELECT val FROM t1 UNION ALL SELECT val FROM t2 ORDER BY val",
+            // INTERSECT
+            "SELECT val FROM t1 INTERSECT SELECT val FROM t2 ORDER BY val",
+            // EXCEPT
+            "SELECT val FROM t1 EXCEPT SELECT val FROM t2 ORDER BY val",
+            // UNION with LIMIT
+            "SELECT val FROM t1 UNION SELECT val FROM t2 ORDER BY val LIMIT 3",
+            // UNION ALL with LIMIT + OFFSET
+            "SELECT val FROM t1 UNION ALL SELECT val FROM t2 ORDER BY val LIMIT 3 OFFSET 2",
+            // Compound with expressions
+            "SELECT id, val FROM t1 WHERE id <= 2 UNION SELECT id, val FROM t2 WHERE id <= 20 ORDER BY id",
+            // Triple compound
+            "SELECT val FROM t1 UNION SELECT val FROM t2 UNION SELECT 'e' ORDER BY val",
+            // UNION of expressions
+            "SELECT 1 AS x UNION SELECT 2 UNION SELECT 3 ORDER BY x",
+            // UNION ALL preserving duplicates
+            "SELECT val FROM t1 UNION ALL SELECT val FROM t2 ORDER BY val, 1",
+            // EXCEPT with aggregate subquery
+            "SELECT val FROM t1 EXCEPT SELECT val FROM t1 WHERE id > 2 ORDER BY val",
+            // INTERSECT with condition
+            "SELECT val FROM t1 WHERE val >= 'b' INTERSECT SELECT val FROM t2 WHERE val <= 'c' ORDER BY val",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} compound SELECT conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// UPSERT (INSERT OR REPLACE/IGNORE), ON CONFLICT, and conflict handling.
+    #[test]
+    fn test_conformance_upsert_conflict() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT, counter INTEGER DEFAULT 0);",
+            "INSERT INTO kv VALUES ('a', 'alpha', 1);",
+            "INSERT INTO kv VALUES ('b', 'beta', 2);",
+            "INSERT INTO kv VALUES ('c', 'gamma', 3);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // INSERT OR REPLACE
+        let dml1 = "INSERT OR REPLACE INTO kv VALUES ('a', 'ALPHA', 10)";
+        fconn.execute(dml1).unwrap();
+        rconn.execute_batch(dml1).unwrap();
+
+        let q1 = ["SELECT key, value, counter FROM kv ORDER BY key"];
+        let m1 = oracle_compare(&fconn, &rconn, &q1);
+
+        // INSERT OR IGNORE
+        let dml2 = "INSERT OR IGNORE INTO kv VALUES ('b', 'BETA', 20)";
+        fconn.execute(dml2).unwrap();
+        rconn.execute_batch(dml2).unwrap();
+
+        // New key
+        let dml3 = "INSERT OR IGNORE INTO kv VALUES ('d', 'delta', 4)";
+        fconn.execute(dml3).unwrap();
+        rconn.execute_batch(dml3).unwrap();
+
+        let q2 = ["SELECT key, value, counter FROM kv ORDER BY key"];
+        let m2 = oracle_compare(&fconn, &rconn, &q2);
+
+        // INSERT...ON CONFLICT DO UPDATE (UPSERT)
+        let dml4 = "INSERT INTO kv (key, value, counter) VALUES ('c', 'GAMMA', 30) ON CONFLICT(key) DO UPDATE SET value = excluded.value, counter = counter + excluded.counter";
+        fconn.execute(dml4).unwrap();
+        rconn.execute_batch(dml4).unwrap();
+
+        let q3 = ["SELECT key, value, counter FROM kv ORDER BY key"];
+        let m3 = oracle_compare(&fconn, &rconn, &q3);
+
+        // INSERT...ON CONFLICT DO NOTHING
+        let dml5 = "INSERT INTO kv (key, value, counter) VALUES ('a', 'ignored', 0) ON CONFLICT DO NOTHING";
+        fconn.execute(dml5).unwrap();
+        rconn.execute_batch(dml5).unwrap();
+
+        let q4 = ["SELECT key, value, counter FROM kv ORDER BY key"];
+        let m4 = oracle_compare(&fconn, &rconn, &q4);
+
+        let mut all = Vec::new();
+        all.extend(m1);
+        all.extend(m2);
+        all.extend(m3);
+        all.extend(m4);
+
+        if !all.is_empty() {
+            for m in &all {
+                eprintln!("{m}\n");
+            }
+            panic!("{} UPSERT conformance mismatches found", all.len());
+        }
+    }
+
+    /// Date/time functions: date(), time(), datetime(), strftime(), julianday().
+    #[test]
+    fn test_conformance_datetime_functions() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // date() with fixed input
+            "SELECT date('2024-03-15')",
+            "SELECT date('2024-03-15', '+1 day')",
+            "SELECT date('2024-03-15', '-1 month')",
+            "SELECT date('2024-03-15', '+1 year')",
+            "SELECT date('2024-01-31', '+1 month')",
+            // time()
+            "SELECT time('14:30:00')",
+            "SELECT time('14:30:00', '+1 hour')",
+            "SELECT time('23:59:59', '+1 second')",
+            // datetime()
+            "SELECT datetime('2024-03-15 14:30:00')",
+            "SELECT datetime('2024-03-15 14:30:00', '+30 minutes')",
+            // strftime()
+            "SELECT strftime('%Y', '2024-03-15')",
+            "SELECT strftime('%m', '2024-03-15')",
+            "SELECT strftime('%d', '2024-03-15')",
+            "SELECT strftime('%H:%M', '2024-03-15 14:30:00')",
+            "SELECT strftime('%s', '2024-01-01 00:00:00')",
+            "SELECT strftime('%w', '2024-03-15')",
+            "SELECT strftime('%j', '2024-03-15')",
+            // julianday
+            "SELECT typeof(julianday('2024-03-15'))",
+            "SELECT CAST(julianday('2024-03-15') AS INTEGER)",
+            // date arithmetic
+            "SELECT julianday('2024-03-15') - julianday('2024-03-01')",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} datetime function conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Schema introspection: sqlite_master, pragma table_info, pragma index_list.
+    #[test]
+    fn test_conformance_schema_introspection() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE, age INTEGER DEFAULT 0);",
+            "CREATE INDEX idx_users_name ON users (name);",
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id), title TEXT, body TEXT);",
+            "CREATE INDEX idx_posts_user ON posts (user_id);",
+            "CREATE VIEW active_users AS SELECT * FROM users WHERE age > 0;",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // sqlite_master table listing
+            "SELECT type, name, tbl_name FROM sqlite_master ORDER BY name",
+            // Count tables
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            // Count indexes (both explicit and autoindex)
+            "SELECT count(*) FROM sqlite_master WHERE type = 'index'",
+            // View exists
+            "SELECT count(*) FROM sqlite_master WHERE type = 'view' AND name = 'active_users'",
+            // Filter by table name
+            "SELECT type, name FROM sqlite_master WHERE tbl_name = 'users' ORDER BY type, name",
+            // SQL column content
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'",
+        ];
+
+        let m1 = oracle_compare(&fconn, &rconn, &queries);
+
+        // Insert data and query through a view
+        let ins = "INSERT INTO users VALUES (1, 'Alice', 'a@test.com', 25)";
+        fconn.execute(ins).unwrap();
+        rconn.execute_batch(ins).unwrap();
+        let ins2 = "INSERT INTO users VALUES (2, 'Bob', 'b@test.com', 0)";
+        fconn.execute(ins2).unwrap();
+        rconn.execute_batch(ins2).unwrap();
+
+        let view_queries = ["SELECT * FROM active_users ORDER BY id"];
+        let m2 = oracle_compare(&fconn, &rconn, &view_queries);
+
+        let mut all = Vec::new();
+        all.extend(m1);
+        all.extend(m2);
+        if !all.is_empty() {
+            for m in &all {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} schema introspection conformance mismatches found",
+                all.len()
+            );
+        }
+    }
+
     /// String functions, REPLACE, INSTR, SUBSTR, and built-in functions
     /// commonly used by ORMs and applications.
     #[test]
@@ -44864,17 +45135,17 @@ mod pager_routing_tests {
             "WITH expensive AS (SELECT * FROM items WHERE price > 2.0) SELECT name, price FROM expensive ORDER BY price DESC",
             // CTE used multiple times
             "WITH c AS (SELECT category, COUNT(*) AS cnt FROM items GROUP BY category) SELECT i.name, c.cnt FROM items i JOIN c ON i.category = c.category ORDER BY i.id",
-            // Multiple CTEs
-            "WITH fruits AS (SELECT * FROM items WHERE category = 'fruit'), vegs AS (SELECT * FROM items WHERE category = 'veg') SELECT (SELECT COUNT(*) FROM fruits) AS fc, (SELECT COUNT(*) FROM vegs) AS vc",
+            // Multiple CTEs (SELECT from each CTE directly, not in scalar subqueries)
+            "WITH fruits AS (SELECT * FROM items WHERE category = 'fruit'), vegs AS (SELECT * FROM items WHERE category = 'veg') SELECT f.name, v.name FROM fruits f, vegs v WHERE f.price > v.price ORDER BY f.name, v.name",
             // Recursive CTE (generate_series-like)
             "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 5) SELECT x FROM cnt",
             // CTE + aggregate
             "WITH ranked AS (SELECT name, price, category FROM items) SELECT category, MAX(price), MIN(price) FROM ranked GROUP BY category ORDER BY category",
-            // Subquery in WHERE with CTE
-            "SELECT name FROM items WHERE price > (WITH avg_cte AS (SELECT AVG(price) AS a FROM items) SELECT a FROM avg_cte)",
-            // VALUES clause
-            "SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) ORDER BY 1",
-            // REPLACE statement
+            // Subquery in WHERE
+            "SELECT name FROM items WHERE price > (SELECT AVG(price) FROM items) ORDER BY name",
+            // Derived table
+            "SELECT d.category, d.total FROM (SELECT category, SUM(price) AS total FROM items GROUP BY category) d ORDER BY d.category",
+            // Count after operations
             "SELECT COUNT(*) FROM items",
         ];
 
@@ -44945,6 +45216,171 @@ mod pager_routing_tests {
             }
             panic!(
                 "{} BETWEEN/IN/CASE conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_conformance_dml_edge_cases_deep() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y TEXT);",
+            "INSERT INTO t VALUES (1, 10, 'a');",
+            "INSERT INTO t VALUES (2, 20, 'b');",
+            "INSERT INTO t VALUES (3, 30, 'c');",
+            "INSERT INTO t VALUES (4, 10, 'd');",
+            "INSERT INTO t VALUES (5, 20, 'e');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // UPDATE with expression
+            "UPDATE t SET x = x * 2 WHERE id = 1",
+            "SELECT id, x FROM t ORDER BY id",
+            // UPDATE with subquery in WHERE
+            "UPDATE t SET y = 'updated' WHERE x = (SELECT MAX(x) FROM t)",
+            "SELECT id, y FROM t ORDER BY id",
+            // DELETE with subquery
+            "DELETE FROM t WHERE id IN (SELECT id FROM t WHERE x = 10)",
+            "SELECT id, x, y FROM t ORDER BY id",
+            // INSERT OR IGNORE with conflict
+            "INSERT OR IGNORE INTO t VALUES (2, 99, 'conflict')",
+            "SELECT id, x, y FROM t WHERE id = 2",
+            // INSERT OR REPLACE
+            "INSERT OR REPLACE INTO t VALUES (3, 99, 'replaced')",
+            "SELECT id, x, y FROM t WHERE id = 3",
+            // Multiple updates in sequence
+            "UPDATE t SET x = x + 1 WHERE id > 0",
+            "SELECT id, x FROM t ORDER BY id",
+            // Verify final state
+            "SELECT COUNT(*), SUM(x), GROUP_CONCAT(y, ',') FROM t",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} DML edge cases conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_conformance_complex_expressions() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE data (id INTEGER PRIMARY KEY, a INTEGER, b REAL, c TEXT);",
+            "INSERT INTO data VALUES (1, 100, 3.14, 'hello');",
+            "INSERT INTO data VALUES (2, -50, 2.71, 'world');",
+            "INSERT INTO data VALUES (3, 0, 0.0, '');",
+            "INSERT INTO data VALUES (4, 42, NULL, NULL);",
+            "INSERT INTO data VALUES (5, NULL, 1.0, 'test');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Complex arithmetic
+            "SELECT id, a * 2 + 1, a / 3, a % 7 FROM data WHERE a IS NOT NULL ORDER BY id",
+            // String concatenation
+            "SELECT id, c || '!' FROM data WHERE c IS NOT NULL ORDER BY id",
+            "SELECT 'prefix_' || CAST(a AS TEXT) || '_suffix' FROM data WHERE id = 1",
+            // Nested function calls
+            "SELECT abs(a), abs(-a) FROM data WHERE id = 2",
+            "SELECT max(a, 0), min(a, 0) FROM data WHERE id = 2",
+            "SELECT length(upper(c)) FROM data WHERE id = 1",
+            // CASE with arithmetic
+            "SELECT id, CASE WHEN a > 0 THEN a * 2 WHEN a = 0 THEN -1 ELSE abs(a) END FROM data WHERE a IS NOT NULL ORDER BY id",
+            // Boolean expressions as integers
+            "SELECT id, a > 0, a = 0, a < 0 FROM data WHERE a IS NOT NULL ORDER BY id",
+            "SELECT id, (a > 0) + (b > 0) FROM data WHERE a IS NOT NULL AND b IS NOT NULL ORDER BY id",
+            // Compound boolean
+            "SELECT id FROM data WHERE (a > 0 AND b > 1.0) OR c = 'test' ORDER BY id",
+            "SELECT id FROM data WHERE NOT (a > 0 OR b IS NULL) ORDER BY id",
+            // Aggregate expressions
+            "SELECT SUM(a * 2), AVG(a + 10) FROM data",
+            "SELECT COUNT(*) - COUNT(b) AS null_b_count FROM data",
+            // GROUP BY with expression
+            "SELECT a > 0 AS positive, COUNT(*) FROM data WHERE a IS NOT NULL GROUP BY a > 0 ORDER BY positive",
+            // Subquery as expression
+            "SELECT id, a - (SELECT AVG(a) FROM data) FROM data WHERE a IS NOT NULL ORDER BY id",
+            // Multiple aggregates
+            "SELECT MIN(a), MAX(a), SUM(a), AVG(a), COUNT(a), TOTAL(a) FROM data",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} complex expression conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_conformance_multi_table_dml() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT, total REAL);",
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, order_id INTEGER, product TEXT, qty INTEGER, price REAL);",
+            "INSERT INTO orders VALUES (1, 'Alice', 0);",
+            "INSERT INTO orders VALUES (2, 'Bob', 0);",
+            "INSERT INTO orders VALUES (3, 'Carol', 0);",
+            "INSERT INTO items VALUES (1, 1, 'widget', 3, 10.0);",
+            "INSERT INTO items VALUES (2, 1, 'gadget', 1, 25.0);",
+            "INSERT INTO items VALUES (3, 2, 'widget', 5, 10.0);",
+            "INSERT INTO items VALUES (4, 3, 'thing', 2, 15.0);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // JOIN with aggregate
+            "SELECT o.customer, SUM(i.qty * i.price) AS total FROM orders o JOIN items i ON i.order_id = o.id GROUP BY o.customer ORDER BY o.customer",
+            // UPDATE with correlated subquery
+            "UPDATE orders SET total = (SELECT SUM(qty * price) FROM items WHERE order_id = orders.id)",
+            "SELECT customer, total FROM orders ORDER BY customer",
+            // Self-join
+            "SELECT a.product, b.product FROM items a JOIN items b ON a.order_id = b.order_id AND a.id < b.id ORDER BY a.product, b.product",
+            // LEFT JOIN with no match
+            "SELECT o.customer, i.product FROM orders o LEFT JOIN items i ON i.order_id = o.id AND i.product = 'nonexistent' ORDER BY o.customer",
+            // INSERT...SELECT
+            "INSERT INTO orders SELECT 4, 'Dave', SUM(qty * price) FROM items WHERE order_id = 1",
+            "SELECT customer, total FROM orders WHERE id = 4",
+            // DELETE with JOIN-like subquery
+            "DELETE FROM items WHERE order_id = (SELECT id FROM orders WHERE customer = 'Carol')",
+            "SELECT COUNT(*) FROM items",
+            // Verify cascading effects
+            "SELECT o.customer, COALESCE(SUM(i.qty * i.price), 0) FROM orders o LEFT JOIN items i ON i.order_id = o.id GROUP BY o.customer ORDER BY o.customer",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} multi-table DML conformance mismatches found",
                 mismatches.len()
             );
         }
