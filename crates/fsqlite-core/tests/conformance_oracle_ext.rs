@@ -5142,3 +5142,250 @@ fn test_conformance_derived_table_complex() {
         panic!("{} derived table complex mismatches", mismatches.len());
     }
 }
+
+/// Window functions with multiple different OVER clauses in one SELECT.
+#[test]
+fn test_conformance_window_multi_spec() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE sales(id INTEGER PRIMARY KEY, region TEXT, month INTEGER, revenue INTEGER)",
+        "INSERT INTO sales VALUES(1,'East',1,100),(2,'East',2,150),(3,'East',3,200)",
+        "INSERT INTO sales VALUES(4,'West',1,80),(5,'West',2,120),(6,'West',3,160)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // Two different window specs
+        "SELECT region, month, revenue, SUM(revenue) OVER (PARTITION BY region ORDER BY month) AS cumulative, RANK() OVER (ORDER BY revenue DESC) AS overall_rank FROM sales ORDER BY region, month",
+        // Same function different specs
+        "SELECT region, month, revenue, ROW_NUMBER() OVER (PARTITION BY region ORDER BY month) AS rn_region, ROW_NUMBER() OVER (ORDER BY revenue DESC) AS rn_global FROM sales ORDER BY region, month",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} window multi-spec mismatches", mismatches.len());
+    }
+}
+
+/// Correlated subquery in SELECT list with GROUP BY.
+#[test]
+fn test_conformance_correlated_subquery_group_by() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT, amount REAL)",
+        "CREATE TABLE customers(name TEXT PRIMARY KEY, city TEXT)",
+        "INSERT INTO customers VALUES('Alice','NYC'),('Bob','LA'),('Carol','NYC')",
+        "INSERT INTO orders VALUES(1,'Alice',100),(2,'Alice',200),(3,'Bob',150),(4,'Carol',50)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // Correlated subquery in SELECT + GROUP BY
+        "SELECT customer, SUM(amount), (SELECT city FROM customers WHERE name = orders.customer) AS city FROM orders GROUP BY customer ORDER BY customer",
+        // Aggregate with correlated subquery in HAVING
+        "SELECT customer, SUM(amount) AS total FROM orders GROUP BY customer HAVING SUM(amount) > (SELECT AVG(amount) FROM orders) ORDER BY customer",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} correlated subquery GROUP BY mismatches", mismatches.len());
+    }
+}
+
+/// Subquery in ORDER BY.
+#[test]
+fn test_conformance_subquery_order_by() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
+        "INSERT INTO t VALUES(1,'A',10),(2,'B',50),(3,'A',30),(4,'C',20),(5,'B',40)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // ORDER BY expression involving aggregate subquery
+        "SELECT DISTINCT grp FROM t ORDER BY (SELECT SUM(val) FROM t t2 WHERE t2.grp = t.grp) DESC",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} subquery ORDER BY mismatches", mismatches.len());
+    }
+}
+
+/// UPDATE/DELETE with LIMIT (if supported).
+#[test]
+fn test_conformance_update_delete_complex_where() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
+        "INSERT INTO t VALUES(1,'A',10),(2,'A',20),(3,'B',30),(4,'B',40),(5,'C',50)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    // UPDATE with complex WHERE
+    fconn.execute("UPDATE t SET val = val * 2 WHERE grp IN ('A', 'B') AND val > 15").unwrap();
+    rconn.execute_batch("UPDATE t SET val = val * 2 WHERE grp IN ('A', 'B') AND val > 15").unwrap();
+
+    let q1 = oracle_compare(&fconn, &rconn, &["SELECT * FROM t ORDER BY id"]);
+
+    // DELETE with complex WHERE
+    fconn.execute("DELETE FROM t WHERE val > (SELECT AVG(val) FROM t)").unwrap();
+    rconn.execute_batch("DELETE FROM t WHERE val > (SELECT AVG(val) FROM t)").unwrap();
+
+    let q2 = oracle_compare(&fconn, &rconn, &[
+        "SELECT * FROM t ORDER BY id",
+        "SELECT COUNT(*) FROM t",
+    ]);
+
+    let all: Vec<_> = [q1, q2].concat();
+    if !all.is_empty() {
+        for m in &all {
+            eprintln!("{m}\n");
+        }
+        panic!("{} UPDATE/DELETE complex WHERE mismatches", all.len());
+    }
+}
+
+/// Multi-table DELETE with subquery.
+#[test]
+fn test_conformance_multi_table_subquery_delete() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE products(id INTEGER PRIMARY KEY, cat_id INTEGER, name TEXT)",
+        "INSERT INTO categories VALUES(1,'Electronics'),(2,'Clothing'),(3,'Food')",
+        "INSERT INTO products VALUES(1,1,'Phone'),(2,1,'Laptop'),(3,2,'Shirt'),(4,3,'Apple')",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    // Delete products NOT in Electronics (uses different table in subquery)
+    fconn
+        .execute(
+            "DELETE FROM products WHERE cat_id NOT IN (SELECT id FROM categories WHERE name = 'Electronics')",
+        )
+        .unwrap();
+    rconn
+        .execute_batch(
+            "DELETE FROM products WHERE cat_id NOT IN (SELECT id FROM categories WHERE name = 'Electronics')",
+        )
+        .unwrap();
+
+    let queries = [
+        "SELECT * FROM products ORDER BY id",
+        "SELECT COUNT(*) FROM products",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} multi-table subquery DELETE mismatches", mismatches.len());
+    }
+}
+
+/// Complex SELECT with multiple JOINs and aggregation.
+#[test]
+fn test_conformance_multi_join_agg_complex() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE students(id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE courses(id INTEGER PRIMARY KEY, title TEXT)",
+        "CREATE TABLE enrollments(student_id INTEGER, course_id INTEGER, grade TEXT)",
+        "INSERT INTO students VALUES(1,'Alice'),(2,'Bob'),(3,'Carol')",
+        "INSERT INTO courses VALUES(1,'Math'),(2,'Science'),(3,'English')",
+        "INSERT INTO enrollments VALUES(1,1,'A'),(1,2,'B'),(2,1,'B'),(2,3,'A'),(3,1,'C'),(3,2,'A'),(3,3,'B')",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // Count courses per student
+        "SELECT s.name, COUNT(e.course_id) AS num_courses FROM students s LEFT JOIN enrollments e ON s.id = e.student_id GROUP BY s.id, s.name ORDER BY s.name",
+        // Average grade by course (A=4, B=3, C=2)
+        "SELECT c.title, COUNT(*) AS enrolled FROM courses c JOIN enrollments e ON c.id = e.course_id GROUP BY c.id, c.title ORDER BY c.title",
+        // Students with all A grades
+        "SELECT s.name FROM students s WHERE NOT EXISTS (SELECT 1 FROM enrollments e WHERE e.student_id = s.id AND e.grade != 'A') AND EXISTS (SELECT 1 FROM enrollments e WHERE e.student_id = s.id) ORDER BY s.name",
+        // Cross join with IN filter (EXISTS in eval_join_expr not supported yet)
+        "SELECT s.name, c.title FROM students s, courses c WHERE s.id || '-' || c.id IN (SELECT student_id || '-' || course_id FROM enrollments) ORDER BY s.name, c.title",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} multi-join agg complex mismatches", mismatches.len());
+    }
+}
+
+/// CREATE TABLE AS SELECT (CTAS).
+#[test]
+fn test_conformance_ctas() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE src(id INTEGER PRIMARY KEY, name TEXT, val INTEGER)",
+        "INSERT INTO src VALUES(1,'Alice',10),(2,'Bob',20),(3,'Carol',30)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    fconn.execute("CREATE TABLE dst AS SELECT name, val * 2 AS doubled FROM src WHERE val > 10").unwrap();
+    rconn.execute_batch("CREATE TABLE dst AS SELECT name, val * 2 AS doubled FROM src WHERE val > 10").unwrap();
+
+    let queries = [
+        "SELECT * FROM dst ORDER BY name",
+        "SELECT COUNT(*) FROM dst",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} CTAS mismatches", mismatches.len());
+    }
+}
