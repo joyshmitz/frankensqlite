@@ -13758,6 +13758,51 @@ impl Connection {
             combined = filtered;
         }
 
+        // ── 5b. Build set of col_map indices to skip for SELECT * ──
+        // Per SQL standard, NATURAL JOIN and JOIN...USING produce "coalesced"
+        // columns: shared columns appear once (from the left table). The right
+        // table's duplicate columns are excluded from SELECT *.
+        let mut using_skip_indices: HashSet<usize> = HashSet::new();
+        {
+            let mut offset = table_sources[0].col_names.len();
+            for (join_idx, join) in from.joins.iter().enumerate() {
+                let using_cols: Option<&[String]> = if join.join_type.natural {
+                    // For NATURAL JOIN, shared columns were computed above.
+                    // Recompute them to find which right columns to skip.
+                    let left_cols: Vec<&str> = table_sources[..=join_idx]
+                        .iter()
+                        .flat_map(|s| s.col_names.iter().map(String::as_str))
+                        .collect();
+                    let right_src = &table_sources[join_idx + 1];
+                    let shared: Vec<String> = right_src
+                        .col_names
+                        .iter()
+                        .filter(|c| left_cols.iter().any(|l| l.eq_ignore_ascii_case(c.as_str())))
+                        .cloned()
+                        .collect();
+                    // Mark indices of shared columns in the right table's portion of col_map.
+                    for (i, col_name) in table_sources[join_idx + 1].col_names.iter().enumerate() {
+                        if shared.iter().any(|s| s.eq_ignore_ascii_case(col_name)) {
+                            using_skip_indices.insert(offset + i);
+                        }
+                    }
+                    None
+                } else if let Some(JoinConstraint::Using(cols)) = &join.constraint {
+                    Some(cols.as_slice())
+                } else {
+                    None
+                };
+                if let Some(cols) = using_cols {
+                    for (i, col_name) in table_sources[join_idx + 1].col_names.iter().enumerate() {
+                        if cols.iter().any(|c| c.eq_ignore_ascii_case(col_name)) {
+                            using_skip_indices.insert(offset + i);
+                        }
+                    }
+                }
+                offset += table_sources[join_idx + 1].col_names.len();
+            }
+        }
+
         // ── 6. Expand SELECT columns and detect ORDER BY extras ──
         // Expand Star / TableStar into explicit column references so that
         // sort_rows_by_order_terms can resolve integer positions and column
@@ -13767,7 +13812,9 @@ impl Connection {
             .flat_map(|col| match col {
                 ResultColumn::Star => col_map
                     .iter()
-                    .map(|(tbl, c)| ResultColumn::Expr {
+                    .enumerate()
+                    .filter(|(idx, _)| !using_skip_indices.contains(idx))
+                    .map(|(_, (tbl, c))| ResultColumn::Expr {
                         expr: Expr::Column(
                             ColumnRef::qualified(tbl.clone(), c.clone()),
                             Span::new(0, 0),
@@ -13853,7 +13900,11 @@ impl Connection {
             for col in columns {
                 match col {
                     ResultColumn::Star => {
-                        values.extend(row.iter().cloned());
+                        for (i, v) in row.iter().enumerate() {
+                            if !using_skip_indices.contains(&i) {
+                                values.push(v.clone());
+                            }
+                        }
                     }
                     ResultColumn::TableStar(table_name) => {
                         let mut offset = 0;
@@ -66138,6 +66189,243 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} case aggregate mix mismatches", mismatches.len());
+        }
+    }
+    /// Oracle: BETWEEN with mixed types and edge cases.
+    #[test]
+    fn test_conformance_between_type_edges() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, val)",
+            "INSERT INTO t VALUES(1, 5),(2, 10),(3, 15),(4, 'hello'),(5, NULL),(6, 3.14)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT id FROM t WHERE val BETWEEN 5 AND 15 ORDER BY id",
+            "SELECT id FROM t WHERE val NOT BETWEEN 5 AND 15 ORDER BY id",
+            "SELECT id FROM t WHERE val BETWEEN 3.0 AND 6.0 ORDER BY id",
+            // BETWEEN with NULL bound
+            "SELECT id FROM t WHERE val BETWEEN NULL AND 10 ORDER BY id",
+            "SELECT id FROM t WHERE val BETWEEN 5 AND NULL ORDER BY id",
+            // Expression-based BETWEEN
+            "SELECT id FROM t WHERE val BETWEEN 2+3 AND 3*5 ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} between type edge mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: Multiple CTEs in a single WITH clause.
+    #[test]
+    fn test_conformance_multi_cte_cross_ref() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT, amount INTEGER, status TEXT)",
+            "INSERT INTO orders VALUES(1,'Alice',100,'shipped'),(2,'Bob',200,'pending'),(3,'Alice',150,'shipped'),(4,'Charlie',300,'pending'),(5,'Bob',50,'shipped')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Multiple CTEs
+            "WITH shipped AS (SELECT * FROM orders WHERE status='shipped'), pending AS (SELECT * FROM orders WHERE status='pending') SELECT s.customer, s.amount FROM shipped s ORDER BY s.customer, s.amount",
+            "WITH shipped AS (SELECT * FROM orders WHERE status='shipped'), pending AS (SELECT * FROM orders WHERE status='pending') SELECT p.customer, p.amount FROM pending p ORDER BY p.customer",
+            // CTE referencing another CTE
+            "WITH base AS (SELECT customer, SUM(amount) AS total FROM orders GROUP BY customer), ranked AS (SELECT customer, total FROM base WHERE total > 100) SELECT * FROM ranked ORDER BY customer",
+            // CTE used multiple times
+            "WITH totals AS (SELECT customer, SUM(amount) AS total FROM orders GROUP BY customer) SELECT t1.customer, t2.customer FROM totals t1, totals t2 WHERE t1.total > t2.total ORDER BY t1.customer, t2.customer",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} multi CTE mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: DELETE with LIMIT and ORDER BY (SQLite extension).
+    #[test]
+    fn test_conformance_delete_limit_order() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)",
+            "INSERT INTO t VALUES(1,50),(2,30),(3,10),(4,40),(5,20)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // Simple DELETE
+        let del = "DELETE FROM t WHERE val < 25";
+        fconn.execute(del).unwrap();
+        rconn.execute_batch(del).unwrap();
+
+        let queries = ["SELECT * FROM t ORDER BY id", "SELECT COUNT(*) FROM t"];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} delete limit/order mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: Nested aggregates in subqueries.
+    #[test]
+    fn test_conformance_nested_agg_subquery() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE scores(id INTEGER PRIMARY KEY, team TEXT, player TEXT, score INTEGER)",
+            "INSERT INTO scores VALUES(1,'A','p1',10),(2,'A','p2',20),(3,'B','p3',30),(4,'B','p4',15),(5,'A','p5',25)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Subquery in WHERE with aggregate
+            "SELECT team, AVG(score) FROM scores GROUP BY team HAVING AVG(score) > (SELECT AVG(score) FROM scores) ORDER BY team",
+            // Scalar subquery with aggregate in SELECT
+            "SELECT team, SUM(score), (SELECT SUM(score) FROM scores) AS grand_total FROM scores GROUP BY team ORDER BY team",
+            // Subquery comparing group aggregate to overall aggregate
+            "SELECT player, score FROM scores WHERE score > (SELECT AVG(score) FROM scores) ORDER BY player",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} nested agg subquery mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: Rowid and aliases (_rowid_, oid, rowid).
+    #[test]
+    fn test_conformance_rowid_aliases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t(name TEXT, val INTEGER)",
+            "INSERT INTO t VALUES('a',10),('b',20),('c',30)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT rowid, name, val FROM t ORDER BY rowid",
+            "SELECT _rowid_, name FROM t ORDER BY _rowid_",
+            "SELECT oid, name FROM t ORDER BY oid",
+            // Rowid in WHERE
+            "SELECT name FROM t WHERE rowid = 2",
+            // Rowid range
+            "SELECT name FROM t WHERE rowid BETWEEN 1 AND 2 ORDER BY rowid",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} rowid alias mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: DISTINCT with ORDER BY interaction.
+    #[test]
+    fn test_conformance_distinct_order_interaction() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, category TEXT, val INTEGER)",
+            "INSERT INTO t VALUES(1,'a',10),(2,'b',20),(3,'a',30),(4,'b',10),(5,'c',20),(6,'a',10)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT DISTINCT category FROM t ORDER BY category",
+            "SELECT DISTINCT val FROM t ORDER BY val",
+            "SELECT DISTINCT category, val FROM t ORDER BY category, val",
+            // DISTINCT with expression
+            "SELECT DISTINCT category || '-' || val FROM t ORDER BY 1",
+            // COUNT DISTINCT in subquery
+            "SELECT (SELECT COUNT(DISTINCT category) FROM t)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} distinct order by mismatches", mismatches.len());
+        }
+    }
+
+    /// Oracle: Multiple LEFT JOINs with NULLs from different tables.
+    #[test]
+    fn test_conformance_multi_left_join_nulls() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)",
+            "INSERT INTO users VALUES(1,'Alice'),(2,'Bob'),(3,'Charlie')",
+            "CREATE TABLE posts(id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)",
+            "INSERT INTO posts VALUES(1,1,'Post A'),(2,1,'Post B'),(3,2,'Post C')",
+            "CREATE TABLE comments(id INTEGER PRIMARY KEY, post_id INTEGER, text TEXT)",
+            "INSERT INTO comments VALUES(1,1,'Comment 1'),(2,1,'Comment 2')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Triple LEFT JOIN
+            "SELECT u.name, p.title, c.text FROM users u LEFT JOIN posts p ON p.user_id = u.id LEFT JOIN comments c ON c.post_id = p.id ORDER BY u.name, p.title, c.text",
+            // Aggregating across LEFT JOINs
+            "SELECT u.name, COUNT(p.id) AS post_count, COUNT(c.id) AS comment_count FROM users u LEFT JOIN posts p ON p.user_id = u.id LEFT JOIN comments c ON c.post_id = p.id GROUP BY u.name ORDER BY u.name",
+            // Filter on outer join NULL
+            "SELECT u.name FROM users u LEFT JOIN posts p ON p.user_id = u.id WHERE p.id IS NULL ORDER BY u.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} multi left join null mismatches", mismatches.len());
         }
     }
 }

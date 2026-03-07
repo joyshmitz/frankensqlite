@@ -17046,3 +17046,156 @@ fn test_conformance_numeric_edge_cases_s149() {
         panic!("{} numeric edge case mismatches", mismatches.len());
     }
 }
+
+#[test]
+fn test_conformance_window_range_groups_s150() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE wrg(id INTEGER PRIMARY KEY, val INTEGER, cat TEXT)",
+        "INSERT INTO wrg VALUES(1,10,'A'),(2,10,'A'),(3,20,'B'),(4,30,'B'),(5,30,'C')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // RANGE frame (groups equal values)
+        "SELECT id, val, SUM(val) OVER (ORDER BY val RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS range_sum FROM wrg ORDER BY id",
+        // GROUPS frame
+        "SELECT id, val, SUM(val) OVER (ORDER BY val GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS groups_sum FROM wrg ORDER BY id",
+        // RANGE with offset
+        "SELECT id, val, COUNT(*) OVER (ORDER BY val RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS cnt FROM wrg ORDER BY id",
+        // LAG/LEAD with default
+        "SELECT id, val, LAG(val, 1, -1) OVER (ORDER BY id) AS prev, LEAD(val, 1, -1) OVER (ORDER BY id) AS next FROM wrg ORDER BY id",
+        // NTH_VALUE
+        "SELECT id, val, NTH_VALUE(val, 2) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS second FROM wrg ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches { eprintln!("{m}\n"); }
+        panic!("{} window RANGE/GROUPS mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_upsert_advanced_s151() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE ua(id INTEGER PRIMARY KEY, name TEXT UNIQUE, count INTEGER DEFAULT 0)",
+        "INSERT INTO ua VALUES(1,'Alice',1),(2,'Bob',2)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    // UPSERT: increment on conflict
+    for s in &[
+        "INSERT INTO ua(name, count) VALUES('Alice', 1) ON CONFLICT(name) DO UPDATE SET count = count + excluded.count",
+        "INSERT INTO ua(name, count) VALUES('Charlie', 1) ON CONFLICT(name) DO UPDATE SET count = count + excluded.count",
+        "INSERT INTO ua(name, count) VALUES('Alice', 3) ON CONFLICT(name) DO UPDATE SET count = count + excluded.count",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = ["SELECT * FROM ua ORDER BY name"];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches { eprintln!("{m}\n"); }
+        panic!("{} UPSERT advanced mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_trigger_cascade_s152() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE tc_log(id INTEGER PRIMARY KEY, action TEXT, item_id INTEGER, ts TEXT DEFAULT (datetime('now')))",
+        "CREATE TABLE tc_items(id INTEGER PRIMARY KEY, name TEXT, active INTEGER DEFAULT 1)",
+        "CREATE TRIGGER tc_insert AFTER INSERT ON tc_items BEGIN INSERT INTO tc_log(action, item_id) VALUES('INSERT', NEW.id); END",
+        "CREATE TRIGGER tc_delete AFTER DELETE ON tc_items BEGIN INSERT INTO tc_log(action, item_id) VALUES('DELETE', OLD.id); END",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    for s in &[
+        "INSERT INTO tc_items(name) VALUES('Widget')",
+        "INSERT INTO tc_items(name) VALUES('Gadget')",
+        "DELETE FROM tc_items WHERE name = 'Widget'",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT action, item_id FROM tc_log ORDER BY id",
+        "SELECT * FROM tc_items ORDER BY id",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches { eprintln!("{m}\n"); }
+        panic!("{} trigger cascade mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_collate_nocase_group_s153() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE cng(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
+        "INSERT INTO cng VALUES(1,'Alice'),(2,'alice'),(3,'ALICE'),(4,'Bob'),(5,'BOB')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT name, COUNT(*) FROM cng GROUP BY name ORDER BY name",
+        "SELECT DISTINCT name FROM cng ORDER BY name",
+        "SELECT name FROM cng WHERE name = 'alice' ORDER BY id",
+        "SELECT name FROM cng WHERE name IN ('alice', 'bob') ORDER BY id",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches { eprintln!("{m}\n"); }
+        panic!("{} COLLATE NOCASE group mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_create_table_as_select_s154() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE ctas_src(id INTEGER PRIMARY KEY, name TEXT, val REAL)",
+        "INSERT INTO ctas_src VALUES(1,'Alice',10.5),(2,'Bob',20.5),(3,'Charlie',30.5)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    // CREATE TABLE AS SELECT
+    fconn.execute("CREATE TABLE ctas_dst AS SELECT name, val * 2 AS doubled FROM ctas_src WHERE val > 15").unwrap();
+    rconn.execute_batch("CREATE TABLE ctas_dst AS SELECT name, val * 2 AS doubled FROM ctas_src WHERE val > 15").unwrap();
+
+    let queries = [
+        "SELECT * FROM ctas_dst ORDER BY name",
+        "SELECT COUNT(*) FROM ctas_dst",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches { eprintln!("{m}\n"); }
+        panic!("{} CREATE TABLE AS SELECT mismatches", mismatches.len());
+    }
+}
