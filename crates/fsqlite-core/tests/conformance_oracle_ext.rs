@@ -4958,7 +4958,9 @@ fn test_conformance_last_insert_rowid_changes() {
     let q1 = oracle_compare(&fconn, &rconn, &["SELECT last_insert_rowid()"]);
 
     // After update
-    fconn.execute("UPDATE t SET val = 'x' WHERE id > 1").unwrap();
+    fconn
+        .execute("UPDATE t SET val = 'x' WHERE id > 1")
+        .unwrap();
     rconn
         .execute_batch("UPDATE t SET val = 'x' WHERE id > 1")
         .unwrap();
@@ -4966,9 +4968,7 @@ fn test_conformance_last_insert_rowid_changes() {
 
     // After delete
     fconn.execute("DELETE FROM t WHERE id = 1").unwrap();
-    rconn
-        .execute_batch("DELETE FROM t WHERE id = 1")
-        .unwrap();
+    rconn.execute_batch("DELETE FROM t WHERE id = 1").unwrap();
     let q3 = oracle_compare(&fconn, &rconn, &["SELECT changes()"]);
 
     let all: Vec<_> = [q1, q2, q3].concat();
@@ -4976,10 +4976,7 @@ fn test_conformance_last_insert_rowid_changes() {
         for m in &all {
             eprintln!("{m}\n");
         }
-        panic!(
-            "{} last_insert_rowid/changes mismatches",
-            all.len()
-        );
+        panic!("{} last_insert_rowid/changes mismatches", all.len());
     }
 }
 

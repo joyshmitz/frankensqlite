@@ -3349,10 +3349,18 @@ impl Connection {
             return Ok(statement);
         }
         match statement {
+            Statement::Select(ref select) if select.with.is_some() => {
+                // When the SELECT has a WITH clause, the CTE tables have not
+                // been materialized yet.  Subqueries may reference CTE names,
+                // so skip eager rewriting here — it will happen after CTE
+                // materialization inside execute_with_ctes.
+                Ok(statement)
+            }
             Statement::Select(select) => {
                 let rewritten = self.rewrite_subqueries(&select, params)?;
                 Ok(Statement::Select(rewritten))
             }
+            Statement::Update(ref update) if update.with.is_some() => Ok(statement),
             Statement::Update(mut update) => {
                 // Only rewrite EXISTS / scalar subqueries; leave IN for VDBE probe.
                 for assignment in &mut update.assignments {
@@ -3363,6 +3371,7 @@ impl Connection {
                 }
                 Ok(Statement::Update(update))
             }
+            Statement::Delete(ref delete) if delete.with.is_some() => Ok(statement),
             Statement::Delete(mut delete) => {
                 // Only rewrite EXISTS / scalar subqueries; leave IN for VDBE probe.
                 if let Some(where_expr) = delete.where_clause.as_mut() {
@@ -11667,14 +11676,6 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        eprintln!(
-            "[DEBUG] execute_expression_only_with_subqueries called, schema tables: {:?}",
-            self.schema
-                .borrow()
-                .iter()
-                .map(|t| &t.name)
-                .collect::<Vec<_>>()
-        );
         let SelectCore::Select { columns, .. } = &select.body.select else {
             return Err(FrankenError::Internal(
                 "execute_expression_only_with_subqueries called on non-SELECT core".to_owned(),
@@ -12430,25 +12431,38 @@ impl Connection {
         let program = self.compile_table_select(&raw_select)?;
         let (raw_rows, _) = self.execute_table_program(&program, params)?;
 
-        let mut row_values: Vec<Vec<SqliteValue>> =
+        let row_values: Vec<Vec<SqliteValue>> =
             raw_rows.iter().map(|r| r.values().to_vec()).collect();
 
-        // Sort rows by PARTITION BY then ORDER BY from the first window spec.
-        if let (Some(pb), Some(ob)) = (win_partition_by.first(), win_order_by.first()) {
-            let pb = pb.clone();
-            let ob = ob.clone();
-            row_values.sort_by(|a, b| {
-                for pexpr in &pb {
-                    let va = eval_join_expr(pexpr, a, &col_map).unwrap_or(SqliteValue::Null);
-                    let vb = eval_join_expr(pexpr, b, &col_map).unwrap_or(SqliteValue::Null);
+        // Compute window function values.  Each window function may have its
+        // own PARTITION BY / ORDER BY, so we build per-function partitions and
+        // sort orders independently instead of using a single shared sort.
+        let total_rows = row_values.len();
+        // Results indexed by [window_func_index][raw_row_index].
+        let mut window_results: Vec<Vec<SqliteValue>> =
+            vec![vec![SqliteValue::Null; total_rows]; win_funcs.len()];
+
+        for (wi, func) in win_funcs.iter().enumerate() {
+            // Build sorted row indices for this window function's spec.
+            let pb = &win_partition_by[wi];
+            let ob = &win_order_by[wi];
+            let mut sorted_indices: Vec<usize> = (0..total_rows).collect();
+            sorted_indices.sort_by(|&a, &b| {
+                for pexpr in pb {
+                    let va = eval_join_expr(pexpr, &row_values[a], &col_map)
+                        .unwrap_or(SqliteValue::Null);
+                    let vb = eval_join_expr(pexpr, &row_values[b], &col_map)
+                        .unwrap_or(SqliteValue::Null);
                     let ord = cmp_sqlite_values(&va, &vb);
                     if ord != std::cmp::Ordering::Equal {
                         return ord;
                     }
                 }
-                for (oexpr, desc) in &ob {
-                    let va = eval_join_expr(oexpr, a, &col_map).unwrap_or(SqliteValue::Null);
-                    let vb = eval_join_expr(oexpr, b, &col_map).unwrap_or(SqliteValue::Null);
+                for (oexpr, desc) in ob {
+                    let va = eval_join_expr(oexpr, &row_values[a], &col_map)
+                        .unwrap_or(SqliteValue::Null);
+                    let vb = eval_join_expr(oexpr, &row_values[b], &col_map)
+                        .unwrap_or(SqliteValue::Null);
                     let ord = cmp_sqlite_values(&va, &vb);
                     let ord = if *desc { ord.reverse() } else { ord };
                     if ord != std::cmp::Ordering::Equal {
@@ -12457,37 +12471,36 @@ impl Connection {
                 }
                 std::cmp::Ordering::Equal
             });
-        }
 
-        // Build partitions: groups of row indices with equal PARTITION BY keys.
-        let partition_by = win_partition_by
-            .first()
-            .map_or(&[] as &[Expr], Vec::as_slice);
-        let partitions: Vec<Vec<usize>> = if partition_by.is_empty() {
-            vec![(0..row_values.len()).collect()]
-        } else {
-            let mut parts: Vec<(Vec<SqliteValue>, Vec<usize>)> = Vec::new();
-            for (i, row) in row_values.iter().enumerate() {
-                let key: Vec<SqliteValue> = partition_by
-                    .iter()
-                    .map(|e| eval_join_expr(e, row, &col_map).unwrap_or(SqliteValue::Null))
-                    .collect();
-                if let Some(part) = parts.iter_mut().find(|(k, _)| k == &key) {
-                    part.1.push(i);
-                } else {
-                    parts.push((key, vec![i]));
+            // Build partitions for this window function.
+            let partitions: Vec<Vec<usize>> = if pb.is_empty() {
+                vec![sorted_indices.clone()]
+            } else {
+                let mut parts: Vec<(Vec<SqliteValue>, Vec<usize>)> = Vec::new();
+                for &ri in &sorted_indices {
+                    let key: Vec<SqliteValue> = pb
+                        .iter()
+                        .map(|e| {
+                            eval_join_expr(e, &row_values[ri], &col_map)
+                                .unwrap_or(SqliteValue::Null)
+                        })
+                        .collect();
+                    if let Some(part) = parts.iter_mut().find(|(k, _)| k == &key) {
+                        part.1.push(ri);
+                    } else {
+                        parts.push((key, vec![ri]));
+                    }
                 }
-            }
-            parts.into_iter().map(|(_, indices)| indices).collect()
-        };
+                parts.into_iter().map(|(_, indices)| indices).collect()
+            };
 
-        // Compute window function values for each partition.
-        let total_rows = row_values.len();
-        let mut window_results: Vec<Vec<SqliteValue>> =
-            vec![Vec::with_capacity(total_rows); win_funcs.len()];
-
-        for partition_indices in &partitions {
-            for (wi, func) in win_funcs.iter().enumerate() {
+            // Evaluate this window function across its partitions.
+            // Results are pushed in partition traversal order; we'll scatter
+            // them to raw row indices afterwards.
+            let mut func_vals: Vec<SqliteValue> = Vec::with_capacity(total_rows);
+            let mut func_row_order: Vec<usize> = Vec::with_capacity(total_rows);
+            for partition_indices in &partitions {
+                func_row_order.extend_from_slice(partition_indices);
                 let mut state = func.initial_state();
                 let fname = &win_func_names[wi];
                 // Determine effective frame bounds.
@@ -12532,7 +12545,7 @@ impl Connection {
                             func.step(&mut sliding_state, &args)?;
                         }
                         let _ = ri; // used only for symmetry with other paths
-                        window_results[wi].push(func.value(&sliding_state)?);
+                        func_vals.push(func.value(&sliding_state)?);
                     }
                 } else if win_two_pass[wi] {
                     // Two-pass: step all rows first.
@@ -12549,14 +12562,14 @@ impl Connection {
                         // Functions relying on inverse() to advance row
                         // counter: value+inverse per row.
                         for _ in partition_indices {
-                            window_results[wi].push(func.value(&state)?);
+                            func_vals.push(func.value(&state)?);
                             func.inverse(&mut state, &[])?;
                         }
                     } else if !has_order {
                         // No ORDER BY → frame is entire partition.
                         let val = func.value(&state)?;
                         for _ in partition_indices {
-                            window_results[wi].push(val.clone());
+                            func_vals.push(val.clone());
                         }
                     } else if is_peer_aware {
                         // Direct computation for cume_dist/percent_rank using
@@ -12595,7 +12608,7 @@ impl Connection {
                                 }
                             };
                             for _ in pos..peer_end {
-                                window_results[wi].push(val.clone());
+                                func_vals.push(val.clone());
                             }
                             pos = peer_end;
                         }
@@ -12603,7 +12616,7 @@ impl Connection {
                         // UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING: same value for all rows.
                         let val = func.value(&state)?;
                         for _ in partition_indices {
-                            window_results[wi].push(val.clone());
+                            func_vals.push(val.clone());
                         }
                     } else if frame_start_unbounded {
                         // UNBOUNDED PRECEDING TO CURRENT ROW (or similar):
@@ -12620,12 +12633,12 @@ impl Connection {
                                 &col_map,
                             )?;
                             func.step(&mut running_state, &args)?;
-                            window_results[wi].push(func.value(&running_state)?);
+                            func_vals.push(func.value(&running_state)?);
                         }
                     } else {
                         // Generic two-pass: value+inverse per row.
                         for _ in partition_indices {
-                            window_results[wi].push(func.value(&state)?);
+                            func_vals.push(func.value(&state)?);
                             func.inverse(&mut state, &[])?;
                         }
                     }
@@ -12675,7 +12688,7 @@ impl Connection {
                             }
                             let val = func.value(&state)?;
                             for _ in pos..peer_end {
-                                window_results[wi].push(val.clone());
+                                func_vals.push(val.clone());
                             }
                             pos = peer_end;
                         }
@@ -12688,35 +12701,68 @@ impl Connection {
                                 &col_map,
                             )?;
                             func.step(&mut state, &args)?;
-                            window_results[wi].push(func.value(&state)?);
+                            func_vals.push(func.value(&state)?);
                         }
                     }
                 }
+            }
+
+            // Scatter func_vals back to window_results indexed by raw row index.
+            for (i, &ri) in func_row_order.iter().enumerate() {
+                window_results[wi][ri] = std::mem::replace(&mut func_vals[i], SqliteValue::Null);
             }
         }
 
-        // Build result rows in partition order, keeping track of raw row indices.
+        // Build result rows sorted by the first window spec's partition/order
+        // (matches SQLite's implicit output ordering for window queries).
+        let first_pb = &win_partition_by[0];
+        let first_ob = &win_order_by[0];
+        let mut output_order: Vec<usize> = (0..total_rows).collect();
+        output_order.sort_by(|&a, &b| {
+            for pexpr in first_pb {
+                let va =
+                    eval_join_expr(pexpr, &row_values[a], &col_map).unwrap_or(SqliteValue::Null);
+                let vb =
+                    eval_join_expr(pexpr, &row_values[b], &col_map).unwrap_or(SqliteValue::Null);
+                let ord = cmp_sqlite_values(&va, &vb);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            for (oexpr, desc) in first_ob {
+                let va =
+                    eval_join_expr(oexpr, &row_values[a], &col_map).unwrap_or(SqliteValue::Null);
+                let vb =
+                    eval_join_expr(oexpr, &row_values[b], &col_map).unwrap_or(SqliteValue::Null);
+                let ord = cmp_sqlite_values(&va, &vb);
+                let ord = if *desc { ord.reverse() } else { ord };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+        // window_results is indexed by [func][raw_row_index].
         let mut result = Vec::with_capacity(total_rows);
         let mut result_raw_indices: Vec<usize> = Vec::with_capacity(total_rows);
-        let mut win_row = 0;
-        for partition_indices in &partitions {
-            for &ri in partition_indices {
-                let row = &row_values[ri];
-                let mut values = Vec::with_capacity(col_kinds.len());
-                for kind in &col_kinds {
-                    match kind {
-                        ColKind::Plain(expr) => {
-                            values.push(eval_join_expr(expr, row, &col_map)?);
-                        }
-                        ColKind::Window(wi) => {
-                            values.push(window_results[*wi][win_row].clone());
-                        }
+        for ri in output_order {
+            let row = &row_values[ri];
+            let mut values = Vec::with_capacity(col_kinds.len());
+            for kind in &col_kinds {
+                match kind {
+                    ColKind::Plain(expr) => {
+                        values.push(eval_join_expr(expr, row, &col_map)?);
+                    }
+                    ColKind::Window(wi) => {
+                        values.push(std::mem::replace(
+                            &mut window_results[*wi][ri],
+                            SqliteValue::Null,
+                        ));
                     }
                 }
-                result.push(Row { values });
-                result_raw_indices.push(ri);
-                win_row += 1;
             }
+            result.push(Row { values });
+            result_raw_indices.push(ri);
         }
 
         // Apply outer ORDER BY if present.
@@ -12860,20 +12906,10 @@ impl Connection {
         let mut temp_names = Vec::new();
         let result = (|| -> Result<Vec<Row>> {
             self.materialize_with_clause(select.with.as_ref(), params, &mut temp_names)?;
-            eprintln!(
-                "[DEBUG] execute_with_ctes: materialized CTEs: {temp_names:?}, schema tables: {:?}",
-                self.schema
-                    .borrow()
-                    .iter()
-                    .map(|t| &t.name)
-                    .collect::<Vec<_>>()
-            );
             let mut stripped = select.clone();
             stripped.with = None;
-            eprintln!("[DEBUG] execute_with_ctes: executing stripped SELECT");
             self.execute_statement(Statement::Select(stripped), params)
         })();
-        eprintln!("[DEBUG] execute_with_ctes: result = {result:?}");
         self.cleanup_cte_tables(&temp_names);
         self.set_reject_mem_fallback(prev_reject);
         result
@@ -63544,6 +63580,75 @@ mod pager_routing_tests {
                 "{} correlated subquery + GROUP BY mismatches",
                 mismatches.len()
             );
+        }
+    }
+
+    /// Probe: edge cases in aggregate functions, empty tables, type conversions.
+    #[test]
+    fn test_conformance_edge_aggregate_type_probe() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE nums(id INTEGER PRIMARY KEY, x REAL, y INTEGER, s TEXT)",
+            "INSERT INTO nums VALUES(1,1.5,10,'hello'),(2,2.5,20,'world'),(3,NULL,NULL,NULL),(4,3.5,30,'foo'),(5,0.0,0,'bar')",
+            "CREATE TABLE empty_t(id INTEGER PRIMARY KEY, val TEXT)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // total() returns 0.0 on empty set (not NULL like SUM)
+            "SELECT total(val) FROM empty_t",
+            "SELECT SUM(val) FROM empty_t",
+            "SELECT COUNT(*) FROM empty_t",
+            "SELECT COUNT(val) FROM empty_t",
+            // total() vs SUM with NULLs
+            "SELECT total(x) FROM nums",
+            "SELECT SUM(x) FROM nums",
+            // GROUP_CONCAT with NULL values
+            "SELECT GROUP_CONCAT(s) FROM nums",
+            "SELECT GROUP_CONCAT(s, '|') FROM nums",
+            // Aggregate with DISTINCT
+            "SELECT COUNT(DISTINCT y) FROM nums",
+            "SELECT SUM(DISTINCT y) FROM nums",
+            // avg with NULL
+            "SELECT AVG(x) FROM nums",
+            "SELECT AVG(y) FROM nums",
+            // min/max on text
+            "SELECT MIN(s), MAX(s) FROM nums",
+            // Aggregate on empty table
+            "SELECT MIN(val), MAX(val), AVG(val) FROM empty_t",
+            // abs edge cases
+            "SELECT abs(-9223372036854775807) AS a1, abs(0) AS a2, abs(-1.5) AS a3",
+            // zeroblob
+            "SELECT typeof(zeroblob(4)) AS t, length(zeroblob(4)) AS l, hex(zeroblob(4)) AS h",
+            // quote function
+            "SELECT quote(NULL) AS q1, quote(42) AS q2, quote('hello') AS q3, quote(X'CAFE') AS q4",
+            // unicode function
+            "SELECT unicode('A') AS u1, unicode('a') AS u2",
+            // char function
+            "SELECT char(65, 66, 67) AS c1",
+            // random (just check it returns an integer)
+            "SELECT typeof(random()) AS t",
+            // ltrim/rtrim/trim with specific chars
+            "SELECT ltrim('xxxhello', 'x') AS l, rtrim('helloyyy', 'y') AS r, trim('xxhelloxx', 'x') AS t",
+            // replace
+            "SELECT replace('hello world', 'world', 'there') AS r",
+            // LIKE with escape
+            "SELECT 'abc%def' LIKE 'abc!%def' ESCAPE '!' AS r",
+            // Nested aggregate in expression
+            "SELECT COUNT(*) * 2 AS doubled, SUM(y) / COUNT(*) AS int_avg FROM nums WHERE y IS NOT NULL",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} edge aggregate/type mismatches", mismatches.len());
         }
     }
 
