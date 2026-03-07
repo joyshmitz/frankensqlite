@@ -221,10 +221,15 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
 
         if cursor.first(&cx)? {
             loop {
+                let rowid = cursor.rowid(&cx)?;
                 let payload = cursor.payload(&cx)?;
-                if let Some(values) = parse_record(&payload) {
-                    entries.push(values);
-                }
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                entries.push(values);
                 if !cursor.next(&cx)? {
                     break;
                 }
@@ -286,6 +291,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
             i32::try_from(root_page_u32).expect("validated root page must fit MemDatabase");
         db.create_table_at(real_root_page, num_columns);
 
+        let table_name_for_err = name.clone();
         schema.push(TableSchema {
             name,
             root_page: real_root_page,
@@ -312,9 +318,14 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
                 loop {
                     let rowid = cursor.rowid(&cx)?;
                     let payload = cursor.payload(&cx)?;
-                    if let Some(values) = parse_record(&payload) {
-                        mem_table.insert_row(rowid, values);
-                    }
+                    let values = parse_record(&payload).ok_or_else(|| {
+                        FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "table `{table_name_for_err}` rowid {rowid} payload is not a valid SQLite record"
+                            ),
+                        }
+                    })?;
+                    mem_table.insert_row(rowid, values);
                     if !cursor.next(&cx)? {
                         break;
                     }
@@ -1771,6 +1782,63 @@ mod tests {
             message.contains("supported range")
                 || message.contains("out-of-range")
                 || message.contains("2147483648"),
+            "unexpected load error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_invalid_utf8_in_sqlite_master_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_master_utf8.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                INSERT INTO docs VALUES (1, 'hello');
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master
+                SET sql = CAST(x'FF' AS TEXT)
+                WHERE name = 'docs';
+                PRAGMA writable_schema = OFF;
+                ",
+            )
+            .unwrap();
+        }
+
+        let err = load_from_sqlite(&db_path).expect_err("invalid sqlite_master text should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("sqlite_master row")
+                || message.contains("valid SQLite record")
+                || message.contains("payload"),
+            "unexpected load error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_invalid_utf8_in_table_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_table_utf8.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
+                CREATE TABLE docs (title TEXT);
+                INSERT INTO docs VALUES (CAST(x'FF' AS TEXT));
+                ",
+            )
+            .unwrap();
+        }
+
+        let err = load_from_sqlite(&db_path).expect_err("invalid table text should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("table `docs`")
+                || message.contains("valid SQLite record")
+                || message.contains("payload"),
             "unexpected load error: {message}"
         );
     }

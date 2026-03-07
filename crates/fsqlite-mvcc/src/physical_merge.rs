@@ -793,12 +793,11 @@ pub fn repack_btree_page(
 
     // Cell content start
     #[allow(clippy::cast_possible_truncation)]
-    let ccs_raw =
-        if cell_content_start == 65536 || (cell_count == 0 && cell_content_start == usable) {
-            0u16
-        } else {
-            u16::try_from(cell_content_start).unwrap_or(0)
-        };
+    let ccs_raw = if cell_content_start == 65536 {
+        0u16
+    } else {
+        u16::try_from(cell_content_start).unwrap_or(0)
+    };
     let ccs_be = ccs_raw.to_be_bytes();
     page[header_offset + 5] = ccs_be[0];
     page[header_offset + 6] = ccs_be[1];
@@ -1613,6 +1612,15 @@ mod tests {
     // -----------------------------------------------------------------------
     // Additional edge-case tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_repack_empty_page() {
+        let ps = default_page_size();
+        let tid = table_id_1();
+        let repacked =
+            repack_btree_page(&[], BTreePageType::LeafTable, ps, 0, false, None).unwrap();
+        let _parsed = parse_btree_page(&repacked, ps, 0, false, BtreeRef::Table(tid)).unwrap();
+    }
 
     #[test]
     fn test_empty_patch_merge() {

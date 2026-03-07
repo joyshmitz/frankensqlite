@@ -4,6 +4,7 @@
 // string scanning. Tracks line/column for error reporting.
 
 use fsqlite_ast::Span;
+use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use memchr::memchr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -577,8 +578,7 @@ impl<'a> Lexer<'a> {
                     (Some(h), Some(l)) => bytes.push((h << 4) | l),
                     _ => {
                         return TokenKind::Error(format!(
-                            "invalid hex in blob literal at byte {}",
-                            start
+                            "invalid hex in blob literal at byte {start}"
                         ));
                     }
                 }
@@ -695,6 +695,30 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        // SQLite strictness: a number cannot be immediately followed by an alphabetical character or underscore.
+        // Doing so produces an "unrecognized token" error.
+        if let Some(c) = self.peek() {
+            if c.is_ascii_alphabetic()
+                || c == b'_'
+                || (c == b'.'
+                    && self
+                        .peek_at(1)
+                        .is_some_and(|n| n.is_ascii_alphabetic() || n == b'_'))
+            {
+                let err_start = start;
+                while self.pos < self.src.len() {
+                    let ch = self.src[self.pos];
+                    if ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'.' {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                let err_text = String::from_utf8_lossy(&self.src[err_start..self.pos]);
+                return TokenKind::Error(format!("unrecognized token: \"{err_text}\""));
+            }
+        }
+
         let text = String::from_utf8_lossy(&self.src[start..self.pos]);
         if is_float {
             match text.parse::<f64>() {
@@ -747,7 +771,10 @@ impl<'a> Lexer<'a> {
             }
             let text = String::from_utf8_lossy(&self.src[num_start..self.pos]);
             match text.parse::<u32>() {
-                Ok(n) => TokenKind::QuestionNum(n),
+                Ok(n) if (1..=MAX_VARIABLE_NUMBER).contains(&n) => TokenKind::QuestionNum(n),
+                Ok(n) => TokenKind::Error(format!(
+                    "variable number must be between ?1 and ?{MAX_VARIABLE_NUMBER}, got ?{n}"
+                )),
                 Err(_) => TokenKind::Error("invalid parameter number".to_owned()),
             }
         } else {
@@ -762,6 +789,9 @@ impl<'a> Lexer<'a> {
         while self.pos < self.src.len() {
             let ch = self.src[self.pos];
             if ch.is_ascii_alphanumeric() || ch == b'_' || ch >= 0x80 {
+                self.advance();
+            } else if ch == b':' && self.peek_at(1) == Some(b':') {
+                self.advance();
                 self.advance();
             } else {
                 break;
@@ -782,6 +812,9 @@ impl<'a> Lexer<'a> {
             let ch = self.src[self.pos];
             if ch.is_ascii_alphanumeric() || ch == b'_' || ch >= 0x80 {
                 self.advance();
+            } else if ch == b':' && self.peek_at(1) == Some(b':') {
+                self.advance();
+                self.advance();
             } else {
                 break;
             }
@@ -801,6 +834,20 @@ impl<'a> Lexer<'a> {
             let ch = self.src[self.pos];
             if ch.is_ascii_alphanumeric() || ch == b'_' || ch >= 0x80 {
                 self.advance();
+            } else if ch == b':' && self.peek_at(1) == Some(b':') {
+                self.advance();
+                self.advance();
+            } else if ch == b'(' {
+                self.advance();
+                while self.pos < self.src.len() && self.src[self.pos] != b')' {
+                    self.advance();
+                }
+                if self.pos >= self.src.len() || self.src[self.pos] != b')' {
+                    let name = String::from_utf8_lossy(&self.src[name_start..self.pos]);
+                    return TokenKind::Error(format!("unrecognized token: \"${name}\""));
+                }
+                self.advance();
+                break; // Tcl array variable parameters end after the closing paren.
             } else {
                 break;
             }
@@ -1149,6 +1196,84 @@ mod tests {
         // 0x00000000000000001 (17 chars, 1 significant) is valid.
         let tokens = kinds("0x00000000000000001");
         assert_eq!(tokens[0], TokenKind::Integer(1));
+    }
+
+    #[test]
+    fn test_lex_number_hex() {
+        let tokens = kinds("0x1A 0Xff 0x0");
+        assert_eq!(tokens[0], TokenKind::Integer(26));
+        assert_eq!(tokens[1], TokenKind::Integer(255));
+        assert_eq!(tokens[2], TokenKind::Integer(0));
+        assert_eq!(tokens[3], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_number_unrecognized() {
+        let tokens = kinds("123a 123.a");
+        assert!(
+            matches!(tokens[0], TokenKind::Error(ref e) if e.contains("unrecognized token: \"123a\""))
+        );
+        assert!(
+            matches!(tokens[1], TokenKind::Error(ref e) if e.contains("unrecognized token: \"123.a\""))
+        );
+    }
+
+    #[test]
+    fn test_lex_number_hex_invalid() {
+        let tokens = kinds("0x");
+        assert!(matches!(tokens[0], TokenKind::Error(_)));
+    }
+
+    #[test]
+    fn test_lex_positional_params() {
+        let tokens = kinds("? ?123");
+        assert_eq!(tokens[0], TokenKind::Question);
+        assert_eq!(tokens[1], TokenKind::QuestionNum(123));
+        assert_eq!(tokens[2], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_positional_params_reject_zero_and_out_of_range() {
+        let tokens = kinds("?0 ?32767");
+        assert!(
+            matches!(tokens[0], TokenKind::Error(ref e) if e.contains("between ?1 and ?32766")),
+            "expected ?0 to be rejected, got {:?}",
+            tokens[0]
+        );
+        assert!(
+            matches!(tokens[1], TokenKind::Error(ref e) if e.contains("between ?1 and ?32766")),
+            "expected ?32767 to be rejected, got {:?}",
+            tokens[1]
+        );
+        assert_eq!(tokens[2], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_named_params() {
+        let tokens = kinds(":foo @bar $baz_123");
+        assert_eq!(tokens[0], TokenKind::ColonParam("foo".to_owned()));
+        assert_eq!(tokens[1], TokenKind::AtParam("bar".to_owned()));
+        assert_eq!(tokens[2], TokenKind::DollarParam("baz_123".to_owned()));
+        assert_eq!(tokens[3], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_named_params_with_tcl_syntax() {
+        let tokens = kinds("$::foo(bar) :a::b");
+        assert_eq!(tokens[0], TokenKind::DollarParam("::foo(bar)".to_owned()));
+        assert_eq!(tokens[1], TokenKind::ColonParam("a::b".to_owned()));
+        assert_eq!(tokens[2], TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_lex_named_params_with_unclosed_tcl_array_syntax() {
+        let tokens = kinds("$::foo(bar");
+        assert!(
+            matches!(tokens[0], TokenKind::Error(ref e) if e.contains("unrecognized token")),
+            "expected unterminated Tcl-style parameter to be rejected, got {:?}",
+            tokens[0]
+        );
+        assert_eq!(tokens[1], TokenKind::Eof);
     }
 
     fn histogram_total(hist: &TokenizeDurationSecondsHistogram) -> u64 {

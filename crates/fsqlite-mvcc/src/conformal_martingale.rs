@@ -63,7 +63,8 @@ impl ConformalMartingaleMonitor {
         self.regime_length += 1;
         self.regime_mean += (x - self.regime_mean) / (self.regime_length as f64);
 
-        if self.history.len() < 10 {
+        let min_history = self.config.window_size.min(10);
+        if self.history.len() < min_history {
             // Need a minimum history to compute meaningful p-values
             if self.history.len() == self.config.window_size {
                 self.history.pop_front();
@@ -75,7 +76,7 @@ impl ConformalMartingaleMonitor {
         // Conformal scoring: rank `x` against history.
         // We use absolute deviation from history median as our non-conformity measure.
         let mut sorted_hist = self.history.clone().into_iter().collect::<Vec<_>>();
-        sorted_hist.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted_hist.sort_by(|a, b| a.total_cmp(b));
         let median = sorted_hist[sorted_hist.len() / 2];
 
         let score = (x - median).abs();

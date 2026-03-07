@@ -449,7 +449,7 @@ pub fn jsonb_patch(input: &str, patch: &str) -> Result<Vec<u8>> {
 }
 
 /// Row shape produced by `json_each` and `json_tree`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonTableRow {
     /// Object key, array index, or NULL (root/scalar).
     pub key: SqliteValue,

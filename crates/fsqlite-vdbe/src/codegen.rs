@@ -9616,6 +9616,7 @@ fn extract_collation(expr: &Expr) -> Option<&str> {
 }
 
 /// Extract explicit COLLATE from an ORDER BY term's expression.
+#[allow(dead_code)]
 fn extract_collation_from_ordering_term(term: &OrderingTerm) -> Option<&str> {
     extract_collation(&term.expr)
 }

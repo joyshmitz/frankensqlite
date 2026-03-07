@@ -1401,7 +1401,7 @@ mod tests {
             ));
             outcome
                 .decode_proof
-                .expect("fallback success should emit decode proof")
+                .expect("fallback-success path should emit decode proof")
         };
 
         let proof_a = run_once();
@@ -1423,7 +1423,7 @@ mod tests {
         });
 
         let strategy = (
-            prop::collection::vec(any::<u8>(), 17..96),
+            prop::collection::vec(proptest::num::u8::ANY, 17..96),
             prop::collection::vec(0_u8..7, 0..4),
             prop::collection::vec(0_u8..7, 0..4),
         );
@@ -1508,7 +1508,7 @@ mod tests {
                     let audit = storage.take_decode_audit_entries();
                     let Some(failure_entry) = audit.iter().find(|entry| !entry.decode_success)
                     else {
-                        return Err(TestCaseError::fail(
+                        return Err(proptest::test_runner::TestCaseError::fail(
                             "expected failure decode proof artifact",
                         ));
                     };

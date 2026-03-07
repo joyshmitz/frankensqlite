@@ -530,6 +530,14 @@ impl SorterCursor {
     }
 }
 
+impl Drop for SorterCursor {
+    fn drop(&mut self) {
+        for run in &self.spill_runs {
+            let _ = std::fs::remove_file(&run.path);
+        }
+    }
+}
+
 /// Iterator over records in a sorted run (either disk-backed or in-memory).
 enum RunIterator {
     /// Records read from a temporary file.

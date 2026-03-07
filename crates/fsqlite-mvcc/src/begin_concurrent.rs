@@ -882,11 +882,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
     // Re-scan against current active state to capture overlap edges that may
     // appear after prepare but before finalize. This keeps committed pivot
     // decisions deterministic.
-    let active_views: Vec<HandleView> = registry
-        .active
-        .values()
-        .map(HandleView::new)
-        .collect();
+    let active_views: Vec<HandleView> = registry.active.values().map(HandleView::new).collect();
     let active_refs: Vec<&dyn ActiveTxnView> = active_views
         .iter()
         .map(|view| view as &dyn ActiveTxnView)

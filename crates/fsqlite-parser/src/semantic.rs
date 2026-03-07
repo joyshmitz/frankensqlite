@@ -1040,11 +1040,26 @@ impl<'a> Resolver<'a> {
                 expr: inner,
                 pattern,
                 escape,
+                op,
                 ..
             } => {
                 self.resolve_expr(inner, scope);
                 self.resolve_expr(pattern, scope);
                 if let Some(esc) = escape {
+                    if *op != fsqlite_ast::LikeOp::Like {
+                        // SQLite only supports ESCAPE with LIKE. For GLOB, MATCH, REGEXP it throws "wrong number of arguments to function X()"
+                        self.push_error(SemanticErrorKind::FunctionArityMismatch {
+                            function: match op {
+                                fsqlite_ast::LikeOp::Like => "LIKE",
+                                fsqlite_ast::LikeOp::Glob => "GLOB",
+                                fsqlite_ast::LikeOp::Match => "MATCH",
+                                fsqlite_ast::LikeOp::Regexp => "REGEXP",
+                            }
+                            .to_owned(),
+                            expected: FunctionArity::Exact(2),
+                            actual: 3,
+                        });
+                    }
                     self.resolve_expr(esc, scope);
                 }
             }
@@ -1229,9 +1244,10 @@ impl<'a> Resolver<'a> {
         let actual = match args {
             FunctionArgs::Star => {
                 if !name.eq_ignore_ascii_case("count") {
+                    let expected = known_function_arity(name).unwrap_or(FunctionArity::Range(0, 1));
                     self.push_error(SemanticErrorKind::FunctionArityMismatch {
                         function: name.to_owned(),
-                        expected: FunctionArity::Range(0, 1),
+                        expected,
                         actual: 1,
                     });
                 }
@@ -1665,7 +1681,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(matches!(
             errors[0].kind,
-            SemanticErrorKind::FunctionArityMismatch { .. }
+            SemanticErrorKind::NoTablesSpecifiedForStar
         ));
     }
 
@@ -1758,9 +1774,29 @@ mod tests {
     #[test]
     fn test_resolve_group_by_alias() {
         let schema = make_schema();
-        let stmt = parse_one("SELECT id FROM users GROUP BY id");
+        let stmt = parse_one("SELECT id AS x FROM users GROUP BY x");
         let mut resolver = Resolver::new(&schema);
         let errors = resolver.resolve_statement(&stmt);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_resolve_escape_on_non_like() {
+        let schema = make_schema();
+        // LIKE with ESCAPE is valid.
+        let stmt_like = parse_one("SELECT 1 LIKE 2 ESCAPE 3");
+        let mut resolver_like = Resolver::new(&schema);
+        let errors_like = resolver_like.resolve_statement(&stmt_like);
+        assert!(errors_like.is_empty(), "LIKE ESCAPE should be valid");
+
+        // GLOB with ESCAPE is invalid.
+        let stmt_glob = parse_one("SELECT 1 GLOB 2 ESCAPE 3");
+        let mut resolver_glob = Resolver::new(&schema);
+        let errors_glob = resolver_glob.resolve_statement(&stmt_glob);
+        assert_eq!(errors_glob.len(), 1);
+        assert!(matches!(
+            errors_glob[0].kind,
+            SemanticErrorKind::FunctionArityMismatch { .. }
+        ));
     }
 }

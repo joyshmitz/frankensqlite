@@ -31,6 +31,7 @@ static BETREE_BUFFER_FLUSHES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BETREE_MESSAGES_BUFFERED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BETREE_CASCADE_DEPTH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BETREE_INSERTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BETREE_DELETES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Snapshot of Bε-tree metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -41,19 +42,22 @@ pub struct BeTreeMetricsSnapshot {
     pub messages_buffered_total: u64,
     /// Sum of cascade depths across all flush operations.
     pub cascade_depth_total: u64,
-    /// Total insert/upsert/delete operations.
+    /// Total inserts.
     pub inserts_total: u64,
+    /// Total deletes.
+    pub deletes_total: u64,
 }
 
 impl fmt::Display for BeTreeMetricsSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "betree_flushes={} betree_msgs_buffered={} betree_cascade_depth={} betree_inserts={}",
+            "betree_flushes={} betree_msgs_buffered={} betree_cascade_depth={} betree_inserts={} betree_deletes={}",
             self.buffer_flushes_total,
             self.messages_buffered_total,
             self.cascade_depth_total,
             self.inserts_total,
+            self.deletes_total,
         )
     }
 }
@@ -66,6 +70,7 @@ pub fn betree_metrics_snapshot() -> BeTreeMetricsSnapshot {
         messages_buffered_total: BETREE_MESSAGES_BUFFERED_TOTAL.load(Ordering::Relaxed),
         cascade_depth_total: BETREE_CASCADE_DEPTH_TOTAL.load(Ordering::Relaxed),
         inserts_total: BETREE_INSERTS_TOTAL.load(Ordering::Relaxed),
+        deletes_total: BETREE_DELETES_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -75,6 +80,7 @@ pub fn reset_betree_metrics() {
     BETREE_MESSAGES_BUFFERED_TOTAL.store(0, Ordering::Relaxed);
     BETREE_CASCADE_DEPTH_TOTAL.store(0, Ordering::Relaxed);
     BETREE_INSERTS_TOTAL.store(0, Ordering::Relaxed);
+    BETREE_DELETES_TOTAL.store(0, Ordering::Relaxed);
 }
 
 // ── Configuration ────────────────────────────────────────────────────────
@@ -216,7 +222,7 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
 
     /// Delete a key. No-op if the key doesn't exist.
     pub fn delete(&mut self, key: K) {
-        BETREE_INSERTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        BETREE_DELETES_TOTAL.fetch_add(1, Ordering::Relaxed);
 
         let msg = BeMessage::Delete { key };
         self.apply_message(msg);

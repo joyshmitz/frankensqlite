@@ -911,7 +911,7 @@ impl Parser {
                 None
             }
         };
-        self.expect_kw(&TokenKind::KwInto)?;
+        self.eat_kw(&TokenKind::KwInto);
         let table = self.parse_qualified_name()?;
         let alias = if self.eat_kw(&TokenKind::KwAs) {
             Some(self.parse_identifier()?)

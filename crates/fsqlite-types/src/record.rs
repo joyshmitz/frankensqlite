@@ -20,7 +20,7 @@ use crate::value::SqliteValue;
 #[allow(clippy::cast_possible_truncation)]
 pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
     if data.is_empty() {
-        return Some(Vec::new());
+        return None;
     }
 
     // Read the header size.
@@ -48,9 +48,7 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
         let value_len_u64 = serial_type_len(st)?;
         let value_len = usize::try_from(value_len_u64).unwrap_or(usize::MAX);
 
-        let Some(end) = body_offset.checked_add(value_len) else {
-            return None;
-        };
+        let end = body_offset.checked_add(value_len)?;
 
         if end > data.len() {
             return None;
@@ -60,6 +58,10 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
         let value = decode_value(st, value_bytes)?;
         values.push(value);
         body_offset = end;
+    }
+
+    if body_offset != data.len() {
+        return None;
     }
 
     Some(values)
@@ -168,9 +170,9 @@ fn decode_value(serial_type: u64, bytes: &[u8]) -> Option<SqliteValue> {
                 Some(SqliteValue::Float(value))
             }
         }
-        SerialTypeClass::Text => Some(SqliteValue::Text(
-            String::from_utf8_lossy(bytes).into_owned(),
-        )),
+        SerialTypeClass::Text => std::str::from_utf8(bytes)
+            .ok()
+            .map(|text| SqliteValue::Text(text.to_owned())),
         SerialTypeClass::Blob => Some(SqliteValue::Blob(bytes.to_vec())),
         SerialTypeClass::Reserved => None,
     }
@@ -503,9 +505,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_data() {
-        let values = parse_record(&[]).unwrap();
-        assert!(values.is_empty());
+    fn parse_empty_data_is_malformed() {
+        assert!(parse_record(&[]).is_none());
+    }
+
+    #[test]
+    fn malformed_record_invalid_utf8_text() {
+        let data = [0x02, 0x0F, 0xFF];
+        assert!(parse_record(&data).is_none());
+    }
+
+    #[test]
+    fn malformed_record_rejects_trailing_body_bytes() {
+        let data = [0x02, 0x01, 0x2A, 0x63];
+        assert!(parse_record(&data).is_none());
     }
 
     #[test]

@@ -20,6 +20,7 @@ use fsqlite_func::scalar::ScalarFunction;
 use fsqlite_func::vtab::{ColumnContext, IndexInfo, VirtualTable, VirtualTableCursor};
 use fsqlite_types::SqliteValue;
 use fsqlite_types::cx::Cx;
+use rand::RngCore;
 use tracing::{debug, info};
 
 #[must_use]
@@ -415,8 +416,8 @@ fn decimal_sub_impl(a: &str, b: &str) -> Option<String> {
 
 /// Perform decimal multiplication: a * b.
 fn decimal_mul_impl(a: &str, b: &str) -> Option<String> {
-    let Some((neg_a, int_a, frac_a)) = parse_decimal(a) else { return None; };
-    let Some((neg_b, int_b, frac_b)) = parse_decimal(b) else { return None; };
+    let (neg_a, int_a, frac_a) = parse_decimal(a)?;
+    let (neg_b, int_b, frac_b) = parse_decimal(b)?;
 
     let result_negative = neg_a != neg_b;
     let frac_places = frac_a.len() + frac_b.len();
@@ -459,8 +460,8 @@ fn decimal_mul_impl(a: &str, b: &str) -> Option<String> {
 
 /// Compare two decimal values, returning -1, 0, or 1.
 fn decimal_cmp_impl(a: &str, b: &str) -> Option<i64> {
-    let Some((neg_a, int_a, frac_a)) = parse_decimal(a) else { return None; };
-    let Some((neg_b, int_b, frac_b)) = parse_decimal(b) else { return None; };
+    let (neg_a, int_a, frac_a) = parse_decimal(a)?;
+    let (neg_b, int_b, frac_b) = parse_decimal(b)?;
 
     let a_is_zero = int_a.iter().all(|&d| d == 0) && frac_a.iter().all(|&d| d == 0);
     let b_is_zero = int_b.iter().all(|&d| d == 0) && frac_b.iter().all(|&d| d == 0);
@@ -505,7 +506,9 @@ impl ScalarFunction for DecimalFunc {
             return Ok(SqliteValue::Null);
         }
         let text = args[0].to_text();
-        Ok(SqliteValue::Text(decimal_normalize(&text).unwrap_or_else(|| text.clone())))
+        Ok(SqliteValue::Text(
+            decimal_normalize(&text).unwrap_or_else(|| text.clone()),
+        ))
     }
 
     fn num_args(&self) -> i32 {
@@ -645,42 +648,10 @@ impl ScalarFunction for DecimalCmpFunc {
 // UUID extension
 // ══════════════════════════════════════════════════════════════════════
 
-/// Simple PRNG for UUID v4 generation (xorshift64).
-///
-/// Seeded from system time. Not cryptographic, but sufficient for
-/// UUID v4 uniqueness guarantees.
-fn xorshift64(state: &mut u64) -> u64 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    x
-}
-
 /// Generate a random UUID v4 string.
 fn generate_uuid_v4() -> String {
-    // Seed from a combination of pointer address and a counter
-    // to ensure uniqueness across calls.
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let count = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-    // Use stack address as entropy source (ASLR provides randomness)
-    let stack_var: u64 = 0;
-    #[allow(clippy::ptr_as_ptr)]
-    let addr = std::ptr::addr_of!(stack_var) as u64;
-    let mut state = addr.wrapping_mul(6_364_136_223_846_793_005)
-        ^ count.wrapping_mul(1_442_695_040_888_963_407);
-    if state == 0 {
-        state = 0x5DEE_CE66_D1A4_F87D; // fallback seed
-    }
-
     let mut bytes = [0u8; 16];
-    for chunk in bytes.chunks_exact_mut(8) {
-        let val = xorshift64(&mut state);
-        chunk.copy_from_slice(&val.to_le_bytes());
-    }
+    rand::thread_rng().fill_bytes(&mut bytes);
 
     // Set version (4) and variant (10xx)
     bytes[6] = (bytes[6] & 0x0F) | 0x40; // version 4
@@ -707,21 +678,56 @@ fn generate_uuid_v4() -> String {
     )
 }
 
+fn decode_uuid_nibble(byte: u8, position: usize) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(FrankenError::internal(format!(
+            "invalid UUID character at position {position}: {byte:?}",
+        ))),
+    }
+}
+
+fn decode_uuid_hex_pair(bytes: &[u8], index: usize) -> Result<u8> {
+    let high = decode_uuid_nibble(bytes[index], index)?;
+    let low = decode_uuid_nibble(bytes[index + 1], index + 1)?;
+    Ok((high << 4) | low)
+}
+
 /// Parse a UUID string into 16 bytes.
 fn uuid_str_to_blob(s: &str) -> Result<Vec<u8>> {
-    let hex: String = s.chars().filter(char::is_ascii_hexdigit).collect();
-    if hex.len() != 32 {
-        return Err(FrankenError::internal(format!(
-            "invalid UUID string: expected 32 hex digits, got {}",
-            hex.len()
-        )));
-    }
+    let ascii = s.as_bytes();
+    let hex_digits: Vec<u8> = match ascii.len() {
+        32 => ascii.to_vec(),
+        36 => {
+            for hyphen_index in [8usize, 13, 18, 23] {
+                if ascii[hyphen_index] != b'-' {
+                    return Err(FrankenError::internal(format!(
+                        "invalid UUID string: expected '-' at position {hyphen_index}",
+                    )));
+                }
+            }
+
+            let mut digits = Vec::with_capacity(32);
+            for (index, byte) in ascii.iter().copied().enumerate() {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    continue;
+                }
+                digits.push(byte);
+            }
+            digits
+        }
+        len => {
+            return Err(FrankenError::internal(format!(
+                "invalid UUID string length {len}: expected 32 or 36 characters",
+            )));
+        }
+    };
 
     let mut bytes = Vec::with_capacity(16);
-    for i in (0..32).step_by(2) {
-        let byte = u8::from_str_radix(&hex[i..i + 2], 16)
-            .map_err(|_| FrankenError::internal(format!("invalid hex in UUID at position {i}")))?;
-        bytes.push(byte);
+    for i in (0..hex_digits.len()).step_by(2) {
+        bytes.push(decode_uuid_hex_pair(&hex_digits, i)?);
     }
     Ok(bytes)
 }
@@ -1489,6 +1495,26 @@ mod tests {
     #[test]
     fn test_uuid_str_to_blob_invalid_hex() {
         assert!(uuid_str_to_blob("ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ").is_err());
+    }
+
+    #[test]
+    fn test_uuid_str_to_blob_accepts_compact_hex() {
+        let uuid = "1234567812344abc8def1234567890ab";
+        let blob = uuid_str_to_blob(uuid).unwrap();
+        assert_eq!(
+            blob_to_uuid_str(&blob).unwrap(),
+            "12345678-1234-4abc-8def-1234567890ab"
+        );
+    }
+
+    #[test]
+    fn test_uuid_str_to_blob_rejects_trailing_garbage() {
+        assert!(uuid_str_to_blob("12345678-1234-4abc-8def-1234567890ab!!").is_err());
+    }
+
+    #[test]
+    fn test_uuid_str_to_blob_rejects_misplaced_hyphen() {
+        assert!(uuid_str_to_blob("1234567-81234-4abc-8def-1234567890ab").is_err());
     }
 
     #[test]

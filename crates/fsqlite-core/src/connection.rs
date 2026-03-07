@@ -41,6 +41,7 @@ use fsqlite_parser::Parser;
 use fsqlite_types::DATABASE_HEADER_SIZE;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
+use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
@@ -463,7 +464,7 @@ fn type_name_to_affinity(name: &str) -> u8 {
 }
 
 /// A database row produced by a query.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     values: Vec<SqliteValue>,
 }
@@ -558,7 +559,7 @@ impl std::ops::BitOr for TraceMask {
 }
 
 /// sqlite3_trace_v2-style callback event payload.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceEvent {
     /// Statement text about to execute.
     Statement { sql: String },
@@ -5792,14 +5793,19 @@ impl Connection {
                 )));
             }
             loop {
+                let rowid = cursor.rowid(cx)?;
                 let payload = cursor.payload(cx)?;
-                if let Some(values) = parse_record(&payload) {
-                    // Column index 1 is the `name` column.
-                    if let Some(SqliteValue::Text(row_name)) = values.get(1) {
-                        if row_name.eq_ignore_ascii_case(name) {
-                            return cursor.delete(cx);
-                        }
-                    }
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                // Column index 1 is the `name` column.
+                if let Some(SqliteValue::Text(row_name)) = values.get(1)
+                    && row_name.eq_ignore_ascii_case(name)
+                {
+                    return cursor.delete(cx);
                 }
                 if !cursor.next(cx)? {
                     break;
@@ -5832,30 +5838,35 @@ impl Connection {
                 )));
             }
             loop {
+                let rowid = cursor.rowid(cx)?;
                 let payload = cursor.payload(cx)?;
-                if let Some(values) = parse_record(&payload) {
-                    if let Some(SqliteValue::Text(row_name)) = values.get(1) {
-                        if row_name.eq_ignore_ascii_case(name) {
-                            // Preserve the original rowid so the table entry
-                            // stays before any index entries in rowid order.
-                            let original_rowid = cursor.rowid(cx)?;
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_master row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                if let Some(SqliteValue::Text(row_name)) = values.get(1)
+                    && row_name.eq_ignore_ascii_case(name)
+                {
+                    // Preserve the original rowid so the table entry
+                    // stays before any index entries in rowid order.
+                    let original_rowid = rowid;
 
-                            // Build updated record keeping type, name,
-                            // tbl_name, and rootpage from the existing row,
-                            // only replacing the sql column (index 4).
-                            let mut updated = values.clone();
-                            if updated.len() < 5 {
-                                updated.resize(5, SqliteValue::Null);
-                            }
-                            updated[4] = SqliteValue::Text(new_sql.to_owned());
-                            let record = serialize_record(&updated);
-
-                            // Delete old row then re-insert at the same rowid.
-                            cursor.delete(cx)?;
-                            cursor.table_insert(cx, original_rowid, &record)?;
-                            return Ok(());
-                        }
+                    // Build updated record keeping type, name,
+                    // tbl_name, and rootpage from the existing row,
+                    // only replacing the sql column (index 4).
+                    let mut updated = values.clone();
+                    if updated.len() < 5 {
+                        updated.resize(5, SqliteValue::Null);
                     }
+                    updated[4] = SqliteValue::Text(new_sql.to_owned());
+                    let record = serialize_record(&updated);
+
+                    // Delete old row then re-insert at the same rowid.
+                    cursor.delete(cx)?;
+                    cursor.table_insert(cx, original_rowid, &record)?;
+                    return Ok(());
                 }
                 if !cursor.next(cx)? {
                     break;
@@ -5962,9 +5973,15 @@ impl Connection {
         tracing::trace!(root_page, "sqlite_sequence cache refresh begin");
         if cursor.first(cx)? {
             loop {
+                let rowid = cursor.rowid(cx)?;
                 let payload = cursor.payload(cx)?;
-                if let Some(values) = parse_record(&payload)
-                    && values.len() >= 2
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_sequence row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                if values.len() >= 2
                     && let Some(SqliteValue::Text(table_name)) = values.first()
                 {
                     let seq = values[1].to_integer();
@@ -6037,8 +6054,13 @@ impl Connection {
                 let rowid = cursor.rowid(cx)?;
                 max_rowid = max_rowid.max(rowid);
                 let payload = cursor.payload(cx)?;
-                if let Some(values) = parse_record(&payload)
-                    && let Some(SqliteValue::Text(existing_name)) = values.first()
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_sequence row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                if let Some(SqliteValue::Text(existing_name)) = values.first()
                     && existing_name.eq_ignore_ascii_case(table_name)
                 {
                     found_rowid = Some(rowid);
@@ -6085,9 +6107,15 @@ impl Connection {
                 return Ok(());
             }
             loop {
+                let rowid = cursor.rowid(cx)?;
                 let payload = cursor.payload(cx)?;
-                if let Some(values) = parse_record(&payload)
-                    && let Some(SqliteValue::Text(existing_name)) = values.first()
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_sequence row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                if let Some(SqliteValue::Text(existing_name)) = values.first()
                     && existing_name.eq_ignore_ascii_case(table_name)
                 {
                     tracing::trace!(table = table_name, "sqlite_sequence delete entry");
@@ -6133,8 +6161,13 @@ impl Connection {
             loop {
                 let rowid = cursor.rowid(cx)?;
                 let payload = cursor.payload(cx)?;
-                if let Some(values) = parse_record(&payload)
-                    && let Some(SqliteValue::Text(existing_name)) = values.first()
+                let values =
+                    parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "sqlite_sequence row {rowid} payload is not a valid SQLite record"
+                        ),
+                    })?;
+                if let Some(SqliteValue::Text(existing_name)) = values.first()
                     && existing_name.eq_ignore_ascii_case(old_name)
                 {
                     if cursor.table_move_to(cx, rowid)?.is_found() {
@@ -12380,11 +12413,11 @@ impl Connection {
                 // without ORDER BY → RANGE UNBOUNDED PRECEDING TO UNBOUNDED FOLLOWING.
                 let frame_start_unbounded = frame
                     .as_ref()
-                    .map_or(true, |f| matches!(f.start, FrameBound::UnboundedPreceding));
+                    .is_none_or(|f| matches!(f.start, FrameBound::UnboundedPreceding));
                 let frame_end_unbounded = frame.as_ref().map_or(!has_order, |f| {
                     f.end
                         .as_ref()
-                        .map_or(false, |e| matches!(e, FrameBound::UnboundedFollowing))
+                        .is_some_and(|e| matches!(e, FrameBound::UnboundedFollowing))
                 });
                 // Peer-group functions: cume_dist and percent_rank use RANGE semantics
                 // where rows with equal ORDER BY keys share the same value.
@@ -13862,9 +13895,13 @@ impl Connection {
                     let rowid = cursor.rowid(cx)?;
                     max_rowid = max_rowid.max(rowid);
                     let payload = cursor.payload(cx)?;
-                    if let Some(values) = parse_record(&payload) {
-                        entries.push(values);
-                    }
+                    let values =
+                        parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "sqlite_master row {rowid} payload is not a valid SQLite record"
+                            ),
+                        })?;
+                    entries.push(values);
                     if !cursor.next(cx)? {
                         break;
                     }
@@ -14142,23 +14179,27 @@ impl Connection {
                     loop {
                         let rowid = cursor.rowid(cx)?;
                         let payload = cursor.payload(cx)?;
-                        if let Some(mut values) = parse_record(&payload) {
-                            // If this table has an INTEGER PRIMARY KEY column, insert
-                            // the rowid at that position since it's not stored in the
-                            // record payload.
-                            if let Some(ipk_idx) = ipk_col_idx {
-                                values.insert(ipk_idx, SqliteValue::Integer(rowid));
+                        let mut values = parse_record(&payload).ok_or_else(|| {
+                            FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "table `{name}` rowid {rowid} payload is not a valid SQLite record"
+                                ),
                             }
-                            if name.eq_ignore_ascii_case("sqlite_sequence")
-                                && values.len() >= 2
-                                && let (SqliteValue::Text(tbl_name), SqliteValue::Integer(seq)) =
-                                    (&values[0], &values[1])
-                            {
-                                new_sqlite_sequence_cache
-                                    .insert(tbl_name.to_ascii_lowercase(), *seq);
-                            }
-                            mem_table.insert_row(rowid, values);
+                        })?;
+                        // If this table has an INTEGER PRIMARY KEY column, insert
+                        // the rowid at that position since it's not stored in the
+                        // record payload.
+                        if let Some(ipk_idx) = ipk_col_idx {
+                            values.insert(ipk_idx, SqliteValue::Integer(rowid));
                         }
+                        if name.eq_ignore_ascii_case("sqlite_sequence")
+                            && values.len() >= 2
+                            && let (SqliteValue::Text(tbl_name), SqliteValue::Integer(seq)) =
+                                (&values[0], &values[1])
+                        {
+                            new_sqlite_sequence_cache.insert(tbl_name.to_ascii_lowercase(), *seq);
+                        }
+                        mem_table.insert_row(rowid, values);
                         if !cursor.next(cx)? {
                             break;
                         }
@@ -14273,15 +14314,24 @@ fn is_distinct_select(select: &SelectStatement) -> bool {
 
 /// Remove duplicate rows using `PartialEq`-based comparison.
 fn dedup_rows(rows: &mut Vec<Row>) {
-    let mut seen: Vec<Row> = Vec::new();
-    rows.retain(|row| {
-        if seen.iter().any(|s| s == row) {
-            false
+    let mut enumerated: Vec<(usize, Row)> = rows.drain(..).enumerate().collect();
+    enumerated.sort_by(|(ia, a), (ib, b)| {
+        let mut ord = std::cmp::Ordering::Equal;
+        for (va, vb) in a.values().iter().zip(b.values().iter()) {
+            ord = va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal);
+            if ord != std::cmp::Ordering::Equal {
+                break;
+            }
+        }
+        if ord == std::cmp::Ordering::Equal {
+            ia.cmp(ib)
         } else {
-            seen.push(row.clone());
-            true
+            ord
         }
     });
+    enumerated.dedup_by(|(_, a), (_, b)| a == b);
+    enumerated.sort_by_key(|(i, _)| *i);
+    rows.extend(enumerated.into_iter().map(|(_, row)| row));
 }
 
 /// Check whether a candidate row already exists in a set of value rows.
@@ -14291,15 +14341,24 @@ fn contains_value_row(rows: &[Vec<SqliteValue>], candidate: &[SqliteValue]) -> b
 
 /// Remove duplicate value rows while preserving first-seen order.
 fn dedup_value_rows(rows: &mut Vec<Vec<SqliteValue>>) {
-    let mut seen: Vec<Vec<SqliteValue>> = Vec::with_capacity(rows.len());
-    rows.retain(|row| {
-        if contains_value_row(&seen, row) {
-            false
+    let mut enumerated: Vec<(usize, Vec<SqliteValue>)> = rows.drain(..).enumerate().collect();
+    enumerated.sort_by(|(ia, a), (ib, b)| {
+        let mut ord = std::cmp::Ordering::Equal;
+        for (va, vb) in a.iter().zip(b.iter()) {
+            ord = va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal);
+            if ord != std::cmp::Ordering::Equal {
+                break;
+            }
+        }
+        if ord == std::cmp::Ordering::Equal {
+            ia.cmp(ib)
         } else {
-            seen.push(row.clone());
-            true
+            ord
         }
     });
+    enumerated.dedup_by(|(_, a), (_, b)| a == b);
+    enumerated.sort_by_key(|(i, _)| *i);
+    rows.extend(enumerated.into_iter().map(|(_, row)| row));
 }
 
 /// Apply a LIMIT/OFFSET clause to a post-processed row vector.
@@ -17907,6 +17966,13 @@ fn validate_bound_parameters(program: &VdbeProgram, params: &[SqliteValue]) -> R
                 value: raw_index.to_string(),
             })?;
 
+    if max_required > usize::try_from(MAX_VARIABLE_NUMBER).expect("u32 variable limit fits usize") {
+        return Err(FrankenError::OutOfRange {
+            what: "bind parameter index".to_owned(),
+            value: max_required.to_string(),
+        });
+    }
+
     if max_required > params.len() {
         return Err(FrankenError::OutOfRange {
             what: "bind parameter index".to_owned(),
@@ -19322,6 +19388,16 @@ impl Default for BindParamState {
 impl BindParamState {
     fn claim_anonymous(&mut self) -> Result<i32> {
         let index = self.next_index;
+        if index <= 0
+            || u32::try_from(index)
+                .ok()
+                .is_none_or(|n| n > MAX_VARIABLE_NUMBER)
+        {
+            return Err(FrankenError::OutOfRange {
+                what: "placeholder index".to_owned(),
+                value: index.to_string(),
+            });
+        }
         self.next_index =
             self.next_index
                 .checked_add(1)
@@ -19333,6 +19409,16 @@ impl BindParamState {
     }
 
     fn register_numbered(&mut self, index: i32) -> Result<i32> {
+        if index <= 0
+            || u32::try_from(index)
+                .ok()
+                .is_none_or(|n| n > MAX_VARIABLE_NUMBER)
+        {
+            return Err(FrankenError::OutOfRange {
+                what: "placeholder index".to_owned(),
+                value: index.to_string(),
+            });
+        }
         let next = index
             .checked_add(1)
             .ok_or_else(|| FrankenError::OutOfRange {
@@ -22073,6 +22159,18 @@ mod tests {
     }
 
     #[test]
+    fn test_query_with_params_rejects_zero_numbered_placeholder() {
+        let conn = Connection::open(":memory:").unwrap();
+        let error = conn
+            .query_with_params("SELECT ?0;", &[])
+            .expect_err("?0 must be rejected during parsing");
+        assert!(
+            matches!(error, FrankenError::ParseError { ref detail, .. } if detail.contains("between ?1 and ?32766")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
     fn test_query_with_params_missing_required_param_rejected() {
         let conn = Connection::open(":memory:").unwrap();
         let error = conn
@@ -22120,6 +22218,20 @@ mod tests {
         assert!(matches!(
             error,
             FrankenError::OutOfRange { value, .. } if value == "0"
+        ));
+    }
+
+    #[test]
+    fn test_validate_bound_parameters_rejects_index_above_max_variable_limit() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Variable, 32_767, 1, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let error = super::validate_bound_parameters(&program, &vec![SqliteValue::Null; 32_767])
+            .expect_err("indexes above SQLITE_MAX_VARIABLE_NUMBER must fail");
+        assert!(matches!(
+            error,
+            FrankenError::OutOfRange { value, .. } if value == "32767"
         ));
     }
 
@@ -31653,9 +31765,9 @@ mod sqlite_master_btree_tests {
             loop {
                 let rowid = cursor.rowid(&cx).unwrap();
                 let payload = cursor.payload(&cx).unwrap();
-                if let Some(values) = parse_record(&payload) {
-                    rows.push((rowid, values));
-                }
+                let values = parse_record(&payload)
+                    .expect("sqlite_master test payload should decode as a SQLite record");
+                rows.push((rowid, values));
                 if !cursor.next(&cx).unwrap() {
                     break;
                 }
@@ -32484,9 +32596,9 @@ mod schema_loading_tests {
             loop {
                 let rowid = cursor.rowid(&cx).unwrap();
                 let payload = cursor.payload(&cx).unwrap();
-                if let Some(values) = parse_record(&payload) {
-                    rows.push((rowid, values));
-                }
+                let values = parse_record(&payload)
+                    .expect("sqlite_master test payload should decode as a SQLite record");
+                rows.push((rowid, values));
                 if !cursor.next(&cx).unwrap() {
                     break;
                 }
@@ -32982,6 +33094,67 @@ mod schema_loading_tests {
             message.contains("supported range")
                 || message.contains("out-of-range")
                 || message.contains("2147483648"),
+            "unexpected reopen error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_reopen_rejects_invalid_utf8_in_sqlite_master_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt_master_utf8.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                    INSERT INTO docs VALUES (1, 'hello');
+                    PRAGMA writable_schema = ON;
+                    UPDATE sqlite_master
+                    SET sql = CAST(x'FF' AS TEXT)
+                    WHERE name = 'docs';
+                    PRAGMA writable_schema = OFF;
+                    ",
+                )
+                .unwrap();
+        }
+
+        let err = Connection::open(&db_str).expect_err("invalid sqlite_master text should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("sqlite_master row")
+                || message.contains("valid SQLite record")
+                || message.contains("payload"),
+            "unexpected reopen error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_reopen_rejects_invalid_utf8_in_table_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt_table_utf8.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE docs (title TEXT);
+                    INSERT INTO docs VALUES (CAST(x'FF' AS TEXT));
+                    ",
+                )
+                .unwrap();
+        }
+
+        let err = Connection::open(&db_str).expect_err("invalid table text should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("table `docs`")
+                || message.contains("valid SQLite record")
+                || message.contains("payload"),
             "unexpected reopen error: {message}"
         );
     }

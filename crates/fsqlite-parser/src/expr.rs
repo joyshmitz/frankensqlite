@@ -153,12 +153,10 @@ impl Parser {
         match &tok.kind {
             // ── Literals ────────────────────────────────────────────────
             TokenKind::Integer(i) => Ok(Expr::Literal(Literal::Integer(*i), tok.span)),
-            TokenKind::OversizedInt(s) => {
-                match s.parse::<f64>() {
-                    Ok(v) => Ok(Expr::Literal(Literal::Float(v), tok.span)),
-                    Err(_) => Err(ParseError::at("integer out of range", Some(&tok))),
-                }
-            }
+            TokenKind::OversizedInt(s) => match s.parse::<f64>() {
+                Ok(v) => Ok(Expr::Literal(Literal::Float(v), tok.span)),
+                Err(_) => Err(ParseError::at("integer out of range", Some(&tok))),
+            },
             TokenKind::Float(f) => Ok(Expr::Literal(Literal::Float(*f), tok.span)),
             TokenKind::String(s) => Ok(Expr::Literal(Literal::String(s.clone()), tok.span)),
             TokenKind::Blob(b) => Ok(Expr::Literal(Literal::Blob(b.clone()), tok.span)),
@@ -199,20 +197,6 @@ impl Parser {
                 }
                 let inner = self.parse_expr_bp(bp::UNARY)?;
                 let span = tok.span.merge(inner.span());
-                // Constant-fold: -<float literal> → integer when the negated
-                // value is exactly representable as i64.  This handles the
-                // critical case of `-9223372036854775808` (i64::MIN) whose
-                // unsigned magnitude overflows i64::MAX during lexing, causing
-                // promotion to Float.  C SQLite folds this at parse time.
-                if let Expr::Literal(Literal::Float(f), _) = &inner {
-                    let neg = -f;
-                    // Constant-fold ONLY the critical case of exactly i64::MIN.
-                    // This handles `-9223372036854775808` which the lexer promotes to Float.
-                    // We must NOT fold other floats like `-10.0` as they should remain REAL.
-                    if neg == (i64::MIN as f64) {
-                        return Ok(Expr::Literal(Literal::Integer(i64::MIN), span));
-                    }
-                }
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Negate,
                     expr: Box::new(inner),
@@ -955,6 +939,18 @@ impl Parser {
                     )),
                 }
             }
+            TokenKind::Plus => {
+                let next = self.advance_token();
+                match &next.kind {
+                    TokenKind::Integer(i) => Ok(format!("+{i}")),
+                    TokenKind::OversizedInt(s) => Ok(format!("+{s}")),
+                    TokenKind::Float(f) => Ok(format!("+{f}")),
+                    _ => Err(ParseError::at(
+                        "expected number in type argument",
+                        Some(&next),
+                    )),
+                }
+            }
             TokenKind::OversizedInt(s) | TokenKind::Id(s) | TokenKind::QuotedId(s, _) => {
                 Ok(s.clone())
             }
@@ -1461,7 +1457,7 @@ mod tests {
         ));
     }
 
-    // ── IS NULL / ISNULL / NOTNULL ──────────────────────────────────────
+    // ── IS NULL / IS NOT ─────────────────────────────────────────────────────
 
     #[test]
     fn test_is_null() {
@@ -1604,7 +1600,7 @@ mod tests {
         let expr = parse("a & b | c");
         match &expr {
             Expr::BinaryOp {
-                op: BinaryOp::BitOr,
+                op: BinaryOp::Or,
                 left,
                 ..
             } => assert!(
@@ -1617,7 +1613,7 @@ mod tests {
                 ),
                 "bitwise operators should be left-associative"
             ),
-            other => unreachable!("expected BitOr(BitAnd, c), got {other:?}"),
+            other => unreachable!("expected Or(BitAnd, c), got {other:?}"),
         }
     }
 
@@ -1929,7 +1925,7 @@ mod tests {
                         ..
                     }
                 ),
-                "concat should bind tighter than multiply"
+                "addition should bind tighter than bitwise"
             ),
             other => unreachable!("expected BitAnd(a, Add(b,c)), got {other:?}"),
         }

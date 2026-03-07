@@ -149,8 +149,10 @@ fn sqlite_wal_checksum_native_8byte_chunks(data: &[u8]) -> Result<(u32, u32)> {
     for chunk in data.chunks_exact(8) {
         let w1 = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let w2 = u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-        s1 = s1.wrapping_add(w1).wrapping_add(s2);
-        s2 = s2.wrapping_add(w2).wrapping_add(s1);
+        s1 = s1.wrapping_add(w1);
+        s2 = s2.wrapping_add(s1);
+        s1 = s1.wrapping_add(w2);
+        s2 = s2.wrapping_add(s1);
     }
     Ok((s1, s2))
 }
@@ -1109,7 +1111,8 @@ impl UnixFile {
         }
 
         // Only update in-memory state after the OS-level lock succeeds.
-        slot_state.shared_holders.remove(&self.shm_owner_id);
+        // Do NOT remove the shared holder. This allows downgrading back to SHARED
+        // when UNLOCK | EXCLUSIVE is called, matching SQLite's unixShmLock semantics.
         slot_state.exclusive_owner = Some(self.shm_owner_id);
         lock_debug!(
             slot,

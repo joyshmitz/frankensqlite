@@ -769,25 +769,33 @@ impl PartialEq for SqliteValue {
     }
 }
 
+impl Eq for SqliteValue {}
+
 impl PartialOrd for SqliteValue {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SqliteValue {
+    fn cmp(&self, other: &Self) -> Ordering {
         // SQLite sort order: NULL < numeric < text < blob
         let class_a = self.sort_class();
         let class_b = other.sort_class();
 
         if class_a != class_b {
-            return Some(class_a.cmp(&class_b));
+            return class_a.cmp(&class_b);
         }
 
         match (self, other) {
-            (Self::Null, Self::Null) => Some(Ordering::Equal),
-            (Self::Integer(a), Self::Integer(b)) => Some(a.cmp(b)),
-            (Self::Float(a), Self::Float(b)) => a.partial_cmp(b),
-            (Self::Integer(a), Self::Float(b)) => Some(int_float_cmp(*a, *b)),
-            (Self::Float(a), Self::Integer(b)) => Some(int_float_cmp(*b, *a).reverse()),
-            (Self::Text(a), Self::Text(b)) => Some(a.cmp(b)),
-            (Self::Blob(a), Self::Blob(b)) => Some(a.cmp(b)),
-            _ => None,
+            (Self::Null, Self::Null) => Ordering::Equal,
+            (Self::Integer(a), Self::Integer(b)) => a.cmp(b),
+            (Self::Float(a), Self::Float(b)) => a.partial_cmp(b).unwrap_or_else(|| a.total_cmp(b)),
+            (Self::Integer(a), Self::Float(b)) => int_float_cmp(*a, *b),
+            (Self::Float(a), Self::Integer(b)) => int_float_cmp(*b, *a).reverse(),
+            (Self::Text(a), Self::Text(b)) => a.cmp(b),
+            (Self::Blob(a), Self::Blob(b)) => a.cmp(b),
+            _ => unreachable!(),
         }
     }
 }

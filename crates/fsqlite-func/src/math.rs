@@ -26,7 +26,7 @@ use crate::{FunctionRegistry, ScalarFunction};
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Coerce a `SqliteValue` to `f64`.  Returns `None` for `Null` and for
+/// Coerce a `SqliteValue` to `f64`. Returns `None` for `Null`, `Blob`, and for
 /// non-numeric text (SQLite math functions return NULL for these cases,
 /// per `sqlite3_value_numeric_type()` semantics in C SQLite).
 fn to_f64(v: &SqliteValue) -> Option<f64> {
@@ -41,7 +41,7 @@ fn to_f64(v: &SqliteValue) -> Option<f64> {
             // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
             trimmed.parse::<f64>().ok().filter(|f| f.is_finite())
         }
-        SqliteValue::Blob(_) => Some(0.0),
+        SqliteValue::Blob(_) => None,
     }
 }
 
@@ -1082,6 +1082,17 @@ mod tests {
         assert_null(&LogFunc.invoke(&[null()]).unwrap());
         assert_null(&LogFunc.invoke(&[null(), float(8.0)]).unwrap());
         assert_null(&LogFunc.invoke(&[float(2.0), null()]).unwrap());
+    }
+
+    #[test]
+    fn test_blob_input_returns_null() {
+        let blob = SqliteValue::Blob(vec![b'1', b'2']);
+        assert_null(&SqrtFunc.invoke(std::slice::from_ref(&blob)).unwrap());
+        assert_null(&CeilFunc.invoke(std::slice::from_ref(&blob)).unwrap());
+        assert_null(&Atan2Func.invoke(&[blob.clone(), float(1.0)]).unwrap());
+        assert_null(&PowFunc.invoke(&[float(2.0), blob.clone()]).unwrap());
+        assert_null(&LogFunc.invoke(&[blob.clone()]).unwrap());
+        assert_null(&ModFunc.invoke(&[float(4.0), blob]).unwrap());
     }
 
     #[test]

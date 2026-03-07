@@ -145,7 +145,8 @@ impl WitnessSet {
 #[must_use]
 pub fn witness_keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
     match (a, b) {
-        (WitnessKey::Page(pa), WitnessKey::Page(pb)) => pa == pb,
+        (WitnessKey::Page(pa), WitnessKey::Page(pb) | WitnessKey::ByteRange { page: pb, .. })
+        | (WitnessKey::ByteRange { page: pb, .. }, WitnessKey::Page(pa)) => pa == pb,
         (
             WitnessKey::Cell {
                 btree_root: ra,

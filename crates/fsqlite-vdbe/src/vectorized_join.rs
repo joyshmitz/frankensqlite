@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use fsqlite_types::value::SqliteValue;
 
 /// A single sorted input row for trie construction.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrieRow {
     /// Join-key tuple for this row.
     pub key: Vec<SqliteValue>,
@@ -65,7 +65,7 @@ impl TrieRow {
 }
 
 /// A trie node stored in the arena.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrieNode {
     /// Key value represented by this node.
     pub key: SqliteValue,
@@ -240,7 +240,7 @@ impl fmt::Display for LeapfrogJoinError {
 impl std::error::Error for LeapfrogJoinError {}
 
 /// One aligned key match produced by Leapfrog join.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeapfrogMatch {
     /// Matched join key tuple.
     pub key: Vec<SqliteValue>,
@@ -364,7 +364,7 @@ pub fn leapfrog_join(relations: &[&TrieRelation]) -> Result<Vec<LeapfrogMatch>, 
 }
 
 /// Immutable trie relation for Leapfrog-style join probes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrieRelation {
     arity: usize,
     rows: Vec<TrieRow>,

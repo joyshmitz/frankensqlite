@@ -330,7 +330,11 @@ pub fn discover_incoming_edges(
         }
 
         for write_key in write_keys {
-            if reader.keys.iter().any(|k| crate::witness_plane::witness_keys_overlap(k, write_key)) {
+            if reader
+                .keys
+                .iter()
+                .any(|k| crate::witness_plane::witness_keys_overlap(k, write_key))
+            {
                 if seen_sources.insert(reader.token) {
                     debug!(
                         bead_id = "bd-31bo",
@@ -433,7 +437,11 @@ pub fn discover_outgoing_edges(
         }
 
         for read_key in read_keys {
-            if writer.keys.contains(read_key) {
+            if writer
+                .keys
+                .iter()
+                .any(|k| crate::witness_plane::witness_keys_overlap(k, read_key))
+            {
                 if seen_targets.insert(writer.token) {
                     debug!(
                         bead_id = "bd-31bo",

@@ -116,24 +116,28 @@ pub struct Freelist {
     free_pages: Vec<PageNumber>,
     /// Total number of pages in the database file (for extending).
     db_page_count: u32,
+    /// The page size of the database.
+    page_size: u32,
 }
 
 impl Freelist {
     /// Create a new freelist with no free pages.
     #[must_use]
-    pub fn new(db_page_count: u32) -> Self {
+    pub fn new(db_page_count: u32, page_size: u32) -> Self {
         Self {
             free_pages: Vec::new(),
             db_page_count,
+            page_size,
         }
     }
 
     /// Create a freelist pre-populated with free pages.
     #[must_use]
-    pub fn with_pages(pages: Vec<PageNumber>, db_page_count: u32) -> Self {
+    pub fn with_pages(pages: Vec<PageNumber>, db_page_count: u32, page_size: u32) -> Self {
         Self {
             free_pages: pages,
             db_page_count,
+            page_size,
         }
     }
 
@@ -155,7 +159,19 @@ impl Freelist {
         if self.db_page_count >= MAX_PAGE_COUNT {
             return Err(FrankenError::DatabaseFull);
         }
-        self.db_page_count += 1;
+
+        let mut next = self.db_page_count + 1;
+        let pending_byte_page = (0x4000_0000 / self.page_size) + 1;
+
+        // Skip the pending byte page (§11.14)
+        if next == pending_byte_page {
+            if next >= MAX_PAGE_COUNT {
+                return Err(FrankenError::DatabaseFull);
+            }
+            next += 1;
+        }
+
+        self.db_page_count = next;
         PageNumber::new(self.db_page_count).ok_or(FrankenError::DatabaseFull)
     }
 
@@ -488,6 +504,7 @@ mod tests {
         let mut fl = Freelist::with_pages(
             vec![PageNumber::new(10).unwrap(), PageNumber::new(20).unwrap()],
             100,
+            4096,
         );
 
         assert_eq!(fl.free_count(), 2);
@@ -501,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_freelist_allocate_extends_db() {
-        let mut fl = Freelist::new(100);
+        let mut fl = Freelist::new(100, 4096);
         assert_eq!(fl.free_count(), 0);
 
         let p = fl.allocate().unwrap();
@@ -514,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_freelist_deallocate() {
-        let mut fl = Freelist::new(100);
+        let mut fl = Freelist::new(100, 4096);
         fl.deallocate(PageNumber::new(50).unwrap());
         assert_eq!(fl.free_count(), 1);
 
@@ -524,13 +541,13 @@ mod tests {
 
     #[test]
     fn test_freelist_max_page_count() {
-        let mut fl = Freelist::new(MAX_PAGE_COUNT);
+        let mut fl = Freelist::new(MAX_PAGE_COUNT, 4096);
         assert!(fl.allocate().is_err());
     }
 
     #[test]
     fn test_btree_freelist_reclamation() {
-        let mut freelist = Freelist::new(200);
+        let mut freelist = Freelist::new(200, 4096);
         let reclaimed = PageNumber::new(150).unwrap();
 
         freelist.deallocate(reclaimed);
@@ -611,6 +628,19 @@ mod tests {
         })
         .unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_freelist_allocate_skips_pending_byte() {
+        let page_size = 4096;
+        let pending_byte_page = (0x4000_0000 / page_size) + 1;
+
+        let mut fl = Freelist::new(pending_byte_page - 1, page_size);
+
+        // Next allocation should skip the pending byte page.
+        let p = fl.allocate().unwrap();
+        assert_eq!(p.get(), pending_byte_page + 1);
+        assert_eq!(fl.db_page_count(), pending_byte_page + 1);
     }
 
     #[test]

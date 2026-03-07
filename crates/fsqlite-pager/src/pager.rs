@@ -44,6 +44,9 @@ pub(crate) struct PagerInner<F: VfsFile> {
     freelist: Vec<PageNumber>,
     /// Current journal mode (rollback journal vs WAL).
     journal_mode: JournalMode,
+    /// Whether this pager has a locally failed rollback-journal commit that
+    /// must be repaired before the handle can be reused.
+    rollback_journal_recovery_pending: bool,
     /// Optional WAL backend for WAL-mode operation.
     wal_backend: Option<Box<dyn WalBackend>>,
     /// Monotonic commit sequence for MVCC version tracking.
@@ -527,6 +530,25 @@ where
         }
 
         let wal_snapshot_initialized = if inner.active_transactions == 0 {
+            if inner.rollback_journal_recovery_pending {
+                let journal_path = Self::journal_path(&self.db_path);
+                let page_size = inner.page_size;
+                if !Self::recover_rollback_journal_if_present(
+                    cx,
+                    &*self.vfs,
+                    &mut inner.db_file,
+                    &journal_path,
+                    page_size,
+                )? {
+                    return Err(FrankenError::internal(
+                        "rollback journal missing while local recovery was pending",
+                    ));
+                }
+                // Failed rollback-journal commits can leave uncommitted bytes in
+                // the cache even after the on-disk pre-images are restored.
+                inner.cache.clear();
+                inner.rollback_journal_recovery_pending = false;
+            }
             inner.refresh_committed_state(cx)?
         } else {
             false
@@ -673,6 +695,22 @@ where
         PathBuf::from(jp)
     }
 
+    fn recover_rollback_journal_if_present(
+        cx: &Cx,
+        vfs: &V,
+        db_file: &mut V::File,
+        journal_path: &Path,
+        page_size: PageSize,
+    ) -> Result<bool> {
+        if !vfs.access(cx, journal_path, AccessFlags::EXISTS)? {
+            return Ok(false);
+        }
+
+        Self::replay_journal(cx, vfs, db_file, journal_path, page_size)?;
+        let _ = vfs.delete(cx, journal_path, true);
+        Ok(true)
+    }
+
     /// Open (or create) a database and return a pager.
     ///
     /// If a hot journal is detected (leftover from a crash), it is replayed
@@ -684,13 +722,15 @@ where
         let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
         let (mut db_file, _actual_flags) = vfs.open(&cx, Some(path), flags)?;
 
-        // Hot journal recovery: if a journal file exists, replay it.
         let journal_path = Self::journal_path(path);
-        if vfs.access(&cx, &journal_path, AccessFlags::EXISTS)? {
-            Self::replay_journal(&cx, &*vfs, &mut db_file, &journal_path, page_size)?;
-            // After successful replay, delete the journal.
-            let _ = vfs.delete(&cx, &journal_path, true);
-        }
+        // Hot journal recovery: if a journal file exists, replay it.
+        let _ = Self::recover_rollback_journal_if_present(
+            &cx,
+            &*vfs,
+            &mut db_file,
+            &journal_path,
+            page_size,
+        )?;
 
         let mut file_size = db_file.file_size(&cx)?;
         let header = if file_size == 0 {
@@ -803,6 +843,7 @@ where
                 checkpoint_active: false,
                 freelist,
                 journal_mode: JournalMode::Delete,
+                rollback_journal_recovery_pending: false,
                 wal_backend: None,
                 commit_seq: CommitSeq::new(u64::from(header.change_counter)),
             })),
@@ -904,6 +945,12 @@ where
             }
         }
 
+        // Recovery is complete. Invalidate the journal before best-effort
+        // deletion so a later delete failure does not keep replaying the same
+        // rollback journal on every open.
+        jrnl_file.truncate(cx, 0)?;
+        jrnl_file.sync(cx, SyncFlags::NORMAL)?;
+
         Ok(())
     }
 }
@@ -966,6 +1013,12 @@ where
     V: Vfs + Send,
     V::File: Send + Sync,
 {
+    fn invalidate_journal_after_commit(cx: &Cx, journal_file: &mut V::File) -> Result<()> {
+        journal_file.truncate(cx, 0)?;
+        journal_file.sync(cx, SyncFlags::NORMAL)?;
+        Ok(())
+    }
+
     /// Commit using the rollback journal protocol.
     #[allow(clippy::too_many_lines)]
     fn commit_journal(
@@ -1022,6 +1075,7 @@ where
 
             // Sync journal to ensure durability before modifying database.
             jrnl_file.sync(cx, SyncFlags::NORMAL)?;
+            inner.rollback_journal_recovery_pending = true;
 
             // Phase 2: Write dirty pages to database.
             let saved_db_size = inner.db_size;
@@ -1035,8 +1089,28 @@ where
 
             inner.db_file.sync(cx, SyncFlags::NORMAL)?;
 
-            // Phase 3: Delete journal (commit point).
-            let _ = vfs.delete(cx, journal_path, true);
+            // Phase 3: Make the journal non-hot before best-effort deletion.
+            //
+            // If directory-entry deletion fails after the database sync, a
+            // leftover valid journal must not roll back the committed pages on
+            // the next open.
+            let cleanup_result = match Self::invalidate_journal_after_commit(cx, &mut jrnl_file) {
+                Ok(()) => {
+                    let _ = vfs.delete(cx, journal_path, true);
+                    Ok(())
+                }
+                Err(invalidate_err) => {
+                    if let Err(delete_err) = vfs.delete(cx, journal_path, true) {
+                        Err(FrankenError::internal(format!(
+                            "committed database but failed to invalidate or delete rollback journal: invalidate={invalidate_err}; delete={delete_err}"
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            inner.rollback_journal_recovery_pending = false;
+            cleanup_result?;
         }
 
         Ok(())
@@ -1316,27 +1390,59 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
-        // Restore pages allocated from the freelist.
-        for page in self.allocated_from_freelist.drain(..) {
-            inner.freelist.push(page);
-        }
+        let restored_from_journal = if self.is_writer
+            && self.journal_mode != JournalMode::Wal
+            && inner.rollback_journal_recovery_pending
+        {
+            let page_size = inner.page_size;
+            if !SimplePager::<V>::recover_rollback_journal_if_present(
+                cx,
+                &*self.vfs,
+                &mut inner.db_file,
+                &self.journal_path,
+                page_size,
+            )? {
+                return Err(FrankenError::internal(
+                    "rollback journal missing while failed commit recovery was pending",
+                ));
+            }
+            true
+        } else {
+            false
+        };
 
-        if self.is_writer && self.mode != TransactionMode::Concurrent {
-            inner.db_size = self.original_db_size;
-
-            // Reset next_page to avoid holes if we allocated pages that are now discarded.
-            // Logic matches SimplePager::open.
-            let db_size = inner.db_size;
-            inner.next_page = if db_size >= 2 {
-                db_size.saturating_add(1)
-            } else {
-                2
-            };
-
-            inner.writer_active = false;
-        } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-            for page in self.allocated_from_eof.drain(..) {
+        if restored_from_journal {
+            inner.cache.clear();
+            inner.refresh_committed_state(cx)?;
+            inner.rollback_journal_recovery_pending = false;
+            self.allocated_from_freelist.clear();
+            self.allocated_from_eof.clear();
+            if self.mode != TransactionMode::Concurrent {
+                inner.writer_active = false;
+            }
+        } else {
+            // Restore pages allocated from the freelist.
+            for page in self.allocated_from_freelist.drain(..) {
                 inner.freelist.push(page);
+            }
+
+            if self.is_writer && self.mode != TransactionMode::Concurrent {
+                inner.db_size = self.original_db_size;
+
+                // Reset next_page to avoid holes if we allocated pages that are now discarded.
+                // Logic matches SimplePager::open.
+                let db_size = inner.db_size;
+                inner.next_page = if db_size >= 2 {
+                    db_size.saturating_add(1)
+                } else {
+                    2
+                };
+
+                inner.writer_active = false;
+            } else if self.is_writer && self.mode == TransactionMode::Concurrent {
+                for page in self.allocated_from_eof.drain(..) {
+                    inner.freelist.push(page);
+                }
             }
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
@@ -1742,10 +1848,11 @@ mod tests {
     use super::*;
     use crate::traits::{MvccPager, TransactionHandle, TransactionMode};
     use fsqlite_types::PageSize;
-    use fsqlite_types::flags::AccessFlags;
+    use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
     use fsqlite_types::{BTreePageHeader, DatabaseHeader};
-    use fsqlite_vfs::MemoryVfs;
+    use fsqlite_vfs::{MemoryFile, MemoryVfs, Vfs, VfsFile};
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     const BEAD_ID: &str = "bd-bca.1";
 
@@ -1754,6 +1861,213 @@ mod tests {
         let path = PathBuf::from("/test.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
         (pager, path)
+    }
+
+    #[derive(Clone, Default)]
+    struct JournalDeleteFailVfs {
+        inner: MemoryVfs,
+    }
+
+    impl JournalDeleteFailVfs {
+        fn new() -> Self {
+            Self {
+                inner: MemoryVfs::new(),
+            }
+        }
+    }
+
+    impl Vfs for JournalDeleteFailVfs {
+        type File = MemoryFile;
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn open(
+            &self,
+            cx: &Cx,
+            path: Option<&std::path::Path>,
+            flags: VfsOpenFlags,
+        ) -> Result<(Self::File, VfsOpenFlags)> {
+            self.inner.open(cx, path, flags)
+        }
+
+        fn delete(&self, cx: &Cx, path: &std::path::Path, sync_dir: bool) -> Result<()> {
+            if path.to_string_lossy().ends_with("-journal") {
+                return Err(FrankenError::internal(
+                    "simulated journal delete failure".to_owned(),
+                ));
+            }
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn access(&self, cx: &Cx, path: &std::path::Path, flags: AccessFlags) -> Result<bool> {
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
+            self.inner.full_pathname(cx, path)
+        }
+    }
+
+    #[derive(Debug)]
+    struct DbWriteFailState {
+        target_path: PathBuf,
+        armed: bool,
+        remaining_successful_db_writes: usize,
+    }
+
+    #[derive(Clone)]
+    struct DbWriteFailOnceVfs {
+        inner: MemoryVfs,
+        state: Arc<Mutex<DbWriteFailState>>,
+    }
+
+    impl DbWriteFailOnceVfs {
+        fn new(target_path: PathBuf) -> Self {
+            Self {
+                inner: MemoryVfs::new(),
+                state: Arc::new(Mutex::new(DbWriteFailState {
+                    target_path,
+                    armed: false,
+                    remaining_successful_db_writes: 0,
+                })),
+            }
+        }
+
+        fn arm_after_db_writes(&self, successful_db_writes_before_failure: usize) {
+            let mut state = self.state.lock().expect("DbWriteFailState lock poisoned");
+            state.armed = true;
+            state.remaining_successful_db_writes = successful_db_writes_before_failure;
+        }
+    }
+
+    #[derive(Debug)]
+    struct DbWriteFailOnceFile {
+        inner: MemoryFile,
+        state: Arc<Mutex<DbWriteFailState>>,
+        is_target_db: bool,
+    }
+
+    impl Vfs for DbWriteFailOnceVfs {
+        type File = DbWriteFailOnceFile;
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn open(
+            &self,
+            cx: &Cx,
+            path: Option<&std::path::Path>,
+            flags: VfsOpenFlags,
+        ) -> Result<(Self::File, VfsOpenFlags)> {
+            let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
+            let is_target_db = {
+                let state = self.state.lock().expect("DbWriteFailState lock poisoned");
+                path == Some(state.target_path.as_path()) && flags.contains(VfsOpenFlags::MAIN_DB)
+            };
+            Ok((
+                DbWriteFailOnceFile {
+                    inner,
+                    state: Arc::clone(&self.state),
+                    is_target_db,
+                },
+                actual_flags,
+            ))
+        }
+
+        fn delete(&self, cx: &Cx, path: &std::path::Path, sync_dir: bool) -> Result<()> {
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn access(&self, cx: &Cx, path: &std::path::Path, flags: AccessFlags) -> Result<bool> {
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
+            self.inner.full_pathname(cx, path)
+        }
+    }
+
+    impl VfsFile for DbWriteFailOnceFile {
+        fn close(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.close(cx)
+        }
+
+        fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read(cx, buf, offset)
+        }
+
+        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+            if self.is_target_db {
+                let mut state = self.state.lock().expect("DbWriteFailState lock poisoned");
+                if state.armed {
+                    if state.remaining_successful_db_writes == 0 {
+                        state.armed = false;
+                        return Err(FrankenError::Io(std::io::Error::other(
+                            "simulated main-db write failure",
+                        )));
+                    }
+                    state.remaining_successful_db_writes -= 1;
+                }
+            }
+            self.inner.write(cx, buf, offset)
+        }
+
+        fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+            self.inner.truncate(cx, size)
+        }
+
+        fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+            self.inner.sync(cx, flags)
+        }
+
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            self.inner.file_size(cx)
+        }
+
+        fn lock(&mut self, cx: &Cx, level: fsqlite_types::LockLevel) -> Result<()> {
+            self.inner.lock(cx, level)
+        }
+
+        fn unlock(&mut self, cx: &Cx, level: fsqlite_types::LockLevel) -> Result<()> {
+            self.inner.unlock(cx, level)
+        }
+
+        fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+            self.inner.check_reserved_lock(cx)
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn device_characteristics(&self) -> u32 {
+            self.inner.device_characteristics()
+        }
+
+        fn shm_map(
+            &mut self,
+            cx: &Cx,
+            region: u32,
+            size: u32,
+            extend: bool,
+        ) -> Result<fsqlite_vfs::ShmRegion> {
+            self.inner.shm_map(cx, region, size, extend)
+        }
+
+        fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+            self.inner.shm_lock(cx, offset, n, flags)
+        }
+
+        fn shm_barrier(&self) {
+            self.inner.shm_barrier();
+        }
+
+        fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+            self.inner.shm_unmap(cx, delete)
+        }
     }
 
     #[test]
@@ -2066,7 +2380,8 @@ mod tests {
         let mut txn3 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
         let p2 = txn3.allocate_page(&cx).unwrap();
         assert_eq!(
-            p2, p,
+            p2,
+            p,
             "bead_id={BEAD_ID} case=freelist_reuse p3={} p1={}",
             p2.get(),
             p.get()
@@ -2232,6 +2547,236 @@ mod tests {
 
         txn.rollback(&cx).unwrap();
         let _next_writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+    }
+
+    #[test]
+    fn test_rollback_recovers_after_partial_commit_failure() {
+        let path = PathBuf::from("/rollback_after_failed_commit.db");
+        let journal_path = SimplePager::<DbWriteFailOnceVfs>::journal_path(&path);
+        let vfs = DbWriteFailOnceVfs::new(path.clone());
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let original_two = vec![0x11; ps];
+        let original_three = vec![0x44; ps];
+        let (page_two, page_three) = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            let page_three = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &original_two).unwrap();
+            txn.write_page(&cx, page_three, &original_three).unwrap();
+            txn.commit(&cx).unwrap();
+            (page_two, page_three)
+        };
+
+        vfs.arm_after_db_writes(1);
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.write_page(&cx, page_two, &vec![0x22; ps]).unwrap();
+        txn.write_page(&cx, page_three, &vec![0x55; ps]).unwrap();
+
+        let err = txn.commit(&cx).unwrap_err();
+        assert!(
+            matches!(err, FrankenError::Io(_)),
+            "bead_id={BEAD_ID} case=partial_commit_surfaces_io_error"
+        );
+
+        txn.rollback(&cx).unwrap();
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, page_two).unwrap().into_vec(),
+            original_two
+        );
+        assert_eq!(
+            reader.get_page(&cx, page_three).unwrap().into_vec(),
+            original_three
+        );
+
+        assert!(
+            !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={BEAD_ID} case=rollback_removes_failed_commit_journal"
+        );
+
+        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reopened_reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reopened_reader.get_page(&cx, page_two).unwrap().into_vec(),
+            vec![0x11; ps]
+        );
+        assert_eq!(
+            reopened_reader
+                .get_page(&cx, page_three)
+                .unwrap()
+                .into_vec(),
+            vec![0x44; ps]
+        );
+    }
+
+    #[test]
+    fn test_begin_recovers_abandoned_failed_commit() {
+        let path = PathBuf::from("/begin_recovers_failed_commit.db");
+        let journal_path = SimplePager::<DbWriteFailOnceVfs>::journal_path(&path);
+        let vfs = DbWriteFailOnceVfs::new(path.clone());
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let original_two = vec![0x61; ps];
+        let original_three = vec![0x73; ps];
+        let (page_two, page_three) = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            let page_three = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &original_two).unwrap();
+            txn.write_page(&cx, page_three, &original_three).unwrap();
+            txn.commit(&cx).unwrap();
+            (page_two, page_three)
+        };
+
+        vfs.arm_after_db_writes(1);
+
+        {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            txn.write_page(&cx, page_two, &vec![0x62; ps]).unwrap();
+            txn.write_page(&cx, page_three, &vec![0x74; ps]).unwrap();
+            let err = txn.commit(&cx).unwrap_err();
+            assert!(
+                matches!(err, FrankenError::Io(_)),
+                "bead_id={BEAD_ID} case=abandoned_failed_commit_surfaces_io_error"
+            );
+        }
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, page_two).unwrap().into_vec(),
+            original_two
+        );
+        assert_eq!(
+            reader.get_page(&cx, page_three).unwrap().into_vec(),
+            original_three
+        );
+
+        assert!(
+            !vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={BEAD_ID} case=next_begin_cleans_abandoned_failed_commit_journal"
+        );
+
+        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reopened_reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reopened_reader.get_page(&cx, page_two).unwrap().into_vec(),
+            vec![0x61; ps]
+        );
+        assert_eq!(
+            reopened_reader
+                .get_page(&cx, page_three)
+                .unwrap()
+                .into_vec(),
+            vec![0x73; ps]
+        );
+    }
+
+    #[test]
+    fn test_commit_survives_journal_delete_failure() {
+        let vfs = JournalDeleteFailVfs::new();
+        let path = PathBuf::from("/journal_delete_failure_commit.db");
+        let journal_path = SimplePager::<JournalDeleteFailVfs>::journal_path(&path);
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let page_two = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &vec![0xAB; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            page_two
+        };
+
+        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, page_two).unwrap().into_vec(),
+            vec![0xAB; ps]
+        );
+
+        assert!(
+            vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={BEAD_ID} case=delete_failure_leaves_journal_inode"
+        );
+
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (journal_file, _) = vfs.open(&cx, Some(&journal_path), flags).unwrap();
+        assert_eq!(
+            journal_file.file_size(&cx).unwrap(),
+            0,
+            "bead_id={BEAD_ID} case=delete_failure_still_invalidates_journal"
+        );
+    }
+
+    #[test]
+    fn test_hot_journal_recovery_survives_delete_failure() {
+        let vfs = JournalDeleteFailVfs::new();
+        let path = PathBuf::from("/journal_delete_failure_recovery.db");
+        let journal_path = SimplePager::<JournalDeleteFailVfs>::journal_path(&path);
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        {
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
+            let (mut db_file, _) = vfs.open(&cx, Some(&path), flags).unwrap();
+
+            let header = JournalHeader {
+                page_count: 1,
+                nonce: 0x4652_414E,
+                initial_db_size: 2,
+                sector_size: 512,
+                page_size: PageSize::DEFAULT.get(),
+            };
+            let hdr_bytes = header.encode_padded();
+            let jrnl_flags =
+                VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+            let (mut jrnl_file, _) = vfs.open(&cx, Some(&journal_path), jrnl_flags).unwrap();
+            jrnl_file.write(&cx, &hdr_bytes, 0).unwrap();
+            let record = JournalPageRecord::new(2, vec![0x11; ps], header.nonce);
+            jrnl_file
+                .write(&cx, &record.encode(), hdr_bytes.len() as u64)
+                .unwrap();
+            jrnl_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+
+            let page_offset = PageSize::DEFAULT.as_usize() as u64;
+            db_file.write(&cx, &vec![0x22; ps], page_offset).unwrap();
+            db_file.sync(&cx, SyncFlags::NORMAL).unwrap();
+        }
+
+        let reopened = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let page_two = PageNumber::new(2).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, page_two).unwrap().into_vec(),
+            vec![0x11; ps]
+        );
+
+        assert!(
+            vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+            "bead_id={BEAD_ID} case=recovery_delete_failure_leaves_journal_inode"
+        );
+
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_JOURNAL;
+        let (journal_file, _) = vfs.open(&cx, Some(&journal_path), flags).unwrap();
+        assert_eq!(
+            journal_file.file_size(&cx).unwrap(),
+            0,
+            "bead_id={BEAD_ID} case=recovery_delete_failure_still_invalidates_journal"
+        );
     }
 
     #[test]
@@ -2522,7 +3067,10 @@ mod tests {
         txn.commit(&cx).unwrap();
 
         assert!(
-            !pager.vfs.access(&cx, &journal_path, AccessFlags::EXISTS).unwrap(),
+            !pager
+                .vfs
+                .access(&cx, &journal_path, AccessFlags::EXISTS)
+                .unwrap(),
             "bead_id={BEAD_ID} case=journal_deleted_for_readonly"
         );
     }
@@ -3577,8 +4125,7 @@ mod tests {
             // Content offset should be usable_size (= page_size when reserved=0).
             let expected_content = ps_val;
             assert_eq!(
-                btree.cell_content_start,
-                expected_content,
+                btree.cell_content_start, expected_content,
                 "bead_id={BEAD_5A1} case=content_start ps={ps_val}"
             );
 
@@ -3692,7 +4239,8 @@ mod tests {
         let mut txn3 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
         let p2 = txn3.allocate_page(&cx).unwrap();
         assert_eq!(
-            p2, p,
+            p2,
+            p,
             "bead_id={BEAD_ID} case=freelist_reuse p3={} p1={}",
             p2.get(),
             p.get()
@@ -4397,7 +4945,10 @@ mod tests {
 
         let metrics = pager.cache_metrics_snapshot().unwrap();
         let total = metrics.total_accesses();
-        assert_eq!(total, 300, "bead_id={BEAD_E2E} case=pressure_total_accesses");
+        assert_eq!(
+            total, 300,
+            "bead_id={BEAD_E2E} case=pressure_total_accesses"
+        );
         // All 300 pages should be cache hits (committed pages are cached).
         assert!(
             metrics.hit_rate_percent() > 40.0,
@@ -4442,7 +4993,10 @@ mod tests {
 
         let metrics = pager.cache_metrics_snapshot().unwrap();
         let total = metrics.total_accesses();
-        assert_eq!(total, 200, "bead_id={BEAD_E2E} case=hot_cold_total_accesses");
+        assert_eq!(
+            total, 200,
+            "bead_id={BEAD_E2E} case=hot_cold_total_accesses"
+        );
         // Hot pages should achieve high hit rate after first access.
         assert!(
             metrics.hit_rate_percent() > 40.0,

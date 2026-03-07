@@ -19,7 +19,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// A single bucket in an equi-depth histogram.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistogramBucket {
     /// Inclusive lower bound of the bucket.
     pub lower: SqliteValue,
@@ -39,7 +39,7 @@ impl HistogramBucket {
 }
 
 /// A histogram approximating the distribution of values in a column.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Histogram {
     /// Ordered list of buckets.
     /// Buckets should cover the full range of non-NULL values.
@@ -179,6 +179,7 @@ fn interpolate_position(min: &SqliteValue, max: &SqliteValue, val: &SqliteValue)
 }
 
 /// Statistics for a single column.
+#[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ColumnStats {
     /// Total number of rows in the table.

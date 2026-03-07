@@ -376,8 +376,8 @@ impl MemoryFile {
             return Err(FrankenError::Busy);
         }
 
-        // Exclusive lock clears any shared lock held by this owner.
-        slot_state.shared_holders.remove(&self.shm_owner_id);
+        // Exclusive lock does NOT clear any shared lock held by this owner,
+        // allowing it to be downgraded properly later.
         slot_state.exclusive_owner = Some(self.shm_owner_id);
         Ok(())
     }
