@@ -196,6 +196,10 @@ impl EngineOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the four booleans are the stable concurrent-mode guard artifact shape"
+)]
 struct ConcurrentModeGuard {
     default_on: bool,
     begin_promotes_to_concurrent: bool,
@@ -447,7 +451,7 @@ fn run_sqlite_busy_snapshot_like(path: &Path) -> EngineOutcome {
                 return EngineOutcome::from_sqlite_error(err);
             }
             match conn2.execute_batch("COMMIT;") {
-                Ok(_) => EngineOutcome::ok(
+                Ok(()) => EngineOutcome::ok(
                     "sqlite3",
                     Some("both writers committed under sqlite locking model".to_owned()),
                 ),
@@ -534,7 +538,7 @@ fn run_sqlite_busy_lock(path: &Path) -> EngineOutcome {
     let _ = conn2.execute_batch("ROLLBACK;");
 
     match second_begin {
-        Ok(_) => EngineOutcome::ok(
+        Ok(()) => EngineOutcome::ok(
             "sqlite3",
             Some("second BEGIN IMMEDIATE unexpectedly succeeded".to_owned()),
         ),
@@ -696,11 +700,11 @@ fn scenario_checks(
             let fsqlite_busy_family_code = run
                 .fsqlite
                 .base_error_code
-                .map_or(true, |code| code == 5 || code == 6);
+                .is_none_or(|code| code == 5 || code == 6);
             let sqlite_busy_family_code = run
                 .sqlite
                 .base_error_code
-                .map_or(true, |code| code == 5 || code == 6);
+                .is_none_or(|code| code == 5 || code == 6);
             let busy_family_codes_valid = fsqlite_busy_family_code && sqlite_busy_family_code;
 
             if !fsqlite_conflict_surface {

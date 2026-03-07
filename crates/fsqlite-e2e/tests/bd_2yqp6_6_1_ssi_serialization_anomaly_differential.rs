@@ -76,15 +76,11 @@ impl ScenarioKind {
                 read_key: 1,
                 write_key: 2,
             },
-            (Self::DisjointWrites, 0) => TxPlan {
-                read_key: 1,
-                write_key: 1,
-            },
             (Self::DisjointWrites, 1) => TxPlan {
                 read_key: 2,
                 write_key: 2,
             },
-            (Self::HotRowConflict, 0) | (Self::HotRowConflict, 1) => TxPlan {
+            (Self::DisjointWrites, 0) | (Self::HotRowConflict, 0 | 1) => TxPlan {
                 read_key: 1,
                 write_key: 1,
             },
@@ -384,20 +380,15 @@ fn run_fsqlite(db_path: &Path, scenario: ScenarioKind, scheduler: &SchedulerPlan
     initialize_fsqlite_db(db_path, scenario);
 
     let start_time = Instant::now();
-    let mut conn_a = open_fsqlite_worker(db_path);
-    let mut conn_b = open_fsqlite_worker(db_path);
+    let conn_a = open_fsqlite_worker(db_path);
+    let conn_b = open_fsqlite_worker(db_path);
 
     let mut runtimes = [
-        begin_and_prepare_fsqlite_txn(&mut conn_a, 0, scenario),
-        begin_and_prepare_fsqlite_txn(&mut conn_b, 1, scenario),
+        begin_and_prepare_fsqlite_txn(&conn_a, 0, scenario),
+        begin_and_prepare_fsqlite_txn(&conn_b, 1, scenario),
     ];
 
-    commit_in_order_fsqlite(
-        &mut conn_a,
-        &mut conn_b,
-        &mut runtimes,
-        scheduler.commit_order,
-    );
+    commit_in_order_fsqlite(&conn_a, &conn_b, &mut runtimes, scheduler.commit_order);
 
     let committed_for_graph = committed_txns_from_runtime(&runtimes);
     let elapsed_ms = duration_to_ms(start_time.elapsed().as_millis());
@@ -415,20 +406,15 @@ fn run_sqlite(db_path: &Path, scenario: ScenarioKind, scheduler: &SchedulerPlan)
     initialize_sqlite_db(db_path, scenario);
 
     let start_time = Instant::now();
-    let mut conn_a = open_sqlite_worker(db_path);
-    let mut conn_b = open_sqlite_worker(db_path);
+    let conn_a = open_sqlite_worker(db_path);
+    let conn_b = open_sqlite_worker(db_path);
 
     let mut runtimes = [
-        begin_and_prepare_sqlite_txn(&mut conn_a, 0, scenario),
-        begin_and_prepare_sqlite_txn(&mut conn_b, 1, scenario),
+        begin_and_prepare_sqlite_txn(&conn_a, 0, scenario),
+        begin_and_prepare_sqlite_txn(&conn_b, 1, scenario),
     ];
 
-    commit_in_order_sqlite(
-        &mut conn_a,
-        &mut conn_b,
-        &mut runtimes,
-        scheduler.commit_order,
-    );
+    commit_in_order_sqlite(&conn_a, &conn_b, &mut runtimes, scheduler.commit_order);
 
     let committed_for_graph = committed_txns_from_runtime(&runtimes);
     let elapsed_ms = duration_to_ms(start_time.elapsed().as_millis());
@@ -499,7 +485,7 @@ fn open_sqlite_worker(path: &Path) -> rusqlite::Connection {
 }
 
 fn begin_and_prepare_fsqlite_txn(
-    conn: &mut fsqlite::Connection,
+    conn: &fsqlite::Connection,
     tx_index: usize,
     scenario: ScenarioKind,
 ) -> TxnRuntime {
@@ -575,7 +561,7 @@ fn begin_and_prepare_fsqlite_txn(
 }
 
 fn begin_and_prepare_sqlite_txn(
-    conn: &mut rusqlite::Connection,
+    conn: &rusqlite::Connection,
     tx_index: usize,
     scenario: ScenarioKind,
 ) -> TxnRuntime {
@@ -643,8 +629,8 @@ fn begin_and_prepare_sqlite_txn(
 }
 
 fn commit_in_order_fsqlite(
-    conn_a: &mut fsqlite::Connection,
-    conn_b: &mut fsqlite::Connection,
+    conn_a: &fsqlite::Connection,
+    conn_b: &fsqlite::Connection,
     runtimes: &mut [TxnRuntime; 2],
     commit_order: [usize; 2],
 ) {
@@ -665,8 +651,8 @@ fn commit_in_order_fsqlite(
 }
 
 fn commit_in_order_sqlite(
-    conn_a: &mut rusqlite::Connection,
-    conn_b: &mut rusqlite::Connection,
+    conn_a: &rusqlite::Connection,
+    conn_b: &rusqlite::Connection,
     runtimes: &mut [TxnRuntime; 2],
     commit_order: [usize; 2],
 ) {
@@ -687,7 +673,7 @@ fn commit_in_order_sqlite(
 }
 
 fn commit_single_fsqlite_txn(
-    conn: &mut fsqlite::Connection,
+    conn: &fsqlite::Connection,
     runtime: &mut TxnRuntime,
     commit_seq: u64,
 ) {
@@ -706,12 +692,12 @@ fn commit_single_fsqlite_txn(
 }
 
 fn commit_single_sqlite_txn(
-    conn: &mut rusqlite::Connection,
+    conn: &rusqlite::Connection,
     runtime: &mut TxnRuntime,
     commit_seq: u64,
 ) {
     match conn.execute_batch("COMMIT;") {
-        Ok(_) => {
+        Ok(()) => {
             runtime.trace.outcome = TxnOutcome::Committed;
             runtime.trace.commit_order = Some(commit_seq);
             runtime.open = false;
@@ -1099,8 +1085,6 @@ fn orient_read_write_conflict(
 ) {
     if writer.commit_order <= reader.start_order {
         add_edge(writer_idx, reader_idx);
-    } else if reader.commit_order <= writer.start_order {
-        add_edge(reader_idx, writer_idx);
     } else {
         add_edge(reader_idx, writer_idx);
     }
