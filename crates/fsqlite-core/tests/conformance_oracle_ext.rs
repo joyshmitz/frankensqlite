@@ -9260,3 +9260,37 @@ fn test_conformance_in_subquery_with_group() {
         panic!("{} in subquery pattern mismatches", mismatches.len());
     }
 }
+
+#[test]
+fn test_conformance_cast_aggregate_group_by() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE sales_cag (id INTEGER PRIMARY KEY, region TEXT, qty INTEGER, price REAL)",
+        "INSERT INTO sales_cag VALUES (1,'East',10,5.0),(2,'East',20,3.0),(3,'West',15,4.0),(4,'West',5,8.0)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // CAST wrapping aggregate in GROUP BY
+        "SELECT region, CAST(SUM(qty * price) AS INTEGER) AS revenue FROM sales_cag GROUP BY region ORDER BY region",
+        // CAST in arithmetic with aggregate
+        "SELECT region, CAST(SUM(qty * price) AS INTEGER) / COUNT(*) AS avg_revenue FROM sales_cag GROUP BY region ORDER BY region",
+        // CAST(AVG(...) AS INTEGER)
+        "SELECT region, CAST(AVG(price) AS INTEGER) AS avg_price FROM sales_cag GROUP BY region ORDER BY region",
+        // CAST in CASE wrapping aggregate
+        "SELECT region, CASE WHEN CAST(SUM(qty) AS TEXT) > '20' THEN 'high' ELSE 'low' END AS vol FROM sales_cag GROUP BY region ORDER BY region",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} cast aggregate group by mismatches", mismatches.len());
+    }
+}

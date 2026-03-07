@@ -16578,6 +16578,18 @@ fn eval_group_agg_join_expr(
             let result = if *not { !in_range } else { in_range };
             Ok(SqliteValue::Integer(i64::from(result)))
         }
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            ..
+        } => {
+            let val = eval_group_agg_join_expr(inner, group_rows, col_map)?;
+            if val.is_null() {
+                return Ok(SqliteValue::Null);
+            }
+            Ok(apply_cast(val, &type_name.name))
+        }
+        Expr::Collate { expr: inner, .. } => eval_group_agg_join_expr(inner, group_rows, col_map),
         // No aggregate sub-expressions: delegate to per-row eval on first row.
         other => {
             if let Some(first) = group_rows.first() {
@@ -64888,8 +64900,8 @@ mod pager_routing_tests {
             "SELECT grp, SUM(DISTINCT val) FROM t GROUP BY grp ORDER BY grp",
             // GROUP_CONCAT
             "SELECT grp, GROUP_CONCAT(val, ',') FROM t GROUP BY grp ORDER BY grp",
-            // GROUP_CONCAT DISTINCT
-            "SELECT grp, GROUP_CONCAT(DISTINCT val, '-') FROM t GROUP BY grp ORDER BY grp",
+            // GROUP_CONCAT DISTINCT (no separator — DISTINCT requires exactly 1 arg)
+            "SELECT grp, GROUP_CONCAT(DISTINCT val) FROM t GROUP BY grp ORDER BY grp",
             // Aggregate on empty table
             "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM t WHERE 1=0",
             // Aggregate with all NULLs
