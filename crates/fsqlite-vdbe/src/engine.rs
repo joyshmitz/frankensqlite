@@ -2065,6 +2065,10 @@ pub struct VdbeEngine {
     /// `IdxInsert`, so remaining `IdxInsert` opcodes for this row should be
     /// skipped.
     conflict_skip_idx: bool,
+    /// Index entries inserted for the current row (cursor_id, key_bytes).
+    /// On IGNORE conflict rollback, these entries must be deleted to avoid
+    /// phantom index entries blocking future inserts.
+    pending_idx_entries: Vec<(i32, Vec<u8>)>,
     /// RowSet data structures for OR-optimized queries (keyed by register).
     rowsets: SwissIndex<i32, RowSet>,
     /// Foreign key constraint violation counter (deferred FK enforcement).
@@ -2388,6 +2392,7 @@ impl VdbeEngine {
             last_insert_cursor_id: None,
             pending_insert_rollback: None,
             conflict_skip_idx: false,
+            pending_idx_entries: Vec::new(),
             rowsets: SwissIndex::new(),
             fk_counter: 0,
             autoincrement_seq_by_root_page: HashMap::new(),
@@ -4493,6 +4498,7 @@ impl VdbeEngine {
                     }
                     self.last_insert_cursor_id = Some(cursor_id);
                     self.conflict_skip_idx = false;
+                    self.pending_idx_entries.clear();
 
                     // br-22iss: Clear pending_next_after_delete since Insert repositions
                     // the cursor. This is critical for UPDATE (Delete+Insert) to avoid
@@ -4578,12 +4584,34 @@ impl VdbeEngine {
                                     n_idx_cols,
                                     &columns_label,
                                 ) {
-                                    Ok(()) => {}
+                                    Ok(()) => {
+                                        self.pending_idx_entries
+                                            .push((cursor_id, key_bytes.clone()));
+                                    }
                                     Err(FrankenError::UniqueViolation { .. }) => {
                                         match oe_flag {
                                             // OE_IGNORE (4): Undo the table
-                                            // insert and skip remaining indexes.
+                                            // insert, roll back any already-inserted
+                                            // index entries, and skip remaining indexes.
                                             4 => {
+                                                // Roll back index entries inserted
+                                                // earlier for this row.
+                                                let entries =
+                                                    std::mem::take(&mut self.pending_idx_entries);
+                                                for (idx_cid, idx_key) in &entries {
+                                                    if let Some(isc) =
+                                                        self.storage_cursors.get_mut(idx_cid)
+                                                    {
+                                                        if isc
+                                                            .cursor
+                                                            .index_move_to(&isc.cx, idx_key)?
+                                                            .is_found()
+                                                        {
+                                                            isc.cursor.delete(&isc.cx)?;
+                                                        }
+                                                    }
+                                                }
+
                                                 let rollback = self
                                                     .pending_insert_rollback
                                                     .take()
@@ -4676,6 +4704,8 @@ impl VdbeEngine {
                                 }
                             } else {
                                 sc.cursor.index_insert(&sc.cx, &key_bytes)?;
+                                self.pending_idx_entries
+                                    .push((cursor_id, key_bytes.clone()));
                             }
                         }
                     }
