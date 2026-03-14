@@ -2076,9 +2076,6 @@ pub struct Connection {
     /// Last commit sequence assigned to a successful local COMMIT executed
     /// through this connection.
     last_local_commit_seq: RefCell<Option<CommitSeq>>,
-    /// Global per-database commit serialization guard to keep WAL appends
-    /// single-file ordered across multiple connections.
-    commit_write_mutex: Arc<Mutex<()>>,
     /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
     /// double-run rollback/checkpoint logic.
     closed: RefCell<bool>,
@@ -2262,7 +2259,6 @@ impl Connection {
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             memdb_rows_loaded: Cell::new(eager_memdb_rows),
             last_local_commit_seq: RefCell::new(None),
-            commit_write_mutex: Arc::clone(&shared_mvcc_state.commit_write_mutex),
             closed: RefCell::new(false),
             // Cx capability context (bd-2g5.6)
             root_cx,
@@ -3003,10 +2999,14 @@ impl Connection {
         let mut cleanup_errors = Vec::new();
         if let Some(concurrent_snap) = concurrent_snapshot {
             if let Some(session_id) = *self.concurrent_session_id.borrow() {
-                let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                let registry = lock_unpoisoned(&self.concurrent_registry);
                 if let Some(mut handle) = registry.get_mut(session_id) {
-                    if let Err(err) = concurrent_rollback_to_savepoint(&mut handle, concurrent_snap)
-                    {
+                    if let Err(err) = concurrent_rollback_to_savepoint(
+                        &mut handle,
+                        &self.concurrent_lock_table,
+                        session_id,
+                        concurrent_snap,
+                    ) {
                         cleanup_errors.push(format!(
                             "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
                         ));
@@ -4860,11 +4860,14 @@ impl Connection {
                 let mut concurrent_rollback_succeeded = true;
                 if let Some(concurrent_snap) = concurrent_snapshot.as_ref() {
                     if let Some(session_id) = *self.concurrent_session_id.borrow() {
-                        let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                        let registry = lock_unpoisoned(&self.concurrent_registry);
                         if let Some(mut handle) = registry.get_mut(session_id) {
-                            if let Err(err) =
-                                concurrent_rollback_to_savepoint(&mut handle, concurrent_snap)
-                            {
+                            if let Err(err) = concurrent_rollback_to_savepoint(
+                                &mut handle,
+                                &self.concurrent_lock_table,
+                                session_id,
+                                concurrent_snap,
+                            ) {
                                 concurrent_rollback_succeeded = false;
                                 cleanup_errors.push(format!(
                                     "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
@@ -8915,26 +8918,18 @@ impl Connection {
             }
         }
 
-        // bd-rjc fix: plan_concurrent_commit() must be called under
-        // commit_write_mutex to prevent another connection from advancing
-        // next_commit_seq between plan (which reads it) and finalize (which
-        // bumps it).  Without this, assigned_commit_seq != committed_seq,
-        // corrupting the MVCC commit index.
+        let is_concurrent_txn = *self.concurrent_txn.borrow();
+        let pending_commit_pages = if is_concurrent_txn && txn_has_pending_writes {
+            txn.pending_commit_pages()?
+        } else {
+            Vec::new()
+        };
+
         let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
-            let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-            let is_concurrent_txn = *self.concurrent_txn.borrow();
-            let pending_commit_pages = if is_concurrent_txn && txn_has_pending_writes {
-                txn.pending_commit_pages()?
-            } else {
-                Vec::new()
-            };
             let concurrent_plan = if is_concurrent_txn && txn_has_pending_writes {
                 match self.plan_concurrent_commit(&pending_commit_pages) {
                     Ok(plan) => plan,
                     Err(e) => {
-                        // Plan failed (SSI conflict, etc.) — abort under the
-                        // mutex so we still hold sequencing invariants.
-                        drop(_commit_guard);
                         self.abort_current_concurrent_session();
                         self.txn_metrics_note_rollback();
                         let rollback_result = txn.rollback(&cx);
@@ -8961,11 +8956,11 @@ impl Connection {
             match txn.commit(&cx) {
                 Ok(()) => {
                     if txn_has_pending_writes {
-                        let committed_seq = self.advance_commit_clock();
                         if let Some(plan) = concurrent_plan {
+                            let committed_seq = self.advance_commit_clock();
                             self.finalize_concurrent_commit(plan, committed_seq);
                         }
-                    } else if *self.concurrent_txn.borrow() {
+                    } else if is_concurrent_txn {
                         let _ =
                             self.concurrent_session_id
                                 .borrow_mut()
@@ -8974,8 +8969,6 @@ impl Connection {
                                     lock_unpoisoned(&self.concurrent_registry).remove(session_id)
                                 });
                     }
-                    self.live_vtab_commit_all_best_effort(&cx);
-                    self.finalize_live_vtab_registry_commit(&cx);
                     (Ok(()), txn_has_pending_writes, false)
                 }
                 Err(e) => {
@@ -9038,6 +9031,8 @@ impl Connection {
         }
 
         txn_result?;
+        self.live_vtab_commit_all_best_effort(&cx);
+        self.finalize_live_vtab_registry_commit(&cx);
 
         if committed_write {
             let committed_seq = self
@@ -9111,7 +9106,6 @@ impl Connection {
             let mut guard = self.active_txn.borrow_mut();
             let finalize_err = if let Some(txn) = guard.as_deref_mut() {
                 if result.is_ok() {
-                    let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
                     match txn.commit(&cx) {
                         Ok(()) => {
                             let _ = self.advance_commit_clock();
@@ -12850,6 +12844,21 @@ impl Connection {
         }
     }
 
+    fn capture_ssi_snapshot_from_plan(plan: &PreparedConcurrentCommit) -> SsiTxnEvidenceSnapshot {
+        let mut write_pages = plan.write_set_pages().to_vec();
+        write_pages.sort_by_key(|page| page.get());
+        write_pages.dedup();
+        SsiTxnEvidenceSnapshot {
+            txn: plan.txn_token(),
+            snapshot_seq: plan.begin_seq(),
+            read_pages: plan.read_pages(),
+            write_pages,
+            has_in_rw: plan.has_in_rw(),
+            has_out_rw: plan.has_out_rw(),
+            marked_for_abort: false,
+        }
+    }
+
     fn collect_active_conflict_evidence(
         registry: &ConcurrentRegistry,
         session_id: u64,
@@ -12942,7 +12951,7 @@ impl Connection {
 
     fn track_pending_commit_pages_with_registry(
         &self,
-        registry: &mut ConcurrentRegistry,
+        registry: &ConcurrentRegistry,
         session_id: u64,
         pending_commit_pages: &[PageNumber],
     ) -> Result<()> {
@@ -12950,13 +12959,39 @@ impl Connection {
             return Ok(());
         }
 
-        let mut handle = registry
-            .get_mut(session_id)
-            .ok_or_else(|| FrankenError::Internal("MVCC session invalid or inactive".to_owned()))?;
         for &page in pending_commit_pages {
-            if handle.tracks_write_conflict_page(page) {
+            let (already_tracked, snapshot_high) = {
+                let handle = registry.get(session_id).ok_or_else(|| {
+                    FrankenError::Internal(
+                        "concurrent transaction missing session during pending commit tracking"
+                            .to_owned(),
+                    )
+                })?;
+                (
+                    handle.tracks_write_conflict_page(page),
+                    handle.snapshot().high,
+                )
+            };
+            if already_tracked {
                 continue;
             }
+
+            if self
+                .concurrent_commit_index
+                .latest(page)
+                .is_some_and(|seq| seq > snapshot_high)
+            {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: page.get().to_string(),
+                });
+            }
+
+            let mut handle = registry.get_mut(session_id).ok_or_else(|| {
+                FrankenError::Internal(
+                    "concurrent transaction missing session during pending commit tracking"
+                        .to_owned(),
+                )
+            })?;
             concurrent_track_write_conflict_page(
                 &mut handle,
                 &self.concurrent_lock_table,
@@ -12965,8 +13000,16 @@ impl Connection {
             )
             .map_err(|error| match error {
                 MvccError::Busy => FrankenError::Busy,
-                _ => FrankenError::Internal(format!(
-                    "MVCC pending commit page tracking failed: {error}"
+                MvccError::BusySnapshot => FrankenError::BusySnapshot {
+                    conflicting_pages: page.get().to_string(),
+                },
+                MvccError::InvalidState => FrankenError::Internal(
+                    "concurrent transaction became inactive while tracking pending commit pages"
+                        .to_owned(),
+                ),
+                other => FrankenError::Internal(format!(
+                    "pending commit page tracking failed for page {}: {other}",
+                    page.get()
                 )),
             })?;
         }
@@ -12991,17 +13034,14 @@ impl Connection {
         };
 
         let mut abort_card: Option<SsiDecisionCardDraft> = None;
-        let assigned_commit_seq =
-            CommitSeq::new(self.next_commit_seq.load(AtomicOrdering::Acquire));
-
+        let planned_commit_seq = CommitSeq::new(self.next_commit_seq.load(AtomicOrdering::Acquire));
         self.track_pending_commit_pages_with_registry(registry, session_id, pending_commit_pages)?;
 
-        let (snapshot, active_conflicts) = match registry.get(session_id) {
+        let snapshot = match registry.get(session_id) {
             Some(handle) if handle.is_active() => {
                 let snapshot = Self::capture_ssi_snapshot(&handle);
-                let active_conflicts =
-                    Self::collect_active_conflict_evidence(registry, session_id, &snapshot);
-                (snapshot, active_conflicts)
+                drop(handle);
+                snapshot
             }
             Some(_) | None => {
                 return Err(FrankenError::Internal(
@@ -13015,10 +13055,12 @@ impl Connection {
                 &self.concurrent_commit_index,
                 &self.concurrent_lock_table,
                 session_id,
-                assigned_commit_seq,
+                planned_commit_seq,
             ) {
                 Ok(plan) => Ok(plan),
                 Err((err, fcw_result)) => {
+                    let active_conflicts =
+                        Self::collect_active_conflict_evidence(registry, session_id, &snapshot);
                     let (decision_type, rationale, conflict_pages) = match &fcw_result {
                         FcwResult::Conflict {
                             conflicting_pages,
@@ -13096,7 +13138,7 @@ impl Connection {
                     let primary_conflict_page = conflict_pages.first().map_or(0, |page| page.get());
                     tracing::warn!(
                         txn_id = snapshot.txn.id.get(),
-                        commit_seq = assigned_commit_seq.get(),
+                        commit_seq = planned_commit_seq.get(),
                         snapshot_high = snapshot.snapshot_seq.get(),
                         page_id = primary_conflict_page,
                         visibility_decision = "commit_abort",
@@ -13134,7 +13176,7 @@ impl Connection {
                     .unwrap_or(0);
                 tracing::debug!(
                     txn_id = plan.txn_token().id.get(),
-                    commit_seq = plan.assigned_commit_seq().get(),
+                    commit_seq = plan.planned_commit_seq().get(),
                     snapshot_high = plan.begin_seq().get(),
                     page_id = first_page,
                     visibility_decision = "commit_plan_clean",
@@ -13189,27 +13231,17 @@ impl Connection {
             &plan,
             committed_seq,
         );
-        let commit_card = registry.remove(session_id).map(|handle| {
-            let handle = handle.lock();
-            let snapshot = Self::capture_ssi_snapshot(&handle);
-            let active_conflicts =
-                Self::collect_active_conflict_evidence(registry, session_id, &snapshot);
-            Self::build_ssi_decision_draft(
-                &snapshot,
-                SsiDecisionType::CommitAllowed,
-                active_conflicts.conflicting_txns,
-                Self::merge_conflict_pages(
-                    Vec::new(),
-                    active_conflicts.conflict_pages,
-                    &snapshot.write_pages,
-                ),
-                format!("commit_allowed_commit_seq={}", committed_seq.get()),
-            )
-            .with_commit_seq(committed_seq)
-        });
-        if let Some(card) = commit_card {
-            self.ssi_evidence_ledger.record_async(card);
-        }
+        let snapshot = Self::capture_ssi_snapshot_from_plan(&plan);
+        let commit_card = Self::build_ssi_decision_draft(
+            &snapshot,
+            SsiDecisionType::CommitAllowed,
+            plan.conflicting_txns(),
+            Self::merge_conflict_pages(Vec::new(), plan.conflict_pages(), &snapshot.write_pages),
+            format!("commit_allowed_commit_seq={}", committed_seq.get()),
+        )
+        .with_commit_seq(committed_seq);
+        let _ = registry.remove(session_id);
+        self.ssi_evidence_ledger.record_async(commit_card);
         *self.concurrent_session_id.borrow_mut() = None;
     }
 
@@ -13280,28 +13312,28 @@ impl Connection {
             }
         }
 
+        let is_concurrent_txn = *self.concurrent_txn.borrow();
+        let (txn_has_pending_writes, pending_commit_pages) = {
+            let txn_guard = self.active_txn.borrow();
+            let txn_has_pending_writes = txn_guard
+                .as_ref()
+                .is_some_and(|txn| TransactionHandle::has_pending_writes(&**txn));
+            let pending_commit_pages = if is_concurrent_txn && txn_has_pending_writes {
+                txn_guard
+                    .as_ref()
+                    .map(|txn| txn.pending_commit_pages())
+                    .transpose()?
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            (txn_has_pending_writes, pending_commit_pages)
+        };
+
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
         let (commit_result, committed_write) = {
-            let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-            let is_concurrent_txn = *self.concurrent_txn.borrow();
-            let (txn_has_pending_writes, pending_commit_pages) = {
-                let txn_guard = self.active_txn.borrow();
-                let txn_has_pending_writes = txn_guard
-                    .as_ref()
-                    .is_some_and(|txn| TransactionHandle::has_pending_writes(&**txn));
-                let pending_commit_pages = if is_concurrent_txn && txn_has_pending_writes {
-                    txn_guard
-                        .as_ref()
-                        .map(|txn| txn.pending_commit_pages())
-                        .transpose()?
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
-                (txn_has_pending_writes, pending_commit_pages)
-            };
-            let concurrent_commit_plan = if is_concurrent_txn && txn_has_pending_writes {
+            let concurrent_commit_plan = if is_concurrent_txn {
                 self.plan_concurrent_commit(&pending_commit_pages)?
             } else {
                 None
@@ -13316,21 +13348,12 @@ impl Connection {
             };
 
             if matches!(commit_res, Ok(())) {
-                if txn_has_pending_writes {
+                if let Some(plan) = concurrent_commit_plan {
                     let committed_seq = self.advance_commit_clock();
-                    if let Some(plan) = concurrent_commit_plan {
-                        self.finalize_concurrent_commit(plan, committed_seq);
-                    }
-                } else if *self.concurrent_txn.borrow() {
-                    let _ = self
-                        .concurrent_session_id
-                        .borrow_mut()
-                        .take()
-                        .and_then(|session_id| {
-                            lock_unpoisoned(&self.concurrent_registry).remove(session_id)
-                        });
+                    self.finalize_concurrent_commit(plan, committed_seq);
                 }
             }
+
             (commit_res, txn_has_pending_writes)
         };
 
@@ -13478,14 +13501,20 @@ impl Connection {
             // Restore concurrent write set state if in concurrent mode.
             if let Some(concurrent_snap) = concurrent_snap {
                 let session_id = concurrent_session_id.expect("validated above");
-                let mut registry = lock_unpoisoned(&self.concurrent_registry);
                 {
+                    let registry = lock_unpoisoned(&self.concurrent_registry);
                     let mut handle = registry.get_mut(session_id).ok_or_else(|| {
                         FrankenError::Internal("concurrent session handle not found".to_owned())
                     })?;
-                    concurrent_rollback_to_savepoint(&mut handle, &concurrent_snap).map_err(
-                        |e| FrankenError::Internal(format!("concurrent rollback failed: {e}")),
-                    )?;
+                    concurrent_rollback_to_savepoint(
+                        &mut handle,
+                        &self.concurrent_lock_table,
+                        session_id,
+                        &concurrent_snap,
+                    )
+                    .map_err(|e| {
+                        FrankenError::Internal(format!("concurrent rollback failed: {e}"))
+                    })?;
                 }
             }
             let live_vtab_level = Self::savepoint_level_from_depth(idx)?;
@@ -13754,8 +13783,8 @@ impl Connection {
                         "concurrent transaction active but no session ID".to_owned(),
                     )
                 })?;
-                let registry = lock_unpoisoned(&self.concurrent_registry);
                 let snapshot = {
+                    let registry = lock_unpoisoned(&self.concurrent_registry);
                     let handle = registry.get(session_id).ok_or_else(|| {
                         FrankenError::Internal("concurrent session handle not found".to_owned())
                     })?;
@@ -24276,7 +24305,6 @@ struct SharedMvccState {
     lock_table: Arc<InProcessPageLockTable>,
     commit_index: Arc<CommitIndex>,
     next_commit_seq: Arc<AtomicU64>,
-    commit_write_mutex: Arc<Mutex<()>>,
     _runtime: Arc<RuntimeContext>,
     runtime_state: Mutex<SharedRuntimeState>,
 }
@@ -24303,7 +24331,6 @@ impl SharedMvccState {
             lock_table: Arc::new(InProcessPageLockTable::new()),
             commit_index: Arc::new(CommitIndex::new()),
             next_commit_seq: Arc::new(AtomicU64::new(1)),
-            commit_write_mutex: Arc::new(Mutex::new(())),
             _runtime: runtime,
             runtime_state: Mutex::new(SharedRuntimeState {
                 key,
@@ -44143,6 +44170,96 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_without_writes_clears_concurrent_session_state() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        let session_id = conn
+            .concurrent_session_id
+            .borrow()
+            .expect("BEGIN CONCURRENT should register a session");
+
+        conn.execute("COMMIT;").unwrap();
+
+        assert!(
+            conn.concurrent_session_id.borrow().is_none(),
+            "successful COMMIT without pending writes must clear the connection session id"
+        );
+        let registry = lock_unpoisoned(&conn.concurrent_registry);
+        assert!(
+            registry.get(session_id).is_none(),
+            "successful COMMIT without pending writes must unregister the MVCC session"
+        );
+    }
+
+    #[test]
+    fn test_read_only_concurrent_commit_records_ssi_commit_evidence() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        let rows = conn.query("SELECT x FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        conn.execute("COMMIT;").unwrap();
+
+        let cards = conn.ssi_decisions_snapshot();
+        assert!(
+            cards.iter().any(|card| {
+                card.decision_type == fsqlite_mvcc::SsiDecisionType::CommitAllowed
+                    && card.write_set.is_empty()
+                    && card.read_set_summary.page_count > 0
+                    && card.commit_seq.is_some()
+            }),
+            "read-only concurrent COMMIT should still publish SSI commit evidence"
+        );
+    }
+
+    #[test]
+    fn test_commit_after_savepoint_rollback_releases_retained_page_locks() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+
+        let session_id = conn
+            .concurrent_session_id
+            .borrow()
+            .expect("BEGIN CONCURRENT should register a session");
+
+        conn.execute("ROLLBACK TO sp1;").unwrap();
+        conn.execute("RELEASE sp1;").unwrap();
+
+        {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            let handle = registry
+                .get(session_id)
+                .expect("concurrent handle should remain registered after savepoint rollback");
+            assert!(
+                !handle.held_locks().is_empty(),
+                "savepoint rollback should preserve already-acquired page ownership until commit"
+            );
+        }
+
+        conn.execute("COMMIT;").unwrap();
+
+        assert!(
+            conn.concurrent_session_id.borrow().is_none(),
+            "successful COMMIT after savepoint rollback must clear the connection session id"
+        );
+        let registry = lock_unpoisoned(&conn.concurrent_registry);
+        assert!(
+            registry.get(session_id).is_none(),
+            "successful COMMIT after savepoint rollback must unregister the MVCC session"
+        );
+        assert_eq!(
+            conn.concurrent_lock_table.total_lock_count(),
+            0,
+            "successful COMMIT after savepoint rollback must release retained MVCC page locks"
+        );
+    }
+
+    #[test]
     fn test_begin_uses_pager_publication_visibility_for_concurrent_snapshot() {
         let conn = Connection::open(":memory:").unwrap();
         let published = conn.pager.published_snapshot();
@@ -44480,6 +44597,86 @@ mod tests {
                 "expected Internal rollback-required error for missing concurrent session, got {other:?}"
             ),
         }
+    }
+
+    #[test]
+    fn test_commit_planning_tracks_existing_freelist_trunk_pages_from_pending_commit_surface() {
+        use fsqlite_pager::TransactionMode;
+
+        let conn = Connection::open(":memory:").unwrap();
+        let cx = conn.op_cx().unwrap();
+        let ps = PageSize::MIN.as_usize();
+
+        let (p2, p3) = {
+            let mut seed = conn.pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p2 = seed.allocate_page(&cx).unwrap();
+            let p3 = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, p2, &vec![0x11; ps]).unwrap();
+            seed.write_page(&cx, p3, &vec![0x22; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            (p2, p3)
+        };
+
+        {
+            let mut establish_committed_freelist =
+                conn.pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            establish_committed_freelist.free_page(&cx, p2).unwrap();
+            establish_committed_freelist.commit(&cx).unwrap();
+        }
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        let session_id = conn
+            .concurrent_session_id
+            .borrow()
+            .expect("BEGIN CONCURRENT should register a session");
+
+        let predicted = {
+            let mut txn_guard = conn.active_txn.borrow_mut();
+            let txn = txn_guard
+                .as_mut()
+                .expect("concurrent transaction should keep an active pager handle");
+            txn.free_page(&cx, p3).unwrap();
+            let predicted = txn.pending_commit_pages().unwrap();
+            assert!(
+                predicted.contains(&p2),
+                "commit planning must see the committed freelist trunk page in the pending surface"
+            );
+            predicted
+        };
+
+        {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            let handle = registry
+                .get(session_id)
+                .expect("concurrent handle should be present before commit planning");
+            assert!(
+                !handle.tracks_write_conflict_page(p2),
+                "precondition: the existing committed freelist trunk page should not already be tracked before commit planning"
+            );
+        }
+
+        {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            conn.track_pending_commit_pages_with_registry(&registry, session_id, &predicted)
+                .expect("commit planning should track pending commit pages before SSI validation");
+        }
+
+        {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            let handle = registry
+                .get(session_id)
+                .expect("concurrent handle should remain present after pending surface tracking");
+            assert!(
+                handle.tracks_write_conflict_page(p2),
+                "commit planning must acquire the existing committed freelist trunk page before validation"
+            );
+            assert!(
+                handle.held_locks().contains(&p2),
+                "commit planning must hold the committed freelist trunk page lock once it becomes part of the pending surface"
+            );
+        }
+
+        conn.execute("ROLLBACK;").unwrap();
     }
 
     #[test]
@@ -46180,14 +46377,13 @@ mod tests {
             .borrow()
             .expect("concurrent session should exist");
         {
-            let mut registry = lock_unpoisoned(&conn.concurrent_registry);
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
             let handle = registry
                 .get_mut(session_id)
                 .expect("session handle should exist");
-            fsqlite_mvcc::ActiveTxnView::set_has_in_rw(handle, true);
-            fsqlite_mvcc::ActiveTxnView::set_has_out_rw(handle, true);
-            fsqlite_mvcc::ActiveTxnView::set_marked_for_abort(handle, true);
-            drop(registry);
+            fsqlite_mvcc::ActiveTxnView::set_has_in_rw(&*handle, true);
+            fsqlite_mvcc::ActiveTxnView::set_has_out_rw(&*handle, true);
+            fsqlite_mvcc::ActiveTxnView::set_marked_for_abort(&*handle, true);
         }
         let err = conn.execute("COMMIT;").expect_err("SSI pivot must abort");
         assert!(
@@ -46278,14 +46474,13 @@ mod tests {
             .borrow()
             .expect("concurrent session should exist");
         {
-            let mut registry = lock_unpoisoned(&conn.concurrent_registry);
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
             let handle = registry
                 .get_mut(session_id)
                 .expect("session handle should exist");
-            fsqlite_mvcc::ActiveTxnView::set_has_in_rw(handle, true);
-            fsqlite_mvcc::ActiveTxnView::set_has_out_rw(handle, true);
-            fsqlite_mvcc::ActiveTxnView::set_marked_for_abort(handle, true);
-            drop(registry);
+            fsqlite_mvcc::ActiveTxnView::set_has_in_rw(&*handle, true);
+            fsqlite_mvcc::ActiveTxnView::set_has_out_rw(&*handle, true);
+            fsqlite_mvcc::ActiveTxnView::set_marked_for_abort(&*handle, true);
         }
         let _ = conn.execute("COMMIT;");
 
@@ -49857,6 +50052,32 @@ mod autocommit_txn_tests {
         assert!(
             conn.db.borrow().get_table(dirty_root).is_none(),
             "autocommit rollback must reload and discard dirty connection-local tables"
+        );
+    }
+
+    #[test]
+    fn test_autocommit_pending_write_commit_uses_detached_txn_handle_for_planning() {
+        let conn = Connection::open(":memory:").unwrap();
+        let cx = conn.op_cx().unwrap();
+
+        assert!(conn.ensure_autocommit_txn().unwrap());
+        {
+            let mut txn_guard = conn.active_txn.borrow_mut();
+            let txn = txn_guard.as_mut().expect("autocommit txn should be active");
+            let page_no = txn.allocate_page(&cx).unwrap();
+            let page_bytes = vec![0xCD; fsqlite_types::PageSize::DEFAULT.as_usize()];
+            txn.write_page(&cx, page_no, &page_bytes).unwrap();
+        }
+
+        conn.resolve_autocommit_txn(true, true)
+            .expect("pending-write autocommit commit should plan against the detached txn handle");
+        assert!(conn.active_txn.borrow().is_none());
+        assert!(!conn.is_concurrent_transaction());
+        assert!(!conn.has_concurrent_session());
+        assert_eq!(
+            conn.concurrent_writer_count(),
+            0,
+            "successful autocommit commit must unregister the concurrent session"
         );
     }
 
@@ -53679,10 +53900,9 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_commit_seq_does_not_advance_without_serialization_mutex() {
-        // Verify that commit_write_mutex is held during COMMIT (no interleaving).
-        // We test this indirectly by checking that two sequential commits from
-        // the same connection produce strictly ordered sequences.
+    fn test_commit_seq_remains_strictly_increasing_across_commits() {
+        // Even without an outer commit mutex, successful commits must still
+        // publish strictly increasing commit sequence numbers.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE mutex_test (id INTEGER PRIMARY KEY);")
             .unwrap();
@@ -54028,31 +54248,35 @@ mod pager_routing_tests {
 
         // Handle 1 acquires page 5.
         let sid1 = registry.begin_concurrent(snap).unwrap();
-        let h1 = registry.get_mut(sid1).unwrap();
-        let result1 = concurrent_write_page(
-            h1,
-            &lock_table,
-            sid1,
-            page,
-            PageData::from_vec(vec![0xAA; 4096]),
-        );
-        assert!(result1.is_ok(), "first writer should succeed");
+        {
+            let mut h1 = registry.get_mut(sid1).unwrap();
+            let result1 = concurrent_write_page(
+                &mut h1,
+                &lock_table,
+                sid1,
+                page,
+                PageData::from_vec(vec![0xAA; 4096]),
+            );
+            assert!(result1.is_ok(), "first writer should succeed");
+        }
 
         // Handle 2 tries the same page → MvccError::Busy.
         let sid2 = registry.begin_concurrent(snap).unwrap();
-        let h2 = registry.get_mut(sid2).unwrap();
-        let result2 = concurrent_write_page(
-            h2,
-            &lock_table,
-            sid2,
-            page,
-            PageData::from_vec(vec![0xBB; 4096]),
-        );
-        assert_eq!(
-            result2,
-            Err(MvccError::Busy),
-            "contending writer must get Busy"
-        );
+        {
+            let mut h2 = registry.get_mut(sid2).unwrap();
+            let result2 = concurrent_write_page(
+                &mut h2,
+                &lock_table,
+                sid2,
+                page,
+                PageData::from_vec(vec![0xBB; 4096]),
+            );
+            assert_eq!(
+                result2,
+                Err(MvccError::Busy),
+                "contending writer must get Busy"
+            );
+        }
     }
 
     #[test]
@@ -54068,25 +54292,29 @@ mod pager_routing_tests {
         let sid1 = registry.begin_concurrent(snap).unwrap();
         let sid2 = registry.begin_concurrent(snap).unwrap();
 
-        let h1 = registry.get_mut(sid1).unwrap();
-        let r1 = concurrent_write_page(
-            h1,
-            &lock_table,
-            sid1,
-            PageNumber::new(10).unwrap(),
-            PageData::from_vec(vec![0xAA; 4096]),
-        );
-        assert!(r1.is_ok(), "writer 1 should succeed on page 10");
+        {
+            let mut h1 = registry.get_mut(sid1).unwrap();
+            let r1 = concurrent_write_page(
+                &mut h1,
+                &lock_table,
+                sid1,
+                PageNumber::new(10).unwrap(),
+                PageData::from_vec(vec![0xAA; 4096]),
+            );
+            assert!(r1.is_ok(), "writer 1 should succeed on page 10");
+        }
 
-        let h2 = registry.get_mut(sid2).unwrap();
-        let r2 = concurrent_write_page(
-            h2,
-            &lock_table,
-            sid2,
-            PageNumber::new(20).unwrap(),
-            PageData::from_vec(vec![0xBB; 4096]),
-        );
-        assert!(r2.is_ok(), "writer 2 should succeed on page 20");
+        {
+            let mut h2 = registry.get_mut(sid2).unwrap();
+            let r2 = concurrent_write_page(
+                &mut h2,
+                &lock_table,
+                sid2,
+                PageNumber::new(20).unwrap(),
+                PageData::from_vec(vec![0xBB; 4096]),
+            );
+            assert!(r2.is_ok(), "writer 2 should succeed on page 20");
+        }
     }
 
     #[test]
@@ -54246,9 +54474,9 @@ mod pager_routing_tests {
         let snap_a = Snapshot::new(CommitSeq::new(5), SchemaEpoch::new(0));
         let sid = registry.begin_concurrent(snap_a).unwrap();
         {
-            let ha = registry.get_mut(sid).unwrap();
+            let mut ha = registry.get_mut(sid).unwrap();
             concurrent_write_page(
-                ha,
+                &mut ha,
                 &lock_table,
                 sid,
                 page,
@@ -54262,7 +54490,7 @@ mod pager_routing_tests {
 
         // FCW validation for A should detect conflict.
         let ha = registry.get(sid).unwrap();
-        let result = validate_first_committer_wins(ha, &commit_index);
+        let result = validate_first_committer_wins(&ha, &commit_index);
         match result {
             FcwResult::Conflict {
                 conflicting_pages,
@@ -54300,9 +54528,9 @@ mod pager_routing_tests {
         let snap = Snapshot::new(CommitSeq::new(10), SchemaEpoch::new(0));
         let sid = registry.begin_concurrent(snap).unwrap();
         {
-            let h = registry.get_mut(sid).unwrap();
+            let mut h = registry.get_mut(sid).unwrap();
             concurrent_write_page(
-                h,
+                &mut h,
                 &lock_table,
                 sid,
                 page,
@@ -54313,7 +54541,7 @@ mod pager_routing_tests {
 
         // No intervening commits in the index → FCW should be Clean.
         let h = registry.get(sid).unwrap();
-        let result = validate_first_committer_wins(h, &commit_index);
+        let result = validate_first_committer_wins(&h, &commit_index);
         assert_eq!(result, FcwResult::Clean, "no conflict expected");
     }
 
