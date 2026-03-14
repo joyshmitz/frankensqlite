@@ -31,7 +31,7 @@ pub const MAX_OVERFLOW_CHAIN: usize = 1_000_000;
 /// `read_page` is a callback that reads a raw page by page number.
 ///
 /// Returns the complete reassembled payload.
-pub fn read_overflow_chain<F>(
+pub fn read_overflow_chain<F, P>(
     local_data: &[u8],
     first_overflow: PageNumber,
     total_payload_size: u32,
@@ -39,7 +39,8 @@ pub fn read_overflow_chain<F>(
     read_page: &mut F,
 ) -> Result<Vec<u8>>
 where
-    F: FnMut(PageNumber) -> Result<Vec<u8>>,
+    F: FnMut(PageNumber) -> Result<P>,
+    P: AsRef<[u8]>,
 {
     let mut payload = Vec::new();
     read_overflow_chain_into(
@@ -54,7 +55,7 @@ where
 }
 
 /// Read a complete payload into an existing buffer.
-pub fn read_overflow_chain_into<F>(
+pub fn read_overflow_chain_into<F, P>(
     local_data: &[u8],
     first_overflow: PageNumber,
     total_payload_size: u32,
@@ -63,7 +64,8 @@ pub fn read_overflow_chain_into<F>(
     out: &mut Vec<u8>,
 ) -> Result<()>
 where
-    F: FnMut(PageNumber) -> Result<Vec<u8>>,
+    F: FnMut(PageNumber) -> Result<P>,
+    P: AsRef<[u8]>,
 {
     out.clear();
     if total_payload_size > MAX_ALLOCATION_SIZE {
@@ -101,18 +103,20 @@ where
         }
 
         let page_data = read_page(current_page)?;
-        if page_data.len() <= 4 {
+        let page_bytes = page_data.as_ref();
+        if page_bytes.len() <= 4 {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: "overflow page too small or empty".to_owned(),
             });
         }
 
-        let next_raw = u32::from_be_bytes([page_data[0], page_data[1], page_data[2], page_data[3]]);
+        let next_raw =
+            u32::from_be_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
 
-        let available = page_data.len().saturating_sub(4).min(bytes_per_overflow);
+        let available = page_bytes.len().saturating_sub(4).min(bytes_per_overflow);
         let to_read = bytes_remaining.min(available);
 
-        out.extend_from_slice(&page_data[4..4 + to_read]);
+        out.extend_from_slice(&page_bytes[4..4 + to_read]);
         bytes_remaining -= to_read;
 
         if bytes_remaining > 0 {

@@ -31,6 +31,8 @@ use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::record::parse_record;
 use fsqlite_types::serial_type::{read_varint, write_varint};
 use fsqlite_types::{PageData, PageNumber, WitnessKey};
+use std::borrow::Cow;
+use std::sync::Arc;
 use tracing::{Level, debug, trace, warn};
 
 #[inline]
@@ -49,6 +51,14 @@ fn observe_cursor_cancellation(cx: &Cx) -> Result<()> {
 pub trait PageReader {
     /// Read a page by number, returning the raw bytes.
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>>;
+
+    /// Read a page by number, returning owned page data.
+    ///
+    /// Implementations can override this to forward shared page buffers
+    /// without forcing an intermediate `Vec<u8>` clone.
+    fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        Ok(PageData::from_vec(self.read_page(cx, page_no)?))
+    }
 
     /// Hint that a page is likely to be needed soon.
     ///
@@ -121,6 +131,10 @@ impl<'a, T: TransactionHandle + ?Sized> TransactionPageIo<'a, T> {
 impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         Ok(self.txn.get_page(cx, page_no)?.into_vec())
+    }
+
+    fn read_page_data(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        self.txn.get_page(cx, page_no)
     }
 }
 
@@ -231,12 +245,38 @@ impl PageReader for MemPageStore {
 
 impl PageWriter for MemPageStore {
     fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        self.pages.insert(page_no.get(), data.to_vec());
+        let page_size = self.page_size as usize;
+        if data.len() > page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "test page store refused oversized page write: {} > {}",
+                    data.len(),
+                    page_size
+                ),
+            });
+        }
+        let mut page = vec![0_u8; page_size];
+        let copy_len = data.len().min(page_size);
+        page[..copy_len].copy_from_slice(&data[..copy_len]);
+        self.pages.insert(page_no.get(), page);
         Ok(())
     }
 
     fn write_page_data(&mut self, _cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
-        self.pages.insert(page_no.get(), data.into_vec());
+        let page_size = self.page_size as usize;
+        if data.len() > page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "test page store refused oversized page write: {} > {}",
+                    data.len(),
+                    page_size
+                ),
+            });
+        }
+        let mut page = vec![0_u8; page_size];
+        let copy_len = data.len().min(page_size);
+        page[..copy_len].copy_from_slice(&data.as_bytes()[..copy_len]);
+        self.pages.insert(page_no.get(), page);
         Ok(())
     }
 
@@ -274,11 +314,11 @@ struct StackEntry {
     #[allow(dead_code)]
     page_no: PageNumber,
     /// Cached raw page data.
-    page_data: Vec<u8>,
+    page_data: PageData,
     /// Parsed page header.
     header: BtreePageHeader,
     /// Cell pointer offsets (cached from the cell pointer array).
-    cell_pointers: Vec<u16>,
+    cell_pointers: Arc<[u16]>,
     /// Current cell index. For interior pages, this indicates which child
     /// was descended into. For leaf pages, this is the current position.
     /// A value equal to `cell_count` means "past the right-most child" on
@@ -316,6 +356,23 @@ pub struct BtCursor<P> {
     read_witnesses: Vec<WitnessKey>,
     /// Active per-operation observability stats while a `btree_op` span is open.
     active_op_stats: Option<BtreeOpRuntimeStats>,
+    /// Reusable buffer for cell encoding — avoids per-insert heap allocation.
+    ///
+    /// Taken out of the struct via `std::mem::take` during encoding (to
+    /// satisfy the borrow checker), then put back after insert completes.
+    /// The Vec capacity is preserved across the take/put cycle so repeated
+    /// inserts reuse the same allocation.
+    cell_buf: Vec<u8>,
+    /// Set when the last `table_insert` appended at the rightmost position
+    /// (the seek landed at EOF, meaning the new rowid is larger than all
+    /// existing rowids). Enables the sequential-append fast path on the
+    /// next insert.  Reset to false on any non-append insert or delete.
+    last_insert_was_rightmost_append: bool,
+    /// Last rowid successfully inserted via `table_insert`.
+    ///
+    /// Set on successful leaf insert or balance-for-insert.  Used by the VDBE
+    /// engine to implement `sqlite3_last_insert_rowid()` on a per-cursor basis.
+    pub last_insert_rowid: Option<i64>,
 }
 
 impl<P> BtCursor<P> {
@@ -326,6 +383,7 @@ impl<P> BtCursor<P> {
     pub fn invalidate(&mut self) {
         self.at_eof = true;
         self.stack.clear();
+        self.last_insert_was_rightmost_append = false;
     }
 
     /// Whether this cursor is for a table (intkey) B-tree.
@@ -388,6 +446,9 @@ impl<P: PageReader> BtCursor<P> {
             at_eof: true,
             read_witnesses: Vec::new(),
             active_op_stats: None,
+            cell_buf: Vec::new(),
+            last_insert_was_rightmost_append: false,
+            last_insert_rowid: None,
         }
     }
 
@@ -612,10 +673,14 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         self.note_page_visit(page_no);
-        let page_data = self.pager.read_page(cx, page_no)?;
+        let page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
-        let header = cell::parse_page_header(&page_data, page_no)?;
-        let cell_pointers = cell::read_cell_pointers(&page_data, &header, header_offset)?;
+        let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
+        let cell_pointers = Arc::<[u16]>::from(cell::read_cell_pointers(
+            page_data.as_bytes(),
+            &header,
+            header_offset,
+        )?);
 
         Ok(StackEntry {
             page_no,
@@ -633,10 +698,14 @@ impl<P: PageReader> BtCursor<P> {
     fn reload_page_fresh(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
         observe_cursor_cancellation(cx)?;
         self.note_page_visit(page_no);
-        let page_data = self.pager.read_page(cx, page_no)?;
+        let page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
-        let header = cell::parse_page_header(&page_data, page_no)?;
-        let cell_pointers = cell::read_cell_pointers(&page_data, &header, header_offset)?;
+        let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
+        let cell_pointers = Arc::<[u16]>::from(cell::read_cell_pointers(
+            page_data.as_bytes(),
+            &header,
+            header_offset,
+        )?);
         Ok(StackEntry {
             page_no,
             page_data,
@@ -660,7 +729,7 @@ impl<P: PageReader> BtCursor<P> {
         }
         let offset = entry.cell_pointers[idx_usize] as usize;
         CellRef::parse(
-            &entry.page_data,
+            entry.page_data.as_bytes(),
             offset,
             entry.header.page_type,
             self.usable_size,
@@ -930,7 +999,7 @@ impl<P: PageReader> BtCursor<P> {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let offset = entry.cell_pointers[mid as usize] as usize;
-            let cell_data = &entry.page_data[offset..];
+            let cell_data = &entry.page_data.as_bytes()[offset..];
             let rowid = if let Some((_, n)) = read_varint(cell_data) {
                 if let Some((r, _)) = read_varint(&cell_data[n..]) {
                     #[allow(clippy::cast_possible_wrap)]
@@ -978,7 +1047,7 @@ impl<P: PageReader> BtCursor<P> {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
             let offset = entry.cell_pointers[mid as usize] as usize;
-            let cell_data = &entry.page_data[offset..];
+            let cell_data = &entry.page_data.as_bytes()[offset..];
             if cell_data.len() < 4 {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "interior table cell too short for child pointer".to_owned(),
@@ -1125,21 +1194,48 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
-    /// Read the full payload for a cell (resolving overflow if needed).
-    fn read_cell_payload(&self, cx: &Cx, entry: &StackEntry, cell: &CellRef) -> Result<Vec<u8>> {
-        let local = cell.local_payload(&entry.page_data);
+    /// Read the full payload for a cell into the provided buffer.
+    fn read_cell_payload_into(
+        &self,
+        cx: &Cx,
+        entry: &StackEntry,
+        cell: &CellRef,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let local = cell.local_payload(entry.page_data.as_bytes());
 
         if let Some(first_overflow) = cell.overflow_page {
-            overflow::read_overflow_chain(
+            overflow::read_overflow_chain_into(
                 local,
                 first_overflow,
                 cell.payload_size,
                 self.usable_size,
-                &mut |pgno| self.pager.read_page(cx, pgno),
+                &mut |pgno| self.pager.read_page_data(cx, pgno).map(PageData::into_vec),
+                out,
             )
         } else {
-            Ok(local.to_vec())
+            out.clear();
+            out.extend_from_slice(local);
+            Ok(())
         }
+    }
+
+    /// Read the full payload for a cell (resolving overflow if needed).
+    fn read_cell_payload<'a>(
+        &self,
+        cx: &Cx,
+        entry: &'a StackEntry,
+        cell: &CellRef,
+    ) -> Result<Cow<'a, [u8]>> {
+        if cell.overflow_page.is_none() {
+            return Ok(Cow::Borrowed(
+                cell.local_payload(entry.page_data.as_bytes()),
+            ));
+        }
+
+        let mut payload = Vec::new();
+        self.read_cell_payload_into(cx, entry, cell, &mut payload)?;
+        Ok(Cow::Owned(payload))
     }
 
     /// Binary search a leaf index page for a key.
@@ -1163,7 +1259,7 @@ impl<P: PageReader> BtCursor<P> {
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
-            let ord = self.compare_index_key_bytes(&key, target, parsed_target.as_deref());
+            let ord = self.compare_index_key_bytes(key.as_ref(), target, parsed_target.as_deref());
 
             match ord {
                 std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
@@ -1195,7 +1291,7 @@ impl<P: PageReader> BtCursor<P> {
             let mid = lo + (hi - lo) / 2;
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
-            let ord = self.compare_index_key_bytes(&key, target, parsed_target.as_deref());
+            let ord = self.compare_index_key_bytes(key.as_ref(), target, parsed_target.as_deref());
 
             // Note: target vs key comparison direction
             match ord {
@@ -1489,7 +1585,11 @@ impl<P: PageWriter> BtCursor<P> {
                 // Ensure tail is zeroed if the chunk didn't fill the space.
                 page_buf[4 + chunk.len()..].fill(0);
             }
-            if let Err(err) = self.pager.write_page(cx, pgno, &page_buf) {
+            let owned_page = std::mem::replace(&mut page_buf, vec![0_u8; page_size]);
+            if let Err(err) = self
+                .pager
+                .write_page_data(cx, pgno, PageData::from_vec(owned_page))
+            {
                 // Best-effort cleanup: any overflow pages allocated for this
                 // cell must be released if chain materialization fails midway.
                 for leaked in pages.iter().copied() {
@@ -1519,11 +1619,12 @@ impl<P: PageWriter> BtCursor<P> {
                 });
             }
 
-            let page = self.pager.read_page(cx, pgno)?;
-            if page.len() < 4 {
+            let page = self.pager.read_page_data(cx, pgno)?;
+            let page_bytes = page.as_bytes();
+            if page_bytes.len() < 4 {
                 warn!(
                     page = pgno.get(),
-                    page_len = page.len(),
+                    page_len = page_bytes.len(),
                     "overflow chain corruption detected while freeing"
                 );
                 return Err(FrankenError::DatabaseCorrupt {
@@ -1531,7 +1632,8 @@ impl<P: PageWriter> BtCursor<P> {
                 });
             }
 
-            let next = u32::from_be_bytes([page[0], page[1], page[2], page[3]]);
+            let next =
+                u32::from_be_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
             current = PageNumber::new(next);
             self.pager.free_page(cx, pgno)?;
         }
@@ -1539,12 +1641,19 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(())
     }
 
-    fn encode_table_leaf_cell(
+    /// Encode a table leaf cell into the provided buffer, returning the
+    /// overflow head page (if any).
+    ///
+    /// The buffer is cleared and reused across calls so repeated inserts
+    /// reuse the same heap allocation.
+    fn encode_table_leaf_cell_into(
         &mut self,
         cx: &Cx,
         rowid: i64,
         payload: &[u8],
-    ) -> Result<(Vec<u8>, Option<PageNumber>)> {
+        out: &mut Vec<u8>,
+    ) -> Result<Option<PageNumber>> {
+        out.clear();
         let payload_size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
         let payload_size_u64 = u64::from(payload_size);
         let local_size = cell::local_payload_size(
@@ -1554,7 +1663,6 @@ impl<P: PageWriter> BtCursor<P> {
         ) as usize;
         let local_size = local_size.min(payload.len());
 
-        let mut out = Vec::with_capacity(24 + local_size + 4);
         let mut varint = [0u8; 9];
         let p_len = write_varint(&mut varint, payload_size_u64);
         out.extend_from_slice(&varint[..p_len]);
@@ -1568,17 +1676,34 @@ impl<P: PageWriter> BtCursor<P> {
             let first_overflow =
                 self.write_overflow_chain_for_insert(cx, &payload[local_size..])?;
             out.extend_from_slice(&first_overflow.get().to_be_bytes());
-            Ok((out, Some(first_overflow)))
+            Ok(Some(first_overflow))
         } else {
-            Ok((out, None))
+            Ok(None)
         }
     }
 
-    fn encode_index_leaf_cell(
+    /// Backwards-compatible wrapper — allocates a fresh Vec per call.
+    #[allow(dead_code)]
+    fn encode_table_leaf_cell(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        payload: &[u8],
+    ) -> Result<(Vec<u8>, Option<PageNumber>)> {
+        let mut out = Vec::with_capacity(24 + payload.len().min(self.usable_size as usize) + 4);
+        let overflow = self.encode_table_leaf_cell_into(cx, rowid, payload, &mut out)?;
+        Ok((out, overflow))
+    }
+
+    /// Encode an index leaf cell into the provided buffer, returning the
+    /// overflow head page (if any).
+    fn encode_index_leaf_cell_into(
         &mut self,
         cx: &Cx,
         key: &[u8],
-    ) -> Result<(Vec<u8>, Option<PageNumber>)> {
+        out: &mut Vec<u8>,
+    ) -> Result<Option<PageNumber>> {
+        out.clear();
         let payload_size = u32::try_from(key.len()).map_err(|_| FrankenError::TooBig)?;
         let payload_size_u64 = u64::from(payload_size);
         let local_size = cell::local_payload_size(
@@ -1588,7 +1713,6 @@ impl<P: PageWriter> BtCursor<P> {
         ) as usize;
         let local_size = local_size.min(key.len());
 
-        let mut out = Vec::with_capacity(16 + local_size + 4);
         let mut varint = [0u8; 9];
         let p_len = write_varint(&mut varint, payload_size_u64);
         out.extend_from_slice(&varint[..p_len]);
@@ -1597,10 +1721,21 @@ impl<P: PageWriter> BtCursor<P> {
         if local_size < key.len() {
             let first_overflow = self.write_overflow_chain_for_insert(cx, &key[local_size..])?;
             out.extend_from_slice(&first_overflow.get().to_be_bytes());
-            Ok((out, Some(first_overflow)))
+            Ok(Some(first_overflow))
         } else {
-            Ok((out, None))
+            Ok(None)
         }
+    }
+
+    /// Backwards-compatible wrapper — allocates a fresh Vec per call.
+    fn encode_index_leaf_cell(
+        &mut self,
+        cx: &Cx,
+        key: &[u8],
+    ) -> Result<(Vec<u8>, Option<PageNumber>)> {
+        let mut out = Vec::with_capacity(16 + key.len().min(self.usable_size as usize) + 4);
+        let overflow = self.encode_index_leaf_cell_into(cx, key, &mut out)?;
+        Ok((out, overflow))
     }
 
     /// Try to insert a cell directly onto the leaf page at the top of the
@@ -1613,10 +1748,10 @@ impl<P: PageWriter> BtCursor<P> {
         }
         let leaf_page_no = self.stack[depth - 1].page_no;
 
-        let mut page_data = self.pager.read_page(cx, leaf_page_no)?;
+        let mut page_data = self.pager.read_page_data(cx, leaf_page_no)?;
         let header_offset = cell::header_offset_for_page(leaf_page_no);
-        let mut header = cell::parse_page_header(&page_data, leaf_page_no)?;
-        let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
+        let mut header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
+        let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
 
         let content_offset = header.content_offset(self.usable_size);
         let Some(new_content_offset) = content_offset.checked_sub(cell_data.len()) else {
@@ -1630,10 +1765,6 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false); // Page full.
         }
 
-        // Cell fits — write directly.
-        page_data[new_content_offset..new_content_offset + cell_data.len()]
-            .copy_from_slice(cell_data);
-
         let insert_at = usize::from(insert_idx).min(ptrs.len());
         #[allow(clippy::cast_possible_truncation)]
         {
@@ -1641,12 +1772,17 @@ impl<P: PageWriter> BtCursor<P> {
             header.cell_count = ptrs.len() as u16;
             header.cell_content_offset = new_content_offset as u32;
         }
-        header.write(&mut page_data, header_offset);
-        cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
-        self.pager
-            .write_page_data(cx, leaf_page_no, PageData::from_vec(page_data))?;
+        {
+            let page_bytes = page_data.as_bytes_mut();
+            page_bytes[new_content_offset..new_content_offset + cell_data.len()]
+                .copy_from_slice(cell_data);
+            header.write(page_bytes, header_offset);
+            cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+        }
 
-        // Refresh the top stack entry.
+        self.pager.write_page_data(cx, leaf_page_no, page_data)?;
+
+        // Refresh the top stack entry from the pager.
         let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
         #[allow(clippy::cast_possible_truncation)]
         {
@@ -1728,16 +1864,45 @@ impl<P: PageWriter> BtCursor<P> {
                 }
             }
 
-            let mut outcome = balance::balance_nonroot(
-                cx,
-                &mut self.pager,
-                parent_page_no,
-                child_idx,
-                &[cell_data.to_vec()],
-                insert_idx as usize,
-                self.usable_size,
-                parent_is_root,
-            )?;
+            let mut outcome = if leaf_entry.header.page_type == cell::BtreePageType::LeafTable {
+                match balance::balance_table_leaf_local_split(
+                    cx,
+                    &mut self.pager,
+                    parent_page_no,
+                    child_idx,
+                    leaf_entry.page_no,
+                    cell_data,
+                    insert_idx as usize,
+                    self.usable_size,
+                    parent_is_root,
+                )? {
+                    Some(outcome) => {
+                        self.note_split_event();
+                        outcome
+                    }
+                    None => balance::balance_nonroot(
+                        cx,
+                        &mut self.pager,
+                        parent_page_no,
+                        child_idx,
+                        &[cell_data.to_vec()],
+                        insert_idx as usize,
+                        self.usable_size,
+                        parent_is_root,
+                    )?,
+                }
+            } else {
+                balance::balance_nonroot(
+                    cx,
+                    &mut self.pager,
+                    parent_page_no,
+                    child_idx,
+                    &[cell_data.to_vec()],
+                    insert_idx as usize,
+                    self.usable_size,
+                    parent_is_root,
+                )?
+            };
 
             // If balancing split the parent page, propagate the split up the
             // cursor stack by updating each ancestor in turn.
@@ -1867,8 +2032,8 @@ impl<P: PageWriter> BtCursor<P> {
 
             // Check whether the parent now has zero cells — if so, it
             // needs to be merged with its siblings at the next level up.
-            let parent_data = self.pager.read_page(cx, parent_page_no)?;
-            let parent_header = cell::parse_page_header(&parent_data, parent_page_no)?;
+            let parent_data = self.pager.read_page_data(cx, parent_page_no)?;
+            let parent_header = cell::parse_page_header(parent_data.as_bytes(), parent_page_no)?;
 
             if parent_header.cell_count == 0 && parent_header.page_type.is_interior() {
                 level -= 1;
@@ -1927,10 +2092,10 @@ impl<P: PageWriter> BtCursor<P> {
         };
 
         // Remove old cell from page and try to insert new cell.
-        let mut page_data = self.pager.read_page(cx, page_no)?;
+        let mut page_data = self.pager.read_page_data(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
-        let mut header = cell::parse_page_header(&page_data, page_no)?;
-        let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
+        let mut header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
+        let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
         let cell_idx_usize = usize::from(cell_idx);
         if cell_idx_usize >= ptrs.len() {
             return Err(FrankenError::DatabaseCorrupt {
@@ -1954,7 +2119,12 @@ impl<P: PageWriter> BtCursor<P> {
         let mut cells_to_move = Vec::with_capacity(ptrs.len());
         for (i, &off) in ptrs.iter().enumerate() {
             let ptr = off as usize;
-            let cell = CellRef::parse(&page_data, ptr, header.page_type, self.usable_size)?;
+            let cell = CellRef::parse(
+                page_data.as_bytes(),
+                ptr,
+                header.page_type,
+                self.usable_size,
+            )?;
             // Full on-page size: header varints (payload_offset - ptr) + local payload + overflow ptr.
             let size = crate::payload::cell_on_page_size(&cell, ptr);
             cells_to_move.push((ptr, size, i));
@@ -1974,7 +2144,9 @@ impl<P: PageWriter> BtCursor<P> {
                     detail: "cell content overlaps pointer array during defragmentation".to_owned(),
                 });
             }
-            page_data.copy_within(ptr..ptr + size, new_content_offset);
+            page_data
+                .as_bytes_mut()
+                .copy_within(ptr..ptr + size, new_content_offset);
             ptrs[i] = new_content_offset as u16;
         }
 
@@ -1986,7 +2158,6 @@ impl<P: PageWriter> BtCursor<P> {
         if fits {
             new_content_offset -= new_cell.len();
             let new_end = new_content_offset + new_cell.len();
-            page_data[new_content_offset..new_end].copy_from_slice(&new_cell);
             ptrs.insert(
                 cell_idx_usize,
                 u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
@@ -2002,11 +2173,14 @@ impl<P: PageWriter> BtCursor<P> {
                 u32::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
                     detail: "interior content offset exceeds u32 range".to_owned(),
                 })?;
-            header.write(&mut page_data, header_offset);
-            cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
+            {
+                let page_bytes = page_data.as_bytes_mut();
+                page_bytes[new_content_offset..new_end].copy_from_slice(&new_cell);
+                header.write(page_bytes, header_offset);
+                cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+            }
 
-            self.pager
-                .write_page_data(cx, page_no, PageData::from_vec(page_data))?;
+            self.pager.write_page_data(cx, page_no, page_data)?;
             let mut refreshed = self.reload_page_fresh(cx, page_no)?;
             refreshed.cell_idx = cell_idx;
             if let Some(top) = self.stack.last_mut() {
@@ -2061,10 +2235,10 @@ impl<P: PageWriter> BtCursor<P> {
         // If we update the leaf first and then fail to free the chain, we leak
         // pages but preserve database integrity. Leaks are recoverable (VACUUM);
         // corruption is not.
-        let mut page_data = self.pager.read_page(cx, leaf_page_no)?;
+        let mut page_data = self.pager.read_page_data(cx, leaf_page_no)?;
         let header_offset = cell::header_offset_for_page(leaf_page_no);
-        let mut header = cell::parse_page_header(&page_data, leaf_page_no)?;
-        let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
+        let mut header = cell::parse_page_header(page_data.as_bytes(), leaf_page_no)?;
+        let mut ptrs = cell::read_cell_pointers(page_data.as_bytes(), &header, header_offset)?;
         if delete_idx >= ptrs.len() {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2085,7 +2259,12 @@ impl<P: PageWriter> BtCursor<P> {
         let mut cells_to_move = Vec::with_capacity(ptrs.len());
         for (i, &off) in ptrs.iter().enumerate() {
             let ptr = off as usize;
-            let cell = CellRef::parse(&page_data, ptr, header.page_type, self.usable_size)?;
+            let cell = CellRef::parse(
+                page_data.as_bytes(),
+                ptr,
+                header.page_type,
+                self.usable_size,
+            )?;
             // Full on-page size: header varints (payload_offset - ptr) + local payload + overflow ptr.
             let size = crate::payload::cell_on_page_size(&cell, ptr);
             cells_to_move.push((ptr, size, i));
@@ -2106,13 +2285,15 @@ impl<P: PageWriter> BtCursor<P> {
                     detail: "cell content overlaps pointer array during defragmentation".to_owned(),
                 });
             }
-            page_data.copy_within(ptr..ptr + size, new_content_offset);
+            page_data
+                .as_bytes_mut()
+                .copy_within(ptr..ptr + size, new_content_offset);
             ptrs[i] = new_content_offset as u16;
         }
 
         // Fill the now-unused space with zeros for cleanliness (optional, but good for reproducibility/debugging).
         if new_content_offset > ptr_array_end {
-            page_data[ptr_array_end..new_content_offset].fill(0);
+            page_data.as_bytes_mut()[ptr_array_end..new_content_offset].fill(0);
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -2123,10 +2304,12 @@ impl<P: PageWriter> BtCursor<P> {
         header.fragmented_free_bytes = 0;
         header.first_freeblock = 0;
 
-        header.write(&mut page_data, header_offset);
-        cell::write_cell_pointers(&mut page_data, header_offset, &header, &ptrs);
-        self.pager
-            .write_page_data(cx, leaf_page_no, PageData::from_vec(page_data))?;
+        {
+            let page_bytes = page_data.as_bytes_mut();
+            header.write(page_bytes, header_offset);
+            cell::write_cell_pointers(page_bytes, header_offset, &header, &ptrs);
+        }
+        self.pager.write_page_data(cx, leaf_page_no, page_data)?;
 
         // Refresh the stack entry.
         let mut refreshed = self.reload_page_fresh(cx, leaf_page_no)?;
@@ -2171,10 +2354,12 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     }
 
     fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
+        self.last_insert_was_rightmost_append = false;
         self.with_btree_op(cx, BtreeOpType::Seek, |cursor| cursor.table_seek(cx, rowid))
     }
 
     fn first(&mut self, cx: &Cx) -> Result<bool> {
+        self.last_insert_was_rightmost_append = false;
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
@@ -2339,10 +2524,15 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            // ── Normal path: full B-tree seek ────────────────────────
             let seek = cursor.table_seek_for_insert(cx, rowid)?;
             if seek.is_found() {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
+
+            // Detect rightmost-append: seek landed at EOF means the new
+            // rowid is larger than all existing rows in the tree.
+            let is_rightmost_append = cursor.at_eof;
 
             let insert_idx = {
                 let top = cursor
@@ -2356,14 +2546,30 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 }
             };
 
-            let (cell_data, overflow_head) = cursor.encode_table_leaf_cell(cx, rowid, data)?;
+            // Take cell_buf for reuse in the normal path too.
+            let mut cell_data = std::mem::take(&mut cursor.cell_buf);
+            let overflow_head =
+                cursor.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
 
             match cursor.try_insert_on_leaf(cx, insert_idx, &cell_data) {
-                Ok(true) => Ok(()),
+                Ok(true) => {
+                    cursor.cell_buf = cell_data;
+                    cursor.last_insert_rowid = Some(rowid);
+                    cursor.last_insert_was_rightmost_append = is_rightmost_append;
+                    Ok(())
+                }
                 Ok(false) => {
                     // Page full — balance and redistribute.
                     let balance_result = cursor.balance_for_insert(cx, &cell_data, insert_idx);
-                    if balance_result.is_err() {
+                    cursor.cell_buf = cell_data;
+                    if balance_result.is_ok() {
+                        cursor.last_insert_rowid = Some(rowid);
+                        // After balance the tree structure changed — cursor
+                        // position may not be on the rightmost leaf anymore.
+                        // Disable fast path; the next insert will re-seek.
+                        cursor.last_insert_was_rightmost_append = false;
+                    } else {
+                        cursor.last_insert_was_rightmost_append = false;
                         if let Some(first) = overflow_head {
                             let _ = cursor.free_overflow_chain(cx, first);
                         }
@@ -2371,6 +2577,8 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     balance_result
                 }
                 Err(error) => {
+                    cursor.cell_buf = cell_data;
+                    cursor.last_insert_was_rightmost_append = false;
                     if let Some(first) = overflow_head {
                         let _ = cursor.free_overflow_chain(cx, first);
                     }
@@ -2382,6 +2590,11 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
     fn delete(&mut self, cx: &Cx) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
+            // Delete invalidates the sequential-append fast path since the
+            // tree structure changes and the cursor may no longer be on
+            // the rightmost leaf.
+            cursor.last_insert_was_rightmost_append = false;
+
             if cursor.at_eof || cursor.stack.is_empty() {
                 return Err(FrankenError::internal("cursor at EOF"));
             }
@@ -2517,7 +2730,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
         let cell = self.parse_cell_at(top, top.cell_idx)?;
-        self.read_cell_payload(cx, top, &cell)
+        Ok(self.read_cell_payload(cx, top, &cell)?.into_owned())
     }
 
     fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
@@ -2530,13 +2743,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
         let cell = self.parse_cell_at(top, top.cell_idx)?;
 
-        buf.clear();
-        if cell.overflow_page.is_none() {
-            buf.extend_from_slice(cell.local_payload(&top.page_data));
-        } else {
-            buf.extend_from_slice(&self.read_cell_payload(cx, top, &cell)?);
-        }
-        Ok(())
+        self.read_cell_payload_into(cx, top, &cell, buf)
     }
 
     fn rowid(&self, cx: &Cx) -> Result<i64> {
@@ -2555,9 +2762,10 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         // Index cursor: rowid is stored as the trailing field in the
         // serialized key record.
         let key = self.read_cell_payload(cx, top, &cell)?;
-        let key_values = parse_record(&key).ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: "malformed index key record while extracting rowid".to_owned(),
-        })?;
+        let key_values =
+            parse_record(key.as_ref()).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "malformed index key record while extracting rowid".to_owned(),
+            })?;
         key_values
             .last()
             .and_then(fsqlite_types::SqliteValue::as_integer)
@@ -2927,7 +3135,43 @@ mod tests {
         let bytes = io
             .read_page(&cx, page_no)
             .expect("read_page should return the owned bytes");
+        assert_eq!(
+            bytes.len(),
+            fsqlite_types::PageSize::default().as_usize(),
+            "owned-page writes should preserve the page-size invariant"
+        );
         assert_eq!(&bytes[..expected.len()], expected.as_slice());
+        assert!(
+            bytes[expected.len()..].iter().all(|byte| *byte == 0),
+            "owned-page writes should zero-fill any unwritten tail bytes"
+        );
+    }
+
+    #[test]
+    fn test_mem_page_store_write_page_short_buffer_is_zero_filled_to_page_size() {
+        let cx = Cx::new();
+        let page_size = 128_u32;
+        let mut store = MemPageStore::new(page_size);
+        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+        let expected = vec![0xCD; 32];
+
+        store
+            .write_page(&cx, page_no, &expected)
+            .expect("write_page should normalize short buffers");
+
+        let bytes = store
+            .read_page(&cx, page_no)
+            .expect("read_page should return normalized page bytes");
+        assert_eq!(
+            bytes.len(),
+            page_size as usize,
+            "raw write_page should preserve the page-size invariant"
+        );
+        assert_eq!(&bytes[..expected.len()], expected.as_slice());
+        assert!(
+            bytes[expected.len()..].iter().all(|byte| *byte == 0),
+            "raw write_page should zero-fill any unwritten tail bytes"
+        );
     }
 
     #[test]
@@ -3323,10 +3567,9 @@ mod tests {
     #[test]
     fn test_cursor_index_insert_single_leaf() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
-        );
+        store
+            .pages
+            .insert(2, build_leaf_index(&[b"apple", b"carrot", b"pear"]));
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
@@ -3343,33 +3586,28 @@ mod tests {
             2,
             build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
         );
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (2, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(20, b"e"), (30, b"f")]));
+        store.pages.insert(3, build_leaf_index(&[b"a"]));
+        store.pages.insert(4, build_leaf_index(&[b"c"]));
+        store.pages.insert(5, build_leaf_index(&[b"e", b"f"]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
-        assert_eq!(depth, 4, "expected a manually seeded depth-4 tree");
-
-        let expected_rowids = [10_i64, 20, 30];
-        for rowid in expected_rowids {
-            let seek = cursor.table_move_to(&cx, rowid).unwrap();
-            assert!(seek.is_found(), "missing rowid {rowid} in depth-4 tree");
-        }
-
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, false);
         assert!(cursor.first(&cx).unwrap());
-        let mut scanned = Vec::new();
+        let mut scanned = vec![cursor.payload(&cx).unwrap()];
         while cursor.next(&cx).unwrap() {
-            scanned.push(cursor.rowid(&cx).unwrap());
+            scanned.push(cursor.payload(&cx).unwrap());
         }
-        assert_eq!(scanned, expected_rowids);
+        assert_eq!(
+            scanned,
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec(),
+                b"f".to_vec(),
+            ]
+        );
     }
 
     #[test]
@@ -3379,27 +3617,28 @@ mod tests {
             2,
             build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
         );
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
-        store
-            .pages
-            .insert(5, build_leaf_table(&[(20, b"e"), (30, b"f")]));
+        store.pages.insert(3, build_leaf_index(&[b"a"]));
+        store.pages.insert(4, build_leaf_index(&[b"c"]));
+        store.pages.insert(5, build_leaf_index(&[b"e", b"f"]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
 
         assert!(cursor.last(&cx).unwrap());
-        assert!(cursor.prev(&cx).unwrap());
-        assert!(cursor.prev(&cx).unwrap());
-        assert!(
-            cursor
-                .witness_keys()
-                .iter()
-                .any(|key| matches!(key, WitnessKey::Cell { .. }))
+        let mut scanned = vec![cursor.payload(&cx).unwrap()];
+        while cursor.prev(&cx).unwrap() {
+            scanned.push(cursor.payload(&cx).unwrap());
+        }
+        assert_eq!(
+            scanned,
+            vec![
+                b"f".to_vec(),
+                b"e".to_vec(),
+                b"d".to_vec(),
+                b"c".to_vec(),
+                b"b".to_vec(),
+                b"a".to_vec(),
+            ]
         );
     }
 
@@ -3723,7 +3962,8 @@ mod tests {
                 let divider = cursor.parse_cell_at(&root_entry, 0).unwrap();
                 break cursor
                     .read_cell_payload(&cx, &root_entry, &divider)
-                    .unwrap();
+                    .unwrap()
+                    .into_owned();
             }
         };
 
@@ -3736,7 +3976,7 @@ mod tests {
                 }
             }
         }
-        expected.retain(|key| key != &separator_key);
+        expected.retain(|key| key.as_slice() != separator_key.as_slice());
 
         let seek = cursor.index_move_to(&cx, &separator_key).unwrap();
         assert!(
@@ -3906,7 +4146,7 @@ mod tests {
         assert!(leftmost_max_rowid >= 1);
         assert!(leftmost_max_rowid < max_rowid);
 
-        for rowid in 1..=leftmost_max_rowid {
+        for rowid in 0..=leftmost_max_rowid {
             let seek = cursor.table_move_to(&cx, rowid).unwrap();
             assert!(seek.is_found(), "rowid {rowid} should exist before delete");
             cursor.delete(&cx).unwrap();
@@ -3923,7 +4163,10 @@ mod tests {
             "root should collapse to leaf after all rows deleted, got {:?}",
             root_header.page_type
         );
-        assert_eq!(root_header.cell_count, 0);
+        assert_eq!(
+            root_header.cell_count, 4,
+            "root collapse should preserve the surviving leaf rows"
+        );
     }
 
     #[test]
@@ -3964,7 +4207,7 @@ mod tests {
         assert!(leftmost_max_rowid >= 1);
         assert!(leftmost_max_rowid < max_rowid);
 
-        for rowid in 1..=leftmost_max_rowid {
+        for rowid in 0..=leftmost_max_rowid {
             let seek = cursor.table_move_to(&cx, rowid).unwrap();
             assert!(seek.is_found(), "rowid {rowid} should exist before delete");
             cursor.delete(&cx).unwrap();
@@ -3981,7 +4224,10 @@ mod tests {
             "root should collapse to leaf after all rows deleted, got {:?}",
             root_header.page_type
         );
-        assert_eq!(root_header.cell_count, 0);
+        assert_eq!(
+            root_header.cell_count, 4,
+            "root collapse should preserve the surviving leaf rows"
+        );
     }
 
     #[test]
@@ -4008,7 +4254,7 @@ mod tests {
             );
         }
 
-        for rowid in 1..=max_rowid {
+        for rowid in 0..=max_rowid {
             let seek = cursor.table_move_to(&cx, rowid).unwrap();
             assert!(seek.is_found(), "rowid {rowid} should exist before delete");
             cursor.delete(&cx).unwrap();
@@ -4231,7 +4477,7 @@ mod tests {
         let mut store = MemPageStore::new(USABLE);
         store
             .pages
-            .insert(2, build_interior_table(&[(pn(3), 100)], pn(4)));
+            .insert(2, build_interior_table(&[(pn(3), 100)], pn(7)));
         store
             .pages
             .insert(3, build_interior_table(&[(pn(4), 50)], pn(8)));
@@ -4263,7 +4509,7 @@ mod tests {
         }
 
         assert!(cursor.first(&cx).unwrap());
-        let mut scanned = Vec::new();
+        let mut scanned = vec![cursor.rowid(&cx).unwrap()];
         while cursor.next(&cx).unwrap() {
             scanned.push(cursor.rowid(&cx).unwrap());
         }

@@ -50,6 +50,15 @@ pub enum BalanceResult {
 
 type SplitPagesAndDividers = (Vec<PageNumber>, Vec<(PageNumber, Vec<u8>)>);
 
+#[derive(Debug, Clone)]
+struct PreparedLeafTableLocalSplit {
+    original_leaf_page: PageData,
+    new_sibling_pgno: PageNumber,
+    new_pgnos: Vec<PageNumber>,
+    new_dividers: Vec<(PageNumber, Vec<u8>)>,
+    pending_page_writes: Vec<(PageNumber, Vec<u8>, Option<PageData>)>,
+}
+
 // ---------------------------------------------------------------------------
 // Gathered cell descriptor
 // ---------------------------------------------------------------------------
@@ -90,18 +99,23 @@ pub fn balance_deeper<W: PageWriter>(
     root_page_no: PageNumber,
     usable_size: u32,
 ) -> Result<PageNumber> {
-    let root_data = writer.read_page(cx, root_page_no)?;
+    let root_data = writer.read_page_data(cx, root_page_no)?;
     let root_offset = header_offset_for_page(root_page_no);
-    let root_header = parse_page_header(&root_data, root_page_no)?;
+    let root_header = parse_page_header(root_data.as_bytes(), root_page_no)?;
 
     // Extract cells from the root page safely to avoid offset shifting bugs.
-    let cell_ptrs = read_cell_pointers(&root_data, &root_header, root_offset)?;
+    let cell_ptrs = read_cell_pointers(root_data.as_bytes(), &root_header, root_offset)?;
     let mut root_cells: Vec<GatheredCell> = Vec::with_capacity(cell_ptrs.len());
     for &ptr in &cell_ptrs {
         let cell_offset = usize::from(ptr);
-        let cell_ref = CellRef::parse(&root_data, cell_offset, root_header.page_type, usable_size)?;
+        let cell_ref = CellRef::parse(
+            root_data.as_bytes(),
+            cell_offset,
+            root_header.page_type,
+            usable_size,
+        )?;
         let cell_end = cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
-        let data = root_data[cell_offset..cell_end].to_vec();
+        let data = root_data.as_bytes()[cell_offset..cell_end].to_vec();
         let size = u16::try_from(data.len()).map_err(|_| FrankenError::DatabaseCorrupt {
             detail: "cell too large during balance_deeper".to_owned(),
         })?;
@@ -152,7 +166,7 @@ pub fn balance_deeper<W: PageWriter>(
 
     // Preserve the database header on page 1.
     if root_offset > 0 {
-        new_root[..root_offset].copy_from_slice(&root_data[..root_offset]);
+        new_root[..root_offset].copy_from_slice(&root_data.as_bytes()[..root_offset]);
     }
 
     if let Err(err) = writer.write_page_data(cx, root_page_no, PageData::from_vec(new_root)) {
@@ -194,9 +208,9 @@ pub fn balance_quick<W: PageWriter>(
     usable_size: u32,
 ) -> Result<Option<PageNumber>> {
     // Read parent page to check for space.
-    let original_parent_data = writer.read_page(cx, parent_page_no)?;
+    let original_parent_data = writer.read_page_data(cx, parent_page_no)?;
     let parent_offset = header_offset_for_page(parent_page_no);
-    let parent_header = parse_page_header(&original_parent_data, parent_page_no)?;
+    let parent_header = parse_page_header(original_parent_data.as_bytes(), parent_page_no)?;
 
     // Calculate required space for the divider cell.
     // Divider: [4-byte child ptr] [rowid varint]
@@ -268,7 +282,7 @@ pub fn balance_quick<W: PageWriter>(
     }
 
     // Read the existing leaf to find the divider key (its rightmost rowid).
-    let leaf_data = match writer.read_page(cx, leaf_page_no) {
+    let leaf_data = match writer.read_page_data(cx, leaf_page_no) {
         Ok(data) => data,
         Err(err) => {
             let _ = writer.free_page(cx, new_pgno);
@@ -276,14 +290,14 @@ pub fn balance_quick<W: PageWriter>(
         }
     };
     let leaf_offset = header_offset_for_page(leaf_page_no);
-    let leaf_header = match parse_page_header(&leaf_data, leaf_page_no) {
+    let leaf_header = match parse_page_header(leaf_data.as_bytes(), leaf_page_no) {
         Ok(header) => header,
         Err(err) => {
             let _ = writer.free_page(cx, new_pgno);
             return Err(err);
         }
     };
-    let leaf_ptrs = match read_cell_pointers(&leaf_data, &leaf_header, leaf_offset) {
+    let leaf_ptrs = match read_cell_pointers(leaf_data.as_bytes(), &leaf_header, leaf_offset) {
         Ok(ptrs) => ptrs,
         Err(err) => {
             let _ = writer.free_page(cx, new_pgno);
@@ -293,14 +307,18 @@ pub fn balance_quick<W: PageWriter>(
 
     let divider_rowid = if leaf_header.cell_count > 0 {
         let last_ptr = leaf_ptrs[leaf_header.cell_count as usize - 1] as usize;
-        let last_cell =
-            match CellRef::parse(&leaf_data, last_ptr, BtreePageType::LeafTable, usable_size) {
-                Ok(cell) => cell,
-                Err(err) => {
-                    let _ = writer.free_page(cx, new_pgno);
-                    return Err(err);
-                }
-            };
+        let last_cell = match CellRef::parse(
+            leaf_data.as_bytes(),
+            last_ptr,
+            BtreePageType::LeafTable,
+            usable_size,
+        ) {
+            Ok(cell) => cell,
+            Err(err) => {
+                let _ = writer.free_page(cx, new_pgno);
+                return Err(err);
+            }
+        };
         match last_cell.rowid {
             Some(rowid) => rowid,
             None => {
@@ -338,15 +356,15 @@ pub fn balance_quick<W: PageWriter>(
 
     let parent_update_result = (|| -> Result<()> {
         // Update parent's right_child to point to new sibling.
-        let mut parent_data = writer.read_page(cx, parent_page_no)?;
+        let mut parent_data = writer.read_page_data(cx, parent_page_no)?;
         let parent_offset = header_offset_for_page(parent_page_no);
         // Right-child is at header_offset + 8.
-        parent_data[parent_offset + 8..parent_offset + 12]
+        parent_data.as_bytes_mut()[parent_offset + 8..parent_offset + 12]
             .copy_from_slice(&new_pgno.get().to_be_bytes());
-        writer.write_page_data(cx, parent_page_no, PageData::from_vec(parent_data))
+        writer.write_page_data(cx, parent_page_no, parent_data)
     })();
     if let Err(err) = parent_update_result {
-        let _ = writer.write_page(cx, parent_page_no, &original_parent_data);
+        let _ = writer.write_page_data(cx, parent_page_no, original_parent_data.clone());
         let _ = writer.free_page(cx, new_pgno);
         return Err(err);
     }
@@ -378,10 +396,10 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     usable_size: u32,
     parent_is_root: bool,
 ) -> Result<BalanceResult> {
-    let parent_data = writer.read_page(cx, parent_page_no)?;
+    let parent_data = writer.read_page_data(cx, parent_page_no)?;
     let parent_offset = header_offset_for_page(parent_page_no);
-    let parent_header = parse_page_header(&parent_data, parent_page_no)?;
-    let parent_ptrs = read_cell_pointers(&parent_data, &parent_header, parent_offset)?;
+    let parent_header = parse_page_header(parent_data.as_bytes(), parent_page_no)?;
+    let parent_ptrs = read_cell_pointers(parent_data.as_bytes(), &parent_header, parent_offset)?;
 
     let total_children = parent_header.cell_count as usize + 1;
 
@@ -396,7 +414,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     for i in 0..sibling_count {
         let abs_idx = first_child + i;
         let pgno = child_page_number(
-            &parent_data,
+            parent_data.as_bytes(),
             &parent_header,
             &parent_ptrs,
             parent_offset,
@@ -410,14 +428,14 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
             let div_idx = first_child + i; // Parent cell index for this divider.
             let div_offset = parent_ptrs[div_idx] as usize;
             let div_cell = CellRef::parse(
-                &parent_data,
+                parent_data.as_bytes(),
                 div_offset,
                 parent_header.page_type,
                 usable_size,
             )?;
             // Extract the raw divider cell bytes.
             let div_end = div_offset + cell_on_page_size_from_ref(&div_cell, div_offset);
-            divider_cells.push(parent_data[div_offset..div_end].to_vec());
+            divider_cells.push(parent_data.as_bytes()[div_offset..div_end].to_vec());
         }
     }
 
@@ -425,14 +443,14 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     let mut all_cells: Vec<GatheredCell> = Vec::new();
     let mut sibling_types: Vec<BtreePageType> = Vec::new();
     let mut old_right_children: Vec<Option<PageNumber>> = Vec::new();
-    let mut original_sibling_pages: Vec<(PageNumber, Vec<u8>)> = Vec::with_capacity(sibling_count);
+    let mut original_sibling_pages: Vec<(PageNumber, PageData)> = Vec::with_capacity(sibling_count);
 
     for (sib_idx, &pgno) in sibling_pgnos.iter().enumerate() {
-        let page_data = writer.read_page(cx, pgno)?;
+        let page_data = writer.read_page_data(cx, pgno)?;
         original_sibling_pages.push((pgno, page_data.clone()));
         let page_offset = header_offset_for_page(pgno);
-        let page_header = parse_page_header(&page_data, pgno)?;
-        let ptrs = read_cell_pointers(&page_data, &page_header, page_offset)?;
+        let page_header = parse_page_header(page_data.as_bytes(), pgno)?;
+        let ptrs = read_cell_pointers(page_data.as_bytes(), &page_header, page_offset)?;
 
         sibling_types.push(page_header.page_type);
         old_right_children.push(page_header.right_child);
@@ -440,10 +458,14 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
         // Gather cells from this sibling.
         let relative_sib = child_idx.saturating_sub(first_child);
         for (cell_idx, &ptr) in ptrs.iter().enumerate() {
-            let cell_ref =
-                CellRef::parse(&page_data, ptr as usize, page_header.page_type, usable_size)?;
+            let cell_ref = CellRef::parse(
+                page_data.as_bytes(),
+                ptr as usize,
+                page_header.page_type,
+                usable_size,
+            )?;
             let cell_end = ptr as usize + cell_on_page_size_from_ref(&cell_ref, ptr as usize);
-            let raw = page_data[ptr as usize..cell_end].to_vec();
+            let raw = page_data.as_bytes()[ptr as usize..cell_end].to_vec();
 
             // Insert overflow cells at the correct position.
             if sib_idx == relative_sib && cell_idx == overflow_insert_idx {
@@ -558,13 +580,13 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     }
     let pages_to_free_after_success: Vec<PageNumber> =
         sibling_pgnos.iter().skip(new_page_count).copied().collect();
-    let original_parent_page = writer.read_page(cx, parent_page_no)?;
+    let original_parent_page = writer.read_page_data(cx, parent_page_no)?;
 
     // Inline rollback helper — avoids closure capturing `writer` which would
     // conflict with the mutable borrows needed inside the loop.
     macro_rules! do_rollback {
         ($err:expr) => {{
-            let _ = writer.write_page(cx, parent_page_no, &original_parent_page);
+            let _ = writer.write_page_data(cx, parent_page_no, original_parent_page.clone());
             restore_pages_best_effort(cx, writer, &original_sibling_pages);
             free_pages_best_effort(cx, writer, &newly_allocated_pgnos);
             $err
@@ -573,6 +595,8 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
 
     // Populate new pages and collect divider info for parent.
     let mut new_dividers: Vec<(PageNumber, Vec<u8>)> = Vec::new();
+    let mut pending_page_writes: Vec<(PageNumber, Vec<u8>, Option<PageData>)> =
+        Vec::with_capacity(new_page_count);
     let mut cell_cursor = 0usize;
 
     for (page_idx, &cell_count) in distribution.iter().enumerate() {
@@ -616,9 +640,15 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
             Err(err) => return Err(do_rollback!(err)),
         };
 
-        if let Err(err) = writer.write_page_data(cx, pgno, PageData::from_vec(page_data)) {
-            return Err(do_rollback!(err));
-        }
+        pending_page_writes.push((
+            pgno,
+            page_data,
+            if page_idx < original_sibling_pages.len() {
+                Some(original_sibling_pages[page_idx].1.clone())
+            } else {
+                None
+            },
+        ));
 
         // Extract divider for parent (between this page and the next).
         if page_idx < new_page_count - 1 {
@@ -667,6 +697,19 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
         // For interior pages and index leaves, skip the divider cell between pages.
         if page_type != BtreePageType::LeafTable && page_idx < new_page_count - 1 {
             cell_cursor += 1;
+        }
+    }
+
+    pending_page_writes.sort_by_key(|(pgno, _, _)| pgno.get());
+    for (pgno, page_data, original_page) in pending_page_writes {
+        if let Err(err) = write_page_if_changed(
+            cx,
+            writer,
+            pgno,
+            page_data,
+            original_page.as_ref().map(PageData::as_bytes),
+        ) {
+            return Err(do_rollback!(err));
         }
     }
 
@@ -773,10 +816,347 @@ fn cell_on_page_size_from_ref(cell: &CellRef, cell_start: usize) -> usize {
 fn restore_pages_best_effort<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
-    pages: &[(PageNumber, Vec<u8>)],
+    pages: &[(PageNumber, PageData)],
 ) {
     for (pgno, data) in pages {
-        let _ = writer.write_page(cx, *pgno, data);
+        restore_page_best_effort(cx, writer, *pgno, data);
+    }
+}
+
+fn restore_page_best_effort<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    page_no: PageNumber,
+    original_page: &PageData,
+) {
+    if let Ok(current_page) = writer.read_page_data(cx, page_no) {
+        if current_page.as_bytes() == original_page.as_bytes() {
+            return;
+        }
+    }
+    let _ = writer.write_page_data(cx, page_no, original_page.clone());
+}
+
+fn write_page_if_changed<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    page_no: PageNumber,
+    page_data: Vec<u8>,
+    original_page: Option<&[u8]>,
+) -> Result<()> {
+    if let Some(original_page) = original_page {
+        if original_page == page_data.as_slice() {
+            return Ok(());
+        }
+    }
+    writer.write_page_data(cx, page_no, PageData::from_vec(page_data))
+}
+
+fn parent_has_room_for_table_leaf_split<R: crate::cursor::PageReader>(
+    cx: &Cx,
+    reader: &R,
+    parent_page_no: PageNumber,
+    usable_size: u32,
+) -> Result<bool> {
+    let parent_page = reader.read_page_data(cx, parent_page_no)?;
+    let parent_offset = header_offset_for_page(parent_page_no);
+    let parent_header = parse_page_header(parent_page.as_bytes(), parent_page_no)?;
+    let parent_used = parent_offset
+        + usize::from(parent_header.page_type.header_size())
+        + (usize::from(parent_header.cell_count) * usize::from(CELL_POINTER_SIZE));
+    let free_space = parent_header
+        .content_offset(usable_size)
+        .saturating_sub(parent_used);
+    Ok(free_space >= 15)
+}
+
+/// Choose the split index for leaf table cell redistribution.
+///
+/// The split point balances two competing goals:
+///
+/// 1. **Space efficiency:** Minimize wasted space across both pages.
+/// 2. **Concurrency friendliness:** Leave slack in both halves to reduce
+///    the frequency of future splits, which in turn reduces parent-page
+///    modifications — the primary source of MVCC structural conflicts.
+///
+/// The target split is biased away from a perfectly balanced 50/50
+/// toward ~60/40 (left heavier).  This means the right (new) page
+/// starts with ~40% slack, accommodating more future inserts before
+/// the next split.
+///
+/// Inspired by B-link tree designs (Lehman & Yao, 1981) which prioritize
+/// reducing structural modifications for concurrent access, and by the
+/// observation in `STATE_OF_THE_CODEBASE_AND_NEXT_STEPS.md` that the
+/// best shared-page conflict is the one that never happens.
+fn choose_leaf_table_split_index(
+    cells: &[GatheredCell],
+    left_header_offset: usize,
+    right_header_offset: usize,
+    usable_size: u32,
+) -> Option<usize> {
+    if cells.len() < 2 {
+        return None;
+    }
+
+    let header_size = BtreePageType::LeafTable.header_size() as usize;
+    let left_base = left_header_offset.checked_add(header_size)?;
+    let right_base = right_header_offset.checked_add(header_size)?;
+    let usable = usable_size as usize;
+    let mut cell_costs = Vec::with_capacity(cells.len());
+    let mut total_cost = 0usize;
+    for cell in cells {
+        let cost = cell_cost(cell)?;
+        total_cost = total_cost.checked_add(cost)?;
+        cell_costs.push(cost);
+    }
+
+    // Target fill: bias left page to ~60% of total payload, leaving
+    // ~40% slack in the right page.  This reduces future split frequency
+    // and therefore reduces structural B-tree page conflicts under MVCC.
+    //
+    // Why 60/40 and not 70/30?  70/30 would leave the left page so full
+    // that the very next insert triggers another split, amplifying the
+    // problem.  60/40 provides a good balance between space utilization
+    // and split avoidance.
+    let target_left = left_base + (total_cost * 3 / 5); // ~60% target
+
+    let mut left_total = left_base;
+    let mut right_total = right_base.checked_add(total_cost)?;
+    let mut best_split: Option<(usize, usize)> = None;
+
+    for (idx, cost) in cell_costs
+        .iter()
+        .copied()
+        .enumerate()
+        .take(cells.len().saturating_sub(1))
+    {
+        left_total = left_total.checked_add(cost)?;
+        right_total = right_total.checked_sub(cost)?;
+        if left_total > usable || right_total > usable {
+            continue;
+        }
+
+        // Distance from the biased target — smaller is better.
+        // On ties, prefer the later (higher) split index which puts more
+        // cells on the left page, consistent with the 60% bias goal.
+        let key = left_total.abs_diff(target_left);
+
+        match &best_split {
+            Some((_, best_key)) if key > *best_key => {}
+            _ => best_split = Some((idx + 1, key)),
+        }
+    }
+
+    best_split.map(|(split_idx, _)| split_idx)
+}
+
+fn table_leaf_divider_bytes(
+    left_page_no: PageNumber,
+    rightmost_left_cell: &GatheredCell,
+    usable_size: u32,
+) -> Result<Vec<u8>> {
+    let cell_ref = CellRef::parse(
+        &rightmost_left_cell.data,
+        0,
+        BtreePageType::LeafTable,
+        usable_size,
+    )?;
+    let rowid = cell_ref
+        .rowid
+        .ok_or_else(|| FrankenError::internal("table leaf split cell missing rowid"))?;
+    #[allow(clippy::cast_sign_loss)]
+    let rowid_u64 = rowid as u64;
+    let mut divider = [0u8; 13];
+    divider[0..4].copy_from_slice(&left_page_no.get().to_be_bytes());
+    let divider_len = write_varint(&mut divider[4..], rowid_u64);
+    Ok(divider[..4 + divider_len].to_vec())
+}
+
+fn rollback_prepared_leaf_table_local_split_best_effort<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    prepared: &PreparedLeafTableLocalSplit,
+) {
+    restore_page_best_effort(
+        cx,
+        writer,
+        prepared.new_pgnos[0],
+        &prepared.original_leaf_page,
+    );
+    let _ = writer.free_page(cx, prepared.new_sibling_pgno);
+}
+
+fn prepare_leaf_table_local_split<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    leaf_page_no: PageNumber,
+    overflow_cell: &[u8],
+    overflow_insert_idx: usize,
+    usable_size: u32,
+) -> Result<Option<PreparedLeafTableLocalSplit>> {
+    let leaf_page = writer.read_page_data(cx, leaf_page_no)?;
+    let leaf_offset = header_offset_for_page(leaf_page_no);
+    let leaf_header = parse_page_header(leaf_page.as_bytes(), leaf_page_no)?;
+    if leaf_header.page_type != BtreePageType::LeafTable {
+        return Ok(None);
+    }
+
+    let ptrs = read_cell_pointers(leaf_page.as_bytes(), &leaf_header, leaf_offset)?;
+    let insert_idx = overflow_insert_idx.min(ptrs.len());
+    let mut all_cells = Vec::with_capacity(ptrs.len().saturating_add(1));
+    let mut overflow_inserted = false;
+
+    for (cell_idx, &ptr) in ptrs.iter().enumerate() {
+        if cell_idx == insert_idx {
+            all_cells.push(GatheredCell {
+                size: u16::try_from(overflow_cell.len()).unwrap_or(u16::MAX),
+                data: overflow_cell.to_vec(),
+            });
+            overflow_inserted = true;
+        }
+
+        let ptr = usize::from(ptr);
+        let cell_ref = CellRef::parse(
+            leaf_page.as_bytes(),
+            ptr,
+            BtreePageType::LeafTable,
+            usable_size,
+        )?;
+        let cell_end = ptr + cell_on_page_size_from_ref(&cell_ref, ptr);
+        let raw = leaf_page.as_bytes()[ptr..cell_end].to_vec();
+        all_cells.push(GatheredCell {
+            size: u16::try_from(raw.len()).unwrap_or(u16::MAX),
+            data: raw,
+        });
+    }
+
+    if !overflow_inserted {
+        all_cells.push(GatheredCell {
+            size: u16::try_from(overflow_cell.len()).unwrap_or(u16::MAX),
+            data: overflow_cell.to_vec(),
+        });
+    }
+
+    let Some(split_idx) = choose_leaf_table_split_index(&all_cells, leaf_offset, 0, usable_size)
+    else {
+        return Ok(None);
+    };
+
+    let new_sibling_pgno = writer.allocate_page(cx)?;
+    let rollback_allocation = |writer: &mut W| {
+        let _ = writer.free_page(cx, new_sibling_pgno);
+    };
+
+    let left_page = match build_page(
+        &all_cells[..split_idx],
+        BtreePageType::LeafTable,
+        leaf_offset,
+        usable_size,
+        None,
+    ) {
+        Ok(page) => page,
+        Err(err) => {
+            rollback_allocation(writer);
+            return Err(err);
+        }
+    };
+    let right_page = match build_page(
+        &all_cells[split_idx..],
+        BtreePageType::LeafTable,
+        header_offset_for_page(new_sibling_pgno),
+        usable_size,
+        None,
+    ) {
+        Ok(page) => page,
+        Err(err) => {
+            rollback_allocation(writer);
+            return Err(err);
+        }
+    };
+
+    let original_leaf_page = leaf_page.clone();
+    let mut pending_page_writes = vec![
+        (leaf_page_no, left_page, Some(leaf_page.clone())),
+        (new_sibling_pgno, right_page, None),
+    ];
+    pending_page_writes.sort_by_key(|(pgno, _, _)| pgno.get());
+
+    let divider =
+        match table_leaf_divider_bytes(leaf_page_no, &all_cells[split_idx - 1], usable_size) {
+            Ok(divider) => divider,
+            Err(err) => {
+                restore_page_best_effort(cx, writer, leaf_page_no, &original_leaf_page);
+                let _ = writer.free_page(cx, new_sibling_pgno);
+                return Err(err);
+            }
+        };
+
+    Ok(Some(PreparedLeafTableLocalSplit {
+        original_leaf_page,
+        new_sibling_pgno,
+        new_pgnos: vec![leaf_page_no, new_sibling_pgno],
+        new_dividers: vec![(leaf_page_no, divider)],
+        pending_page_writes,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn balance_table_leaf_local_split<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    parent_page_no: PageNumber,
+    child_idx: usize,
+    leaf_page_no: PageNumber,
+    overflow_cell: &[u8],
+    overflow_insert_idx: usize,
+    usable_size: u32,
+    parent_is_root: bool,
+) -> Result<Option<BalanceResult>> {
+    if !parent_has_room_for_table_leaf_split(cx, writer, parent_page_no, usable_size)? {
+        return Ok(None);
+    }
+
+    let Some(prepared) = prepare_leaf_table_local_split(
+        cx,
+        writer,
+        leaf_page_no,
+        overflow_cell,
+        overflow_insert_idx,
+        usable_size,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    for (page_no, page_data, original_page) in prepared.pending_page_writes.iter() {
+        if let Err(err) = write_page_if_changed(
+            cx,
+            writer,
+            *page_no,
+            page_data.clone(),
+            original_page.as_ref().map(PageData::as_bytes),
+        ) {
+            rollback_prepared_leaf_table_local_split_best_effort(cx, writer, &prepared);
+            return Err(err);
+        }
+    }
+
+    match apply_child_replacement(
+        cx,
+        writer,
+        parent_page_no,
+        usable_size,
+        child_idx,
+        1,
+        &prepared.new_pgnos,
+        &prepared.new_dividers,
+        parent_is_root,
+    ) {
+        Ok(outcome) => Ok(Some(outcome)),
+        Err(err) => {
+            rollback_prepared_leaf_table_local_split_best_effort(cx, writer, &prepared);
+            Err(err)
+        }
     }
 }
 
@@ -1200,10 +1580,10 @@ fn insert_cell_into_page<W: PageWriter>(
     _usable_size: u32,
     cell_data: &[u8],
 ) -> Result<()> {
-    let mut page_data = writer.read_page(cx, page_no)?;
+    let mut page_data = writer.read_page_data(cx, page_no)?;
     let offset = header_offset_for_page(page_no);
-    let mut header = parse_page_header(&page_data, page_no)?;
-    let mut ptrs = read_cell_pointers(&page_data, &header, offset)?;
+    let mut header = parse_page_header(page_data.as_bytes(), page_no)?;
+    let mut ptrs = read_cell_pointers(page_data.as_bytes(), &header, offset)?;
 
     let cell_len = cell_data.len();
     let new_content_offset = header
@@ -1222,9 +1602,6 @@ fn insert_cell_into_page<W: PageWriter>(
         ));
     }
 
-    // Write cell content.
-    page_data[new_content_offset..new_content_offset + cell_len].copy_from_slice(cell_data);
-
     // Add cell pointer.
     #[allow(clippy::cast_possible_truncation)]
     ptrs.push(new_content_offset as u16);
@@ -1235,10 +1612,14 @@ fn insert_cell_into_page<W: PageWriter>(
     {
         header.cell_content_offset = new_content_offset as u32;
     }
-    header.write(&mut page_data, offset);
-    write_cell_pointers(&mut page_data, offset, &header, &ptrs);
+    {
+        let page_bytes = page_data.as_bytes_mut();
+        page_bytes[new_content_offset..new_content_offset + cell_len].copy_from_slice(cell_data);
+        header.write(page_bytes, offset);
+        write_cell_pointers(page_bytes, offset, &header, &ptrs);
+    }
 
-    writer.write_page_data(cx, page_no, PageData::from_vec(page_data))
+    writer.write_page_data(cx, page_no, page_data)
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,10 +1641,10 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     new_dividers: &[(PageNumber, Vec<u8>)],
     parent_is_root: bool,
 ) -> Result<BalanceResult> {
-    let page_data = writer.read_page(cx, parent_page_no)?;
+    let page_data = writer.read_page_data(cx, parent_page_no)?;
     let offset = header_offset_for_page(parent_page_no);
-    let header = parse_page_header(&page_data, parent_page_no)?;
-    let ptrs = read_cell_pointers(&page_data, &header, offset)?;
+    let header = parse_page_header(page_data.as_bytes(), parent_page_no)?;
+    let ptrs = read_cell_pointers(page_data.as_bytes(), &header, offset)?;
     let total_children = header.cell_count as usize + 1;
     let touches_rightmost = first_child + old_sibling_count == total_children;
 
@@ -1277,9 +1658,14 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
         if i >= first_child && i < first_child + old_divider_count {
             continue; // Skip old divider.
         }
-        let cell_ref = CellRef::parse(&page_data, ptr as usize, header.page_type, usable_size)?;
+        let cell_ref = CellRef::parse(
+            page_data.as_bytes(),
+            ptr as usize,
+            header.page_type,
+            usable_size,
+        )?;
         let cell_end = ptr as usize + cell_on_page_size_from_ref(&cell_ref, ptr as usize);
-        let raw = page_data[ptr as usize..cell_end].to_vec();
+        let raw = page_data.as_bytes()[ptr as usize..cell_end].to_vec();
         kept_cells.push(GatheredCell {
             size: u16::try_from(raw.len()).unwrap_or(u16::MAX),
             data: raw,
@@ -1352,7 +1738,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
                 usable_size,
                 offset,
                 header.page_type,
-                &page_data,
+                page_data.as_bytes(),
                 &final_cells,
                 right_child,
             )?;
@@ -1369,7 +1755,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
             usable_size,
             offset,
             header.page_type,
-            &page_data[..offset],
+            &page_data.as_bytes()[..offset],
             &final_cells,
             right_child,
         )?;
@@ -1388,10 +1774,16 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     // Preserve database header on page 1.
     let mut final_page = new_page;
     if offset > 0 {
-        final_page[..offset].copy_from_slice(&page_data[..offset]);
+        final_page[..offset].copy_from_slice(&page_data.as_bytes()[..offset]);
     }
 
-    writer.write_page_data(cx, parent_page_no, PageData::from_vec(final_page))?;
+    write_page_if_changed(
+        cx,
+        writer,
+        parent_page_no,
+        final_page,
+        Some(page_data.as_bytes()),
+    )?;
 
     // Balance-shallower: when the root page has zero cells after merging
     // children, copy the single right-child's content into the root and
@@ -1430,25 +1822,25 @@ fn balance_shallower<W: PageWriter>(
     child_pgno: PageNumber,
     usable_size: u32,
 ) -> Result<()> {
-    let child_data = writer.read_page(cx, child_pgno)?;
+    let child_data = writer.read_page_data(cx, child_pgno)?;
     let root_offset = header_offset_for_page(root_page_no);
     let child_offset = header_offset_for_page(child_pgno);
-    let child_header = parse_page_header(&child_data, child_pgno)?;
+    let child_header = parse_page_header(child_data.as_bytes(), child_pgno)?;
 
     // Rebuild child cells using the root's header offset. This handles page-1
     // (100-byte header) safely and avoids raw offset shifting pitfalls.
-    let child_ptrs = read_cell_pointers(&child_data, &child_header, child_offset)?;
+    let child_ptrs = read_cell_pointers(child_data.as_bytes(), &child_header, child_offset)?;
     let mut child_cells: Vec<GatheredCell> = Vec::with_capacity(child_ptrs.len());
     for &ptr in &child_ptrs {
         let cell_offset = usize::from(ptr);
         let cell_ref = CellRef::parse(
-            &child_data,
+            child_data.as_bytes(),
             cell_offset,
             child_header.page_type,
             usable_size,
         )?;
         let cell_end = cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
-        let data = child_data[cell_offset..cell_end].to_vec();
+        let data = child_data.as_bytes()[cell_offset..cell_end].to_vec();
         let size = u16::try_from(data.len()).map_err(|_| FrankenError::DatabaseCorrupt {
             detail: "cell too large during balance_shallower".to_owned(),
         })?;
@@ -1476,8 +1868,8 @@ fn balance_shallower<W: PageWriter>(
 
     // Preserve the database file header on page 1.
     if root_offset > 0 {
-        let original_root = writer.read_page(cx, root_page_no)?;
-        new_root[..root_offset].copy_from_slice(&original_root[..root_offset]);
+        let original_root = writer.read_page_data(cx, root_page_no)?;
+        new_root[..root_offset].copy_from_slice(&original_root.as_bytes()[..root_offset]);
     }
 
     writer.write_page_data(cx, root_page_no, PageData::from_vec(new_root))?;
@@ -1904,7 +2296,8 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
         .map(|(i, data)| (child_pgnos[i], data))
         .collect();
 
-    // Write child pages.
+    let mut pending_child_writes: Vec<(PageNumber, Vec<u8>, bool)> =
+        Vec::with_capacity(child_count);
     for (i, (start, end)) in ranges.iter().copied().enumerate() {
         let child_pgno = child_pgnos[i];
         let child_off = header_offset_for_page(child_pgno);
@@ -1922,7 +2315,22 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
         if i == 0 && child_off > 0 {
             final_page[..child_off].copy_from_slice(&original_page[..child_off]);
         }
-        if let Err(err) = writer.write_page_data(cx, child_pgno, PageData::from_vec(final_page)) {
+        pending_child_writes.push((child_pgno, final_page, i == 0));
+    }
+
+    pending_child_writes.sort_by_key(|(pgno, _, _)| pgno.get());
+    for (child_pgno, final_page, is_original_page) in pending_child_writes {
+        if let Err(err) = write_page_if_changed(
+            cx,
+            writer,
+            child_pgno,
+            final_page,
+            if is_original_page {
+                Some(original_page)
+            } else {
+                None
+            },
+        ) {
             return Err(do_rollback2!(err));
         }
     }
@@ -2033,6 +2441,50 @@ mod tests {
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
     }
 
+    #[derive(Debug, Clone)]
+    struct RecordingMemPageStore {
+        inner: MemPageStore,
+        writes_by_page: HashMap<u32, usize>,
+    }
+
+    impl RecordingMemPageStore {
+        fn new(inner: MemPageStore) -> Self {
+            Self {
+                inner,
+                writes_by_page: HashMap::new(),
+            }
+        }
+
+        fn write_count(&self, page_no: PageNumber) -> usize {
+            self.writes_by_page
+                .get(&page_no.get())
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl crate::cursor::PageReader for RecordingMemPageStore {
+        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            self.inner.read_page(cx, page_no)
+        }
+    }
+
+    impl PageWriter for RecordingMemPageStore {
+        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+            *self.writes_by_page.entry(page_no.get()).or_default() += 1;
+            self.inner.write_page(cx, page_no, data)
+        }
+
+        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+            self.inner.allocate_page(cx)
+        }
+
+        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+            self.inner.free_page(cx, page_no)
+        }
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+    }
+
     fn pn(n: u32) -> PageNumber {
         PageNumber::new(n).unwrap()
     }
@@ -2072,6 +2524,18 @@ mod tests {
         write_cell_pointers(&mut page, 0, &header, &cell_offsets);
 
         page
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn build_leaf_table_cell(rowid: i64, payload: &[u8]) -> Vec<u8> {
+        let mut cell_buf = vec![0u8; payload.len() + 18];
+        let mut pos = 0usize;
+        pos += write_varint(&mut cell_buf[pos..], payload.len() as u64);
+        pos += write_varint(&mut cell_buf[pos..], rowid as u64);
+        cell_buf[pos..pos + payload.len()].copy_from_slice(payload);
+        pos += payload.len();
+        cell_buf.truncate(pos);
+        cell_buf
     }
 
     /// Build an interior table page with divider cells + right_child.
@@ -2363,6 +2827,162 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_apply_child_replacement_noop_skips_parent_rewrite() {
+        let cx = Cx::new();
+        let mut store = RecordingMemPageStore::new(MemPageStore::new(20));
+
+        let parent = build_interior_table(&[(pn(3), 40), (pn(4), 80)], pn(5));
+        store.inner.pages.insert(2, parent.clone());
+
+        let outcome =
+            apply_child_replacement(&cx, &mut store, pn(2), USABLE, 1, 1, &[pn(4)], &[], false)
+                .expect("no-op replacement should succeed");
+
+        assert!(matches!(outcome, BalanceResult::Done));
+        assert_eq!(
+            store.write_count(pn(2)),
+            0,
+            "identical parent image should not be rewritten"
+        );
+        assert_eq!(store.inner.pages.get(&2), Some(&parent));
+    }
+
+    #[test]
+    fn test_balance_table_leaf_local_split_only_touches_target_leaf_parent_and_new_sibling() {
+        let cx = Cx::new();
+        let mut base = MemPageStore::new(20);
+
+        let payload = vec![b'm'; 240];
+        let left_entries: Vec<(i64, &[u8])> = (10_i64..=12)
+            .map(|rowid| (rowid, b"left" as &[u8]))
+            .collect();
+        let middle_entries: Vec<(i64, &[u8])> = (100_i64..=115)
+            .map(|rowid| (rowid, payload.as_slice()))
+            .collect();
+        let right_entries: Vec<(i64, &[u8])> = (200_i64..=202)
+            .map(|rowid| (rowid, b"right" as &[u8]))
+            .collect();
+
+        let parent = build_interior_table(&[(pn(3), 40), (pn(4), 150)], pn(5));
+        let left_leaf = build_leaf_table(&left_entries);
+        let middle_leaf = build_leaf_table(&middle_entries);
+        let right_leaf = build_leaf_table(&right_entries);
+        let original_middle_leaf = middle_leaf.clone();
+
+        base.pages.insert(2, parent);
+        base.pages.insert(3, left_leaf.clone());
+        base.pages.insert(4, middle_leaf);
+        base.pages.insert(5, right_leaf.clone());
+
+        let mut store = RecordingMemPageStore::new(base);
+        let overflow_cell = build_leaf_table_cell(50, payload.as_slice());
+
+        let outcome = balance_table_leaf_local_split(
+            &cx,
+            &mut store,
+            pn(2),
+            1,
+            pn(4),
+            &overflow_cell,
+            0,
+            USABLE,
+            true,
+        )
+        .expect("local split should succeed")
+        .expect("leaf table split should take the local fast path");
+
+        assert!(matches!(outcome, BalanceResult::Done));
+        assert_eq!(
+            store.write_count(pn(2)),
+            1,
+            "parent should be updated exactly once"
+        );
+        assert_eq!(
+            store.write_count(pn(4)),
+            1,
+            "target leaf should be rewritten exactly once"
+        );
+        assert_eq!(
+            store.write_count(pn(20)),
+            1,
+            "local split should allocate and write exactly one new sibling"
+        );
+        assert_eq!(
+            store.write_count(pn(3)),
+            0,
+            "left neighbor must remain untouched"
+        );
+        assert_eq!(
+            store.write_count(pn(5)),
+            0,
+            "right neighbor must remain untouched"
+        );
+        assert_eq!(store.inner.pages.get(&3), Some(&left_leaf));
+        assert_eq!(store.inner.pages.get(&5), Some(&right_leaf));
+        assert_ne!(
+            store.inner.pages.get(&4),
+            Some(&original_middle_leaf),
+            "target leaf should actually change when the split fires"
+        );
+    }
+
+    #[test]
+    fn test_balance_table_leaf_local_split_bails_when_parent_is_full() {
+        let cx = Cx::new();
+        let mut base = MemPageStore::new(20);
+
+        let mut full_parent = vec![0u8; USABLE as usize];
+        let header = BtreePageHeader {
+            page_type: BtreePageType::InteriorTable,
+            first_freeblock: 0,
+            cell_count: 1,
+            cell_content_offset: 20,
+            fragmented_free_bytes: 0,
+            right_child: Some(pn(5)),
+        };
+        header.write(&mut full_parent, 0);
+
+        let payload = vec![b'm'; 240];
+        let leaf_entries: Vec<(i64, &[u8])> = (100_i64..=115)
+            .map(|rowid| (rowid, payload.as_slice()))
+            .collect();
+        let leaf = build_leaf_table(&leaf_entries);
+        let original_leaf = leaf.clone();
+
+        base.pages.insert(2, full_parent.clone());
+        base.pages.insert(5, leaf);
+
+        let mut store = RecordingMemPageStore::new(base);
+        let overflow_cell = build_leaf_table_cell(50, payload.as_slice());
+
+        let outcome = balance_table_leaf_local_split(
+            &cx,
+            &mut store,
+            pn(2),
+            1,
+            pn(5),
+            &overflow_cell,
+            0,
+            USABLE,
+            true,
+        )
+        .expect("parent-space gate should not error");
+
+        assert!(
+            outcome.is_none(),
+            "local split should decline when parent lacks room for the divider"
+        );
+        assert_eq!(store.write_count(pn(2)), 0);
+        assert_eq!(store.write_count(pn(5)), 0);
+        assert_eq!(store.inner.pages.get(&2), Some(&full_parent));
+        assert_eq!(store.inner.pages.get(&5), Some(&original_leaf));
+        assert!(
+            !store.inner.pages.contains_key(&20),
+            "declined local split must not allocate a sibling page"
+        );
+    }
+
     // -- compute_distribution tests --
 
     #[test]
@@ -2550,18 +3170,19 @@ mod tests {
         let outcome = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true).unwrap();
         assert!(matches!(outcome, BalanceResult::Done));
 
-        // With small cells plus the overflow, all 5 cells fit on one page.
-        // balance_shallower collapses the root to a leaf.
+        // All four leaf-table cells fit on one page, so balance_shallower
+        // collapses the root to a leaf. The parent divider key is not an
+        // extra table row; it is only a separator copied from the left child.
         let root_data = store.pages.get(&2).unwrap();
         let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
         assert!(
             root_header.page_type.is_leaf(),
             "root should collapse to leaf after small-cell merge with overflow"
         );
-        // Original: 4 cells + 1 overflow = 5 total.
+        // Original: 4 leaf rows total.
         assert_eq!(
-            root_header.cell_count, 5,
-            "all cells including overflow should be preserved"
+            root_header.cell_count, 4,
+            "all leaf-table rows should be preserved after merge"
         );
     }
 
