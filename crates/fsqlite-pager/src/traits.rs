@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use fsqlite_error::Result;
 use fsqlite_types::cx::Cx;
-use fsqlite_types::{PageData, PageNumber};
+use fsqlite_types::{PageData, PageNumber, PageSize};
 
 // ---------------------------------------------------------------------------
 // Sealed trait discipline
@@ -467,6 +467,55 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         Ok(Vec::new())
     }
 
+    /// Whether page 1 is currently part of this transaction's pending commit
+    /// surface, including commit-time allocator/header synthesis.
+    fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
+        Ok(self.pending_commit_pages()?.contains(&PageNumber::ONE))
+    }
+
+    /// Returns the transaction's effective database page size.
+    ///
+    /// Real pager-backed transactions override this so upper layers can
+    /// normalize owned page buffers before staging them in MVCC state.
+    fn page_size(&self) -> PageSize {
+        PageSize::default()
+    }
+
+    /// Whether calling [`allocate_page`](Self::allocate_page) right now must
+    /// add page 1 to the MVCC conflict surface before the underlying allocator
+    /// state changes.
+    ///
+    /// Real pager-backed transactions override this with exact allocator
+    /// semantics so upper layers can avoid false page-1 conflicts on net-zero
+    /// allocator churn. The default remains conservative.
+    fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Whether calling [`free_page`](Self::free_page) for `page_no` right now
+    /// must add page 1 to the MVCC conflict surface before the underlying
+    /// allocator state changes.
+    ///
+    /// Real pager-backed transactions override this with exact allocator
+    /// semantics so upper layers can avoid false page-1 conflicts on net-zero
+    /// allocator churn. The default remains conservative.
+    fn free_page_requires_page_one_conflict_tracking(&self, _page_no: PageNumber) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// Whether calling [`write_page`](Self::write_page) or
+    /// [`write_page_data`](Self::write_page_data) for `page_no` right now must
+    /// add page 1 to the MVCC conflict surface before the underlying page
+    /// state changes.
+    ///
+    /// Real pager-backed transactions override this with exact growth
+    /// semantics so upper layers can defer page-1 tracking until a newly
+    /// allocated high page actually becomes part of the pending commit
+    /// surface. The default remains conservative.
+    fn write_page_requires_page_one_conflict_tracking(&self, _page_no: PageNumber) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Roll back this transaction, discarding the write-set.
     ///
     /// Rollback is infallible in the MVCC model (we simply discard the
@@ -718,7 +767,11 @@ impl TransactionHandle for MemoryMockTransaction {
 
     fn write_page_data(&mut self, _cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
         self.committed = false;
-        self.pages.insert(page_no, data);
+        let page_size = fsqlite_types::PageSize::default().as_usize();
+        let mut page = vec![0_u8; page_size];
+        let copy_len = data.len().min(page_size);
+        page[..copy_len].copy_from_slice(&data.as_bytes()[..copy_len]);
+        self.pages.insert(page_no, PageData::from_vec(page));
         Ok(())
     }
 

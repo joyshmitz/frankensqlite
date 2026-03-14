@@ -5,12 +5,11 @@
 //! Full concurrent MVCC behavior is layered on top in Phase 6.
 
 use std::collections::{HashMap, HashSet};
-use std::hint::spin_loop;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
@@ -607,9 +606,7 @@ fn collect_wal_commit_batch<'a>(
 }
 
 const SNAPSHOT_PUBLICATION_MODE: &str = "seqlock_published_pages";
-const PUBLISHED_SNAPSHOT_SPIN_LIMIT: u32 = 64;
-const PUBLISHED_SNAPSHOT_SLEEP_AFTER: u32 = 512;
-const PUBLISHED_SNAPSHOT_SLEEP: Duration = Duration::from_micros(50);
+const PUBLISHED_SNAPSHOT_WAIT_SLICE: Duration = Duration::from_micros(50);
 const PUBLISHED_READ_FAST_RETRY_LIMIT: usize = 64;
 const PUBLISHED_COUNTER_STRIPE_COUNT: usize = 64;
 
@@ -664,23 +661,6 @@ impl StripedCounter64 {
     }
 }
 
-#[inline]
-fn publication_retry_pause(retry: u32) {
-    if retry < PUBLISHED_SNAPSHOT_SPIN_LIMIT {
-        spin_loop();
-        return;
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if retry < PUBLISHED_SNAPSHOT_SLEEP_AFTER {
-            std::thread::yield_now();
-        } else {
-            std::thread::sleep(PUBLISHED_SNAPSHOT_SLEEP);
-        }
-    }
-}
-
 /// Point-in-time view of the pager metadata publication plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PagerPublishedSnapshot {
@@ -712,6 +692,8 @@ struct PublishedPagerUpdate {
 #[derive(Debug)]
 struct PublishedPagerState {
     publish_lock: Mutex<()>,
+    sequence_gate: Mutex<()>,
+    sequence_cv: Condvar,
     sequence: AtomicU64,
     visible_commit_seq: AtomicU64,
     db_size: AtomicU32,
@@ -733,6 +715,8 @@ impl PublishedPagerState {
     ) -> Self {
         Self {
             publish_lock: Mutex::new(()),
+            sequence_gate: Mutex::new(()),
+            sequence_cv: Condvar::new(),
             sequence: AtomicU64::new(2),
             visible_commit_seq: AtomicU64::new(visible_commit_seq.get()),
             db_size: AtomicU32::new(db_size),
@@ -747,13 +731,11 @@ impl PublishedPagerState {
     }
 
     fn snapshot(&self) -> PagerPublishedSnapshot {
-        let mut retry = 0_u32;
         loop {
             let snapshot_gen = self.sequence.load(AtomicOrdering::Acquire);
             if snapshot_gen % 2 == 1 {
                 self.record_retry();
-                publication_retry_pause(retry);
-                retry = retry.saturating_add(1);
+                self.wait_for_sequence_change(snapshot_gen, PUBLISHED_SNAPSHOT_WAIT_SLICE);
                 continue;
             }
 
@@ -778,8 +760,7 @@ impl PublishedPagerState {
             }
 
             self.record_retry();
-            publication_retry_pause(retry);
-            retry = retry.saturating_add(1);
+            self.wait_for_sequence_change(snapshot_gen, PUBLISHED_SNAPSHOT_WAIT_SLICE);
         }
     }
 
@@ -867,6 +848,7 @@ impl PublishedPagerState {
             .sequence
             .fetch_add(1, AtomicOrdering::AcqRel)
             .saturating_add(1);
+        self.sequence_cv.notify_all();
         tracing::trace!(
             target: "fsqlite.snapshot_publication",
             trace_id = cx.trace_id(),
@@ -890,6 +872,19 @@ impl PublishedPagerState {
 
     fn record_retry(&self) {
         self.read_retry_count.increment();
+    }
+
+    fn wait_for_sequence_change(&self, observed_sequence: u64, timeout: Duration) {
+        let guard = self
+            .sequence_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_guard, _timeout) = self
+            .sequence_cv
+            .wait_timeout_while(guard, timeout, |()| {
+                self.sequence.load(AtomicOrdering::Acquire) == observed_sequence
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 
     fn read_retry_count(&self) -> u64 {
@@ -1775,8 +1770,9 @@ struct SavepointEntry {
     /// The user-supplied savepoint name.
     name: String,
     /// Snapshot of the write-set at the time the savepoint was created.
-    /// Stores raw bytes (Vec<u8>) to decouple from buffer pool handle lifetime.
-    write_set_snapshot: HashMap<PageNumber, Vec<u8>>,
+    /// Stores published page data so savepoint capture can reuse the staged
+    /// page's shared `Arc<Vec<u8>>` when available instead of cloning bytes.
+    write_set_snapshot: HashMap<PageNumber, PageData>,
     /// Sorted unique page ids in the write-set snapshot.
     write_pages_sorted_snapshot: Vec<PageNumber>,
     /// Snapshot of freed pages at the time the savepoint was created.
@@ -1828,6 +1824,14 @@ impl StagedPage {
         let backing = StagedPageBacking::Owned(data.clone());
         let _ = published.set(data);
         Self { backing, published }
+    }
+
+    fn from_page_data_for_pool(pool: &PageBufPool, data: PageData) -> Result<Self> {
+        if data.len() == pool.page_size() {
+            Ok(Self::from_page_data(data))
+        } else {
+            Self::from_bytes(pool, data.as_bytes())
+        }
     }
 
     fn as_page_bytes(&self) -> &[u8] {
@@ -1995,6 +1999,89 @@ impl<V: Vfs> SimpleTransaction<V> {
         }
     }
 
+    #[must_use]
+    fn current_page_one_conflict_tracking_required_with_inner(
+        &self,
+        inner: &PagerInner<V::File>,
+    ) -> bool {
+        let committed_db_size = self.committed_db_size_with_inner(inner);
+        let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
+        let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+
+        if self.journal_mode == JournalMode::Wal {
+            wal_page1_plan.requires_page_one_rewrite()
+        } else {
+            !self.write_set.is_empty() || freelist_dirty
+        }
+    }
+
+    #[must_use]
+    fn allocate_page_requires_page_one_conflict_tracking_with_inner(
+        &self,
+        inner: &PagerInner<V::File>,
+    ) -> bool {
+        if self.current_page_one_conflict_tracking_required_with_inner(inner) {
+            return true;
+        }
+
+        let committed_db_size = self.committed_db_size_with_inner(inner);
+        let committed_freelist_is_snapshot_pinned =
+            self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
+
+        if committed_freelist_is_snapshot_pinned {
+            return false;
+        }
+
+        match inner.freelist.last().copied() {
+            Some(page) => page.get() <= committed_db_size,
+            None => false,
+        }
+    }
+
+    #[must_use]
+    fn free_page_requires_page_one_conflict_tracking_with_inner(
+        &self,
+        inner: &PagerInner<V::File>,
+        page_no: PageNumber,
+    ) -> bool {
+        if self.current_page_one_conflict_tracking_required_with_inner(inner) {
+            return true;
+        }
+
+        page_no.get() <= self.committed_db_size_with_inner(inner)
+    }
+
+    #[must_use]
+    fn write_page_requires_page_one_conflict_tracking_with_inner(
+        &self,
+        inner: &PagerInner<V::File>,
+        page_no: PageNumber,
+    ) -> bool {
+        if page_no == PageNumber::ONE
+            || self.current_page_one_conflict_tracking_required_with_inner(inner)
+        {
+            return true;
+        }
+
+        page_no.get() > self.committed_db_size_with_inner(inner)
+    }
+
+    #[must_use]
+    fn page_one_in_pending_commit_surface_with_inner(&self, inner: &PagerInner<V::File>) -> bool {
+        let committed_db_size = self.committed_db_size_with_inner(inner);
+        let durable_freelist =
+            self.predicted_durable_freelist_pages_with_inner(inner, committed_db_size);
+        let freelist_dirty =
+            self.committed_durable_freelist_pages_with_inner(inner) != durable_freelist;
+        let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
+
+        if self.journal_mode == JournalMode::Wal {
+            wal_page1_plan.requires_page_one_rewrite()
+        } else {
+            !self.write_set.is_empty() || freelist_dirty
+        }
+    }
+
     fn predicted_commit_pages_with_inner(&self, inner: &PagerInner<V::File>) -> Vec<PageNumber> {
         let mut pages = self.write_pages_sorted.clone();
         let committed_db_size = self.committed_db_size_with_inner(inner);
@@ -2009,13 +2096,7 @@ impl<V: Vfs> SimpleTransaction<V> {
             pages.extend(durable_freelist.into_iter().take(trunk_count));
         }
 
-        let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
-        let must_write_page1 = if self.journal_mode == JournalMode::Wal {
-            wal_page1_plan.requires_page_one_rewrite()
-        } else {
-            !self.write_set.is_empty() || freelist_dirty
-        };
-        if must_write_page1 {
+        if self.page_one_in_pending_commit_surface_with_inner(inner) {
             pages.push(PageNumber::ONE);
         }
 
@@ -2280,7 +2361,8 @@ where
                 if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
                     break;
                 }
-                publication_retry_pause(u32::try_from(published_retry_count).unwrap_or(u32::MAX));
+                self.published
+                    .wait_for_sequence_change(snapshot.snapshot_gen, PUBLISHED_SNAPSHOT_WAIT_SLICE);
                 published_retry_count = published_retry_count.saturating_add(1);
                 continue;
             }
@@ -2309,7 +2391,8 @@ where
                 if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
                     break;
                 }
-                publication_retry_pause(u32::try_from(published_retry_count).unwrap_or(u32::MAX));
+                self.published
+                    .wait_for_sequence_change(snapshot.snapshot_gen, PUBLISHED_SNAPSHOT_WAIT_SLICE);
                 published_retry_count = published_retry_count.saturating_add(1);
                 continue;
             }
@@ -2366,11 +2449,13 @@ where
             self.freed_pages.swap_remove(pos);
         }
 
+        let staged = StagedPage::from_page_data_for_pool(&self.pool, data)?;
+
         insert_staged_page(
             &mut self.write_set,
             &mut self.write_pages_sorted,
             page_no,
-            StagedPage::from_page_data(data),
+            staged,
         );
         Ok(())
     }
@@ -2621,6 +2706,46 @@ where
         Ok(self.predicted_commit_pages_with_inner(&inner))
     }
 
+    fn page_size(&self) -> PageSize {
+        PageSize::new(u32::try_from(self.pool.page_size()).expect("pool page size fits u32"))
+            .expect("pool page size invariant")
+    }
+
+    fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
+        if !self.has_pending_writes() {
+            return Ok(false);
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        Ok(self.page_one_in_pending_commit_surface_with_inner(&inner))
+    }
+
+    fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        Ok(self.allocate_page_requires_page_one_conflict_tracking_with_inner(&inner))
+    }
+
+    fn free_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        Ok(self.free_page_requires_page_one_conflict_tracking_with_inner(&inner, page_no))
+    }
+
+    fn write_page_requires_page_one_conflict_tracking(&self, page_no: PageNumber) -> Result<bool> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        Ok(self.write_page_requires_page_one_conflict_tracking_with_inner(&inner, page_no))
+    }
+
     fn rollback(&mut self, cx: &Cx) -> Result<()> {
         if self.finished {
             return Ok(());
@@ -2719,7 +2844,7 @@ where
             write_set_snapshot: self
                 .write_set
                 .iter()
-                .map(|(&k, v)| (k, v.as_page_bytes().to_vec()))
+                .map(|(&k, v)| (k, v.published_page()))
                 .collect(),
             write_pages_sorted_snapshot: self.write_pages_sorted.clone(),
             freed_pages_snapshot: self.freed_pages.clone(),
@@ -2759,7 +2884,10 @@ where
             .write_set_snapshot
             .iter()
             .map(|(&k, v)| -> Result<(PageNumber, StagedPage)> {
-                Ok((k, StagedPage::from_bytes(&self.pool, v)?))
+                Ok((
+                    k,
+                    StagedPage::from_page_data_for_pool(&self.pool, v.clone())?,
+                ))
             })
             .collect::<Result<HashMap<_, _>>>()?;
 
@@ -8745,6 +8873,143 @@ mod tests {
     }
 
     #[test]
+    fn test_allocate_page_requires_page_one_conflict_tracking_skips_pure_concurrent_eof_allocate() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        assert!(
+            !txn.allocate_page_requires_page_one_conflict_tracking()
+                .unwrap(),
+            "bead_id={BEAD_ID} case=concurrent_eof_allocate_does_not_predeclare_page_one_conflict"
+        );
+    }
+
+    #[test]
+    fn test_allocate_page_requires_page_one_conflict_tracking_skips_beyond_db_size_reuse() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let reusable_pages = {
+            let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+            let page_one = abandoned.allocate_page(&cx).unwrap();
+            let page_two = abandoned.allocate_page(&cx).unwrap();
+            abandoned
+                .write_page(&cx, page_one, &vec![0x44; ps])
+                .unwrap();
+            abandoned
+                .write_page(&cx, page_two, &vec![0x55; ps])
+                .unwrap();
+            abandoned.rollback(&cx).unwrap();
+            [page_one, page_two]
+        };
+
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        assert!(
+            !txn.allocate_page_requires_page_one_conflict_tracking()
+                .unwrap(),
+            "bead_id={BEAD_ID} case=beyond_db_size_reuse_skips_page_one_conflict_tracking"
+        );
+        let reused = txn.allocate_page(&cx).unwrap();
+        assert!(
+            reusable_pages.contains(&reused),
+            "bead_id={BEAD_ID} case=allocator_page_one_hook_matches_actual_reuse reused={} expected=({}, {})",
+            reused.get(),
+            reusable_pages[0].get(),
+            reusable_pages[1].get()
+        );
+    }
+
+    #[test]
+    fn test_free_page_requires_page_one_conflict_tracking_distinguishes_durable_vs_net_zero() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let durable_page = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page, &[0xAB; 32]).unwrap();
+            seed.commit(&cx).unwrap();
+            page
+        };
+
+        let durable_txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        assert!(
+            durable_txn
+                .free_page_requires_page_one_conflict_tracking(durable_page)
+                .unwrap(),
+            "bead_id={BEAD_ID} case=durable_free_requires_page_one_conflict_tracking"
+        );
+
+        let reusable_pages = {
+            let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+            let page_one = abandoned.allocate_page(&cx).unwrap();
+            let page_two = abandoned.allocate_page(&cx).unwrap();
+            abandoned
+                .write_page(&cx, page_one, &vec![0x55; ps])
+                .unwrap();
+            abandoned
+                .write_page(&cx, page_two, &vec![0x66; ps])
+                .unwrap();
+            abandoned.rollback(&cx).unwrap();
+            [page_one, page_two]
+        };
+
+        let mut net_zero_txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let reused = net_zero_txn.allocate_page(&cx).unwrap();
+        assert!(
+            reusable_pages.contains(&reused),
+            "bead_id={BEAD_ID} case=net_zero_free_reuses_abandoned_page reused={} expected=({}, {})",
+            reused.get(),
+            reusable_pages[0].get(),
+            reusable_pages[1].get()
+        );
+        assert!(
+            !net_zero_txn
+                .free_page_requires_page_one_conflict_tracking(reused)
+                .unwrap(),
+            "bead_id={BEAD_ID} case=net_zero_free_skips_page_one_conflict_tracking"
+        );
+    }
+
+    #[test]
+    fn test_write_page_requires_page_one_conflict_tracking_for_concurrent_growth() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+
+        assert!(
+            txn.write_page_requires_page_one_conflict_tracking(page)
+                .unwrap(),
+            "bead_id={BEAD_ID} case=first_high_page_write_requires_page_one_conflict_tracking"
+        );
+    }
+
+    #[test]
+    fn test_write_page_requires_page_one_conflict_tracking_skips_interior_page() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+
+        let durable_page = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, page, &[0xAB; 32]).unwrap();
+            seed.commit(&cx).unwrap();
+            page
+        };
+
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        assert!(
+            !txn.write_page_requires_page_one_conflict_tracking(durable_page)
+                .unwrap(),
+            "bead_id={BEAD_ID} case=interior_page_write_skips_page_one_conflict_tracking"
+        );
+    }
+
+    #[test]
     fn test_concurrent_rollback_to_savepoint_reclaims_eof_allocations() {
         let (pager, _) = test_pager();
         let cx = Cx::new();
@@ -10012,6 +10277,38 @@ mod tests {
             published.try_get_page(page_no),
             Some(current_page),
             "bead_id={BEAD_ID} case=stale_publication_preserves_page"
+        );
+    }
+
+    #[test]
+    fn test_write_page_data_short_buffer_is_zero_filled_to_page_size() {
+        let (pager, _path) = test_pager();
+        let cx = Cx::new();
+        let page_size = PageSize::DEFAULT.as_usize();
+
+        let page_no = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_no = txn.allocate_page(&cx).unwrap();
+            txn.write_page_data(&cx, page_no, PageData::from_vec(vec![0xAB; 32]))
+                .unwrap();
+            txn.commit(&cx).unwrap();
+            page_no
+        };
+
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let page = reader.get_page(&cx, page_no).unwrap();
+        assert_eq!(
+            page.len(),
+            page_size,
+            "bead_id={BEAD_ID} case=short_owned_page_write_preserves_page_size"
+        );
+        assert!(
+            page.as_bytes()[..32].iter().all(|byte| *byte == 0xAB),
+            "bead_id={BEAD_ID} case=short_owned_page_write_keeps_prefix"
+        );
+        assert!(
+            page.as_bytes()[32..].iter().all(|byte| *byte == 0),
+            "bead_id={BEAD_ID} case=short_owned_page_write_zero_fills_tail"
         );
     }
 
