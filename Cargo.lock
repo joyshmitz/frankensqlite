@@ -1120,6 +1120,7 @@ dependencies = [
  "fsqlite-pager",
  "fsqlite-parser",
  "fsqlite-types",
+ "fsqlite-vfs",
  "fsqlite-wal",
  "hashbrown 0.14.5",
  "proptest",
