@@ -30,11 +30,14 @@ use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
+#[cfg(test)]
+use fsqlite_mvcc::concurrent_write_page;
 use fsqlite_mvcc::{
-    CommitIndex, CommitLog, ConcurrentRegistry, InProcessPageLockTable, MvccError,
-    SharedConcurrentHandle, TimeTravelSnapshot, TimeTravelTarget, VersionStore,
-    concurrent_free_page, concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
-    concurrent_restore_page_state, concurrent_track_write_conflict_page, concurrent_write_page,
+    CommitIndex, CommitLog, InProcessPageLockTable, MvccError, SharedConcurrentHandle,
+    TimeTravelSnapshot, TimeTravelTarget, VersionStore, concurrent_clear_page_state,
+    concurrent_free_page, concurrent_page_is_freed, concurrent_page_state,
+    concurrent_prepare_write_page, concurrent_read_page, concurrent_restore_page_state,
+    concurrent_stage_prepared_write_page, concurrent_track_write_conflict_page,
     create_time_travel_snapshot,
 };
 use fsqlite_pager::TransactionHandle;
@@ -249,10 +252,17 @@ impl MemCursor {
     }
 }
 
-/// A single row in the sorter, caching both the decoded values and the original blob.
+/// A single row in the sorter.
+///
+/// Stores only the decoded **sort-key prefix** (first `key_columns` values)
+/// for comparison, plus the raw record blob for output.  Prior to the lazy
+/// key decode optimization, ALL columns were eagerly decoded into `values`
+/// — now only the sort-key columns are materialized.
 #[derive(Debug, Clone)]
 struct SorterRow {
+    /// Decoded sort-key columns (first `key_columns` values only).
     values: Vec<SqliteValue>,
+    /// Raw serialized record for output via `SorterData`.
     blob: Vec<u8>,
 }
 
@@ -465,16 +475,19 @@ impl SorterCursor {
         let record_count = self.rows.len() as u64;
         let mut bytes_written: u64 = 0;
         for row in &self.rows {
-            let blob = serialize_record(&row.values);
+            // Write the raw blob directly instead of re-serializing from
+            // decoded values.  The blob is the original record bytes from
+            // MakeRecord and is identical to what serialize_record would
+            // produce (but without the decode→re-encode round-trip).
             #[allow(clippy::cast_possible_truncation)]
-            let len_bytes = (blob.len() as u32).to_le_bytes();
+            let len_bytes = (row.blob.len() as u32).to_le_bytes();
             writer
                 .write_all(&len_bytes)
                 .map_err(|e| FrankenError::internal(format!("sorter spill write len: {e}")))?;
             writer
-                .write_all(&blob)
+                .write_all(&row.blob)
                 .map_err(|e| FrankenError::internal(format!("sorter spill write data: {e}")))?;
-            bytes_written += 4 + blob.len() as u64;
+            bytes_written += 4 + row.blob.len() as u64;
         }
         writer
             .flush()
@@ -562,7 +575,7 @@ impl SorterCursor {
         // Collect all runs: disk runs first, then in-memory remainder.
         let mut run_iters: Vec<RunIterator> = Vec::with_capacity(self.spill_runs.len() + 1);
         for run in &self.spill_runs {
-            run_iters.push(RunIterator::from_file(&run.path)?);
+            run_iters.push(RunIterator::from_file(&run.path, self.key_columns)?);
         }
         if !self.rows.is_empty() {
             let mem_rows = std::mem::take(&mut self.rows);
@@ -657,6 +670,8 @@ enum RunIterator {
     File {
         reader: std::io::BufReader<std::fs::File>,
         current: Option<SorterRow>,
+        /// Number of leading sort-key columns to decode from spilled records.
+        key_columns: usize,
     },
     /// Records from an in-memory Vec (used for the final unsorted batch).
     Memory {
@@ -666,12 +681,13 @@ enum RunIterator {
 }
 
 impl RunIterator {
-    fn from_file(path: &std::path::Path) -> Result<Self> {
+    fn from_file(path: &std::path::Path, key_columns: usize) -> Result<Self> {
         let file = std::fs::File::open(path)
             .map_err(|e| FrankenError::internal(format!("sorter run open: {e}")))?;
         Ok(Self::File {
             reader: std::io::BufReader::new(file),
             current: None,
+            key_columns,
         })
     }
 
@@ -698,7 +714,11 @@ impl RunIterator {
 
     fn advance(&mut self) -> Result<()> {
         match self {
-            Self::File { reader, current } => {
+            Self::File {
+                reader,
+                current,
+                key_columns,
+            } => {
                 use std::io::Read;
                 let mut len_buf = [0u8; 4];
                 match reader.read_exact(&mut len_buf) {
@@ -708,9 +728,11 @@ impl RunIterator {
                         reader
                             .read_exact(&mut buf)
                             .map_err(|e| FrankenError::internal(format!("sorter run read: {e}")))?;
-                        let values = parse_record(&buf).ok_or_else(|| {
-                            FrankenError::internal("sorter run: malformed record")
-                        })?;
+                        // Decode only the sort-key prefix — not all columns.
+                        let values = fsqlite_types::record::parse_record_prefix(&buf, *key_columns)
+                            .ok_or_else(|| {
+                                FrankenError::internal("sorter run: malformed record")
+                            })?;
                         *current = Some(SorterRow { values, blob: buf });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -750,6 +772,10 @@ impl RunIterator {
 struct ConcurrentContext {
     /// Session ID for this concurrent transaction.
     session_id: u64,
+    /// Stable transaction ID used in hot-path logging.
+    txn_id: u64,
+    /// Immutable snapshot upper bound for this concurrent transaction.
+    snapshot_high: CommitSeq,
     /// Stable shared handle for this concurrent transaction.
     handle: SharedConcurrentHandle,
     /// Shared reference to the page-level lock table.
@@ -799,10 +825,19 @@ impl SharedTxnPageIo {
         commit_index: Arc<CommitIndex>,
         busy_timeout_ms: u64,
     ) -> Self {
+        let (txn_id, snapshot_high) = {
+            let handle_guard = handle.lock();
+            (
+                handle_guard.txn_token().id.get(),
+                handle_guard.snapshot().high,
+            )
+        };
         Self {
             txn: Rc::new(RefCell::new(txn)),
             concurrent: Some(ConcurrentContext {
                 session_id,
+                txn_id,
+                snapshot_high,
                 handle,
                 lock_table,
                 commit_index,
@@ -822,63 +857,453 @@ impl SharedTxnPageIo {
             ))),
         }
     }
-}
 
-const WRITE_BUSY_HANDOFF_BASE_SPINS: u32 = 64;
-const WRITE_BUSY_HANDOFF_MAX_SPINS: u32 = 2_048;
-const WRITE_BUSY_HANDOFF_YIELD_EVERY: u32 = 8;
+    fn clear_stale_synthetic_pending_commit_surface(
+        &self,
+        _cx: &Cx,
+        operation: &str,
+    ) -> Result<()> {
+        let Some(ctx) = &self.concurrent else {
+            return Ok(());
+        };
+        let pending_commit_pages = self.txn.borrow().pending_commit_pages()?;
+        let pending_commit_surface = pending_commit_pages.iter().copied().collect::<HashSet<_>>();
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BusyRetryWait {
-    attempt: u32,
-    spin_loops: u32,
-    yielded: bool,
-}
+        let pages_to_clear = {
+            let handle = ctx.handle.lock();
+            handle
+                .write_set_pages()
+                .into_iter()
+                .filter(|page| !pending_commit_surface.contains(page))
+                .filter(|page| {
+                    let state = concurrent_page_state(&handle, *page);
+                    state.is_synthetic_conflict_only()
+                })
+                .collect::<Vec<_>>()
+        };
 
-#[derive(Debug, Clone, Copy, Default)]
-struct BusyRetryHandoff {
-    next_attempt: u32,
-}
-
-impl BusyRetryHandoff {
-    fn next_wait(&mut self, started: Instant, deadline: Duration) -> Option<BusyRetryWait> {
-        if deadline.is_zero() || started.elapsed() >= deadline {
-            return None;
+        for page in pages_to_clear {
+            let mut handle = ctx.handle.lock();
+            concurrent_clear_page_state(&mut handle, &ctx.lock_table, ctx.session_id, page)
+                .map_err(|restore_error| {
+                    FrankenError::Internal(format!(
+                        "MVCC pending commit surface clear failed for page {} during {operation}: {restore_error}",
+                        page.get()
+                    ))
+                })?;
         }
 
-        let attempt = self.next_attempt.saturating_add(1);
-        self.next_attempt = attempt;
-        Some(BusyRetryWait {
-            attempt,
-            spin_loops: busy_retry_spin_loops(attempt),
-            yielded: busy_retry_should_yield(attempt),
-        })
+        Ok(())
+    }
+
+    fn write_page_internal(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+        page_data_base: PageData,
+    ) -> Result<()> {
+        // ═══════════════════════════════════════════════════════════════
+        // FAST PATH: Already-owned page — single lock, no retry loop.
+        //
+        // When this transaction already holds the page lock for `page_no`,
+        // there can be no commit-index conflict and no lock contention.
+        // Skip the full slow path (3 handle lock acquisitions, restore
+        // closure setup, commit-index check, retry loop, page-one state
+        // capture) and go directly to staging + pager write.
+        //
+        // This is the dominant path during balance/split operations where
+        // multiple writes go to the same page (read-modify-write cycle).
+        //
+        // Reduces handle lock acquisitions from 3 to 1 per write for
+        // already-owned pages.  Inspired by the profile evidence showing
+        // 95% of cycles in write_page with IPC 0.05 due to lock convoy.
+        // ═══════════════════════════════════════════════════════════════
+        if let Some(ref ctx) = self.concurrent {
+            let mut handle = ctx.handle.lock();
+            if handle.holds_page_lock(page_no) {
+                // Page-one conflict tracking: add if needed and not yet tracked.
+                if page_no != PageNumber::ONE {
+                    let needs_p1 = self
+                        .txn
+                        .borrow()
+                        .write_page_requires_page_one_conflict_tracking(page_no)?;
+                    if needs_p1 && !handle.tracks_write_conflict_page(PageNumber::ONE) {
+                        drop(handle);
+                        track_concurrent_conflict_only_page(
+                            cx,
+                            ctx,
+                            PageNumber::ONE,
+                            "write_page_fast",
+                        )?;
+                        handle = ctx.handle.lock();
+                    }
+                }
+                // Capture prior state so we can restore on pager write failure,
+                // matching the slow path's error-recovery contract.
+                let prior_state = concurrent_page_state(&handle, page_no);
+                // Stage page data in MVCC handle (single lock acquisition).
+                if let Err(stage_error) = concurrent_stage_prepared_write_page(
+                    &mut handle,
+                    page_no,
+                    page_data_base.clone(),
+                ) {
+                    return Err(FrankenError::Internal(format!(
+                        "MVCC fast-path staging failed: {stage_error}"
+                    )));
+                }
+                drop(handle);
+                // Write to pager.
+                if let Err(write_error) =
+                    self.txn
+                        .borrow_mut()
+                        .write_page_data(cx, page_no, page_data_base)
+                {
+                    // Restore prior MVCC state to keep handle consistent
+                    // with the pager's write set on failure.
+                    let mut restore_handle = ctx.handle.lock();
+                    if let Err(restore_error) = concurrent_restore_page_state(
+                        &mut restore_handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        &prior_state,
+                    ) {
+                        return Err(FrankenError::Internal(format!(
+                            "pager write_page failed: {write_error}; \
+                             MVCC fast-path restore failed: {restore_error}"
+                        )));
+                    }
+                    return Err(write_error);
+                }
+                self.clear_stale_synthetic_pending_commit_surface(cx, "write_page_fast")?;
+                return Ok(());
+            }
+            drop(handle);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // SLOW PATH: New page acquisition (full concurrent machinery).
+        // ═══════════════════════════════════════════════════════════════
+        let page_one_tracking_required = self
+            .concurrent
+            .as_ref()
+            .map(|_| {
+                if page_no == PageNumber::ONE {
+                    return Ok(false);
+                }
+                self.txn
+                    .borrow()
+                    .write_page_requires_page_one_conflict_tracking(page_no)
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let (prior_page_state, page_one_state) = if let Some(ctx) = &self.concurrent {
+            let handle = ctx.handle.lock();
+            let prior_page_state = Some(concurrent_page_state(&handle, page_no));
+            let page_one_state = if page_one_tracking_required {
+                if !handle.tracks_write_conflict_page(PageNumber::ONE) {
+                    Some(concurrent_page_state(&handle, PageNumber::ONE))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (prior_page_state, page_one_state)
+        } else {
+            (None, None)
+        };
+        let restore_concurrent_state = || -> std::result::Result<(), String> {
+            let Some(ctx) = &self.concurrent else {
+                return Ok(());
+            };
+            let mut handle = ctx.handle.lock();
+            if let Some(prior_page_state) = prior_page_state.as_ref()
+                && let Err(restore_error) = concurrent_restore_page_state(
+                    &mut handle,
+                    &ctx.lock_table,
+                    ctx.session_id,
+                    prior_page_state,
+                )
+            {
+                return Err(format!("MVCC state restore failed: {restore_error}"));
+            }
+            if let Some(page_one_state) = page_one_state.as_ref()
+                && let Err(restore_error) = concurrent_restore_page_state(
+                    &mut handle,
+                    &ctx.lock_table,
+                    ctx.session_id,
+                    page_one_state,
+                )
+            {
+                return Err(format!("MVCC page1 restore failed: {restore_error}"));
+            }
+            Ok(())
+        };
+        if let Some(ref ctx) = self.concurrent {
+            if page_one_state.is_some() {
+                track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "write_page")?;
+            }
+            let started = Instant::now();
+            let deadline = Duration::from_millis(ctx.busy_timeout_ms);
+
+            loop {
+                observe_execution_cancellation(cx)?;
+                let (write_result, conflicting_commit_seq) = {
+                    let mut handle = ctx.handle.lock();
+                    let conflicting_commit_seq = (!handle.holds_page_lock(page_no))
+                        .then(|| ctx.commit_index.latest(page_no))
+                        .flatten()
+                        .filter(|seq| *seq > ctx.snapshot_high);
+                    let write_result = conflicting_commit_seq.is_none().then(|| {
+                        concurrent_prepare_write_page(
+                            &mut handle,
+                            &ctx.lock_table,
+                            ctx.session_id,
+                            page_no,
+                        )
+                    });
+                    (write_result, conflicting_commit_seq)
+                };
+                let txn_id = ctx.txn_id;
+                let snapshot_high = ctx.snapshot_high.get();
+
+                if let Some(conflicting_commit_seq) = conflicting_commit_seq {
+                    let error = FrankenError::BusySnapshot {
+                        conflicting_pages: page_no.get().to_string(),
+                    };
+                    if let Err(restore_error) = restore_concurrent_state() {
+                        return Err(FrankenError::Internal(format!("{error}; {restore_error}")));
+                    }
+                    tracing::warn!(
+                        txn_id,
+                        commit_seq = conflicting_commit_seq.get(),
+                        snapshot_high,
+                        page_id = page_no.get(),
+                        visibility_decision = "write_snapshot_stale",
+                        conflict_reason = "fcw_base_drift",
+                        "mvcc write rejected due to stale snapshot"
+                    );
+                    return Err(error);
+                }
+
+                match write_result.expect("write result must exist when snapshot is valid") {
+                    Ok(()) => {
+                        tracing::debug!(
+                            txn_id,
+                            commit_seq = snapshot_high,
+                            snapshot_high,
+                            page_id = page_no.get(),
+                            visibility_decision = "write_lock_acquired",
+                            conflict_reason = "none",
+                            "mvcc write visibility decision"
+                        );
+                        break;
+                    }
+                    Err(MvccError::Busy) => {
+                        let remaining = deadline.saturating_sub(started.elapsed());
+                        match wait_for_page_lock_holder_change(cx, ctx, page_no, remaining) {
+                            Ok(true) => {
+                                tracing::warn!(
+                                    txn_id,
+                                    commit_seq = snapshot_high,
+                                    snapshot_high,
+                                    page_id = page_no.get(),
+                                    visibility_decision = "write_retry",
+                                    conflict_reason = "page_lock_busy",
+                                    retry_policy = "park_wake",
+                                    retry_wait_ms = remaining.as_millis(),
+                                    "mvcc write conflict detected"
+                                );
+                            }
+                            Ok(false) => {
+                                let error = FrankenError::Busy;
+                                if let Err(restore_error) = restore_concurrent_state() {
+                                    return Err(FrankenError::Internal(format!(
+                                        "{error}; {restore_error}"
+                                    )));
+                                }
+                                tracing::warn!(
+                                    txn_id,
+                                    commit_seq = snapshot_high,
+                                    snapshot_high,
+                                    page_id = page_no.get(),
+                                    visibility_decision = "write_busy_timeout",
+                                    conflict_reason = "page_lock_busy",
+                                    retry_policy = "park_wake",
+                                    "mvcc write conflict exceeded busy timeout"
+                                );
+                                return Err(error);
+                            }
+                            Err(wait_error) => {
+                                if let Err(restore_error) = restore_concurrent_state() {
+                                    return Err(FrankenError::Internal(format!(
+                                        "{wait_error}; {restore_error}"
+                                    )));
+                                }
+                                return Err(wait_error);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let error = FrankenError::Internal(format!("MVCC write_page failed: {e}"));
+                        if let Err(restore_error) = restore_concurrent_state() {
+                            return Err(FrankenError::Internal(format!(
+                                "{error}; {restore_error}"
+                            )));
+                        }
+                        tracing::warn!(
+                            txn_id,
+                            commit_seq = snapshot_high,
+                            snapshot_high,
+                            page_id = page_no.get(),
+                            visibility_decision = "write_abort",
+                            conflict_reason = %e,
+                            "mvcc write failed"
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        let mut staged_page_data = Some(page_data_base);
+        if let Some(ctx) = &self.concurrent {
+            let stage_result = {
+                let mut handle = ctx.handle.lock();
+                concurrent_stage_prepared_write_page(
+                    &mut handle,
+                    page_no,
+                    staged_page_data
+                        .clone()
+                        .expect("concurrent write staging requires preserved page payload"),
+                )
+            };
+            if let Err(stage_error) = stage_result {
+                let error =
+                    FrankenError::Internal(format!("MVCC write staging failed: {stage_error}"));
+                if let Err(restore_error) = restore_concurrent_state() {
+                    return Err(FrankenError::Internal(format!("{error}; {restore_error}")));
+                }
+                return Err(error);
+            }
+        }
+        let pager_write_data = if self.concurrent.is_some() {
+            staged_page_data
+                .clone()
+                .expect("staged page data must be present before pager write")
+        } else {
+            staged_page_data
+                .take()
+                .expect("non-concurrent pager writes consume the owned page data once")
+        };
+        let write_result = self
+            .txn
+            .borrow_mut()
+            .write_page_data(cx, page_no, pager_write_data);
+        if let Err(write_error) = write_result {
+            if let Some(ctx) = &self.concurrent {
+                let mut handle = ctx.handle.lock();
+                if let Some(prior_page_state) = prior_page_state.as_ref()
+                    && let Err(restore_error) = concurrent_restore_page_state(
+                        &mut handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        prior_page_state,
+                    )
+                {
+                    return Err(FrankenError::Internal(format!(
+                        "pager write_page failed: {write_error}; MVCC state restore failed: {restore_error}"
+                    )));
+                }
+                if let Some(page_one_state) = page_one_state.as_ref()
+                    && let Err(restore_error) = concurrent_restore_page_state(
+                        &mut handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        page_one_state,
+                    )
+                {
+                    return Err(FrankenError::Internal(format!(
+                        "pager write_page failed: {write_error}; MVCC page1 restore failed: {restore_error}"
+                    )));
+                }
+            }
+            return Err(write_error);
+        }
+        self.clear_stale_synthetic_pending_commit_surface(cx, "write_page")?;
+        Ok(())
     }
 }
 
-const fn busy_retry_spin_loops(attempt: u32) -> u32 {
-    let growth = attempt.saturating_sub(1);
-    let shift = if growth > 5 { 5 } else { growth };
-    let spins = WRITE_BUSY_HANDOFF_BASE_SPINS << shift;
-    if spins > WRITE_BUSY_HANDOFF_MAX_SPINS {
-        WRITE_BUSY_HANDOFF_MAX_SPINS
-    } else {
-        spins
+const PAGE_LOCK_WAIT_CANCELLATION_POLL: Duration = Duration::from_millis(5);
+
+fn normalize_owned_page_data(page_size: usize, data: &[u8]) -> Result<PageData> {
+    if data.len() == page_size {
+        return Ok(PageData::from_vec(data.to_vec()));
     }
-}
-
-const fn busy_retry_should_yield(attempt: u32) -> bool {
-    attempt >= WRITE_BUSY_HANDOFF_YIELD_EVERY && attempt % WRITE_BUSY_HANDOFF_YIELD_EVERY == 0
-}
-
-fn perform_busy_retry_handoff(wait: BusyRetryWait) {
-    for _ in 0..wait.spin_loops {
-        std::hint::spin_loop();
+    if data.len() > page_size {
+        return Err(FrankenError::Internal(format!(
+            "page buffer exceeds page size invariant: {} > {}",
+            data.len(),
+            page_size
+        )));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    if wait.yielded {
-        std::thread::yield_now();
+    let mut page = vec![0_u8; page_size];
+    page[..data.len()].copy_from_slice(data);
+    Ok(PageData::from_vec(page))
+}
+
+fn normalize_page_data_to_size(page_size: usize, data: PageData) -> Result<PageData> {
+    if data.len() == page_size {
+        return Ok(data);
+    }
+    if data.len() > page_size {
+        return Err(FrankenError::Internal(format!(
+            "page buffer exceeds page size invariant: {} > {}",
+            data.len(),
+            page_size
+        )));
+    }
+
+    normalize_owned_page_data(page_size, data.as_bytes())
+}
+
+fn wait_for_page_lock_holder_change(
+    cx: &Cx,
+    ctx: &ConcurrentContext,
+    page_no: PageNumber,
+    remaining: Duration,
+) -> Result<bool> {
+    observe_execution_cancellation(cx)?;
+
+    let Some(holder) = ctx.lock_table.holder(page_no) else {
+        return Ok(true);
+    };
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+
+    let started = Instant::now();
+    loop {
+        observe_execution_cancellation(cx)?;
+
+        let wait_budget = remaining.saturating_sub(started.elapsed());
+        if wait_budget.is_zero() {
+            return Ok(false);
+        }
+
+        let wait_slice = wait_budget.min(PAGE_LOCK_WAIT_CANCELLATION_POLL);
+        if ctx
+            .lock_table
+            .wait_for_holder_change(page_no, holder, wait_slice)
+        {
+            return Ok(true);
+        }
+
+        if ctx.lock_table.holder(page_no) != Some(holder) {
+            return Ok(true);
+        }
     }
 }
 
@@ -890,23 +1315,42 @@ fn track_concurrent_conflict_only_page(
 ) -> Result<()> {
     let started = Instant::now();
     let deadline = Duration::from_millis(ctx.busy_timeout_ms);
-    let mut handoff = BusyRetryHandoff::default();
 
     loop {
         observe_execution_cancellation(cx)?;
-        let (txn_id, snapshot_high, conflicting_commit_seq) = {
-            let handle = ctx.handle.lock();
-            let snapshot_high = handle.snapshot().high;
-            let conflicting_commit_seq = (!handle.tracks_write_conflict_page(page_no))
+        let (track_result, already_tracked, conflicting_commit_seq) = {
+            let mut handle = ctx.handle.lock();
+            let already_tracked = handle.tracks_write_conflict_page(page_no);
+            let conflicting_commit_seq = (!handle.holds_page_lock(page_no))
                 .then(|| ctx.commit_index.latest(page_no))
                 .flatten()
-                .filter(|seq| *seq > snapshot_high);
-            (
-                handle.txn_token().id.get(),
-                snapshot_high.get(),
-                conflicting_commit_seq,
-            )
+                .filter(|seq| *seq > ctx.snapshot_high);
+            let track_result = conflicting_commit_seq.is_none().then(|| {
+                concurrent_track_write_conflict_page(
+                    &mut handle,
+                    &ctx.lock_table,
+                    ctx.session_id,
+                    page_no,
+                )
+            });
+            (track_result, already_tracked, conflicting_commit_seq)
         };
+        let txn_id = ctx.txn_id;
+        let snapshot_high = ctx.snapshot_high.get();
+
+        if already_tracked {
+            tracing::debug!(
+                txn_id,
+                commit_seq = snapshot_high,
+                snapshot_high,
+                page_id = page_no.get(),
+                visibility_decision = "conflict_only_already_tracked",
+                conflict_reason = "none",
+                operation,
+                "mvcc conflict-only page already tracked"
+            );
+            return Ok(());
+        }
 
         if let Some(conflicting_commit_seq) = conflicting_commit_seq {
             tracing::warn!(
@@ -924,20 +1368,7 @@ fn track_concurrent_conflict_only_page(
             });
         }
 
-        let (track_result, txn_id, snapshot_high) = {
-            let mut handle = ctx.handle.lock();
-            let txn_id = handle.txn_token().id.get();
-            let snapshot_high = handle.snapshot().high.get();
-            let track_result = concurrent_track_write_conflict_page(
-                &mut handle,
-                &ctx.lock_table,
-                ctx.session_id,
-                page_no,
-            );
-            (track_result, txn_id, snapshot_high)
-        };
-
-        match track_result {
+        match track_result.expect("track result must exist when snapshot is valid") {
             Ok(()) => {
                 tracing::debug!(
                     txn_id,
@@ -952,7 +1383,8 @@ fn track_concurrent_conflict_only_page(
                 return Ok(());
             }
             Err(MvccError::Busy) => {
-                let Some(wait) = handoff.next_wait(started, deadline) else {
+                let remaining = deadline.saturating_sub(started.elapsed());
+                if !wait_for_page_lock_holder_change(cx, ctx, page_no, remaining)? {
                     tracing::warn!(
                         txn_id,
                         commit_seq = snapshot_high,
@@ -961,11 +1393,11 @@ fn track_concurrent_conflict_only_page(
                         visibility_decision = "conflict_only_busy_timeout",
                         conflict_reason = "page_lock_busy",
                         operation,
-                        retry_policy = "bounded_handoff",
+                        retry_policy = "park_wake",
                         "mvcc conflict-only page exceeded busy timeout"
                     );
                     return Err(FrankenError::Busy);
-                };
+                }
 
                 tracing::warn!(
                     txn_id,
@@ -975,13 +1407,10 @@ fn track_concurrent_conflict_only_page(
                     visibility_decision = "conflict_only_retry",
                     conflict_reason = "page_lock_busy",
                     operation,
-                    retry_policy = "bounded_handoff",
-                    retry_attempt = wait.attempt,
-                    retry_spin_loops = wait.spin_loops,
-                    retry_yielded = wait.yielded,
+                    retry_policy = "park_wake",
+                    retry_wait_ms = remaining.as_millis(),
                     "mvcc conflict-only page contention detected"
                 );
-                perform_busy_retry_handoff(wait);
             }
             Err(e) => {
                 tracing::warn!(
@@ -1007,9 +1436,9 @@ impl PageReader for SharedTxnPageIo {
         if let Some(ctx) = &self.concurrent {
             // Read-own-writes visibility: if this txn already wrote the page,
             // return that version first and still record the read for SSI.
+            let txn_id = ctx.txn_id;
+            let snapshot_high = ctx.snapshot_high.get();
             let mut handle = ctx.handle.lock();
-            let txn_id = handle.txn_token().id.get();
-            let snapshot_high = handle.snapshot().high.get();
             if concurrent_page_is_freed(&handle, page_no) {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -1066,158 +1495,43 @@ impl PageReader for SharedTxnPageIo {
 
 impl PageWriter for SharedTxnPageIo {
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        // bd-kivg / 5E.2: Acquire page-level lock and record in write set if concurrent.
-        let prior_page_state = self
-            .concurrent
-            .as_ref()
-            .map(|ctx| {
-                let handle = ctx.handle.lock();
-                Ok::<_, FrankenError>(concurrent_page_state(&handle, page_no))
-            })
-            .transpose()?;
-        if let Some(ref ctx) = self.concurrent {
-            let started = Instant::now();
-            let deadline = Duration::from_millis(ctx.busy_timeout_ms);
-            let mut handoff = BusyRetryHandoff::default();
+        let page_size = self.txn.borrow().page_size().as_usize();
+        let page_data = normalize_owned_page_data(page_size, data)?;
+        self.write_page_internal(cx, page_no, page_data)
+    }
 
-            let page_data_base = PageData::from_vec(data.to_vec());
-
-            loop {
-                observe_execution_cancellation(cx)?;
-                let page_data = page_data_base.clone();
-                let (write_result, txn_id, snapshot_high, conflicting_commit_seq) = {
-                    let mut handle = ctx.handle.lock();
-                    let txn_id = handle.txn_token().id.get();
-                    let snapshot_high = handle.snapshot().high;
-                    let conflicting_commit_seq = (!handle.tracks_write_conflict_page(page_no))
-                        .then(|| ctx.commit_index.latest(page_no))
-                        .flatten()
-                        .filter(|seq| *seq > snapshot_high);
-                    let write_result = conflicting_commit_seq.is_none().then(|| {
-                        concurrent_write_page(
-                            &mut handle,
-                            &ctx.lock_table,
-                            ctx.session_id,
-                            page_no,
-                            page_data,
-                        )
-                    });
-                    (
-                        write_result,
-                        txn_id,
-                        snapshot_high.get(),
-                        conflicting_commit_seq,
-                    )
-                };
-
-                if let Some(conflicting_commit_seq) = conflicting_commit_seq {
-                    tracing::warn!(
-                        txn_id,
-                        commit_seq = conflicting_commit_seq.get(),
-                        snapshot_high,
-                        page_id = page_no.get(),
-                        visibility_decision = "write_snapshot_stale",
-                        conflict_reason = "fcw_base_drift",
-                        "mvcc write rejected due to stale snapshot"
-                    );
-                    return Err(FrankenError::BusySnapshot {
-                        conflicting_pages: page_no.get().to_string(),
-                    });
-                }
-
-                match write_result.expect("write result must exist when snapshot is valid") {
-                    Ok(()) => {
-                        tracing::debug!(
-                            txn_id,
-                            commit_seq = snapshot_high,
-                            snapshot_high,
-                            page_id = page_no.get(),
-                            visibility_decision = "write_set_recorded",
-                            conflict_reason = "none",
-                            "mvcc write visibility decision"
-                        );
-                        break;
-                    }
-                    Err(MvccError::Busy) => {
-                        let Some(wait) = handoff.next_wait(started, deadline) else {
-                            tracing::warn!(
-                                txn_id,
-                                commit_seq = snapshot_high,
-                                snapshot_high,
-                                page_id = page_no.get(),
-                                visibility_decision = "write_busy_timeout",
-                                conflict_reason = "page_lock_busy",
-                                retry_policy = "bounded_handoff",
-                                "mvcc write conflict exceeded busy timeout"
-                            );
-                            return Err(FrankenError::Busy);
-                        };
-
-                        tracing::warn!(
-                            txn_id,
-                            commit_seq = snapshot_high,
-                            snapshot_high,
-                            page_id = page_no.get(),
-                            visibility_decision = "write_retry",
-                            conflict_reason = "page_lock_busy",
-                            retry_policy = "bounded_handoff",
-                            retry_attempt = wait.attempt,
-                            retry_spin_loops = wait.spin_loops,
-                            retry_yielded = wait.yielded,
-                            "mvcc write conflict detected"
-                        );
-                        perform_busy_retry_handoff(wait);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            txn_id,
-                            commit_seq = snapshot_high,
-                            snapshot_high,
-                            page_id = page_no.get(),
-                            visibility_decision = "write_abort",
-                            conflict_reason = %e,
-                            "mvcc write failed"
-                        );
-                        return Err(FrankenError::Internal(format!(
-                            "MVCC write_page failed: {e}"
-                        )));
-                    }
-                }
-            }
-        }
-        // Persist to the underlying transaction.
-        let write_result = self.txn.borrow_mut().write_page(cx, page_no, data);
-        if let Err(write_error) = write_result {
-            if let (Some(ctx), Some(prior_page_state)) =
-                (&self.concurrent, prior_page_state.as_ref())
-            {
-                let mut handle = ctx.handle.lock();
-                if let Err(restore_error) = concurrent_restore_page_state(
-                    &mut handle,
-                    &ctx.lock_table,
-                    ctx.session_id,
-                    prior_page_state,
-                ) {
-                    return Err(FrankenError::Internal(format!(
-                        "pager write_page failed: {write_error}; MVCC state restore failed: {restore_error}"
-                    )));
-                }
-            }
-            return Err(write_error);
-        }
-        Ok(())
+    fn write_page_data(&mut self, cx: &Cx, page_no: PageNumber, data: PageData) -> Result<()> {
+        let page_size = self.txn.borrow().page_size().as_usize();
+        let page_data = normalize_page_data_to_size(page_size, data)?;
+        self.write_page_internal(cx, page_no, page_data)
     }
 
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-        let page_one_state = self
+        let page_one_tracking_required = self
             .concurrent
             .as_ref()
-            .map(|ctx| {
-                let handle = ctx.handle.lock();
-                Ok::<_, FrankenError>(concurrent_page_state(&handle, PageNumber::ONE))
+            .map(|_| {
+                self.txn
+                    .borrow()
+                    .allocate_page_requires_page_one_conflict_tracking()
             })
-            .transpose()?;
-        if let Some(ctx) = &self.concurrent {
+            .transpose()?
+            .unwrap_or(false);
+        let page_one_state = self.concurrent.as_ref().and_then(|ctx| {
+            let handle = ctx.handle.lock();
+            if page_one_tracking_required {
+                if !handle.tracks_write_conflict_page(PageNumber::ONE) {
+                    Some(concurrent_page_state(&handle, PageNumber::ONE))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        if let Some(ctx) = &self.concurrent
+            && page_one_state.is_some()
+        {
             track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "allocate_page")?;
         }
         let allocate_result = self.txn.borrow_mut().allocate_page(cx);
@@ -1236,43 +1550,54 @@ impl PageWriter for SharedTxnPageIo {
                 }
             }
         }
-        allocate_result
+        let page_no = allocate_result?;
+        self.clear_stale_synthetic_pending_commit_surface(cx, "allocate_page")?;
+        Ok(page_no)
     }
 
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        let prior_page_state = self
+        let page_one_tracking_required = self
             .concurrent
             .as_ref()
-            .map(|ctx| {
-                let handle = ctx.handle.lock();
-                Ok::<_, FrankenError>(concurrent_page_state(&handle, page_no))
+            .map(|_| {
+                self.txn
+                    .borrow()
+                    .free_page_requires_page_one_conflict_tracking(page_no)
             })
-            .transpose()?;
-        let page_one_state = self
-            .concurrent
-            .as_ref()
-            .map(|ctx| {
-                let handle = ctx.handle.lock();
-                Ok::<_, FrankenError>(concurrent_page_state(&handle, PageNumber::ONE))
-            })
-            .transpose()?;
+            .transpose()?
+            .unwrap_or(false);
+        let (prior_page_state, page_one_state) = if let Some(ctx) = &self.concurrent {
+            let handle = ctx.handle.lock();
+            let prior_page_state = Some(concurrent_page_state(&handle, page_no));
+            let page_one_state = if page_one_tracking_required {
+                if !handle.tracks_write_conflict_page(PageNumber::ONE) {
+                    Some(concurrent_page_state(&handle, PageNumber::ONE))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (prior_page_state, page_one_state)
+        } else {
+            (None, None)
+        };
         if let Some(ref ctx) = self.concurrent {
-            track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "free_page")?;
+            if page_one_state.is_some() {
+                track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "free_page")?;
+            }
             let concurrent_free_result = (|| -> Result<()> {
                 let started = Instant::now();
                 let deadline = Duration::from_millis(ctx.busy_timeout_ms);
-                let mut handoff = BusyRetryHandoff::default();
 
                 loop {
                     observe_execution_cancellation(cx)?;
-                    let (free_result, txn_id, snapshot_high, conflicting_commit_seq) = {
+                    let (free_result, conflicting_commit_seq) = {
                         let mut handle = ctx.handle.lock();
-                        let txn_id = handle.txn_token().id.get();
-                        let snapshot_high = handle.snapshot().high;
-                        let conflicting_commit_seq = (!handle.tracks_write_conflict_page(page_no))
+                        let conflicting_commit_seq = (!handle.holds_page_lock(page_no))
                             .then(|| ctx.commit_index.latest(page_no))
                             .flatten()
-                            .filter(|seq| *seq > snapshot_high);
+                            .filter(|seq| *seq > ctx.snapshot_high);
                         let free_result = conflicting_commit_seq.is_none().then(|| {
                             concurrent_free_page(
                                 &mut handle,
@@ -1281,13 +1606,10 @@ impl PageWriter for SharedTxnPageIo {
                                 page_no,
                             )
                         });
-                        (
-                            free_result,
-                            txn_id,
-                            snapshot_high.get(),
-                            conflicting_commit_seq,
-                        )
+                        (free_result, conflicting_commit_seq)
                     };
+                    let txn_id = ctx.txn_id;
+                    let snapshot_high = ctx.snapshot_high.get();
 
                     if let Some(conflicting_commit_seq) = conflicting_commit_seq {
                         tracing::warn!(
@@ -1318,7 +1640,8 @@ impl PageWriter for SharedTxnPageIo {
                             return Ok(());
                         }
                         Err(MvccError::Busy) => {
-                            let Some(wait) = handoff.next_wait(started, deadline) else {
+                            let remaining = deadline.saturating_sub(started.elapsed());
+                            if !wait_for_page_lock_holder_change(cx, ctx, page_no, remaining)? {
                                 tracing::warn!(
                                     txn_id,
                                     commit_seq = snapshot_high,
@@ -1326,11 +1649,11 @@ impl PageWriter for SharedTxnPageIo {
                                     page_id = page_no.get(),
                                     visibility_decision = "free_busy_timeout",
                                     conflict_reason = "page_lock_busy",
-                                    retry_policy = "bounded_handoff",
+                                    retry_policy = "park_wake",
                                     "mvcc free conflict exceeded busy timeout"
                                 );
                                 return Err(FrankenError::Busy);
-                            };
+                            }
 
                             tracing::warn!(
                                 txn_id,
@@ -1339,13 +1662,10 @@ impl PageWriter for SharedTxnPageIo {
                                 page_id = page_no.get(),
                                 visibility_decision = "free_retry",
                                 conflict_reason = "page_lock_busy",
-                                retry_policy = "bounded_handoff",
-                                retry_attempt = wait.attempt,
-                                retry_spin_loops = wait.spin_loops,
-                                retry_yielded = wait.yielded,
+                                retry_policy = "park_wake",
+                                retry_wait_ms = remaining.as_millis(),
                                 "mvcc free conflict detected"
                             );
-                            perform_busy_retry_handoff(wait);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -1424,6 +1744,7 @@ impl PageWriter for SharedTxnPageIo {
             }
             return Err(free_error);
         }
+        self.clear_stale_synthetic_pending_commit_surface(cx, "free_page")?;
         Ok(())
     }
 
@@ -1803,8 +2124,24 @@ struct StorageCursor {
     target_vals_buf: Vec<SqliteValue>,
     /// Scratch buffer for parsing current index keys.
     cur_vals_buf: Vec<SqliteValue>,
-    /// Cached decoded table row for repeated `Column` reads at one position.
+    /// Lazily-populated decoded columns for the current row.
+    ///
+    /// Unlike the original eager-decode path, columns are decoded on demand
+    /// from `header_offsets` + `payload_buf`.  The `decoded_mask` tracks
+    /// which slots contain materialized values (up to 64 columns; records
+    /// wider than 64 columns fall back to eager full-decode).
     row_vals_buf: Vec<SqliteValue>,
+    /// Pre-parsed record header offset table for lazy column access.
+    ///
+    /// Populated when the cursor moves to a new position.  Individual
+    /// columns are then decoded on demand via
+    /// [`fsqlite_types::record::decode_column_from_offset`].
+    header_offsets: Vec<fsqlite_types::record::ColumnOffset>,
+    /// Bitmask tracking which columns in `row_vals_buf` have been decoded.
+    ///
+    /// Bit *i* is set when `row_vals_buf[i]` contains a materialized value.
+    /// For records with >64 columns, all bits are pre-set (eager decode).
+    decoded_mask: u64,
     /// Cache the cursor's physical position to avoid redundant payload reads.
     last_position_stamp: Option<(u32, u16)>,
 }
@@ -4295,6 +4632,8 @@ impl VdbeEngine {
                             target_vals_buf: Vec::new(),
                             cur_vals_buf: Vec::new(),
                             row_vals_buf: Vec::new(),
+                            header_offsets: Vec::new(),
+                            decoded_mask: 0,
                             last_position_stamp: None,
                         },
                     );
@@ -4332,21 +4671,21 @@ impl VdbeEngine {
                 }
 
                 Opcode::String8 => {
-                    let val = match &op.p4 {
-                        P4::Str(s) => s.clone(),
-                        _ => String::new(),
-                    };
-                    self.set_reg(op.p2, SqliteValue::Text(val));
+                    // Write text constant to register, reusing the
+                    // register's existing String buffer when possible.
+                    match &op.p4 {
+                        P4::Str(s) => self.write_text_to_reg(op.p2, s),
+                        _ => self.set_reg(op.p2, SqliteValue::Text(String::new())),
+                    }
                     pc += 1;
                 }
 
                 Opcode::String => {
                     // p1 = length, p4 = string data. Same as String8 for us.
-                    let val = match &op.p4 {
-                        P4::Str(s) => s.clone(),
-                        _ => String::new(),
-                    };
-                    self.set_reg(op.p2, SqliteValue::Text(val));
+                    match &op.p4 {
+                        P4::Str(s) => self.write_text_to_reg(op.p2, s),
+                        _ => self.set_reg(op.p2, SqliteValue::Text(String::new())),
+                    }
                     pc += 1;
                 }
 
@@ -4368,11 +4707,12 @@ impl VdbeEngine {
                 }
 
                 Opcode::Blob => {
-                    let val = match &op.p4 {
-                        P4::Blob(b) => b.clone(),
-                        _ => Vec::new(),
-                    };
-                    self.set_reg(op.p2, SqliteValue::Blob(val));
+                    // Write blob constant to register, reusing the
+                    // register's existing Vec<u8> buffer when possible.
+                    match &op.p4 {
+                        P4::Blob(b) => self.write_blob_to_reg(op.p2, b),
+                        _ => self.set_reg(op.p2, SqliteValue::Blob(Vec::new())),
+                    }
                     pc += 1;
                 }
 
@@ -4381,8 +4721,10 @@ impl VdbeEngine {
                     // Move p3 registers from p1 to p2.
                     // To handle potential overlap correctly, we collect all source
                     // values into a temporary buffer before writing them to the destination.
+                    // SmallVec avoids heap allocation for typical 1-8 register moves.
                     let count = usize::try_from(op.p3).unwrap_or(0);
-                    let mut temp = Vec::with_capacity(count);
+                    let mut temp: smallvec::SmallVec<[SqliteValue; 8]> =
+                        smallvec::SmallVec::with_capacity(count);
 
                     for offset in 0..count {
                         let value = Self::reg_with_offset(op.p1, offset)
@@ -4485,14 +4827,39 @@ impl VdbeEngine {
                 // ── String Concatenation ────────────────────────────────
                 Opcode::Concat => {
                     // Concatenate p1 and p2 into p3.
+                    // SQLite concat order: result = b || a  (p2 first, then p1).
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
                     let result = if a.is_null() || b.is_null() {
                         SqliteValue::Null
                     } else {
-                        let mut s = b.to_text();
-                        s.push_str(&a.to_text());
-                        SqliteValue::Text(s)
+                        // Fast path: when both are already Text, avoid the
+                        // to_text() clone+allocation on the second operand.
+                        match (b, a) {
+                            (SqliteValue::Text(bs), SqliteValue::Text(as_)) => {
+                                let mut s = String::with_capacity(bs.len() + as_.len());
+                                s.push_str(bs);
+                                s.push_str(as_);
+                                SqliteValue::Text(s)
+                            }
+                            (SqliteValue::Text(bs), a_val) => {
+                                let a_text = a_val.to_text();
+                                let mut s = String::with_capacity(bs.len() + a_text.len());
+                                s.push_str(bs);
+                                s.push_str(&a_text);
+                                SqliteValue::Text(s)
+                            }
+                            (b_val, SqliteValue::Text(as_)) => {
+                                let mut s = b_val.to_text();
+                                s.push_str(as_);
+                                SqliteValue::Text(s)
+                            }
+                            _ => {
+                                let mut s = b.to_text();
+                                s.push_str(&a.to_text());
+                                SqliteValue::Text(s)
+                            }
+                        }
                     };
                     self.set_reg(op.p3, result);
                     pc += 1;
@@ -4936,6 +5303,8 @@ impl VdbeEngine {
                                 target_vals_buf: Vec::new(),
                                 cur_vals_buf: Vec::new(),
                                 row_vals_buf: Vec::new(),
+                                header_offsets: Vec::new(),
+                                decoded_mask: 0,
                                 last_position_stamp: None,
                             },
                         );
@@ -5239,11 +5608,20 @@ impl VdbeEngine {
 
                 Opcode::Column => {
                     // Read column p2 from cursor p1 into register p3.
+                    //
+                    // Fast path for storage cursors: write from the lazy
+                    // column cache directly into the target register,
+                    // reusing existing Text/Blob buffer capacity.  This
+                    // eliminates the alloc+dealloc cycle that the
+                    // cursor_column→clone→set_reg path requires for
+                    // every text/blob column on every row.
                     let cursor_id = op.p1;
                     let col_idx = op.p2 as usize;
                     let target = op.p3;
-                    let val = self.cursor_column(cursor_id, col_idx)?;
-                    self.set_reg(target, val);
+                    if !self.column_to_reg_direct(cursor_id, col_idx, target)? {
+                        let val = self.cursor_column(cursor_id, col_idx)?;
+                        self.set_reg(target, val);
+                    }
                     pc += 1;
                 }
 
@@ -6209,12 +6587,23 @@ impl VdbeEngine {
                 }
 
                 Opcode::SorterInsert => {
+                    // Move the record value out of the register instead of
+                    // cloning it — the register will be overwritten by the
+                    // next MakeRecord before it's read again.
+                    //
+                    // Lazy key decode: only decode the first `key_columns`
+                    // values (the sort key) instead of all columns.  The
+                    // raw blob is retained for output via `SorterData`.
                     let cursor_id = op.p1;
-                    let record = self.get_reg(op.p2).clone();
+                    let record = self.take_reg(op.p2);
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        let decoded = decode_record(&record)?;
                         let blob = record_blob_bytes(&record).to_vec();
-                        sorter.insert_row(decoded, blob)?;
+                        let key_values =
+                            fsqlite_types::record::parse_record_prefix(&blob, sorter.key_columns)
+                                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                detail: "malformed record in SorterInsert".to_owned(),
+                            })?;
+                        sorter.insert_row(key_values, blob)?;
                     }
                     pc += 1;
                 }
@@ -7916,8 +8305,12 @@ impl VdbeEngine {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
         // Register writes replace the logical value, so any prior subtype
-        // metadata must be discarded as well.
-        self.register_subtypes.remove(&r);
+        // metadata must be discarded as well.  Guard with is_empty() to
+        // avoid a HashMap probe on every register write — subtypes are
+        // rare (only JSON/pointer types).
+        if !self.register_subtypes.is_empty() {
+            self.register_subtypes.remove(&r);
+        }
         self.registers[idx] = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
@@ -7937,14 +8330,271 @@ impl VdbeEngine {
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
-        self.register_subtypes.remove(&r);
+        if !self.register_subtypes.is_empty() {
+            self.register_subtypes.remove(&r);
+        }
         self.registers[idx] = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
         };
     }
 
+    /// Write a text string to a register, reusing the existing `String`
+    /// buffer's capacity when the register already holds a `Text` value.
+    /// Avoids the allocate-then-free cycle for repeated text writes to the
+    /// same register (common in scan loops with string constant columns).
+    #[inline]
+    #[allow(clippy::cast_sign_loss)]
+    fn write_text_to_reg(&mut self, r: i32, text: &str) {
+        if !(0..=65535).contains(&r) {
+            return;
+        }
+        let idx = r as usize;
+        if idx >= self.registers.len() {
+            self.registers.resize(idx + 1, SqliteValue::Null);
+        }
+        if !self.register_subtypes.is_empty() {
+            self.register_subtypes.remove(&r);
+        }
+        match &mut self.registers[idx] {
+            SqliteValue::Text(existing) => {
+                existing.clear();
+                existing.push_str(text);
+            }
+            slot => {
+                *slot = SqliteValue::Text(text.to_owned());
+            }
+        }
+    }
+
+    /// Write a blob to a register, reusing the existing `Vec<u8>` buffer's
+    /// capacity when the register already holds a `Blob` value.
+    #[inline]
+    #[allow(clippy::cast_sign_loss)]
+    fn write_blob_to_reg(&mut self, r: i32, blob: &[u8]) {
+        if !(0..=65535).contains(&r) {
+            return;
+        }
+        let idx = r as usize;
+        if idx >= self.registers.len() {
+            self.registers.resize(idx + 1, SqliteValue::Null);
+        }
+        if !self.register_subtypes.is_empty() {
+            self.register_subtypes.remove(&r);
+        }
+        match &mut self.registers[idx] {
+            SqliteValue::Blob(existing) => {
+                existing.clear();
+                existing.extend_from_slice(blob);
+            }
+            slot => {
+                *slot = SqliteValue::Blob(blob.to_vec());
+            }
+        }
+    }
+
+    /// Zero-clone column-to-register write for storage cursors.
+    ///
+    /// Inlines the storage-cursor branch of [`cursor_column`] but writes
+    /// the column value *directly* into the target register, reusing
+    /// existing `Text`/`Blob` buffer capacity via disjoint struct field
+    /// borrows (`self.storage_cursors` vs `self.registers`).
+    ///
+    /// Returns `Ok(true)` when the column read was handled,
+    /// `Ok(false)` when the cursor is not a storage cursor (caller must
+    /// fall back to `cursor_column`).
+    #[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
+    fn column_to_reg_direct(
+        &mut self,
+        cursor_id: i32,
+        col_idx: usize,
+        target: i32,
+    ) -> Result<bool> {
+        let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(false);
+        };
+        if cursor.cursor.eof() {
+            self.set_reg(target, SqliteValue::Null);
+            return Ok(true);
+        }
+
+        // ── Ensure payload loaded and header parsed ────────────────
+        let position_stamp = cursor.cursor.position_stamp();
+        if cursor.last_position_stamp != position_stamp {
+            cursor
+                .cursor
+                .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
+            let col_count = fsqlite_types::record::parse_record_header_into(
+                &cursor.payload_buf,
+                &mut cursor.header_offsets,
+            )
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "malformed record header in cursor payload (direct path)".to_owned(),
+            })?;
+            if col_count > 64 {
+                cursor.row_vals_buf.clear();
+                fsqlite_types::record::parse_record_into(
+                    &cursor.payload_buf,
+                    &mut cursor.row_vals_buf,
+                );
+                cursor.decoded_mask = u64::MAX;
+            } else {
+                cursor.row_vals_buf.resize(col_count, SqliteValue::Null);
+                cursor.decoded_mask = 0;
+            }
+            cursor.last_position_stamp = position_stamp;
+        }
+
+        // ── Resolve IPK alias and payload column index ────────────
+        let root_page = self.cursor_root_pages.get(&cursor_id).copied();
+        let rowid = cursor.cursor.rowid(&cursor.cx)?;
+        let ipk_col_idx = root_page
+            .and_then(|rp| self.rowid_alias_col_by_root_page.get(&rp))
+            .copied();
+        let payload_includes = root_page.zip(ipk_col_idx).is_some_and(|(rp, ipk)| {
+            payload_includes_rowid_alias_lazy(
+                &cursor.header_offsets,
+                &cursor.payload_buf,
+                &mut cursor.row_vals_buf,
+                &mut cursor.decoded_mask,
+                rowid,
+                ipk,
+                self.table_column_count_by_root_page.get(&rp).copied(),
+            )
+        });
+
+        let payload_idx = if let Some(ipk) = ipk_col_idx {
+            if col_idx == ipk {
+                self.set_reg_fast(target, SqliteValue::Integer(rowid));
+                return Ok(true);
+            }
+            if col_idx > ipk && !payload_includes {
+                col_idx - 1
+            } else {
+                col_idx
+            }
+        } else {
+            col_idx
+        };
+
+        // ── Lazy decode + zero-clone register write ────────────────
+        let collect_vdbe_metrics = vdbe_metrics_enabled();
+
+        if payload_idx < cursor.header_offsets.len() {
+            // Already decoded? Write from cache to register with buffer reuse.
+            if payload_idx < 64 && cursor.decoded_mask & (1u64 << payload_idx) != 0 {
+                if let Some(cached) = cursor.row_vals_buf.get(payload_idx) {
+                    if collect_vdbe_metrics {
+                        FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                        record_decoded_value_metrics(cached);
+                    }
+                    // KEY OPTIMIZATION: write from &cached (borrows
+                    // self.storage_cursors) directly into self.registers
+                    // (disjoint struct field) — zero clone for matching types.
+                    let reg_idx = target as usize;
+                    if (0..=65535).contains(&target) {
+                        if reg_idx >= self.registers.len() {
+                            self.registers.resize(reg_idx + 1, SqliteValue::Null);
+                        }
+                        if !self.register_subtypes.is_empty() {
+                            self.register_subtypes.remove(&target);
+                        }
+                        match (&mut self.registers[reg_idx], cached) {
+                            (SqliteValue::Text(old), SqliteValue::Text(src)) => {
+                                old.clear();
+                                old.push_str(src);
+                            }
+                            (SqliteValue::Blob(old), SqliteValue::Blob(src)) => {
+                                old.clear();
+                                old.extend_from_slice(src);
+                            }
+                            // NaN → Null normalization (matches set_reg behavior).
+                            (slot, SqliteValue::Float(f)) if f.is_nan() => {
+                                *slot = SqliteValue::Null;
+                            }
+                            (slot, val) => {
+                                *slot = val.clone();
+                            }
+                        }
+                    }
+                    return Ok(true);
+                }
+            }
+
+            // Not yet decoded: decode from raw payload.
+            let val = fsqlite_types::record::decode_column_from_offset(
+                &cursor.payload_buf,
+                &cursor.header_offsets[payload_idx],
+                collect_vdbe_metrics,
+            )
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("failed to decode column {payload_idx} from cursor payload"),
+            })?;
+
+            if collect_vdbe_metrics {
+                FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                record_decoded_value_metrics(&val);
+            }
+
+            // Cache the decoded value with buffer reuse.
+            if payload_idx >= cursor.row_vals_buf.len() {
+                cursor
+                    .row_vals_buf
+                    .resize(payload_idx + 1, SqliteValue::Null);
+            }
+            let cache_slot = &mut cursor.row_vals_buf[payload_idx];
+            match (cache_slot, &val) {
+                (SqliteValue::Text(old), SqliteValue::Text(new_text)) => {
+                    old.clear();
+                    old.push_str(new_text);
+                }
+                (SqliteValue::Blob(old), SqliteValue::Blob(new_blob)) => {
+                    old.clear();
+                    old.extend_from_slice(new_blob);
+                }
+                (slot, _) => {
+                    *slot = val.clone();
+                }
+            }
+            if payload_idx < 64 {
+                cursor.decoded_mask |= 1u64 << payload_idx;
+            }
+
+            // Write freshly decoded value to register (owned, no clone needed).
+            self.set_reg(target, val);
+            return Ok(true);
+        }
+
+        // ── Column beyond record width: ALTER TABLE ADD COLUMN defaults ─
+        if let Some(&rp) = self.cursor_root_pages.get(&cursor_id) {
+            if let Some(defaults) = self.column_defaults_by_root_page.get(&rp) {
+                if let Some(Some(default_val)) = defaults.get(col_idx) {
+                    if collect_vdbe_metrics {
+                        FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                        record_decoded_value_metrics(default_val);
+                    }
+                    self.set_reg(target, default_val.clone());
+                    return Ok(true);
+                }
+            }
+        }
+        if collect_vdbe_metrics {
+            FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            record_decoded_value_metrics(&SqliteValue::Null);
+        }
+        self.set_reg(target, SqliteValue::Null);
+        Ok(true)
+    }
+
     /// Read a column value from the cursor's current row.
+    ///
+    /// Uses **lazy column decode**: when the cursor moves to a new position,
+    /// only the record header is parsed (serial types + byte offsets).
+    /// Individual column values are decoded on first access and cached in
+    /// `row_vals_buf` for subsequent reads at the same position.
+    ///
+    /// For records with >64 columns the full eager-decode path is used
+    /// because the `decoded_mask` is a single `u64`.
     fn cursor_column(&mut self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
         let collect_vdbe_metrics = vdbe_metrics_enabled();
         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
@@ -7953,17 +8603,37 @@ impl VdbeEngine {
             }
             let position_stamp = cursor.cursor.position_stamp();
             if cursor.last_position_stamp != position_stamp {
+                // ── Position changed: re-read payload, parse header only ──
                 cursor
                     .cursor
                     .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
-                cursor.row_vals_buf.clear();
-                fsqlite_types::record::parse_record_into(
+
+                // Parse header offset table (serial types + byte ranges).
+                let col_count = fsqlite_types::record::parse_record_header_into(
                     &cursor.payload_buf,
-                    &mut cursor.row_vals_buf,
+                    &mut cursor.header_offsets,
                 )
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "malformed record header in cursor payload".to_owned(),
                 })?;
+
+                if col_count > 64 {
+                    // Wide record: fall back to eager full decode so we
+                    // don't need a heap-allocated bitmask.
+                    cursor.row_vals_buf.clear();
+                    fsqlite_types::record::parse_record_into(
+                        &cursor.payload_buf,
+                        &mut cursor.row_vals_buf,
+                    );
+                    cursor.decoded_mask = u64::MAX; // mark all as decoded
+                } else {
+                    // Narrow record (≤64 cols): lazy path.
+                    // Resize row_vals_buf to column count, filling new
+                    // slots with Null (placeholder — decoded_mask tracks
+                    // which are real).
+                    cursor.row_vals_buf.resize(col_count, SqliteValue::Null);
+                    cursor.decoded_mask = 0;
+                }
                 cursor.last_position_stamp = position_stamp;
             }
 
@@ -7976,8 +8646,11 @@ impl VdbeEngine {
                 root_page
                     .zip(ipk_col_idx)
                     .is_some_and(|(root_page, ipk_col_idx)| {
-                        payload_includes_rowid_alias(
-                            &cursor.row_vals_buf,
+                        payload_includes_rowid_alias_lazy(
+                            &cursor.header_offsets,
+                            &cursor.payload_buf,
+                            &mut cursor.row_vals_buf,
+                            &mut cursor.decoded_mask,
                             rowid,
                             ipk_col_idx,
                             self.table_column_count_by_root_page
@@ -7998,12 +8671,70 @@ impl VdbeEngine {
                 col_idx
             };
 
-            if let Some(val) = cursor.row_vals_buf.get(payload_idx).cloned() {
+            // ── Lazy column decode: decode on demand ─────────────────
+            if payload_idx < cursor.header_offsets.len() {
+                // Check if already decoded via bitmask.
+                if payload_idx < 64 && cursor.decoded_mask & (1u64 << payload_idx) != 0 {
+                    // Already materialized — return cached value.
+                    if let Some(val) = cursor.row_vals_buf.get(payload_idx).cloned() {
+                        if collect_vdbe_metrics {
+                            FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                            record_decoded_value_metrics(&val);
+                        }
+                        return Ok(val);
+                    }
+                }
+                // Decode just this column from the offset table + raw payload.
+                let val = fsqlite_types::record::decode_column_from_offset(
+                    &cursor.payload_buf,
+                    &cursor.header_offsets[payload_idx],
+                    collect_vdbe_metrics,
+                )
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("failed to decode column {payload_idx} from cursor payload"),
+                })?;
+                // Cache the decoded value with buffer reuse: move the
+                // original into the cache slot (reusing its Text/Blob
+                // buffer when types match) and return a clone.  This
+                // saves one allocation compared to cloning for the cache
+                // and returning the original, because the cache slot can
+                // absorb the new value into its existing buffer.
+                if payload_idx >= cursor.row_vals_buf.len() {
+                    cursor
+                        .row_vals_buf
+                        .resize(payload_idx + 1, SqliteValue::Null);
+                }
                 if collect_vdbe_metrics {
                     FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                     record_decoded_value_metrics(&val);
                 }
-                return Ok(val);
+                let slot = &mut cursor.row_vals_buf[payload_idx];
+                match (slot, val) {
+                    (SqliteValue::Text(old), SqliteValue::Text(new_text)) => {
+                        old.clear();
+                        old.push_str(&new_text);
+                        if payload_idx < 64 {
+                            cursor.decoded_mask |= 1u64 << payload_idx;
+                        }
+                        return Ok(SqliteValue::Text(new_text));
+                    }
+                    (SqliteValue::Blob(old), SqliteValue::Blob(new_blob)) => {
+                        old.clear();
+                        old.extend_from_slice(&new_blob);
+                        if payload_idx < 64 {
+                            cursor.decoded_mask |= 1u64 << payload_idx;
+                        }
+                        return Ok(SqliteValue::Blob(new_blob));
+                    }
+                    (slot, val) => {
+                        let ret = val.clone();
+                        *slot = val;
+                        if payload_idx < 64 {
+                            cursor.decoded_mask |= 1u64 << payload_idx;
+                        }
+                        return Ok(ret);
+                    }
+                }
             }
             // Column beyond record width — check ALTER TABLE ADD COLUMN defaults.
             if let Some(&root_page) = self.cursor_root_pages.get(&cursor_id) {
@@ -8242,6 +8973,8 @@ impl VdbeEngine {
                         target_vals_buf: Vec::new(),
                         cur_vals_buf: Vec::new(),
                         row_vals_buf: Vec::new(),
+                        header_offsets: Vec::new(),
+                        decoded_mask: 0,
                         last_position_stamp: None,
                     },
                 );
@@ -8322,6 +9055,8 @@ impl VdbeEngine {
                         target_vals_buf: Vec::new(),
                         cur_vals_buf: Vec::new(),
                         row_vals_buf: Vec::new(),
+                        header_offsets: Vec::new(),
+                        decoded_mask: 0,
                         last_position_stamp: None,
                     },
                 );
@@ -8438,6 +9173,8 @@ impl VdbeEngine {
                 target_vals_buf: Vec::new(),
                 cur_vals_buf: Vec::new(),
                 row_vals_buf: Vec::new(),
+                header_offsets: Vec::new(),
+                decoded_mask: 0,
                 last_position_stamp: None,
             },
         );
@@ -8737,6 +9474,7 @@ fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record(values)
 }
 
+#[allow(dead_code)]
 fn payload_includes_rowid_alias(
     payload_values: &[SqliteValue],
     rowid: i64,
@@ -8760,8 +9498,77 @@ fn payload_includes_rowid_alias(
     }
 }
 
+/// Lazy-decode variant of [`payload_includes_rowid_alias`] that works
+/// with the header offset table instead of requiring all columns to be
+/// pre-decoded.
+///
+/// For the common `NULL`-at-IPK case, only the serial type is inspected
+/// (zero-decode).  For the integer-match case, a single column is decoded
+/// on demand and cached in `row_vals_buf` + `decoded_mask`.
+#[allow(clippy::too_many_arguments)]
+fn payload_includes_rowid_alias_lazy(
+    header_offsets: &[fsqlite_types::record::ColumnOffset],
+    payload_buf: &[u8],
+    row_vals_buf: &mut Vec<SqliteValue>,
+    decoded_mask: &mut u64,
+    rowid: i64,
+    ipk_col_idx: usize,
+    table_column_count: Option<usize>,
+) -> bool {
+    let payload_cols = header_offsets.len();
+    if let Some(table_cols) = table_column_count
+        && payload_cols >= table_cols
+    {
+        return true;
+    }
+    if payload_cols <= ipk_col_idx {
+        return false;
+    }
+
+    let col = &header_offsets[ipk_col_idx];
+    use fsqlite_types::serial_type::{SerialTypeClass, classify_serial_type};
+
+    match classify_serial_type(col.serial_type) {
+        // NULL serial type → rowid alias is present (stored as NULL placeholder).
+        SerialTypeClass::Null => true,
+        // Zero constant (serial type 8 = integer 0).
+        SerialTypeClass::Zero => rowid == 0,
+        // One constant (serial type 9 = integer 1).
+        SerialTypeClass::One => rowid == 1,
+        // Integer: decode just this one column to compare.
+        SerialTypeClass::Integer => {
+            // Lazily decode and cache.
+            if ipk_col_idx < 64 && *decoded_mask & (1u64 << ipk_col_idx) != 0 {
+                // Already decoded.
+                match row_vals_buf.get(ipk_col_idx) {
+                    Some(SqliteValue::Integer(v)) => *v == rowid,
+                    _ => false,
+                }
+            } else if let Some(val) =
+                fsqlite_types::record::decode_column_from_offset(payload_buf, col, false)
+            {
+                let result = matches!(&val, SqliteValue::Integer(v) if *v == rowid);
+                // Cache the decoded value.
+                if ipk_col_idx >= row_vals_buf.len() {
+                    row_vals_buf.resize(ipk_col_idx + 1, SqliteValue::Null);
+                }
+                row_vals_buf[ipk_col_idx] = val;
+                if ipk_col_idx < 64 {
+                    *decoded_mask |= 1u64 << ipk_col_idx;
+                }
+                result
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
 fn invalidate_storage_cursor_row_cache(cursor: &mut StorageCursor) {
     cursor.row_vals_buf.clear();
+    cursor.header_offsets.clear();
+    cursor.decoded_mask = 0;
     cursor.last_position_stamp = None;
 }
 
@@ -9391,6 +10198,8 @@ mod tests {
     use crate::ProgramBuilder;
     use fsqlite_func::vtab::{IndexInfo, VirtualTable, VirtualTableCursor};
     use fsqlite_func::{FunctionRegistry, ScalarFunction, register_builtins};
+    use fsqlite_mvcc::ConcurrentRegistry;
+    use fsqlite_types::Snapshot;
     use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 
     struct CancelExecutionFunc {
@@ -14564,9 +15373,13 @@ mod tests {
         sorter.spill_threshold = 1;
 
         // Insert several rows — each should trigger a spill.
+        // The blob must be a valid serialized record so that the spill
+        // read-back path (`parse_record_prefix`) can decode key columns.
         for value in [50i64, 30, 10, 40, 20] {
+            let vals = vec![SqliteValue::Integer(value)];
+            let blob = serialize_record(&vals);
             sorter
-                .insert_row(vec![SqliteValue::Integer(value)], vec![])
+                .insert_row(vals, blob)
                 .expect("insert should succeed");
         }
 
@@ -14634,8 +15447,10 @@ mod tests {
         sorter.spill_threshold = 1;
 
         for value in [10i64, 50, 30, 20, 40] {
+            let vals = vec![SqliteValue::Integer(value)];
+            let blob = serialize_record(&vals);
             sorter
-                .insert_row(vec![SqliteValue::Integer(value)], vec![])
+                .insert_row(vals, blob)
                 .expect("insert should succeed");
         }
 
@@ -16330,144 +17145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_busy_retry_spin_loops_grow_then_cap() {
-        assert_eq!(busy_retry_spin_loops(1), WRITE_BUSY_HANDOFF_BASE_SPINS);
-        assert_eq!(busy_retry_spin_loops(2), WRITE_BUSY_HANDOFF_BASE_SPINS * 2);
-        assert_eq!(busy_retry_spin_loops(3), WRITE_BUSY_HANDOFF_BASE_SPINS * 4);
-        assert_eq!(busy_retry_spin_loops(6), WRITE_BUSY_HANDOFF_MAX_SPINS);
-        assert_eq!(busy_retry_spin_loops(32), WRITE_BUSY_HANDOFF_MAX_SPINS);
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct BusyRetryScheduleSummary {
-        attempts: u32,
-        total_spin_loops: u64,
-        max_spin_loops: u32,
-        yield_count: u32,
-        p50_spin_loops: u32,
-        p95_spin_loops: u32,
-        p99_spin_loops: u32,
-    }
-
-    fn summarize_busy_retry_schedule(attempts: u32) -> BusyRetryScheduleSummary {
-        assert!(
-            attempts > 0,
-            "busy-retry validation needs at least one attempt"
-        );
-
-        let waits = (1..=attempts)
-            .map(|attempt| BusyRetryWait {
-                attempt,
-                spin_loops: busy_retry_spin_loops(attempt),
-                yielded: busy_retry_should_yield(attempt),
-            })
-            .collect::<Vec<_>>();
-
-        let total_spin_loops = waits.iter().map(|wait| u64::from(wait.spin_loops)).sum();
-        let max_spin_loops = waits
-            .iter()
-            .map(|wait| wait.spin_loops)
-            .max()
-            .unwrap_or_default();
-        let yield_count = u32::try_from(waits.iter().filter(|wait| wait.yielded).count())
-            .expect("busy-retry validation should fit within u32 attempt counts");
-
-        let mut spin_samples = waits.iter().map(|wait| wait.spin_loops).collect::<Vec<_>>();
-        spin_samples.sort_unstable();
-
-        BusyRetryScheduleSummary {
-            attempts,
-            total_spin_loops,
-            max_spin_loops,
-            yield_count,
-            p50_spin_loops: percentile_spin_loops(&spin_samples, 50),
-            p95_spin_loops: percentile_spin_loops(&spin_samples, 95),
-            p99_spin_loops: percentile_spin_loops(&spin_samples, 99),
-        }
-    }
-
-    fn percentile_spin_loops(sorted_spin_loops: &[u32], percentile: u8) -> u32 {
-        assert!(
-            (1..=100).contains(&percentile),
-            "percentile must be in 1..=100"
-        );
-        assert!(
-            !sorted_spin_loops.is_empty(),
-            "percentile validation needs at least one sample"
-        );
-
-        let rank = usize::from(percentile)
-            .saturating_mul(sorted_spin_loops.len())
-            .div_ceil(100);
-        let index = rank
-            .saturating_sub(1)
-            .min(sorted_spin_loops.len().saturating_sub(1));
-        sorted_spin_loops[index]
-    }
-
-    #[test]
-    fn test_busy_retry_yield_cadence_is_bounded() {
-        for attempt in 1..WRITE_BUSY_HANDOFF_YIELD_EVERY {
-            assert!(
-                !busy_retry_should_yield(attempt),
-                "attempt {attempt} should stay on-CPU"
-            );
-        }
-
-        assert!(busy_retry_should_yield(WRITE_BUSY_HANDOFF_YIELD_EVERY));
-        assert!(!busy_retry_should_yield(WRITE_BUSY_HANDOFF_YIELD_EVERY + 1));
-        assert!(busy_retry_should_yield(WRITE_BUSY_HANDOFF_YIELD_EVERY * 2));
-    }
-
-    #[test]
-    fn test_busy_retry_handoff_respects_deadline() {
-        let mut handoff = BusyRetryHandoff::default();
-        let expired_started = Instant::now()
-            .checked_sub(Duration::from_millis(5))
-            .expect("expired instant should be constructible");
-        assert!(
-            handoff
-                .next_wait(expired_started, Duration::from_millis(1))
-                .is_none(),
-            "expired deadline must stop retrying"
-        );
-
-        let fresh_wait = handoff
-            .next_wait(Instant::now(), Duration::from_millis(1))
-            .expect("fresh deadline should allow a bounded handoff wait");
-        assert_eq!(fresh_wait.attempt, 1);
-        assert_eq!(fresh_wait.spin_loops, WRITE_BUSY_HANDOFF_BASE_SPINS);
-        assert!(!fresh_wait.yielded, "first retry should not yield");
-    }
-
-    #[test]
-    fn test_busy_retry_schedule_summary_captures_tail_latency_budget() {
-        let summary = summarize_busy_retry_schedule(8);
-
-        assert_eq!(summary.attempts, 8);
-        assert_eq!(summary.total_spin_loops, 8_128);
-        assert_eq!(summary.max_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
-        assert_eq!(summary.p50_spin_loops, 512);
-        assert_eq!(summary.p95_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
-        assert_eq!(summary.p99_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
-    }
-
-    #[test]
-    fn test_busy_retry_schedule_summary_bounds_wake_amplification() {
-        let summary = summarize_busy_retry_schedule(21);
-
-        assert_eq!(
-            summary.yield_count,
-            21 / WRITE_BUSY_HANDOFF_YIELD_EVERY,
-            "wake amplification must stay at one scheduler yield per bounded retry window"
-        );
-        assert_eq!(summary.max_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
-        assert_eq!(summary.p95_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
-        assert_eq!(summary.p99_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
-    }
-
-    #[test]
-    fn test_shared_txn_page_io_busy_timeout_preserves_losing_writer_state() {
+    fn test_shared_txn_page_io_zero_busy_timeout_preserves_losing_writer_state() {
         use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
         use fsqlite_types::Snapshot;
 
@@ -16516,7 +17194,7 @@ mod tests {
             writer_handle,
             Arc::clone(&lock_table),
             Arc::clone(&commit_index),
-            1,
+            0,
         );
 
         let err = page_io
@@ -16530,31 +17208,797 @@ mod tests {
         let guard = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let holder = guard
-            .get(holder_session)
-            .expect("holder session should remain registered");
-        assert!(
-            holder.write_set().contains_key(&contested_page),
-            "winning writer must retain the contested page in its write set"
-        );
-
-        let writer = guard
-            .get(writer_session)
-            .expect("losing writer session should remain registered");
-        assert!(
-            writer.write_set().is_empty(),
-            "timed-out writer must not leak page data into its write set"
-        );
-        assert!(
-            writer.held_locks().is_empty(),
-            "timed-out writer must not retain the contested page lock"
-        );
+        {
+            let holder = guard
+                .get(holder_session)
+                .expect("holder session should remain registered");
+            assert!(
+                holder.write_set().contains_key(&contested_page),
+                "winning writer must retain the contested page in its write set"
+            );
+        }
+        {
+            let writer = guard
+                .get(writer_session)
+                .expect("losing writer session should remain registered");
+            assert!(
+                writer.write_set().is_empty(),
+                "timed-out writer must not leak page data into its write set"
+            );
+            assert!(
+                writer.held_locks().is_empty(),
+                "timed-out writer must not retain the contested page lock"
+            );
+        }
         drop(guard);
 
         assert_eq!(
             lock_table.total_lock_count(),
             1,
             "contested page lock must remain owned only by the winning writer"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_owned_lock_skips_busy_snapshot_after_savepoint_rollback() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+        let target_page = PageNumber::new(2).unwrap();
+        let first_bytes = vec![0xAB; PageSize::DEFAULT.as_usize()];
+        let second_bytes = vec![0xCD; PageSize::DEFAULT.as_usize()];
+
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle must be present");
+            (session_id, handle)
+        };
+
+        let savepoint = {
+            let guard = handle.lock();
+            fsqlite_mvcc::concurrent_savepoint(&guard, "sp1").unwrap()
+        };
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            session_id,
+            Arc::clone(&handle),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        page_io
+            .write_page(&cx, target_page, &first_bytes)
+            .expect("initial concurrent write should succeed");
+
+        {
+            let mut guard = handle.lock();
+            fsqlite_mvcc::concurrent_rollback_to_savepoint(
+                &mut guard,
+                &lock_table,
+                session_id,
+                &savepoint,
+            )
+            .unwrap();
+            assert!(
+                guard.holds_page_lock(target_page),
+                "rollback-to-savepoint must preserve page ownership"
+            );
+            assert!(
+                !guard.tracks_write_conflict_page(target_page),
+                "rollback-to-savepoint should clear staged tracking for the rolled-back page"
+            );
+        }
+
+        commit_index.update(target_page, CommitSeq::new(8));
+
+        page_io
+            .write_page(&cx, target_page, &second_bytes)
+            .expect("already-owned page should bypass stale-snapshot rejection");
+
+        let expected = PageData::from_vec(second_bytes);
+        let guard = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let writer = guard
+            .get(session_id)
+            .expect("writer session should remain registered");
+        assert_eq!(
+            concurrent_read_page(&writer, target_page),
+            Some(&expected),
+            "rewrite after savepoint rollback should restage the owned page"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_waits_for_page_lock_release_and_succeeds() {
+        use fsqlite_mvcc::concurrent_abort;
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+        let contested_page = PageNumber::ONE;
+        let page_bytes = vec![0xCD; PageSize::DEFAULT.as_usize()];
+
+        let (holder_session, writer_session, writer_handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let holder_session = guard
+                .begin_concurrent(snapshot)
+                .expect("holder session should register");
+            let writer_session = guard
+                .begin_concurrent(snapshot)
+                .expect("writer session should register");
+
+            let mut holder = guard
+                .get_mut(holder_session)
+                .expect("holder session must be present");
+            concurrent_write_page(
+                &mut holder,
+                &lock_table,
+                holder_session,
+                contested_page,
+                PageData::from_vec(page_bytes.clone()),
+            )
+            .expect("holder should acquire the contested page lock");
+            let writer_handle = guard
+                .handle(writer_session)
+                .expect("writer session handle must be present");
+            (holder_session, writer_session, writer_handle)
+        };
+
+        let release_registry = Arc::clone(&registry);
+        let release_lock_table = Arc::clone(&lock_table);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let guard = release_registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut holder = guard
+                .get_mut(holder_session)
+                .expect("holder session must still be present before release");
+            concurrent_abort(&mut holder, &release_lock_table, holder_session);
+        });
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            writer_session,
+            writer_handle,
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            250,
+        );
+
+        page_io
+            .write_page(&cx, contested_page, &page_bytes)
+            .expect("writer should wake and acquire the page after holder release");
+        releaser
+            .join()
+            .expect("holder release helper thread must complete cleanly");
+
+        let guard = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let writer = guard
+                .get(writer_session)
+                .expect("writer session should remain registered");
+            assert!(
+                writer.write_set().contains_key(&contested_page),
+                "woken writer must stage the contested page in its write set"
+            );
+            assert!(
+                writer.held_locks().contains(&contested_page),
+                "woken writer must own the contested page lock after retrying"
+            );
+        }
+        drop(guard);
+
+        assert_eq!(
+            lock_table.total_lock_count(),
+            1,
+            "after wake/retry exactly one writer must hold the contested page lock"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_short_concurrent_write_preserves_page_size_on_read() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle must be present");
+            (session_id, handle)
+        };
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            session_id,
+            handle,
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+        let expected = vec![0xA5; 32];
+
+        page_io
+            .write_page(&cx, page_no, &expected)
+            .expect("short concurrent write should succeed");
+
+        let bytes = page_io
+            .read_page(&cx, page_no)
+            .expect("read-your-writes should return the normalized page image");
+        assert_eq!(
+            bytes.len(),
+            PageSize::DEFAULT.as_usize(),
+            "concurrent read-your-writes must preserve the pager page-size invariant"
+        );
+        assert_eq!(&bytes[..expected.len()], expected.as_slice());
+        assert!(
+            bytes[expected.len()..].iter().all(|byte| *byte == 0),
+            "concurrent read-your-writes should zero-fill any unwritten tail bytes"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_short_concurrent_owned_write_preserves_page_size_on_read() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle must be present");
+            (session_id, handle)
+        };
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            session_id,
+            handle,
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+        let expected = vec![0x5A; 32];
+
+        page_io
+            .write_page_data(&cx, page_no, PageData::from_vec(expected.clone()))
+            .expect("short concurrent owned write should succeed");
+
+        let bytes = page_io
+            .read_page(&cx, page_no)
+            .expect("read-your-writes should return the normalized owned page image");
+        assert_eq!(
+            bytes.len(),
+            PageSize::DEFAULT.as_usize(),
+            "concurrent owned writes must preserve the pager page-size invariant"
+        );
+        assert_eq!(&bytes[..expected.len()], expected.as_slice());
+        assert!(
+            bytes[expected.len()..].iter().all(|byte| *byte == 0),
+            "concurrent owned writes should zero-fill any unwritten tail bytes"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_rejects_oversized_write_buffer() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut page_io = SharedTxnPageIo::new(Box::new(txn));
+        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+        let oversized = vec![0xCC; PageSize::DEFAULT.as_usize() + 1];
+
+        let err = page_io
+            .write_page(&cx, page_no, &oversized)
+            .expect_err("oversized page buffer should be rejected");
+
+        assert!(
+            matches!(err, FrankenError::Internal(ref message) if message.contains("page buffer exceeds page size invariant")),
+            "unexpected error for oversized page buffer: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_rejects_oversized_owned_page_buffer() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut page_io = SharedTxnPageIo::new(Box::new(txn));
+        let page_no = PageNumber::new(2).expect("page number must be non-zero");
+        let oversized = PageData::from_vec(vec![0xDD; PageSize::DEFAULT.as_usize() + 1]);
+
+        let err = page_io
+            .write_page_data(&cx, page_no, oversized)
+            .expect_err("oversized owned page buffer should be rejected");
+
+        assert!(
+            matches!(err, FrankenError::Internal(ref message) if message.contains("page buffer exceeds page size invariant")),
+            "unexpected error for oversized owned page buffer: {err}"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_busy_snapshot_restores_page_one_tracking() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+        let target_page = PageNumber::new(2).unwrap();
+        let page_bytes = vec![0xEF; PageSize::DEFAULT.as_usize()];
+
+        let (writer_session, writer_handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let writer_session = guard
+                .begin_concurrent(snapshot)
+                .expect("writer session should register");
+            let writer_handle = guard
+                .handle(writer_session)
+                .expect("writer session handle must be present");
+            (writer_session, writer_handle)
+        };
+
+        commit_index.update(target_page, CommitSeq::new(8));
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            writer_session,
+            writer_handle,
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            250,
+        );
+
+        let err = page_io
+            .write_page(&cx, target_page, &page_bytes)
+            .expect_err("stale snapshot should reject the write");
+        assert!(
+            matches!(err, FrankenError::BusySnapshot { .. }),
+            "expected SQLITE_BUSY_SNAPSHOT on stale page write, got {err}"
+        );
+
+        let guard = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let writer = guard
+            .get(writer_session)
+            .expect("writer session should remain registered");
+        assert!(
+            writer.write_set().is_empty(),
+            "stale snapshot must not leak staged page bytes into the write set"
+        );
+        assert!(
+            !writer.tracks_write_conflict_page(PageNumber::ONE),
+            "failed write must restore the synthetic page-one conflict surface"
+        );
+        assert!(
+            !writer.held_locks().contains(&PageNumber::ONE),
+            "failed write must not retain the synthetic page-one lock"
+        );
+        assert_eq!(
+            lock_table.total_lock_count(),
+            0,
+            "stale snapshot failure should leave the lock table unchanged"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_net_zero_growth_clears_synthetic_page_one_tracking() {
+        use fsqlite_pager::{MemoryMockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MemoryMockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle must be present");
+            (session_id, handle)
+        };
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            session_id,
+            Arc::clone(&handle),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        let page_no = page_io
+            .allocate_page(&cx)
+            .expect("allocate_page should succeed for concurrent txn");
+        let page_bytes = vec![0x5A; PageSize::DEFAULT.as_usize()];
+        page_io
+            .write_page(&cx, page_no, &page_bytes)
+            .expect("write_page should succeed for allocated page");
+
+        {
+            let guard = handle.lock();
+            assert!(
+                !guard.tracks_write_conflict_page(PageNumber::ONE),
+                "successful writes must reconcile synthetic page-one tracking when the pager does not expose page one in pending_commit_pages"
+            );
+            assert!(
+                !guard.held_locks().contains(&PageNumber::ONE),
+                "successful writes must release any synthetic page-one lock when reconciliation drops page one from the conflict surface"
+            );
+        }
+
+        page_io
+            .free_page(&cx, page_no)
+            .expect("free_page should succeed for net-zero growth");
+
+        let guard = handle.lock();
+        assert!(
+            !guard.tracks_write_conflict_page(PageNumber::ONE),
+            "net-zero growth should drop the synthetic page-one conflict surface"
+        );
+        assert!(
+            !guard.held_locks().contains(&PageNumber::ONE),
+            "net-zero growth should release the synthetic page-one lock"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_free_does_not_late_acquire_existing_freelist_trunk_pages() {
+        use std::path::PathBuf;
+
+        use fsqlite_pager::{MvccPager as _, SimplePager, TransactionMode};
+        use fsqlite_types::Snapshot;
+        use fsqlite_vfs::MemoryVfs;
+
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/late_pending_commit_freelist_trunk.db");
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN).unwrap();
+        let ps = PageSize::MIN.as_usize();
+
+        let (p2, p3) = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p2 = seed.allocate_page(&cx).unwrap();
+            let p3 = seed.allocate_page(&cx).unwrap();
+            seed.write_page(&cx, p2, &vec![0x11; ps]).unwrap();
+            seed.write_page(&cx, p3, &vec![0x22; ps]).unwrap();
+            seed.commit(&cx).unwrap();
+            (p2, p3)
+        };
+
+        {
+            let mut establish_committed_freelist =
+                pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            establish_committed_freelist.free_page(&cx, p2).unwrap();
+            establish_committed_freelist.commit(&cx).unwrap();
+        }
+
+        {
+            let mut preview = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+            preview.free_page(&cx, p3).unwrap();
+            let predicted = preview.pending_commit_pages().unwrap();
+            assert!(
+                predicted.contains(&p2),
+                "freeing a durable page should require rewriting the existing freelist trunk page at commit"
+            );
+            assert!(
+                !predicted.contains(&p3),
+                "the commit surface can include an existing durable trunk without directly rewriting the newly freed page"
+            );
+            preview.rollback(&cx).unwrap();
+        }
+
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+
+        let (session_id, handle, blocker_session) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle must be present");
+            let blocker_session = guard
+                .begin_concurrent(snapshot)
+                .expect("blocker session should register");
+            (session_id, handle, blocker_session)
+        };
+
+        {
+            let guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut blocker = guard
+                .get_mut(blocker_session)
+                .expect("blocker handle should be present");
+            concurrent_track_write_conflict_page(&mut blocker, &lock_table, blocker_session, p2)
+                .expect("blocker must hold the existing freelist trunk page lock");
+        }
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            session_id,
+            Arc::clone(&handle),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        page_io
+            .free_page(&cx, p3)
+            .expect("free_page must not fail just because commit-time trunk rewrites will later need an existing freelist page");
+
+        let guard = handle.lock();
+        assert!(
+            !guard.tracks_write_conflict_page(p2),
+            "the per-op path must not late-acquire committed freelist trunk pages after mutating the pager state"
+        );
+        assert!(
+            !guard.held_locks().contains(&p2),
+            "the per-op path must not steal the committed trunk page lock before commit planning"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_clears_preexisting_synthetic_page_one_tracking_when_unneeded() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        // Simulate the state after an earlier allocator operation has already
+        // installed synthetic page-one tracking, but the current pager surface
+        // no longer needs page one in `pending_commit_pages()`.
+        let cx = Cx::new();
+        let pager = MockMvccPager;
+        let txn = pager
+            .begin(&cx, TransactionMode::Immediate)
+            .expect("transaction should start");
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+
+        let (session_id, handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle must be present");
+            (session_id, handle)
+        };
+
+        {
+            let mut guard = handle.lock();
+            concurrent_track_write_conflict_page(
+                &mut guard,
+                &lock_table,
+                session_id,
+                PageNumber::ONE,
+            )
+            .expect("synthetic page-one tracking should be installed");
+        }
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            session_id,
+            Arc::clone(&handle),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        {
+            let guard = handle.lock();
+            assert!(
+                guard.tracks_write_conflict_page(PageNumber::ONE),
+                "test precondition should start with synthetic page-one tracking already present"
+            );
+        }
+
+        page_io
+            .free_page(
+                &cx,
+                PageNumber::new(2).expect("page number must be non-zero"),
+            )
+            .expect("free_page should succeed while pending commit pages stay empty");
+
+        let guard = handle.lock();
+        assert!(
+            !guard.tracks_write_conflict_page(PageNumber::ONE),
+            "reconciliation must clear stale synthetic page-one tracking even when the current op did not introduce it"
+        );
+        assert!(
+            !guard.held_locks().contains(&PageNumber::ONE),
+            "reconciliation must release the stale synthetic page-one lock"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_wait_is_cancellation_responsive() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MockMvccPager;
+        let root_cx = Cx::new();
+        let write_cx = root_cx.create_child();
+        let txn = pager.begin(&root_cx, TransactionMode::Immediate).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+        let contested_page = PageNumber::ONE;
+        let page_bytes = vec![0xAA; PageSize::DEFAULT.as_usize()];
+
+        let (holder_session, writer_session, writer_handle) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let holder_session = guard
+                .begin_concurrent(snapshot)
+                .expect("holder session should register");
+            let writer_session = guard
+                .begin_concurrent(snapshot)
+                .expect("writer session should register");
+
+            let mut holder = guard
+                .get_mut(holder_session)
+                .expect("holder session must be present");
+            concurrent_write_page(
+                &mut holder,
+                &lock_table,
+                holder_session,
+                contested_page,
+                PageData::from_vec(page_bytes.clone()),
+            )
+            .expect("holder should acquire the contested page lock");
+            let writer_handle = guard
+                .handle(writer_session)
+                .expect("writer session handle must be present");
+            (holder_session, writer_session, writer_handle)
+        };
+
+        let cancel_cx = write_cx.clone();
+        let cancel_helper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            cancel_cx.cancel();
+        });
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            writer_session,
+            writer_handle,
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            500,
+        );
+
+        let started = std::time::Instant::now();
+        let err = page_io
+            .write_page(&write_cx, contested_page, &page_bytes)
+            .expect_err("cancelled waiter should abort before busy timeout");
+        cancel_helper
+            .join()
+            .expect("cancel helper thread must complete cleanly");
+
+        assert!(matches!(err, FrankenError::Abort));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "cancelled wait should return promptly instead of sleeping until busy_timeout"
+        );
+
+        let guard = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let holder = guard
+            .get(holder_session)
+            .expect("holder session should remain registered");
+        assert!(
+            holder.held_locks().contains(&contested_page),
+            "cancellation must not disturb the winning writer's held lock"
+        );
+        let writer = guard
+            .get(writer_session)
+            .expect("writer session should remain registered");
+        assert!(
+            writer.write_set().is_empty(),
+            "cancelled write must not stage page bytes"
+        );
+        assert!(
+            writer.held_locks().is_empty(),
+            "cancelled write must not retain the contested page lock"
         );
     }
 

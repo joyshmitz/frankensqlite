@@ -11,8 +11,8 @@ use fsqlite_ast::{
     AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FromClause,
     FunctionArgs, InsertSource, InsertStatement, JsonArrow, LimitClause, Literal, NullsOrder,
     OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, SortDirection,
-    Statement, TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction,
-    UpsertClause, UpsertTarget,
+    Span, Statement, TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement,
+    UpsertAction, UpsertClause, UpsertTarget,
 };
 use fsqlite_parser::Parser as SqlParser;
 use fsqlite_types::StrictColumnType;
@@ -1200,7 +1200,39 @@ pub fn codegen_select(
     let rowid_target = if is_aggregate {
         None
     } else {
-        extract_rowid_target_expr(where_clause.as_deref(), Some(table))
+        extract_rowid_target_expr(where_clause.as_deref(), Some(table), table_alias)
+    };
+    let rowid_range = if is_aggregate
+        || !stmt.order_by.is_empty()
+        || distinct != Distinctness::All
+        || !group_by.is_empty()
+        || having.is_some()
+    {
+        None
+    } else {
+        extract_rowid_range_target(where_clause.as_deref(), Some(table), table_alias)
+            .and_then(|range| rowid_range_fast_path_is_safe(range).then_some(range))
+    };
+    let index_range = if is_aggregate
+        || time_travel.is_some()
+        || !stmt.order_by.is_empty()
+        || distinct != Distinctness::All
+        || !group_by.is_empty()
+        || having.is_some()
+    {
+        None
+    } else {
+        extract_column_range_target(where_clause.as_deref(), table, table_alias).and_then(
+            |(col_name, range)| {
+                if !index_range_fast_path_is_safe(table, table_alias, schema, &col_name, range) {
+                    return None;
+                }
+                table
+                    .index_for_column(&col_name)
+                    .filter(|idx| idx.key_term_count() == 1 && !idx.key_term_descending(0))
+                    .map(|idx| (col_name, idx, range))
+            },
+        )
     };
     // Check for a simple indexed equality probe (only for non-aggregate queries).
     // We probe with [bound_value, i64::MIN] so SeekGE anchors on the first
@@ -1209,7 +1241,7 @@ pub fn codegen_select(
     let index_eq = if is_aggregate {
         None
     } else {
-        extract_column_eq_target(where_clause.as_deref(), table)
+        extract_column_eq_target(where_clause.as_deref(), table, table_alias)
     };
     let mut index_cursor_to_close = None;
 
@@ -1240,6 +1272,38 @@ pub fn codegen_select(
 
         // ResultRow.
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    } else if let Some(rowid_range) = rowid_range {
+        return codegen_select_rowid_range_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            time_travel,
+            schema,
+            columns,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            rowid_range,
+        );
+    } else if let Some((_index_column_name, idx_schema, index_range)) = index_range {
+        return codegen_select_index_range_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            index_range,
+        );
     } else if let Some((col_name, target_expr)) = index_eq {
         // --- Index-seek SELECT ---
         if let Some(idx_schema) = table.index_for_column(&col_name) {
@@ -1625,6 +1689,420 @@ fn codegen_select_full_scan(
     b.resolve_label(end_label);
 
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct RowidRangeBound<'a> {
+    rowid_expr: &'a Expr,
+    expr: &'a Expr,
+    inclusive: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RowidRangeTarget<'a> {
+    lower: Option<RowidRangeBound<'a>>,
+    upper: Option<RowidRangeBound<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct ColumnRangeBound<'a> {
+    expr: &'a Expr,
+    inclusive: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ColumnRangeTarget<'a> {
+    lower: Option<ColumnRangeBound<'a>>,
+    upper: Option<ColumnRangeBound<'a>>,
+}
+
+/// Generate VDBE bytecode for a bounded rowid/IPK scan.
+///
+/// This specializes the common `rowid >= low AND rowid < high` shape into a
+/// SeekGE/SeekGT + Next loop so range scans do not fall back to a full table
+/// scan. The optimization is intentionally conservative: it only fires when
+/// the entire WHERE clause is a pure conjunction of rowid bounds.
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_rowid_range_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    time_travel: Option<&TimeTravelClause>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    rowid_range: RowidRangeTarget<'_>,
+) -> Result<(), CodegenError> {
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
+
+    let lower_reg = rowid_range.lower.map(|bound| {
+        let reg = b.alloc_reg();
+        emit_expr(b, bound.expr, reg, None);
+        b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+        reg
+    });
+    let upper_reg = rowid_range.upper.map(|bound| {
+        let reg = b.alloc_reg();
+        emit_expr(b, bound.expr, reg, None);
+        b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+        reg
+    });
+    let upper_comparison = rowid_range
+        .upper
+        .map(|bound| resolved_rowid_range_comparison(table, table_alias, schema, bound));
+
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    emit_set_snapshot(b, cursor, time_travel);
+
+    if let Some(bound) = rowid_range.lower {
+        let seek_opcode = if bound.inclusive {
+            Opcode::SeekGE
+        } else {
+            Opcode::SeekGT
+        };
+        b.emit_jump_to_label(
+            seek_opcode,
+            cursor,
+            lower_reg.expect("lower bound register should exist"),
+            done_label,
+            P4::None,
+            0,
+        );
+    } else {
+        b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+    }
+
+    let loop_top = b.current_addr();
+    let skip_label = b.emit_label();
+
+    if let Some(bound) = rowid_range.upper {
+        let current_rowid_reg = b.alloc_reg();
+        let stop_opcode = if bound.inclusive {
+            Opcode::Gt
+        } else {
+            Opcode::Ge
+        };
+        b.emit_op(Opcode::Rowid, cursor, current_rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(
+            stop_opcode,
+            upper_reg.expect("upper bound register should exist"),
+            current_rowid_reg,
+            done_label,
+            upper_comparison
+                .as_ref()
+                .map_or(P4::None, |comparison| comparison.collation_p4.clone()),
+            upper_comparison
+                .as_ref()
+                .map_or(0, |comparison| comparison.cmp_p5),
+        );
+    }
+
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
+
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    b.resolve_label(skip_label);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = loop_top as i32;
+    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_index_range_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    index_range: ColumnRangeTarget<'_>,
+) -> Result<(), CodegenError> {
+    let idx_cursor = cursor + 1;
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
+
+    let lower_probe = index_range.lower.map(|bound| {
+        let base = b.alloc_regs(2);
+        emit_expr(b, bound.expr, base, None);
+        b.emit_jump_to_label(Opcode::IsNull, base, 0, done_label, P4::None, 0);
+        b.emit_op(Opcode::Int64, 0, base + 1, 0, P4::Int64(i64::MIN), 0);
+        (base, bound)
+    });
+    let upper_reg = index_range.upper.map(|bound| {
+        let reg = b.alloc_reg();
+        emit_expr(b, bound.expr, reg, None);
+        b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+        reg
+    });
+    let current_key_reg = (upper_reg.is_some()
+        || lower_probe.is_some_and(|(_, bound)| !bound.inclusive))
+    .then(|| b.alloc_reg());
+    let covering_output = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
+    let needs_table_lookup = covering_output.is_none();
+
+    if needs_table_lookup {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+
+    if let Some((lower_reg, _)) = lower_probe {
+        let probe_record_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            lower_reg,
+            2,
+            probe_record_reg,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            probe_record_reg,
+            done_label,
+            P4::None,
+            0,
+        );
+    } else {
+        b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
+    }
+
+    let loop_top = b.current_addr();
+    let skip_label = b.emit_label();
+
+    if let Some(key_reg) = current_key_reg {
+        b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
+        if lower_probe.is_none() {
+            b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, skip_label, P4::None, 0);
+        }
+    }
+
+    if let Some((lower_reg, bound)) = lower_probe
+        && !bound.inclusive
+    {
+        b.emit_jump_to_label(
+            Opcode::Le,
+            lower_reg,
+            current_key_reg.expect("exclusive lower bound should read current key"),
+            skip_label,
+            P4::None,
+            0,
+        );
+    }
+
+    if let Some(bound) = index_range.upper {
+        let stop_opcode = if bound.inclusive {
+            Opcode::Gt
+        } else {
+            Opcode::Ge
+        };
+        b.emit_jump_to_label(
+            stop_opcode,
+            upper_reg.expect("upper bound register should exist"),
+            current_key_reg.expect("upper bound should read current key"),
+            done_label,
+            P4::None,
+            0,
+        );
+    }
+
+    let rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+
+    if needs_table_lookup {
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            skip_label,
+            P4::None,
+            0,
+        );
+    }
+
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
+
+    if let Some(covering_output) = &covering_output {
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, covering_output, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
+
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    b.resolve_label(skip_label);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = loop_top as i32;
+    b.emit_op(Opcode::Next, idx_cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    if needs_table_lookup {
+        b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+fn index_range_fast_path_is_safe(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    column_name: &str,
+    range: ColumnRangeTarget<'_>,
+) -> bool {
+    [range.lower, range.upper]
+        .into_iter()
+        .flatten()
+        .all(|bound| {
+            let comparison = resolved_index_range_comparison(
+                table,
+                table_alias,
+                schema,
+                column_name,
+                bound.expr,
+            );
+            (comparison.cmp_p5 & !0x80) == 0 && matches!(comparison.collation_p4, P4::None)
+        })
+}
+
+fn rowid_range_fast_path_is_safe(range: RowidRangeTarget<'_>) -> bool {
+    [range.lower, range.upper]
+        .into_iter()
+        .flatten()
+        .all(|bound| rowid_range_bound_is_seek_safe(bound.expr))
+}
+
+fn rowid_range_bound_is_seek_safe(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(Literal::Integer(_), _) => true,
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate,
+            expr,
+            ..
+        } => matches!(expr.as_ref(), Expr::Literal(Literal::Integer(_), _)),
+        _ => false,
+    }
+}
+
+fn resolved_rowid_range_comparison(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    bound: RowidRangeBound<'_>,
+) -> ResolvedComparisonInfo {
+    let scan = ScanCtx {
+        cursor: 0,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondary: None,
+    };
+    ResolvedComparisonInfo::new(bound.rowid_expr, bound.expr, &scan)
+}
+
+fn resolved_index_range_comparison(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    column_name: &str,
+    bound_expr: &Expr,
+) -> ResolvedComparisonInfo {
+    let column_expr = Expr::Column(ColumnRef::bare(column_name), Span::ZERO);
+    let scan = ScanCtx {
+        cursor: 0,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondary: None,
+    };
+    ResolvedComparisonInfo::new(&column_expr, bound_expr, &scan)
 }
 
 fn emit_covering_output_reads(
@@ -6014,7 +6492,7 @@ pub fn codegen_update(
     // Register table-to-index cursor metadata for REPLACE conflict resolution.
     register_table_index_meta(b, table, table_cursor);
 
-    let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table));
+    let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table), None);
 
     let set_placeholder_count: u32 = stmt
         .assignments
@@ -6723,7 +7201,7 @@ pub fn codegen_delete(
 
     // --- Pass 1: collect matching rowids ---
     let collect_done_label = b.emit_label();
-    let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table));
+    let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table), None);
 
     if let Some(target_expr) = rowid_target {
         emit_expr(b, target_expr, rowid_reg, None);
@@ -8264,6 +8742,24 @@ fn is_simple_constant(expr: &Expr) -> bool {
     matches!(expr, Expr::Placeholder(..) | Expr::Literal(..))
 }
 
+fn is_rowid_range_constant(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(..))
+        || matches!(
+            expr,
+            Expr::Placeholder(
+                fsqlite_ast::PlaceholderType::Numbered(_)
+                    | fsqlite_ast::PlaceholderType::ColonNamed(_)
+                    | fsqlite_ast::PlaceholderType::AtNamed(_)
+                    | fsqlite_ast::PlaceholderType::DollarNamed(_),
+                _
+            )
+        )
+}
+
+fn is_index_range_constant(expr: &Expr) -> bool {
+    is_rowid_range_constant(expr)
+}
+
 /// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
 ///
 /// Returns the 1-based bind parameter index if so.
@@ -8271,14 +8767,16 @@ fn is_simple_constant(expr: &Expr) -> bool {
 fn extract_rowid_bind_param(
     where_clause: Option<&Expr>,
     table: Option<&TableSchema>,
+    table_alias: Option<&str>,
 ) -> Option<i32> {
-    let expr = extract_rowid_target_expr(where_clause, table)?;
+    let expr = extract_rowid_target_expr(where_clause, table, table_alias)?;
     bind_param_index(expr)
 }
 
 fn extract_rowid_target_expr<'a>(
     where_clause: Option<&'a Expr>,
     table: Option<&TableSchema>,
+    table_alias: Option<&str>,
 ) -> Option<&'a Expr> {
     let expr = where_clause?;
     if let Expr::BinaryOp {
@@ -8288,20 +8786,198 @@ fn extract_rowid_target_expr<'a>(
         ..
     } = expr
     {
-        if is_rowid_expr(left, table) && is_simple_constant(right) {
+        if is_rowid_expr(left, table, table_alias) && is_simple_constant(right) {
             return Some(right);
         }
-        if is_rowid_expr(right, table) && is_simple_constant(left) {
+        if is_rowid_expr(right, table, table_alias) && is_simple_constant(left) {
             return Some(left);
         }
     }
     None
 }
 
+fn extract_rowid_range_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: Option<&TableSchema>,
+    table_alias: Option<&str>,
+) -> Option<RowidRangeTarget<'a>> {
+    let expr = where_clause?;
+    let mut target = RowidRangeTarget::default();
+    if collect_rowid_range_bounds(expr, table, table_alias, &mut target)
+        && (target.lower.is_some() || target.upper.is_some())
+    {
+        Some(target)
+    } else {
+        None
+    }
+}
+
+fn collect_rowid_range_bounds<'a>(
+    expr: &'a Expr,
+    table: Option<&TableSchema>,
+    table_alias: Option<&str>,
+    target: &mut RowidRangeTarget<'a>,
+) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } => {
+            collect_rowid_range_bounds(left, table, table_alias, target)
+                && collect_rowid_range_bounds(right, table, table_alias, target)
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => extract_rowid_range_bound(left, *op, right, table, table_alias)
+            .is_some_and(|(slot, bound)| assign_rowid_range_bound(target, slot, bound)),
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not: false,
+            ..
+        } if is_rowid_expr(operand, table, table_alias)
+            && is_rowid_range_constant(low)
+            && is_rowid_range_constant(high) =>
+        {
+            assign_rowid_range_bound(
+                target,
+                RowidRangeSlot::Lower,
+                RowidRangeBound {
+                    rowid_expr: operand,
+                    expr: low,
+                    inclusive: true,
+                },
+            ) && assign_rowid_range_bound(
+                target,
+                RowidRangeSlot::Upper,
+                RowidRangeBound {
+                    rowid_expr: operand,
+                    expr: high,
+                    inclusive: true,
+                },
+            )
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RowidRangeSlot {
+    Lower,
+    Upper,
+}
+
+fn extract_rowid_range_bound<'a>(
+    left: &'a Expr,
+    op: fsqlite_ast::BinaryOp,
+    right: &'a Expr,
+    table: Option<&TableSchema>,
+    table_alias: Option<&str>,
+) -> Option<(RowidRangeSlot, RowidRangeBound<'a>)> {
+    if is_rowid_expr(left, table, table_alias) && is_rowid_range_constant(right) {
+        return match op {
+            fsqlite_ast::BinaryOp::Ge => Some((
+                RowidRangeSlot::Lower,
+                RowidRangeBound {
+                    rowid_expr: left,
+                    expr: right,
+                    inclusive: true,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Gt => Some((
+                RowidRangeSlot::Lower,
+                RowidRangeBound {
+                    rowid_expr: left,
+                    expr: right,
+                    inclusive: false,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Le => Some((
+                RowidRangeSlot::Upper,
+                RowidRangeBound {
+                    rowid_expr: left,
+                    expr: right,
+                    inclusive: true,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Lt => Some((
+                RowidRangeSlot::Upper,
+                RowidRangeBound {
+                    rowid_expr: left,
+                    expr: right,
+                    inclusive: false,
+                },
+            )),
+            _ => None,
+        };
+    }
+
+    if is_rowid_expr(right, table, table_alias) && is_rowid_range_constant(left) {
+        return match op {
+            fsqlite_ast::BinaryOp::Le => Some((
+                RowidRangeSlot::Lower,
+                RowidRangeBound {
+                    rowid_expr: right,
+                    expr: left,
+                    inclusive: true,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Lt => Some((
+                RowidRangeSlot::Lower,
+                RowidRangeBound {
+                    rowid_expr: right,
+                    expr: left,
+                    inclusive: false,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Ge => Some((
+                RowidRangeSlot::Upper,
+                RowidRangeBound {
+                    rowid_expr: right,
+                    expr: left,
+                    inclusive: true,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Gt => Some((
+                RowidRangeSlot::Upper,
+                RowidRangeBound {
+                    rowid_expr: right,
+                    expr: left,
+                    inclusive: false,
+                },
+            )),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn assign_rowid_range_bound<'a>(
+    target: &mut RowidRangeTarget<'a>,
+    slot: RowidRangeSlot,
+    bound: RowidRangeBound<'a>,
+) -> bool {
+    let target_slot = match slot {
+        RowidRangeSlot::Lower => &mut target.lower,
+        RowidRangeSlot::Upper => &mut target.upper,
+    };
+    if target_slot.is_some() {
+        false
+    } else {
+        *target_slot = Some(bound);
+        true
+    }
+}
+
 /// Check if a WHERE clause is `col = ?` for an indexed column.
 fn extract_column_eq_target<'a>(
     where_clause: Option<&'a Expr>,
     table: &TableSchema,
+    table_alias: Option<&str>,
 ) -> Option<(String, &'a Expr)> {
     let expr = where_clause?;
     if let Expr::BinaryOp {
@@ -8311,12 +8987,12 @@ fn extract_column_eq_target<'a>(
         ..
     } = expr
     {
-        if let Some(col_name) = column_name(left, table) {
+        if let Some(col_name) = column_name(left, table, table_alias) {
             if is_simple_constant(right) {
                 return Some((col_name, right));
             }
         }
-        if let Some(col_name) = column_name(right, table) {
+        if let Some(col_name) = column_name(right, table, table_alias) {
             if is_simple_constant(left) {
                 return Some((col_name, left));
             }
@@ -8325,11 +9001,213 @@ fn extract_column_eq_target<'a>(
     None
 }
 
+#[derive(Clone, Copy)]
+enum ColumnRangeSlot {
+    Lower,
+    Upper,
+}
+
+fn extract_column_range_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(String, ColumnRangeTarget<'a>)> {
+    let expr = where_clause?;
+    let mut column_name = None;
+    let mut target = ColumnRangeTarget::default();
+    if collect_column_range_bounds(expr, table, table_alias, &mut column_name, &mut target)
+        && (target.lower.is_some() || target.upper.is_some())
+    {
+        column_name.map(|col| (col, target))
+    } else {
+        None
+    }
+}
+
+fn collect_column_range_bounds<'a>(
+    expr: &'a Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    target_column: &mut Option<String>,
+    target: &mut ColumnRangeTarget<'a>,
+) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::And,
+            right,
+            ..
+        } => {
+            collect_column_range_bounds(left, table, table_alias, target_column, target)
+                && collect_column_range_bounds(right, table, table_alias, target_column, target)
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => extract_column_range_bound(left, *op, right, table, table_alias).is_some_and(
+            |(column_name, slot, bound)| {
+                assign_column_range_bound(target_column, target, column_name, slot, bound)
+            },
+        ),
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not: false,
+            ..
+        } if is_index_range_constant(low) && is_index_range_constant(high) => {
+            column_name(operand, table, table_alias).is_some_and(|column_name| {
+                assign_column_range_bound(
+                    target_column,
+                    target,
+                    column_name.clone(),
+                    ColumnRangeSlot::Lower,
+                    ColumnRangeBound {
+                        expr: low,
+                        inclusive: true,
+                    },
+                ) && assign_column_range_bound(
+                    target_column,
+                    target,
+                    column_name,
+                    ColumnRangeSlot::Upper,
+                    ColumnRangeBound {
+                        expr: high,
+                        inclusive: true,
+                    },
+                )
+            })
+        }
+        _ => false,
+    }
+}
+
+fn extract_column_range_bound<'a>(
+    left: &'a Expr,
+    op: fsqlite_ast::BinaryOp,
+    right: &'a Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(String, ColumnRangeSlot, ColumnRangeBound<'a>)> {
+    if let Some(column_name) = column_name(left, table, table_alias)
+        && is_index_range_constant(right)
+    {
+        return match op {
+            fsqlite_ast::BinaryOp::Ge => Some((
+                column_name,
+                ColumnRangeSlot::Lower,
+                ColumnRangeBound {
+                    expr: right,
+                    inclusive: true,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Gt => Some((
+                column_name,
+                ColumnRangeSlot::Lower,
+                ColumnRangeBound {
+                    expr: right,
+                    inclusive: false,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Le => Some((
+                column_name,
+                ColumnRangeSlot::Upper,
+                ColumnRangeBound {
+                    expr: right,
+                    inclusive: true,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Lt => Some((
+                column_name,
+                ColumnRangeSlot::Upper,
+                ColumnRangeBound {
+                    expr: right,
+                    inclusive: false,
+                },
+            )),
+            _ => None,
+        };
+    }
+
+    if let Some(column_name) = column_name(right, table, table_alias)
+        && is_index_range_constant(left)
+    {
+        return match op {
+            fsqlite_ast::BinaryOp::Le => Some((
+                column_name,
+                ColumnRangeSlot::Lower,
+                ColumnRangeBound {
+                    expr: left,
+                    inclusive: true,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Lt => Some((
+                column_name,
+                ColumnRangeSlot::Lower,
+                ColumnRangeBound {
+                    expr: left,
+                    inclusive: false,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Ge => Some((
+                column_name,
+                ColumnRangeSlot::Upper,
+                ColumnRangeBound {
+                    expr: left,
+                    inclusive: true,
+                },
+            )),
+            fsqlite_ast::BinaryOp::Gt => Some((
+                column_name,
+                ColumnRangeSlot::Upper,
+                ColumnRangeBound {
+                    expr: left,
+                    inclusive: false,
+                },
+            )),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+fn assign_column_range_bound<'a>(
+    target_column: &mut Option<String>,
+    target: &mut ColumnRangeTarget<'a>,
+    column_name: String,
+    slot: ColumnRangeSlot,
+    bound: ColumnRangeBound<'a>,
+) -> bool {
+    if let Some(existing) = target_column.as_deref() {
+        if !existing.eq_ignore_ascii_case(&column_name) {
+            return false;
+        }
+    } else {
+        *target_column = Some(column_name);
+    }
+
+    let target_slot = match slot {
+        ColumnRangeSlot::Lower => &mut target.lower,
+        ColumnRangeSlot::Upper => &mut target.upper,
+    };
+    if target_slot.is_some() {
+        false
+    } else {
+        *target_slot = Some(bound);
+        true
+    }
+}
+
 /// Extract a column name from an expression if it's a simple column reference.
 #[allow(dead_code)]
-fn column_name(expr: &Expr, table: &TableSchema) -> Option<String> {
+fn column_name(expr: &Expr, table: &TableSchema, table_alias: Option<&str>) -> Option<String> {
     if let Expr::Column(col_ref, _) = expr {
-        if !is_rowid_ref(col_ref, Some(table)) {
+        if let Some(qualifier) = &col_ref.table
+            && !matches_table_or_alias(qualifier, table, table_alias)
+        {
+            return None;
+        }
+        if !is_rowid_ref(col_ref, Some(table), table_alias) {
             return Some(col_ref.column.clone());
         }
     }
@@ -8337,12 +9215,17 @@ fn column_name(expr: &Expr, table: &TableSchema) -> Option<String> {
 }
 
 /// Check if an expression is a rowid reference.
-fn is_rowid_expr(expr: &Expr, table: Option<&TableSchema>) -> bool {
+fn is_rowid_expr(expr: &Expr, table: Option<&TableSchema>, table_alias: Option<&str>) -> bool {
     if let Expr::Column(col_ref, _) = expr {
-        if is_rowid_ref(col_ref, table) {
+        if is_rowid_ref(col_ref, table, table_alias) {
             return true;
         }
         if let Some(t) = table {
+            if let Some(qualifier) = &col_ref.table
+                && !matches_table_or_alias(qualifier, t, table_alias)
+            {
+                return false;
+            }
             for col in &t.columns {
                 if col.is_ipk && col.name.eq_ignore_ascii_case(&col_ref.column) {
                     return true;
@@ -8353,8 +9236,17 @@ fn is_rowid_expr(expr: &Expr, table: Option<&TableSchema>) -> bool {
     false
 }
 
-fn is_rowid_ref(col_ref: &ColumnRef, table: Option<&TableSchema>) -> bool {
+fn is_rowid_ref(
+    col_ref: &ColumnRef,
+    table: Option<&TableSchema>,
+    table_alias: Option<&str>,
+) -> bool {
     if let Some(t) = table {
+        if let Some(qualifier) = &col_ref.table
+            && !matches_table_or_alias(qualifier, t, table_alias)
+        {
+            return false;
+        }
         if let Some(col_idx) = t.column_index(&col_ref.column) {
             return t.columns[col_idx].is_ipk;
         }
@@ -10794,6 +11686,70 @@ mod tests {
         }]
     }
 
+    fn test_schema_with_nocase_text_index() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![ColumnInfo {
+                name: "name".to_owned(),
+                affinity: 'B',
+                is_ipk: false,
+                type_name: Some("TEXT".to_owned()),
+                notnull: false,
+                unique: false,
+                default_value: None,
+                strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
+                collation: Some("NOCASE".to_owned()),
+            }],
+            indexes: vec![IndexSchema {
+                name: "idx_t_name".to_owned(),
+                root_page: 3,
+                columns: vec!["name".to_owned()],
+                key_expressions: vec!["name".to_owned()],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: false,
+            }],
+            strict: false,
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
+    fn test_schema_with_typed_numeric_index() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![ColumnInfo {
+                name: "n".to_owned(),
+                affinity: 'D',
+                is_ipk: false,
+                type_name: Some("INTEGER".to_owned()),
+                notnull: false,
+                unique: false,
+                default_value: None,
+                strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
+                collation: None,
+            }],
+            indexes: vec![IndexSchema {
+                name: "idx_t_n".to_owned(),
+                root_page: 3,
+                columns: vec!["n".to_owned()],
+                key_expressions: vec!["n".to_owned()],
+                key_sort_directions: vec![],
+                where_clause: None,
+                is_unique: false,
+            }],
+            strict: false,
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
     fn test_schema_with_subquery_source() -> Vec<TableSchema> {
         vec![
             TableSchema {
@@ -10860,11 +11816,42 @@ mod tests {
         Expr::Placeholder(PlaceholderType::Numbered(n), Span::ZERO)
     }
 
+    fn anonymous_placeholder() -> Expr {
+        Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)
+    }
+
     fn rowid_eq_param() -> Box<Expr> {
         Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
             op: AstBinaryOp::Eq,
             right: Box::new(placeholder(1)),
+            span: Span::ZERO,
+        })
+    }
+
+    fn col_cmp_param(col: &str, op: AstBinaryOp, n: u32) -> Box<Expr> {
+        Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare(col), Span::ZERO)),
+            op,
+            right: Box::new(placeholder(n)),
+            span: Span::ZERO,
+        })
+    }
+
+    fn qualified_col_cmp_param(table: &str, col: &str, op: AstBinaryOp, n: u32) -> Box<Expr> {
+        Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::qualified(table, col), Span::ZERO)),
+            op,
+            right: Box::new(placeholder(n)),
+            span: Span::ZERO,
+        })
+    }
+
+    fn and_expr(left: Box<Expr>, right: Box<Expr>) -> Box<Expr> {
+        Box::new(Expr::BinaryOp {
+            left,
+            op: AstBinaryOp::And,
+            right,
             span: Span::ZERO,
         })
     }
@@ -11051,6 +12038,241 @@ mod tests {
             .find(|op| op.opcode == Opcode::Transaction)
             .unwrap();
         assert_eq!(txn.p2, 0);
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_range_uses_bounded_seek_scan() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(and_expr(
+                Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    op: AstBinaryOp::Ge,
+                    right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                    span: Span::ZERO,
+                }),
+                Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    op: AstBinaryOp::Lt,
+                    right: Box::new(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+                    span: Span::ZERO,
+                }),
+            )),
+        );
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "range scan should position with SeekGE instead of a full-table Rewind"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Ge),
+            "exclusive upper bound should stop once current rowid reaches the high key"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "bounded rowid/IPK range should not fall back to a full-table rewind"
+        );
+
+        let next = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Next)
+            .expect("bounded range scan should advance with Next");
+        assert_eq!(next.p1, 0, "Next should advance the table cursor");
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_between_uses_seek_and_upper_guard() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(Box::new(Expr::Between {
+                expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                low: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+                high: Box::new(Expr::Literal(Literal::Integer(20), Span::ZERO)),
+                not: false,
+                span: Span::ZERO,
+            })),
+        );
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "BETWEEN should reuse the rowid/IPK range seek path"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Gt),
+            "inclusive upper bound should stop only after the current rowid exceeds the high key"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_range_with_anonymous_params_stays_on_full_scan() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(and_expr(
+                Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    op: AstBinaryOp::Ge,
+                    right: Box::new(anonymous_placeholder()),
+                    span: Span::ZERO,
+                }),
+                Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    op: AstBinaryOp::Lt,
+                    right: Box::new(anonymous_placeholder()),
+                    span: Span::ZERO,
+                }),
+            )),
+        );
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "anonymous placeholder ranges must stay on the original full-scan path"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "fast-path range seek must not reorder anonymous placeholders"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_range_with_numbered_params_stays_on_full_scan() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(and_expr(
+                col_cmp_param("a", AstBinaryOp::Ge, 1),
+                col_cmp_param("a", AstBinaryOp::Lt, 2),
+            )),
+        );
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "numbered rowid/IPK ranges must stay on the generic scan path until runtime integer proof exists"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "numbered rowid/IPK ranges must not use the bounded seek fast path without runtime type proof"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_range_with_wrong_qualifier_falls_back() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(and_expr(
+                qualified_col_cmp_param("u", "a", AstBinaryOp::Ge, 1),
+                qualified_col_cmp_param("u", "a", AstBinaryOp::Lt, 2),
+            )),
+        );
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "mismatched qualifier must not use the rowid range fast path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_range_with_non_numeric_text_literal_falls_back() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                op: AstBinaryOp::Gt,
+                right: Box::new(Expr::Literal(Literal::String("abc".to_owned()), Span::ZERO)),
+                span: Span::ZERO,
+            })),
+        );
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "non-numeric text rowid/IPK bounds must stay on the generic scan path"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "non-numeric text rowid/IPK bounds must not use the bounded seek fast path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_ipk_range_with_quoted_numeric_bounds_falls_back() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(and_expr(
+                Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    op: AstBinaryOp::Ge,
+                    right: Box::new(Expr::Literal(Literal::String("10".to_owned()), Span::ZERO)),
+                    span: Span::ZERO,
+                }),
+                Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                    op: AstBinaryOp::Lt,
+                    right: Box::new(Expr::Literal(Literal::String("20".to_owned()), Span::ZERO)),
+                    span: Span::ZERO,
+                }),
+            )),
+        );
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "quoted numeric rowid/IPK bounds must fall back until affinity-aware seeks exist"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "quoted numeric rowid/IPK bounds must not use the bounded seek fast path"
+        );
     }
 
     #[test]
@@ -12843,6 +14065,356 @@ mod tests {
             usize::try_from(ne.p2).unwrap(),
             if_addr,
             "duplicate-run boundary must not jump directly into the full-scan fallback"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_with_index_wrong_qualifier_falls_back() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("u", "b"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(1)),
+                span: Span::ZERO,
+            })),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "mismatched qualifier should fall back to the generic table scan"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")
+            }),
+            "mismatched qualifier must not open the indexed-equality fast path"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "mismatched qualifier must not use the indexed row lookup fast path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_with_index_range() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(and_expr(
+                col_cmp_param("b", AstBinaryOp::Gt, 1),
+                col_cmp_param("b", AstBinaryOp::Lt, 2),
+            )),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "indexed range should position with SeekGE on the index cursor"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Le),
+            "exclusive lower bound should skip entries equal to the low key"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Ge),
+            "exclusive upper bound should stop once the current key reaches the high key"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")),
+            "range scan should open the matching index"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "index range should not fall back to rewinding the table cursor"
+        );
+
+        let next = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Next)
+            .expect("index range should advance through index entries");
+        assert_eq!(next.p1, 1, "Next should advance the index cursor");
+    }
+
+    #[test]
+    fn test_codegen_select_upper_only_index_range_guards_null_keys() {
+        let stmt = simple_select(&["a"], "t", Some(col_cmp_param("b", AstBinaryOp::Lt, 1)));
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let key_read_idx = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Column && op.p1 == 1 && op.p2 == 0)
+            .expect("upper-only range should read the current index key");
+        let key_reg = ops[key_read_idx].p3;
+        let key_null_guard_idx = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::IsNull && op.p1 == key_reg)
+            .expect("upper-only range should skip NULL index keys");
+        let upper_guard_idx = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Ge)
+            .expect("exclusive upper bound should emit Ge stop guard");
+
+        assert!(
+            key_read_idx < key_null_guard_idx,
+            "NULL guard should run after reading the current index key"
+        );
+        assert!(
+            key_null_guard_idx < upper_guard_idx,
+            "NULL guard should run before the upper-bound comparison"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_with_index_between_can_be_covering() {
+        let stmt = simple_select(
+            &["b"],
+            "t",
+            Some(Box::new(Expr::Between {
+                expr: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                low: Box::new(placeholder(1)),
+                high: Box::new(placeholder(2)),
+                not: false,
+                span: Span::ZERO,
+            })),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "BETWEEN should reuse the indexed range seek path"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Gt),
+            "inclusive upper bound should stop only after the current key exceeds the high key"
+        );
+
+        let table_open_count = ops
+            .iter()
+            .filter(|op| {
+                op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(name) if name == "t")
+            })
+            .count();
+        assert_eq!(
+            table_open_count, 0,
+            "covering index range should not open the table cursor"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "covering index range should not perform table rowid lookups"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_index_range_checks_offset_before_projection() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: Some(and_expr(
+                        col_cmp_param("b", AstBinaryOp::Ge, 1),
+                        col_cmp_param("b", AstBinaryOp::Lt, 2),
+                    )),
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: Some(LimitClause {
+                limit: Expr::Literal(Literal::Integer(5), Span::ZERO),
+                offset: Some(Expr::Literal(Literal::Integer(3), Span::ZERO)),
+            }),
+        };
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        let ifpos_idx = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::IfPos)
+            .expect("range scan with OFFSET should emit IfPos");
+        let seek_rowid_idx = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SeekRowid)
+            .expect("non-covering index range should seek into the table");
+        let projected_column_idx = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::Column && op.p1 == 0 && op.p2 == 0)
+            .expect("non-covering index range should project table columns");
+
+        assert!(
+            seek_rowid_idx < ifpos_idx,
+            "OFFSET should only decrement after the row lookup succeeds"
+        );
+        assert!(
+            ifpos_idx < projected_column_idx,
+            "OFFSET skipping should happen before decoding projected columns"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_index_range_with_nocase_collation_falls_back() {
+        let stmt = simple_select(
+            &["name"],
+            "t",
+            Some(col_cmp_param("name", AstBinaryOp::Lt, 1)),
+        );
+        let schema = test_schema_with_nocase_text_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "NOCASE range should stay on the generic full-scan path"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_name")),
+            "unsafe collation semantics should not use the index-range fast path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_index_range_with_numeric_affinity_falls_back() {
+        let stmt = simple_select(
+            &["n"],
+            "t",
+            Some(and_expr(
+                col_cmp_param("n", AstBinaryOp::Ge, 1),
+                col_cmp_param("n", AstBinaryOp::Lt, 2),
+            )),
+        );
+        let schema = test_schema_with_typed_numeric_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "typed numeric range should stay on the generic full-scan path until seek semantics match WHERE coercion"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_n")),
+            "unsafe affinity semantics should not use the index-range fast path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_index_range_with_anonymous_params_stays_on_full_scan() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(and_expr(
+                Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                    op: AstBinaryOp::Ge,
+                    right: Box::new(anonymous_placeholder()),
+                    span: Span::ZERO,
+                }),
+                Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                    op: AstBinaryOp::Lt,
+                    right: Box::new(anonymous_placeholder()),
+                    span: Span::ZERO,
+                }),
+            )),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "anonymous placeholder ranges must stay on the original full-scan path"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "fast-path index range seek must not reorder anonymous placeholders"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_index_range_with_wrong_qualifier_falls_back() {
+        let stmt = simple_select(
+            &["a"],
+            "t",
+            Some(and_expr(
+                qualified_col_cmp_param("u", "b", AstBinaryOp::Ge, 1),
+                qualified_col_cmp_param("u", "b", AstBinaryOp::Lt, 2),
+            )),
+        );
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "mismatched qualifier should fall back to the generic table scan"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")
+            }),
+            "mismatched qualifier must not open the index-range fast path"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.opcode, Opcode::SeekGE | Opcode::SeekGT)),
+            "mismatched qualifier must not use the index-range seek path"
         );
     }
 

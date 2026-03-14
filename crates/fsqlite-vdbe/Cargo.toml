@@ -28,6 +28,7 @@ tempfile = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+fsqlite-vfs = { workspace = true }
 
 [[bench]]
 name = "vectorized_batch"
