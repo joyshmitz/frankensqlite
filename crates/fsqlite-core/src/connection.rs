@@ -3004,8 +3004,9 @@ impl Connection {
         if let Some(concurrent_snap) = concurrent_snapshot {
             if let Some(session_id) = *self.concurrent_session_id.borrow() {
                 let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                if let Some(handle) = registry.get_mut(session_id) {
-                    if let Err(err) = concurrent_rollback_to_savepoint(handle, concurrent_snap) {
+                if let Some(mut handle) = registry.get_mut(session_id) {
+                    if let Err(err) = concurrent_rollback_to_savepoint(&mut handle, concurrent_snap)
+                    {
                         cleanup_errors.push(format!(
                             "concurrent rollback_to_savepoint('{savepoint_name}') failed: {err}"
                         ));
@@ -3940,8 +3941,8 @@ impl Connection {
             if *self.concurrent_txn.get_mut() {
                 if let Some(session_id) = *self.concurrent_session_id.get_mut() {
                     let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                    if let Some(handle) = registry.get_mut(session_id) {
-                        concurrent_abort(handle, &self.concurrent_lock_table, session_id);
+                    if let Some(mut handle) = registry.get_mut(session_id) {
+                        concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
                     }
                     registry.remove(session_id);
                 }
@@ -4800,7 +4801,7 @@ impl Connection {
                 let handle = registry.get(session_id).ok_or_else(|| {
                     FrankenError::Internal("concurrent session handle not found".to_owned())
                 })?;
-                let snapshot = concurrent_savepoint(handle, &savepoint_name).map_err(|e| {
+                let snapshot = concurrent_savepoint(&handle, &savepoint_name).map_err(|e| {
                     FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
                 })?;
                 Ok(Some(snapshot))
@@ -4860,9 +4861,9 @@ impl Connection {
                 if let Some(concurrent_snap) = concurrent_snapshot.as_ref() {
                     if let Some(session_id) = *self.concurrent_session_id.borrow() {
                         let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                        if let Some(handle) = registry.get_mut(session_id) {
+                        if let Some(mut handle) = registry.get_mut(session_id) {
                             if let Err(err) =
-                                concurrent_rollback_to_savepoint(handle, concurrent_snap)
+                                concurrent_rollback_to_savepoint(&mut handle, concurrent_snap)
                             {
                                 concurrent_rollback_succeeded = false;
                                 cleanup_errors.push(format!(
@@ -8858,8 +8859,8 @@ impl Connection {
             return;
         };
         let mut registry = lock_unpoisoned(&self.concurrent_registry);
-        if let Some(handle) = registry.get_mut(session_id) {
-            concurrent_abort(handle, &self.concurrent_lock_table, session_id);
+        if let Some(mut handle) = registry.get_mut(session_id) {
+            concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
         }
         registry.remove(session_id);
     }
@@ -12949,7 +12950,7 @@ impl Connection {
             return Ok(());
         }
 
-        let handle = registry
+        let mut handle = registry
             .get_mut(session_id)
             .ok_or_else(|| FrankenError::Internal("MVCC session invalid or inactive".to_owned()))?;
         for &page in pending_commit_pages {
@@ -12957,7 +12958,7 @@ impl Connection {
                 continue;
             }
             concurrent_track_write_conflict_page(
-                handle,
+                &mut handle,
                 &self.concurrent_lock_table,
                 session_id,
                 page,
@@ -12997,7 +12998,7 @@ impl Connection {
 
         let (snapshot, active_conflicts) = match registry.get(session_id) {
             Some(handle) if handle.is_active() => {
-                let snapshot = Self::capture_ssi_snapshot(handle);
+                let snapshot = Self::capture_ssi_snapshot(&handle);
                 let active_conflicts =
                     Self::collect_active_conflict_evidence(registry, session_id, &snapshot);
                 (snapshot, active_conflicts)
@@ -13478,13 +13479,14 @@ impl Connection {
             if let Some(concurrent_snap) = concurrent_snap {
                 let session_id = concurrent_session_id.expect("validated above");
                 let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                let handle = registry.get_mut(session_id).ok_or_else(|| {
-                    FrankenError::Internal("concurrent session handle not found".to_owned())
-                })?;
-                concurrent_rollback_to_savepoint(handle, &concurrent_snap).map_err(|e| {
-                    FrankenError::Internal(format!("concurrent rollback failed: {e}"))
-                })?;
-                drop(registry);
+                {
+                    let mut handle = registry.get_mut(session_id).ok_or_else(|| {
+                        FrankenError::Internal("concurrent session handle not found".to_owned())
+                    })?;
+                    concurrent_rollback_to_savepoint(&mut handle, &concurrent_snap).map_err(
+                        |e| FrankenError::Internal(format!("concurrent rollback failed: {e}")),
+                    )?;
+                }
             }
             let live_vtab_level = Self::savepoint_level_from_depth(idx)?;
             let live_vtab_result = self.live_vtab_rollback_to_all(&cx, live_vtab_level);
@@ -13517,8 +13519,8 @@ impl Connection {
             if *self.concurrent_txn.borrow() {
                 if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
                     let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                    if let Some(handle) = registry.get_mut(session_id) {
-                        concurrent_abort(handle, &self.concurrent_lock_table, session_id);
+                    if let Some(mut handle) = registry.get_mut(session_id) {
+                        concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
                     }
                     registry.remove(session_id);
                 }
@@ -13753,13 +13755,14 @@ impl Connection {
                     )
                 })?;
                 let registry = lock_unpoisoned(&self.concurrent_registry);
-                let handle = registry.get(session_id).ok_or_else(|| {
-                    FrankenError::Internal("concurrent session handle not found".to_owned())
-                })?;
-                let snapshot = concurrent_savepoint(handle, name).map_err(|e| {
-                    FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
-                })?;
-                drop(registry);
+                let snapshot = {
+                    let handle = registry.get(session_id).ok_or_else(|| {
+                        FrankenError::Internal("concurrent session handle not found".to_owned())
+                    })?;
+                    concurrent_savepoint(&handle, name).map_err(|e| {
+                        FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
+                    })?
+                };
                 Ok(Some(snapshot))
             })();
             match concurrent_result {
