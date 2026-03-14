@@ -70,20 +70,9 @@ pub enum FcwResult {
 pub struct ConcurrentHandle {
     /// Read snapshot established at `BEGIN CONCURRENT` time.
     snapshot: Snapshot,
-    /// Pages written by this transaction, keyed by page number.
-    write_set: HashMap<PageNumber, PageData>,
-    /// Pages freed by this transaction.
-    ///
-    /// These pages may have no staged payload bytes, but they still need to
-    /// participate in FCW/SSI/commit-index tracking so stale concurrent
-    /// writers cannot commit against a tree that removed them.
-    freed_pages: HashSet<PageNumber>,
-    /// Pages that participate in the write-conflict surface without staged
-    /// payload bytes, such as page 1 when allocation/free changes metadata
-    /// later materialized by the pager commit path.
-    conflict_only_pages: HashSet<PageNumber>,
-    /// Set of page-level locks held by this transaction.
-    page_locks: HashSet<PageNumber>,
+    /// Per-page transactional state for staged writes, frees, synthetic
+    /// conflict tracking, and held page locks.
+    page_states: HashMap<PageNumber, PageTxnState>,
     /// Transaction state (Active / Committed / Aborted).
     state: TransactionState,
     /// Pages read by this transaction (for SSI rw-antidependency detection).
@@ -107,6 +96,80 @@ pub struct ConcurrentHandle {
     marked_for_abort: Cell<bool>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PageTxnState {
+    staged_data: Option<PageData>,
+    is_freed: bool,
+    is_conflict_only: bool,
+    held_lock: bool,
+}
+
+impl PageTxnState {
+    #[must_use]
+    fn tracks_write_conflict(&self) -> bool {
+        self.staged_data.is_some() || self.is_freed || self.is_conflict_only
+    }
+
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        !self.held_lock && !self.tracks_write_conflict()
+    }
+}
+
+pub struct WriteSetView<'a> {
+    page_states: &'a HashMap<PageNumber, PageTxnState>,
+}
+
+impl WriteSetView<'_> {
+    #[must_use]
+    pub fn contains_key(&self, page: &PageNumber) -> bool {
+        self.page_states
+            .get(page)
+            .is_some_and(|state| state.staged_data.is_some())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.page_states
+            .values()
+            .all(|state| state.staged_data.is_none())
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.page_states
+            .values()
+            .filter(|state| state.staged_data.is_some())
+            .count()
+    }
+}
+
+pub struct HeldLocksView<'a> {
+    page_states: &'a HashMap<PageNumber, PageTxnState>,
+}
+
+impl HeldLocksView<'_> {
+    #[must_use]
+    pub fn contains(&self, page: &PageNumber) -> bool {
+        self.page_states
+            .get(page)
+            .is_some_and(|state| state.held_lock)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.page_states.values().all(|state| !state.held_lock)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.page_states
+            .values()
+            .filter(|state| state.held_lock)
+            .count()
+    }
+}
+
 /// Snapshot of one page's local concurrent tracking state.
 ///
 /// This is used to restore the in-memory MVCC bookkeeping if the underlying
@@ -122,16 +185,27 @@ pub struct ConcurrentPageState {
     held_lock: bool,
 }
 
+impl ConcurrentPageState {
+    #[must_use]
+    pub fn is_synthetic_conflict_only(&self) -> bool {
+        self.was_conflict_only && self.staged_data.is_none() && !self.was_freed
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SavepointPageState {
+    staged_data: Option<PageData>,
+    is_freed: bool,
+    is_conflict_only: bool,
+}
+
 impl ConcurrentHandle {
     /// Create a new concurrent handle with the given snapshot and token.
     #[must_use]
     pub fn new(snapshot: Snapshot, txn_token: TxnToken) -> Self {
         Self {
             snapshot,
-            write_set: HashMap::new(),
-            freed_pages: HashSet::new(),
-            conflict_only_pages: HashSet::new(),
-            page_locks: HashSet::new(),
+            page_states: HashMap::new(),
             state: TransactionState::Active,
             read_set: HashSet::new(),
             read_index: HashMap::new(),
@@ -160,42 +234,59 @@ impl ConcurrentHandle {
     /// Returns the set of pages in the write set.
     #[must_use]
     pub fn write_set_pages(&self) -> Vec<PageNumber> {
-        let mut pages = self.write_set.keys().copied().collect::<Vec<_>>();
-        pages.extend(self.freed_pages.iter().copied());
-        pages.extend(self.conflict_only_pages.iter().copied());
+        let mut pages = self
+            .page_states
+            .iter()
+            .filter_map(|(&page, state)| state.tracks_write_conflict().then_some(page))
+            .collect::<Vec<_>>();
         pages.sort_unstable();
-        pages.dedup();
         pages
     }
 
     /// Returns the number of pages in the write set.
     #[must_use]
     pub fn write_set_len(&self) -> usize {
-        self.write_set.len()
+        self.page_states
+            .values()
+            .filter(|state| state.staged_data.is_some())
+            .count()
     }
 
     /// Access the raw write set (for `is_dirty` checks).
     #[must_use]
-    pub fn write_set(&self) -> &HashMap<PageNumber, PageData> {
-        &self.write_set
+    pub fn write_set(&self) -> WriteSetView<'_> {
+        WriteSetView {
+            page_states: &self.page_states,
+        }
     }
 
     #[must_use]
     pub fn is_page_freed(&self, page: PageNumber) -> bool {
-        self.freed_pages.contains(&page)
+        self.page_states
+            .get(&page)
+            .is_some_and(|state| state.is_freed)
     }
 
     #[must_use]
     pub fn tracks_write_conflict_page(&self, page: PageNumber) -> bool {
-        self.write_set.contains_key(&page)
-            || self.freed_pages.contains(&page)
-            || self.conflict_only_pages.contains(&page)
+        self.page_states
+            .get(&page)
+            .is_some_and(PageTxnState::tracks_write_conflict)
     }
 
     /// Returns the set of page locks held.
     #[must_use]
-    pub fn held_locks(&self) -> &HashSet<PageNumber> {
-        &self.page_locks
+    pub fn held_locks(&self) -> HeldLocksView<'_> {
+        HeldLocksView {
+            page_states: &self.page_states,
+        }
+    }
+
+    #[must_use]
+    pub fn holds_page_lock(&self, page: PageNumber) -> bool {
+        self.page_states
+            .get(&page)
+            .is_some_and(|state| state.held_lock)
     }
 
     /// Check whether this transaction is still active.
@@ -243,9 +334,16 @@ impl ConcurrentHandle {
     /// Record a granular write witness for fine-grained SSI.
     pub fn record_write_witness(&mut self, key: WitnessKey) {
         if let Some(p) = witness_key_page(&key) {
-            self.page_locks.insert(p);
-            self.write_index.entry(p).or_default().push(key);
-        } else {
+            self.ensure_page_state(p).held_lock = true;
+            let witnesses = self.write_index.entry(p).or_default();
+            if !witnesses.iter().any(|existing| existing == &key) {
+                witnesses.push(key);
+            }
+        } else if !self
+            .global_write_witnesses
+            .iter()
+            .any(|existing| existing == &key)
+        {
             self.global_write_witnesses.push(key);
         }
     }
@@ -278,6 +376,16 @@ impl ConcurrentHandle {
         keys
     }
 
+    #[must_use]
+    pub fn has_global_read_witnesses(&self) -> bool {
+        !self.global_read_witnesses.is_empty()
+    }
+
+    #[must_use]
+    pub fn has_global_write_witnesses(&self) -> bool {
+        !self.global_write_witnesses.is_empty()
+    }
+
     /// Whether this handle has incoming rw-antidependency (SSI).
     #[must_use]
     pub fn has_in_rw(&self) -> bool {
@@ -294,6 +402,24 @@ impl ConcurrentHandle {
     #[must_use]
     pub fn is_marked_for_abort(&self) -> bool {
         self.marked_for_abort.get()
+    }
+
+    fn page_state(&self, page: PageNumber) -> Option<&PageTxnState> {
+        self.page_states.get(&page)
+    }
+
+    fn ensure_page_state(&mut self, page: PageNumber) -> &mut PageTxnState {
+        self.page_states.entry(page).or_default()
+    }
+
+    fn remove_page_state_if_empty(&mut self, page: PageNumber) {
+        if self
+            .page_states
+            .get(&page)
+            .is_some_and(PageTxnState::is_empty)
+        {
+            self.page_states.remove(&page);
+        }
     }
 }
 
@@ -363,9 +489,10 @@ impl ActiveTxnView for ConcurrentHandle {
         let page = match witness_key_page(key) {
             Some(p) => p,
             None => {
-                return (!self.write_set.is_empty()
-                    || !self.freed_pages.is_empty()
-                    || !self.conflict_only_pages.is_empty())
+                return self
+                    .page_states
+                    .values()
+                    .any(PageTxnState::tracks_write_conflict)
                     || !self.global_write_witnesses.is_empty();
             }
         };
@@ -412,12 +539,8 @@ impl ActiveTxnView for ConcurrentHandle {
 pub struct ConcurrentSavepoint {
     /// Savepoint name.
     pub name: String,
-    /// Snapshot of the write set at savepoint creation time.
-    write_set_snapshot: HashMap<PageNumber, PageData>,
-    /// Snapshot of pages freed at savepoint creation time.
-    freed_pages_snapshot: HashSet<PageNumber>,
-    /// Snapshot of conflict-only pages at savepoint creation time.
-    conflict_only_pages_snapshot: HashSet<PageNumber>,
+    /// Snapshot of per-page tracking state at savepoint creation time.
+    page_states_snapshot: HashMap<PageNumber, SavepointPageState>,
     /// Number of pages in write_set at savepoint creation.
     write_set_len: usize,
 }
@@ -440,8 +563,16 @@ pub struct ConcurrentRegistry {
     active: HashMap<u64, SharedConcurrentHandle>,
     /// Committed-reader history (RCRI-like) for SSI edge discovery.
     committed_readers: Vec<CommittedReaderInfo>,
+    /// Page-local index into committed reader history.
+    committed_readers_by_page: HashMap<PageNumber, Vec<usize>>,
+    /// Committed reader entries that include at least one global witness.
+    committed_readers_with_global_keys: Vec<usize>,
     /// Committed-writer history (commit-log-like) for SSI edge discovery.
     committed_writers: Vec<CommittedWriterInfo>,
+    /// Page-local index into committed writer history.
+    committed_writers_by_page: HashMap<PageNumber, Vec<usize>>,
+    /// Committed writer entries that include at least one global witness.
+    committed_writers_with_global_keys: Vec<usize>,
     /// Next session id to assign.
     next_session_id: u64,
     /// Epoch counter for TxnToken generation (increments on each session).
@@ -455,7 +586,11 @@ impl ConcurrentRegistry {
         Self {
             active: HashMap::new(),
             committed_readers: Vec::new(),
+            committed_readers_by_page: HashMap::new(),
+            committed_readers_with_global_keys: Vec::new(),
             committed_writers: Vec::new(),
+            committed_writers_by_page: HashMap::new(),
+            committed_writers_with_global_keys: Vec::new(),
             next_session_id: 1,
             epoch_counter: 0,
         }
@@ -522,7 +657,11 @@ impl ConcurrentRegistry {
     fn prune_committed_conflict_history(&mut self) {
         let Some(min_active_begin) = self.history_retention_horizon() else {
             self.committed_readers.clear();
+            self.committed_readers_by_page.clear();
+            self.committed_readers_with_global_keys.clear();
             self.committed_writers.clear();
+            self.committed_writers_by_page.clear();
+            self.committed_writers_with_global_keys.clear();
             return;
         };
         self.committed_readers
@@ -573,10 +712,143 @@ impl ConcurrentRegistry {
                 // history is bounded by active transactions), just clear everything.
                 tracing::warn!("prune_committed_conflict_history: forced to clear SSI history");
                 self.committed_readers.clear();
+                self.committed_readers_by_page.clear();
+                self.committed_readers_with_global_keys.clear();
                 self.committed_writers.clear();
+                self.committed_writers_by_page.clear();
+                self.committed_writers_with_global_keys.clear();
                 break;
             }
         }
+
+        self.rebuild_committed_history_indexes();
+    }
+
+    fn rebuild_committed_history_indexes(&mut self) {
+        self.committed_readers_by_page.clear();
+        self.committed_readers_with_global_keys.clear();
+        for (idx, reader) in self.committed_readers.iter().enumerate() {
+            let summary = summarize_witness_keys(&reader.keys);
+            if summary.has_global_keys {
+                self.committed_readers_with_global_keys.push(idx);
+            }
+            for page in summary.pages {
+                self.committed_readers_by_page
+                    .entry(page)
+                    .or_default()
+                    .push(idx);
+            }
+        }
+
+        self.committed_writers_by_page.clear();
+        self.committed_writers_with_global_keys.clear();
+        for (idx, writer) in self.committed_writers.iter().enumerate() {
+            let summary = summarize_witness_keys(&writer.keys);
+            if summary.has_global_keys {
+                self.committed_writers_with_global_keys.push(idx);
+            }
+            for page in summary.pages {
+                self.committed_writers_by_page
+                    .entry(page)
+                    .or_default()
+                    .push(idx);
+            }
+        }
+    }
+
+    fn index_committed_reader(&mut self, entry_idx: usize) {
+        let Some(reader) = self.committed_readers.get(entry_idx) else {
+            return;
+        };
+        let summary = summarize_witness_keys(&reader.keys);
+        if summary.has_global_keys {
+            self.committed_readers_with_global_keys.push(entry_idx);
+        }
+        for page in summary.pages {
+            self.committed_readers_by_page
+                .entry(page)
+                .or_default()
+                .push(entry_idx);
+        }
+    }
+
+    fn index_committed_writer(&mut self, entry_idx: usize) {
+        let Some(writer) = self.committed_writers.get(entry_idx) else {
+            return;
+        };
+        let summary = summarize_witness_keys(&writer.keys);
+        if summary.has_global_keys {
+            self.committed_writers_with_global_keys.push(entry_idx);
+        }
+        for page in summary.pages {
+            self.committed_writers_by_page
+                .entry(page)
+                .or_default()
+                .push(entry_idx);
+        }
+    }
+
+    fn committed_reader_candidates(
+        &self,
+        committing_txn: TxnToken,
+        committing_begin_seq: CommitSeq,
+        committing_commit_seq: CommitSeq,
+        write_key_summary: &WitnessKeySummary,
+    ) -> Vec<CommittedReaderInfo> {
+        if self.committed_readers.is_empty() {
+            return Vec::new();
+        }
+        let candidate_indexes = if write_key_summary.has_global_keys {
+            (0..self.committed_readers.len()).collect::<Vec<_>>()
+        } else {
+            collect_indexed_candidates(
+                &self.committed_readers_with_global_keys,
+                &self.committed_readers_by_page,
+                &write_key_summary.pages,
+            )
+        };
+        let committing_begin = committing_begin_seq.get();
+        let committing_end = committing_commit_seq.get();
+        candidate_indexes
+            .into_iter()
+            .filter_map(|idx| self.committed_readers.get(idx))
+            .filter(|reader| {
+                reader.token != committing_txn
+                    && committing_begin < reader.commit_seq.get()
+                    && reader.begin_seq.get() < committing_end
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn committed_writer_candidates(
+        &self,
+        committing_txn: TxnToken,
+        committing_begin_seq: CommitSeq,
+        _committing_commit_seq: CommitSeq,
+        read_key_summary: &WitnessKeySummary,
+    ) -> Vec<CommittedWriterInfo> {
+        if self.committed_writers.is_empty() {
+            return Vec::new();
+        }
+        let candidate_indexes = if read_key_summary.has_global_keys {
+            (0..self.committed_writers.len()).collect::<Vec<_>>()
+        } else {
+            collect_indexed_candidates(
+                &self.committed_writers_with_global_keys,
+                &self.committed_writers_by_page,
+                &read_key_summary.pages,
+            )
+        };
+        let committing_begin = committing_begin_seq.get();
+        candidate_indexes
+            .into_iter()
+            .filter_map(|idx| self.committed_writers.get(idx))
+            .filter(|writer| {
+                writer.token != committing_txn && committing_begin < writer.commit_seq.get()
+            })
+            .cloned()
+            .collect()
     }
 
     /// Compute the GC horizon: the minimum `snapshot.high` across all active
@@ -630,6 +902,97 @@ impl Default for ConcurrentRegistry {
 /// Acquires a page-level lock if not already held, then records the page
 /// data in the write set.  Returns an error if the lock is held by another
 /// concurrent transaction.
+pub fn concurrent_prepare_write_page(
+    handle: &mut ConcurrentHandle,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+    page: PageNumber,
+) -> Result<(), MvccError> {
+    if !handle.is_active() {
+        return Err(MvccError::InvalidState);
+    }
+    let (holds_lock, was_freed, was_conflict_only, has_staged_data) = handle
+        .page_state(page)
+        .map_or((false, false, false, false), |state| {
+            (
+                state.held_lock,
+                state.is_freed,
+                state.is_conflict_only,
+                state.staged_data.is_some(),
+            )
+        });
+
+    if has_staged_data {
+        debug_assert!(holds_lock, "staged write pages must retain their page lock");
+        debug_assert!(!was_freed, "staged write pages cannot also be marked freed");
+        debug_assert!(
+            !was_conflict_only,
+            "staged write pages cannot also be conflict-only"
+        );
+        return Ok(());
+    }
+
+    if holds_lock && (was_freed || was_conflict_only) {
+        let state = handle.ensure_page_state(page);
+        state.is_freed = false;
+        state.is_conflict_only = false;
+        handle.remove_page_state_if_empty(page);
+        return Ok(());
+    }
+
+    let already_tracked = handle.tracks_write_conflict_page(page);
+    if !holds_lock {
+        let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+        if lock_table.try_acquire(page, txn_id).is_err() {
+            handle.remove_page_state_if_empty(page);
+            return Err(MvccError::Busy);
+        }
+        handle.ensure_page_state(page).held_lock = true;
+    }
+    let state = handle.ensure_page_state(page);
+    state.is_freed = false;
+    state.is_conflict_only = false;
+    if !already_tracked {
+        handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+    }
+    handle.remove_page_state_if_empty(page);
+    Ok(())
+}
+
+/// Stage payload bytes for a page that is already prepared for writing.
+pub fn concurrent_stage_prepared_write_page(
+    handle: &mut ConcurrentHandle,
+    page: PageNumber,
+    data: PageData,
+) -> Result<(), MvccError> {
+    if !handle.is_active() {
+        return Err(MvccError::InvalidState);
+    }
+
+    debug_assert!(
+        handle.holds_page_lock(page),
+        "prepared page writes must retain their page lock before staging bytes"
+    );
+    debug_assert!(
+        !handle
+            .page_state(page)
+            .is_some_and(|state| state.is_conflict_only),
+        "prepared write staging must clear conflict-only tracking first"
+    );
+    debug_assert!(
+        !handle.page_state(page).is_some_and(|state| state.is_freed),
+        "prepared write staging must clear freed-page tracking first"
+    );
+
+    handle.ensure_page_state(page).staged_data = Some(data);
+    Ok(())
+}
+
+/// Write a page within a concurrent transaction.
+///
+/// Acquires a page-level lock if not already held, then records the page
+/// data in the write set. Returns an error if the lock is held by another
+/// concurrent transaction.
 pub fn concurrent_write_page(
     handle: &mut ConcurrentHandle,
     lock_table: &InProcessPageLockTable,
@@ -637,43 +1000,20 @@ pub fn concurrent_write_page(
     page: PageNumber,
     data: PageData,
 ) -> Result<(), MvccError> {
-    if !handle.is_active() {
-        return Err(MvccError::InvalidState);
-    }
-    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
-    if handle.write_set.contains_key(&page)
-        && handle.page_locks.contains(&page)
-        && !handle.freed_pages.contains(&page)
-        && !handle.conflict_only_pages.contains(&page)
-    {
-        handle.write_set.insert(page, data);
-        return Ok(());
-    }
-
-    let already_tracked = handle.tracks_write_conflict_page(page);
-    // Acquire page lock if not already held.
-    if handle.page_locks.insert(page) && lock_table.try_acquire(page, txn_id).is_err() {
-        handle.page_locks.remove(&page);
-        return Err(MvccError::Busy);
-    }
-    handle.freed_pages.remove(&page);
-    handle.conflict_only_pages.remove(&page);
-    if !already_tracked {
-        handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
-    }
-    handle.write_set.insert(page, data);
-    Ok(())
+    concurrent_prepare_write_page(handle, lock_table, session_id, page)?;
+    concurrent_stage_prepared_write_page(handle, page, data)
 }
 
 /// Capture the local concurrent tracking state for a page.
 #[must_use]
 pub fn concurrent_page_state(handle: &ConcurrentHandle, page: PageNumber) -> ConcurrentPageState {
+    let state = handle.page_state(page);
     ConcurrentPageState {
         page,
-        staged_data: handle.write_set.get(&page).cloned(),
-        was_freed: handle.freed_pages.contains(&page),
-        was_conflict_only: handle.conflict_only_pages.contains(&page),
-        held_lock: handle.page_locks.contains(&page),
+        staged_data: state.and_then(|state| state.staged_data.clone()),
+        was_freed: state.is_some_and(|state| state.is_freed),
+        was_conflict_only: state.is_some_and(|state| state.is_conflict_only),
+        held_lock: state.is_some_and(|state| state.held_lock),
     }
 }
 
@@ -689,31 +1029,44 @@ pub fn concurrent_restore_page_state(
     }
     let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
 
-    if let Some(data) = &state.staged_data {
-        handle.write_set.insert(state.page, data.clone());
-    } else {
-        handle.write_set.remove(&state.page);
+    {
+        let restored = handle.ensure_page_state(state.page);
+        restored.staged_data.clone_from(&state.staged_data);
+        restored.is_freed = state.was_freed;
+        restored.is_conflict_only = state.was_conflict_only;
+        restored.held_lock = state.held_lock;
     }
 
-    if state.was_freed {
-        handle.freed_pages.insert(state.page);
-    } else {
-        handle.freed_pages.remove(&state.page);
-    }
-
-    if state.was_conflict_only {
-        handle.conflict_only_pages.insert(state.page);
-    } else {
-        handle.conflict_only_pages.remove(&state.page);
-    }
-
-    if state.held_lock {
-        handle.page_locks.insert(state.page);
-    } else {
-        handle.page_locks.remove(&state.page);
+    if !state.held_lock {
         lock_table.release(state.page, txn_id);
     }
+    handle.remove_page_state_if_empty(state.page);
+    Ok(())
+}
 
+/// Clear all local concurrent tracking for a page.
+///
+/// Upper layers use this when a synthetic conflict surface is no longer part
+/// of the transaction's pending commit state. SSI witnesses are intentionally
+/// retained as a safe overapproximation.
+pub fn concurrent_clear_page_state(
+    handle: &mut ConcurrentHandle,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+    page: PageNumber,
+) -> Result<(), MvccError> {
+    if !handle.is_active() {
+        return Err(MvccError::InvalidState);
+    }
+    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+
+    if let Some(state) = handle.page_state(page)
+        && state.held_lock
+    {
+        lock_table.release(page, txn_id);
+    }
+
+    handle.page_states.remove(&page);
     Ok(())
 }
 
@@ -727,14 +1080,35 @@ pub fn concurrent_track_write_conflict_page(
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
-    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
     let already_tracked = handle.tracks_write_conflict_page(page);
-    if handle.page_locks.insert(page) && lock_table.try_acquire(page, txn_id).is_err() {
-        handle.page_locks.remove(&page);
+    let holds_lock = handle.holds_page_lock(page);
+    if already_tracked && holds_lock {
+        debug_assert!(
+            holds_lock,
+            "tracked conflict pages must retain their page lock"
+        );
+        return Ok(());
+    }
+    if holds_lock {
+        let state = handle.ensure_page_state(page);
+        if state.staged_data.is_none() && !state.is_freed {
+            state.is_conflict_only = true;
+        }
+        if !already_tracked {
+            handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+        }
+        return Ok(());
+    }
+
+    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    if lock_table.try_acquire(page, txn_id).is_err() {
+        handle.remove_page_state_if_empty(page);
         return Err(MvccError::Busy);
     }
-    if !handle.write_set.contains_key(&page) && !handle.freed_pages.contains(&page) {
-        handle.conflict_only_pages.insert(page);
+    let state = handle.ensure_page_state(page);
+    state.held_lock = true;
+    if state.staged_data.is_none() && !state.is_freed {
+        state.is_conflict_only = true;
     }
     if !already_tracked {
         handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
@@ -755,15 +1129,42 @@ pub fn concurrent_free_page(
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
+    if handle.is_page_freed(page) {
+        debug_assert!(
+            handle.holds_page_lock(page),
+            "freed pages must retain their page lock"
+        );
+        debug_assert!(
+            handle
+                .page_state(page)
+                .is_none_or(|state| state.staged_data.is_none()),
+            "freed pages cannot retain staged page bytes"
+        );
+        return Ok(());
+    }
+    if handle.holds_page_lock(page) {
+        let already_tracked = handle.tracks_write_conflict_page(page);
+        let state = handle.ensure_page_state(page);
+        state.staged_data = None;
+        state.is_conflict_only = false;
+        state.is_freed = true;
+        if !already_tracked {
+            handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
+        }
+        return Ok(());
+    }
+
     let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
     let already_tracked = handle.tracks_write_conflict_page(page);
-    if handle.page_locks.insert(page) && lock_table.try_acquire(page, txn_id).is_err() {
-        handle.page_locks.remove(&page);
+    if lock_table.try_acquire(page, txn_id).is_err() {
+        handle.remove_page_state_if_empty(page);
         return Err(MvccError::Busy);
     }
-    handle.write_set.remove(&page);
-    handle.conflict_only_pages.remove(&page);
-    handle.freed_pages.insert(page);
+    let state = handle.ensure_page_state(page);
+    state.held_lock = true;
+    state.staged_data = None;
+    state.is_conflict_only = false;
+    state.is_freed = true;
     if !already_tracked {
         handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
     }
@@ -777,7 +1178,9 @@ pub fn concurrent_free_page(
 /// version store using the handle's snapshot).
 #[must_use]
 pub fn concurrent_read_page(handle: &ConcurrentHandle, page: PageNumber) -> Option<&PageData> {
-    handle.write_set.get(&page)
+    handle
+        .page_state(page)
+        .and_then(|state| state.staged_data.as_ref())
 }
 
 /// Whether the page has been freed by this concurrent transaction.
@@ -812,7 +1215,7 @@ pub fn validate_first_committer_wins(
 
     if conflicting_pages.is_empty() {
         tracing::debug!(
-            write_set_size = handle.write_set.len(),
+            write_set_size = handle.write_set_len(),
             snapshot_seq = snapshot_seq.get(),
             "fcw_validation: clean (no base drift)"
         );
@@ -847,15 +1250,19 @@ pub enum SsiResult {
 /// This captures the pre-commit validation result without publishing commit
 /// side effects. Callers should run physical pager commit first, then pass
 /// this plan to [`finalize_prepared_concurrent_commit_with_ssi`] to publish
-/// conflict history and edge propagation.
+/// conflict history and edge propagation. `planned_commit_seq` is an
+/// optimistic planning frontier, not necessarily the final published commit
+/// sequence if another commit slips in between prepare and finalize.
 #[derive(Debug, Clone)]
 pub struct PreparedConcurrentCommit {
     session_id: u64,
-    assigned_commit_seq: CommitSeq,
+    planned_commit_seq: CommitSeq,
     txn_token: TxnToken,
     begin_seq: CommitSeq,
     read_keys: Vec<WitnessKey>,
+    read_key_summary: WitnessKeySummary,
     write_keys: Vec<WitnessKey>,
+    write_key_summary: WitnessKeySummary,
     write_set_pages: Vec<PageNumber>,
     has_in_rw: bool,
     has_out_rw: bool,
@@ -871,8 +1278,8 @@ impl PreparedConcurrentCommit {
     }
 
     #[must_use]
-    pub const fn assigned_commit_seq(&self) -> CommitSeq {
-        self.assigned_commit_seq
+    pub const fn planned_commit_seq(&self) -> CommitSeq {
+        self.planned_commit_seq
     }
 
     #[must_use]
@@ -906,6 +1313,50 @@ impl PreparedConcurrentCommit {
     }
 
     #[must_use]
+    pub fn read_pages(&self) -> Vec<PageNumber> {
+        self.read_key_summary.pages.clone()
+    }
+
+    #[must_use]
+    pub fn write_set_pages(&self) -> &[PageNumber] {
+        &self.write_set_pages
+    }
+
+    #[must_use]
+    pub fn conflicting_txns(&self) -> Vec<TxnToken> {
+        let mut txns = self
+            .incoming_edges
+            .iter()
+            .map(|edge| edge.from)
+            .chain(self.outgoing_edges.iter().map(|edge| edge.to))
+            .collect::<Vec<_>>();
+        txns.sort_by(|left, right| {
+            left.id
+                .get()
+                .cmp(&right.id.get())
+                .then_with(|| left.epoch.get().cmp(&right.epoch.get()))
+        });
+        txns.dedup();
+        txns
+    }
+
+    #[must_use]
+    pub fn conflict_pages(&self) -> Vec<PageNumber> {
+        let mut pages = self
+            .incoming_edges
+            .iter()
+            .chain(self.outgoing_edges.iter())
+            .filter_map(|edge| witness_key_page(&edge.overlap_key))
+            .collect::<Vec<_>>();
+        if pages.is_empty() {
+            pages.extend(self.write_set_pages.iter().copied());
+        }
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+    }
+
+    #[must_use]
     pub const fn dro_t3_decision(&self) -> Option<crate::ssi_abort_policy::DroHotPathDecision> {
         self.dro_t3_decision
     }
@@ -920,6 +1371,8 @@ struct HandleView {
     tracked_write_pages: HashSet<PageNumber>,
     read_keys: Vec<WitnessKey>,
     write_keys: Vec<WitnessKey>,
+    has_global_read_witnesses: bool,
+    has_global_write_witnesses: bool,
     has_in_rw: Cell<bool>,
     has_out_rw: Cell<bool>,
 }
@@ -934,9 +1387,148 @@ impl HandleView {
             tracked_write_pages: handle.write_set_pages().into_iter().collect(),
             read_keys: handle.read_witness_keys(),
             write_keys: handle.write_witness_keys(),
+            has_global_read_witnesses: handle.has_global_read_witnesses(),
+            has_global_write_witnesses: handle.has_global_write_witnesses(),
             has_in_rw: Cell::new(handle.has_in_rw()),
             has_out_rw: Cell::new(handle.has_out_rw()),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct WitnessKeySummary {
+    pages: Vec<PageNumber>,
+    has_global_keys: bool,
+}
+
+fn summarize_witness_keys(keys: &[WitnessKey]) -> WitnessKeySummary {
+    let mut pages = Vec::new();
+    let mut has_global_keys = false;
+    for key in keys {
+        if let Some(page) = witness_key_page(key) {
+            pages.push(page);
+        } else {
+            has_global_keys = true;
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    WitnessKeySummary {
+        pages,
+        has_global_keys,
+    }
+}
+
+fn collect_indexed_candidates(
+    global_indexes: &[usize],
+    indexes_by_page: &HashMap<PageNumber, Vec<usize>>,
+    pages: &[PageNumber],
+) -> Vec<usize> {
+    let mut candidate_indexes = global_indexes.to_vec();
+    for &page in pages {
+        if let Some(indexes) = indexes_by_page.get(&page) {
+            candidate_indexes.extend(indexes.iter().copied());
+        }
+    }
+    candidate_indexes.sort_unstable();
+    candidate_indexes.dedup();
+    candidate_indexes
+}
+
+#[derive(Debug, Default)]
+struct ActiveEdgeDiscoveryIndex {
+    all_readers: Vec<usize>,
+    all_writers: Vec<usize>,
+    readers_with_global_keys: Vec<usize>,
+    writers_with_global_keys: Vec<usize>,
+    readers_by_page: HashMap<PageNumber, Vec<usize>>,
+    writers_by_page: HashMap<PageNumber, Vec<usize>>,
+}
+
+impl ActiveEdgeDiscoveryIndex {
+    fn build(views: &[HandleView]) -> Self {
+        let mut index = Self::default();
+        for (idx, view) in views.iter().enumerate() {
+            if !view.read_keys.is_empty() {
+                index.all_readers.push(idx);
+                if view.has_global_read_witnesses {
+                    index.readers_with_global_keys.push(idx);
+                }
+                for &page in &view.read_pages {
+                    index.readers_by_page.entry(page).or_default().push(idx);
+                }
+            }
+            if !view.write_keys.is_empty() {
+                index.all_writers.push(idx);
+                if view.has_global_write_witnesses {
+                    index.writers_with_global_keys.push(idx);
+                }
+                for &page in &view.tracked_write_pages {
+                    index.writers_by_page.entry(page).or_default().push(idx);
+                }
+            }
+        }
+        index
+    }
+
+    fn incoming_candidate_refs<'a>(
+        &'a self,
+        views: &'a [HandleView],
+        committing_txn: TxnToken,
+        _committing_begin_seq: CommitSeq,
+        committing_commit_seq: CommitSeq,
+        write_key_summary: &WitnessKeySummary,
+    ) -> Vec<&'a dyn ActiveTxnView> {
+        let candidate_indexes = if write_key_summary.has_global_keys {
+            self.all_readers.clone()
+        } else {
+            collect_indexed_candidates(
+                &self.readers_with_global_keys,
+                &self.readers_by_page,
+                &write_key_summary.pages,
+            )
+        };
+        let committing_end = committing_commit_seq.get();
+        candidate_indexes
+            .into_iter()
+            .filter_map(|idx| views.get(idx))
+            .filter(|view| {
+                view.token != committing_txn
+                    && view.is_active
+                    && view.begin_seq.get() < committing_end
+            })
+            .map(|view| view as &dyn ActiveTxnView)
+            .collect()
+    }
+
+    fn outgoing_candidate_refs<'a>(
+        &'a self,
+        views: &'a [HandleView],
+        committing_txn: TxnToken,
+        _committing_begin_seq: CommitSeq,
+        committing_commit_seq: CommitSeq,
+        read_key_summary: &WitnessKeySummary,
+    ) -> Vec<&'a dyn ActiveTxnView> {
+        let candidate_indexes = if read_key_summary.has_global_keys {
+            self.all_writers.clone()
+        } else {
+            collect_indexed_candidates(
+                &self.writers_with_global_keys,
+                &self.writers_by_page,
+                &read_key_summary.pages,
+            )
+        };
+        let committing_end = committing_commit_seq.get();
+        candidate_indexes
+            .into_iter()
+            .filter_map(|idx| views.get(idx))
+            .filter(|view| {
+                view.token != committing_txn
+                    && view.is_active
+                    && view.begin_seq.get() < committing_end
+            })
+            .map(|view| view as &dyn ActiveTxnView)
+            .collect()
     }
 }
 
@@ -967,7 +1559,9 @@ impl ActiveTxnView for HandleView {
             | WitnessKey::Cell { btree_root: p, .. }
             | WitnessKey::ByteRange { page: p, .. }
             | WitnessKey::KeyRange { btree_root: p, .. } => self.read_pages.contains(p),
-            WitnessKey::Custom { .. } => !self.read_pages.is_empty(), // Conservative fallback
+            WitnessKey::Custom { .. } => {
+                !self.read_pages.is_empty() || self.has_global_read_witnesses
+            }
         }
     }
 
@@ -977,7 +1571,9 @@ impl ActiveTxnView for HandleView {
             | WitnessKey::Cell { btree_root: p, .. }
             | WitnessKey::ByteRange { page: p, .. }
             | WitnessKey::KeyRange { btree_root: p, .. } => self.tracked_write_pages.contains(p),
-            WitnessKey::Custom { .. } => !self.tracked_write_pages.is_empty(), // Conservative fallback
+            WitnessKey::Custom { .. } => {
+                !self.tracked_write_pages.is_empty() || self.has_global_write_witnesses
+            }
         }
     }
 
@@ -1045,7 +1641,7 @@ pub fn concurrent_commit(
     let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
 
     // Step 1: First-committer-wins validation.
-    let fcw_result = validate_first_committer_wins(&handle, commit_index);
+    let fcw_result = validate_first_committer_wins(handle, commit_index);
     match &fcw_result {
         FcwResult::Clean => {
             // FCW passed. Now run SSI validation.
@@ -1105,12 +1701,11 @@ pub fn prepare_concurrent_commit_with_ssi(
     commit_index: &CommitIndex,
     lock_table: &InProcessPageLockTable,
     session_id: u64,
-    assign_commit_seq: CommitSeq,
+    planned_commit_seq: CommitSeq,
 ) -> Result<PreparedConcurrentCommit, (MvccError, FcwResult)> {
     let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
 
-    // First, verify the session exists and is active.
-    {
+    let commit_view = {
         let handle = registry
             .get(session_id)
             .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
@@ -1121,33 +1716,33 @@ pub fn prepare_concurrent_commit_with_ssi(
         // Step 1: First-committer-wins validation.
         let fcw_result = validate_first_committer_wins(&handle, commit_index);
         if !matches!(fcw_result, FcwResult::Clean) {
-            lock_table.release_all(txn_id);
-            if let Some(mut handle) = registry.get_mut(session_id) {
-                handle.mark_aborted();
-            }
-            return Err((MvccError::BusySnapshot, fcw_result));
+            Err(fcw_result)
+        } else {
+            let mut read_keys = handle.read_witness_keys();
+            read_keys.sort_unstable();
+            let mut write_keys = handle.write_witness_keys();
+            write_keys.sort_unstable();
+            Ok((
+                handle.token(),
+                handle.begin_seq(),
+                read_keys,
+                write_keys,
+                handle.write_set_pages(),
+                handle.is_marked_for_abort(),
+            ))
         }
-    }
-
-    // Build view of committing txn state.
-    let (txn, begin_seq, read_keys, write_keys, write_set_pages, marked_for_abort) = {
-        let handle = registry
-            .get(session_id)
-            .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
-
-        let read_keys = handle.read_witness_keys();
-        let write_keys = handle.write_witness_keys();
-        let write_set_pages = handle.write_set_pages();
-
-        (
-            handle.token(),
-            handle.begin_seq(),
-            read_keys,
-            write_keys,
-            write_set_pages,
-            handle.marked_for_abort.get(),
-        )
     };
+    let (txn, begin_seq, sorted_read_keys, sorted_write_keys, write_set_pages, marked_for_abort) =
+        match commit_view {
+            Ok(view) => view,
+            Err(fcw_result) => {
+                lock_table.release_all(txn_id);
+                if let Some(mut handle) = registry.get_mut(session_id) {
+                    handle.mark_aborted();
+                }
+                return Err((MvccError::BusySnapshot, fcw_result));
+            }
+        };
 
     if marked_for_abort {
         tracing::warn!(
@@ -1161,12 +1756,6 @@ pub fn prepare_concurrent_commit_with_ssi(
         return Err((MvccError::BusySnapshot, FcwResult::Clean));
     }
 
-    // Sort keys for deterministic evidence ordering.
-    let mut sorted_read_keys = read_keys.clone();
-    sorted_read_keys.sort_unstable();
-    let mut sorted_write_keys = write_keys.clone();
-    sorted_write_keys.sort_unstable();
-
     // Step 2: Discover SSI edges without publishing side effects yet.
     let views = registry
         .iter_active()
@@ -1175,26 +1764,47 @@ pub fn prepare_concurrent_commit_with_ssi(
             guard.is_active().then_some(HandleView::new(&guard))
         })
         .collect::<Vec<_>>();
-    let active_views: Vec<&dyn ActiveTxnView> = views
-        .iter()
-        .map(|view| view as &dyn ActiveTxnView)
-        .collect();
+    let active_index = ActiveEdgeDiscoveryIndex::build(&views);
+    let read_key_summary = summarize_witness_keys(&sorted_read_keys);
+    let write_key_summary = summarize_witness_keys(&sorted_write_keys);
+    let active_reader_candidates = active_index.incoming_candidate_refs(
+        &views,
+        txn,
+        begin_seq,
+        planned_commit_seq,
+        &write_key_summary,
+    );
+    let committed_reader_candidates = registry.committed_reader_candidates(
+        txn,
+        begin_seq,
+        planned_commit_seq,
+        &write_key_summary,
+    );
+    let active_writer_candidates = active_index.outgoing_candidate_refs(
+        &views,
+        txn,
+        begin_seq,
+        planned_commit_seq,
+        &read_key_summary,
+    );
+    let committed_writer_candidates =
+        registry.committed_writer_candidates(txn, begin_seq, planned_commit_seq, &read_key_summary);
 
     let incoming_edges = discover_incoming_edges(
         txn,
         begin_seq,
-        assign_commit_seq,
+        planned_commit_seq,
         &sorted_write_keys,
-        &active_views,
-        &registry.committed_readers,
+        &active_reader_candidates,
+        &committed_reader_candidates,
     );
     let outgoing_edges = discover_outgoing_edges(
         txn,
         begin_seq,
-        assign_commit_seq,
+        planned_commit_seq,
         &sorted_read_keys,
-        &active_views,
-        &registry.committed_writers,
+        &active_writer_candidates,
+        &committed_writer_candidates,
     );
 
     let has_in_rw = !incoming_edges.is_empty();
@@ -1222,11 +1832,13 @@ pub fn prepare_concurrent_commit_with_ssi(
 
     Ok(PreparedConcurrentCommit {
         session_id,
-        assigned_commit_seq: assign_commit_seq,
+        planned_commit_seq,
         txn_token: txn,
         begin_seq,
         read_keys: sorted_read_keys,
+        read_key_summary,
         write_keys: sorted_write_keys,
+        write_key_summary,
         write_set_pages,
         has_in_rw,
         has_out_rw,
@@ -1248,9 +1860,9 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
     prepared: &PreparedConcurrentCommit,
     committed_seq: CommitSeq,
 ) {
-    debug_assert_eq!(
-        committed_seq, prepared.assigned_commit_seq,
-        "prepared commit sequence mismatch"
+    debug_assert!(
+        committed_seq >= prepared.planned_commit_seq,
+        "final commit sequence must not move backwards from the planning frontier"
     );
 
     let Some(txn_id) = TxnId::new(prepared.session_id) else {
@@ -1268,10 +1880,33 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             HandleView::new(&guard)
         })
         .collect();
-    let active_refs: Vec<&dyn ActiveTxnView> = active_views
-        .iter()
-        .map(|view| view as &dyn ActiveTxnView)
-        .collect();
+    let active_index = ActiveEdgeDiscoveryIndex::build(&active_views);
+    let active_reader_candidates = active_index.incoming_candidate_refs(
+        &active_views,
+        prepared.txn_token,
+        prepared.begin_seq,
+        committed_seq,
+        &prepared.write_key_summary,
+    );
+    let committed_reader_candidates = registry.committed_reader_candidates(
+        prepared.txn_token,
+        prepared.begin_seq,
+        committed_seq,
+        &prepared.write_key_summary,
+    );
+    let active_writer_candidates = active_index.outgoing_candidate_refs(
+        &active_views,
+        prepared.txn_token,
+        prepared.begin_seq,
+        committed_seq,
+        &prepared.read_key_summary,
+    );
+    let committed_writer_candidates = registry.committed_writer_candidates(
+        prepared.txn_token,
+        prepared.begin_seq,
+        committed_seq,
+        &prepared.read_key_summary,
+    );
 
     let mut incoming_edges = prepared.incoming_edges.clone();
     for edge in discover_incoming_edges(
@@ -1279,8 +1914,23 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.begin_seq,
         committed_seq,
         &prepared.write_keys,
-        &active_refs,
+        &active_reader_candidates,
         &[],
+    ) {
+        if incoming_edges
+            .iter()
+            .all(|existing| existing.from != edge.from)
+        {
+            incoming_edges.push(edge);
+        }
+    }
+    for edge in discover_incoming_edges(
+        prepared.txn_token,
+        prepared.begin_seq,
+        committed_seq,
+        &prepared.write_keys,
+        &[],
+        &committed_reader_candidates,
     ) {
         if incoming_edges
             .iter()
@@ -1296,8 +1946,20 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.begin_seq,
         committed_seq,
         &prepared.read_keys,
-        &active_refs,
+        &active_writer_candidates,
         &[],
+    ) {
+        if outgoing_edges.iter().all(|existing| existing.to != edge.to) {
+            outgoing_edges.push(edge);
+        }
+    }
+    for edge in discover_outgoing_edges(
+        prepared.txn_token,
+        prepared.begin_seq,
+        committed_seq,
+        &prepared.read_keys,
+        &[],
+        &committed_writer_candidates,
     ) {
         if outgoing_edges.iter().all(|existing| existing.to != edge.to) {
             outgoing_edges.push(edge);
@@ -1421,6 +2083,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             had_in_rw: has_in_rw,
             keys: prepared.read_keys.clone(),
         });
+        registry.index_committed_reader(registry.committed_readers.len() - 1);
     }
     if !prepared.write_keys.is_empty() {
         registry.committed_writers.push(CommittedWriterInfo {
@@ -1429,6 +2092,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             had_out_rw: has_out_rw,
             keys: prepared.write_keys.clone(),
         });
+        registry.index_committed_writer(registry.committed_writers.len() - 1);
     }
     registry.prune_committed_conflict_history();
 }
@@ -1452,7 +2116,7 @@ pub fn concurrent_commit_with_ssi(
         Err(e) => {
             if let Some(handle) = registry.remove(session_id) {
                 let mut handle = handle.lock();
-                concurrent_abort(&mut *handle, lock_table, session_id);
+                concurrent_abort(&mut handle, lock_table, session_id);
             }
             return Err(e);
         }
@@ -1491,12 +2155,24 @@ pub fn concurrent_savepoint(
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
+    let page_states_snapshot = handle
+        .page_states
+        .iter()
+        .filter_map(|(&page, state)| {
+            state.tracks_write_conflict().then_some((
+                page,
+                SavepointPageState {
+                    staged_data: state.staged_data.clone(),
+                    is_freed: state.is_freed,
+                    is_conflict_only: state.is_conflict_only,
+                },
+            ))
+        })
+        .collect();
     Ok(ConcurrentSavepoint {
         name: name.to_owned(),
-        write_set_snapshot: handle.write_set.clone(),
-        freed_pages_snapshot: handle.freed_pages.clone(),
-        conflict_only_pages_snapshot: handle.conflict_only_pages.clone(),
-        write_set_len: handle.write_set.len(),
+        page_states_snapshot,
+        write_set_len: handle.write_set_len(),
     })
 }
 
@@ -1507,18 +2183,56 @@ pub fn concurrent_savepoint(
 /// The snapshot remains active for continued operations.
 pub fn concurrent_rollback_to_savepoint(
     handle: &mut ConcurrentHandle,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
     savepoint: &ConcurrentSavepoint,
 ) -> Result<(), MvccError> {
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
-    handle.write_set.clone_from(&savepoint.write_set_snapshot);
-    handle
-        .freed_pages
-        .clone_from(&savepoint.freed_pages_snapshot);
-    handle
-        .conflict_only_pages
-        .clone_from(&savepoint.conflict_only_pages_snapshot);
+    let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+    let mut reacquired_pages = Vec::new();
+    for &page in savepoint.page_states_snapshot.keys() {
+        if !handle.page_state(page).is_some_and(|state| state.held_lock) {
+            if lock_table.try_acquire(page, txn_id).is_err() {
+                for reacquired in reacquired_pages {
+                    lock_table.release(reacquired, txn_id);
+                }
+                return Err(MvccError::Busy);
+            }
+            reacquired_pages.push(page);
+        }
+    }
+
+    let mut restored = HashMap::with_capacity(
+        handle
+            .page_states
+            .len()
+            .max(savepoint.page_states_snapshot.len()),
+    );
+
+    for (&page, snapshot_state) in &savepoint.page_states_snapshot {
+        restored.insert(
+            page,
+            PageTxnState {
+                staged_data: snapshot_state.staged_data.clone(),
+                is_freed: snapshot_state.is_freed,
+                is_conflict_only: snapshot_state.is_conflict_only,
+                held_lock: true,
+            },
+        );
+    }
+
+    for (&page, state) in &handle.page_states {
+        if state.held_lock {
+            restored.entry(page).or_insert_with(|| PageTxnState {
+                held_lock: true,
+                ..PageTxnState::default()
+            });
+        }
+    }
+
+    handle.page_states = restored;
     Ok(())
 }
 
@@ -1533,7 +2247,8 @@ mod tests {
     use std::sync::Arc;
 
     use fsqlite_types::{
-        CommitSeq, PageData, PageNumber, PageSize, SchemaEpoch, Snapshot, WitnessKey,
+        CommitSeq, PageData, PageNumber, PageSize, SchemaEpoch, Snapshot, TxnEpoch, TxnId,
+        TxnToken, WitnessKey,
     };
 
     use crate::core_types::{CommitIndex, InProcessPageLockTable};
@@ -1541,12 +2256,14 @@ mod tests {
     use crate::ssi_validation::ActiveTxnView;
 
     use super::{
-        ConcurrentRegistry, FcwResult, MAX_CONCURRENT_WRITERS, concurrent_abort, concurrent_commit,
-        concurrent_free_page, concurrent_page_is_freed, concurrent_page_state,
-        concurrent_read_page, concurrent_restore_page_state, concurrent_rollback_to_savepoint,
-        concurrent_savepoint, concurrent_track_write_conflict_page, concurrent_write_page,
+        CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle, ConcurrentRegistry, FcwResult,
+        HandleView, MAX_CONCURRENT_WRITERS, concurrent_abort, concurrent_clear_page_state,
+        concurrent_commit, concurrent_commit_with_ssi, concurrent_free_page,
+        concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
+        concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
+        concurrent_track_write_conflict_page, concurrent_write_page,
         finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
-        validate_first_committer_wins,
+        summarize_witness_keys, validate_first_committer_wins,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {
@@ -1562,6 +2279,13 @@ mod tests {
 
     fn test_data() -> PageData {
         PageData::zeroed(PageSize::DEFAULT)
+    }
+
+    fn test_token(id: u64) -> TxnToken {
+        TxnToken::new(
+            TxnId::new(id).expect("test transaction id"),
+            TxnEpoch::new(id as u32 + 1),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -1583,23 +2307,23 @@ mod tests {
             .expect("session 2");
 
         // Session 1 writes page 5.
-        let h1 = registry.get_mut(s1).expect("handle 1");
-        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data())
+        let mut h1 = registry.get_mut(s1).expect("handle 1");
+        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
             .expect("write page 5");
 
         // Session 2 writes page 10 (different page => no conflict).
-        let h2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(h2, &lock_table, s2, test_page(10), test_data())
+        let mut h2 = registry.get_mut(s2).expect("handle 2");
+        concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data())
             .expect("write page 10");
 
         // Both commit successfully.
-        let h1 = registry.get_mut(s1).expect("handle 1");
-        let seq1 = concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+        let mut h1 = registry.get_mut(s1).expect("handle 1");
+        let seq1 = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
             .expect("commit 1");
         assert_eq!(seq1, CommitSeq::new(11));
 
-        let h2 = registry.get_mut(s2).expect("handle 2");
-        let seq2 = concurrent_commit(h2, &commit_index, &lock_table, s2, CommitSeq::new(12))
+        let mut h2 = registry.get_mut(s2).expect("handle 2");
+        let seq2 = concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12))
             .expect("commit 2");
         assert_eq!(seq2, CommitSeq::new(12));
     }
@@ -1623,23 +2347,23 @@ mod tests {
         // Both write to page 5, but lock contention prevents s2 from
         // acquiring the same lock.  In our model, each session uses its
         // session_id as the lock holder.
-        let h1 = registry.get_mut(s1).expect("handle 1");
-        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data())
+        let mut h1 = registry.get_mut(s1).expect("handle 1");
+        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
             .expect("s1 write page 5");
 
         // s1 commits first (first-committer-wins).
-        let h1 = registry.get_mut(s1).expect("handle 1");
-        concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+        let mut h1 = registry.get_mut(s1).expect("handle 1");
+        concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
             .expect("s1 commits first");
 
         // Now s2 tries to write and commit the same page.  The lock was
         // released by s1's commit, so s2 can acquire it.
-        let h2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(h2, &lock_table, s2, test_page(5), test_data())
+        let mut h2 = registry.get_mut(s2).expect("handle 2");
+        concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data())
             .expect("s2 write page 5");
 
-        let h2 = registry.get_mut(s2).expect("handle 2");
-        let result = concurrent_commit(h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
+        let mut h2 = registry.get_mut(s2).expect("handle 2");
+        let result = concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
         assert!(result.is_err());
         let (err, fcw) = result.unwrap_err();
         assert_eq!(err, MvccError::BusySnapshot);
@@ -1666,30 +2390,30 @@ mod tests {
             .expect("session 3");
 
         // s1 writes page 5, s3 writes page 10 (no overlap).
-        let h1 = registry.get_mut(s1).expect("h1");
-        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        let mut h1 = registry.get_mut(s1).expect("h1");
+        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
 
-        let h3 = registry.get_mut(s3).expect("h3");
-        concurrent_write_page(h3, &lock_table, s3, test_page(10), test_data()).unwrap();
+        let mut h3 = registry.get_mut(s3).expect("h3");
+        concurrent_write_page(&mut h3, &lock_table, s3, test_page(10), test_data()).unwrap();
 
         // s1 commits first on page 5.
-        let h1 = registry.get_mut(s1).expect("h1");
-        concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
+        let mut h1 = registry.get_mut(s1).expect("h1");
+        concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11))
             .expect("s1 commits");
 
         // s2 now tries page 5 (same as s1, but s1 already committed).
-        let h2 = registry.get_mut(s2).expect("h2");
-        concurrent_write_page(h2, &lock_table, s2, test_page(5), test_data()).unwrap();
+        let mut h2 = registry.get_mut(s2).expect("h2");
+        concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data()).unwrap();
 
-        let h2 = registry.get_mut(s2).expect("h2");
-        let result = concurrent_commit(h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
+        let mut h2 = registry.get_mut(s2).expect("h2");
+        let result = concurrent_commit(&mut h2, &commit_index, &lock_table, s2, CommitSeq::new(12));
         assert!(result.is_err());
         let (err, _) = result.unwrap_err();
         assert_eq!(err, MvccError::BusySnapshot);
 
         // s3 commits on page 10 (no conflict with s1's page 5).
-        let h3 = registry.get_mut(s3).expect("h3");
-        let seq3 = concurrent_commit(h3, &commit_index, &lock_table, s3, CommitSeq::new(13))
+        let mut h3 = registry.get_mut(s3).expect("h3");
+        let seq3 = concurrent_commit(&mut h3, &commit_index, &lock_table, s3, CommitSeq::new(13))
             .expect("s3 commits");
         assert_eq!(seq3, CommitSeq::new(13));
     }
@@ -1708,45 +2432,59 @@ mod tests {
             .expect("session");
 
         // Write page 1 (INSERT A).
-        let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data()).unwrap();
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data()).unwrap();
+        }
 
         // Create savepoint.
-        let handle = registry.get(s1).expect("handle");
-        let sp = concurrent_savepoint(&handle, "sp1").unwrap();
+        let sp = {
+            let handle = registry.get(s1).expect("handle");
+            concurrent_savepoint(&handle, "sp1").unwrap()
+        };
         assert_eq!(sp.captured_len(), 1);
 
         // Write page 2 (INSERT B).
-        let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, test_page(2), test_data()).unwrap();
-        assert_eq!(handle.write_set_len(), 2);
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_write_page(&mut handle, &lock_table, s1, test_page(2), test_data()).unwrap();
+            assert_eq!(handle.write_set_len(), 2);
+        }
 
         // Rollback to savepoint: page 2 should be removed from write set,
         // but its lock should still be held.
-        let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_rollback_to_savepoint(&mut handle, &sp).unwrap();
-        assert_eq!(handle.write_set_len(), 1);
-        assert!(handle.held_locks().contains(&test_page(2))); // Lock preserved.
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &sp).unwrap();
+            assert_eq!(handle.write_set_len(), 1);
+            assert!(handle.held_locks().contains(&test_page(2))); // Lock preserved.
+        }
 
         // Write page 3 (INSERT C).
-        let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, test_page(3), test_data()).unwrap();
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_write_page(&mut handle, &lock_table, s1, test_page(3), test_data()).unwrap();
+        }
 
         // Commit: pages 1 and 3 are in the write set (not page 2).
-        let handle = registry.get_mut(s1).expect("handle");
-        let mut pages = handle.write_set_pages();
-        pages.sort();
-        assert_eq!(pages, vec![test_page(1), test_page(3)]);
+        {
+            let handle = registry.get_mut(s1).expect("handle");
+            let mut pages = handle.write_set_pages();
+            pages.sort();
+            assert_eq!(pages, vec![test_page(1), test_page(3)]);
+        }
 
-        let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_commit(
-            &mut handle,
-            &commit_index,
-            &lock_table,
-            s1,
-            CommitSeq::new(11),
-        )
-        .expect("commit succeeds");
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_commit(
+                &mut handle,
+                &commit_index,
+                &lock_table,
+                s1,
+                CommitSeq::new(11),
+            )
+            .expect("commit succeeds");
+        }
     }
 
     #[test]
@@ -1756,20 +2494,26 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
-        let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data()).unwrap();
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data()).unwrap();
+        }
 
-        let handle = registry.get(s1).expect("handle");
-        let sp = concurrent_savepoint(&handle, "sp1").unwrap();
+        let sp = {
+            let handle = registry.get(s1).expect("handle");
+            concurrent_savepoint(&handle, "sp1").unwrap()
+        };
 
-        let mut handle = registry.get_mut(s1).expect("handle");
-        concurrent_free_page(&mut handle, &lock_table, s1, test_page(1)).unwrap();
-        assert!(concurrent_page_is_freed(&handle, test_page(1)));
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_free_page(&mut handle, &lock_table, s1, test_page(1)).unwrap();
+            assert!(concurrent_page_is_freed(&handle, test_page(1)));
 
-        concurrent_rollback_to_savepoint(&mut handle, &sp).unwrap();
-        assert!(!concurrent_page_is_freed(&handle, test_page(1)));
-        assert!(concurrent_read_page(&handle, test_page(1)).is_some());
-        assert_eq!(handle.write_set_pages(), vec![test_page(1)]);
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &sp).unwrap();
+            assert!(!concurrent_page_is_freed(&handle, test_page(1)));
+            assert!(concurrent_read_page(&handle, test_page(1)).is_some());
+            assert_eq!(handle.write_set_pages(), vec![test_page(1)]);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1860,6 +2604,69 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_page_state_releases_lock_and_conflict_tracking() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, PageNumber::ONE)
+            .unwrap();
+
+        assert!(handle.tracks_write_conflict_page(PageNumber::ONE));
+        assert!(handle.held_locks().contains(&PageNumber::ONE));
+
+        concurrent_clear_page_state(&mut handle, &lock_table, s1, PageNumber::ONE).unwrap();
+
+        assert!(
+            !handle.tracks_write_conflict_page(PageNumber::ONE),
+            "clearing the page state must remove the synthetic conflict surface"
+        );
+        assert!(
+            !handle.held_locks().contains(&PageNumber::ONE),
+            "clearing the page state must release the page lock"
+        );
+
+        let other_txn = fsqlite_types::TxnId::new(999).unwrap();
+        assert!(
+            lock_table.try_acquire(PageNumber::ONE, other_txn).is_ok(),
+            "clearing the page state must make the page lock available to other writers"
+        );
+        assert!(lock_table.release(PageNumber::ONE, other_txn));
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_reacquires_cleared_page_state_lock() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        let savepoint = {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, PageNumber::ONE)
+                .unwrap();
+            concurrent_savepoint(&handle, "sp1").unwrap()
+        };
+
+        {
+            let mut handle = registry.get_mut(s1).expect("handle");
+            concurrent_clear_page_state(&mut handle, &lock_table, s1, PageNumber::ONE).unwrap();
+            assert!(!handle.tracks_write_conflict_page(PageNumber::ONE));
+            assert!(!handle.holds_page_lock(PageNumber::ONE));
+
+            concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
+            assert!(handle.tracks_write_conflict_page(PageNumber::ONE));
+            assert!(handle.holds_page_lock(PageNumber::ONE));
+        }
+
+        let other_txn = fsqlite_types::TxnId::new(999).unwrap();
+        assert!(
+            lock_table.try_acquire(PageNumber::ONE, other_txn).is_err(),
+            "rollback-to-savepoint must reacquire the cleared page lock"
+        );
+    }
+
+    #[test]
     fn test_concurrent_commit_updates_commit_index_for_freed_pages() {
         let lock_table = InProcessPageLockTable::new();
         let commit_index = CommitIndex::new();
@@ -1935,6 +2742,133 @@ mod tests {
     }
 
     #[test]
+    fn test_concurrent_track_write_conflict_page_fast_path_reuses_tracked_page_without_duplicate_witnesses()
+     {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let page = PageNumber::ONE;
+
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, page).unwrap();
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, page).unwrap();
+
+        assert!(handle.tracks_write_conflict_page(page));
+        assert_eq!(handle.held_locks().len(), 1);
+        assert_eq!(
+            handle
+                .write_witness_keys()
+                .iter()
+                .filter(
+                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == page)
+                )
+                .count(),
+            1,
+            "retracking an already-owned conflict-only page should not duplicate page witnesses"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_write_page_reuses_savepoint_preserved_lock_without_duplicate_witnesses() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let page = test_page(11);
+        let expected = test_data();
+
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_write_page(&mut handle, &lock_table, s1, page, expected.clone()).unwrap();
+        let savepoint = concurrent_savepoint(&handle, "sp1").unwrap();
+        concurrent_write_page(&mut handle, &lock_table, s1, test_page(12), test_data()).unwrap();
+        concurrent_rollback_to_savepoint(&mut handle, &lock_table, s1, &savepoint).unwrap();
+        assert!(handle.held_locks().contains(&test_page(12)));
+        assert!(!handle.tracks_write_conflict_page(test_page(12)));
+
+        concurrent_write_page(
+            &mut handle,
+            &lock_table,
+            s1,
+            test_page(12),
+            expected.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            concurrent_read_page(&handle, test_page(12)),
+            Some(&expected)
+        );
+        assert_eq!(
+            handle
+                .write_witness_keys()
+                .iter()
+                .filter(
+                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == test_page(12))
+                )
+                .count(),
+            1,
+            "reusing a savepoint-preserved lock should not duplicate page witnesses"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_write_page_promotes_conflict_only_page_without_duplicate_witnesses() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let page = PageNumber::ONE;
+        let expected = test_data();
+
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_track_write_conflict_page(&mut handle, &lock_table, s1, page).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, s1, page, expected.clone()).unwrap();
+
+        assert_eq!(concurrent_read_page(&handle, page), Some(&expected));
+        assert!(
+            !handle
+                .page_state(page)
+                .is_some_and(|state| state.is_conflict_only)
+        );
+        assert_eq!(
+            handle
+                .write_witness_keys()
+                .iter()
+                .filter(
+                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == page)
+                )
+                .count(),
+            1,
+            "promoting a conflict-only page into the write set should not duplicate page witnesses"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_write_page_rewrites_freed_page_without_duplicate_witnesses() {
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let page = test_page(13);
+        let expected = test_data();
+
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_write_page(&mut handle, &lock_table, s1, page, expected.clone()).unwrap();
+        concurrent_free_page(&mut handle, &lock_table, s1, page).unwrap();
+        concurrent_write_page(&mut handle, &lock_table, s1, page, expected.clone()).unwrap();
+
+        assert_eq!(concurrent_read_page(&handle, page), Some(&expected));
+        assert!(!concurrent_page_is_freed(&handle, page));
+        assert_eq!(
+            handle
+                .write_witness_keys()
+                .iter()
+                .filter(
+                    |key| matches!(key, WitnessKey::Page(witness_page) if *witness_page == page)
+                )
+                .count(),
+            1,
+            "rewriting a previously freed page should not duplicate page witnesses"
+        );
+    }
+
+    #[test]
     fn test_concurrent_registry_remove_keeps_shared_handle_alive_for_existing_clones() {
         let mut registry = ConcurrentRegistry::new();
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
@@ -1963,11 +2897,13 @@ mod tests {
         concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
         concurrent_write_page(&mut handle, &lock_table, s1, test_page(6), test_data()).unwrap();
         assert_eq!(handle.held_locks().len(), 2);
+        drop(handle);
 
         // Abort: locks released.
         let mut handle = registry.get_mut(s1).expect("handle");
         concurrent_abort(&mut handle, &lock_table, s1);
         assert!(!handle.is_active());
+        drop(handle);
 
         // Another session can now acquire the same locks.
         let s2 = registry
@@ -2035,7 +2971,7 @@ mod tests {
         concurrent_write_page(&mut handle, &lock_table, s1, test_page(5), test_data()).unwrap();
 
         let handle = registry.get(s1).expect("handle");
-        let result = validate_first_committer_wins(handle, &commit_index);
+        let result = validate_first_committer_wins(&handle, &commit_index);
         match result {
             FcwResult::Conflict {
                 conflicting_pages,
@@ -2081,6 +3017,7 @@ mod tests {
 
         let handle = registry.get(s1).expect("handle");
         assert!(handle.is_active());
+        drop(handle);
 
         let removed = registry.remove(s1);
         assert!(removed.is_some());
@@ -2101,10 +3038,11 @@ mod tests {
             .get_mut(doomed)
             .expect("doomed handle")
             .set_marked_for_abort(true);
+        let survivor_token = registry.get(survivor).expect("survivor handle").txn_token();
         registry
             .committed_readers
             .push(crate::ssi_validation::CommittedReaderInfo {
-                token: registry.get(survivor).expect("survivor handle").txn_token(),
+                token: survivor_token,
                 begin_seq: CommitSeq::new(20),
                 commit_seq: CommitSeq::new(15),
                 had_in_rw: false,
@@ -2139,8 +3077,8 @@ mod tests {
             .begin_concurrent(test_snapshot(10))
             .expect("session 1");
         {
-            let h1 = registry.get_mut(s1).expect("handle 1");
-            concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data())
+            let mut h1 = registry.get_mut(s1).expect("handle 1");
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data())
                 .expect("session 1 writes page 5");
         }
 
@@ -2176,9 +3114,238 @@ mod tests {
         let s2 = registry
             .begin_concurrent(test_snapshot(11))
             .expect("session 2");
-        let h2 = registry.get_mut(s2).expect("handle 2");
-        concurrent_write_page(h2, &lock_table, s2, test_page(5), test_data())
+        let mut h2 = registry.get_mut(s2).expect("handle 2");
+        concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data())
             .expect("page lock should be released during finalize");
+    }
+
+    #[test]
+    fn test_finalize_rechecks_committed_writers_that_commit_after_prepare() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(7));
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(9), test_data()).unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("prepare should succeed before the late writer commits");
+
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut h2 = registry.get_mut(s2).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(7), test_data()).unwrap();
+        }
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(11),
+        )
+        .expect("late writer should commit before the prepared txn finalizes");
+
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &prepared,
+            CommitSeq::new(12),
+        );
+
+        let committed = registry
+            .get(s1)
+            .expect("prepared txn handle should remain present until explicit removal");
+        assert!(
+            committed.has_out_rw(),
+            "finalize must discover committed writers that were not present during prepare"
+        );
+    }
+
+    #[test]
+    fn test_finalize_rechecks_committed_readers_that_commit_after_prepare() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(3));
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(9), test_data()).unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("prepare should succeed before the late reader commits");
+
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(9));
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(11), test_data()).unwrap();
+        }
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(11),
+        )
+        .expect("late reader should commit before the prepared txn finalizes");
+
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &prepared,
+            CommitSeq::new(12),
+        );
+
+        let committed = registry
+            .get(s1)
+            .expect("prepared txn handle should remain present until explicit removal");
+        assert!(
+            committed.has_in_rw(),
+            "finalize must discover committed readers that were not present during prepare"
+        );
+    }
+
+    #[test]
+    fn test_committed_reader_candidates_include_matching_page_and_global_entries_only() {
+        let mut registry = ConcurrentRegistry::new();
+        let relevant = test_token(101);
+        let global = test_token(102);
+        let unrelated = test_token(103);
+
+        registry.committed_readers.push(CommittedReaderInfo {
+            token: unrelated,
+            begin_seq: CommitSeq::new(5),
+            commit_seq: CommitSeq::new(12),
+            had_in_rw: false,
+            keys: vec![WitnessKey::Page(test_page(99))],
+        });
+        registry.index_committed_reader(0);
+        registry.committed_readers.push(CommittedReaderInfo {
+            token: relevant,
+            begin_seq: CommitSeq::new(5),
+            commit_seq: CommitSeq::new(12),
+            had_in_rw: false,
+            keys: vec![WitnessKey::Page(test_page(7))],
+        });
+        registry.index_committed_reader(1);
+        registry.committed_readers.push(CommittedReaderInfo {
+            token: global,
+            begin_seq: CommitSeq::new(5),
+            commit_seq: CommitSeq::new(12),
+            had_in_rw: false,
+            keys: vec![WitnessKey::Custom {
+                namespace: 7,
+                bytes: b"global-reader".to_vec(),
+            }],
+        });
+        registry.index_committed_reader(2);
+
+        let summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
+        let mut candidates = registry
+            .committed_reader_candidates(
+                test_token(999),
+                CommitSeq::new(10),
+                CommitSeq::new(20),
+                &summary,
+            )
+            .into_iter()
+            .map(|reader| reader.token)
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|token| token.id.get());
+
+        assert_eq!(candidates, vec![relevant, global]);
+    }
+
+    #[test]
+    fn test_committed_writer_candidates_include_matching_page_and_global_entries_only() {
+        let mut registry = ConcurrentRegistry::new();
+        let relevant = test_token(201);
+        let global = test_token(202);
+        let unrelated = test_token(203);
+
+        registry.committed_writers.push(CommittedWriterInfo {
+            token: unrelated,
+            commit_seq: CommitSeq::new(12),
+            had_out_rw: false,
+            keys: vec![WitnessKey::Page(test_page(88))],
+        });
+        registry.index_committed_writer(0);
+        registry.committed_writers.push(CommittedWriterInfo {
+            token: relevant,
+            commit_seq: CommitSeq::new(12),
+            had_out_rw: false,
+            keys: vec![WitnessKey::Page(test_page(9))],
+        });
+        registry.index_committed_writer(1);
+        registry.committed_writers.push(CommittedWriterInfo {
+            token: global,
+            commit_seq: CommitSeq::new(12),
+            had_out_rw: false,
+            keys: vec![WitnessKey::Custom {
+                namespace: 9,
+                bytes: b"global-writer".to_vec(),
+            }],
+        });
+        registry.index_committed_writer(2);
+
+        let summary = summarize_witness_keys(&[WitnessKey::Page(test_page(9))]);
+        let mut candidates = registry
+            .committed_writer_candidates(
+                test_token(999),
+                CommitSeq::new(10),
+                CommitSeq::new(20),
+                &summary,
+            )
+            .into_iter()
+            .map(|writer| writer.token)
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|token| token.id.get());
+
+        assert_eq!(candidates, vec![relevant, global]);
+    }
+
+    #[test]
+    fn test_handle_view_custom_overlap_respects_global_witnesses() {
+        let mut handle = ConcurrentHandle::new(test_snapshot(10), test_token(301));
+        handle.record_read_witness(WitnessKey::Custom {
+            namespace: 3,
+            bytes: b"read-global".to_vec(),
+        });
+        handle.record_write_witness(WitnessKey::Custom {
+            namespace: 4,
+            bytes: b"write-global".to_vec(),
+        });
+        let view = HandleView::new(&handle);
+
+        assert!(view.check_read_overlap(&WitnessKey::Custom {
+            namespace: 5,
+            bytes: b"candidate".to_vec(),
+        }));
+        assert!(view.check_write_overlap(&WitnessKey::Custom {
+            namespace: 6,
+            bytes: b"candidate".to_vec(),
+        }));
     }
 
     #[test]
@@ -2191,14 +3358,14 @@ mod tests {
         let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
         {
-            let h1 = registry.get_mut(s1).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(20));
-            concurrent_write_page(h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
         }
         {
-            let h2 = registry.get_mut(s2).unwrap();
+            let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(30));
-            concurrent_write_page(h2, &lock_table, s2, test_page(20), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(20), test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -2226,8 +3393,8 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         {
-            let h1 = registry.get_mut(s1).unwrap();
-            concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
         }
 
         let prepared = prepare_concurrent_commit_with_ssi(
@@ -2258,17 +3425,17 @@ mod tests {
             .expect("session");
 
         // Abort the handle.
-        let handle = registry.get_mut(s1).expect("handle");
-        concurrent_abort(handle, &lock_table, s1);
+        let mut handle = registry.get_mut(s1).expect("handle");
+        concurrent_abort(&mut handle, &lock_table, s1);
 
         // Write should fail on aborted handle.
-        let handle = registry.get_mut(s1).expect("handle");
-        let result = concurrent_write_page(handle, &lock_table, s1, test_page(1), test_data());
+        let mut handle = registry.get_mut(s1).expect("handle");
+        let result = concurrent_write_page(&mut handle, &lock_table, s1, test_page(1), test_data());
         assert_eq!(result.unwrap_err(), MvccError::InvalidState);
 
         // Savepoint should fail on aborted handle.
         let handle = registry.get(s1).expect("handle");
-        let result = concurrent_savepoint(handle, "sp1");
+        let result = concurrent_savepoint(&handle, "sp1");
         assert_eq!(result.unwrap_err(), MvccError::InvalidState);
     }
 
@@ -2284,7 +3451,7 @@ mod tests {
             .begin_concurrent(test_snapshot(10))
             .expect("session");
 
-        let handle = registry.get_mut(s1).expect("handle");
+        let mut handle = registry.get_mut(s1).expect("handle");
         assert_eq!(handle.read_set_len(), 0);
 
         handle.record_read(test_page(5));
@@ -2313,17 +3480,17 @@ mod tests {
 
         // T1 reads and writes.
         {
-            let h1 = registry.get_mut(s1).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(5));
-            concurrent_write_page(h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
             // B
         }
 
         // T2 reads and writes.
         {
-            let h2 = registry.get_mut(s2).unwrap();
+            let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(20));
-            concurrent_write_page(h2, &lock_table, s2, test_page(30), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(30), test_data()).unwrap();
         }
 
         // Both should commit successfully.
@@ -2361,14 +3528,14 @@ mod tests {
         let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
         {
-            let h1 = registry.get_mut(s1).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(5));
-            concurrent_write_page(h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
         }
         {
-            let h2 = registry.get_mut(s2).unwrap();
+            let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(10));
-            concurrent_write_page(h2, &lock_table, s2, test_page(20), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(20), test_data()).unwrap();
         }
 
         concurrent_commit_with_ssi(
@@ -2433,17 +3600,17 @@ mod tests {
 
         // T1: reads page 5 (A), writes page 10 (B).
         {
-            let h1 = registry.get_mut(s1).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(5)); // A
-            concurrent_write_page(h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
             // B
         }
 
         // T2: reads page 10 (B), writes page 5 (A).
         {
-            let h2 = registry.get_mut(s2).unwrap();
+            let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(10)); // B
-            concurrent_write_page(h2, &lock_table, s2, test_page(5), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(5), test_data()).unwrap();
             // A
         }
 
@@ -2485,14 +3652,14 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
-        let h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        let mut h1 = registry.get_mut(s1).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
 
         // Manually mark for abort.
         h1.marked_for_abort.set(true);
 
         // Commit should fail.
-        let result = concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
         assert!(result.is_err());
         let (err, _) = result.unwrap_err();
         assert_eq!(err, MvccError::BusySnapshot);
@@ -2507,15 +3674,15 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
-        let h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        let mut h1 = registry.get_mut(s1).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
 
         // Set only incoming edge (no outgoing).
         h1.has_in_rw.set(true);
         h1.has_out_rw.set(false);
 
         // Commit should succeed (not a pivot).
-        let result = concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
         assert!(result.is_ok(), "only incoming edge should allow commit");
     }
 
@@ -2528,15 +3695,15 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
-        let h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        let mut h1 = registry.get_mut(s1).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
 
         // Set only outgoing edge (no incoming).
         h1.has_in_rw.set(false);
         h1.has_out_rw.set(true);
 
         // Commit should succeed (not a pivot).
-        let result = concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
         assert!(result.is_ok(), "only outgoing edge should allow commit");
     }
 
@@ -2549,15 +3716,15 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
-        let h1 = registry.get_mut(s1).unwrap();
-        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        let mut h1 = registry.get_mut(s1).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, s1, test_page(5), test_data()).unwrap();
 
         // Set both edges → dangerous structure.
         h1.has_in_rw.set(true);
         h1.has_out_rw.set(true);
 
         // Commit should fail (pivot).
-        let result = concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        let result = concurrent_commit(&mut h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
         assert!(result.is_err());
         let (err, _) = result.unwrap_err();
         assert_eq!(err, MvccError::BusySnapshot);
@@ -2571,11 +3738,11 @@ mod tests {
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
-        let h1 = registry.get_mut(s1).unwrap();
+        let mut h1 = registry.get_mut(s1).unwrap();
         h1.record_read(test_page(5));
         h1.record_read(test_page(10));
-        concurrent_write_page(h1, &lock_table, s1, test_page(15), test_data()).unwrap();
-        concurrent_write_page(h1, &lock_table, s1, test_page(20), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, s1, test_page(15), test_data()).unwrap();
+        concurrent_write_page(&mut h1, &lock_table, s1, test_page(20), test_data()).unwrap();
 
         let read_keys = h1.read_witness_keys();
         let write_keys = h1.write_witness_keys();
@@ -2634,22 +3801,22 @@ mod tests {
 
         // T1 operations.
         {
-            let h1 = registry.get_mut(s1).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(10));
             h1.record_read(test_page(20));
-            concurrent_write_page(h1, &lock_table, s1, test_page(30), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(30), test_data()).unwrap();
         }
         // T2 operations.
         {
-            let h2 = registry.get_mut(s2).unwrap();
+            let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(50));
-            concurrent_write_page(h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data()).unwrap();
         }
         // T3 operations.
         {
-            let h3 = registry.get_mut(s3).unwrap();
+            let mut h3 = registry.get_mut(s3).unwrap();
             h3.record_read(test_page(30));
-            concurrent_write_page(h3, &lock_table, s3, test_page(40), test_data()).unwrap();
+            concurrent_write_page(&mut h3, &lock_table, s3, test_page(40), test_data()).unwrap();
         }
 
         // Step 1: T3 commits. T1 writes page 30, T3 reads page 30
@@ -2765,22 +3932,22 @@ mod tests {
 
         // T1 operations.
         {
-            let h1 = registry.get_mut(s1).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(10));
             h1.record_read(test_page(20));
-            concurrent_write_page(h1, &lock_table, s1, test_page(30), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(30), test_data()).unwrap();
         }
         // T2 operations.
         {
-            let h2 = registry.get_mut(s2).unwrap();
+            let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(50));
-            concurrent_write_page(h2, &lock_table, s2, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(10), test_data()).unwrap();
         }
         // T3 operations.
         {
-            let h3 = registry.get_mut(s3).unwrap();
+            let mut h3 = registry.get_mut(s3).unwrap();
             h3.record_read(test_page(30));
-            concurrent_write_page(h3, &lock_table, s3, test_page(40), test_data()).unwrap();
+            concurrent_write_page(&mut h3, &lock_table, s3, test_page(40), test_data()).unwrap();
         }
 
         // Step 1: T3 commits. T1 writes page 30, T3 reads page 30
@@ -2872,14 +4039,14 @@ mod tests {
         let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
         {
-            let h1 = registry.get_mut(s1).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(100));
-            concurrent_write_page(h1, &lock_table, s1, test_page(200), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(200), test_data()).unwrap();
         }
         {
-            let h2 = registry.get_mut(s2).unwrap();
+            let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(200));
-            concurrent_write_page(h2, &lock_table, s2, test_page(300), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(300), test_data()).unwrap();
         }
 
         // Before any commit: both T1 and T2 have no SSI flags.
@@ -2952,8 +4119,8 @@ mod tests {
 
         // T1 writes page 42 and commits first.
         {
-            let h1 = registry.get_mut(s1).unwrap();
-            concurrent_write_page(h1, &lock_table, s1, test_page(42), test_data()).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(42), test_data()).unwrap();
         }
         let result1 = concurrent_commit_with_ssi(
             &mut registry,
@@ -2967,8 +4134,8 @@ mod tests {
         // After T1 committed, the page lock on page 42 is released.
         // T2 now writes the same page.
         {
-            let h2 = registry.get_mut(s2).unwrap();
-            concurrent_write_page(h2, &lock_table, s2, test_page(42), test_data()).unwrap();
+            let mut h2 = registry.get_mut(s2).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(42), test_data()).unwrap();
         }
 
         // T2 commits second — FCW detects page 42 was modified after
@@ -3014,9 +4181,9 @@ mod tests {
         };
 
         {
-            let winner_handle = registry.get_mut(winner_session).unwrap();
+            let mut winner_handle = registry.get_mut(winner_session).unwrap();
             concurrent_write_page(
-                winner_handle,
+                &mut winner_handle,
                 &lock_table,
                 winner_session,
                 test_page(77),
@@ -3039,9 +4206,9 @@ mod tests {
         );
 
         {
-            let loser_handle = registry.get_mut(loser_session).unwrap();
+            let mut loser_handle = registry.get_mut(loser_session).unwrap();
             concurrent_write_page(
-                loser_handle,
+                &mut loser_handle,
                 &lock_table,
                 loser_session,
                 test_page(77),
@@ -3098,16 +4265,16 @@ mod tests {
 
         // T1: reads B (20), writes A (10)
         {
-            let h1 = registry.get_mut(s1).unwrap();
+            let mut h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(20));
-            concurrent_write_page(h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            concurrent_write_page(&mut h1, &lock_table, s1, test_page(10), test_data()).unwrap();
         }
 
         // T2: reads C (30), writes B (20)
         {
-            let h2 = registry.get_mut(s2).unwrap();
+            let mut h2 = registry.get_mut(s2).unwrap();
             h2.record_read(test_page(30));
-            concurrent_write_page(h2, &lock_table, s2, test_page(20), test_data()).unwrap();
+            concurrent_write_page(&mut h2, &lock_table, s2, test_page(20), test_data()).unwrap();
         }
 
         // T1 commits and should carry had_out_rw=true due to T2 writing B.
@@ -3134,9 +4301,9 @@ mod tests {
 
         // T3 now performs its workload using the earlier snapshot.
         {
-            let h3 = registry.get_mut(s3).unwrap();
+            let mut h3 = registry.get_mut(s3).unwrap();
             h3.record_read(test_page(10));
-            concurrent_write_page(h3, &lock_table, s3, test_page(40), test_data()).unwrap();
+            concurrent_write_page(&mut h3, &lock_table, s3, test_page(40), test_data()).unwrap();
         }
 
         // T3 must abort due to outgoing edge to committed writer pivot T1.

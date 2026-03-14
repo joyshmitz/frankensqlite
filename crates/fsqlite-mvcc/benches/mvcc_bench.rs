@@ -348,23 +348,25 @@ fn bench_fcw_clean(c: &mut Criterion) {
                     let session_id = registry.begin_concurrent(snapshot).unwrap();
 
                     let lock_table = InProcessPageLockTable::new();
-                    let handle = registry.get_mut(session_id).unwrap();
-                    for i in 1..=count {
-                        let data = PageData::zeroed(PageSize::default());
-                        fsqlite_mvcc::concurrent_write_page(
-                            handle,
-                            &lock_table,
-                            session_id,
-                            page(i),
-                            data,
-                        )
-                        .unwrap();
+                    {
+                        let mut handle = registry.get_mut(session_id).unwrap();
+                        for i in 1..=count {
+                            let data = PageData::zeroed(PageSize::default());
+                            fsqlite_mvcc::concurrent_write_page(
+                                &mut handle,
+                                &lock_table,
+                                session_id,
+                                page(i),
+                                data,
+                            )
+                            .unwrap();
+                        }
                     }
                     (registry, session_id, commit_index)
                 },
                 |(registry, session_id, commit_index)| {
                     let handle = registry.get(session_id).unwrap();
-                    black_box(validate_first_committer_wins(handle, &commit_index));
+                    black_box(validate_first_committer_wins(&handle, &commit_index));
                 },
                 BatchSize::LargeInput,
             );
@@ -394,23 +396,25 @@ fn bench_fcw_conflict(c: &mut Criterion) {
                     let session_id = registry.begin_concurrent(snapshot).unwrap();
 
                     let lock_table = InProcessPageLockTable::new();
-                    let handle = registry.get_mut(session_id).unwrap();
-                    for i in 1..=count {
-                        let data = PageData::zeroed(PageSize::default());
-                        fsqlite_mvcc::concurrent_write_page(
-                            handle,
-                            &lock_table,
-                            session_id,
-                            page(i),
-                            data,
-                        )
-                        .unwrap();
+                    {
+                        let mut handle = registry.get_mut(session_id).unwrap();
+                        for i in 1..=count {
+                            let data = PageData::zeroed(PageSize::default());
+                            fsqlite_mvcc::concurrent_write_page(
+                                &mut handle,
+                                &lock_table,
+                                session_id,
+                                page(i),
+                                data,
+                            )
+                            .unwrap();
+                        }
                     }
                     (registry, session_id, commit_index)
                 },
                 |(registry, session_id, commit_index)| {
                     let handle = registry.get(session_id).unwrap();
-                    black_box(validate_first_committer_wins(handle, &commit_index));
+                    black_box(validate_first_committer_wins(&handle, &commit_index));
                 },
                 BatchSize::LargeInput,
             );
@@ -624,14 +628,14 @@ fn bench_concurrent_writer_lifecycle(c: &mut Criterion) {
 
                     // Each writer writes to shared pages + private pages.
                     for (writer_idx, &session_id) in session_ids.iter().enumerate() {
-                        let handle = registry.get_mut(session_id).unwrap();
+                        let mut handle = registry.get_mut(session_id).unwrap();
 
                         // Write to shared pages (contention zone).
                         for i in 1..=n_shared_pages {
                             let data = PageData::zeroed(PageSize::default());
                             // Ignore lock contention errors — expected for shared pages.
                             let _ = fsqlite_mvcc::concurrent_write_page(
-                                handle,
+                                &mut handle,
                                 &lock_table,
                                 session_id,
                                 page(i),
@@ -645,7 +649,7 @@ fn bench_concurrent_writer_lifecycle(c: &mut Criterion) {
                         for i in 1..=private_pages_per_writer {
                             let data = PageData::zeroed(PageSize::default());
                             let _ = fsqlite_mvcc::concurrent_write_page(
-                                handle,
+                                &mut handle,
                                 &lock_table,
                                 session_id,
                                 page(base + i),
@@ -657,20 +661,20 @@ fn bench_concurrent_writer_lifecycle(c: &mut Criterion) {
                     // First writer commits successfully (FCW clean for its write set).
                     let first_session = session_ids[0];
                     let first_handle = registry.get(first_session).unwrap();
-                    let fcw_result = validate_first_committer_wins(first_handle, &commit_index);
+                    let fcw_result = validate_first_committer_wins(&first_handle, &commit_index);
                     black_box(&fcw_result);
 
                     // Remaining writers validate FCW (may see conflicts on shared pages).
                     for &session_id in &session_ids[1..] {
                         let handle = registry.get(session_id).unwrap();
-                        let result = validate_first_committer_wins(handle, &commit_index);
+                        let result = validate_first_committer_wins(&handle, &commit_index);
                         black_box(&result);
                     }
 
                     // Abort all (cleanup locks).
                     for &session_id in &session_ids {
-                        let handle = registry.get_mut(session_id).unwrap();
-                        fsqlite_mvcc::concurrent_abort(handle, &lock_table, session_id);
+                        let mut handle = registry.get_mut(session_id).unwrap();
+                        fsqlite_mvcc::concurrent_abort(&mut handle, &lock_table, session_id);
                     }
                 },
                 BatchSize::SmallInput,
@@ -721,11 +725,11 @@ fn bench_hotspot_contention(c: &mut Criterion) {
 
                         // All writers try to lock the same hotspot pages.
                         for &session_id in &session_ids {
-                            let handle = registry.get_mut(session_id).unwrap();
+                            let mut handle = registry.get_mut(session_id).unwrap();
                             for i in 1..=hotspot_pages {
                                 let data = PageData::zeroed(PageSize::default());
                                 let _ = fsqlite_mvcc::concurrent_write_page(
-                                    handle,
+                                    &mut handle,
                                     &lock_table,
                                     session_id,
                                     page(i),
@@ -737,7 +741,7 @@ fn bench_hotspot_contention(c: &mut Criterion) {
                         // FCW validation for all.
                         for &session_id in &session_ids {
                             let handle = registry.get(session_id).unwrap();
-                            black_box(validate_first_committer_wins(handle, &commit_index));
+                            black_box(validate_first_committer_wins(&handle, &commit_index));
                         }
 
                         // Verify observer captured contention events.
@@ -746,8 +750,8 @@ fn bench_hotspot_contention(c: &mut Criterion) {
 
                         // Cleanup.
                         for &session_id in &session_ids {
-                            let handle = registry.get_mut(session_id).unwrap();
-                            fsqlite_mvcc::concurrent_abort(handle, &lock_table, session_id);
+                            let mut handle = registry.get_mut(session_id).unwrap();
+                            fsqlite_mvcc::concurrent_abort(&mut handle, &lock_table, session_id);
                         }
                     },
                     BatchSize::SmallInput,

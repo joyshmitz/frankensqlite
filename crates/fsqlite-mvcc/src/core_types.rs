@@ -7,12 +7,12 @@
 //! Foundation types (TxnId, CommitSeq, Snapshot, etc.) live in
 //! [`fsqlite_types::glossary`]; this module builds the runtime machinery on top.
 
-use fsqlite_types::sync_primitives::{Mutex, RwLock};
+use fsqlite_types::sync_primitives::{Condvar, Mutex, RwLock};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cache_aligned::{
     CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,
@@ -267,6 +267,12 @@ pub struct InProcessPageLockTable {
     /// During rolling rebuild: the old shards being drained. Protected by
     /// `Mutex` for synchronization. `None` when no rebuild is in progress.
     draining: Mutex<Option<DrainingState>>,
+    /// Monotonic counter for waking parked page-lock waiters after releases.
+    change_epoch: AtomicU64,
+    /// Park/wake gate paired with [`change_epoch`] to avoid hot-path spin/yield
+    /// retries while still handling missed wakeups correctly.
+    change_gate: Mutex<()>,
+    change_cv: Condvar,
     /// Optional conflict observer for MVCC analytics (bd-t6sv2.1).
     /// When `None`, conflict emission is a no-op branch (zero cost).
     observer: Option<std::sync::Arc<dyn fsqlite_observability::ConflictObserver>>,
@@ -348,6 +354,9 @@ impl InProcessPageLockTable {
                 )))
             })),
             draining: Mutex::new(None),
+            change_epoch: AtomicU64::new(0),
+            change_gate: Mutex::new(()),
+            change_cv: Condvar::new(),
             observer: None,
         }
     }
@@ -364,6 +373,9 @@ impl InProcessPageLockTable {
                 )))
             })),
             draining: Mutex::new(None),
+            change_epoch: AtomicU64::new(0),
+            change_gate: Mutex::new(()),
+            change_cv: Condvar::new(),
             observer: Some(observer),
         }
     }
@@ -441,6 +453,8 @@ impl InProcessPageLockTable {
         let mut map = shard.lock();
         if map.get(&page) == Some(&txn) {
             map.remove(&page);
+            drop(map);
+            self.notify_waiters();
             return true;
         }
         drop(map);
@@ -453,6 +467,7 @@ impl InProcessPageLockTable {
                 drain_map.remove(&page);
                 drop(drain_map);
                 drop(draining_guard);
+                self.notify_waiters();
                 return true;
             }
             drop(drain_map);
@@ -463,34 +478,52 @@ impl InProcessPageLockTable {
 
     /// Release all locks held by `txn` from both active and draining tables.
     pub fn release_all(&self, txn: TxnId) {
+        let mut released_any = false;
         for shard in self.shards.iter() {
             let mut map = shard.lock();
+            let before = map.len();
             map.retain(|_, &mut v| v != txn);
+            released_any |= map.len() != before;
         }
         // Also release from draining table.
         let draining_guard = self.draining.lock();
         if let Some(ref draining) = *draining_guard {
             for shard in draining.shards.iter() {
                 let mut map = shard.lock();
+                let before = map.len();
                 map.retain(|_, &mut v| v != txn);
+                released_any |= map.len() != before;
             }
+        }
+        drop(draining_guard);
+
+        if released_any {
+            self.notify_waiters();
         }
     }
 
     /// Release a specific set of page locks held by `txn`.
     pub fn release_set(&self, pages: impl IntoIterator<Item = PageNumber>, txn: TxnId) {
         let draining_guard = self.draining.lock();
+        let mut released_any = false;
         for page in pages {
             let shard_idx = Self::shard_index_static(page);
             let mut map = self.shards[shard_idx].lock();
             if map.get(&page) == Some(&txn) {
                 map.remove(&page);
+                released_any = true;
             } else if let Some(ref draining) = *draining_guard {
                 let mut drain_map = draining.shards[shard_idx].lock();
                 if drain_map.get(&page) == Some(&txn) {
                     drain_map.remove(&page);
+                    released_any = true;
                 }
             }
+        }
+        drop(draining_guard);
+
+        if released_any {
+            self.notify_waiters();
         }
     }
 
@@ -522,6 +555,50 @@ impl InProcessPageLockTable {
         }
         drop(draining_guard);
         None
+    }
+
+    /// Wait until `page` is no longer held by `observed_holder`.
+    ///
+    /// Returns `true` if the holder changed (including becoming unlocked)
+    /// before `timeout`, or `false` if the deadline elapsed first.
+    #[must_use]
+    pub fn wait_for_holder_change(
+        &self,
+        page: PageNumber,
+        observed_holder: TxnId,
+        timeout: Duration,
+    ) -> bool {
+        let started = Instant::now();
+
+        loop {
+            match self.holder(page) {
+                Some(holder) if holder == observed_holder => {}
+                _ => return true,
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+
+            let observed_epoch = self.change_epoch.load(Ordering::Acquire);
+            let mut gate = self.change_gate.lock();
+            if self.change_epoch.load(Ordering::Acquire) != observed_epoch {
+                drop(gate);
+                continue;
+            }
+
+            #[cfg(not(target_arch = "wasm32"))]
+            self.change_cv.wait_for(&mut gate, remaining);
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = remaining;
+                self.change_cv.wait(&mut gate);
+            }
+
+            drop(gate);
+        }
     }
 
     /// Total number of locks currently held across all shards (active table only).
@@ -678,6 +755,9 @@ impl InProcessPageLockTable {
         drop(draining_guard);
 
         let elapsed = Duration::ZERO;
+        if total_cleaned > 0 {
+            self.notify_waiters();
+        }
         tracing::debug!(
             cleaned = total_cleaned,
             retained = total_retained,
@@ -808,6 +888,12 @@ impl InProcessPageLockTable {
     fn shard_index_static(page: PageNumber) -> usize {
         (page.get() as usize) & (LOCK_TABLE_SHARDS - 1)
     }
+
+    fn notify_waiters(&self) {
+        let _gate = self.change_gate.lock();
+        self.change_epoch.fetch_add(1, Ordering::Release);
+        self.change_cv.notify_all();
+    }
 }
 
 impl Default for InProcessPageLockTable {
@@ -824,7 +910,7 @@ impl std::fmt::Debug for InProcessPageLockTable {
         dbg.field("lock_count", &self.lock_count());
         dbg.field("draining", &draining_count);
         dbg.field("observer_enabled", &self.observer.is_some());
-        dbg.finish()
+        dbg.finish_non_exhaustive()
     }
 }
 
@@ -1374,18 +1460,50 @@ impl LeftRightCommitIndexShard {
 /// A single cache-line-aligned commit index shard.
 type CommitShard = CacheAligned<LeftRightCommitIndexShard>;
 
+/// Number of pages covered by the O(1) flat atomic array.
+///
+/// For page numbers in `1..=FAST_COMMIT_ARRAY_SIZE`, `latest()` is a single
+/// `AtomicU64::load(Acquire)` — no locks, no hashing, no reader tracking.
+/// 65536 entries x 8 bytes = 512 KiB, negligible on modern systems.
+///
+/// Inspired by MICA (Lim et al., NSDI 2014): when keys are bounded integers,
+/// replace hash maps with direct-indexed arrays for O(1) access.
+const FAST_COMMIT_ARRAY_SIZE: usize = 65536;
+
 /// Index mapping each page to its latest committed `CommitSeq`.
 ///
-/// Sharded like the lock table for reduced contention.
-/// Shards are wrapped in [`CacheAligned`] to prevent false sharing (§1.5).
+/// Uses a two-tier design for optimal hot-path performance:
+///
+/// **Tier 1 (fast path):** A flat `AtomicU64` array indexed by page number.
+/// Reads are a single atomic load — no locks, no hashing, no reader-count
+/// tracking.  This covers page numbers 1..=65536, which handles virtually all
+/// benchmark and real-world databases.
+///
+/// **Tier 2 (fallback):** Sharded `LeftRightCommitIndexShard` for page numbers
+/// beyond the flat array.  Shards are wrapped in [`CacheAligned`] to prevent
+/// false sharing (§1.5).
+///
+/// The hot read path (`latest`) for the disjoint-insert benchmark previously
+/// went through the LeftRight machinery: 3 atomic ops + RwLock acquire +
+/// HashMap probe + RwLock release + reader-count decrement.  The flat array
+/// replaces this with 1 atomic load.
 pub struct CommitIndex {
+    /// O(1) atomic read/write for small page numbers.
+    /// Index `i` stores the raw `CommitSeq` value for page `i + 1`.
+    /// Value 0 means no committed version exists.
+    fast_array: Box<[AtomicU64]>,
+    /// Fallback sharded LeftRight path for large page numbers and iteration.
     shards: Box<[CommitShard; LOCK_TABLE_SHARDS]>,
 }
 
 impl CommitIndex {
     #[must_use]
     pub fn new() -> Self {
+        let fast_array: Vec<AtomicU64> = (0..FAST_COMMIT_ARRAY_SIZE)
+            .map(|_| AtomicU64::new(0))
+            .collect();
         Self {
+            fast_array: fast_array.into_boxed_slice(),
             shards: Box::new(std::array::from_fn(|_| {
                 CacheAligned::new(LeftRightCommitIndexShard::new())
             })),
@@ -1393,14 +1511,41 @@ impl CommitIndex {
     }
 
     /// Record that `page` was last committed at `seq`.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Panics if `seq` is `CommitSeq(0)`, because the flat atomic array
+    /// uses 0 as the sentinel for "no committed version."  The commit log
+    /// allocates sequences starting at 1, so this should never happen.
     pub fn update(&self, page: PageNumber, seq: CommitSeq) {
+        debug_assert!(
+            seq.get() != 0,
+            "CommitIndex::update called with CommitSeq(0); the flat array uses 0 as empty sentinel"
+        );
+        let pgno = page.get() as usize;
+        if pgno <= FAST_COMMIT_ARRAY_SIZE {
+            // O(1) atomic write to flat array.
+            self.fast_array[pgno - 1].store(seq.get(), Ordering::Release);
+        }
+        // Always update the sharded path for len()/debug/large-page correctness.
         let shard = &self.shards[self.shard_index(page)];
         shard.update(page, seq);
     }
 
     /// Get the latest `CommitSeq` for `page`.
+    ///
+    /// For page numbers <= 65536 this is a single `AtomicU64::load(Acquire)`.
     #[must_use]
     pub fn latest(&self, page: PageNumber) -> Option<CommitSeq> {
+        let pgno = page.get() as usize;
+        if pgno <= FAST_COMMIT_ARRAY_SIZE {
+            let val = self.fast_array[pgno - 1].load(Ordering::Acquire);
+            return if val == 0 {
+                None
+            } else {
+                Some(CommitSeq::new(val))
+            };
+        }
         let shard = &self.shards[self.shard_index(page)];
         shard.latest(page)
     }
@@ -1420,8 +1565,15 @@ impl Default for CommitIndex {
 impl std::fmt::Debug for CommitIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let total: usize = self.shards.iter().map(|s| s.len()).sum();
+        let fast_populated = self
+            .fast_array
+            .iter()
+            .filter(|a| a.load(Ordering::Relaxed) != 0)
+            .count();
         f.debug_struct("CommitIndex")
             .field("page_count", &total)
+            .field("fast_array_populated", &fast_populated)
+            .field("fast_array_capacity", &self.fast_array.len())
             .finish()
     }
 }
@@ -2214,6 +2366,45 @@ mod tests {
 
         table.release_all(txn);
         assert_eq!(table.lock_count(), 0);
+    }
+
+    #[test]
+    fn test_in_process_lock_table_wait_for_holder_change_wakes_on_release() {
+        let table = Arc::new(InProcessPageLockTable::new());
+        let page = PageNumber::new(7).unwrap();
+        let holder = TxnId::new(1).unwrap();
+
+        table.try_acquire(page, holder).unwrap();
+
+        let waiter_table = Arc::clone(&table);
+        let waiter = std::thread::spawn(move || {
+            waiter_table.wait_for_holder_change(page, holder, Duration::from_secs(1))
+        });
+
+        assert!(table.release(page, holder));
+        assert!(
+            waiter.join().unwrap(),
+            "waiter should observe release before timing out"
+        );
+    }
+
+    #[test]
+    fn test_in_process_lock_table_wait_for_holder_change_times_out() {
+        let table = InProcessPageLockTable::new();
+        let page = PageNumber::new(8).unwrap();
+        let holder = TxnId::new(2).unwrap();
+
+        table.try_acquire(page, holder).unwrap();
+
+        let started = Instant::now();
+        assert!(
+            !table.wait_for_holder_change(page, holder, Duration::from_millis(20)),
+            "wait should time out while holder is unchanged"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(10),
+            "timeout path should not return immediately"
+        );
     }
 
     #[test]
