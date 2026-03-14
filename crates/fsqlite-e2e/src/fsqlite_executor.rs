@@ -10,6 +10,8 @@
 //! partitions in parallel for file-backed databases (and sequentially for
 //! `:memory:` paths, which are connection-local by definition).
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Barrier;
 use std::time::{Duration, Instant};
@@ -975,57 +977,72 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Batch {
-    ops: Vec<OpRecord>,
+#[derive(Debug, Clone, Copy)]
+struct BatchRange {
+    start: usize,
+    end: usize,
     commit: bool,
 }
 
-fn split_into_batches(records: &[OpRecord]) -> Vec<Batch> {
+impl BatchRange {
+    fn ops<'a>(&self, records: &'a [OpRecord]) -> &'a [OpRecord] {
+        &records[self.start..self.end]
+    }
+}
+
+fn split_into_batches(records: &[OpRecord]) -> Vec<BatchRange> {
     let mut out = Vec::new();
     let mut in_txn = false;
-    let mut current = Vec::new();
+    let mut current_start: Option<usize> = None;
 
-    for rec in records {
+    for (idx, rec) in records.iter().enumerate() {
         match rec.kind {
             OpKind::Begin => {
-                if !current.is_empty() {
-                    out.push(Batch {
-                        ops: std::mem::take(&mut current),
+                if let Some(start) = current_start.take() {
+                    out.push(BatchRange {
+                        start,
+                        end: idx,
                         commit: true,
                     });
                 }
                 in_txn = true;
             }
             OpKind::Commit => {
-                out.push(Batch {
-                    ops: std::mem::take(&mut current),
+                let start = current_start.take().unwrap_or(idx);
+                out.push(BatchRange {
+                    start,
+                    end: idx,
                     commit: true,
                 });
                 in_txn = false;
             }
             OpKind::Rollback => {
-                out.push(Batch {
-                    ops: std::mem::take(&mut current),
+                let start = current_start.take().unwrap_or(idx);
+                out.push(BatchRange {
+                    start,
+                    end: idx,
                     commit: false,
                 });
                 in_txn = false;
             }
             _ => {
-                current.push(rec.clone());
-                if !in_txn && !current.is_empty() {
-                    out.push(Batch {
-                        ops: std::mem::take(&mut current),
+                let start = *current_start.get_or_insert(idx);
+                if !in_txn {
+                    out.push(BatchRange {
+                        start,
+                        end: idx + 1,
                         commit: true,
                     });
+                    current_start = None;
                 }
             }
         }
     }
 
-    if !current.is_empty() {
-        out.push(Batch {
-            ops: current,
+    if let Some(start) = current_start {
+        out.push(BatchRange {
+            start,
+            end: records.len(),
             commit: true,
         });
     }
@@ -1053,16 +1070,22 @@ impl OpError {
     }
 }
 
-fn execute_batch(conn: &Connection, batch: &Batch) -> Result<(u64, u64), BatchError> {
-    conn.execute("BEGIN;")
+fn execute_batch_with_executor(
+    executor: &mut PreparedOpExecutor<'_>,
+    records: &[OpRecord],
+    batch: BatchRange,
+) -> Result<(u64, u64), BatchError> {
+    executor
+        .conn
+        .execute("BEGIN;")
         .map_err(classify_fsqlite_error_as_batch)?;
 
     let mut ok: u64 = 0;
-    for op in &batch.ops {
-        match execute_op(conn, op) {
+    for op in batch.ops(records) {
+        match executor.execute_op(op) {
             Ok(()) => ok = ok.saturating_add(1),
             Err(err) => {
-                rollback_active_batch(conn).map_err(|rollback| {
+                rollback_active_batch(executor.conn).map_err(|rollback| {
                     BatchError::Fatal(format!("{}; rollback failed: {rollback}", err.message()))
                 })?;
                 return Err(match err {
@@ -1074,10 +1097,10 @@ fn execute_batch(conn: &Connection, batch: &Batch) -> Result<(u64, u64), BatchEr
     }
 
     let finalize = if batch.commit { "COMMIT;" } else { "ROLLBACK;" };
-    match conn.execute(finalize) {
+    match executor.conn.execute(finalize) {
         Ok(_) => Ok((ok, 0)),
         Err(err) => {
-            rollback_active_batch(conn).map_err(|rollback| {
+            rollback_active_batch(executor.conn).map_err(|rollback| {
                 BatchError::Fatal(format!("{err}; rollback failed: {rollback}"))
             })?;
             Err(classify_fsqlite_error_as_batch(err))
@@ -1093,6 +1116,7 @@ fn run_records_with_retry(
 ) -> WorkerStats {
     let batches = split_into_batches(records);
     let mut stats = WorkerStats::default();
+    let mut executor = PreparedOpExecutor::new(conn);
 
     for batch in batches {
         if stats.error.is_some() {
@@ -1101,7 +1125,7 @@ fn run_records_with_retry(
 
         let mut attempt: u32 = 0;
         loop {
-            match execute_batch(conn, &batch) {
+            match execute_batch_with_executor(&mut executor, records, batch) {
                 Ok((ok, err)) => {
                     stats.ops_ok += ok;
                     stats.ops_err += err;
@@ -1140,208 +1164,387 @@ fn rollback_active_batch(conn: &Connection) -> Result<(), String> {
 
 // ── Operation dispatch ────────────────────────────────────────────────────
 
-fn execute_op(conn: &Connection, rec: &OpRecord) -> Result<(), OpError> {
-    match &rec.kind {
-        OpKind::Sql { statement } => execute_sql(conn, statement, rec.expected.as_ref()),
-        OpKind::Insert { table, key, values } => {
-            execute_insert(conn, table, *key, values, rec.expected.as_ref())
-        }
-        OpKind::Update { table, key, values } => {
-            execute_update(conn, table, *key, values, rec.expected.as_ref())
-        }
-        OpKind::Begin => conn
-            .execute("BEGIN;")
-            .map(|_| ())
-            .map_err(classify_fsqlite_error_as_op),
-        OpKind::Commit => conn
-            .execute("COMMIT;")
-            .map(|_| ())
-            .map_err(classify_fsqlite_error_as_op),
-        OpKind::Rollback => conn
-            .execute("ROLLBACK;")
-            .map(|_| ())
-            .map_err(classify_fsqlite_error_as_op),
-    }
+struct PreparedOpExecutor<'conn> {
+    conn: &'conn Connection,
+    prepared_dml: HashMap<String, fsqlite::PreparedStatement<'conn>>,
+    prepared_sql: HashMap<String, fsqlite::PreparedStatement<'conn>>,
+    sql_scratch: String,
+    params_scratch: Vec<SqliteValue>,
 }
 
-fn execute_sql(
-    conn: &Connection,
-    statement: &str,
-    expected: Option<&ExpectedResult>,
-) -> Result<(), OpError> {
-    let trimmed = statement.trim();
-    let upper = trimmed.to_ascii_uppercase();
-
-    // Skip DDL that FrankenSQLite does not yet support.  These are
-    // performance-only constructs that do not affect logical data.
-    if upper.starts_with("CREATE INDEX")
-        || upper.starts_with("CREATE UNIQUE INDEX")
-        || upper.starts_with("DROP INDEX")
-    {
-        return Ok(());
+impl<'conn> PreparedOpExecutor<'conn> {
+    fn new(conn: &'conn Connection) -> Self {
+        Self {
+            conn,
+            prepared_dml: HashMap::new(),
+            prepared_sql: HashMap::new(),
+            sql_scratch: String::new(),
+            params_scratch: Vec::new(),
+        }
     }
 
-    let is_query = trimmed
-        .split_whitespace()
-        .next()
-        .is_some_and(|w| w.eq_ignore_ascii_case("SELECT"));
+    fn execute_op(&mut self, rec: &OpRecord) -> Result<(), OpError> {
+        match &rec.kind {
+            OpKind::Sql { statement } => self.execute_sql(statement, rec.expected.as_ref()),
+            OpKind::Insert { table, key, values } => {
+                self.execute_insert(table, *key, values, rec.expected.as_ref())
+            }
+            OpKind::Update { table, key, values } => {
+                self.execute_update(table, *key, values, rec.expected.as_ref())
+            }
+            OpKind::Begin => self
+                .conn
+                .execute("BEGIN;")
+                .map(|_| ())
+                .map_err(classify_fsqlite_error_as_op),
+            OpKind::Commit => self
+                .conn
+                .execute("COMMIT;")
+                .map(|_| ())
+                .map_err(classify_fsqlite_error_as_op),
+            OpKind::Rollback => self
+                .conn
+                .execute("ROLLBACK;")
+                .map(|_| ())
+                .map_err(classify_fsqlite_error_as_op),
+        }
+    }
 
-    if is_query {
-        match conn.query(trimmed) {
-            Ok(rows) => {
+    fn execute_sql(
+        &mut self,
+        statement: &str,
+        expected: Option<&ExpectedResult>,
+    ) -> Result<(), OpError> {
+        let trimmed = statement.trim();
+
+        if should_skip_sql_statement(trimmed) {
+            return Ok(());
+        }
+
+        let Some(is_query) = prepared_sql_mode(trimmed) else {
+            return execute_unprepared_sql(self.conn, trimmed, expected);
+        };
+
+        match self.execute_prepared_sql(trimmed, is_query) {
+            Ok(RawSqlExecution::Rows(rows)) => {
                 if matches!(expected, Some(ExpectedResult::Error)) {
                     return Err(OpError::Fatal(format!(
                         "expected error, but query succeeded: `{trimmed}`"
                     )));
                 }
-                if let Some(ExpectedResult::RowCount(n)) = expected {
-                    if rows.len() != *n {
-                        return Err(OpError::Fatal(format!(
-                            "rowcount mismatch: expected {n}, got {} for `{trimmed}`",
-                            rows.len()
-                        )));
-                    }
+                if let Some(ExpectedResult::RowCount(n)) = expected
+                    && rows.len() != *n
+                {
+                    return Err(OpError::Fatal(format!(
+                        "rowcount mismatch: expected {n}, got {} for `{trimmed}`",
+                        rows.len()
+                    )));
                 }
             }
-            Err(e) => {
-                if matches!(expected, Some(ExpectedResult::Error)) {
-                    return Ok(());
-                }
-                return Err(classify_fsqlite_error_as_op(e));
-            }
-        }
-    } else {
-        match conn.execute(trimmed) {
-            Ok(affected) => {
+            Ok(RawSqlExecution::Affected(affected)) => {
                 if matches!(expected, Some(ExpectedResult::Error)) {
                     return Err(OpError::Fatal(format!(
                         "expected error, but statement succeeded: `{trimmed}`"
                     )));
                 }
-                if let Some(ExpectedResult::AffectedRows(n)) = expected {
-                    if affected != *n {
-                        return Err(OpError::Fatal(format!(
-                            "affected mismatch: expected {n}, got {affected} for `{trimmed}`"
-                        )));
-                    }
+                if let Some(ExpectedResult::AffectedRows(n)) = expected
+                    && affected != *n
+                {
+                    return Err(OpError::Fatal(format!(
+                        "affected mismatch: expected {n}, got {affected} for `{trimmed}`"
+                    )));
                 }
             }
-            Err(e) => {
+            Err(error) => {
                 if matches!(expected, Some(ExpectedResult::Error)) {
                     return Ok(());
                 }
-                return Err(classify_fsqlite_error_as_op(e));
+                return Err(classify_fsqlite_error_as_op(error));
             }
         }
+
+        Ok(())
     }
 
-    Ok(())
-}
+    fn execute_insert(
+        &mut self,
+        table: &str,
+        key: i64,
+        values: &[(String, String)],
+        expected: Option<&ExpectedResult>,
+    ) -> Result<(), OpError> {
+        self.params_scratch.clear();
+        self.params_scratch.push(SqliteValue::Integer(key));
+        for (_, value) in values {
+            self.params_scratch.push(parse_value(value));
+        }
 
-fn execute_insert(
-    conn: &Connection,
-    table: &str,
-    key: i64,
-    values: &[(String, String)],
-    expected: Option<&ExpectedResult>,
-) -> Result<(), OpError> {
-    let mut cols = Vec::with_capacity(values.len() + 1);
-    let mut params: Vec<SqliteValue> = Vec::with_capacity(values.len() + 1);
+        self.sql_scratch.clear();
+        push_insert_sql(&mut self.sql_scratch, table, values);
 
-    cols.push("\"id\"".to_owned());
-    params.push(SqliteValue::Integer(key));
-
-    for (col, v) in values {
-        cols.push(format!("\"{}\"", escape_ident(col)));
-        params.push(parse_value(v));
-    }
-
-    let placeholders: Vec<String> = (1..=params.len()).map(|i| format!("?{i}")).collect();
-    let sql = format!(
-        "INSERT INTO \"{}\" ({}) VALUES ({})",
-        escape_ident(table),
-        cols.join(", "),
-        placeholders.join(", ")
-    );
-
-    match conn.execute_with_params(&sql, &params) {
-        Ok(affected) => {
-            if matches!(expected, Some(ExpectedResult::Error)) {
-                return Err(OpError::Fatal(format!(
-                    "expected error, but statement succeeded: `{sql}`"
-                )));
-            }
-            if let Some(ExpectedResult::AffectedRows(n)) = expected {
-                if affected != *n {
+        match self.execute_prepared_dml_with_scratch() {
+            Ok(affected) => {
+                if matches!(expected, Some(ExpectedResult::Error)) {
                     return Err(OpError::Fatal(format!(
-                        "affected mismatch: expected {n}, got {affected} for `{sql}`"
+                        "expected error, but statement succeeded: `{}`",
+                        self.sql_scratch
+                    )));
+                }
+                if let Some(ExpectedResult::AffectedRows(n)) = expected
+                    && affected != *n
+                {
+                    return Err(OpError::Fatal(format!(
+                        "affected mismatch: expected {n}, got {affected} for `{}`",
+                        self.sql_scratch
                     )));
                 }
             }
-        }
-        Err(e) => {
-            if matches!(expected, Some(ExpectedResult::Error)) {
-                return Ok(());
+            Err(error) => {
+                if matches!(expected, Some(ExpectedResult::Error)) {
+                    return Ok(());
+                }
+                return Err(classify_fsqlite_error_as_op(error));
             }
-            return Err(classify_fsqlite_error_as_op(e));
         }
+
+        Ok(())
     }
 
-    Ok(())
-}
+    fn execute_update(
+        &mut self,
+        table: &str,
+        key: i64,
+        values: &[(String, String)],
+        expected: Option<&ExpectedResult>,
+    ) -> Result<(), OpError> {
+        self.params_scratch.clear();
+        self.params_scratch.push(SqliteValue::Integer(key));
+        for (_, value) in values {
+            self.params_scratch.push(parse_value(value));
+        }
 
-fn execute_update(
-    conn: &Connection,
-    table: &str,
-    key: i64,
-    values: &[(String, String)],
-    expected: Option<&ExpectedResult>,
-) -> Result<(), OpError> {
-    let mut sets = Vec::with_capacity(values.len());
-    let mut params: Vec<SqliteValue> = Vec::with_capacity(values.len() + 1);
+        self.sql_scratch.clear();
+        push_update_sql(&mut self.sql_scratch, table, values);
 
-    params.push(SqliteValue::Integer(key));
-
-    for (idx, (col, v)) in values.iter().enumerate() {
-        let p = idx + 2;
-        sets.push(format!("\"{}\"=?{p}", escape_ident(col)));
-        params.push(parse_value(v));
-    }
-
-    let sql = format!(
-        "UPDATE \"{}\" SET {} WHERE id=?1",
-        escape_ident(table),
-        sets.join(", ")
-    );
-
-    match conn.execute_with_params(&sql, &params) {
-        Ok(affected) => {
-            if matches!(expected, Some(ExpectedResult::Error)) {
-                return Err(OpError::Fatal(format!(
-                    "expected error, but statement succeeded: `{sql}`"
-                )));
-            }
-            if let Some(ExpectedResult::AffectedRows(n)) = expected {
-                if affected != *n {
+        match self.execute_prepared_dml_with_scratch() {
+            Ok(affected) => {
+                if matches!(expected, Some(ExpectedResult::Error)) {
                     return Err(OpError::Fatal(format!(
-                        "affected mismatch: expected {n}, got {affected} for `{sql}`"
+                        "expected error, but statement succeeded: `{}`",
+                        self.sql_scratch
+                    )));
+                }
+                if let Some(ExpectedResult::AffectedRows(n)) = expected
+                    && affected != *n
+                {
+                    return Err(OpError::Fatal(format!(
+                        "affected mismatch: expected {n}, got {affected} for `{}`",
+                        self.sql_scratch
                     )));
                 }
             }
-        }
-        Err(e) => {
-            if matches!(expected, Some(ExpectedResult::Error)) {
-                return Ok(());
+            Err(error) => {
+                if matches!(expected, Some(ExpectedResult::Error)) {
+                    return Ok(());
+                }
+                return Err(classify_fsqlite_error_as_op(error));
             }
-            return Err(classify_fsqlite_error_as_op(e));
         }
+
+        Ok(())
     }
 
-    Ok(())
+    fn execute_prepared_dml_with_scratch(&mut self) -> Result<usize, FrankenError> {
+        self.ensure_prepared_dml_for_scratch()?;
+        for attempt in 0..=1 {
+            let sql = self.sql_scratch.as_str();
+            let params = self.params_scratch.as_slice();
+            let execute_result = {
+                let stmt = self
+                    .prepared_dml
+                    .get(sql)
+                    .expect("prepared DML cache must contain the current scratch SQL");
+                stmt.execute_with_params(params)
+            };
+            match execute_result {
+                Ok(affected) => return Ok(affected),
+                Err(FrankenError::SchemaChanged) if attempt == 0 => {
+                    self.prepared_dml.remove(sql);
+                    self.ensure_prepared_dml_for_scratch()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("schema change retry loop must return or error")
+    }
+
+    fn ensure_prepared_dml_for_scratch(&mut self) -> Result<(), FrankenError> {
+        if !self.prepared_dml.contains_key(self.sql_scratch.as_str()) {
+            let sql = self.sql_scratch.clone();
+            let stmt = self.conn.prepare(&sql)?;
+            self.prepared_dml.insert(sql, stmt);
+        }
+        Ok(())
+    }
+
+    fn execute_prepared_sql(
+        &mut self,
+        sql: &str,
+        is_query: bool,
+    ) -> Result<RawSqlExecution, FrankenError> {
+        self.ensure_prepared_sql(sql)?;
+        for attempt in 0..=1 {
+            let execute_result = {
+                let stmt = self
+                    .prepared_sql
+                    .get(sql)
+                    .expect("prepared SQL cache must contain the requested SQL");
+                if is_query {
+                    stmt.query().map(RawSqlExecution::Rows)
+                } else {
+                    stmt.execute().map(RawSqlExecution::Affected)
+                }
+            };
+            match execute_result {
+                Ok(result) => return Ok(result),
+                Err(FrankenError::SchemaChanged) if attempt == 0 => {
+                    self.prepared_sql.remove(sql);
+                    self.ensure_prepared_sql(sql)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("schema change retry loop must return or error")
+    }
+
+    fn ensure_prepared_sql(&mut self, sql: &str) -> Result<(), FrankenError> {
+        if !self.prepared_sql.contains_key(sql) {
+            let stmt = self.conn.prepare(sql)?;
+            self.prepared_sql.insert(sql.to_owned(), stmt);
+        }
+        Ok(())
+    }
+}
+
+enum RawSqlExecution {
+    Rows(Vec<fsqlite::Row>),
+    Affected(usize),
+}
+
+fn execute_op(conn: &Connection, rec: &OpRecord) -> Result<(), OpError> {
+    PreparedOpExecutor::new(conn).execute_op(rec)
+}
+
+#[cfg(test)]
+fn execute_sql(
+    conn: &Connection,
+    statement: &str,
+    expected: Option<&ExpectedResult>,
+) -> Result<(), OpError> {
+    PreparedOpExecutor::new(conn).execute_sql(statement, expected)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+fn starts_with_ascii_prefix(input: &str, prefix: &str) -> bool {
+    input
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn should_skip_sql_statement(sql: &str) -> bool {
+    starts_with_ascii_prefix(sql, "CREATE INDEX")
+        || starts_with_ascii_prefix(sql, "CREATE UNIQUE INDEX")
+        || starts_with_ascii_prefix(sql, "DROP INDEX")
+}
+
+fn prepared_sql_mode(sql: &str) -> Option<bool> {
+    let first_word = sql.split_whitespace().next()?;
+    if first_word.eq_ignore_ascii_case("SELECT") {
+        Some(true)
+    } else if first_word.eq_ignore_ascii_case("INSERT")
+        || first_word.eq_ignore_ascii_case("UPDATE")
+        || first_word.eq_ignore_ascii_case("DELETE")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn execute_unprepared_sql(
+    conn: &Connection,
+    trimmed: &str,
+    expected: Option<&ExpectedResult>,
+) -> Result<(), OpError> {
+    match conn.execute(trimmed) {
+        Ok(affected) => {
+            if matches!(expected, Some(ExpectedResult::Error)) {
+                return Err(OpError::Fatal(format!(
+                    "expected error, but statement succeeded: `{trimmed}`"
+                )));
+            }
+            if let Some(ExpectedResult::AffectedRows(n)) = expected
+                && affected != *n
+            {
+                return Err(OpError::Fatal(format!(
+                    "affected mismatch: expected {n}, got {affected} for `{trimmed}`"
+                )));
+            }
+        }
+        Err(error) => {
+            if matches!(expected, Some(ExpectedResult::Error)) {
+                return Ok(());
+            }
+            return Err(classify_fsqlite_error_as_op(error));
+        }
+    }
+
+    Ok(())
+}
+
+fn push_quoted_ident(out: &mut String, ident: &str) {
+    out.push('"');
+    for ch in ident.chars() {
+        if ch == '"' {
+            out.push('"');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+}
+
+fn push_insert_sql(out: &mut String, table: &str, values: &[(String, String)]) {
+    out.push_str("INSERT INTO ");
+    push_quoted_ident(out, table);
+    out.push_str(" (");
+    push_quoted_ident(out, "id");
+    for (col, _) in values {
+        out.push_str(", ");
+        push_quoted_ident(out, col);
+    }
+    out.push_str(") VALUES (?1");
+    for index in 2..=values.len() + 1 {
+        let _ = write!(out, ", ?{index}");
+    }
+    out.push(')');
+}
+
+fn push_update_sql(out: &mut String, table: &str, values: &[(String, String)]) {
+    out.push_str("UPDATE ");
+    push_quoted_ident(out, table);
+    out.push_str(" SET ");
+    for (idx, (col, _)) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        push_quoted_ident(out, col);
+        let _ = write!(out, "=?{}", idx + 2);
+    }
+    out.push_str(" WHERE id=?1");
+}
+
+#[cfg(test)]
 fn escape_ident(s: &str) -> String {
     s.replace('"', "\"\"")
 }
@@ -1447,6 +1650,210 @@ mod tests {
         assert!(profile.vdbe.actual_opcodes_executed_total > 0);
         assert!(profile.allocator_pressure.is_some());
         assert!(profile.btree.is_some());
+    }
+
+    #[test]
+    fn split_into_batches_preserves_empty_explicit_transactions() {
+        let records = vec![
+            OpRecord {
+                op_id: 0,
+                worker: 0,
+                kind: OpKind::Begin,
+                expected: None,
+            },
+            OpRecord {
+                op_id: 1,
+                worker: 0,
+                kind: OpKind::Commit,
+                expected: None,
+            },
+            OpRecord {
+                op_id: 2,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: "CREATE TABLE t0(id INTEGER PRIMARY KEY);".to_owned(),
+                },
+                expected: None,
+            },
+        ];
+
+        let batches = split_into_batches(&records);
+
+        assert_eq!(batches.len(), 2);
+        assert!(batches[0].commit);
+        assert!(batches[0].ops(&records).is_empty());
+        assert!(batches[1].commit);
+        assert_eq!(batches[1].ops(&records).len(), 1);
+    }
+
+    #[test]
+    fn prepared_op_executor_reuses_insert_shape() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT, num REAL);")
+            .unwrap();
+
+        let mut executor = PreparedOpExecutor::new(&conn);
+        let rows = [
+            OpRecord {
+                op_id: 0,
+                worker: 0,
+                kind: OpKind::Insert {
+                    table: "t0".to_owned(),
+                    key: 1,
+                    values: vec![
+                        ("val".to_owned(), "alpha".to_owned()),
+                        ("num".to_owned(), "1.5".to_owned()),
+                    ],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            },
+            OpRecord {
+                op_id: 1,
+                worker: 0,
+                kind: OpKind::Insert {
+                    table: "t0".to_owned(),
+                    key: 2,
+                    values: vec![
+                        ("val".to_owned(), "beta".to_owned()),
+                        ("num".to_owned(), "2.5".to_owned()),
+                    ],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            },
+        ];
+
+        for row in &rows {
+            executor.execute_op(row).unwrap();
+        }
+
+        assert_eq!(executor.prepared_dml.len(), 1);
+        let count = conn.query_row("SELECT COUNT(*) FROM t0;").unwrap();
+        assert_eq!(count.get(0), Some(&SqliteValue::Integer(2)));
+    }
+
+    #[test]
+    fn prepared_op_executor_reuses_sql_shape() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")
+            .unwrap();
+
+        let mut executor = PreparedOpExecutor::new(&conn);
+        let reads = [
+            OpRecord {
+                op_id: 0,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: "SELECT val FROM t0 WHERE id = 1;".to_owned(),
+                },
+                expected: Some(ExpectedResult::RowCount(1)),
+            },
+            OpRecord {
+                op_id: 1,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: "SELECT val FROM t0 WHERE id = 1;".to_owned(),
+                },
+                expected: Some(ExpectedResult::RowCount(1)),
+            },
+        ];
+
+        for read in &reads {
+            executor.execute_op(read).unwrap();
+        }
+
+        assert_eq!(executor.prepared_sql.len(), 1);
+    }
+
+    #[test]
+    fn run_oplog_fsqlite_prepared_dml_reduces_parser_churn_for_repeated_inserts() {
+        let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 17, 1, 20);
+        let config = FsqliteExecConfig {
+            collect_hot_path_profile: true,
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite(Path::new(":memory:"), &oplog, &config).unwrap();
+        let profile = report
+            .hot_path_profile
+            .expect("collect_hot_path_profile should populate report");
+
+        assert!(
+            profile.parser.parsed_statements_total < report.ops_total,
+            "expected prepared DML reuse to keep parsed statements below executed insert ops: parsed={} ops={}",
+            profile.parser.parsed_statements_total,
+            report.ops_total
+        );
+    }
+
+    #[test]
+    fn run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_repeated_selects() {
+        let repeated_reads = (0_u64..20)
+            .map(|op_id| OpRecord {
+                op_id: op_id + 2,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: "SELECT val FROM t0 WHERE id = 1;".to_owned(),
+                },
+                expected: Some(ExpectedResult::RowCount(1)),
+            })
+            .collect::<Vec<_>>();
+
+        let mut records = vec![
+            OpRecord {
+                op_id: 0,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: "CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);".to_owned(),
+                },
+                expected: None,
+            },
+            OpRecord {
+                op_id: 1,
+                worker: 0,
+                kind: OpKind::Insert {
+                    table: "t0".to_owned(),
+                    key: 1,
+                    values: vec![("val".to_owned(), "alpha".to_owned())],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            },
+        ];
+        records.extend(repeated_reads);
+
+        let oplog = OpLog {
+            header: OpLogHeader {
+                fixture_id: "prepared-sql-read-reuse".to_owned(),
+                seed: 23,
+                rng: RngSpec::default(),
+                concurrency: ConcurrencyModel {
+                    worker_count: 1,
+                    transaction_size: 1,
+                    commit_order_policy: "deterministic".to_owned(),
+                },
+                preset: None,
+            },
+            records,
+        };
+        let config = FsqliteExecConfig {
+            collect_hot_path_profile: true,
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite(Path::new(":memory:"), &oplog, &config).unwrap();
+        let profile = report
+            .hot_path_profile
+            .expect("collect_hot_path_profile should populate report");
+
+        assert!(
+            profile.parser.parsed_statements_total < report.ops_total,
+            "expected prepared SQL reuse to keep parsed statements below executed ops: parsed={} ops={}",
+            profile.parser.parsed_statements_total,
+            report.ops_total
+        );
     }
 
     #[test]

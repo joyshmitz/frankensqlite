@@ -103,10 +103,10 @@ fn concurrent_writer_throughput(n_threads: u32, ops_per_writer: u32) -> (f64, u6
 
                     let pgno = page(page_base + (i % 1000) + 1);
                     let write_ok = {
-                        let mut r = reg.lock().unwrap();
-                        let handle = r.get_mut(session_id).unwrap();
+                        let r = reg.lock().unwrap();
+                        let mut handle = r.get_mut(session_id).unwrap();
                         concurrent_write_page(
-                            handle,
+                            &mut handle,
                             &lt,
                             session_id,
                             pgno,
@@ -123,9 +123,9 @@ fn concurrent_writer_throughput(n_threads: u32, ops_per_writer: u32) -> (f64, u6
 
                     let assign_seq = CommitSeq::new(seq.fetch_add(1, Ordering::Relaxed));
                     let commit_result = {
-                        let mut r = reg.lock().unwrap();
-                        let handle = r.get_mut(session_id).unwrap();
-                        concurrent_commit(handle, &ci, &lt, session_id, assign_seq)
+                        let r = reg.lock().unwrap();
+                        let mut handle = r.get_mut(session_id).unwrap();
+                        concurrent_commit(&mut handle, &ci, &lt, session_id, assign_seq)
                     };
 
                     {
@@ -169,21 +169,21 @@ fn test_basic_concurrent_writer_correctness() {
     let s2 = registry.begin_concurrent(snapshot_at(100)).unwrap();
 
     {
-        let h = registry.get_mut(s1).unwrap();
-        concurrent_write_page(h, &lock_table, s1, page(5), page_data(0xA1)).unwrap();
+        let mut h = registry.get_mut(s1).unwrap();
+        concurrent_write_page(&mut h, &lock_table, s1, page(5), page_data(0xA1)).unwrap();
     }
     {
-        let h = registry.get_mut(s2).unwrap();
-        concurrent_write_page(h, &lock_table, s2, page(10), page_data(0xB2)).unwrap();
+        let mut h = registry.get_mut(s2).unwrap();
+        concurrent_write_page(&mut h, &lock_table, s2, page(10), page_data(0xB2)).unwrap();
     }
 
     let seq1 = {
-        let h = registry.get_mut(s1).unwrap();
-        concurrent_commit(h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap()
+        let mut h = registry.get_mut(s1).unwrap();
+        concurrent_commit(&mut h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap()
     };
     let seq2 = {
-        let h = registry.get_mut(s2).unwrap();
-        concurrent_commit(h, &commit_index, &lock_table, s2, CommitSeq::new(102)).unwrap()
+        let mut h = registry.get_mut(s2).unwrap();
+        concurrent_commit(&mut h, &commit_index, &lock_table, s2, CommitSeq::new(102)).unwrap()
     };
 
     assert_eq!(
@@ -213,21 +213,21 @@ fn test_first_committer_wins_conflict() {
 
     // Both write to the SAME page.
     {
-        let h = registry.get_mut(s1).unwrap();
-        concurrent_write_page(h, &lock_table, s1, page(5), page_data(0xA1)).unwrap();
+        let mut h = registry.get_mut(s1).unwrap();
+        concurrent_write_page(&mut h, &lock_table, s1, page(5), page_data(0xA1)).unwrap();
     }
 
     // s2 tries to write to same page — should get Busy (lock contention).
     {
-        let h = registry.get_mut(s2).unwrap();
-        let result = concurrent_write_page(h, &lock_table, s2, page(5), page_data(0xB2));
+        let mut h = registry.get_mut(s2).unwrap();
+        let result = concurrent_write_page(&mut h, &lock_table, s2, page(5), page_data(0xB2));
         assert!(result.is_err(), "bead_id={BEAD_ID} case=page_lock_conflict",);
     }
 
     // s1 commits successfully.
     let seq1 = {
-        let h = registry.get_mut(s1).unwrap();
-        concurrent_commit(h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap()
+        let mut h = registry.get_mut(s1).unwrap();
+        concurrent_commit(&mut h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap()
     };
     assert_eq!(
         seq1,
@@ -249,24 +249,24 @@ fn test_fcw_stale_snapshot_conflict() {
     // s1 writes and commits to page 5.
     let s1 = registry.begin_concurrent(snapshot_at(100)).unwrap();
     {
-        let h = registry.get_mut(s1).unwrap();
-        concurrent_write_page(h, &lock_table, s1, page(5), page_data(0xA1)).unwrap();
+        let mut h = registry.get_mut(s1).unwrap();
+        concurrent_write_page(&mut h, &lock_table, s1, page(5), page_data(0xA1)).unwrap();
     }
     {
-        let h = registry.get_mut(s1).unwrap();
-        concurrent_commit(h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap();
+        let mut h = registry.get_mut(s1).unwrap();
+        concurrent_commit(&mut h, &commit_index, &lock_table, s1, CommitSeq::new(101)).unwrap();
     }
     registry.remove(s1);
 
     // s2 started with old snapshot (100), tries to write page 5 — FCW conflict at commit.
     let s2 = registry.begin_concurrent(snapshot_at(100)).unwrap();
     {
-        let h = registry.get_mut(s2).unwrap();
-        concurrent_write_page(h, &lock_table, s2, page(5), page_data(0xC3)).unwrap();
+        let mut h = registry.get_mut(s2).unwrap();
+        concurrent_write_page(&mut h, &lock_table, s2, page(5), page_data(0xC3)).unwrap();
     }
     let result = {
-        let h = registry.get_mut(s2).unwrap();
-        concurrent_commit(h, &commit_index, &lock_table, s2, CommitSeq::new(102))
+        let mut h = registry.get_mut(s2).unwrap();
+        concurrent_commit(&mut h, &commit_index, &lock_table, s2, CommitSeq::new(102))
     };
 
     match result {
@@ -373,10 +373,10 @@ fn test_ssi_abort_rate_transparency() {
                     // Overlapping page range: pages 1..=10 shared by all threads.
                     let pgno = page((i % 10) + 1);
                     let write_ok = {
-                        let mut r = reg.lock().unwrap();
-                        let handle = r.get_mut(session_id).unwrap();
+                        let r = reg.lock().unwrap();
+                        let mut handle = r.get_mut(session_id).unwrap();
                         concurrent_write_page(
-                            handle,
+                            &mut handle,
                             &lt,
                             session_id,
                             pgno,
@@ -393,9 +393,9 @@ fn test_ssi_abort_rate_transparency() {
 
                     let assign = CommitSeq::new(seq.fetch_add(1, Ordering::Relaxed));
                     let result = {
-                        let mut r = reg.lock().unwrap();
-                        let handle = r.get_mut(session_id).unwrap();
-                        concurrent_commit(handle, &ci, &lt, session_id, assign)
+                        let r = reg.lock().unwrap();
+                        let mut handle = r.get_mut(session_id).unwrap();
+                        concurrent_commit(&mut handle, &ci, &lt, session_id, assign)
                     };
                     {
                         let mut r = reg.lock().unwrap();
@@ -539,17 +539,21 @@ fn test_conformance_summary() {
     let s1 = registry.begin_concurrent(snapshot_at(100)).unwrap();
     let s2 = registry.begin_concurrent(snapshot_at(100)).unwrap();
     {
-        let h = registry.get_mut(s1).unwrap();
-        concurrent_write_page(h, &lock_table, s1, page(1), page_data(1)).unwrap();
+        let mut h = registry.get_mut(s1).unwrap();
+        concurrent_write_page(&mut h, &lock_table, s1, page(1), page_data(1)).unwrap();
     }
     {
-        let h = registry.get_mut(s2).unwrap();
-        concurrent_write_page(h, &lock_table, s2, page(2), page_data(2)).unwrap();
+        let mut h = registry.get_mut(s2).unwrap();
+        concurrent_write_page(&mut h, &lock_table, s2, page(2), page_data(2)).unwrap();
     }
-    let c1 = registry.get_mut(s1).unwrap();
-    let ok1 = concurrent_commit(c1, &commit_index, &lock_table, s1, CommitSeq::new(101)).is_ok();
-    let c2 = registry.get_mut(s2).unwrap();
-    let ok2 = concurrent_commit(c2, &commit_index, &lock_table, s2, CommitSeq::new(102)).is_ok();
+    let ok1 = {
+        let mut c1 = registry.get_mut(s1).unwrap();
+        concurrent_commit(&mut c1, &commit_index, &lock_table, s1, CommitSeq::new(101)).is_ok()
+    };
+    let ok2 = {
+        let mut c2 = registry.get_mut(s2).unwrap();
+        concurrent_commit(&mut c2, &commit_index, &lock_table, s2, CommitSeq::new(102)).is_ok()
+    };
     let pass_correctness = ok1 && ok2;
     registry.remove(s1);
     registry.remove(s2);
@@ -557,12 +561,13 @@ fn test_conformance_summary() {
     // 2. FCW conflict detection.
     let s3 = registry.begin_concurrent(snapshot_at(100)).unwrap();
     {
-        let h = registry.get_mut(s3).unwrap();
-        concurrent_write_page(h, &lock_table, s3, page(1), page_data(3)).unwrap();
+        let mut h = registry.get_mut(s3).unwrap();
+        concurrent_write_page(&mut h, &lock_table, s3, page(1), page_data(3)).unwrap();
     }
-    let c3 = registry.get_mut(s3).unwrap();
-    let pass_fcw =
-        concurrent_commit(c3, &commit_index, &lock_table, s3, CommitSeq::new(103)).is_err(); // Should fail: page 1 already committed at seq 101.
+    let pass_fcw = {
+        let mut c3 = registry.get_mut(s3).unwrap();
+        concurrent_commit(&mut c3, &commit_index, &lock_table, s3, CommitSeq::new(103)).is_err()
+    }; // Should fail: page 1 already committed at seq 101.
     registry.remove(s3);
 
     // 3. Zero contention throughput.

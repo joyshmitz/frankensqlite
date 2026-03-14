@@ -3151,7 +3151,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
                     eprintln!("error: --workload requires a preset name");
                     return 2;
                 }
-                workload = argv[i].clone();
+                workload.clone_from(&argv[i]);
             }
             "--concurrency" => {
                 i += 1;
