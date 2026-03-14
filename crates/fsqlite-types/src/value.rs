@@ -357,6 +357,30 @@ impl SqliteValue {
         }
     }
 
+    /// Borrow the inner text string without allocating.
+    ///
+    /// Returns `Some(&str)` for `Text` values, `None` otherwise.
+    /// Use this in comparisons, LIKE patterns, and WHERE clause
+    /// evaluation to avoid the clone that `to_text()` incurs.
+    #[inline]
+    #[must_use]
+    pub fn as_text_str(&self) -> Option<&str> {
+        match self {
+            Self::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Borrow the inner blob bytes without allocating.
+    #[inline]
+    #[must_use]
+    pub fn as_blob_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Blob(b) => Some(b),
+            _ => None,
+        }
+    }
+
     /// Convert to text following SQLite's CAST(x AS TEXT) coercion rules.
     ///
     /// For blobs, this interprets the raw bytes as UTF-8 (with lossy
@@ -447,6 +471,7 @@ impl SqliteValue {
     ///
     /// Integer values are obviously integer-typed. Text/Blob values that parse
     /// as i64 are also integer-typed. Float and Null are not.
+    #[inline]
     pub fn is_integer_numeric_type(&self) -> bool {
         fn text_is_integer_numeric_type(s: &str) -> bool {
             let trimmed = s.trim_start();
@@ -469,6 +494,7 @@ impl SqliteValue {
     /// A value is "float numeric type" only if it has a numeric prefix
     /// containing '.', 'e', or 'E'. Non-numeric text/blob is NOT float
     /// (it coerces to integer 0 in C SQLite's OP_Add/Sub/Mul).
+    #[inline]
     fn is_float_numeric_type(&self) -> bool {
         fn text_is_float(s: &str) -> bool {
             let trimmed = s.trim_start();
@@ -823,12 +849,14 @@ impl PartialEq for SqliteValue {
 impl Eq for SqliteValue {}
 
 impl PartialOrd for SqliteValue {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for SqliteValue {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         // SQLite sort order: NULL < numeric < text < blob
         let class_a = self.sort_class();

@@ -22,6 +22,8 @@
 /// Compute the number of bytes of data for a given serial type.
 ///
 /// Returns `None` for reserved serial types (10, 11).
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub const fn serial_type_len(serial_type: u64) -> Option<u64> {
     match serial_type {
         0 | 8 | 9 => Some(0),
@@ -59,6 +61,8 @@ pub enum SerialTypeClass {
 }
 
 /// Classify a serial type value.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub const fn classify_serial_type(serial_type: u64) -> SerialTypeClass {
     match serial_type {
         0 => SerialTypeClass::Null,
@@ -136,17 +140,29 @@ pub const SMALL_TYPE_SIZES: [u8; 128] = {
 ///
 /// SQLite varints are 1-9 bytes. The high bit of each byte indicates whether
 /// more bytes follow (except the 9th byte which uses all 8 bits).
-#[inline]
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     if buf.is_empty() {
         return None;
     }
 
     let first = buf[0];
+    // 1-byte fast path (~50% of varints in typical SQLite records).
     if first < 0x80 {
         return Some((u64::from(first), 1));
     }
 
+    // 2-byte fast path (~30-40% of remaining varints: serial types 13-16383,
+    // header sizes 128-16383).  Avoids the loop + enumerate + skip overhead.
+    if buf.len() >= 2 {
+        let second = buf[1];
+        if second & 0x80 == 0 {
+            return Some(((u64::from(first & 0x7F) << 7) | u64::from(second), 2));
+        }
+    }
+
+    // General case: 3-9 byte varints (rare in practice).
     let mut value: u64 = u64::from(first & 0x7F);
     for (i, &byte) in buf.iter().enumerate().skip(1).take(7) {
         if byte & 0x80 == 0 {

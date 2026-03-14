@@ -121,10 +121,6 @@ pub fn record_profile_snapshot() -> RecordHotPathProfileSnapshot {
 }
 
 fn note_decoded_value(value: &SqliteValue) {
-    if !record_profile_enabled() {
-        return;
-    }
-
     match value {
         SqliteValue::Null => {
             FSQLITE_RECORD_VALUE_NULLS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -222,9 +218,9 @@ pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<(
         // Reuse caller-owned scratch slots so repeated row decodes keep
         // existing text/blob backing storage alive across iterations.
         if let Some(slot) = values.get_mut(decoded_count) {
-            decode_value_into(serial_type, value_bytes, slot)?;
+            decode_value_into(serial_type, value_bytes, slot, profile_enabled)?;
         } else {
-            let value = decode_value(serial_type, value_bytes)?;
+            let value = decode_value(serial_type, value_bytes, profile_enabled)?;
             values.push(value);
         }
         body_offset = end;
@@ -290,7 +286,7 @@ pub fn parse_record_column(data: &[u8], col_idx: usize) -> Option<SqliteValue> {
 
         if current_idx == col_idx {
             let value_bytes = &data[body_offset..end];
-            let value = decode_value(serial_type, value_bytes);
+            let value = decode_value(serial_type, value_bytes, profile_enabled);
             if let Some(start) = start {
                 FSQLITE_RECORD_DECODE_TIME_NS.fetch_add(
                     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -336,6 +332,139 @@ pub fn record_column_count(data: &[u8]) -> Option<usize> {
     Some(count)
 }
 
+// ---------------------------------------------------------------------------
+// Lazy column decode — Record Offset Table
+// ---------------------------------------------------------------------------
+
+/// Pre-parsed record header offset for a single column.
+///
+/// Stores the serial type and byte range within the record body so that
+/// individual columns can be decoded on demand without scanning the entire
+/// record's data section.
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnOffset {
+    /// SQLite serial type code for this column.
+    pub serial_type: u64,
+    /// Start offset of the value bytes within the record (from byte 0).
+    pub body_offset: u32,
+    /// Length of the value bytes.
+    pub value_len: u32,
+}
+
+/// Parse only the record header into a caller-owned offset table.
+///
+/// This is the lazy-decode counterpart to [`parse_record_into`]:
+/// it scans the header to learn each column's serial type and byte range
+/// but does **not** decode any column values.  Individual columns can
+/// then be decoded on demand via [`decode_value`] with the corresponding
+/// [`ColumnOffset`].
+///
+/// Returns `Some(column_count)` on success, `None` if the header is
+/// malformed.
+#[allow(clippy::cast_possible_truncation)]
+pub fn parse_record_header_into(data: &[u8], offsets: &mut Vec<ColumnOffset>) -> Option<usize> {
+    offsets.clear();
+    if data.is_empty() {
+        return None;
+    }
+
+    let (header_size_u64, hdr_varint_len) = read_varint(data)?;
+    let header_size = usize::try_from(header_size_u64).unwrap_or(usize::MAX);
+
+    if header_size > data.len() || header_size < hdr_varint_len {
+        return None;
+    }
+
+    let mut offset = hdr_varint_len;
+    let mut body_offset = header_size;
+
+    while offset < header_size {
+        let (serial_type, consumed) = read_varint(&data[offset..header_size])?;
+        offset += consumed;
+
+        let value_len_u64 = serial_type_len(serial_type)?;
+        let value_len = usize::try_from(value_len_u64).unwrap_or(usize::MAX);
+        let body_start = body_offset;
+        body_offset = body_offset.checked_add(value_len)?;
+
+        if body_offset > data.len() {
+            return None;
+        }
+
+        offsets.push(ColumnOffset {
+            serial_type,
+            body_offset: u32::try_from(body_start).unwrap_or(u32::MAX),
+            value_len: u32::try_from(value_len).unwrap_or(u32::MAX),
+        });
+    }
+
+    // Validate that the body section is fully consumed.
+    if body_offset != data.len() {
+        return None;
+    }
+
+    Some(offsets.len())
+}
+
+/// Decode a single column from previously-parsed offset table + raw record data.
+///
+/// This avoids re-scanning the header on each column access and only
+/// materializes the value for the requested column.
+#[inline]
+pub fn decode_column_from_offset(
+    data: &[u8],
+    col: &ColumnOffset,
+    profile_enabled: bool,
+) -> Option<SqliteValue> {
+    let start = col.body_offset as usize;
+    let end = start + col.value_len as usize;
+    if end > data.len() {
+        return None;
+    }
+    decode_value(col.serial_type, &data[start..end], profile_enabled)
+}
+
+/// Decode only the first `n` columns from a serialized record.
+///
+/// This is the sort-key extraction path: for ORDER BY on 2 columns of a
+/// 20-column record, we decode only 2 columns instead of 20.  The raw
+/// blob is kept separately for output.
+#[allow(clippy::cast_possible_truncation)]
+pub fn parse_record_prefix(data: &[u8], max_cols: usize) -> Option<Vec<SqliteValue>> {
+    if data.is_empty() || max_cols == 0 {
+        return Some(Vec::new());
+    }
+
+    let (header_size_u64, hdr_varint_len) = read_varint(data)?;
+    let header_size = usize::try_from(header_size_u64).unwrap_or(usize::MAX);
+    if header_size > data.len() || header_size < hdr_varint_len {
+        return None;
+    }
+
+    let mut values = Vec::with_capacity(max_cols.min(16));
+    let mut offset = hdr_varint_len;
+    let mut body_offset = header_size;
+    let profile_enabled = record_profile_enabled();
+
+    while offset < header_size && values.len() < max_cols {
+        let (serial_type, consumed) = read_varint(&data[offset..header_size])?;
+        offset += consumed;
+
+        let value_len_u64 = serial_type_len(serial_type)?;
+        let value_len = usize::try_from(value_len_u64).unwrap_or(usize::MAX);
+        let end = body_offset.checked_add(value_len)?;
+        if end > data.len() {
+            return None;
+        }
+
+        let value = decode_value(serial_type, &data[body_offset..end], profile_enabled)?;
+        values.push(value);
+        body_offset = end;
+    }
+
+    Some(values)
+}
+
 /// Serialize a list of `SqliteValue` into the SQLite record format.
 pub fn serialize_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record_iter(values.iter())
@@ -346,41 +475,62 @@ pub fn serialize_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
     serialize_record_iter(values.iter().copied())
 }
 
-/// Core serialization logic using a zero-allocation, multi-pass iterator.
+/// Core serialization logic.
+///
+/// Computes each column's serial type **once** into a small stack buffer
+/// (up to 32 columns without heap allocation), then writes header + body
+/// in a single pass.  This replaces the prior 3-pass design that called
+/// `serial_type_for_value()` three times per column.
+#[allow(clippy::cast_possible_truncation)]
 pub fn serialize_record_iter<'a, I>(values: I) -> Vec<u8>
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {
+    // ── Phase 1: compute serial types + sizes (one call per column) ──
+    // Stack-allocate for records up to 32 columns (covers 95%+ of tables).
+    let mut serial_types_buf: [u64; 32] = [0; 32];
+    let mut serial_types_heap: Vec<u64> = Vec::new();
+    let mut n_cols: usize = 0;
     let mut header_content_size: usize = 0;
     let mut body_size: usize = 0;
 
     for v in values.clone() {
         let st = serial_type_for_value(v);
-        header_content_size += varint_len(st);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            body_size += serial_type_len(st).unwrap_or(0) as usize;
+        if n_cols < 32 {
+            serial_types_buf[n_cols] = st;
+        } else {
+            if serial_types_heap.is_empty() {
+                serial_types_heap.extend_from_slice(&serial_types_buf);
+            }
+            serial_types_heap.push(st);
         }
+        header_content_size += varint_len(st);
+        body_size += serial_type_len(st).unwrap_or(0) as usize;
+        n_cols += 1;
     }
 
-    let header_size = compute_header_size(header_content_size);
-    let header_size_varint_len = varint_len(header_size as u64);
+    let serial_types: &[u64] = if n_cols <= 32 {
+        &serial_types_buf[..n_cols]
+    } else {
+        &serial_types_heap
+    };
 
+    // ── Phase 2: single-pass write header + body ─────────────────────
+    let header_size = compute_header_size(header_content_size);
     let total_size = header_size + body_size;
     let mut buf = vec![0u8; total_size];
 
+    // Write header-size varint.
     let mut offset = write_varint(&mut buf, header_size as u64);
-    debug_assert_eq!(offset, header_size_varint_len);
 
-    for v in values.clone() {
-        let st = serial_type_for_value(v);
+    // Write serial type varints (from cached array, not recomputed).
+    for &st in serial_types {
         offset += write_varint(&mut buf[offset..], st);
     }
     debug_assert_eq!(offset, header_size);
 
-    #[allow(clippy::cast_possible_truncation)]
-    for v in values {
-        let st = serial_type_for_value(v);
+    // Write encoded values (serial types read from cache).
+    for (v, &st) in values.zip(serial_types.iter()) {
         let value_len = serial_type_len(st).unwrap_or(0) as usize;
         encode_value(v, st, &mut buf[offset..offset + value_len]);
         offset += value_len;
@@ -423,8 +573,11 @@ fn serial_type_for_value(value: &SqliteValue) -> u64 {
 }
 
 /// Decode a value from its serial type and raw bytes.
+///
+/// Public so that [`RecordOffsetTable`] consumers can perform lazy
+/// per-column decoding without re-parsing the header.
 #[allow(clippy::cast_possible_truncation)]
-fn decode_value(serial_type: u64, bytes: &[u8]) -> Option<SqliteValue> {
+pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Option<SqliteValue> {
     let value = match classify_serial_type(serial_type) {
         SerialTypeClass::Null => Some(SqliteValue::Null),
         SerialTypeClass::Zero => Some(SqliteValue::Integer(0)),
@@ -452,13 +605,18 @@ fn decode_value(serial_type: u64, bytes: &[u8]) -> Option<SqliteValue> {
         SerialTypeClass::Reserved => None,
     };
 
-    if let Some(value) = value.as_ref() {
+    if profile_enabled && let Some(value) = value.as_ref() {
         note_decoded_value(value);
     }
     value
 }
 
-fn decode_value_into(serial_type: u64, bytes: &[u8], slot: &mut SqliteValue) -> Option<()> {
+fn decode_value_into(
+    serial_type: u64,
+    bytes: &[u8],
+    slot: &mut SqliteValue,
+    profile_enabled: bool,
+) -> Option<()> {
     match classify_serial_type(serial_type) {
         SerialTypeClass::Null => {
             *slot = SqliteValue::Null;
@@ -508,7 +666,9 @@ fn decode_value_into(serial_type: u64, bytes: &[u8], slot: &mut SqliteValue) -> 
         SerialTypeClass::Reserved => return None,
     }
 
-    note_decoded_value(slot);
+    if profile_enabled {
+        note_decoded_value(slot);
+    }
     Some(())
 }
 
@@ -1143,6 +1303,29 @@ mod tests {
                 values[0],
                 decoded[0]
             );
+        }
+
+        /// INV-PBT-4: Lazy header-only parse + per-column decode matches full parse.
+        #[test]
+        fn prop_lazy_decode_matches_full(
+            values in proptest::collection::vec(arb_sqlite_value(), 1..50)
+        ) {
+            let encoded = serialize_record(&values);
+            let full = parse_record(&encoded).expect("full parse must succeed");
+            let mut offsets = Vec::new();
+            let col_count = parse_record_header_into(&encoded, &mut offsets)
+                .expect("header-only parse must succeed");
+            prop_assert_eq!(col_count, full.len(), "column count mismatch");
+            for i in 0..col_count {
+                let lazy_val = decode_column_from_offset(&encoded, &offsets[i], false)
+                    .expect("lazy decode must succeed");
+                prop_assert!(
+                    values_bitwise_eq(&full[i], &lazy_val),
+                    "lazy decode mismatch at col {i}: full={:?} lazy={:?}",
+                    full[i],
+                    lazy_val,
+                );
+            }
         }
     }
 }
