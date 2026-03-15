@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::json;
@@ -1397,6 +1397,55 @@ struct ViewDef {
     query: SelectStatement,
 }
 
+/// Connection-local differential stream events emitted to subscribers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DifferentialEvent {
+    /// Initial bootstrap payload captured at a committed MVCC snapshot.
+    Snapshot {
+        subscriber_id: u64,
+        view_name: String,
+        snapshot_seq: u64,
+        next_commit_seq: u64,
+        rows: Vec<Row>,
+    },
+    /// Placeholder stream mode until table-level differential routing lands.
+    Invalidation {
+        subscriber_id: u64,
+        view_name: String,
+        commit_seq: u64,
+    },
+}
+
+/// Public status snapshot for one active differential subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DifferentialSubscriberStatus {
+    pub subscriber_id: u64,
+    pub view_name: String,
+    pub snapshot_seq: u64,
+    pub next_commit_seq: u64,
+    pub bootstrap_row_count: usize,
+}
+
+#[derive(Clone)]
+struct DifferentialSubscriber {
+    id: u64,
+    view_name: String,
+    #[allow(dead_code)]
+    view_query: SelectStatement,
+    snapshot_seq: CommitSeq,
+    stream_begin_seq: CommitSeq,
+    bootstrap_row_count: usize,
+    sender: mpsc::Sender<DifferentialEvent>,
+}
+
+#[derive(Default)]
+struct DifferentialRegistry {
+    next_subscriber_id: AtomicU64,
+    subscribers: Mutex<HashMap<u64, DifferentialSubscriber>>,
+    snapshot_bootstraps_total: AtomicU64,
+    fallback_invalidations_total: AtomicU64,
+}
+
 /// A stored trigger definition captured from `CREATE TRIGGER`.
 #[derive(Debug, Clone)]
 struct TriggerDef {
@@ -2003,6 +2052,8 @@ pub struct Connection {
     /// Connection-scoped PRAGMA state used by the E2E harness for fairness knobs
     /// (journal_mode, synchronous, cache_size, page_size).
     pragma_state: RefCell<fsqlite_vdbe::pragma::ConnectionPragmaState>,
+    /// Differential-view subscriber registry for Bloodstream bootstrap/stream handoff.
+    differential_registry: DifferentialRegistry,
     /// Maps table name (lowercased) to the 0-based column index of the
     /// `INTEGER PRIMARY KEY` column, which is an alias for `rowid`.
     /// Used by fallback paths (GROUP BY, JOIN) to resolve rowid/\_rowid\_/oid.
@@ -2234,6 +2285,7 @@ impl Connection {
             concurrent_txn: RefCell::new(false),
             concurrent_mode_default: RefCell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
+            differential_registry: DifferentialRegistry::default(),
             rowid_alias_columns: RefCell::new(HashMap::new()),
             original_ddl_sql: RefCell::new(HashMap::new()),
             autoincrement_tables: RefCell::new(HashSet::new()),
@@ -9035,12 +9087,10 @@ impl Connection {
         self.finalize_live_vtab_registry_commit(&cx);
 
         if committed_write {
-            let committed_seq = self
-                .last_local_commit_seq
-                .borrow()
-                .map(|s| s.get())
-                .unwrap_or(0);
-            self.capture_time_travel_snapshot(committed_seq);
+            if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
+                self.emit_differential_commit_invalidations(committed_seq);
+                self.capture_time_travel_snapshot(committed_seq.get());
+            }
             self.maybe_run_adaptive_autocheckpoint();
         }
         Ok(())
@@ -13377,12 +13427,10 @@ impl Connection {
 
             // Capture time-travel snapshot AFTER cleanup so the write transaction
             // handle is fully dropped and the pager can serve reads to reload_memdb.
-            let committed_seq = self
-                .last_local_commit_seq
-                .borrow()
-                .map(|s| s.get())
-                .unwrap_or(0);
-            self.capture_time_travel_snapshot(committed_seq);
+            if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
+                self.emit_differential_commit_invalidations(committed_seq);
+                self.capture_time_travel_snapshot(committed_seq.get());
+            }
 
             // MVCC GC (bd-3bql / 5E.5): After commit, trigger GC if scheduler permits.
             // Commit makes new versions visible, potentially making old ones prunable.
@@ -15331,6 +15379,9 @@ impl Connection {
                     values: vec![SqliteValue::Text("ok".into())],
                 }])
             }
+            "fsqlite.differential_status"
+            | "differential_status"
+            | "fsqlite_differential_status" => Ok(vec![]),
             // ── MVCC conflict observability PRAGMAs (bd-t6sv2.1) ──────────
             "fsqlite.conflict_stats" | "conflict_stats" => {
                 let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
@@ -16462,6 +16513,136 @@ impl Connection {
         self.pragma_state.borrow()
     }
 
+    /// Registers a connection-local differential subscriber for an existing view.
+    ///
+    /// The subscriber receives a snapshot payload at the current committed
+    /// `CommitSeq(N)` and will subsequently receive invalidation events
+    /// beginning at `N + 1` until table-level differential routing lands.
+    pub fn register_differential_view_subscriber(
+        &self,
+        view_name: &str,
+        sender: mpsc::Sender<DifferentialEvent>,
+    ) -> Result<u64> {
+        if !self.pragma_state.borrow().differential_views.is_enabled() {
+            return Err(FrankenError::NotImplemented(
+                "differential subscribers require PRAGMA fsqlite_differential_views = ON"
+                    .to_owned(),
+            ));
+        }
+        if *self.in_transaction.borrow() {
+            return Err(FrankenError::NotImplemented(
+                "differential subscribers currently require autocommit mode".to_owned(),
+            ));
+        }
+
+        let view = self.lookup_differential_view(view_name)?;
+        let snapshot_seq = self.pager.published_snapshot().visible_commit_seq;
+        let rows = self.execute_statement(&Statement::Select(view.query.clone()), None)?;
+        let stream_begin_seq = CommitSeq::new(snapshot_seq.get().saturating_add(1));
+        let subscriber_id = self
+            .differential_registry
+            .next_subscriber_id
+            .fetch_add(1, AtomicOrdering::AcqRel)
+            .saturating_add(1);
+
+        sender
+            .send(DifferentialEvent::Snapshot {
+                subscriber_id,
+                view_name: view.name.clone(),
+                snapshot_seq: snapshot_seq.get(),
+                next_commit_seq: stream_begin_seq.get(),
+                rows: rows.clone(),
+            })
+            .map_err(|_| {
+                FrankenError::Internal(format!(
+                    "differential subscriber for view `{}` dropped during snapshot bootstrap",
+                    view.name
+                ))
+            })?;
+
+        let subscriber = DifferentialSubscriber {
+            id: subscriber_id,
+            view_name: view.name.clone(),
+            view_query: view.query,
+            snapshot_seq,
+            stream_begin_seq,
+            bootstrap_row_count: rows.len(),
+            sender,
+        };
+        let active_subs = {
+            let mut subscribers = lock_unpoisoned(&self.differential_registry.subscribers);
+            subscribers.insert(subscriber_id, subscriber);
+            subscribers.len()
+        };
+
+        self.differential_registry
+            .snapshot_bootstraps_total
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        tracing::debug!(
+            target: "fsqlite::differential::registry",
+            event = "subscribe",
+            subscriber_id,
+            active_subs = u64::try_from(active_subs).unwrap_or(u64::MAX)
+        );
+        tracing::info!(
+            target: "fsqlite::differential",
+            event = "snapshot_bootstrap",
+            subscriber_id,
+            view_name = %view.name,
+            rows_sent = u64::try_from(rows.len()).unwrap_or(u64::MAX),
+            seq = snapshot_seq.get(),
+            next_seq = stream_begin_seq.get()
+        );
+
+        Ok(subscriber_id)
+    }
+
+    /// Removes a previously registered differential subscriber.
+    pub fn unregister_differential_subscriber(&self, subscriber_id: u64) -> bool {
+        let removed = {
+            let mut subscribers = lock_unpoisoned(&self.differential_registry.subscribers);
+            subscribers.remove(&subscriber_id)
+        };
+        if let Some(subscriber) = removed {
+            let active_subs = self.differential_subscriber_count();
+            tracing::debug!(
+                target: "fsqlite::differential::registry",
+                event = "unsubscribe",
+                subscriber_id,
+                view_name = %subscriber.view_name,
+                active_subs = u64::try_from(active_subs).unwrap_or(u64::MAX)
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns a stable status snapshot of active differential subscribers.
+    #[must_use]
+    pub fn differential_subscribers(&self) -> Vec<DifferentialSubscriberStatus> {
+        let mut snapshot: Vec<DifferentialSubscriberStatus> = lock_unpoisoned(
+            &self.differential_registry.subscribers,
+        )
+        .values()
+        .map(|subscriber| DifferentialSubscriberStatus {
+            subscriber_id: subscriber.id,
+            view_name: subscriber.view_name.clone(),
+            snapshot_seq: subscriber.snapshot_seq.get(),
+            next_commit_seq: subscriber.stream_begin_seq.get(),
+            bootstrap_row_count: subscriber.bootstrap_row_count,
+        })
+        .collect();
+        snapshot.sort_by_key(|subscriber| subscriber.subscriber_id);
+        snapshot
+    }
+
+    /// Returns the number of active differential subscribers.
+    #[must_use]
+    pub fn differential_subscriber_count(&self) -> usize {
+        lock_unpoisoned(&self.differential_registry.subscribers).len()
+    }
+
     // ── Compilation helpers ─────────────────────────────────────────────
 
     /// Compile a table-backed SELECT through the VDBE codegen.
@@ -16483,6 +16664,148 @@ impl Connection {
         fsqlite_vdbe::codegen::clear_extra_aggregate_names();
         result?;
         builder.finish()
+    }
+
+    fn lookup_differential_view(&self, view_name: &str) -> Result<ViewDef> {
+        let trimmed = view_name.trim();
+        if trimmed.is_empty() {
+            return Err(FrankenError::TypeMismatch {
+                expected: "non-empty view name".to_owned(),
+                actual: view_name.to_owned(),
+            });
+        }
+
+        self.views
+            .borrow()
+            .iter()
+            .find(|view| view.name.eq_ignore_ascii_case(trimmed))
+            .cloned()
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: trimmed.to_owned(),
+            })
+    }
+
+    fn differential_status_rows(&self) -> Vec<Row> {
+        let subscribers = self.differential_subscribers();
+        let active_views = subscribers
+            .iter()
+            .map(|subscriber| subscriber.view_name.clone())
+            .collect::<Vec<_>>()
+            .join(",");
+        let latest_visible_commit_seq = self.pager.published_snapshot().visible_commit_seq.get();
+
+        vec![
+            Row {
+                values: vec![
+                    SqliteValue::Text("enabled".into()),
+                    SqliteValue::Integer(i64::from(
+                        self.pragma_state.borrow().differential_views.is_enabled(),
+                    )),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("active_subscriptions".into()),
+                    SqliteValue::Integer(i64::try_from(subscribers.len()).unwrap_or(i64::MAX)),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("snapshot_bootstraps_total".into()),
+                    SqliteValue::Integer(
+                        i64::try_from(
+                            self.differential_registry
+                                .snapshot_bootstraps_total
+                                .load(AtomicOrdering::Relaxed),
+                        )
+                        .unwrap_or(i64::MAX),
+                    ),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("fallback_invalidations_total".into()),
+                    SqliteValue::Integer(
+                        i64::try_from(
+                            self.differential_registry
+                                .fallback_invalidations_total
+                                .load(AtomicOrdering::Relaxed),
+                        )
+                        .unwrap_or(i64::MAX),
+                    ),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("latest_visible_commit_seq".into()),
+                    SqliteValue::Integer(
+                        i64::try_from(latest_visible_commit_seq).unwrap_or(i64::MAX),
+                    ),
+                ],
+            },
+            Row {
+                values: vec![
+                    SqliteValue::Text("active_views".into()),
+                    SqliteValue::Text(active_views),
+                ],
+            },
+        ]
+    }
+
+    fn emit_differential_commit_invalidations(&self, committed_seq: CommitSeq) {
+        let subscribers: Vec<DifferentialSubscriber> = lock_unpoisoned(
+            &self.differential_registry.subscribers,
+        )
+        .values()
+        .filter(|subscriber| committed_seq >= subscriber.stream_begin_seq)
+        .cloned()
+        .collect();
+
+        if subscribers.is_empty() {
+            return;
+        }
+
+        let mut dropped = Vec::new();
+        for subscriber in subscribers {
+            let event = DifferentialEvent::Invalidation {
+                subscriber_id: subscriber.id,
+                view_name: subscriber.view_name.clone(),
+                commit_seq: committed_seq.get(),
+            };
+            if subscriber.sender.send(event).is_err() {
+                dropped.push(subscriber.id);
+                continue;
+            }
+
+            self.differential_registry
+                .fallback_invalidations_total
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            tracing::debug!(
+                target: "fsqlite::differential",
+                event = "fallback_invalidation",
+                subscriber_id = subscriber.id,
+                view_name = %subscriber.view_name,
+                commit_seq = committed_seq.get()
+            );
+        }
+
+        if dropped.is_empty() {
+            return;
+        }
+
+        let mut subscribers = lock_unpoisoned(&self.differential_registry.subscribers);
+        for subscriber_id in dropped {
+            if let Some(subscriber) = subscribers.remove(&subscriber_id) {
+                tracing::debug!(
+                    target: "fsqlite::differential::registry",
+                    event = "unsubscribe",
+                    subscriber_id,
+                    view_name = %subscriber.view_name,
+                    active_subs = u64::try_from(subscribers.len()).unwrap_or(u64::MAX),
+                    reason = "receiver_dropped"
+                );
+            }
+        }
     }
 
     fn table_declares_without_rowid(&self, table_name: &str) -> bool {
@@ -24258,6 +24581,41 @@ fn in_subquery_needs_eager_eval(sub: &SelectStatement) -> bool {
     )
 }
 
+/// Check whether the subquery's FROM clause references an unmaterialized view.
+/// VDBE codegen cannot resolve views in IN-probe paths (it only looks in the
+/// materialized table schema), so such subqueries must be eagerly evaluated at
+/// the connection level where views can be materialized.
+fn in_subquery_references_view(sub: &SelectStatement, conn: &Connection) -> bool {
+    let views = conn.views.borrow();
+    if views.is_empty() {
+        return false;
+    }
+    let schema = conn.schema.borrow();
+    let is_view = |name: &str| -> bool {
+        views.iter().any(|v| v.name.eq_ignore_ascii_case(name))
+            && !schema.iter().any(|t| t.name.eq_ignore_ascii_case(name))
+    };
+    if let SelectCore::Select {
+        from: Some(ref from),
+        ..
+    } = sub.body.select
+    {
+        if let TableOrSubquery::Table { ref name, .. } = from.source {
+            if is_view(&name.name) {
+                return true;
+            }
+        }
+        for join in &from.joins {
+            if let TableOrSubquery::Table { ref name, .. } = join.table {
+                if is_view(&name.name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Recursively detect expression forms that the non-IN rewrite pass mutates.
 fn expr_contains_rewritable_subquery(expr: &Expr) -> bool {
     match expr {
@@ -24279,10 +24637,13 @@ fn expr_contains_rewritable_subquery(expr: &Expr) -> bool {
             expr_contains_rewritable_subquery(expr)
                 || match set {
                     InSet::List(exprs) => exprs.iter().any(expr_contains_rewritable_subquery),
-                    // IN subqueries with GROUP BY / HAVING / windows / compounds
-                    // / WITH need eager evaluation because VDBE codegen emits
-                    // NULL for those.
-                    InSet::Subquery(sub) => in_subquery_needs_eager_eval(sub),
+                    // Always mark IN subqueries as rewritable so the rewrite
+                    // pass can inspect them.  The actual eager-eval decision
+                    // is made inside `rewrite_in_expr` which checks for GROUP
+                    // BY / HAVING / windows / views / etc.  Without this,
+                    // IN subqueries referencing views are never reached by
+                    // the rewrite pass and VDBE codegen silently emits NULL.
+                    InSet::Subquery(_) => true,
                     InSet::Table(_) => false,
                 }
         }
@@ -25130,19 +25491,30 @@ fn rewrite_in_expr(
         } => {
             rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
             if let InSet::Subquery(sub) = set {
-                // Eagerly evaluate the subquery when requested, OR when the
-                // subquery uses GROUP BY / HAVING / windows / compounds / WITH
-                // which VDBE codegen cannot handle in IN-probe expressions
-                // (it would emit NULL).
-                let needs_eager = rewrite_in_subqueries || in_subquery_needs_eager_eval(sub);
-                if needs_eager {
-                    let rows = conn.execute_statement(&Statement::Select(*sub.clone()), params)?;
-                    let literals: Vec<Expr> = rows
-                        .into_iter()
-                        .filter_map(|row| row.values.into_iter().next())
-                        .map(value_to_literal_expr)
-                        .collect();
-                    *set = InSet::List(literals);
+                // Correlated IN subqueries reference outer table columns and
+                // must be evaluated per-row; skip eager rewrite.
+                if !is_correlated_subquery(sub) {
+                    // Eagerly evaluate the subquery when requested, OR when the
+                    // subquery uses GROUP BY / HAVING / windows / compounds / WITH
+                    // which VDBE codegen cannot handle in IN-probe expressions
+                    // (it would emit NULL).  Also eagerly evaluate when the
+                    // subquery references a VIEW — VDBE codegen's
+                    // resolve_in_probe_source / try_emit_complex_in_subquery
+                    // cannot resolve view names (they only look in the
+                    // materialized table schema) and would silently emit NULL.
+                    let needs_eager = rewrite_in_subqueries
+                        || in_subquery_needs_eager_eval(sub)
+                        || in_subquery_references_view(sub, conn);
+                    if needs_eager {
+                        let rows =
+                            conn.execute_statement(&Statement::Select(*sub.clone()), params)?;
+                        let literals: Vec<Expr> = rows
+                            .into_iter()
+                            .filter_map(|row| row.values.into_iter().next())
+                            .map(value_to_literal_expr)
+                            .collect();
+                        *set = InSet::List(literals);
+                    }
                 }
             }
             if let InSet::List(exprs) = set {
@@ -33044,8 +33416,9 @@ fn format_time_travel_target(target: &TimeTravelTarget) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitSeq, Connection, ConnectionEnv, InProcessPageLockTable, IoPollStrategy, PagerBackend,
-        Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SimplePager, Snapshot,
+        CommitSeq, Connection, ConnectionEnv, DifferentialEvent, InProcessPageLockTable,
+        IoPollStrategy, PagerBackend, Row, RuntimeConfig, RuntimeContext, SchemaEpoch,
+        SimplePager, Snapshot,
         init_global_runtime, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
         join_table_supports_hidden_rowid, lock_unpoisoned, statement_contains_rewritable_subquery,
         wal_file_present_with_vfs, wal_path_for_db_path,
@@ -46885,6 +47258,137 @@ mod tests {
         assert_eq!(state.cache_size, -8000);
         assert_eq!(state.page_size, 16384);
         assert_eq!(state.busy_timeout_ms, 3000);
+    }
+
+    #[test]
+    fn test_differential_subscriber_requires_enabled_pragma() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE VIEW v_items AS SELECT id, name FROM items ORDER BY id;")
+            .unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        let err = conn
+            .register_differential_view_subscriber("v_items", tx)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FrankenError::NotImplemented(message)
+                if message.contains("PRAGMA fsqlite_differential_views = ON")
+        ));
+    }
+
+    #[test]
+    fn test_differential_subscriber_bootstrap_and_commit_invalidation() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'alpha'), (2, 'beta');")
+            .unwrap();
+        conn.execute("CREATE VIEW v_items AS SELECT id, name FROM items ORDER BY id;")
+            .unwrap();
+        conn.execute("PRAGMA fsqlite_differential_views = ON;").unwrap();
+
+        let expected_snapshot_seq = conn.current_global_commit_seq().get();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let subscriber_id = conn
+            .register_differential_view_subscriber("v_items", tx)
+            .unwrap();
+
+        let bootstrap = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        match bootstrap {
+            DifferentialEvent::Snapshot {
+                subscriber_id: event_subscriber_id,
+                view_name,
+                snapshot_seq,
+                next_commit_seq,
+                rows,
+            } => {
+                assert_eq!(event_subscriber_id, subscriber_id);
+                assert_eq!(view_name, "v_items");
+                assert_eq!(snapshot_seq, expected_snapshot_seq);
+                assert_eq!(next_commit_seq, expected_snapshot_seq + 1);
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+                assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+                assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+                assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".to_owned()));
+            }
+            other => panic!("expected bootstrap snapshot, got {other:?}"),
+        }
+
+        let statuses = conn.differential_subscribers();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].subscriber_id, subscriber_id);
+        assert_eq!(statuses[0].view_name, "v_items");
+        assert_eq!(statuses[0].snapshot_seq, expected_snapshot_seq);
+        assert_eq!(statuses[0].next_commit_seq, expected_snapshot_seq + 1);
+        assert_eq!(statuses[0].bootstrap_row_count, 2);
+
+        conn.execute("INSERT INTO items VALUES (3, 'gamma');").unwrap();
+        let invalidation = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        match invalidation {
+            DifferentialEvent::Invalidation {
+                subscriber_id: event_subscriber_id,
+                view_name,
+                commit_seq,
+            } => {
+                assert_eq!(event_subscriber_id, subscriber_id);
+                assert_eq!(view_name, "v_items");
+                assert_eq!(commit_seq, conn.last_local_commit_seq().unwrap());
+            }
+            other => panic!("expected invalidation, got {other:?}"),
+        }
+
+        let status_rows = conn.query("PRAGMA fsqlite_differential_status;").unwrap();
+        let find_value = |key: &str| {
+            status_rows
+                .iter()
+                .find(|row| row.values()[0] == SqliteValue::Text(key.to_owned()))
+                .map(|row| row.values()[1].clone())
+                .unwrap()
+        };
+        assert_eq!(find_value("enabled"), SqliteValue::Integer(1));
+        assert_eq!(find_value("active_subscriptions"), SqliteValue::Integer(1));
+        assert_eq!(find_value("snapshot_bootstraps_total"), SqliteValue::Integer(1));
+        assert_eq!(find_value("fallback_invalidations_total"), SqliteValue::Integer(1));
+        assert_eq!(
+            find_value("active_views"),
+            SqliteValue::Text("v_items".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_differential_subscriber_unregister_stops_future_invalidations() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'alpha');").unwrap();
+        conn.execute("CREATE VIEW v_items AS SELECT id, name FROM items ORDER BY id;")
+            .unwrap();
+        conn.execute("PRAGMA fsqlite_differential_views = ON;").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let subscriber_id = conn
+            .register_differential_view_subscriber("v_items", tx)
+            .unwrap();
+        let bootstrap = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert!(matches!(bootstrap, DifferentialEvent::Snapshot { .. }));
+
+        assert!(conn.unregister_differential_subscriber(subscriber_id));
+        assert_eq!(conn.differential_subscriber_count(), 0);
+
+        conn.execute("INSERT INTO items VALUES (2, 'beta');").unwrap();
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+
+        let status_rows = conn.query("PRAGMA fsqlite_differential_status;").unwrap();
+        assert!(status_rows.iter().any(|row| {
+            row.values()[0] == SqliteValue::Text("active_subscriptions".to_owned())
+                && row.values()[1] == SqliteValue::Integer(0)
+        }));
     }
 
     #[test]
