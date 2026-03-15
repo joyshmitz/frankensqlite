@@ -1569,7 +1569,7 @@ mod tests {
         let intruder_page = sample_page(0xEE);
 
         baseline
-            .append_frame(&cx, 99, &intruder_page, 0)
+            .append_frame(&cx, 99, &intruder_page, 1)
             .expect("baseline intruder append");
         for (index, page) in pages.iter().enumerate() {
             baseline
@@ -1601,7 +1601,7 @@ mod tests {
         let stale_finalization_state = prepared.finalized_for;
 
         intruder
-            .append_frame(&cx, 99, &intruder_page, 0)
+            .append_frame(&cx, 99, &intruder_page, 1)
             .expect("intruder append");
         intruder.sync(&cx).expect("intruder sync");
 

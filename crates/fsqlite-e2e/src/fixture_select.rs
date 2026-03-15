@@ -504,6 +504,8 @@ pub struct BenchmarkArtifactContract {
     pub result_jsonl_name: String,
     pub summary_md_name: String,
     pub manifest_name: String,
+    pub hardware_discovery_bundle_json_name: String,
+    pub hardware_discovery_summary_md_name: String,
     pub logs_dir_name: String,
     pub profiles_dir_name: String,
     pub retention_policies: Vec<BenchmarkArtifactRetentionPolicy>,
@@ -525,6 +527,8 @@ pub struct BenchmarkArtifactNames {
     pub result_jsonl: String,
     pub summary_md: String,
     pub manifest_json: String,
+    pub hardware_discovery_bundle_json: String,
+    pub hardware_discovery_summary_md: String,
     pub logs_dir: String,
     pub profiles_dir: String,
 }
@@ -820,6 +824,8 @@ pub fn benchmark_artifact_names(contract: &BenchmarkArtifactContract) -> Benchma
         result_jsonl: contract.result_jsonl_name.clone(),
         summary_md: contract.summary_md_name.clone(),
         manifest_json: contract.manifest_name.clone(),
+        hardware_discovery_bundle_json: contract.hardware_discovery_bundle_json_name.clone(),
+        hardware_discovery_summary_md: contract.hardware_discovery_summary_md_name.clone(),
         logs_dir: contract.logs_dir_name.clone(),
         profiles_dir: contract.profiles_dir_name.clone(),
     }
@@ -1609,6 +1615,44 @@ pub fn validate_beads_benchmark_campaign(
             campaign.artifact_contract.manifest_schema_version,
             BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1
         ));
+    }
+    for (label, value) in [
+        (
+            "artifact result_jsonl_name",
+            &campaign.artifact_contract.result_jsonl_name,
+        ),
+        (
+            "artifact summary_md_name",
+            &campaign.artifact_contract.summary_md_name,
+        ),
+        (
+            "artifact manifest_name",
+            &campaign.artifact_contract.manifest_name,
+        ),
+        (
+            "artifact hardware_discovery_bundle_json_name",
+            &campaign
+                .artifact_contract
+                .hardware_discovery_bundle_json_name,
+        ),
+        (
+            "artifact hardware_discovery_summary_md_name",
+            &campaign
+                .artifact_contract
+                .hardware_discovery_summary_md_name,
+        ),
+        (
+            "artifact logs_dir_name",
+            &campaign.artifact_contract.logs_dir_name,
+        ),
+        (
+            "artifact profiles_dir_name",
+            &campaign.artifact_contract.profiles_dir_name,
+        ),
+    ] {
+        if value.trim().is_empty() {
+            errors.push(format!("{label} must not be empty"));
+        }
     }
     for required_class in BenchmarkArtifactRetentionClass::ALL {
         let matches = campaign
@@ -2592,6 +2636,8 @@ mod tests {
                 result_jsonl_name: "results.jsonl".to_owned(),
                 summary_md_name: "summary.md".to_owned(),
                 manifest_name: "manifest.json".to_owned(),
+                hardware_discovery_bundle_json_name: "hardware_discovery_bundle.json".to_owned(),
+                hardware_discovery_summary_md_name: "hardware_discovery_summary.md".to_owned(),
                 logs_dir_name: "logs".to_owned(),
                 profiles_dir_name: "profiles".to_owned(),
                 retention_policies: vec![
@@ -3061,6 +3107,14 @@ mod tests {
         assert_eq!(manifest.mode, BenchmarkMode::SqliteReference);
         assert_eq!(manifest.run_id, "run-20260315T015800Z");
         assert_eq!(manifest.artifact_names.manifest_json, "manifest.json");
+        assert_eq!(
+            manifest.artifact_names.hardware_discovery_bundle_json,
+            "hardware_discovery_bundle.json"
+        );
+        assert_eq!(
+            manifest.artifact_names.hardware_discovery_summary_md,
+            "hardware_discovery_summary.md"
+        );
         assert!(
             manifest
                 .artifact_bundle_relpath

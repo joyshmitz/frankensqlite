@@ -820,10 +820,10 @@ def path_field(path: str, *, transform=None) -> dict[str, object]:
 
 workspace_root = Path(os.environ["WORKSPACE_ROOT"])
 artifact_bundle_dir = Path(os.environ["ARTIFACT_BUNDLE_DIR"])
-bundle_json_path = artifact_bundle_dir / "hardware_discovery_bundle.json"
-summary_md_path = artifact_bundle_dir / "hardware_discovery_summary.md"
 manifest_snapshot: dict[str, object] | None = None
 manifest_payload_dict: dict[str, object] | None = None
+bundle_json_name = "hardware_discovery_bundle.json"
+summary_md_name = "hardware_discovery_summary.md"
 
 manifest_json = os.environ.get("MANIFEST_JSON") or None
 if manifest_json:
@@ -834,6 +834,18 @@ if manifest_json:
         manifest_payload = None
     if isinstance(manifest_payload, dict):
         manifest_payload_dict = manifest_payload
+        manifest_artifact_names = manifest_payload.get("artifact_names")
+        if isinstance(manifest_artifact_names, dict):
+            manifest_bundle_name = normalize_scalar(
+                manifest_artifact_names.get("hardware_discovery_bundle_json")
+            )
+            manifest_summary_name = normalize_scalar(
+                manifest_artifact_names.get("hardware_discovery_summary_md")
+            )
+            if manifest_bundle_name is not None:
+                bundle_json_name = manifest_bundle_name
+            if manifest_summary_name is not None:
+                summary_md_name = manifest_summary_name
         manifest_provenance = manifest_payload.get("provenance")
         placement_policy = (
             manifest_provenance.get("placement_policy")
@@ -861,6 +873,7 @@ if manifest_json:
                 if isinstance(manifest_payload.get("provenance"), dict)
                 else None
             ),
+            "artifact_names": manifest_artifact_names if isinstance(manifest_artifact_names, dict) else None,
             "placement_policy": {
                 "placement_profile_id": (
                     placement_policy.get("placement_profile_id")
@@ -889,6 +902,9 @@ if manifest_json:
                 ),
             },
         }
+
+bundle_json_path = artifact_bundle_dir / bundle_json_name
+summary_md_path = artifact_bundle_dir / summary_md_name
 
 lscpu = parse_lscpu()
 cpuinfo = parse_cpuinfo()

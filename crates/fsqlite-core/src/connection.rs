@@ -15381,7 +15381,7 @@ impl Connection {
             }
             "fsqlite.differential_status"
             | "differential_status"
-            | "fsqlite_differential_status" => Ok(vec![]),
+            | "fsqlite_differential_status" => Ok(self.differential_status_rows()),
             // ── MVCC conflict observability PRAGMAs (bd-t6sv2.1) ──────────
             "fsqlite.conflict_stats" | "conflict_stats" => {
                 let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);

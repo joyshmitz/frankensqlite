@@ -528,6 +528,8 @@
     "result_jsonl_name": "results.jsonl",
     "summary_md_name": "summary.md",
     "manifest_name": "manifest.json",
+    "hardware_discovery_bundle_json_name": "hardware_discovery_bundle.json",
+    "hardware_discovery_summary_md_name": "hardware_discovery_summary.md",
     "logs_dir_name": "logs",
     "profiles_dir_name": "profiles",
     "retention_policies": [

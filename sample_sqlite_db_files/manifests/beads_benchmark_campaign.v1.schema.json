@@ -643,6 +643,8 @@
         "result_jsonl_name",
         "summary_md_name",
         "manifest_name",
+        "hardware_discovery_bundle_json_name",
+        "hardware_discovery_summary_md_name",
         "logs_dir_name",
         "profiles_dir_name",
         "retention_policies"
@@ -671,6 +673,12 @@
           "$ref": "#/$defs/non_empty_string"
         },
         "manifest_name": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "hardware_discovery_bundle_json_name": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "hardware_discovery_summary_md_name": {
           "$ref": "#/$defs/non_empty_string"
         },
         "logs_dir_name": {
