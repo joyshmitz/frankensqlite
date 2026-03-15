@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use fsqlite_harness::leapfrog_exit_criteria::{BEAD_ID, LeapfrogExitCriteria};
 
 const CONTRACT_PATH: &str = "leapfrog_exit_criteria.toml";
-const REQUIRED_TESTS: [&str; 4] = [
+const REQUIRED_TESTS: [&str; 5] = [
     "test_bd_db300_7_3_contract_schema_and_links",
     "test_bd_db300_7_3_required_campaign_surface_exists",
     "test_bd_db300_7_3_cell_targets_are_monotone",
     "test_bd_db300_7_3_verification_plan_is_actionable",
+    "test_bd_db300_7_3_transferability_rubric_is_actionable",
 ];
 const REQUIRED_LOG_FIELDS: [&str; 8] = [
     "throughput_ratio_vs_sqlite",
@@ -20,6 +21,30 @@ const REQUIRED_LOG_FIELDS: [&str; 8] = [
     "responsiveness_regression_ratio_vs_sqlite",
     "topology_reassignments",
 ];
+const REQUIRED_MODES: [&str; 3] = ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"];
+const REQUIRED_METRIC_FAMILIES: [&str; 12] = [
+    "throughput",
+    "retry",
+    "abort",
+    "cpu_efficiency",
+    "latency",
+    "topology",
+    "wait",
+    "page_touch",
+    "split_path",
+    "allocator",
+    "cache",
+    "copy_allocation",
+];
+const REQUIRED_TRANSFERABILITY_CLASSES: [&str; 4] = [
+    "transferable",
+    "profile_specific_but_useful",
+    "suspicious",
+    "non_claimable",
+];
+const REQUIRED_HARDWARE_CLASSES: [&str; 3] =
+    ["same_host", "same_topology_class", "cross_hardware_class"];
+const REQUIRED_DOWNSTREAM_BEADS: [&str; 2] = ["bd-db300.7.3", "bd-db300.7.4"];
 
 fn workspace_root() -> Result<PathBuf, String> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -104,6 +129,19 @@ fn test_bd_db300_7_3_required_campaign_surface_exists() -> Result<(), String> {
     if actual_profiles != expected_profiles {
         return Err(format!(
             "placement profile mismatch actual={actual_profiles:?} expected={expected_profiles:?}"
+        ));
+    }
+
+    let expected_modes = REQUIRED_MODES.into_iter().collect::<BTreeSet<_>>();
+    let actual_modes = criteria
+        .campaign
+        .required_modes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if actual_modes != expected_modes {
+        return Err(format!(
+            "mode set mismatch actual={actual_modes:?} expected={expected_modes:?}"
         ));
     }
 
@@ -193,9 +231,50 @@ fn test_bd_db300_7_3_verification_plan_is_actionable() -> Result<(), String> {
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    let artifacts = criteria
+        .verification_plan
+        .logging_artifacts
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let metric_definitions = criteria
+        .metric_dictionary
+        .metrics
+        .iter()
+        .map(|metric| (metric.metric_id.as_str(), metric))
+        .collect::<std::collections::BTreeMap<_, _>>();
     for required_field in REQUIRED_LOG_FIELDS {
         if !log_fields.contains(required_field) {
             return Err(format!("required log field missing field={required_field}"));
+        }
+        let Some(metric) = metric_definitions.get(required_field) else {
+            return Err(format!(
+                "metric dictionary missing required metric_id={required_field}"
+            ));
+        };
+        if !metric.required_for_claim {
+            return Err(format!(
+                "required metric_id={required_field} must be marked required_for_claim"
+            ));
+        }
+        if metric.collection_artifact.trim().is_empty() || metric.collection_field.trim().is_empty()
+        {
+            return Err(format!(
+                "required metric_id={required_field} must name a concrete collection artifact and field"
+            ));
+        }
+        if !artifacts.contains(metric.collection_artifact.as_str()) {
+            return Err(format!(
+                "required metric_id={required_field} points at undeclared artifact={}",
+                metric.collection_artifact
+            ));
+        }
+    }
+    for log_field in &log_fields {
+        if !metric_definitions.contains_key(log_field) {
+            return Err(format!(
+                "required log field lacks metric dictionary entry field={log_field}"
+            ));
         }
     }
 
@@ -217,16 +296,11 @@ fn test_bd_db300_7_3_verification_plan_is_actionable() -> Result<(), String> {
         return Err("claim language must mention the recommended placement".to_owned());
     }
 
-    let artifacts = criteria
-        .verification_plan
-        .logging_artifacts
-        .iter()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
     for required_artifact in [
         "artifacts/{bead_id}/{run_id}/events.jsonl",
         "artifacts/{bead_id}/{run_id}/manifest.json",
         "artifacts/{bead_id}/{run_id}/summary.md",
+        "artifacts/{bead_id}/{run_id}/metric_dictionary.json",
         "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl",
         "artifacts/{bead_id}/{run_id}/retry_report.json",
         "artifacts/{bead_id}/{run_id}/topology.json",
@@ -236,6 +310,191 @@ fn test_bd_db300_7_3_verification_plan_is_actionable() -> Result<(), String> {
                 "logging artifact missing artifact={required_artifact}"
             ));
         }
+    }
+
+    let metric_families = criteria
+        .metric_dictionary
+        .metrics
+        .iter()
+        .map(|metric| metric.family.as_str())
+        .collect::<BTreeSet<_>>();
+    for required_family in REQUIRED_METRIC_FAMILIES {
+        if !metric_families.contains(required_family) {
+            return Err(format!(
+                "metric dictionary missing required family={required_family}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_db300_7_3_transferability_rubric_is_actionable() -> Result<(), String> {
+    let criteria = load_contract()?;
+    let rubric = &criteria.transferability_rubric;
+
+    let actual_modes = rubric
+        .required_modes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_modes = REQUIRED_MODES.into_iter().collect::<BTreeSet<_>>();
+    if actual_modes != expected_modes {
+        return Err(format!(
+            "rubric modes mismatch actual={actual_modes:?} expected={expected_modes:?}"
+        ));
+    }
+
+    let actual_hardware_classes = rubric
+        .required_hardware_classes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_hardware_classes = REQUIRED_HARDWARE_CLASSES
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if actual_hardware_classes != expected_hardware_classes {
+        return Err(format!(
+            "rubric hardware classes mismatch actual={actual_hardware_classes:?} expected={expected_hardware_classes:?}"
+        ));
+    }
+
+    let actual_downstream_beads = rubric
+        .downstream_beads
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let expected_downstream_beads = REQUIRED_DOWNSTREAM_BEADS
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if actual_downstream_beads != expected_downstream_beads {
+        return Err(format!(
+            "rubric downstream bead mismatch actual={actual_downstream_beads:?} expected={expected_downstream_beads:?}"
+        ));
+    }
+
+    if rubric.single_writer_role != "comparison_or_fallback_only" {
+        return Err(format!(
+            "unexpected single_writer_role={}",
+            rubric.single_writer_role
+        ));
+    }
+
+    let ordered_classes = rubric
+        .classification_order
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if ordered_classes != REQUIRED_TRANSFERABILITY_CLASSES {
+        return Err(format!(
+            "rubric class order mismatch actual={ordered_classes:?} expected={REQUIRED_TRANSFERABILITY_CLASSES:?}"
+        ));
+    }
+
+    let actual_classes = rubric
+        .classes
+        .iter()
+        .map(|class| class.classification_id.as_str())
+        .collect::<Vec<_>>();
+    if actual_classes != REQUIRED_TRANSFERABILITY_CLASSES {
+        return Err(format!(
+            "rubric classes mismatch actual={actual_classes:?} expected={REQUIRED_TRANSFERABILITY_CLASSES:?}"
+        ));
+    }
+
+    let expected_report_labels = std::collections::BTreeMap::from([
+        ("transferable", "transferable win"),
+        ("profile_specific_but_useful", "lab-specific win"),
+        ("suspicious", "topology-sensitive win"),
+        ("non_claimable", "no-catastrophic-regression failure"),
+    ]);
+    let expected_minimum_hardware = std::collections::BTreeMap::from([
+        ("transferable", "same_topology_class"),
+        ("profile_specific_but_useful", "same_host"),
+        ("suspicious", "same_host"),
+        ("non_claimable", "same_host"),
+    ]);
+    let expected_claimability = std::collections::BTreeMap::from([
+        ("transferable", true),
+        ("profile_specific_but_useful", false),
+        ("suspicious", false),
+        ("non_claimable", false),
+    ]);
+    let expected_catastrophic_guard = std::collections::BTreeMap::from([
+        ("transferable", true),
+        ("profile_specific_but_useful", true),
+        ("suspicious", true),
+        ("non_claimable", false),
+    ]);
+    let mut covered_profiles = BTreeSet::new();
+    for class in &rubric.classes {
+        let class_id = class.classification_id.as_str();
+        let Some(expected_label) = expected_report_labels.get(class_id) else {
+            return Err(format!("unexpected class id={class_id}"));
+        };
+        if class.final_report_label != *expected_label {
+            return Err(format!(
+                "class={class_id} report label mismatch actual={} expected={expected_label}",
+                class.final_report_label
+            ));
+        }
+        let Some(expected_hardware) = expected_minimum_hardware.get(class_id) else {
+            return Err(format!("missing hardware expectation for class={class_id}"));
+        };
+        if class.minimum_hardware_evidence != *expected_hardware {
+            return Err(format!(
+                "class={class_id} hardware evidence mismatch actual={} expected={expected_hardware}",
+                class.minimum_hardware_evidence
+            ));
+        }
+        let Some(expected_claimable) = expected_claimability.get(class_id) else {
+            return Err(format!(
+                "missing claimability expectation for class={class_id}"
+            ));
+        };
+        if class.claimable != *expected_claimable {
+            return Err(format!(
+                "class={class_id} claimability mismatch actual={} expected={expected_claimable}",
+                class.claimable
+            ));
+        }
+        let Some(expected_guard) = expected_catastrophic_guard.get(class_id) else {
+            return Err(format!(
+                "missing catastrophic-guard expectation for class={class_id}"
+            ));
+        };
+        if class.requires_no_catastrophic_regression != *expected_guard {
+            return Err(format!(
+                "class={class_id} catastrophic guard mismatch actual={} expected={expected_guard}",
+                class.requires_no_catastrophic_regression
+            ));
+        }
+        if class.summary.trim().is_empty()
+            || class.placement_rule.trim().is_empty()
+            || class.mode_rule.trim().is_empty()
+            || class.hardware_rule.trim().is_empty()
+            || class.reporting_requirement.trim().is_empty()
+            || class.example.trim().is_empty()
+        {
+            return Err(format!("class={class_id} contains blank rubric prose"));
+        }
+        for profile in &class.example_profiles {
+            covered_profiles.insert(profile.as_str());
+        }
+    }
+
+    let expected_profiles = [
+        "baseline_unpinned",
+        "recommended_pinned",
+        "adversarial_cross_node",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if covered_profiles != expected_profiles {
+        return Err(format!(
+            "rubric profile coverage mismatch actual={covered_profiles:?} expected={expected_profiles:?}"
+        ));
     }
 
     Ok(())

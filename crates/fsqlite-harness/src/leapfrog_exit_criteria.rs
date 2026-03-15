@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 pub const BEAD_ID: &str = "bd-db300.7.3";
 /// Stable schema identifier for the exit-criteria contract.
 pub const LEAPFROG_EXIT_CRITERIA_SCHEMA_V1: &str = "fsqlite-harness.leapfrog_exit_criteria.v1";
+/// Stable schema identifier for the scorecard metric dictionary embedded in the
+/// leapfrog contract.
+pub const SCORECARD_METRIC_DICTIONARY_SCHEMA_V1: &str =
+    "fsqlite-harness.scorecard_metric_dictionary.v1";
+/// Stable schema identifier for the transferability rubric embedded in the
+/// leapfrog contract.
+pub const TRANSFERABILITY_RUBRIC_SCHEMA_V1: &str = "fsqlite-harness.transferability_rubric.v1";
 /// Workspace-relative path to the canonical exit-criteria contract.
 pub const LEAPFROG_EXIT_CRITERIA_PATH: &str = "leapfrog_exit_criteria.toml";
 const CANONICAL_CAMPAIGN_MANIFEST_PATH: &str =
@@ -29,6 +36,63 @@ const REQUIRED_LOG_FIELDS: [&str; 8] = [
     "responsiveness_regression_ratio_vs_sqlite",
     "topology_reassignments",
 ];
+const REQUIRED_UNIT_TESTS: [&str; 5] = [
+    "test_bd_db300_7_3_contract_schema_and_links",
+    "test_bd_db300_7_3_required_campaign_surface_exists",
+    "test_bd_db300_7_3_cell_targets_are_monotone",
+    "test_bd_db300_7_3_verification_plan_is_actionable",
+    "test_bd_db300_7_3_transferability_rubric_is_actionable",
+];
+const REQUIRED_CELL_SUFFIXES: [&str; 3] = ["c1", "c4", "c8"];
+const REQUIRED_MODES: [&str; 3] = ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"];
+const REQUIRED_PLACEMENT_PROFILES: [&str; 3] = [
+    "baseline_unpinned",
+    "recommended_pinned",
+    "adversarial_cross_node",
+];
+const REQUIRED_E2E_SCENARIOS: [&str; 9] = [
+    "commutative_inserts_disjoint_keys_c1",
+    "commutative_inserts_disjoint_keys_c4",
+    "commutative_inserts_disjoint_keys_c8",
+    "hot_page_contention_c1",
+    "hot_page_contention_c4",
+    "hot_page_contention_c8",
+    "mixed_read_write_c1",
+    "mixed_read_write_c4",
+    "mixed_read_write_c8",
+];
+const REQUIRED_LOGGING_ARTIFACTS: [&str; 7] = [
+    "artifacts/{bead_id}/{run_id}/events.jsonl",
+    "artifacts/{bead_id}/{run_id}/manifest.json",
+    "artifacts/{bead_id}/{run_id}/summary.md",
+    "artifacts/{bead_id}/{run_id}/metric_dictionary.json",
+    "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl",
+    "artifacts/{bead_id}/{run_id}/retry_report.json",
+    "artifacts/{bead_id}/{run_id}/topology.json",
+];
+const REQUIRED_METRIC_FAMILIES: [&str; 12] = [
+    "throughput",
+    "retry",
+    "abort",
+    "cpu_efficiency",
+    "latency",
+    "topology",
+    "wait",
+    "page_touch",
+    "split_path",
+    "allocator",
+    "cache",
+    "copy_allocation",
+];
+const REQUIRED_TRANSFERABILITY_CLASSES: [&str; 4] = [
+    "transferable",
+    "profile_specific_but_useful",
+    "suspicious",
+    "non_claimable",
+];
+const REQUIRED_HARDWARE_CLASSES: [&str; 3] =
+    ["same_host", "same_topology_class", "cross_hardware_class"];
+const REQUIRED_RUBRIC_DOWNSTREAM_BEADS: [&str; 2] = ["bd-db300.7.3", "bd-db300.7.4"];
 
 /// Typed decision record for Track G3 leapfrog claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +100,8 @@ pub struct LeapfrogExitCriteria {
     pub meta: ExitCriteriaMeta,
     pub campaign: CampaignRequirements,
     pub scorecard: ScorecardPolicy,
+    pub metric_dictionary: ScorecardMetricDictionary,
+    pub transferability_rubric: TransferabilityRubric,
     pub cell_gates: Vec<CellGate>,
     pub verification_plan: VerificationPlan,
     pub references: ExitCriteriaReferences,
@@ -71,6 +137,68 @@ pub struct ScorecardPolicy {
     pub adversarial_profile_id: String,
     pub claim_language: String,
     pub claim_forbidden_when_any_fail: bool,
+}
+
+/// Canonical metric dictionary for db300 scorecard and gate consumers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorecardMetricDictionary {
+    pub schema_version: String,
+    pub dictionary_id: String,
+    pub notes: String,
+    pub metrics: Vec<ScorecardMetricDefinition>,
+}
+
+/// One machine-readable metric definition used by scorecards and gates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScorecardMetricDefinition {
+    pub metric_id: String,
+    pub label: String,
+    pub family: String,
+    pub availability: String,
+    pub unit: String,
+    pub aggregation: String,
+    pub collection_artifact: String,
+    pub collection_field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<String>,
+    pub comparability: String,
+    pub required_for_claim: bool,
+    pub zero_semantics: String,
+    pub missing_semantics: String,
+    pub suppressed_semantics: String,
+    pub not_applicable_semantics: String,
+}
+
+/// Machine-readable rubric for classifying whether a measured win is broadly
+/// transferable, narrowly useful, suspicious, or non-claimable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferabilityRubric {
+    pub schema_version: String,
+    pub rubric_id: String,
+    pub required_modes: Vec<String>,
+    pub required_hardware_classes: Vec<String>,
+    pub classification_order: Vec<String>,
+    pub downstream_beads: Vec<String>,
+    pub single_writer_role: String,
+    pub classes: Vec<TransferabilityClass>,
+}
+
+/// One transferability class with the evidence and reporting rules future
+/// agents must apply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferabilityClass {
+    pub classification_id: String,
+    pub final_report_label: String,
+    pub claimable: bool,
+    pub requires_no_catastrophic_regression: bool,
+    pub minimum_hardware_evidence: String,
+    pub summary: String,
+    pub placement_rule: String,
+    pub mode_rule: String,
+    pub hardware_rule: String,
+    pub reporting_requirement: String,
+    pub example_profiles: Vec<String>,
+    pub example: String,
 }
 
 /// Explicit gate for one canonical concurrency cell.
@@ -185,6 +313,29 @@ impl LeapfrogExitCriteria {
         if !self.scorecard.claim_forbidden_when_any_fail {
             return Err("scorecard.claim_forbidden_when_any_fail must be true".to_owned());
         }
+        require_eq(
+            "metric_dictionary.schema_version",
+            &self.metric_dictionary.schema_version,
+            SCORECARD_METRIC_DICTIONARY_SCHEMA_V1,
+        )?;
+        require_non_empty(
+            "metric_dictionary.dictionary_id",
+            &self.metric_dictionary.dictionary_id,
+        )?;
+        require_non_empty("metric_dictionary.notes", &self.metric_dictionary.notes)?;
+        require_eq(
+            "transferability_rubric.schema_version",
+            &self.transferability_rubric.schema_version,
+            TRANSFERABILITY_RUBRIC_SCHEMA_V1,
+        )?;
+        require_non_empty(
+            "transferability_rubric.rubric_id",
+            &self.transferability_rubric.rubric_id,
+        )?;
+        require_non_empty(
+            "transferability_rubric.single_writer_role",
+            &self.transferability_rubric.single_writer_role,
+        )?;
 
         let required_profile_ids = unique_set(
             "campaign.required_placement_profiles",
@@ -201,12 +352,116 @@ impl LeapfrogExitCriteria {
             &self.campaign.manifest_path,
             CANONICAL_CAMPAIGN_MANIFEST_PATH,
         )?;
-        if !required_cell_suffixes.contains("c1")
-            || !required_cell_suffixes.contains("c4")
-            || !required_cell_suffixes.contains("c8")
+        if required_mode_ids
+            != REQUIRED_MODES
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
         {
-            return Err("campaign.required_cell_suffixes must include c1, c4, and c8".to_owned());
+            return Err(format!(
+                "campaign.required_modes mismatch actual={required_mode_ids:?} expected={:?}",
+                REQUIRED_MODES
+            ));
         }
+        if required_profile_ids
+            != REQUIRED_PLACEMENT_PROFILES
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(format!(
+                "campaign.required_placement_profiles mismatch actual={required_profile_ids:?} expected={:?}",
+                REQUIRED_PLACEMENT_PROFILES
+            ));
+        }
+        if required_cell_suffixes
+            != REQUIRED_CELL_SUFFIXES
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(format!(
+                "campaign.required_cell_suffixes mismatch actual={required_cell_suffixes:?} expected={:?}",
+                REQUIRED_CELL_SUFFIXES
+            ));
+        }
+        let rubric_mode_ids = unique_set(
+            "transferability_rubric.required_modes",
+            &self.transferability_rubric.required_modes,
+        )?;
+        if rubric_mode_ids != required_mode_ids {
+            return Err(format!(
+                "transferability_rubric.required_modes mismatch actual={rubric_mode_ids:?} expected={required_mode_ids:?}"
+            ));
+        }
+        let rubric_hardware_classes = unique_set(
+            "transferability_rubric.required_hardware_classes",
+            &self.transferability_rubric.required_hardware_classes,
+        )?;
+        if rubric_hardware_classes
+            != REQUIRED_HARDWARE_CLASSES
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(format!(
+                "transferability_rubric.required_hardware_classes mismatch actual={rubric_hardware_classes:?} expected={:?}",
+                REQUIRED_HARDWARE_CLASSES
+            ));
+        }
+        let rubric_classification_order = unique_set(
+            "transferability_rubric.classification_order",
+            &self.transferability_rubric.classification_order,
+        )?;
+        if rubric_classification_order
+            != REQUIRED_TRANSFERABILITY_CLASSES
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(format!(
+                "transferability_rubric.classification_order mismatch actual={rubric_classification_order:?} expected={:?}",
+                REQUIRED_TRANSFERABILITY_CLASSES
+            ));
+        }
+        if self
+            .transferability_rubric
+            .classification_order
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != REQUIRED_TRANSFERABILITY_CLASSES
+        {
+            return Err(format!(
+                "transferability_rubric.classification_order order mismatch actual={:?} expected={:?}",
+                self.transferability_rubric
+                    .classification_order
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                REQUIRED_TRANSFERABILITY_CLASSES
+            ));
+        }
+        let rubric_downstream_beads = unique_set(
+            "transferability_rubric.downstream_beads",
+            &self.transferability_rubric.downstream_beads,
+        )?;
+        if rubric_downstream_beads
+            != REQUIRED_RUBRIC_DOWNSTREAM_BEADS
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(format!(
+                "transferability_rubric.downstream_beads mismatch actual={rubric_downstream_beads:?} expected={:?}",
+                REQUIRED_RUBRIC_DOWNSTREAM_BEADS
+            ));
+        }
+        require_eq(
+            "transferability_rubric.single_writer_role",
+            &self.transferability_rubric.single_writer_role,
+            "comparison_or_fallback_only",
+        )?;
 
         for profile_id in [
             &self.scorecard.recommended_profile_id,
@@ -290,6 +545,22 @@ impl LeapfrogExitCriteria {
                 ));
             }
         }
+        if self
+            .cell_gates
+            .iter()
+            .map(|gate| gate.cell.as_str())
+            .collect::<Vec<_>>()
+            != REQUIRED_CELL_SUFFIXES
+        {
+            return Err(format!(
+                "cell_gates order mismatch actual={:?} expected={:?}",
+                self.cell_gates
+                    .iter()
+                    .map(|gate| gate.cell.as_str())
+                    .collect::<Vec<_>>(),
+                REQUIRED_CELL_SUFFIXES
+            ));
+        }
 
         if seen_cells.len() != required_cell_suffixes.len() {
             return Err(format!(
@@ -315,10 +586,33 @@ impl LeapfrogExitCriteria {
             "verification_plan.required_log_fields",
             &self.verification_plan.required_log_fields,
         )?;
+        let metric_ids = unique_metric_ids(&self.metric_dictionary.metrics)?;
         if unit_tests.is_empty() || e2e_scenarios.is_empty() || logging_artifacts.is_empty() {
             return Err(
                 "verification_plan must list unit tests, scenarios, and artifacts".to_owned(),
             );
+        }
+        if unit_tests
+            != REQUIRED_UNIT_TESTS
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(format!(
+                "verification_plan.unit_tests mismatch actual={unit_tests:?} expected={:?}",
+                REQUIRED_UNIT_TESTS
+            ));
+        }
+        if e2e_scenarios
+            != REQUIRED_E2E_SCENARIOS
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(format!(
+                "verification_plan.e2e_scenarios mismatch actual={e2e_scenarios:?} expected={:?}",
+                REQUIRED_E2E_SCENARIOS
+            ));
         }
         for required_field in REQUIRED_LOG_FIELDS {
             if !log_fields.contains(required_field) {
@@ -326,6 +620,244 @@ impl LeapfrogExitCriteria {
                     "verification_plan.required_log_fields missing `{required_field}`"
                 ));
             }
+            if !metric_ids.contains(required_field) {
+                return Err(format!(
+                    "metric_dictionary.metrics missing required log metric `{required_field}`"
+                ));
+            }
+        }
+        for log_field in &log_fields {
+            if !metric_ids.contains(log_field.as_str()) {
+                return Err(format!(
+                    "verification_plan.required_log_fields references undefined metric `{log_field}`"
+                ));
+            }
+        }
+        for required_artifact in REQUIRED_LOGGING_ARTIFACTS {
+            if !logging_artifacts.contains(required_artifact) {
+                return Err(format!(
+                    "verification_plan.logging_artifacts missing `{required_artifact}`"
+                ));
+            }
+        }
+
+        let mut metric_families = BTreeSet::new();
+        for metric in &self.metric_dictionary.metrics {
+            require_non_empty("metric_dictionary.metrics.metric_id", &metric.metric_id)?;
+            require_non_empty("metric_dictionary.metrics.label", &metric.label)?;
+            require_non_empty("metric_dictionary.metrics.family", &metric.family)?;
+            require_metric_family(&metric.family)?;
+            metric_families.insert(metric.family.as_str());
+            require_non_empty(
+                "metric_dictionary.metrics.availability",
+                &metric.availability,
+            )?;
+            require_metric_availability(&metric.availability)?;
+            require_non_empty("metric_dictionary.metrics.unit", &metric.unit)?;
+            require_non_empty("metric_dictionary.metrics.aggregation", &metric.aggregation)?;
+            require_non_empty(
+                "metric_dictionary.metrics.collection_artifact",
+                &metric.collection_artifact,
+            )?;
+            if !logging_artifacts.contains(metric.collection_artifact.as_str()) {
+                return Err(format!(
+                    "metric `{}` references unknown collection artifact `{}`",
+                    metric.metric_id, metric.collection_artifact
+                ));
+            }
+            require_non_empty(
+                "metric_dictionary.metrics.collection_field",
+                &metric.collection_field,
+            )?;
+            if let Some(derivation) = &metric.derivation {
+                require_non_empty("metric_dictionary.metrics.derivation", derivation)?;
+            }
+            require_non_empty(
+                "metric_dictionary.metrics.comparability",
+                &metric.comparability,
+            )?;
+            require_metric_comparability(&metric.comparability)?;
+            require_non_empty(
+                "metric_dictionary.metrics.zero_semantics",
+                &metric.zero_semantics,
+            )?;
+            require_non_empty(
+                "metric_dictionary.metrics.missing_semantics",
+                &metric.missing_semantics,
+            )?;
+            require_non_empty(
+                "metric_dictionary.metrics.suppressed_semantics",
+                &metric.suppressed_semantics,
+            )?;
+            require_non_empty(
+                "metric_dictionary.metrics.not_applicable_semantics",
+                &metric.not_applicable_semantics,
+            )?;
+            if metric.required_for_claim && !log_fields.contains(metric.metric_id.as_str()) {
+                return Err(format!(
+                    "metric `{}` is marked required_for_claim but is absent from verification_plan.required_log_fields",
+                    metric.metric_id
+                ));
+            }
+        }
+        for required_family in REQUIRED_METRIC_FAMILIES {
+            if !metric_families.contains(required_family) {
+                return Err(format!(
+                    "metric_dictionary.metrics missing required family `{required_family}`"
+                ));
+            }
+        }
+        if self.transferability_rubric.classes.len() != REQUIRED_TRANSFERABILITY_CLASSES.len() {
+            return Err(format!(
+                "transferability_rubric.classes count mismatch actual={} expected={}",
+                self.transferability_rubric.classes.len(),
+                REQUIRED_TRANSFERABILITY_CLASSES.len()
+            ));
+        }
+        let mut seen_rubric_classes = BTreeSet::new();
+        let mut rubric_example_profiles = BTreeSet::new();
+        for class in &self.transferability_rubric.classes {
+            require_non_empty(
+                "transferability_rubric.classes.classification_id",
+                &class.classification_id,
+            )?;
+            if !seen_rubric_classes.insert(class.classification_id.as_str()) {
+                return Err(format!(
+                    "transferability_rubric.classes contains duplicate classification_id `{}`",
+                    class.classification_id
+                ));
+            }
+            require_non_empty(
+                "transferability_rubric.classes.final_report_label",
+                &class.final_report_label,
+            )?;
+            require_non_empty("transferability_rubric.classes.summary", &class.summary)?;
+            require_non_empty(
+                "transferability_rubric.classes.placement_rule",
+                &class.placement_rule,
+            )?;
+            require_non_empty("transferability_rubric.classes.mode_rule", &class.mode_rule)?;
+            require_non_empty(
+                "transferability_rubric.classes.hardware_rule",
+                &class.hardware_rule,
+            )?;
+            require_non_empty(
+                "transferability_rubric.classes.reporting_requirement",
+                &class.reporting_requirement,
+            )?;
+            require_non_empty("transferability_rubric.classes.example", &class.example)?;
+            require_hardware_evidence(&class.minimum_hardware_evidence)?;
+            let expected_label = required_transferability_report_label(&class.classification_id)
+                .ok_or_else(|| {
+                    format!(
+                        "unexpected transferability class `{}`",
+                        class.classification_id
+                    )
+                })?;
+            require_eq(
+                "transferability_rubric.classes.final_report_label",
+                &class.final_report_label,
+                expected_label,
+            )?;
+            if class.claimable
+                != required_transferability_claimable(&class.classification_id).ok_or_else(
+                    || {
+                        format!(
+                            "unexpected transferability class `{}`",
+                            class.classification_id
+                        )
+                    },
+                )?
+            {
+                return Err(format!(
+                    "transferability class `{}` claimable mismatch actual={} expected={}",
+                    class.classification_id,
+                    class.claimable,
+                    required_transferability_claimable(&class.classification_id).unwrap_or(false)
+                ));
+            }
+            if class.requires_no_catastrophic_regression
+                != required_transferability_no_catastrophic_regression(&class.classification_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "unexpected transferability class `{}`",
+                            class.classification_id
+                        )
+                    })?
+            {
+                return Err(format!(
+                    "transferability class `{}` requires_no_catastrophic_regression mismatch actual={} expected={}",
+                    class.classification_id,
+                    class.requires_no_catastrophic_regression,
+                    required_transferability_no_catastrophic_regression(&class.classification_id)
+                        .unwrap_or(false)
+                ));
+            }
+            let expected_minimum_hardware_evidence =
+                required_transferability_minimum_hardware_evidence(&class.classification_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "unexpected transferability class `{}`",
+                            class.classification_id
+                        )
+                    })?;
+            require_eq(
+                "transferability_rubric.classes.minimum_hardware_evidence",
+                &class.minimum_hardware_evidence,
+                expected_minimum_hardware_evidence,
+            )?;
+            let example_profiles = unique_set(
+                "transferability_rubric.classes.example_profiles",
+                &class.example_profiles,
+            )?;
+            if example_profiles.is_empty() {
+                return Err(format!(
+                    "transferability class `{}` must reference at least one example profile",
+                    class.classification_id
+                ));
+            }
+            for profile_id in &example_profiles {
+                if !required_profile_ids.contains(profile_id.as_str()) {
+                    return Err(format!(
+                        "transferability class `{}` references unknown example profile `{profile_id}`",
+                        class.classification_id
+                    ));
+                }
+                rubric_example_profiles.insert(profile_id.clone());
+            }
+        }
+        if seen_rubric_classes
+            != REQUIRED_TRANSFERABILITY_CLASSES
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        {
+            return Err(format!(
+                "transferability_rubric.classes mismatch actual={seen_rubric_classes:?} expected={:?}",
+                REQUIRED_TRANSFERABILITY_CLASSES
+            ));
+        }
+        if self
+            .transferability_rubric
+            .classes
+            .iter()
+            .map(|class| class.classification_id.as_str())
+            .collect::<Vec<_>>()
+            != REQUIRED_TRANSFERABILITY_CLASSES
+        {
+            return Err(format!(
+                "transferability_rubric.classes order mismatch actual={:?} expected={:?}",
+                self.transferability_rubric
+                    .classes
+                    .iter()
+                    .map(|class| class.classification_id.as_str())
+                    .collect::<Vec<_>>(),
+                REQUIRED_TRANSFERABILITY_CLASSES
+            ));
+        }
+        if rubric_example_profiles != required_profile_ids {
+            return Err(format!(
+                "transferability_rubric example profile coverage mismatch actual={rubric_example_profiles:?} expected={required_profile_ids:?}"
+            ));
         }
 
         for path in [
@@ -354,23 +886,6 @@ impl LeapfrogExitCriteria {
             ) {
                 return Err(format!("unexpected required mode `{mode_id}`"));
             }
-        }
-
-        let mut covered_suffixes = BTreeSet::new();
-        for scenario_id in &e2e_scenarios {
-            let matched_suffix = required_cell_suffixes
-                .iter()
-                .find(|suffix| scenario_id.ends_with(suffix.as_str()))
-                .ok_or_else(|| {
-                    format!("campaign row `{scenario_id}` does not end with a required cell suffix")
-                })?;
-            covered_suffixes.insert(matched_suffix.clone());
-        }
-
-        if covered_suffixes != required_cell_suffixes {
-            return Err(format!(
-                "verification_plan.e2e_scenarios does not cover all required suffixes actual={covered_suffixes:?} expected={required_cell_suffixes:?}"
-            ));
         }
 
         Ok(())
@@ -425,6 +940,114 @@ fn unique_set(field: &str, values: &[String]) -> Result<BTreeSet<String>, String
     Ok(seen)
 }
 
+fn unique_metric_ids(metrics: &[ScorecardMetricDefinition]) -> Result<BTreeSet<String>, String> {
+    let mut seen = BTreeSet::new();
+    if metrics.is_empty() {
+        return Err("metric_dictionary.metrics must not be empty".to_owned());
+    }
+    for metric in metrics {
+        require_non_empty("metric_dictionary.metrics.metric_id", &metric.metric_id)?;
+        if !seen.insert(metric.metric_id.clone()) {
+            return Err(format!(
+                "metric_dictionary.metrics contains duplicate metric_id `{}`",
+                metric.metric_id
+            ));
+        }
+    }
+    Ok(seen)
+}
+
+fn require_metric_family(value: &str) -> Result<(), String> {
+    if matches!(
+        value,
+        "throughput"
+            | "retry"
+            | "abort"
+            | "cpu_efficiency"
+            | "latency"
+            | "topology"
+            | "wait"
+            | "page_touch"
+            | "split_path"
+            | "allocator"
+            | "cache"
+            | "copy_allocation"
+    ) {
+        Ok(())
+    } else {
+        Err(format!("unsupported metric family `{value}`"))
+    }
+}
+
+fn require_metric_availability(value: &str) -> Result<(), String> {
+    if matches!(
+        value,
+        "required_artifact_field" | "supporting_artifact_field" | "planned_follow_on"
+    ) {
+        Ok(())
+    } else {
+        Err(format!("unsupported metric availability `{value}`"))
+    }
+}
+
+fn require_metric_comparability(value: &str) -> Result<(), String> {
+    if matches!(
+        value,
+        "cross_mode_comparable" | "mode_specific" | "topology_sensitive" | "advisory_only"
+    ) {
+        Ok(())
+    } else {
+        Err(format!("unsupported metric comparability `{value}`"))
+    }
+}
+
+fn require_hardware_evidence(value: &str) -> Result<(), String> {
+    if matches!(
+        value,
+        "same_host" | "same_topology_class" | "cross_hardware_class"
+    ) {
+        Ok(())
+    } else {
+        Err(format!("unsupported minimum hardware evidence `{value}`"))
+    }
+}
+
+fn required_transferability_report_label(classification_id: &str) -> Option<&'static str> {
+    match classification_id {
+        "transferable" => Some("transferable win"),
+        "profile_specific_but_useful" => Some("lab-specific win"),
+        "suspicious" => Some("topology-sensitive win"),
+        "non_claimable" => Some("no-catastrophic-regression failure"),
+        _ => None,
+    }
+}
+
+fn required_transferability_claimable(classification_id: &str) -> Option<bool> {
+    match classification_id {
+        "transferable" => Some(true),
+        "profile_specific_but_useful" | "suspicious" | "non_claimable" => Some(false),
+        _ => None,
+    }
+}
+
+fn required_transferability_no_catastrophic_regression(classification_id: &str) -> Option<bool> {
+    match classification_id {
+        "transferable" | "profile_specific_but_useful" | "suspicious" => Some(true),
+        "non_claimable" => Some(false),
+        _ => None,
+    }
+}
+
+fn required_transferability_minimum_hardware_evidence(
+    classification_id: &str,
+) -> Option<&'static str> {
+    match classification_id {
+        "transferable" => Some("same_topology_class"),
+        "profile_specific_but_useful" | "suspicious" | "non_claimable" => Some("same_host"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +1078,65 @@ mod tests {
                 claim_language: "claim".to_owned(),
                 claim_forbidden_when_any_fail: true,
             },
+            metric_dictionary: ScorecardMetricDictionary {
+                schema_version: SCORECARD_METRIC_DICTIONARY_SCHEMA_V1.to_owned(),
+                dictionary_id: "db300-test-metrics.v1".to_owned(),
+                notes: "test".to_owned(),
+                metrics: vec![ScorecardMetricDefinition {
+                    metric_id: "throughput_ratio_vs_sqlite".to_owned(),
+                    label: "Throughput ratio vs SQLite".to_owned(),
+                    family: "throughput".to_owned(),
+                    availability: "required_artifact_field".to_owned(),
+                    unit: "ratio".to_owned(),
+                    aggregation: "gate against per-cell median".to_owned(),
+                    collection_artifact: "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+                        .to_owned(),
+                    collection_field: "throughput_ratio_vs_sqlite".to_owned(),
+                    derivation: Some("candidate / sqlite_reference".to_owned()),
+                    comparability: "cross_mode_comparable".to_owned(),
+                    required_for_claim: true,
+                    zero_semantics: "collapse".to_owned(),
+                    missing_semantics: "fail".to_owned(),
+                    suppressed_semantics: "never".to_owned(),
+                    not_applicable_semantics: "profiling-only".to_owned(),
+                }],
+            },
+            transferability_rubric: TransferabilityRubric {
+                schema_version: TRANSFERABILITY_RUBRIC_SCHEMA_V1.to_owned(),
+                rubric_id: "db300-transferability-rubric.v1".to_owned(),
+                required_modes: REQUIRED_MODES.iter().map(|id| (*id).to_owned()).collect(),
+                required_hardware_classes: REQUIRED_HARDWARE_CLASSES
+                    .iter()
+                    .map(|id| (*id).to_owned())
+                    .collect(),
+                classification_order: REQUIRED_TRANSFERABILITY_CLASSES
+                    .iter()
+                    .map(|id| (*id).to_owned())
+                    .collect(),
+                downstream_beads: REQUIRED_RUBRIC_DOWNSTREAM_BEADS
+                    .iter()
+                    .map(|id| (*id).to_owned())
+                    .collect(),
+                single_writer_role: "comparison_or_fallback_only".to_owned(),
+                classes: vec![TransferabilityClass {
+                    classification_id: "transferable".to_owned(),
+                    final_report_label: "transferable win".to_owned(),
+                    claimable: true,
+                    requires_no_catastrophic_regression: true,
+                    minimum_hardware_evidence: "same_topology_class".to_owned(),
+                    summary: "summary".to_owned(),
+                    placement_rule: "placement".to_owned(),
+                    mode_rule: "mode".to_owned(),
+                    hardware_rule: "hardware".to_owned(),
+                    reporting_requirement: "report".to_owned(),
+                    example_profiles: vec![
+                        "recommended_pinned".to_owned(),
+                        "baseline_unpinned".to_owned(),
+                        "adversarial_cross_node".to_owned(),
+                    ],
+                    example: "example".to_owned(),
+                }],
+            },
             cell_gates: vec![CellGate {
                 cell: "c1".to_owned(),
                 goal: "goal".to_owned(),
@@ -472,7 +1154,11 @@ mod tests {
             verification_plan: VerificationPlan {
                 unit_tests: vec!["test".to_owned()],
                 e2e_scenarios: vec!["scenario".to_owned()],
-                logging_artifacts: vec!["artifact".to_owned()],
+                logging_artifacts: vec![
+                    "artifact".to_owned(),
+                    "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl".to_owned(),
+                    "artifacts/{bead_id}/{run_id}/metric_dictionary.json".to_owned(),
+                ],
                 required_log_fields: REQUIRED_LOG_FIELDS
                     .iter()
                     .map(|field| (*field).to_owned())

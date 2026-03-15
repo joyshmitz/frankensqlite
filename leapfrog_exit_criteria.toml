@@ -30,6 +30,348 @@ adversarial_profile_id = "adversarial_cross_node"
 claim_language = "Only say FrankenSQLite 'leapfrogs SQLite' when every c1/c4/c8 gate passes on recommended_pinned and the baseline_unpinned/adversarial_cross_node catastrophic floors still hold."
 claim_forbidden_when_any_fail = true
 
+[metric_dictionary]
+schema_version = "fsqlite-harness.scorecard_metric_dictionary.v1"
+dictionary_id = "db300-scorecard-metrics.v1"
+notes = "Defines the canonical db300 metric IDs, units, rollups, collection artifacts, and blank-value semantics so scorecards, gates, and follow-on reporting beads can consume one machine-readable source of truth."
+
+[transferability_rubric]
+schema_version = "fsqlite-harness.transferability_rubric.v1"
+rubric_id = "db300-transferability-rubric.v1"
+required_modes = ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"]
+required_hardware_classes = ["same_host", "same_topology_class", "cross_hardware_class"]
+classification_order = ["transferable", "profile_specific_but_useful", "suspicious", "non_claimable"]
+downstream_beads = ["bd-db300.7.3", "bd-db300.7.4"]
+single_writer_role = "comparison_or_fallback_only"
+
+[[transferability_rubric.classes]]
+classification_id = "transferable"
+final_report_label = "transferable win"
+claimable = true
+requires_no_catastrophic_regression = true
+minimum_hardware_evidence = "same_topology_class"
+summary = "Use when MVCC shows a repeatable recommended-profile win against SQLite, baseline and adversarial placements stay above catastrophic floors, and the result keeps its direction on the same topology class."
+placement_rule = "Requires a headline win on recommended_pinned plus no catastrophic regression on baseline_unpinned and adversarial_cross_node."
+mode_rule = "Compare SQLite as the headline baseline, MVCC as the candidate mode, and forced single-writer as comparison or fallback evidence that must stay visible rather than hiding losses."
+hardware_rule = "Do not call a result transferable until it has been replayed on the same topology class; cross_hardware_class confirmation strengthens confidence but is not a substitute for baseline/adversarial safety."
+reporting_requirement = "G3 may allow the leapfrog claim only for this class, and G4 should present it as the headline outcome with the supporting baseline/adversarial rows beside it."
+example_profiles = ["recommended_pinned", "baseline_unpinned", "adversarial_cross_node"]
+example = "Example: c4 or c8 on recommended_pinned beats SQLite in MVCC, baseline_unpinned and adversarial_cross_node both stay above their catastrophic floors, and single-writer remains clearly labeled as comparison-only evidence."
+
+[[transferability_rubric.classes]]
+classification_id = "profile_specific_but_useful"
+final_report_label = "lab-specific win"
+claimable = false
+requires_no_catastrophic_regression = true
+minimum_hardware_evidence = "same_host"
+summary = "Use when the gain is real and operationally interesting on the measured host or placement profile, but it has not yet earned a broad transferability claim."
+placement_rule = "Allows recommended_pinned to outperform SQLite while baseline_unpinned or adversarial_cross_node stay merely non-catastrophic rather than headline-worthy."
+mode_rule = "MVCC may beat SQLite on the favored profile, but the report must keep single-writer and the weaker placements visible so the win cannot be mistaken for a universal result."
+hardware_rule = "A same_host replay is enough to publish the result as useful, but lack of same_topology_class replay means the report must explicitly mark it as lab-specific."
+reporting_requirement = "G4 must label this class as a lab-specific win and keep the placement caveat in the main summary rather than burying it in footnotes."
+example_profiles = ["recommended_pinned", "baseline_unpinned"]
+example = "Example: recommended_pinned c8 shows a strong MVCC gain over SQLite on one pinned host, baseline_unpinned stays above the catastrophic floor but is materially weaker, and the result has not yet been reproduced on another same-topology machine."
+
+[[transferability_rubric.classes]]
+classification_id = "suspicious"
+final_report_label = "topology-sensitive win"
+claimable = false
+requires_no_catastrophic_regression = true
+minimum_hardware_evidence = "same_host"
+summary = "Use when the local result is positive but depends on topology-sensitive behavior or an overly narrow profile in a way that makes the causal story unstable."
+placement_rule = "Recommended_pinned may look good, but the combination of baseline_unpinned, adversarial_cross_node, or profile-to-profile spread suggests the gain is fragile even before catastrophic failure."
+mode_rule = "Treat large divergence between MVCC, SQLite, and forced single-writer as a warning sign when the apparent win only survives under one highly curated placement."
+hardware_rule = "If the result disappears or meaningfully changes under small affinity or topology shifts on the same host, keep it in this class until the cause is explained."
+reporting_requirement = "G4 must label this class as a topology-sensitive win, preserve the negative rows next to the positive one, and avoid headline language."
+example_profiles = ["recommended_pinned", "adversarial_cross_node"]
+example = "Example: recommended_pinned c4 beats SQLite only under one affinity layout, adversarial_cross_node remains above the catastrophic floor but swings sharply, and the observed gain tracks topology-sensitive counters more than cross-profile robustness."
+
+[[transferability_rubric.classes]]
+classification_id = "non_claimable"
+final_report_label = "no-catastrophic-regression failure"
+claimable = false
+requires_no_catastrophic_regression = false
+minimum_hardware_evidence = "same_host"
+summary = "Use whenever a narrow local win is paired with catastrophic collapse elsewhere or the evidence is too incomplete to make an honest performance claim."
+placement_rule = "Any breach of the baseline_unpinned or adversarial_cross_node catastrophic floor forces this class even if recommended_pinned looks impressive."
+mode_rule = "A recommended-profile MVCC win never overrides catastrophic losses, missing comparison rows, or single-writer evidence that reveals the improvement is not robust."
+hardware_rule = "Same-host evidence is sufficient to reject the claim; broader hardware confirmation is unnecessary once catastrophic failure or incompleteness is established."
+reporting_requirement = "Both G3 and G4 must label this class as a no-catastrophic-regression failure and keep the failing rows in the main report."
+example_profiles = ["baseline_unpinned", "adversarial_cross_node"]
+example = "Example: recommended_pinned c8 posts a strong MVCC throughput gain, but baseline_unpinned or adversarial_cross_node falls below its catastrophic floor, so the result is non-claimable regardless of the local headline number."
+
+[[metric_dictionary.metrics]]
+metric_id = "throughput_ratio_vs_sqlite"
+label = "Throughput ratio vs SQLite"
+family = "throughput"
+availability = "required_artifact_field"
+unit = "ratio"
+aggregation = "Gate against the median scorecard row for the matched placement profile and canonical c1/c4/c8 cell."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "throughput_ratio_vs_sqlite"
+derivation = "candidate_ops_per_sec / sqlite_reference_ops_per_sec on the matched cell."
+comparability = "cross_mode_comparable"
+required_for_claim = true
+zero_semantics = "A zero ratio means the candidate produced no usable throughput or completely collapsed relative to SQLite."
+missing_semantics = "Missing means the scorecard row was not emitted and the leapfrog claim must fail."
+suppressed_semantics = "Never suppressed in leapfrog gate outputs."
+not_applicable_semantics = "Not applicable only for standalone profiling runs that are outside the leapfrog scorecard."
+
+[[metric_dictionary.metrics]]
+metric_id = "retry_rate"
+label = "Retry rate"
+family = "retry"
+availability = "required_artifact_field"
+unit = "fraction"
+aggregation = "Gate against the per-cell aggregate retry rate across the deterministic run bundle."
+collection_artifact = "artifacts/{bead_id}/{run_id}/retry_report.json"
+collection_field = "retry_rate"
+derivation = "retries_total / attempted_transactions_total for the matched cell."
+comparability = "cross_mode_comparable"
+required_for_claim = true
+zero_semantics = "A zero retry rate means the cell completed without any BUSY or conflict retries."
+missing_semantics = "Missing means retry accounting is incomplete and the claim must fail."
+suppressed_semantics = "Never suppressed in leapfrog gate outputs."
+not_applicable_semantics = "Not applicable only when a scenario does not execute transactional work."
+
+[[metric_dictionary.metrics]]
+metric_id = "abort_rate"
+label = "Abort rate"
+family = "abort"
+availability = "supporting_artifact_field"
+unit = "fraction"
+aggregation = "Use the per-cell aggregate abort rate as a supporting interpretation signal next to retry_rate."
+collection_artifact = "artifacts/{bead_id}/{run_id}/retry_report.json"
+collection_field = "abort_rate"
+derivation = "aborts_total / attempted_transactions_total for the matched cell."
+comparability = "cross_mode_comparable"
+required_for_claim = false
+zero_semantics = "A zero abort rate means no transaction had to be abandoned after retries or validation."
+missing_semantics = "Missing means abort accounting was not emitted; treat as incomplete evidence rather than as zero."
+suppressed_semantics = "Never suppressed in leapfrog gate outputs."
+not_applicable_semantics = "Not applicable only when the scenario contains no abort-capable transactional path."
+
+[[metric_dictionary.metrics]]
+metric_id = "cpu_utilization_pct"
+label = "CPU utilization percent"
+family = "cpu_efficiency"
+availability = "required_artifact_field"
+unit = "percent"
+aggregation = "Gate against the median CPU utilization percent for the matched cell and placement profile."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "cpu_utilization_pct"
+derivation = "Aggregate worker and helper CPU busy time over wall-clock run time, normalized to the declared logical-core budget."
+comparability = "cross_mode_comparable"
+required_for_claim = true
+zero_semantics = "Zero means the engine left the allocated machine mostly idle."
+missing_semantics = "Missing means CPU-efficiency evidence is absent and the claim must fail."
+suppressed_semantics = "Suppressed means host counters were intentionally disabled; treat as missing for claim evaluation."
+not_applicable_semantics = "Not applicable only for non-executed dry-run or contract-only scenarios."
+
+[[metric_dictionary.metrics]]
+metric_id = "ipc_estimate"
+label = "IPC estimate"
+family = "cpu_efficiency"
+availability = "planned_follow_on"
+unit = "instructions_per_cycle"
+aggregation = "Use same-host median IPC as an advisory signal when perf-stat/topdown counters are available."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "ipc_estimate"
+derivation = "instructions / cycles from perf-stat or topdown sidecars bound to the matched cell."
+comparability = "topology_sensitive"
+required_for_claim = false
+zero_semantics = "Zero indicates no retired instructions were observed or the counter sample was unusable."
+missing_semantics = "Missing means the host or workflow did not surface IPC yet; do not coerce to zero."
+suppressed_semantics = "Suppressed means profiler-safe mode skipped IPC capture on purpose."
+not_applicable_semantics = "Not applicable on hosts where perf counters are unavailable or forbidden."
+
+[[metric_dictionary.metrics]]
+metric_id = "p50_latency_ratio_vs_sqlite"
+label = "p50 latency ratio vs SQLite"
+family = "latency"
+availability = "required_artifact_field"
+unit = "ratio"
+aggregation = "Gate against the p50 ratio for the matched cell."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "p50_latency_ratio_vs_sqlite"
+derivation = "candidate_p50_latency / sqlite_reference_p50_latency on the matched cell."
+comparability = "cross_mode_comparable"
+required_for_claim = true
+zero_semantics = "A zero ratio means the latency baseline is broken or the candidate emitted no completed operations."
+missing_semantics = "Missing means p50 latency comparison is absent and the claim must fail."
+suppressed_semantics = "Never suppressed in leapfrog gate outputs."
+not_applicable_semantics = "Not applicable only when the scenario has no end-to-end latency sample."
+
+[[metric_dictionary.metrics]]
+metric_id = "p95_latency_ratio_vs_sqlite"
+label = "p95 latency ratio vs SQLite"
+family = "latency"
+availability = "required_artifact_field"
+unit = "ratio"
+aggregation = "Gate against the p95 ratio for the matched cell."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "p95_latency_ratio_vs_sqlite"
+derivation = "candidate_p95_latency / sqlite_reference_p95_latency on the matched cell."
+comparability = "cross_mode_comparable"
+required_for_claim = true
+zero_semantics = "A zero ratio means the latency baseline is broken or the candidate emitted no completed operations."
+missing_semantics = "Missing means p95 latency comparison is absent and the claim must fail."
+suppressed_semantics = "Never suppressed in leapfrog gate outputs."
+not_applicable_semantics = "Not applicable only when the scenario has no end-to-end latency sample."
+
+[[metric_dictionary.metrics]]
+metric_id = "p99_latency_ratio_vs_sqlite"
+label = "p99 latency ratio vs SQLite"
+family = "latency"
+availability = "required_artifact_field"
+unit = "ratio"
+aggregation = "Gate against the p99 ratio for the matched cell."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "p99_latency_ratio_vs_sqlite"
+derivation = "candidate_p99_latency / sqlite_reference_p99_latency on the matched cell."
+comparability = "cross_mode_comparable"
+required_for_claim = true
+zero_semantics = "A zero ratio means the latency baseline is broken or the candidate emitted no completed operations."
+missing_semantics = "Missing means p99 latency comparison is absent and the claim must fail."
+suppressed_semantics = "Never suppressed in leapfrog gate outputs."
+not_applicable_semantics = "Not applicable only when the scenario has no end-to-end latency sample."
+
+[[metric_dictionary.metrics]]
+metric_id = "responsiveness_regression_ratio_vs_sqlite"
+label = "Responsiveness regression ratio vs SQLite"
+family = "latency"
+availability = "required_artifact_field"
+unit = "ratio"
+aggregation = "Gate against the responsiveness ratio for the matched cell."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "responsiveness_regression_ratio_vs_sqlite"
+derivation = "candidate_responsiveness_marker / sqlite_reference_responsiveness_marker on the matched cell."
+comparability = "cross_mode_comparable"
+required_for_claim = true
+zero_semantics = "Zero means the candidate never exposed the responsiveness marker or the baseline was invalid."
+missing_semantics = "Missing means responsiveness evidence is absent and the claim must fail."
+suppressed_semantics = "Never suppressed in leapfrog gate outputs."
+not_applicable_semantics = "Not applicable only when the scenario does not emit the responsiveness marker."
+
+[[metric_dictionary.metrics]]
+metric_id = "wait_fraction_of_wall_time"
+label = "Wait fraction of wall time"
+family = "wait"
+availability = "supporting_artifact_field"
+unit = "fraction"
+aggregation = "Use the per-cell aggregate wait share as a supporting explanation for retry or tail failures."
+collection_artifact = "artifacts/{bead_id}/{run_id}/retry_report.json"
+collection_field = "wait_fraction_of_wall_time"
+derivation = "time_spent_waiting_or_backing_off / wall_time for the matched cell."
+comparability = "advisory_only"
+required_for_claim = false
+zero_semantics = "Zero means the engine spent no measurable time queued, sleeping, or blocked."
+missing_semantics = "Missing means the wait-share diagnostic was not emitted; do not treat as zero."
+suppressed_semantics = "Suppressed means profiler-safe mode skipped fine-grained wait attribution."
+not_applicable_semantics = "Not applicable when the run contains no contention-capable work."
+
+[[metric_dictionary.metrics]]
+metric_id = "page_touch_shared_hotset_ratio"
+label = "Shared hot-set page touch ratio"
+family = "page_touch"
+availability = "planned_follow_on"
+unit = "fraction"
+aggregation = "Use the matched-cell median ratio of touches that land on the shared hot set."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "page_touch_shared_hotset_ratio"
+derivation = "shared_hotset_page_touches / total_page_touches for the matched cell."
+comparability = "mode_specific"
+required_for_claim = false
+zero_semantics = "Zero means touches were fully disjoint across workers."
+missing_semantics = "Missing means page-touch taxonomy has not yet been surfaced for the cell."
+suppressed_semantics = "Suppressed means page-touch capture was disabled to keep the run lightweight."
+not_applicable_semantics = "Not applicable for modes that do not surface per-transaction page-touch accounting."
+
+[[metric_dictionary.metrics]]
+metric_id = "page_split_rate"
+label = "Page split rate"
+family = "split_path"
+availability = "planned_follow_on"
+unit = "splits_per_operation"
+aggregation = "Use the per-cell aggregate split rate as a supporting mode-specific write-path indicator."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "page_split_rate"
+derivation = "page_splits_total / committed_operations for the matched cell."
+comparability = "mode_specific"
+required_for_claim = false
+zero_semantics = "Zero means no measured write path triggered a split."
+missing_semantics = "Missing means split-path accounting has not yet been surfaced for the cell."
+suppressed_semantics = "Suppressed means the run omitted detailed write-path counters."
+not_applicable_semantics = "Not applicable for read-only or oracle-only cells."
+
+[[metric_dictionary.metrics]]
+metric_id = "allocator_bytes_per_op"
+label = "Allocator bytes per operation"
+family = "allocator"
+availability = "planned_follow_on"
+unit = "bytes_per_operation"
+aggregation = "Use same-cell median bytes-per-operation as a supporting allocator-pressure indicator."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "allocator_bytes_per_op"
+derivation = "allocator_bytes_total / committed_operations for the matched cell."
+comparability = "advisory_only"
+required_for_claim = false
+zero_semantics = "Zero means no heap growth was attributed to the measured path."
+missing_semantics = "Missing means allocator accounting was not emitted; do not treat as zero."
+suppressed_semantics = "Suppressed means allocator profiling was skipped to preserve runtime shape."
+not_applicable_semantics = "Not applicable when the engine or profiler cannot attribute allocator bytes."
+
+[[metric_dictionary.metrics]]
+metric_id = "cache_miss_rate_per_kop"
+label = "Cache-miss rate per thousand operations"
+family = "cache"
+availability = "planned_follow_on"
+unit = "misses_per_kop"
+aggregation = "Use the matched-cell median miss density when same-host cache counters are available."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "cache_miss_rate_per_kop"
+derivation = "cache_misses / (committed_operations / 1000) for the matched cell."
+comparability = "topology_sensitive"
+required_for_claim = false
+zero_semantics = "Zero means the capture observed no cache misses or the counter pack was empty."
+missing_semantics = "Missing means cache counters were unavailable or not surfaced yet."
+suppressed_semantics = "Suppressed means profiler-safe mode skipped cache-counter capture."
+not_applicable_semantics = "Not applicable on hosts without usable cache-counter support."
+
+[[metric_dictionary.metrics]]
+metric_id = "copy_bytes_per_row"
+label = "Copy bytes per result row"
+family = "copy_allocation"
+availability = "planned_follow_on"
+unit = "bytes_per_row"
+aggregation = "Use the matched-cell median copied bytes per materialized row as a supporting row-shape signal."
+collection_artifact = "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl"
+collection_field = "copy_bytes_per_row"
+derivation = "copied_result_value_bytes / materialized_rows for the matched cell."
+comparability = "advisory_only"
+required_for_claim = false
+zero_semantics = "Zero means rows were not copied or the run materialized no result rows."
+missing_semantics = "Missing means copy-volume accounting has not yet been surfaced for the cell."
+suppressed_semantics = "Suppressed means the run skipped row-copy attribution for overhead reasons."
+not_applicable_semantics = "Not applicable for workloads that produce no materialized rows."
+
+[[metric_dictionary.metrics]]
+metric_id = "topology_reassignments"
+label = "Topology reassignments"
+family = "topology"
+availability = "required_artifact_field"
+unit = "count"
+aggregation = "Gate against the total reassignment count for the matched placement profile and cell."
+collection_artifact = "artifacts/{bead_id}/{run_id}/topology.json"
+collection_field = "topology_reassignments"
+derivation = "Count of worker or helper lane placement changes that occurred during the matched run."
+comparability = "topology_sensitive"
+required_for_claim = true
+zero_semantics = "Zero means the placement policy stayed stable for the full run."
+missing_semantics = "Missing means topology evidence is absent and the claim must fail."
+suppressed_semantics = "Never suppressed in leapfrog gate outputs."
+not_applicable_semantics = "Not applicable only for single-process dry runs with no placement management."
+
 [[cell_gates]]
 cell = "c1"
 goal = "Contain single-worker overhead while keeping retries, tails, and responsiveness disciplined."
@@ -78,6 +420,7 @@ unit_tests = [
   "test_bd_db300_7_3_required_campaign_surface_exists",
   "test_bd_db300_7_3_cell_targets_are_monotone",
   "test_bd_db300_7_3_verification_plan_is_actionable",
+  "test_bd_db300_7_3_transferability_rubric_is_actionable",
 ]
 e2e_scenarios = [
   "commutative_inserts_disjoint_keys_c1",
@@ -94,6 +437,7 @@ logging_artifacts = [
   "artifacts/{bead_id}/{run_id}/events.jsonl",
   "artifacts/{bead_id}/{run_id}/manifest.json",
   "artifacts/{bead_id}/{run_id}/summary.md",
+  "artifacts/{bead_id}/{run_id}/metric_dictionary.json",
   "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl",
   "artifacts/{bead_id}/{run_id}/retry_report.json",
   "artifacts/{bead_id}/{run_id}/topology.json",
