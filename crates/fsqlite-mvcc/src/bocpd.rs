@@ -38,7 +38,7 @@ impl HazardFunction {
     #[must_use]
     fn sanitize(self) -> Self {
         match self {
-            Self::Geometric { h } if h.is_finite() && (0.0..1.0).contains(&h) => self,
+            Self::Geometric { h } if h.is_finite() && h > 0.0 && h < 1.0 => self,
             _ => Self::default(),
         }
     }
@@ -341,18 +341,21 @@ impl BocpdConfig {
     fn sanitize(self) -> Self {
         let defaults = Self::default();
         let change_point_threshold = if self.change_point_threshold.is_finite()
-            && (0.0..1.0).contains(&self.change_point_threshold)
+            && self.change_point_threshold > 0.0
+            && self.change_point_threshold < 1.0
         {
             self.change_point_threshold
         } else {
             defaults.change_point_threshold
         };
-        let prune_threshold =
-            if self.prune_threshold.is_finite() && (0.0..1.0).contains(&self.prune_threshold) {
-                self.prune_threshold
-            } else {
-                defaults.prune_threshold
-            };
+        let prune_threshold = if self.prune_threshold.is_finite()
+            && self.prune_threshold >= 0.0
+            && self.prune_threshold < 1.0
+        {
+            self.prune_threshold
+        } else {
+            defaults.prune_threshold
+        };
 
         Self {
             hazard: self.hazard.sanitize(),
@@ -1057,10 +1060,12 @@ mod tests {
 
         assert_eq!(monitor.observation_count(), 2);
         assert!(monitor.current_regime_stats().mean.is_finite());
-        assert!(monitor
-            .entries
-            .iter()
-            .all(|entry| entry.log_prob.is_finite()));
+        assert!(
+            monitor
+                .entries
+                .iter()
+                .all(|entry| entry.log_prob.is_finite())
+        );
     }
 
     // -----------------------------------------------------------------------

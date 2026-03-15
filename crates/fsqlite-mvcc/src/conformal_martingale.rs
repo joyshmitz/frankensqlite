@@ -36,12 +36,12 @@ impl ConformalMartingaleConfig {
     fn sanitize(self) -> Self {
         let defaults = Self::default();
         let window_size = self.window_size.max(1);
-        let alpha = if self.alpha.is_finite() && (0.0..1.0).contains(&self.alpha) {
+        let alpha = if self.alpha.is_finite() && self.alpha > 0.0 && self.alpha < 1.0 {
             self.alpha
         } else {
             defaults.alpha
         };
-        let lambda = if self.lambda.is_finite() && (0.0..2.0).contains(&self.lambda) {
+        let lambda = if self.lambda.is_finite() && self.lambda > 0.0 && self.lambda < 2.0 {
             self.lambda
         } else {
             defaults.lambda
