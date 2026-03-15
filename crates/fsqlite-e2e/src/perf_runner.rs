@@ -153,9 +153,9 @@ pub const HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_prof
 pub const HOT_PATH_OPCODE_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_opcode_profile.v1";
 /// Schema version for raw subsystem profile packs.
 pub const HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_subsystem_profile.v1";
-/// Schema version for structured D1 actionable hotspot ranking artifacts.
-pub const HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2: &str =
-    "fsqlite-e2e.hot_path_actionable_ranking.v2";
+/// Schema version for structured actionable hotspot and baseline-tax artifacts.
+pub const HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3: &str =
+    "fsqlite-e2e.hot_path_actionable_ranking.v3";
 /// Bead identifier for the hot-path profiling work.
 pub const HOT_PATH_PROFILE_BEAD_ID: &str = "bd-db300.4.1";
 /// Canonical scenario identifier prefix for preset-specific hot-path profiles.
@@ -172,6 +172,20 @@ pub struct FsqliteHotPathProfileConfig {
     pub replay_command: String,
     pub golden_dir: Option<String>,
     pub working_base: Option<String>,
+    pub bead_id: Option<String>,
+    pub scenario_prefix: Option<String>,
+}
+
+impl FsqliteHotPathProfileConfig {
+    fn bead_id(&self) -> &str {
+        self.bead_id.as_deref().unwrap_or(HOT_PATH_PROFILE_BEAD_ID)
+    }
+
+    fn scenario_prefix(&self) -> &str {
+        self.scenario_prefix
+            .as_deref()
+            .unwrap_or_else(|| self.bead_id())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,6 +308,36 @@ pub struct HotPathActionableRankingEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathBaselineReuseLedgerEntry {
+    pub rank: u32,
+    pub surface: String,
+    pub supported: bool,
+    pub hits: u64,
+    pub misses: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_rate_basis_points: Option<u32>,
+    pub rationale: String,
+    pub implication: String,
+    pub mapped_beads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathBaselineWasteLedgerEntry {
+    pub rank: u32,
+    pub component: String,
+    pub classification: String,
+    pub metric_kind: String,
+    pub metric_value: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_share_basis_points: Option<u32>,
+    pub allocator_pressure_bytes: u64,
+    pub activity_count: u64,
+    pub rationale: String,
+    pub implication: String,
+    pub mapped_beads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathCostComponentEntry {
     pub rank: u32,
     pub component: String,
@@ -305,6 +349,56 @@ pub struct HotPathCostComponentEntry {
     pub rationale: String,
     pub implication: String,
     pub mapped_beads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathWallTimeComponentEntry {
+    pub rank: u32,
+    pub component: String,
+    pub time_ns: u64,
+    pub wall_share_basis_points: u32,
+    pub rationale: String,
+    pub implication: String,
+    pub mapped_beads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathMicroarchitecturalSignatureEntry {
+    pub rank: u32,
+    pub target: String,
+    pub primary_signature: String,
+    pub secondary_signatures: Vec<String>,
+    pub confidence_label: String,
+    pub confidence_score_basis_points: u32,
+    pub mixed_or_ambiguous: bool,
+    pub rationale: String,
+    pub evidence_sources: Vec<String>,
+    pub fixture_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_class_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_signature: Option<String>,
+    pub implication: String,
+    pub mapped_beads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathMicroarchitecturalContext {
+    pub fixture_id: String,
+    pub row_id: String,
+    pub mode_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_class_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,7 +450,11 @@ pub struct HotPathActionableRanking {
     pub scale: u32,
     pub concurrency: u16,
     pub replay_command: String,
+    pub baseline_reuse_ledger: Vec<HotPathBaselineReuseLedgerEntry>,
+    pub baseline_waste_ledger: Vec<HotPathBaselineWasteLedgerEntry>,
     pub named_hotspots: Vec<HotPathActionableRankingEntry>,
+    pub microarchitectural_signatures: Vec<HotPathMicroarchitecturalSignatureEntry>,
+    pub wall_time_components: Vec<HotPathWallTimeComponentEntry>,
     pub cost_components: Vec<HotPathCostComponentEntry>,
     pub allocator_pressure: Vec<HotPathActionableRankingEntry>,
     pub top_opcodes: Vec<HotPathOpcodeProfileEntry>,
@@ -426,6 +524,8 @@ pub struct HotPathArtifactManifest {
 }
 
 static HOT_PATH_PROFILE_SCOPE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+#[cfg(test)]
+pub(crate) static HOT_PATH_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 struct HotPathProfileScope {
     was_enabled: bool,
@@ -649,8 +749,8 @@ fn build_hot_path_profile_report(
 
     HotPathProfileReport {
         schema_version: HOT_PATH_PROFILE_SCHEMA_V1.to_owned(),
-        bead_id: HOT_PATH_PROFILE_BEAD_ID.to_owned(),
-        scenario_id: hot_path_profile_scenario_id(&config.workload),
+        bead_id: config.bead_id().to_owned(),
+        scenario_id: hot_path_profile_scenario_id(config.scenario_prefix(), &config.workload),
         run_id,
         trace_id,
         fixture_id: fixture_id.to_owned(),
@@ -690,8 +790,8 @@ fn unix_timestamp_millis() -> u64 {
         .unwrap_or(0)
 }
 
-fn hot_path_profile_scenario_id(workload: &str) -> String {
-    format!("{HOT_PATH_PROFILE_SCENARIO_PREFIX}.{workload}")
+fn hot_path_profile_scenario_id(scenario_prefix: &str, workload: &str) -> String {
+    format!("{scenario_prefix}.{workload}")
 }
 
 pub fn profile_fsqlite_hot_path(
@@ -708,10 +808,13 @@ pub fn profile_fsqlite_hot_path(
 
     let now_ms = unix_timestamp_millis();
     let run_id = format!(
-        "{HOT_PATH_PROFILE_BEAD_ID}-{}-{fixture_id}-c{}-s{}-{now_ms}",
-        config.workload, config.concurrency, config.seed
+        "{}-{}-{fixture_id}-c{}-s{}-{now_ms}",
+        config.bead_id(),
+        config.workload,
+        config.concurrency,
+        config.seed
     );
-    let scenario_id = hot_path_profile_scenario_id(&config.workload);
+    let scenario_id = hot_path_profile_scenario_id(config.scenario_prefix(), &config.workload);
     let trace_id = format!("{scenario_id}:{fixture_id}:c{}", config.concurrency);
     let oplog = generate_oplog(
         &config.workload,
@@ -742,7 +845,7 @@ pub fn profile_fsqlite_hot_path(
 
 #[must_use]
 pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String {
-    let actionable_ranking = build_hot_path_actionable_ranking(report);
+    let actionable_ranking = build_hot_path_actionable_ranking(report, None, None);
     let mut out = String::with_capacity(4096);
     let _ = writeln!(out, "# Hot-Path Profile\n");
     let _ = writeln!(out, "- Bead: `{}`", report.bead_id);
@@ -815,6 +918,52 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     }
     let _ = writeln!(out);
 
+    let _ = writeln!(out, "## Baseline Reuse Ledger\n");
+    for entry in &actionable_ranking.baseline_reuse_ledger {
+        let hit_rate = entry
+            .hit_rate_basis_points
+            .map_or_else(|| "n/a".to_owned(), |value| value.to_string());
+        let _ = writeln!(
+            out,
+            "- rank {} {}: supported={}, hits={}, misses={}, hit_rate_bps={} -> {} [{}]",
+            entry.rank,
+            entry.surface,
+            entry.supported,
+            entry.hits,
+            entry.misses,
+            hit_rate,
+            entry.implication,
+            entry.mapped_beads.join(", ")
+        );
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Baseline Waste Ledger\n");
+    for entry in &actionable_ranking.baseline_waste_ledger {
+        let wall_share = entry
+            .wall_share_basis_points
+            .map_or_else(|| "n/a".to_owned(), |value| value.to_string());
+        let _ = writeln!(
+            out,
+            "- rank {} {}: class={}, {}={}, wall_share_bps={}, allocator_pressure_bytes={}, activity_count={} -> {} [{}]",
+            entry.rank,
+            entry.component,
+            entry.classification,
+            entry.metric_kind,
+            entry.metric_value,
+            wall_share,
+            entry.allocator_pressure_bytes,
+            entry.activity_count,
+            entry.implication,
+            entry.mapped_beads.join(", ")
+        );
+    }
+    let _ = writeln!(
+        out,
+        "- note: baseline and structural spillover entries are intentionally listed together here so low-retry rows can be separated from contention-driven wall time without hiding either class of cost."
+    );
+    let _ = writeln!(out);
+
     let _ = writeln!(out, "## Quantified Cost Components\n");
     for entry in &actionable_ranking.cost_components {
         let _ = writeln!(
@@ -829,6 +978,54 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
             entry.activity_count,
             entry.implication,
             entry.mapped_beads.join(", ")
+        );
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Wall-Time Decomposition\n");
+    for entry in &actionable_ranking.wall_time_components {
+        let _ = writeln!(
+            out,
+            "- rank {} {}: time_ns={}, wall_share_bps={} -> {} [{}]",
+            entry.rank,
+            entry.component,
+            entry.time_ns,
+            entry.wall_share_basis_points,
+            entry.implication,
+            entry.mapped_beads.join(", ")
+        );
+    }
+    let _ = writeln!(
+        out,
+        "- note: component shares are evidence-backed but may overlap on multi-worker runs, so they should steer classification rather than be treated as an exclusive partition."
+    );
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Microarchitectural Signatures\n");
+    for entry in &actionable_ranking.microarchitectural_signatures {
+        let secondary = if entry.secondary_signatures.is_empty() {
+            String::from("none")
+        } else {
+            entry.secondary_signatures.join(", ")
+        };
+        let evidence = if entry.evidence_sources.is_empty() {
+            String::from("none")
+        } else {
+            entry.evidence_sources.join(", ")
+        };
+        let _ = writeln!(
+            out,
+            "- rank {} {}: primary={}, secondary={}, confidence={} ({}bp), mixed={} -> {} [{}] evidence={}",
+            entry.rank,
+            entry.target,
+            entry.primary_signature,
+            secondary,
+            entry.confidence_label,
+            entry.confidence_score_basis_points,
+            entry.mixed_or_ambiguous,
+            entry.implication,
+            entry.mapped_beads.join(", "),
+            evidence
         );
     }
     let _ = writeln!(out);
@@ -869,7 +1066,7 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     );
     let _ = writeln!(
         out,
-        "- `actionable_ranking.json` — hotspot-to-bead ledger for D2-D4 handoff"
+        "- `actionable_ranking.json` — hotspot, reuse, and baseline-waste ledger for follow-on Track I/Track J work"
     );
     let _ = writeln!(
         out,
@@ -881,24 +1078,19 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
 fn hotspot_implication(subsystem: &str) -> (&'static str, &'static [&'static str]) {
     match subsystem {
         "parser_ast_churn" => (
-            "D2 target: parser, AST, and compile churn should be reduced through prepared-artifact reuse.",
-            &["bd-db300.4.2", "bd-db300.4.2.1"],
+            "J2/J4 target: parser, AST, and compile churn should be reduced through prepared-artifact reuse and arena-backed scratch.",
+            &["bd-db300.10.2", "bd-db300.10.4"],
         ),
         "record_decode" => (
-            "D3/D4 target: row decode work is expensive enough to justify scratch-space reuse and copy reduction.",
-            &[
-                "bd-db300.4.3",
-                "bd-db300.4.3.1",
-                "bd-db300.4.4",
-                "bd-db300.4.4.1",
-            ],
+            "J2/J5 target: row decode work is expensive enough to justify scratch-space reuse, decode caching, and copy reduction.",
+            &["bd-db300.10.2", "bd-db300.10.5"],
         ),
         "row_materialization" => (
-            "D2/D3 target: result-row materialization is paying avoidable clone/allocation cost in the mixed hot path.",
-            &["bd-db300.4.2", "bd-db300.4.3"],
+            "J2/J6/J7 target: result-row materialization is still paying avoidable clone/allocation and reusable-frame cost in the mixed hot path.",
+            &["bd-db300.10.2", "bd-db300.10.6", "bd-db300.10.7"],
         ),
         _ => (
-            "Secondary follow-up bucket after the named Track D hotspots.",
+            "Secondary follow-up bucket after the named Track J hotspots.",
             &[],
         ),
     }
@@ -907,19 +1099,19 @@ fn hotspot_implication(subsystem: &str) -> (&'static str, &'static [&'static str
 fn allocator_implication(subsystem: &str) -> (&'static str, &'static [&'static str]) {
     match subsystem {
         "result_row_values" => (
-            "D3 target: emitted result rows are carrying most of the transient heap pressure.",
-            &["bd-db300.4.3", "bd-db300.4.3.2"],
+            "J2/J6/J7 target: emitted result rows are carrying most of the transient heap pressure and should benefit from ownership and frame reuse.",
+            &["bd-db300.10.2", "bd-db300.10.6", "bd-db300.10.7"],
         ),
         "record_decode_values" => (
-            "D3/D4 target: decoded record values create enough heap churn to justify scratch buffers and copy reduction.",
-            &["bd-db300.4.3", "bd-db300.4.4"],
+            "J2/J5 target: decoded record values create enough heap churn to justify scratch buffers and decode caching.",
+            &["bd-db300.10.2", "bd-db300.10.5"],
         ),
         "parser_sql_bytes" => (
-            "D2 target: parse-volume churn is visible and should be reduced with reuse rather than repeated prepare work.",
-            &["bd-db300.4.2", "bd-db300.4.2.1"],
+            "J2/J4 target: parse-volume churn is visible and should be reduced with reuse rather than repeated prepare work.",
+            &["bd-db300.10.2", "bd-db300.10.4"],
         ),
         _ => (
-            "Secondary allocator-pressure source after the named Track D hotspots.",
+            "Secondary allocator-pressure source after the named Track J hotspots.",
             &[],
         ),
     }
@@ -928,22 +1120,385 @@ fn allocator_implication(subsystem: &str) -> (&'static str, &'static [&'static s
 fn cost_component_implication(component: &str) -> (&'static str, &'static [&'static str]) {
     match component {
         "parser_ast_churn" => (
-            "D2 target: parser and compile reuse still dominate this component enough to justify prepared-artifact work next.",
-            &["bd-db300.4.2", "bd-db300.4.2.1"],
+            "J2/J4 target: parser and compile reuse still dominate this component enough to justify prepared-artifact work next.",
+            &["bd-db300.10.2", "bd-db300.10.4"],
         ),
         "record_decode" => (
-            "D3/D4 target: decode cost is large enough to justify scratch buffers and copy-reduction work.",
-            &["bd-db300.4.3", "bd-db300.4.4"],
+            "J2/J5 target: decode cost is large enough to justify scratch buffers and decode-cache work.",
+            &["bd-db300.10.2", "bd-db300.10.5"],
         ),
         "row_materialization" => (
-            "D3 target: emitted-row cloning and transient value ownership remain a first-class hot-path cost.",
-            &["bd-db300.4.3", "bd-db300.4.3.1"],
+            "J2/J6/J7 target: emitted-row cloning and transient value ownership remain a first-class hot-path cost.",
+            &["bd-db300.10.2", "bd-db300.10.6", "bd-db300.10.7"],
         ),
         _ => (
-            "Secondary cost component after the named Track D follow-on buckets.",
+            "Secondary cost component after the named Track J follow-on buckets.",
             &[],
         ),
     }
+}
+
+fn wall_time_component_implication(component: &str) -> (&'static str, &'static [&'static str]) {
+    match component {
+        "queueing" => (
+            "A/B target: retried BUSY attempts are consuming visible wall time before useful work resumes, so the handoff policy should be tightened before scaling further.",
+            &["bd-db300.2.4"],
+        ),
+        "synchronization" => (
+            "A/E target: transaction-boundary coordination is still a first-class wall-time tax and should be pushed toward narrower residual serialized regions.",
+            &["bd-db300.1.5", "bd-db300.5.1"],
+        ),
+        "retry" => (
+            "B target: sleep-based retry backoff is still showing up in the hot cell and should be replaced with a bounded handoff strategy.",
+            &["bd-db300.2.4"],
+        ),
+        "service" => (
+            "J target: useful body execution still dominates enough wall time that parser, decode, row-path, and residual VDBE/page-motion optimizations remain the main throughput lever once contention is under control.",
+            &[
+                "bd-db300.10.2",
+                "bd-db300.10.4",
+                "bd-db300.10.5",
+                "bd-db300.10.6",
+                "bd-db300.10.7",
+                "bd-db300.10.8",
+            ],
+        ),
+        "allocator_copy" => (
+            "J target: allocator and copy work is large enough to justify scratch-space reuse, row-value ownership reduction, and reusable buffers.",
+            &[
+                "bd-db300.10.2",
+                "bd-db300.10.3",
+                "bd-db300.10.6",
+                "bd-db300.10.7",
+            ],
+        ),
+        "durability" => (
+            "E target: commit durability is now an explicit measured lane, so future architecture work can separate durable ordering from general executor service cost.",
+            &["bd-db300.5.1"],
+        ),
+        _ => (
+            "Secondary wall-time bucket after the named Track A steering categories.",
+            &[],
+        ),
+    }
+}
+
+fn hot_path_signature_confidence_label(confidence_score_basis_points: u32) -> &'static str {
+    match confidence_score_basis_points {
+        8_000..=u32::MAX => "high",
+        5_500..=7_999 => "medium",
+        _ => "low",
+    }
+}
+
+fn push_unique_signature_evidence(values: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn top_subsystem_for_service(report: &HotPathProfileReport) -> &'static str {
+    report
+        .subsystem_ranking
+        .first()
+        .map_or("service_mixed", |entry| match entry.subsystem.as_str() {
+            "parser_ast_churn" => "parser_ast_churn",
+            "record_decode" => "record_decode",
+            "row_materialization" => "row_materialization",
+            _ => "service_mixed",
+        })
+}
+
+fn component_signature_shape(
+    report: &HotPathProfileReport,
+    component: &str,
+    counter_capture_summary: Option<&HotPathCounterCaptureManifestSummary>,
+) -> (
+    &'static str,
+    Vec<&'static str>,
+    u32,
+    bool,
+    Vec<String>,
+    String,
+) {
+    let mut evidence_sources = Vec::new();
+    push_unique_signature_evidence(
+        &mut evidence_sources,
+        format!("wall_time_component:{component}"),
+    );
+    let has_capture = |capture: &str| {
+        counter_capture_summary.is_some_and(|summary| {
+            summary
+                .host_capability_sensitive_captures
+                .iter()
+                .chain(summary.topology_sensitive_captures.iter())
+                .any(|entry| entry == capture)
+        })
+    };
+    let has_fallback_metric = |metric: &str| {
+        counter_capture_summary.is_some_and(|summary| {
+            summary
+                .fallback_metric_pack
+                .iter()
+                .any(|entry| entry == metric)
+        })
+    };
+    if has_capture("cache_to_cache") {
+        push_unique_signature_evidence(
+            &mut evidence_sources,
+            "counter_capture:cache_to_cache(perf-c2c/perf-mem fallback)",
+        );
+    }
+    if has_capture("remote_access") {
+        push_unique_signature_evidence(
+            &mut evidence_sources,
+            "counter_capture:remote_access(perf-mem/perf-stat fallback)",
+        );
+    }
+    if has_capture("migration") {
+        push_unique_signature_evidence(
+            &mut evidence_sources,
+            "counter_capture:migration(cpu-migrations/context-switch fallback)",
+        );
+    }
+    if has_capture("topdown") {
+        push_unique_signature_evidence(
+            &mut evidence_sources,
+            "counter_capture:topdown(TopdownL1/core-event fallback)",
+        );
+    }
+    if has_fallback_metric("cache-misses") {
+        push_unique_signature_evidence(&mut evidence_sources, "fallback_metric:cache-misses");
+    }
+
+    match component {
+        "durability" => {
+            push_unique_signature_evidence(
+                &mut evidence_sources,
+                "wal_runtime:group_commit_latency_us_total",
+            );
+            push_unique_signature_evidence(
+                &mut evidence_sources,
+                "wal_runtime:checkpoint_duration_us_total",
+            );
+            (
+                "durability_pressure",
+                Vec::new(),
+                9_000,
+                false,
+                evidence_sources,
+                String::from(
+                    "WAL group-commit/checkpoint latency is directly measured on the commit-finalize path, so this cell is a genuine durability-pressure lane rather than a generic executor slowdown.",
+                ),
+            )
+        }
+        "synchronization" => {
+            let mut secondary = Vec::new();
+            if has_capture("remote_access") || has_capture("migration") {
+                secondary.push("remote_numa_traffic");
+            }
+            (
+                if has_capture("cache_to_cache") {
+                    "ownership_ping_pong_hitm"
+                } else {
+                    "mixed_or_ambiguous"
+                },
+                secondary,
+                if has_capture("cache_to_cache") {
+                    7_000
+                } else {
+                    4_000
+                },
+                true,
+                evidence_sources,
+                String::from(
+                    "BEGIN/COMMIT/ROLLBACK boundary time is visible, and the topology-aware capture set points at coordination traffic, but without raw counter values this remains an honest mixed synchronization story rather than a fabricated single cause.",
+                ),
+            )
+        }
+        "queueing" | "retry" => {
+            let mut secondary = Vec::new();
+            if has_capture("cache_to_cache") {
+                secondary.push("ownership_ping_pong_hitm");
+            }
+            if has_capture("remote_access") || has_capture("migration") {
+                secondary.push("remote_numa_traffic");
+            }
+            (
+                "mixed_or_ambiguous",
+                secondary,
+                if has_capture("cache_to_cache") || has_capture("remote_access") {
+                    5_500
+                } else {
+                    3_500
+                },
+                true,
+                evidence_sources,
+                String::from(
+                    "BUSY/retry wall time proves contention is present, but the available evidence only narrows it to topology-sensitive coordination candidates rather than a single definitive microarchitectural culprit.",
+                ),
+            )
+        }
+        "allocator_copy" => (
+            "llc_pressure",
+            vec!["tlb_pressure"],
+            if has_fallback_metric("cache-misses") {
+                6_200
+            } else {
+                5_400
+            },
+            true,
+            evidence_sources,
+            String::from(
+                "Copy-heavy row materialization is the clearest cache/memory lane in the hot path, and the capture pack includes cache-oriented evidence, so LLC/TLB pressure is the most defensible signature pair here.",
+            ),
+        ),
+        "service" => match top_subsystem_for_service(report) {
+            "parser_ast_churn" => (
+                "front_end_starvation",
+                vec!["branch_waste"],
+                if has_capture("topdown") { 6_300 } else { 4_800 },
+                true,
+                {
+                    push_unique_signature_evidence(
+                        &mut evidence_sources,
+                        "subsystem_hotspot:parser_ast_churn",
+                    );
+                    evidence_sources
+                },
+                String::from(
+                    "Service time is dominated by parser/compile work, so front-end starvation with branch waste as a secondary signature is the most honest interpretation of the current evidence pack.",
+                ),
+            ),
+            "record_decode" => (
+                "llc_pressure",
+                vec!["tlb_pressure"],
+                if has_fallback_metric("cache-misses") || has_capture("remote_access") {
+                    6_400
+                } else {
+                    5_000
+                },
+                true,
+                {
+                    push_unique_signature_evidence(
+                        &mut evidence_sources,
+                        "subsystem_hotspot:record_decode",
+                    );
+                    evidence_sources
+                },
+                String::from(
+                    "Useful service work is concentrated in record decode, which is the strongest cache/memory consumer in the measured subsystem mix, so LLC/TLB pressure is the least speculative signature pair.",
+                ),
+            ),
+            "row_materialization" => (
+                "llc_pressure",
+                vec!["remote_numa_traffic"],
+                if has_capture("remote_access") || has_capture("cache_to_cache") {
+                    5_900
+                } else {
+                    4_900
+                },
+                true,
+                {
+                    push_unique_signature_evidence(
+                        &mut evidence_sources,
+                        "subsystem_hotspot:row_materialization",
+                    );
+                    evidence_sources
+                },
+                String::from(
+                    "Service time is being spent cloning row values, which is predominantly a cache/copy path; remote-access evidence keeps the cross-node possibility explicit instead of hiding it.",
+                ),
+            ),
+            _ => (
+                "mixed_or_ambiguous",
+                Vec::new(),
+                3_500,
+                true,
+                evidence_sources,
+                String::from(
+                    "Service time is present but the current profile does not justify a stronger microarchitectural story than an explicit mixed/ambiguous tag.",
+                ),
+            ),
+        },
+        _ => (
+            "mixed_or_ambiguous",
+            Vec::new(),
+            3_000,
+            true,
+            evidence_sources,
+            String::from(
+                "This wall-time bucket is not yet strong enough to support a more specific microarchitectural classification.",
+            ),
+        ),
+    }
+}
+
+fn build_hot_path_microarchitectural_signatures(
+    report: &HotPathProfileReport,
+    counter_capture_summary: Option<&HotPathCounterCaptureManifestSummary>,
+    microarchitectural_context: Option<&HotPathMicroarchitecturalContext>,
+) -> Vec<HotPathMicroarchitecturalSignatureEntry> {
+    let fixture_id = microarchitectural_context.map_or_else(
+        || report.fixture_id.clone(),
+        |value| value.fixture_id.clone(),
+    );
+    let row_id = microarchitectural_context.map(|value| value.row_id.clone());
+    let mode_id = microarchitectural_context.map(|value| value.mode_id.clone());
+    let placement_profile_id =
+        microarchitectural_context.and_then(|value| value.placement_profile_id.clone());
+    let hardware_class_id =
+        microarchitectural_context.and_then(|value| value.hardware_class_id.clone());
+    let hardware_signature =
+        microarchitectural_context.and_then(|value| value.hardware_signature.clone());
+    let wall_time_components = build_hot_path_wall_time_components(report);
+    let mut entries = Vec::with_capacity(wall_time_components.len());
+
+    for component in wall_time_components {
+        let (
+            primary_signature,
+            secondary_signatures,
+            confidence_score_basis_points,
+            mixed,
+            evidence_sources,
+            rationale,
+        ) = component_signature_shape(report, &component.component, counter_capture_summary);
+        let (implication, mapped_beads) = wall_time_component_implication(&component.component);
+        entries.push(HotPathMicroarchitecturalSignatureEntry {
+            rank: 0,
+            target: component.component,
+            primary_signature: primary_signature.to_owned(),
+            secondary_signatures: secondary_signatures
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            confidence_label: hot_path_signature_confidence_label(confidence_score_basis_points)
+                .to_owned(),
+            confidence_score_basis_points,
+            mixed_or_ambiguous: mixed,
+            rationale,
+            evidence_sources,
+            fixture_id: fixture_id.clone(),
+            row_id: row_id.clone(),
+            mode_id: mode_id.clone(),
+            placement_profile_id: placement_profile_id.clone(),
+            hardware_class_id: hardware_class_id.clone(),
+            hardware_signature: hardware_signature.clone(),
+            implication: implication.to_owned(),
+            mapped_beads: mapped_beads.iter().map(|bead| (*bead).to_owned()).collect(),
+        });
+    }
+
+    entries.sort_by(|lhs, rhs| {
+        rhs.confidence_score_basis_points
+            .cmp(&lhs.confidence_score_basis_points)
+            .then_with(|| lhs.target.cmp(&rhs.target))
+    });
+    for (rank, entry) in entries.iter_mut().enumerate() {
+        entry.rank = u32::try_from(rank + 1).unwrap_or(u32::MAX);
+    }
+    entries
 }
 
 fn ratio_basis_points(value: u64, total: u64) -> u32 {
@@ -971,6 +1526,403 @@ fn actionable_entry(
         implication: implication.to_owned(),
         mapped_beads: mapped_beads.iter().map(|bead| (*bead).to_owned()).collect(),
     }
+}
+
+fn baseline_reuse_implication(surface: &str) -> (&'static str, &'static [&'static str]) {
+    match surface {
+        "statement_parse_cache" => (
+            "J4 target: repeated parse misses still show avoidable prepare churn on the low-contention path.",
+            &["bd-db300.10.4"],
+        ),
+        "compiled_plan_cache" => (
+            "J4 target: compiled-plan misses are direct evidence for statement/plan caching work.",
+            &["bd-db300.10.4"],
+        ),
+        "record_decode_cache" => (
+            "J5 target: decode reuse is still invisible, so the report should assume repeated record parsing until explicit cache hits exist.",
+            &["bd-db300.10.5"],
+        ),
+        "cursor_frame_reuse" => (
+            "J7 target: missing cursor/frame reuse evidence means VDBE setup churn is still treated as open baseline tax.",
+            &["bd-db300.10.7"],
+        ),
+        "page_buffer_pool_reuse" => (
+            "J3/J8 target: page-buffer reuse remains opaque in the hot-path report and needs explicit pool-hit evidence.",
+            &["bd-db300.10.3", "bd-db300.10.8"],
+        ),
+        "page_data_ownership_reuse" => (
+            "J6 target: PageData ownership reuse is still not measured directly, so clone/vec/arc churn remains a first-class suspect.",
+            &["bd-db300.10.6"],
+        ),
+        _ => (
+            "Secondary baseline reuse surface after the named Track J cache/reuse buckets.",
+            &[],
+        ),
+    }
+}
+
+fn build_hot_path_baseline_reuse_ledger(
+    report: &HotPathProfileReport,
+) -> Vec<HotPathBaselineReuseLedgerEntry> {
+    let parser_calls = report
+        .parser
+        .parse_single_calls
+        .saturating_add(report.parser.parse_multi_calls);
+    let decode_calls = report
+        .record_decode
+        .parse_record_into_calls
+        .saturating_add(report.record_decode.parse_record_column_calls);
+    let result_rows = report.row_materialization.result_rows_total;
+    let mut entries = vec![
+        HotPathBaselineReuseLedgerEntry {
+            rank: 0,
+            surface: "statement_parse_cache".to_owned(),
+            supported: true,
+            hits: report.parser.parse_cache_hits,
+            misses: report.parser.parse_cache_misses,
+            hit_rate_basis_points: Some(ratio_basis_points(
+                report.parser.parse_cache_hits,
+                report
+                    .parser
+                    .parse_cache_hits
+                    .saturating_add(report.parser.parse_cache_misses),
+            )),
+            rationale: format!(
+                "parse cache hits/misses are measured directly across {} parse calls",
+                parser_calls
+            ),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineReuseLedgerEntry {
+            rank: 0,
+            surface: "compiled_plan_cache".to_owned(),
+            supported: true,
+            hits: report.parser.compiled_cache_hits,
+            misses: report.parser.compiled_cache_misses,
+            hit_rate_basis_points: Some(ratio_basis_points(
+                report.parser.compiled_cache_hits,
+                report
+                    .parser
+                    .compiled_cache_hits
+                    .saturating_add(report.parser.compiled_cache_misses),
+            )),
+            rationale:
+                "compiled-plan cache hits/misses are captured directly at the prepare/compile boundary"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineReuseLedgerEntry {
+            rank: 0,
+            surface: "record_decode_cache".to_owned(),
+            supported: false,
+            hits: 0,
+            misses: 0,
+            hit_rate_basis_points: None,
+            rationale: format!(
+                "record decode activity is measured ({} decode calls), but decode-cache hits/misses are not yet surfaced in the report layer",
+                decode_calls
+            ),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineReuseLedgerEntry {
+            rank: 0,
+            surface: "cursor_frame_reuse".to_owned(),
+            supported: false,
+            hits: 0,
+            misses: 0,
+            hit_rate_basis_points: None,
+            rationale:
+                "runtime phase timing exists, but cursor/frame reuse versus fresh setup is not yet emitted as a machine-readable counter"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineReuseLedgerEntry {
+            rank: 0,
+            surface: "page_buffer_pool_reuse".to_owned(),
+            supported: false,
+            hits: 0,
+            misses: 0,
+            hit_rate_basis_points: None,
+            rationale:
+                "pager-side hit counters exist elsewhere, but this hot-path report does not yet expose page-buffer pool reuse directly"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineReuseLedgerEntry {
+            rank: 0,
+            surface: "page_data_ownership_reuse".to_owned(),
+            supported: false,
+            hits: 0,
+            misses: 0,
+            hit_rate_basis_points: None,
+            rationale: format!(
+                "row materialization emitted {} rows, but PageData ownership reuse versus clone/vec/arc churn is still uninstrumented",
+                result_rows
+            ),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+    ];
+    entries.sort_by(|lhs, rhs| {
+        let lhs_supported_rank = if lhs.supported { 1u8 } else { 0u8 };
+        let rhs_supported_rank = if rhs.supported { 1u8 } else { 0u8 };
+        lhs_supported_rank
+            .cmp(&rhs_supported_rank)
+            .then_with(|| {
+                lhs.hit_rate_basis_points
+                    .unwrap_or(0)
+                    .cmp(&rhs.hit_rate_basis_points.unwrap_or(0))
+            })
+            .then_with(|| {
+                rhs.hits
+                    .saturating_add(rhs.misses)
+                    .cmp(&lhs.hits.saturating_add(lhs.misses))
+            })
+            .then_with(|| lhs.surface.cmp(&rhs.surface))
+    });
+    for (rank, entry) in entries.iter_mut().enumerate() {
+        entry.rank = u32::try_from(rank + 1).unwrap_or(u32::MAX);
+        let (implication, mapped_beads) = baseline_reuse_implication(&entry.surface);
+        entry.implication = implication.to_owned();
+        entry.mapped_beads = mapped_beads.iter().map(|bead| (*bead).to_owned()).collect();
+    }
+    entries
+}
+
+fn baseline_waste_implication(component: &str) -> (&'static str, &'static [&'static str]) {
+    match component {
+        "parser_prepare_churn" => (
+            "J2/J4 target: parse/rewrite/compile work is still visible enough that caching and arena-backed scratch should move first.",
+            &["bd-db300.10.2", "bd-db300.10.4"],
+        ),
+        "record_decode" => (
+            "J2/J5 target: decode time and decoded-value heap churn remain direct baseline-tax candidates.",
+            &["bd-db300.10.2", "bd-db300.10.5"],
+        ),
+        "row_materialization" => (
+            "J2/J6/J7 target: emitted-row cloning is still paying avoidable heap and ownership cost on the common path.",
+            &["bd-db300.10.2", "bd-db300.10.6", "bd-db300.10.7"],
+        ),
+        "executor_body_residual" => (
+            "J6/J7/J8 target: residual service time beyond decode/materialization is where VDBE setup, cursor motion, page fetch, and ownership churn likely still hide.",
+            &["bd-db300.10.6", "bd-db300.10.7", "bd-db300.10.8"],
+        ),
+        "boundary_coordination" => (
+            "Mixed lane: boundary coordination should stay visible so baseline fixes do not accidentally absorb residual commit/path coordination into the wrong bucket.",
+            &["bd-db300.1.5", "bd-db300.5.1"],
+        ),
+        "busy_retry_queueing" => (
+            "Structural spillover: retry and BUSY queueing are not baseline tax and should steer Track A work instead of J-lane fixes.",
+            &["bd-db300.2.4"],
+        ),
+        "durability" => (
+            "Mixed lane: durability must stay explicit so later baseline work does not overclaim gains that really belong to WAL/commit-path changes.",
+            &["bd-db300.5.1"],
+        ),
+        _ => (
+            "Secondary baseline or spillover bucket after the named Track J categories.",
+            &[],
+        ),
+    }
+}
+
+fn build_hot_path_baseline_waste_ledger(
+    report: &HotPathProfileReport,
+) -> Vec<HotPathBaselineWasteLedgerEntry> {
+    let runtime_phase_timing = report
+        .engine_report
+        .runtime_phase_timing
+        .unwrap_or_default();
+    let wall_time_ns = report.engine_report.wall_time_ms.saturating_mul(1_000_000);
+    let parser_time_ns = report
+        .parser
+        .parse_time_ns
+        .saturating_add(report.parser.rewrite_time_ns)
+        .saturating_add(report.parser.compile_time_ns);
+    let decode_calls = report
+        .record_decode
+        .parse_record_into_calls
+        .saturating_add(report.record_decode.parse_record_column_calls);
+    let parser_calls = report
+        .parser
+        .parse_single_calls
+        .saturating_add(report.parser.parse_multi_calls);
+    let wal_durability_time_ns =
+        report
+            .engine_report
+            .hot_path_profile
+            .as_ref()
+            .map_or(0, |hot_path_profile| {
+                hot_path_profile
+                    .wal
+                    .group_commit_latency_us_total
+                    .saturating_add(hot_path_profile.wal.checkpoint_duration_us_total)
+                    .saturating_mul(1_000)
+            });
+    let durability_time_ns =
+        wal_durability_time_ns.min(runtime_phase_timing.commit_finalize_time_ns);
+    let boundary_coordination_time_ns = runtime_phase_timing
+        .begin_boundary_time_ns
+        .saturating_add(runtime_phase_timing.rollback_time_ns)
+        .saturating_add(
+            runtime_phase_timing
+                .commit_finalize_time_ns
+                .saturating_sub(durability_time_ns),
+        );
+    let executor_body_residual = runtime_phase_timing
+        .body_execution_time_ns
+        .saturating_sub(report.record_decode.decode_time_ns)
+        .saturating_sub(
+            report
+                .row_materialization
+                .result_row_materialization_time_ns_total,
+        );
+    let busy_retry_queueing_time_ns = runtime_phase_timing
+        .busy_attempt_time_ns
+        .saturating_add(runtime_phase_timing.retry_backoff_time_ns);
+    let mut entries = vec![
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "parser_prepare_churn".to_owned(),
+            classification: "baseline_tax".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: parser_time_ns,
+            wall_share_basis_points: Some(ratio_basis_points(parser_time_ns, wall_time_ns)),
+            allocator_pressure_bytes: report.allocator_pressure.parser_sql_bytes,
+            activity_count: parser_calls,
+            rationale:
+                "parse, rewrite, and compile time represent repeated prepare-path work on the common path"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "record_decode".to_owned(),
+            classification: "baseline_tax".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: report.record_decode.decode_time_ns,
+            wall_share_basis_points: Some(ratio_basis_points(
+                report.record_decode.decode_time_ns,
+                wall_time_ns,
+            )),
+            allocator_pressure_bytes: report.record_decode.vdbe_decoded_value_heap_bytes_total,
+            activity_count: decode_calls,
+            rationale:
+                "record decode time and decoded-value heap bytes are measured directly in the VDBE hot path"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "row_materialization".to_owned(),
+            classification: "baseline_tax".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: report
+                .row_materialization
+                .result_row_materialization_time_ns_total,
+            wall_share_basis_points: Some(ratio_basis_points(
+                report
+                    .row_materialization
+                    .result_row_materialization_time_ns_total,
+                wall_time_ns,
+            )),
+            allocator_pressure_bytes: report.row_materialization.result_value_heap_bytes_total,
+            activity_count: report.row_materialization.result_rows_total,
+            rationale:
+                "result-row materialization isolates emitted-value cloning and transient ownership work"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "executor_body_residual".to_owned(),
+            classification: "mixed_or_residual".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: executor_body_residual,
+            wall_share_basis_points: Some(ratio_basis_points(
+                executor_body_residual,
+                wall_time_ns,
+            )),
+            allocator_pressure_bytes: 0,
+            activity_count: report.engine_report.ops_total,
+            rationale:
+                "body execution time that remains after explicit decode and row-materialization accounting; likely mixes VDBE dispatch, cursor motion, page fetch, and PageData ownership churn"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "boundary_coordination".to_owned(),
+            classification: "mixed_or_residual".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: boundary_coordination_time_ns,
+            wall_share_basis_points: Some(ratio_basis_points(
+                boundary_coordination_time_ns,
+                wall_time_ns,
+            )),
+            allocator_pressure_bytes: 0,
+            activity_count: report.engine_report.ops_total,
+            rationale:
+                "BEGIN/ROLLBACK boundaries plus non-durable COMMIT coordination are real wall time, but they are not pure baseline tax and should stay separated"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "busy_retry_queueing".to_owned(),
+            classification: "structural_side_effect".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: busy_retry_queueing_time_ns,
+            wall_share_basis_points: Some(ratio_basis_points(
+                busy_retry_queueing_time_ns,
+                wall_time_ns,
+            )),
+            allocator_pressure_bytes: 0,
+            activity_count: report.engine_report.retries,
+            rationale:
+                "BUSY-attempt time and retry-backoff sleep are contention spillover, not evidence of intrinsic single-writer baseline tax"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathBaselineWasteLedgerEntry {
+            rank: 0,
+            component: "durability".to_owned(),
+            classification: "mixed_or_residual".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: durability_time_ns,
+            wall_share_basis_points: Some(ratio_basis_points(durability_time_ns, wall_time_ns)),
+            allocator_pressure_bytes: 0,
+            activity_count: report.engine_report.ops_total,
+            rationale:
+                "WAL durability is an explicit measured lane and must remain visible so baseline optimization claims stay honest"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+    ];
+    entries.sort_by(|lhs, rhs| {
+        rhs.metric_value
+            .cmp(&lhs.metric_value)
+            .then_with(|| lhs.component.cmp(&rhs.component))
+    });
+    for (rank, entry) in entries.iter_mut().enumerate() {
+        entry.rank = u32::try_from(rank + 1).unwrap_or(u32::MAX);
+        let (implication, mapped_beads) = baseline_waste_implication(&entry.component);
+        entry.implication = implication.to_owned();
+        entry.mapped_beads = mapped_beads.iter().map(|bead| (*bead).to_owned()).collect();
+    }
+    entries
 }
 
 fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathCostComponentEntry> {
@@ -1075,6 +2027,131 @@ fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathC
     entries
 }
 
+fn build_hot_path_wall_time_components(
+    report: &HotPathProfileReport,
+) -> Vec<HotPathWallTimeComponentEntry> {
+    let wall_time_ns = report.engine_report.wall_time_ms.saturating_mul(1_000_000);
+    let allocator_copy_time_ns = report
+        .row_materialization
+        .result_row_materialization_time_ns_total;
+    let runtime_phase_timing = report
+        .engine_report
+        .runtime_phase_timing
+        .unwrap_or_default();
+    let wal_durability_time_ns =
+        report
+            .engine_report
+            .hot_path_profile
+            .as_ref()
+            .map_or(0, |hot_path_profile| {
+                hot_path_profile
+                    .wal
+                    .group_commit_latency_us_total
+                    .saturating_add(hot_path_profile.wal.checkpoint_duration_us_total)
+                    .saturating_mul(1_000)
+            });
+    let durability_time_ns =
+        wal_durability_time_ns.min(runtime_phase_timing.commit_finalize_time_ns);
+    let synchronization_time_ns = runtime_phase_timing
+        .begin_boundary_time_ns
+        .saturating_add(runtime_phase_timing.rollback_time_ns)
+        .saturating_add(
+            runtime_phase_timing
+                .commit_finalize_time_ns
+                .saturating_sub(durability_time_ns),
+        );
+    let service_time_ns = runtime_phase_timing
+        .body_execution_time_ns
+        .saturating_sub(allocator_copy_time_ns);
+
+    let mut entries = vec![
+        HotPathWallTimeComponentEntry {
+            rank: 0,
+            component: "queueing".to_owned(),
+            time_ns: runtime_phase_timing.busy_attempt_time_ns,
+            wall_share_basis_points: ratio_basis_points(
+                runtime_phase_timing.busy_attempt_time_ns,
+                wall_time_ns,
+            ),
+            rationale:
+                "elapsed wall time spent inside batch attempts that ended in BUSY and had to queue for a later retry"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathWallTimeComponentEntry {
+            rank: 0,
+            component: "synchronization".to_owned(),
+            time_ns: synchronization_time_ns,
+            wall_share_basis_points: ratio_basis_points(synchronization_time_ns, wall_time_ns),
+            rationale:
+                "BEGIN/ROLLBACK boundary time plus non-durable COMMIT coordination observed directly by the executor"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathWallTimeComponentEntry {
+            rank: 0,
+            component: "retry".to_owned(),
+            time_ns: runtime_phase_timing.retry_backoff_time_ns,
+            wall_share_basis_points: ratio_basis_points(
+                runtime_phase_timing.retry_backoff_time_ns,
+                wall_time_ns,
+            ),
+            rationale:
+                "configured backoff sleep requested after BUSY-family retries in the hot cell"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathWallTimeComponentEntry {
+            rank: 0,
+            component: "service".to_owned(),
+            time_ns: service_time_ns,
+            wall_share_basis_points: ratio_basis_points(service_time_ns, wall_time_ns),
+            rationale:
+                "batch body execution time outside the explicit allocator/copy bucket, capturing useful in-engine service work"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathWallTimeComponentEntry {
+            rank: 0,
+            component: "allocator_copy".to_owned(),
+            time_ns: allocator_copy_time_ns,
+            wall_share_basis_points: ratio_basis_points(allocator_copy_time_ns, wall_time_ns),
+            rationale:
+                "row materialization time measured inline at the VDBE boundary, isolating value cloning and copy-heavy result emission"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathWallTimeComponentEntry {
+            rank: 0,
+            component: "durability".to_owned(),
+            time_ns: durability_time_ns,
+            wall_share_basis_points: ratio_basis_points(durability_time_ns, wall_time_ns),
+            rationale:
+                "WAL group-commit and checkpoint latency captured by runtime telemetry, clipped to observed COMMIT finalize time"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+    ];
+    entries.sort_by(|lhs, rhs| {
+        rhs.time_ns
+            .cmp(&lhs.time_ns)
+            .then_with(|| lhs.component.cmp(&rhs.component))
+    });
+    for (rank, entry) in entries.iter_mut().enumerate() {
+        entry.rank = u32::try_from(rank + 1).unwrap_or(u32::MAX);
+        let (implication, mapped_beads) = wall_time_component_implication(&entry.component);
+        entry.implication = implication.to_owned();
+        entry.mapped_beads = mapped_beads.iter().map(|bead| (*bead).to_owned()).collect();
+    }
+    entries
+}
+
 #[must_use]
 pub fn build_hot_path_opcode_profile(report: &HotPathProfileReport) -> HotPathOpcodeProfilePack {
     let mut opcodes = report.opcode_profile.clone();
@@ -1127,6 +2204,8 @@ pub fn build_hot_path_subsystem_profile(
 #[must_use]
 pub fn build_hot_path_actionable_ranking(
     report: &HotPathProfileReport,
+    counter_capture_summary: Option<&HotPathCounterCaptureManifestSummary>,
+    microarchitectural_context: Option<&HotPathMicroarchitecturalContext>,
 ) -> HotPathActionableRanking {
     let named_hotspots = report
         .subsystem_ranking
@@ -1137,6 +2216,8 @@ pub fn build_hot_path_actionable_ranking(
             actionable_entry(rank, entry, implication, mapped_beads)
         })
         .collect();
+    let baseline_reuse_ledger = build_hot_path_baseline_reuse_ledger(report);
+    let baseline_waste_ledger = build_hot_path_baseline_waste_ledger(report);
     let allocator_pressure = report
         .allocator_pressure
         .ranked_sources
@@ -1147,6 +2228,12 @@ pub fn build_hot_path_actionable_ranking(
             actionable_entry(rank, entry, implication, mapped_beads)
         })
         .collect();
+    let microarchitectural_signatures = build_hot_path_microarchitectural_signatures(
+        report,
+        counter_capture_summary,
+        microarchitectural_context,
+    );
+    let wall_time_components = build_hot_path_wall_time_components(report);
     let cost_components = build_hot_path_cost_components(report);
     let top_opcodes = build_hot_path_opcode_profile(report)
         .opcodes
@@ -1155,7 +2242,7 @@ pub fn build_hot_path_actionable_ranking(
         .collect();
 
     HotPathActionableRanking {
-        schema_version: HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2.to_owned(),
+        schema_version: HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3.to_owned(),
         bead_id: report.bead_id.clone(),
         run_id: report.run_id.clone(),
         trace_id: report.trace_id.clone(),
@@ -1166,7 +2253,11 @@ pub fn build_hot_path_actionable_ranking(
         scale: report.scale,
         concurrency: report.concurrency,
         replay_command: report.replay_command.clone(),
+        baseline_reuse_ledger,
+        baseline_waste_ledger,
         named_hotspots,
+        microarchitectural_signatures,
+        wall_time_components,
         cost_components,
         allocator_pressure,
         top_opcodes,
@@ -1176,6 +2267,9 @@ pub fn build_hot_path_actionable_ranking(
 pub fn write_hot_path_profile_artifacts(
     report: &HotPathProfileReport,
     output_dir: &Path,
+    counter_capture_summary: Option<HotPathCounterCaptureManifestSummary>,
+    provenance: Option<HotPathArtifactProvenance>,
+    microarchitectural_context: Option<HotPathMicroarchitecturalContext>,
 ) -> std::io::Result<HotPathArtifactManifest> {
     std::fs::create_dir_all(output_dir)?;
 
@@ -1187,7 +2281,11 @@ pub fn write_hot_path_profile_artifacts(
     let subsystem_profile = build_hot_path_subsystem_profile(report);
     let subsystem_profile_json = serde_json::to_string_pretty(&subsystem_profile)
         .map_err(|error| std::io::Error::other(format!("subsystem profile JSON: {error}")))?;
-    let actionable_ranking = build_hot_path_actionable_ranking(report);
+    let actionable_ranking = build_hot_path_actionable_ranking(
+        report,
+        counter_capture_summary.as_ref(),
+        microarchitectural_context.as_ref(),
+    );
     let actionable_ranking_json = serde_json::to_string_pretty(&actionable_ranking)
         .map_err(|error| std::io::Error::other(format!("actionable ranking JSON: {error}")))?;
     let summary_md = render_hot_path_profile_markdown(report);
@@ -1219,8 +2317,8 @@ pub fn write_hot_path_profile_artifacts(
         golden_dir: report.golden_dir.clone(),
         working_base: report.working_base.clone(),
         replay_command: report.replay_command.clone(),
-        counter_capture_summary: None,
-        provenance: None,
+        counter_capture_summary,
+        provenance,
         files: vec![
             HotPathArtifactFile {
                 path: "profile.json".to_owned(),
@@ -1246,7 +2344,9 @@ pub fn write_hot_path_profile_artifacts(
             HotPathArtifactFile {
                 path: "actionable_ranking.json".to_owned(),
                 bytes: u64::try_from(actionable_ranking_json.len()).unwrap_or(u64::MAX),
-                description: "structured hotspot-to-bead ledger for D2-D4 handoff".to_owned(),
+                description:
+                    "structured hotspot, reuse, and baseline-waste ledger for follow-on implementation work"
+                        .to_owned(),
             },
         ],
     };
@@ -1507,6 +2607,12 @@ mod tests {
         OpcodeExecutionCount, ValueTypeMetricsSnapshot, VdbeMetricsSnapshot,
     };
 
+    fn hot_path_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        super::HOT_PATH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
     fn sample_hot_path_profile_report(
         config: &FsqliteHotPathProfileConfig,
     ) -> HotPathProfileReport {
@@ -1538,6 +2644,14 @@ mod tests {
             error: None,
             first_failure_diagnostic: None,
             storage_wiring: Some(storage_wiring),
+            runtime_phase_timing: Some(crate::report::RuntimePhaseTimingEvidence {
+                retry_backoff_time_ns: 800_000,
+                busy_attempt_time_ns: 1_200_000,
+                begin_boundary_time_ns: 500_000,
+                body_execution_time_ns: 7_500,
+                commit_finalize_time_ns: 700_000,
+                rollback_time_ns: 300_000,
+            }),
             hot_path_profile: None,
         };
         let snapshot = HotPathProfileSnapshot {
@@ -1629,10 +2743,10 @@ mod tests {
         build_hot_path_profile_report(
             "smoke",
             config,
-            "bd-db300.4.1-smoke".to_owned(),
+            format!("{}-smoke", config.bead_id()),
             format!(
                 "{}:smoke:c1",
-                hot_path_profile_scenario_id(&config.workload)
+                hot_path_profile_scenario_id(config.scenario_prefix(), &config.workload)
             ),
             engine_report,
             snapshot,
@@ -1791,6 +2905,8 @@ mod tests {
                     .to_owned(),
             golden_dir: Some("sample_sqlite_db_files/golden".to_owned()),
             working_base: Some("sample_sqlite_db_files/working".to_owned()),
+            bead_id: None,
+            scenario_prefix: None,
         };
 
         let report = sample_hot_path_profile_report(&config);
@@ -1816,7 +2932,54 @@ mod tests {
         );
 
         let artifact_dir = tempdir.path().join("artifacts");
-        let manifest = write_hot_path_profile_artifacts(&report, &artifact_dir).unwrap();
+        let counter_capture_summary = HotPathCounterCaptureManifestSummary {
+            host_capability_sensitive_captures: vec!["topdown".to_owned()],
+            topology_sensitive_captures: vec!["cache_to_cache".to_owned()],
+            fallback_tools: vec!["perf-stat".to_owned()],
+            fallback_metric_pack: vec!["cache-misses".to_owned()],
+            fallback_notes: vec!["cache_to_cache: perf c2c unavailable".to_owned()],
+            raw_output_relpaths: vec!["profiles/perf-c2c.profiler_safe.data".to_owned()],
+        };
+        let provenance = HotPathArtifactProvenance {
+            row_id: "hot_page_contention_c4".to_owned(),
+            mode_id: "fsqlite_mvcc".to_owned(),
+            artifact_root: artifact_dir.display().to_string(),
+            command_entrypoint: report.replay_command.clone(),
+            workspace_root: Some(tempdir.path().display().to_string()),
+            campaign_manifest_path: Some(
+                "sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json".to_owned(),
+            ),
+            source_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            beads_data_hash: Some("a".repeat(64)),
+            kernel_release: "Linux 6.13.5-test".to_owned(),
+            rustc_version: "rustc 1.91.0-nightly".to_owned(),
+            cargo_profile: "release-perf".to_owned(),
+            commands: vec![crate::fixture_select::BenchmarkArtifactCommand {
+                tool: "realdb-e2e".to_owned(),
+                command_line: report.replay_command.clone(),
+            }],
+            tool_versions: vec![crate::fixture_select::BenchmarkArtifactToolVersion {
+                tool: "cargo".to_owned(),
+                version: "cargo 1.91.0-nightly".to_owned(),
+            }],
+            fallback_notes: counter_capture_summary.fallback_notes.clone(),
+        };
+        let microarchitectural_context = HotPathMicroarchitecturalContext {
+            fixture_id: report.fixture_id.clone(),
+            row_id: provenance.row_id.clone(),
+            mode_id: provenance.mode_id.clone(),
+            placement_profile_id: Some("baseline_unpinned".to_owned()),
+            hardware_class_id: Some("linux_x86_64_any".to_owned()),
+            hardware_signature: Some("linux:x86_64:any".to_owned()),
+        };
+        let manifest = write_hot_path_profile_artifacts(
+            &report,
+            &artifact_dir,
+            Some(counter_capture_summary.clone()),
+            Some(provenance.clone()),
+            Some(microarchitectural_context.clone()),
+        )
+        .unwrap();
         let opcode_profile: HotPathOpcodeProfilePack = serde_json::from_slice(
             &std::fs::read(artifact_dir.join("opcode_profile.json")).unwrap(),
         )
@@ -1849,6 +3012,19 @@ mod tests {
         assert!(artifact_dir.join("manifest.json").exists());
         assert_eq!(manifest.files.len(), 6);
         assert_eq!(
+            manifest.counter_capture_summary,
+            Some(counter_capture_summary.clone())
+        );
+        assert_eq!(manifest.provenance, Some(provenance.clone()));
+        let disk_manifest: HotPathArtifactManifest =
+            serde_json::from_slice(&std::fs::read(artifact_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            disk_manifest.counter_capture_summary,
+            Some(counter_capture_summary)
+        );
+        assert_eq!(disk_manifest.provenance, Some(provenance));
+        assert_eq!(
             opcode_profile.schema_version,
             HOT_PATH_OPCODE_PROFILE_SCHEMA_V1
         );
@@ -1858,11 +3034,15 @@ mod tests {
         );
         assert_eq!(
             actionable_ranking.schema_version,
-            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2
+            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3
         );
         assert!(!opcode_profile.opcodes.is_empty());
         assert!(!subsystem_profile.subsystem_ranking.is_empty());
+        assert!(!actionable_ranking.baseline_reuse_ledger.is_empty());
+        assert!(!actionable_ranking.baseline_waste_ledger.is_empty());
         assert!(!actionable_ranking.named_hotspots.is_empty());
+        assert_eq!(actionable_ranking.microarchitectural_signatures.len(), 6);
+        assert_eq!(actionable_ranking.wall_time_components.len(), 6);
         assert!(!actionable_ranking.cost_components.is_empty());
         assert_eq!(actionable_ranking.allocator_pressure.len(), 3);
         assert_eq!(
@@ -1877,18 +3057,72 @@ mod tests {
         assert!(
             std::fs::read_to_string(artifact_dir.join("summary.md"))
                 .unwrap()
-                .contains("## Quantified Cost Components")
+                .contains("## Baseline Reuse Ledger")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Baseline Waste Ledger")
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Wall-Time Decomposition")
         );
         assert!(
             actionable_ranking
                 .named_hotspots
                 .iter()
                 .flat_map(|entry| entry.mapped_beads.iter())
-                .any(|bead| bead == "bd-db300.4.2"
-                    || bead == "bd-db300.4.3"
-                    || bead == "bd-db300.4.4")
+                .any(|bead| bead == "bd-db300.10.2"
+                    || bead == "bd-db300.10.4"
+                    || bead == "bd-db300.10.5"
+                    || bead == "bd-db300.10.6"
+                    || bead == "bd-db300.10.7")
         );
         assert_eq!(actionable_ranking.cost_components.len(), 3);
+        let wall_component_names = actionable_ranking
+            .wall_time_components
+            .iter()
+            .map(|entry| entry.component.as_str())
+            .collect::<Vec<_>>();
+        assert!(wall_component_names.contains(&"queueing"));
+        assert!(wall_component_names.contains(&"synchronization"));
+        assert!(wall_component_names.contains(&"retry"));
+        assert!(wall_component_names.contains(&"service"));
+        assert!(wall_component_names.contains(&"allocator_copy"));
+        assert!(wall_component_names.contains(&"durability"));
+        assert!(
+            actionable_ranking
+                .microarchitectural_signatures
+                .iter()
+                .all(|entry| entry.fixture_id == report.fixture_id)
+        );
+        assert!(
+            actionable_ranking
+                .microarchitectural_signatures
+                .iter()
+                .all(|entry| entry.row_id.as_deref()
+                    == Some(microarchitectural_context.row_id.as_str()))
+        );
+        assert!(
+            actionable_ranking
+                .microarchitectural_signatures
+                .iter()
+                .all(|entry| entry.mode_id.as_deref()
+                    == Some(microarchitectural_context.mode_id.as_str()))
+        );
+        assert!(
+            actionable_ranking
+                .microarchitectural_signatures
+                .iter()
+                .all(
+                    |entry| entry.placement_profile_id.as_deref() == Some("baseline_unpinned")
+                        && entry.hardware_class_id.as_deref() == Some("linux_x86_64_any")
+                        && entry.hardware_signature.as_deref() == Some("linux:x86_64:any")
+                        && !entry.evidence_sources.is_empty()
+                )
+        );
         let component_names = actionable_ranking
             .cost_components
             .iter()
@@ -1911,7 +3145,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             parser_component.mapped_beads,
-            vec!["bd-db300.4.2".to_owned(), "bd-db300.4.2.1".to_owned()]
+            vec!["bd-db300.10.2".to_owned(), "bd-db300.10.4".to_owned()]
         );
         assert!(!parser_component.implication.is_empty());
 
@@ -1922,7 +3156,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             record_decode_component.mapped_beads,
-            vec!["bd-db300.4.3".to_owned(), "bd-db300.4.4".to_owned()]
+            vec!["bd-db300.10.2".to_owned(), "bd-db300.10.5".to_owned()]
         );
         assert!(!record_decode_component.implication.is_empty());
 
@@ -1933,13 +3167,96 @@ mod tests {
             .unwrap();
         assert_eq!(
             row_materialization_component.mapped_beads,
-            vec!["bd-db300.4.3".to_owned(), "bd-db300.4.3.1".to_owned()]
+            vec![
+                "bd-db300.10.2".to_owned(),
+                "bd-db300.10.6".to_owned(),
+                "bd-db300.10.7".to_owned(),
+            ]
         );
         assert!(!row_materialization_component.implication.is_empty());
+
+        let parse_cache_reuse = actionable_ranking
+            .baseline_reuse_ledger
+            .iter()
+            .find(|entry| entry.surface == "statement_parse_cache")
+            .unwrap();
+        assert!(parse_cache_reuse.supported);
+        assert_eq!(parse_cache_reuse.hit_rate_basis_points, Some(5_000));
+        assert_eq!(
+            parse_cache_reuse.mapped_beads,
+            vec!["bd-db300.10.4".to_owned()]
+        );
+
+        let page_data_reuse_gap = actionable_ranking
+            .baseline_reuse_ledger
+            .iter()
+            .find(|entry| entry.surface == "page_data_ownership_reuse")
+            .unwrap();
+        assert!(!page_data_reuse_gap.supported);
+        assert_eq!(page_data_reuse_gap.hit_rate_basis_points, None);
+        assert_eq!(
+            page_data_reuse_gap.mapped_beads,
+            vec!["bd-db300.10.6".to_owned()]
+        );
+
+        let parser_waste = actionable_ranking
+            .baseline_waste_ledger
+            .iter()
+            .find(|entry| entry.component == "parser_prepare_churn")
+            .unwrap();
+        assert_eq!(parser_waste.classification, "baseline_tax");
+        assert_eq!(parser_waste.metric_kind, "time_ns");
+        assert_eq!(
+            parser_waste.mapped_beads,
+            vec!["bd-db300.10.2".to_owned(), "bd-db300.10.4".to_owned()]
+        );
+
+        let busy_retry_spillover = actionable_ranking
+            .baseline_waste_ledger
+            .iter()
+            .find(|entry| entry.component == "busy_retry_queueing")
+            .unwrap();
+        assert_eq!(
+            busy_retry_spillover.classification,
+            "structural_side_effect"
+        );
+        assert_eq!(busy_retry_spillover.metric_value, 2_000_000);
+        assert_eq!(
+            busy_retry_spillover.mapped_beads,
+            vec!["bd-db300.2.4".to_owned()]
+        );
+    }
+
+    #[test]
+    fn hot_path_profile_smoke_respects_bead_override() {
+        let config = FsqliteHotPathProfileConfig {
+            workload: "hot_page_contention".to_owned(),
+            seed: 7,
+            scale: 6,
+            concurrency: 1,
+            exec_config: crate::fsqlite_executor::FsqliteExecConfig {
+                concurrent_mode: true,
+                run_integrity_check: false,
+                ..crate::fsqlite_executor::FsqliteExecConfig::default()
+            },
+            replay_command:
+                "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db smoke --workload hot_page_contention"
+                    .to_owned(),
+            golden_dir: Some("sample_sqlite_db_files/golden".to_owned()),
+            working_base: Some("sample_sqlite_db_files/working".to_owned()),
+            bead_id: Some("bd-db300.1.3".to_owned()),
+            scenario_prefix: None,
+        };
+
+        let report = sample_hot_path_profile_report(&config);
+
+        assert_eq!(report.bead_id, "bd-db300.1.3");
+        assert_eq!(report.scenario_id, "bd-db300.1.3.hot_page_contention");
     }
 
     #[test]
     fn hot_path_profile_scope_rejects_reentrant_entry() {
+        let _guard = hot_path_test_guard();
         reset_hot_path_profile();
         set_hot_path_profile_enabled(false);
 

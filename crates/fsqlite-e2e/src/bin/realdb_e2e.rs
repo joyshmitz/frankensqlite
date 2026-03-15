@@ -38,7 +38,8 @@ use fsqlite_e2e::fixture_metadata::{
 };
 use fsqlite_e2e::fixture_select::{
     BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BeadsBenchmarkCampaign, BenchmarkArtifactCommand,
-    BenchmarkArtifactToolVersion, load_beads_benchmark_campaign,
+    BenchmarkArtifactToolVersion, BenchmarkMode, PLACEMENT_PROFILE_BASELINE_UNPINNED,
+    load_beads_benchmark_campaign,
 };
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
@@ -46,10 +47,10 @@ use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::perf_runner::{
     FsqliteHotPathProfileConfig, HotPathArtifactFile, HotPathArtifactManifest,
-    HotPathArtifactProvenance, HotPathCounterCaptureManifestSummary, HotPathProfileReport,
-    build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
-    build_hot_path_subsystem_profile, profile_fsqlite_hot_path, render_hot_path_profile_markdown,
-    write_hot_path_profile_artifacts,
+    HotPathArtifactProvenance, HotPathCounterCaptureManifestSummary,
+    HotPathMicroarchitecturalContext, HotPathProfileReport, build_hot_path_actionable_ranking,
+    build_hot_path_opcode_profile, build_hot_path_subsystem_profile, profile_fsqlite_hot_path,
+    render_hot_path_profile_markdown, write_hot_path_profile_artifacts,
 };
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
@@ -123,6 +124,19 @@ fn find_bench_workspace_root(start: &Path) -> Option<PathBuf> {
         .ancestors()
         .find(|dir| dir.join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE).is_file())
         .map(Path::to_path_buf)
+}
+
+fn resolve_hot_path_workspace_root_candidate(candidate: &Path) -> Option<PathBuf> {
+    let normalized = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.to_path_buf());
+    if normalized
+        .join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE)
+        .is_file()
+    {
+        return Some(normalized);
+    }
+    find_bench_workspace_root(&normalized)
 }
 
 fn canonical_bench_defaults(workspace_root: &Path) -> Result<BenchCampaignDefaults, String> {
@@ -232,6 +246,16 @@ struct HotProfileReplayCommand<'a> {
     run_integrity_check: bool,
 }
 
+const HOT_PATH_BEAD_ID_ENV: &str = "FSQLITE_HOT_PATH_BEAD_ID";
+const HOT_PATH_CAMPAIGN_MANIFEST_PATH_ENV: &str = "FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH";
+const HOT_PATH_CARGO_PROFILE_ENV: &str = "FSQLITE_HOT_PATH_CARGO_PROFILE";
+const HOT_PATH_WORKSPACE_ROOT_ENV: &str = "FSQLITE_HOT_PATH_WORKSPACE_ROOT";
+const HOT_PATH_SOURCE_REVISION_ENV: &str = "FSQLITE_HOT_PATH_SOURCE_REVISION";
+const HOT_PATH_BEADS_DATA_HASH_ENV: &str = "FSQLITE_HOT_PATH_BEADS_DATA_HASH";
+const HOT_PATH_PLACEMENT_PROFILE_ID_ENV: &str = "FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID";
+const HOT_PATH_HARDWARE_CLASS_ID_ENV: &str = "FSQLITE_HOT_PATH_HARDWARE_CLASS_ID";
+const HOT_PATH_HARDWARE_SIGNATURE_ENV: &str = "FSQLITE_HOT_PATH_HARDWARE_SIGNATURE";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct HotPathEvidenceCommandPack {
     schema_version: String,
@@ -276,9 +300,45 @@ struct HotPathEvidenceCommand {
     counter_pack: Option<HotPathCounterPackMetadata>,
 }
 
-fn format_hot_profile_replay_command(command: &HotProfileReplayCommand<'_>) -> String {
-    let mut rendered =
-        String::from("rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile");
+fn hot_path_override_env(name: &'static str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn current_hot_path_replay_env_overrides() -> Vec<(&'static str, String)> {
+    [
+        HOT_PATH_BEAD_ID_ENV,
+        HOT_PATH_CAMPAIGN_MANIFEST_PATH_ENV,
+        HOT_PATH_CARGO_PROFILE_ENV,
+        HOT_PATH_WORKSPACE_ROOT_ENV,
+        HOT_PATH_SOURCE_REVISION_ENV,
+        HOT_PATH_BEADS_DATA_HASH_ENV,
+        HOT_PATH_PLACEMENT_PROFILE_ID_ENV,
+        HOT_PATH_HARDWARE_CLASS_ID_ENV,
+        HOT_PATH_HARDWARE_SIGNATURE_ENV,
+    ]
+    .into_iter()
+    .filter_map(|name| hot_path_override_env(name).map(|value| (name, value)))
+    .collect()
+}
+
+fn format_hot_profile_replay_command_with_env_overrides(
+    command: &HotProfileReplayCommand<'_>,
+    env_overrides: &[(&'static str, String)],
+) -> String {
+    let mut rendered = String::from("rch exec --");
+    if !env_overrides.is_empty() {
+        rendered.push_str(" env");
+        for (name, value) in env_overrides {
+            rendered.push(' ');
+            rendered.push_str(name);
+            rendered.push('=');
+            rendered.push_str(&shell_escape(value));
+        }
+    }
+    rendered.push_str(" cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile");
     for (flag, value) in [
         ("--db", command.db.to_owned()),
         ("--workload", command.workload.to_owned()),
@@ -321,6 +381,13 @@ fn format_hot_profile_replay_command(command: &HotProfileReplayCommand<'_>) -> S
         rendered.push_str(" --integrity-check");
     }
     rendered
+}
+
+fn format_hot_profile_replay_command(command: &HotProfileReplayCommand<'_>) -> String {
+    format_hot_profile_replay_command_with_env_overrides(
+        command,
+        &current_hot_path_replay_env_overrides(),
+    )
 }
 
 fn hot_path_output_path(output_dir: &Path, relpath: &str) -> String {
@@ -893,8 +960,119 @@ fn hot_path_mode_id(concurrent_mode: bool) -> &'static str {
     }
 }
 
+fn hot_path_benchmark_mode(concurrent_mode: bool) -> BenchmarkMode {
+    if concurrent_mode {
+        BenchmarkMode::FsqliteMvcc
+    } else {
+        BenchmarkMode::FsqliteSingleWriter
+    }
+}
+
+fn hot_path_hardware_signature(
+    campaign: &BeadsBenchmarkCampaign,
+    hardware_class_id: &str,
+) -> Option<String> {
+    let hardware_class = campaign
+        .hardware_classes
+        .iter()
+        .find(|hardware| hardware.id == hardware_class_id)?;
+    Some(format!(
+        "{}:{}:{}",
+        hardware_class.id_fields.os_family.as_str(),
+        hardware_class.id_fields.cpu_arch.as_str(),
+        hardware_class.id_fields.topology_class.as_str()
+    ))
+}
+
+fn hot_path_fixture_matches_report_fixture(
+    campaign: &BeadsBenchmarkCampaign,
+    campaign_fixture_id: &str,
+    report_fixture_id: &str,
+) -> bool {
+    if campaign_fixture_id == report_fixture_id {
+        return true;
+    }
+    campaign
+        .fixtures
+        .iter()
+        .find(|fixture| fixture.fixture_id == campaign_fixture_id)
+        .and_then(|fixture| {
+            Path::new(&fixture.working_copy_relpath)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+        })
+        .is_some_and(|stem| stem == report_fixture_id)
+}
+
+fn resolve_hot_path_microarchitectural_context(
+    workspace_root: Option<&Path>,
+    report: &HotPathProfileReport,
+) -> HotPathMicroarchitecturalContext {
+    let row_id = hot_path_row_id(&report.workload, report.concurrency);
+    let mode_id = hot_path_mode_id(report.concurrent_mode).to_owned();
+    let mut context = HotPathMicroarchitecturalContext {
+        fixture_id: report.fixture_id.clone(),
+        row_id: row_id.clone(),
+        mode_id,
+        placement_profile_id: None,
+        hardware_class_id: None,
+        hardware_signature: None,
+    };
+    let placement_profile_id_override = hot_path_override_env(HOT_PATH_PLACEMENT_PROFILE_ID_ENV);
+    let hardware_class_id_override = hot_path_override_env(HOT_PATH_HARDWARE_CLASS_ID_ENV);
+    let hardware_signature_override = hot_path_override_env(HOT_PATH_HARDWARE_SIGNATURE_ENV);
+    if placement_profile_id_override.is_some()
+        || hardware_class_id_override.is_some()
+        || hardware_signature_override.is_some()
+    {
+        context.placement_profile_id = placement_profile_id_override;
+        context.hardware_class_id = hardware_class_id_override;
+        context.hardware_signature = hardware_signature_override;
+        return context;
+    }
+    let Some(workspace_root) = workspace_root else {
+        return context;
+    };
+    let Ok(campaign) = load_beads_benchmark_campaign(workspace_root) else {
+        return context;
+    };
+    let Some(row) = campaign.matrix_rows.iter().find(|candidate| {
+        candidate.row_id == row_id
+            && candidate.workload == report.workload
+            && candidate.concurrency == report.concurrency
+            && candidate.fixtures.iter().any(|fixture| {
+                hot_path_fixture_matches_report_fixture(&campaign, fixture, &report.fixture_id)
+            })
+            && candidate
+                .modes
+                .contains(&hot_path_benchmark_mode(report.concurrent_mode))
+    }) else {
+        return context;
+    };
+    let Some(placement_variant) = row
+        .placement_variants
+        .iter()
+        .find(|variant| variant.placement_profile_id == PLACEMENT_PROFILE_BASELINE_UNPINNED)
+        .or_else(|| {
+            row.placement_variants
+                .iter()
+                .find(|variant| variant.required)
+        })
+        .or_else(|| row.placement_variants.first())
+    else {
+        return context;
+    };
+    context.placement_profile_id = Some(placement_variant.placement_profile_id.clone());
+    context.hardware_class_id = Some(placement_variant.hardware_class_id.clone());
+    context.hardware_signature =
+        hot_path_hardware_signature(&campaign, &placement_variant.hardware_class_id);
+    context
+}
+
 fn current_hot_path_cargo_profile() -> String {
-    std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_owned())
+    hot_path_override_env(HOT_PATH_CARGO_PROFILE_ENV)
+        .or_else(|| std::env::var("PROFILE").ok())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn resolve_hot_path_workspace_root(
@@ -902,10 +1080,18 @@ fn resolve_hot_path_workspace_root(
     golden_dir: &Path,
     working_base: &Path,
 ) -> Option<PathBuf> {
+    if let Some(workspace_root) = hot_path_override_env(HOT_PATH_WORKSPACE_ROOT_ENV) {
+        if let Some(workspace_root) =
+            resolve_hot_path_workspace_root_candidate(Path::new(&workspace_root))
+        {
+            return Some(workspace_root);
+        }
+    }
     let mut candidates = Vec::new();
     if let Ok(current_dir) = std::env::current_dir() {
         candidates.push(current_dir);
     }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     for path in [output_dir, golden_dir, working_base] {
         let candidate = if path.is_absolute() {
             path.to_path_buf()
@@ -918,8 +1104,7 @@ fn resolve_hot_path_workspace_root(
     }
 
     for candidate in candidates {
-        let normalized = candidate.canonicalize().unwrap_or(candidate);
-        if let Some(workspace_root) = find_bench_workspace_root(&normalized) {
+        if let Some(workspace_root) = resolve_hot_path_workspace_root_candidate(&candidate) {
             return Some(workspace_root);
         }
     }
@@ -971,6 +1156,9 @@ fn push_hot_path_tool_version(tool_versions: &mut Vec<BenchmarkArtifactToolVersi
 }
 
 fn resolve_hot_path_source_revision(workspace_root: &Path) -> Option<String> {
+    if let Some(source_revision) = hot_path_override_env(HOT_PATH_SOURCE_REVISION_ENV) {
+        return Some(source_revision);
+    }
     let output = Command::new("git")
         .args([
             "-C",
@@ -988,6 +1176,9 @@ fn resolve_hot_path_source_revision(workspace_root: &Path) -> Option<String> {
 }
 
 fn resolve_hot_path_beads_data_hash(workspace_root: &Path) -> Option<String> {
+    if let Some(beads_data_hash) = hot_path_override_env(HOT_PATH_BEADS_DATA_HASH_ENV) {
+        return Some(beads_data_hash);
+    }
     let campaign = load_beads_benchmark_campaign(workspace_root).ok()?;
     let beads_path = workspace_root.join(campaign.beads_data_relpath);
     let bytes = fs::read(beads_path).ok()?;
@@ -1005,18 +1196,26 @@ fn resolve_hot_path_artifact_provenance_inputs(
     let workspace_root = resolve_hot_path_workspace_root(output_dir, golden_dir, working_base);
     let workspace_root_string = workspace_root
         .as_ref()
-        .map(|root| root.display().to_string());
-    let campaign_manifest_path = workspace_root.as_ref().and_then(|root| {
-        root.join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE)
-            .is_file()
-            .then(|| BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE.to_owned())
+        .map(|root| root.display().to_string())
+        .or_else(|| hot_path_override_env(HOT_PATH_WORKSPACE_ROOT_ENV));
+    let campaign_manifest_path = hot_path_override_env(HOT_PATH_CAMPAIGN_MANIFEST_PATH_ENV)
+        .or_else(|| {
+            workspace_root.as_ref().and_then(|root| {
+                root.join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE)
+                    .is_file()
+                    .then(|| BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE.to_owned())
+            })
+        });
+    let source_revision = hot_path_override_env(HOT_PATH_SOURCE_REVISION_ENV).or_else(|| {
+        workspace_root
+            .as_ref()
+            .and_then(|root| resolve_hot_path_source_revision(root))
     });
-    let source_revision = workspace_root
-        .as_ref()
-        .and_then(|root| resolve_hot_path_source_revision(root));
-    let beads_data_hash = workspace_root
-        .as_ref()
-        .and_then(|root| resolve_hot_path_beads_data_hash(root));
+    let beads_data_hash = hot_path_override_env(HOT_PATH_BEADS_DATA_HASH_ENV).or_else(|| {
+        workspace_root
+            .as_ref()
+            .and_then(|root| resolve_hot_path_beads_data_hash(root))
+    });
     let mut tool_versions = Vec::new();
     for tool in ["cargo", "git", "rch", "rustc"] {
         push_hot_path_tool_version(&mut tool_versions, tool);
@@ -3650,6 +3849,8 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         replay_command: format_hot_profile_replay_command(&replay_command),
         golden_dir: Some(golden_dir.display().to_string()),
         working_base: Some(working_base.display().to_string()),
+        bead_id: hot_path_override_env(HOT_PATH_BEAD_ID_ENV),
+        scenario_prefix: None,
     };
 
     let report = match profile_fsqlite_hot_path(&profile_db.db_path, &db, &config) {
@@ -3659,6 +3860,9 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             return 1;
         }
     };
+    let workspace_root = resolve_hot_path_workspace_root(&output_dir, &golden_dir, &working_base);
+    let microarchitectural_context =
+        resolve_hot_path_microarchitectural_context(workspace_root.as_deref(), &report);
     let command_pack = build_hot_path_command_pack(&report, &replay_command);
     let counter_capture_summary = build_hot_path_counter_capture_summary(&command_pack);
     let provenance_inputs = resolve_hot_path_artifact_provenance_inputs(
@@ -3673,14 +3877,19 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         counter_capture_summary.as_ref(),
         provenance_inputs,
     );
-    let mut manifest = match write_hot_path_profile_artifacts(&report, &output_dir) {
+    let manifest = match write_hot_path_profile_artifacts(
+        &report,
+        &output_dir,
+        counter_capture_summary.clone(),
+        Some(provenance),
+        Some(microarchitectural_context.clone()),
+    ) {
         Ok(manifest) => manifest,
         Err(error) => {
             eprintln!("error: failed to write hot-path artifacts: {error}");
             return 1;
         }
     };
-    manifest.provenance = Some(provenance);
     let command_pack_bytes = match write_hot_path_command_pack(&output_dir, &command_pack) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -3708,7 +3917,12 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
     };
 
     if emit_inline_bundle {
-        match serialize_hot_path_inline_bundle(&report, &manifest, &command_pack) {
+        match serialize_hot_path_inline_bundle(
+            &report,
+            &manifest,
+            &command_pack,
+            Some(&microarchitectural_context),
+        ) {
             Ok(json) => eprintln!("{HOT_PATH_INLINE_BUNDLE_PREFIX}{json}"),
             Err(error) => {
                 eprintln!("error: failed to serialize hot-path inline bundle: {error}");
@@ -3770,10 +3984,15 @@ fn serialize_hot_path_inline_bundle(
     report: &HotPathProfileReport,
     manifest: &HotPathArtifactManifest,
     command_pack: &HotPathEvidenceCommandPack,
+    microarchitectural_context: Option<&HotPathMicroarchitecturalContext>,
 ) -> Result<String, serde_json::Error> {
     let opcode_profile = build_hot_path_opcode_profile(report);
     let subsystem_profile = build_hot_path_subsystem_profile(report);
-    let actionable_ranking = build_hot_path_actionable_ranking(report);
+    let actionable_ranking = build_hot_path_actionable_ranking(
+        report,
+        manifest.counter_capture_summary.as_ref(),
+        microarchitectural_context,
+    );
     let summary_markdown = render_hot_path_profile_markdown(report);
     serde_json::to_string(&serde_json::json!({
         "schema_version": HOT_PATH_INLINE_BUNDLE_SCHEMA_V1,
@@ -4852,8 +5071,22 @@ fn cmd_compare(argv: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_e2e::fixture_select::{
+        BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1, BEADS_BENCHMARK_CAMPAIGN_SCHEMA_V1,
+        BeadsBenchmarkCampaign, BeadsBenchmarkFixture, BeadsBenchmarkMatrixRow,
+        BenchmarkArtifactContract, BenchmarkArtifactProvenanceCapture,
+        BenchmarkArtifactRetentionClass, BenchmarkArtifactRetentionPolicy, BenchmarkMode,
+        BuildProfile, ExpandedBenchmarkCell, HARDWARE_CLASS_LINUX_X86_64_ANY, HardwareClass,
+        HardwareClassIdFields, HardwareCpuArchitecture, HardwareOsFamily, HardwareTopologyClass,
+        PlacementAvailability, PlacementClaimContract, PlacementCpuAffinityPolicy,
+        PlacementExecutionContract, PlacementFocusedRerunContract,
+        PlacementFocusedRerunSelectorKind, PlacementHelperLanePolicy, PlacementMemoryPolicy,
+        PlacementProfile, PlacementProfileKind, PlacementSmtPolicy,
+        PlacementSuiteSelectionContract, PlacementSuiteSelectorKind, PlacementVariant,
+        PlacementViolationDisposition, RetryPolicy, SeedPolicy, build_benchmark_artifact_manifest,
+    };
     use fsqlite_e2e::perf_runner::{
-        HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2,
+        HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3,
         HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
         HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1, HotPathAllocatorPressure, HotPathArtifactFile,
         HotPathArtifactManifest, HotPathOpcodeProfileEntry, HotPathParserProfile,
@@ -4864,6 +5097,15 @@ mod tests {
     use jsonschema::{Draft, options};
     use serde_json::Value;
 
+    const HOT_PATH_MANIFEST_SCHEMA_PATH: &str =
+        "sample_sqlite_db_files/manifests/hot_path_profile_manifest.v1.schema.json";
+    const BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_PATH: &str =
+        "sample_sqlite_db_files/manifests/beads_benchmark_artifact_manifest.v1.schema.json";
+    #[allow(clippy::needless_raw_string_hashes)]
+    const HOT_PATH_MANIFEST_SCHEMA_RAW: &str = r###"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://frankensqlite.dev/schemas/hot_path_profile_manifest.v1.schema.json","title":"FrankenSQLite Hot Path Profile Manifest v1","type":"object","additionalProperties":false,"required":["schema_version","bead_id","run_id","trace_id","scenario_id","fixture_id","workload","seed","scale","concurrency","concurrent_mode","run_integrity_check","replay_command","files"],"properties":{"schema_version":{"type":"string","const":"fsqlite-e2e.hot_path_profile_manifest.v1"},"bead_id":{"$ref":"#/$defs/id"},"run_id":{"$ref":"#/$defs/id"},"trace_id":{"$ref":"#/$defs/id"},"scenario_id":{"$ref":"#/$defs/id"},"fixture_id":{"$ref":"#/$defs/id"},"workload":{"$ref":"#/$defs/non_empty_string"},"seed":{"type":"integer","minimum":0},"scale":{"type":"integer","minimum":1},"concurrency":{"type":"integer","minimum":1},"concurrent_mode":{"type":"boolean"},"run_integrity_check":{"type":"boolean"},"golden_dir":{"$ref":"#/$defs/nullable_non_empty_string"},"working_base":{"$ref":"#/$defs/nullable_non_empty_string"},"replay_command":{"$ref":"#/$defs/non_empty_string"},"counter_capture_summary":{"$ref":"#/$defs/counter_capture_summary"},"provenance":{"$ref":"#/$defs/provenance"},"files":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/artifact_file"}}},"$defs":{"id":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._:-]*$"},"non_empty_string":{"type":"string","minLength":1},"nullable_non_empty_string":{"type":["string","null"],"minLength":1},"string_list":{"type":"array","items":{"$ref":"#/$defs/non_empty_string"}},"counter_capture_summary":{"type":"object","additionalProperties":false,"required":["host_capability_sensitive_captures","topology_sensitive_captures","fallback_tools","fallback_metric_pack","fallback_notes","raw_output_relpaths"],"properties":{"host_capability_sensitive_captures":{"$ref":"#/$defs/string_list"},"topology_sensitive_captures":{"$ref":"#/$defs/string_list"},"fallback_tools":{"$ref":"#/$defs/string_list"},"fallback_metric_pack":{"$ref":"#/$defs/string_list"},"fallback_notes":{"$ref":"#/$defs/string_list"},"raw_output_relpaths":{"$ref":"#/$defs/string_list"}}},"command":{"type":"object","additionalProperties":false,"required":["tool","command_line"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"command_line":{"$ref":"#/$defs/non_empty_string"}}},"tool_version":{"type":"object","additionalProperties":false,"required":["tool","version"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"version":{"$ref":"#/$defs/non_empty_string"}}},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"provenance":{"type":"object","additionalProperties":false,"required":["row_id","mode_id","artifact_root","command_entrypoint","kernel_release","rustc_version","cargo_profile","commands","tool_versions","fallback_notes"],"properties":{"row_id":{"$ref":"#/$defs/id"},"mode_id":{"$ref":"#/$defs/id"},"artifact_root":{"$ref":"#/$defs/non_empty_string"},"command_entrypoint":{"$ref":"#/$defs/non_empty_string"},"workspace_root":{"$ref":"#/$defs/nullable_non_empty_string"},"campaign_manifest_path":{"$ref":"#/$defs/nullable_non_empty_string"},"source_revision":{"$ref":"#/$defs/nullable_non_empty_string"},"beads_data_hash":{"oneOf":[{"$ref":"#/$defs/sha256"},{"type":"null"}]},"kernel_release":{"$ref":"#/$defs/non_empty_string"},"rustc_version":{"$ref":"#/$defs/non_empty_string"},"cargo_profile":{"$ref":"#/$defs/non_empty_string"},"commands":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/command"}},"tool_versions":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/tool_version"}},"fallback_notes":{"$ref":"#/$defs/string_list"}}},"artifact_file":{"type":"object","additionalProperties":false,"required":["path","bytes","description"],"properties":{"path":{"$ref":"#/$defs/non_empty_string"},"bytes":{"type":"integer","minimum":0},"description":{"$ref":"#/$defs/non_empty_string"}}}}}"###;
+    #[allow(clippy::needless_raw_string_hashes)]
+    const BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_RAW: &str = r###"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"https://frankensqlite.local/schemas/sample_sqlite_db_files/beads_benchmark_artifact_manifest.v1.schema.json","title":"FrankenSQLite Beads Benchmark Artifact Manifest (v1)","type":"object","additionalProperties":false,"required":["schema_version","campaign_id","campaign_manifest_path","row_id","fixture_id","workload","concurrency","mode","placement_profile_id","hardware_class_id","retry_policy_id","build_profile_id","seed_policy_id","run_id","artifact_bundle_key","artifact_bundle_name","artifact_bundle_dir","artifact_bundle_relpath","artifact_names","retention_policy","provenance"],"properties":{"schema_version":{"type":"string","const":"fsqlite-e2e.beads_benchmark_artifact_manifest.v1"},"campaign_id":{"$ref":"#/$defs/id"},"campaign_manifest_path":{"$ref":"#/$defs/non_empty_string"},"row_id":{"$ref":"#/$defs/id"},"fixture_id":{"$ref":"#/$defs/id"},"workload":{"$ref":"#/$defs/id"},"concurrency":{"type":"integer","minimum":1},"mode":{"type":"string","enum":["sqlite_reference","fsqlite_mvcc","fsqlite_single_writer"]},"placement_profile_id":{"$ref":"#/$defs/id"},"hardware_class_id":{"$ref":"#/$defs/id"},"retry_policy_id":{"$ref":"#/$defs/id"},"build_profile_id":{"$ref":"#/$defs/id"},"seed_policy_id":{"$ref":"#/$defs/id"},"run_id":{"$ref":"#/$defs/id"},"artifact_bundle_key":{"$ref":"#/$defs/non_empty_string"},"artifact_bundle_name":{"$ref":"#/$defs/non_empty_string"},"artifact_bundle_dir":{"$ref":"#/$defs/non_empty_string"},"artifact_bundle_relpath":{"$ref":"#/$defs/non_empty_string"},"artifact_names":{"$ref":"#/$defs/artifact_names"},"retention_policy":{"$ref":"#/$defs/retention_policy"},"provenance":{"$ref":"#/$defs/provenance"}},"$defs":{"id":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9._:-]*$"},"non_empty_string":{"type":"string","minLength":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},"retention_class":{"type":"string","enum":["quick_run","full_proof","failure_bundle","final_scorecard"]},"artifact_names":{"type":"object","additionalProperties":false,"required":["result_jsonl","summary_md","manifest_json","logs_dir","profiles_dir"],"properties":{"result_jsonl":{"$ref":"#/$defs/non_empty_string"},"summary_md":{"$ref":"#/$defs/non_empty_string"},"manifest_json":{"$ref":"#/$defs/non_empty_string"},"logs_dir":{"$ref":"#/$defs/non_empty_string"},"profiles_dir":{"$ref":"#/$defs/non_empty_string"}}},"retention_policy":{"type":"object","additionalProperties":false,"required":["class","description","superseded_by_newer","immutable","authoritative"],"properties":{"class":{"$ref":"#/$defs/retention_class"},"description":{"$ref":"#/$defs/non_empty_string"},"superseded_by_newer":{"type":"boolean"},"immutable":{"type":"boolean"},"authoritative":{"type":"boolean"}}},"command":{"type":"object","additionalProperties":false,"required":["tool","command_line"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"command_line":{"$ref":"#/$defs/non_empty_string"}}},"tool_version":{"type":"object","additionalProperties":false,"required":["tool","version"],"properties":{"tool":{"$ref":"#/$defs/non_empty_string"},"version":{"$ref":"#/$defs/non_empty_string"}}},"placement_cpu_affinity_policy":{"type":"string","enum":["scheduler_default","dedicated_local_one_thread_per_core","split_across_locality_domains"]},"placement_smt_policy":{"type":"string","enum":["host_default","one_thread_per_core","avoid_primary_sibling_reuse"]},"placement_memory_policy":{"type":"string","enum":["host_default","bind_local","match_cross_domain_placement"]},"placement_helper_lane_policy":{"type":"string","enum":["disclose_host_default","same_locality_housekeeping_core","outside_primary_worker_domains"]},"placement_suite_selector_kind":{"type":"string","enum":["matrix_placement_variant"]},"placement_focused_rerun_selector_kind":{"type":"string","enum":["explicit_bindings"]},"placement_violation_disposition":{"type":"string","enum":["not_comparable"]},"placement_suite_selection_contract":{"type":"object","additionalProperties":false,"required":["selector_kind","selector_field"],"properties":{"selector_kind":{"$ref":"#/$defs/placement_suite_selector_kind"},"selector_field":{"$ref":"#/$defs/non_empty_string"}}},"placement_focused_rerun_contract":{"type":"object","additionalProperties":false,"required":["selector_kind","required_bindings"],"properties":{"selector_kind":{"$ref":"#/$defs/placement_focused_rerun_selector_kind"},"required_bindings":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}}}},"placement_claim_contract":{"type":"object","additionalProperties":false,"required":["mandatory_for","optional_for","avoid_for"],"properties":{"mandatory_for":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"optional_for":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"avoid_for":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}}}},"placement_execution_contract":{"type":"object","additionalProperties":false,"required":["cpu_affinity_policy","smt_policy","memory_policy","helper_lane_policy","required_environment_disclosures","suite_selection","focused_rerun","fixed_knobs","optional_knobs","claim_contract","violation_disposition"],"properties":{"cpu_affinity_policy":{"$ref":"#/$defs/placement_cpu_affinity_policy"},"smt_policy":{"$ref":"#/$defs/placement_smt_policy"},"memory_policy":{"$ref":"#/$defs/placement_memory_policy"},"helper_lane_policy":{"$ref":"#/$defs/placement_helper_lane_policy"},"required_environment_disclosures":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"suite_selection":{"$ref":"#/$defs/placement_suite_selection_contract"},"focused_rerun":{"$ref":"#/$defs/placement_focused_rerun_contract"},"fixed_knobs":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"optional_knobs":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/non_empty_string"}},"claim_contract":{"$ref":"#/$defs/placement_claim_contract"},"violation_disposition":{"$ref":"#/$defs/placement_violation_disposition"}}},"hardware_os_family":{"type":"string","enum":["linux"]},"hardware_cpu_architecture":{"type":"string","enum":["x86_64"]},"hardware_topology_class":{"type":"string","enum":["any","many_core_numa"]},"hardware_class_id_fields":{"type":"object","additionalProperties":false,"required":["os_family","cpu_arch","topology_class"],"properties":{"os_family":{"$ref":"#/$defs/hardware_os_family"},"cpu_arch":{"$ref":"#/$defs/hardware_cpu_architecture"},"topology_class":{"$ref":"#/$defs/hardware_topology_class"}}},"hardware_class":{"type":"object","additionalProperties":false,"required":["id","id_fields","min_logical_cores","min_numa_nodes","description"],"properties":{"id":{"$ref":"#/$defs/id"},"id_fields":{"$ref":"#/$defs/hardware_class_id_fields"},"min_logical_cores":{"type":"integer","minimum":1},"min_numa_nodes":{"type":["integer","null"],"minimum":1},"description":{"$ref":"#/$defs/non_empty_string"}}},"build_profile":{"type":"object","additionalProperties":false,"required":["id","cargo_profile","cargo_args","notes"],"properties":{"id":{"$ref":"#/$defs/id"},"cargo_profile":{"$ref":"#/$defs/non_empty_string"},"cargo_args":{"type":"array","items":{"$ref":"#/$defs/non_empty_string"}},"notes":{"$ref":"#/$defs/non_empty_string"}}},"fixture":{"type":"object","additionalProperties":false,"required":["fixture_id","source_path","source_sha256","source_size_bytes","working_copy_relpath","working_copy_sha256","working_copy_size_bytes","page_size","journal_mode","capture_rule"],"properties":{"fixture_id":{"$ref":"#/$defs/id"},"source_path":{"$ref":"#/$defs/non_empty_string"},"source_sha256":{"$ref":"#/$defs/sha256"},"source_size_bytes":{"type":"integer","minimum":1},"working_copy_relpath":{"$ref":"#/$defs/non_empty_string"},"working_copy_sha256":{"$ref":"#/$defs/sha256"},"working_copy_size_bytes":{"type":"integer","minimum":1},"page_size":{"type":"integer","minimum":1},"journal_mode":{"$ref":"#/$defs/non_empty_string"},"capture_rule":{"$ref":"#/$defs/non_empty_string"}}},"placement_policy":{"type":"object","additionalProperties":false,"required":["placement_profile_id","hardware_class_id","availability","command_hint","required","execution_contract"],"properties":{"placement_profile_id":{"$ref":"#/$defs/id"},"hardware_class_id":{"$ref":"#/$defs/id"},"availability":{"type":"string","enum":["universal","topology_aware"]},"command_hint":{"$ref":"#/$defs/non_empty_string"},"required":{"type":"boolean"},"execution_contract":{"$ref":"#/$defs/placement_execution_contract"}}},"provenance":{"type":"object","additionalProperties":false,"required":["command_entrypoint","source_revision","beads_data_hash","kernel_release","fixture","build_profile","hardware_class","placement_policy","commands","tool_versions","fallback_notes"],"properties":{"command_entrypoint":{"$ref":"#/$defs/non_empty_string"},"source_revision":{"$ref":"#/$defs/non_empty_string"},"beads_data_hash":{"$ref":"#/$defs/sha256"},"kernel_release":{"$ref":"#/$defs/non_empty_string"},"fixture":{"$ref":"#/$defs/fixture"},"build_profile":{"$ref":"#/$defs/build_profile"},"hardware_class":{"$ref":"#/$defs/hardware_class"},"placement_policy":{"$ref":"#/$defs/placement_policy"},"commands":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/command"}},"tool_versions":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/tool_version"}},"fallback_notes":{"type":"array","items":{"$ref":"#/$defs/non_empty_string"}}}}}}"###;
+
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -4872,9 +5114,22 @@ mod tests {
             .to_path_buf()
     }
 
-    fn hot_path_manifest_schema_path() -> PathBuf {
-        workspace_root()
-            .join("sample_sqlite_db_files/manifests/hot_path_profile_manifest.v1.schema.json")
+    fn assert_embedded_schema_matches_tracked_file(relative_path: &str, embedded_schema_raw: &str) {
+        let schema_path = workspace_root().join(relative_path);
+        if !schema_path.is_file() {
+            return;
+        }
+        let tracked_schema_raw = fs::read_to_string(&schema_path).expect("read tracked schema");
+        let embedded_schema_json: serde_json::Value =
+            serde_json::from_str(embedded_schema_raw).expect("parse embedded schema fallback");
+        let tracked_schema_json: serde_json::Value =
+            serde_json::from_str(&tracked_schema_raw).expect("parse tracked schema");
+        assert_eq!(
+            tracked_schema_json,
+            embedded_schema_json,
+            "embedded schema fallback drifted from tracked file {}",
+            schema_path.display()
+        );
     }
 
     fn assert_json_schema_valid(schema_raw: &str, doc_raw: &str) {
@@ -4923,6 +5178,7 @@ mod tests {
             error: None,
             first_failure_diagnostic: None,
             storage_wiring: None,
+            runtime_phase_timing: None,
             hot_path_profile: None,
         }
     }
@@ -5024,6 +5280,180 @@ mod tests {
         }
     }
 
+    fn sample_benchmark_campaign() -> BeadsBenchmarkCampaign {
+        BeadsBenchmarkCampaign {
+            schema_version: BEADS_BENCHMARK_CAMPAIGN_SCHEMA_V1.to_owned(),
+            campaign_id: "bd-db300.1.2".to_owned(),
+            title: "sample".to_owned(),
+            working_benchmark_root_relpath: "sample_sqlite_db_files/working/beads_bench_20260310"
+                .to_owned(),
+            beads_data_relpath: ".beads/issues.jsonl".to_owned(),
+            fixtures: vec![BeadsBenchmarkFixture {
+                fixture_id: "frankensqlite".to_owned(),
+                source_path: "/data/projects/frankensqlite/.beads/beads.db".to_owned(),
+                source_sha256: "a".repeat(64),
+                source_size_bytes: 13,
+                working_copy_relpath:
+                    "sample_sqlite_db_files/working/beads_bench_20260310/golden/frankensqlite_beads.db"
+                        .to_owned(),
+                working_copy_sha256: "b".repeat(64),
+                working_copy_size_bytes: 13,
+                page_size: 4096,
+                journal_mode: "wal".to_owned(),
+                capture_rule: "copy pinned working copy".to_owned(),
+            }],
+            placement_profiles: vec![PlacementProfile {
+                id: "baseline_unpinned".to_owned(),
+                kind: PlacementProfileKind::Baseline,
+                description: "scheduler default".to_owned(),
+                command_hint: "run directly".to_owned(),
+                availability: PlacementAvailability::Universal,
+                execution_contract: PlacementExecutionContract {
+                    cpu_affinity_policy: PlacementCpuAffinityPolicy::SchedulerDefault,
+                    smt_policy: PlacementSmtPolicy::HostDefault,
+                    memory_policy: PlacementMemoryPolicy::HostDefault,
+                    helper_lane_policy: PlacementHelperLanePolicy::DiscloseHostDefault,
+                    required_environment_disclosures: vec![
+                        "placement_profile_id".to_owned(),
+                        "hardware_class_id".to_owned(),
+                        "hardware_signature".to_owned(),
+                        "cpu_affinity_mask".to_owned(),
+                        "smt_policy_state".to_owned(),
+                        "memory_policy".to_owned(),
+                        "helper_lane_cpu_set".to_owned(),
+                        "numa_balancing_state".to_owned(),
+                    ],
+                    suite_selection: PlacementSuiteSelectionContract {
+                        selector_kind: PlacementSuiteSelectorKind::MatrixPlacementVariant,
+                        selector_field:
+                            "matrix_rows[].placement_variants[].placement_profile_id".to_owned(),
+                    },
+                    focused_rerun: PlacementFocusedRerunContract {
+                        selector_kind: PlacementFocusedRerunSelectorKind::ExplicitBindings,
+                        required_bindings: vec![
+                            "RUN_ID".to_owned(),
+                            "ARTIFACT_BUNDLE_DIR".to_owned(),
+                            "ARTIFACT_BUNDLE_RELPATH".to_owned(),
+                            "PLACEMENT_PROFILE_ID".to_owned(),
+                            "HARDWARE_CLASS_ID".to_owned(),
+                            "MANIFEST_JSON".to_owned(),
+                            "SOURCE_REVISION".to_owned(),
+                            "BEADS_HASH".to_owned(),
+                        ],
+                    },
+                    fixed_knobs: vec![
+                        "no_taskset_or_numactl_binding".to_owned(),
+                        "report_host_default_smt_policy".to_owned(),
+                        "report_host_default_memory_policy".to_owned(),
+                        "disclose_helper_lane_policy_without_relocation".to_owned(),
+                    ],
+                    optional_knobs: vec![
+                        "exact_scheduler_chosen_cpu_set".to_owned(),
+                        "extra_profiler_capture".to_owned(),
+                    ],
+                    claim_contract: PlacementClaimContract {
+                        mandatory_for: vec![
+                            "portable_baseline_claims".to_owned(),
+                            "host_default_regression_checks".to_owned(),
+                        ],
+                        optional_for: vec!["smoke_reruns".to_owned()],
+                        avoid_for: vec![
+                            "transferable_many_core_win_claims".to_owned(),
+                            "cross_node_sensitivity_claims".to_owned(),
+                        ],
+                    },
+                    violation_disposition: PlacementViolationDisposition::NotComparable,
+                },
+            }],
+            hardware_classes: vec![HardwareClass {
+                id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
+                id_fields: HardwareClassIdFields {
+                    os_family: HardwareOsFamily::Linux,
+                    cpu_arch: HardwareCpuArchitecture::X86_64,
+                    topology_class: HardwareTopologyClass::Any,
+                },
+                min_logical_cores: 4,
+                min_numa_nodes: None,
+                description: "generic".to_owned(),
+            }],
+            retry_policies: vec![RetryPolicy {
+                id: "instrumented_busy_retry_v1".to_owned(),
+                max_busy_retries: 10_000,
+                busy_backoff_ms: 1,
+                busy_backoff_max_ms: 250,
+                notes: "default".to_owned(),
+            }],
+            build_profiles: vec![BuildProfile {
+                id: "release_perf".to_owned(),
+                cargo_profile: "release-perf".to_owned(),
+                cargo_args: vec!["--profile".to_owned(), "release-perf".to_owned()],
+                notes: "perf".to_owned(),
+            }],
+            seed_policies: vec![SeedPolicy {
+                id: "fixed_seed_42".to_owned(),
+                kind: "fixed".to_owned(),
+                base_seed: 42,
+                notes: "stable".to_owned(),
+            }],
+            matrix_rows: vec![BeadsBenchmarkMatrixRow {
+                row_id: "mixed_read_write_c4".to_owned(),
+                fixtures: vec!["frankensqlite".to_owned()],
+                workload: "mixed_read_write".to_owned(),
+                concurrency: 4,
+                modes: vec![BenchmarkMode::FsqliteMvcc],
+                placement_variants: vec![PlacementVariant {
+                    placement_profile_id: "baseline_unpinned".to_owned(),
+                    hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
+                    required: true,
+                }],
+                retry_policy_id: "instrumented_busy_retry_v1".to_owned(),
+                build_profile_id: "release_perf".to_owned(),
+                seed_policy_id: "fixed_seed_42".to_owned(),
+            }],
+            artifact_contract: BenchmarkArtifactContract {
+                artifact_root_relpath: "artifacts/perf/bd-db300.1.2".to_owned(),
+                bundle_dir_template:
+                    "{row_id}__{workload}__c{concurrency}__{fixture_id}__{mode}__{placement_profile_id}__{build_profile_id}__run_{run_id}__rev_{source_revision}__beads_{beads_hash}"
+                        .to_owned(),
+                bundle_key_template:
+                    "{row_id}:{fixture_id}:{workload}:c{concurrency}:{mode}:{placement_profile_id}:{build_profile_id}:run_{run_id}:rev_{source_revision}:beads_{beads_hash}"
+                        .to_owned(),
+                bundle_name_template:
+                    "{row_id} {fixture_id} {workload} c{concurrency} {mode} {placement_profile_id} {build_profile_id} run {run_id} rev {source_revision} beads {beads_hash}"
+                        .to_owned(),
+                manifest_schema_version: BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1.to_owned(),
+                result_jsonl_name: "results.jsonl".to_owned(),
+                summary_md_name: "summary.md".to_owned(),
+                manifest_name: "manifest.json".to_owned(),
+                logs_dir_name: "logs".to_owned(),
+                profiles_dir_name: "profiles".to_owned(),
+                retention_policies: vec![BenchmarkArtifactRetentionPolicy {
+                    class: BenchmarkArtifactRetentionClass::FailureBundle,
+                    description:
+                        "Failure bundle kept immutably for diagnosis and replay.".to_owned(),
+                    superseded_by_newer: false,
+                    immutable: true,
+                    authoritative: true,
+                }],
+            },
+        }
+    }
+
+    fn sample_benchmark_cell() -> ExpandedBenchmarkCell {
+        ExpandedBenchmarkCell {
+            row_id: "mixed_read_write_c4".to_owned(),
+            fixture_id: "frankensqlite".to_owned(),
+            workload: "mixed_read_write".to_owned(),
+            concurrency: 4,
+            mode: BenchmarkMode::FsqliteMvcc,
+            placement_profile_id: "baseline_unpinned".to_owned(),
+            hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
+            retry_policy_id: "instrumented_busy_retry_v1".to_owned(),
+            build_profile_id: "release_perf".to_owned(),
+            seed_policy_id: "fixed_seed_42".to_owned(),
+        }
+    }
+
     fn sample_hot_path_manifest() -> HotPathArtifactManifest {
         HotPathArtifactManifest {
             schema_version: HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1.to_owned(),
@@ -5109,6 +5539,45 @@ mod tests {
     }
 
     #[test]
+    fn resolve_hot_path_microarchitectural_context_accepts_working_copy_fixture_alias() {
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let manifest_path = tempdir.path().join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE);
+        fs::create_dir_all(
+            manifest_path
+                .parent()
+                .expect("campaign manifest should have parent"),
+        )
+        .expect("campaign manifest parent should exist");
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&sample_benchmark_campaign())
+                .expect("sample campaign should serialize"),
+        )
+        .expect("sample campaign manifest should write");
+
+        let mut report = sample_hot_path_report();
+        report.fixture_id = "frankensqlite_beads".to_owned();
+
+        let context = resolve_hot_path_microarchitectural_context(Some(tempdir.path()), &report);
+
+        assert_eq!(context.fixture_id, "frankensqlite_beads");
+        assert_eq!(context.row_id, "mixed_read_write_c4");
+        assert_eq!(context.mode_id, "fsqlite_mvcc");
+        assert_eq!(
+            context.placement_profile_id.as_deref(),
+            Some("baseline_unpinned")
+        );
+        assert_eq!(
+            context.hardware_class_id.as_deref(),
+            Some(HARDWARE_CLASS_LINUX_X86_64_ANY)
+        );
+        assert_eq!(
+            context.hardware_signature.as_deref(),
+            Some("linux:x86_64:any")
+        );
+    }
+
+    #[test]
     fn test_report_has_failure_flags_integrity_failures() {
         let mut report = sample_engine_report();
         assert!(!report_has_failure(&report));
@@ -5137,22 +5606,55 @@ mod tests {
 
     #[test]
     fn format_hot_profile_replay_command_renders_expected_flags() {
-        let rendered = format_hot_profile_replay_command(&HotProfileReplayCommand {
-            db: "fixture-a",
-            workload: "hot_page_contention",
-            golden_dir: Path::new("/tmp/golden dir"),
-            working_base: Path::new("/tmp/working"),
-            concurrency: 4,
-            seed: 42,
-            scale: 50,
-            output_dir: Path::new("/tmp/output dir"),
-            mvcc: false,
-            run_integrity_check: true,
-        });
+        let rendered = format_hot_profile_replay_command_with_env_overrides(
+            &HotProfileReplayCommand {
+                db: "fixture-a",
+                workload: "hot_page_contention",
+                golden_dir: Path::new("/tmp/golden dir"),
+                working_base: Path::new("/tmp/working"),
+                concurrency: 4,
+                seed: 42,
+                scale: 50,
+                output_dir: Path::new("/tmp/output dir"),
+                mvcc: false,
+                run_integrity_check: true,
+            },
+            &[],
+        );
 
         assert_eq!(
             rendered,
             "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload hot_page_contention --golden-dir '/tmp/golden dir' --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir '/tmp/output dir' --no-mvcc --integrity-check"
+        );
+    }
+
+    #[test]
+    fn format_hot_profile_replay_command_renders_env_overrides() {
+        let rendered = format_hot_profile_replay_command_with_env_overrides(
+            &HotProfileReplayCommand {
+                db: "fixture-a",
+                workload: "hot_page_contention",
+                golden_dir: Path::new("/tmp/golden dir"),
+                working_base: Path::new("/tmp/working"),
+                concurrency: 4,
+                seed: 42,
+                scale: 50,
+                output_dir: Path::new("/tmp/output dir"),
+                mvcc: false,
+                run_integrity_check: true,
+            },
+            &[
+                (HOT_PATH_BEAD_ID_ENV, "bd-db300.1.3".to_owned()),
+                (
+                    HOT_PATH_WORKSPACE_ROOT_ENV,
+                    "/data/projects/frankensqlite".to_owned(),
+                ),
+            ],
+        );
+
+        assert_eq!(
+            rendered,
+            "rch exec -- env FSQLITE_HOT_PATH_BEAD_ID=bd-db300.1.3 FSQLITE_HOT_PATH_WORKSPACE_ROOT=/data/projects/frankensqlite cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload hot_page_contention --golden-dir '/tmp/golden dir' --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir '/tmp/output dir' --no-mvcc --integrity-check"
         );
     }
 
@@ -5266,8 +5768,21 @@ mod tests {
             }],
         )
         .expect("manifest finalization should succeed");
-        let text = serialize_hot_path_inline_bundle(&report, &manifest, &command_pack)
-            .expect("inline bundle serialization should succeed");
+        let microarchitectural_context = HotPathMicroarchitecturalContext {
+            fixture_id: report.fixture_id.clone(),
+            row_id: "mixed_read_write_c4".to_owned(),
+            mode_id: "fsqlite_mvcc".to_owned(),
+            placement_profile_id: Some("baseline_unpinned".to_owned()),
+            hardware_class_id: Some(HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned()),
+            hardware_signature: Some("linux:x86_64:any".to_owned()),
+        };
+        let text = serialize_hot_path_inline_bundle(
+            &report,
+            &manifest,
+            &command_pack,
+            Some(&microarchitectural_context),
+        )
+        .expect("inline bundle serialization should succeed");
         let value: Value = serde_json::from_str(&text).expect("bundle JSON must parse");
         assert_eq!(value["schema_version"], HOT_PATH_INLINE_BUNDLE_SCHEMA_V1);
         assert_eq!(
@@ -5284,7 +5799,17 @@ mod tests {
         );
         assert_eq!(
             value["actionable_ranking"]["schema_version"],
-            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V2
+            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V3
+        );
+        assert!(
+            value["actionable_ranking"]["baseline_reuse_ledger"]
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty())
+        );
+        assert!(
+            value["actionable_ranking"]["baseline_waste_ledger"]
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty())
         );
         assert_eq!(
             value["manifest"]["schema_version"],
@@ -5317,6 +5842,26 @@ mod tests {
         assert_eq!(
             value["manifest"]["provenance"]["source_revision"],
             "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(
+            value["actionable_ranking"]["microarchitectural_signatures"][0]["fixture_id"],
+            "fixture-a"
+        );
+        assert_eq!(
+            value["actionable_ranking"]["microarchitectural_signatures"][0]["row_id"],
+            "mixed_read_write_c4"
+        );
+        assert_eq!(
+            value["actionable_ranking"]["microarchitectural_signatures"][0]["placement_profile_id"],
+            "baseline_unpinned"
+        );
+        assert_eq!(
+            value["actionable_ranking"]["microarchitectural_signatures"][0]["hardware_class_id"],
+            "linux_x86_64_any"
+        );
+        assert_eq!(
+            value["actionable_ranking"]["microarchitectural_signatures"][0]["hardware_signature"],
+            "linux:x86_64:any"
         );
         assert_eq!(value["opcode_profile"]["opcodes"][0]["opcode"], "Column");
         assert_eq!(
@@ -5352,6 +5897,11 @@ mod tests {
             value["summary_markdown"]
                 .as_str()
                 .is_some_and(|summary| summary.contains("## Ranked Hotspots"))
+        );
+        assert!(
+            value["summary_markdown"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("## Microarchitectural Signatures"))
         );
     }
 
@@ -5659,13 +6209,10 @@ mod tests {
 
     #[test]
     fn finalized_hot_path_manifest_matches_tracked_json_schema() {
-        let schema_path = hot_path_manifest_schema_path();
-        if !schema_path.is_file() {
-            return;
-        }
-        let schema_raw =
-            fs::read_to_string(&schema_path).expect("read hot_path_profile_manifest schema");
-
+        assert_embedded_schema_matches_tracked_file(
+            HOT_PATH_MANIFEST_SCHEMA_PATH,
+            HOT_PATH_MANIFEST_SCHEMA_RAW,
+        );
         let tempdir = tempfile::tempdir().expect("tempdir should succeed");
         let report = sample_hot_path_report();
         let replay_command = HotProfileReplayCommand {
@@ -5719,7 +6266,68 @@ mod tests {
 
         let manifest_raw =
             serde_json::to_string_pretty(&finalized).expect("serialize finalized manifest");
-        assert_json_schema_valid(&schema_raw, &manifest_raw);
+        assert_json_schema_valid(HOT_PATH_MANIFEST_SCHEMA_RAW, &manifest_raw);
+    }
+
+    #[test]
+    fn hot_path_provenance_capture_matches_shared_artifact_manifest_schema() {
+        assert_embedded_schema_matches_tracked_file(
+            BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_PATH,
+            BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_RAW,
+        );
+        let workspace_root = workspace_root();
+        let campaign = sample_benchmark_campaign();
+        let cell = sample_benchmark_cell();
+
+        let report = sample_hot_path_report();
+        let fixture_id = cell.fixture_id.clone();
+        let replay_command = HotProfileReplayCommand {
+            db: &fixture_id,
+            workload: &cell.workload,
+            golden_dir: Path::new("/tmp/golden"),
+            working_base: Path::new("/tmp/working"),
+            concurrency: cell.concurrency,
+            seed: 42,
+            scale: 50,
+            output_dir: Path::new("/tmp/out"),
+            mvcc: true,
+            run_integrity_check: false,
+        };
+        let command_pack = build_hot_path_command_pack(&report, &replay_command);
+        let counter_capture_summary = build_hot_path_counter_capture_summary(&command_pack);
+        let provenance = build_hot_path_artifact_provenance(
+            &report,
+            &command_pack,
+            counter_capture_summary.as_ref(),
+            sample_hot_path_provenance_inputs(),
+        );
+        let manifest = build_benchmark_artifact_manifest(
+            &workspace_root,
+            &campaign,
+            &cell,
+            BenchmarkArtifactProvenanceCapture {
+                run_id: "run-20260315T040100Z".to_owned(),
+                retention_class: BenchmarkArtifactRetentionClass::FailureBundle,
+                command_entrypoint: provenance.command_entrypoint.clone(),
+                source_revision: provenance
+                    .source_revision
+                    .clone()
+                    .expect("sample provenance should include source_revision"),
+                beads_data_hash: provenance
+                    .beads_data_hash
+                    .clone()
+                    .expect("sample provenance should include beads_data_hash"),
+                kernel_release: provenance.kernel_release.clone(),
+                commands: provenance.commands.clone(),
+                tool_versions: provenance.tool_versions.clone(),
+                fallback_notes: provenance.fallback_notes.clone(),
+            },
+        )
+        .expect("artifact manifest should build from hot-path provenance");
+
+        let manifest_raw =
+            serde_json::to_string_pretty(&manifest).expect("serialize artifact manifest");
+        assert_json_schema_valid(BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_RAW, &manifest_raw);
     }
 
     #[test]
@@ -5822,6 +6430,30 @@ mod tests {
         assert_eq!(
             find_bench_workspace_root(&nested),
             Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn resolve_hot_path_workspace_root_candidate_accepts_root_or_nested_path() {
+        let dir = tempfile::tempdir().expect("tempdir should succeed");
+        let nested = dir.path().join("a/b/c");
+        fs::create_dir_all(&nested).expect("nested dirs should be created");
+        let manifest_dir = dir.path().join("sample_sqlite_db_files/manifests");
+        fs::create_dir_all(&manifest_dir).expect("manifest dir should be created");
+        fs::write(manifest_dir.join("beads_benchmark_campaign.v1.json"), "{}")
+            .expect("sentinel manifest should be written");
+
+        assert_eq!(
+            resolve_hot_path_workspace_root_candidate(dir.path()),
+            Some(dir.path().to_path_buf())
+        );
+        assert_eq!(
+            resolve_hot_path_workspace_root_candidate(&nested),
+            Some(dir.path().to_path_buf())
+        );
+        assert_eq!(
+            resolve_hot_path_workspace_root_candidate(&dir.path().join("missing")),
+            None
         );
     }
 
