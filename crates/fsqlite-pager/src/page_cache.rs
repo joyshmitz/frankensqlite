@@ -10,7 +10,7 @@
 
 use std::cell::Cell;
 
-use fsqlite_error::Result;
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vfs::VfsFile;
@@ -361,7 +361,14 @@ fn page_offset(page_no: PageNumber, page_size: PageSize) -> u64 {
 /// Returns the raw header bytes.
 pub fn read_db_header(cx: &Cx, file: &mut impl VfsFile) -> Result<[u8; 100]> {
     let mut header = [0u8; 100];
-    file.read(cx, &mut header, 0)?;
+    let bytes_read = file.read(cx, &mut header, 0)?;
+    if bytes_read < 100 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "database header short read: expected 100 bytes, got {bytes_read}"
+            ),
+        });
+    }
     Ok(header)
 }
 

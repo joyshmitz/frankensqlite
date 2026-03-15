@@ -393,8 +393,8 @@ pub fn parse_record_header_into(data: &[u8], offsets: &mut Vec<ColumnOffset>) ->
 
         offsets.push(ColumnOffset {
             serial_type,
-            body_offset: u32::try_from(body_start).unwrap_or(u32::MAX),
-            value_len: u32::try_from(value_len).unwrap_or(u32::MAX),
+            body_offset: u32::try_from(body_start).ok()?,
+            value_len: u32::try_from(value_len).ok()?,
         });
     }
 
@@ -417,7 +417,7 @@ pub fn decode_column_from_offset(
     profile_enabled: bool,
 ) -> Option<SqliteValue> {
     let start = col.body_offset as usize;
-    let end = start + col.value_len as usize;
+    let end = start.checked_add(col.value_len as usize)?;
     if end > data.len() {
         return None;
     }
@@ -431,8 +431,11 @@ pub fn decode_column_from_offset(
 /// blob is kept separately for output.
 #[allow(clippy::cast_possible_truncation)]
 pub fn parse_record_prefix(data: &[u8], max_cols: usize) -> Option<Vec<SqliteValue>> {
-    if data.is_empty() || max_cols == 0 {
+    if max_cols == 0 {
         return Some(Vec::new());
+    }
+    if data.is_empty() {
+        return None;
     }
 
     let (header_size_u64, hdr_varint_len) = read_varint(data)?;

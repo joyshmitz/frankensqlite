@@ -26,7 +26,7 @@ use fsqlite_types::limits::MAX_PAGE_COUNT;
 /// Maximum leaf entries that fit on a single trunk page.
 #[must_use]
 pub const fn max_leaf_entries(usable_size: u32) -> u32 {
-    usable_size / 4 - 2
+    (usable_size / 4).saturating_sub(2)
 }
 
 /// Parsed freelist trunk page.

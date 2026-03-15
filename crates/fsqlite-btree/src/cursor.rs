@@ -363,11 +363,6 @@ pub struct BtCursor<P> {
     /// The Vec capacity is preserved across the take/put cycle so repeated
     /// inserts reuse the same allocation.
     cell_buf: Vec<u8>,
-    /// Set when the last `table_insert` appended at the rightmost position
-    /// (the seek landed at EOF, meaning the new rowid is larger than all
-    /// existing rowids). Enables the sequential-append fast path on the
-    /// next insert.  Reset to false on any non-append insert or delete.
-    last_insert_was_rightmost_append: bool,
     /// Last rowid successfully inserted via `table_insert`.
     ///
     /// Set on successful leaf insert or balance-for-insert.  Used by the VDBE
@@ -383,7 +378,6 @@ impl<P> BtCursor<P> {
     pub fn invalidate(&mut self) {
         self.at_eof = true;
         self.stack.clear();
-        self.last_insert_was_rightmost_append = false;
     }
 
     /// Whether this cursor is for a table (intkey) B-tree.
@@ -447,7 +441,6 @@ impl<P: PageReader> BtCursor<P> {
             read_witnesses: Vec::new(),
             active_op_stats: None,
             cell_buf: Vec::new(),
-            last_insert_was_rightmost_append: false,
             last_insert_rowid: None,
         }
     }
@@ -1553,6 +1546,9 @@ impl<P: PageWriter> BtCursor<P> {
         #[allow(clippy::cast_possible_truncation)]
         let page_size = self.usable_size as usize;
         let num_pages = overflow_data.len().div_ceil(bytes_per_page);
+        if num_pages > overflow::MAX_OVERFLOW_CHAIN {
+            return Err(FrankenError::TooBig);
+        }
 
         let mut pages = Vec::with_capacity(num_pages);
         for _ in 0..num_pages {
@@ -2354,12 +2350,10 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     }
 
     fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
-        self.last_insert_was_rightmost_append = false;
         self.with_btree_op(cx, BtreeOpType::Seek, |cursor| cursor.table_seek(cx, rowid))
     }
 
     fn first(&mut self, cx: &Cx) -> Result<bool> {
-        self.last_insert_was_rightmost_append = false;
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         self.at_eof = true;
@@ -2530,10 +2524,6 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
 
-            // Detect rightmost-append: seek landed at EOF means the new
-            // rowid is larger than all existing rows in the tree.
-            let is_rightmost_append = cursor.at_eof;
-
             let insert_idx = {
                 let top = cursor
                     .stack
@@ -2555,7 +2545,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 Ok(true) => {
                     cursor.cell_buf = cell_data;
                     cursor.last_insert_rowid = Some(rowid);
-                    cursor.last_insert_was_rightmost_append = is_rightmost_append;
+
                     Ok(())
                 }
                 Ok(false) => {
@@ -2564,21 +2554,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     cursor.cell_buf = cell_data;
                     if balance_result.is_ok() {
                         cursor.last_insert_rowid = Some(rowid);
-                        // After balance the tree structure changed — cursor
-                        // position may not be on the rightmost leaf anymore.
-                        // Disable fast path; the next insert will re-seek.
-                        cursor.last_insert_was_rightmost_append = false;
-                    } else {
-                        cursor.last_insert_was_rightmost_append = false;
-                        if let Some(first) = overflow_head {
-                            let _ = cursor.free_overflow_chain(cx, first);
-                        }
+                    } else if let Some(first) = overflow_head {
+                        let _ = cursor.free_overflow_chain(cx, first);
                     }
                     balance_result
                 }
                 Err(error) => {
                     cursor.cell_buf = cell_data;
-                    cursor.last_insert_was_rightmost_append = false;
                     if let Some(first) = overflow_head {
                         let _ = cursor.free_overflow_chain(cx, first);
                     }
@@ -2590,11 +2572,6 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
     fn delete(&mut self, cx: &Cx) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
-            // Delete invalidates the sequential-append fast path since the
-            // tree structure changes and the cursor may no longer be on
-            // the rightmost leaf.
-            cursor.last_insert_was_rightmost_append = false;
-
             if cursor.at_eof || cursor.stack.is_empty() {
                 return Err(FrankenError::internal("cursor at EOF"));
             }
@@ -3022,9 +2999,14 @@ mod tests {
         let store = MemPageStore::with_empty_table(root, USABLE);
         let mut cursor = BtCursor::new(store, root, USABLE, true);
 
+        // Use large payloads to force page splits quickly.  With 9KB
+        // payloads on a 4096-byte page, each insert uses overflow pages
+        // and the root splits after just a few rows.
         let payload = vec![0xAB; 9_000];
+        let mut inserts_done: i64 = 0;
         for rowid in 1_i64..=500_i64 {
             cursor.table_insert(&cx, rowid, &payload).unwrap();
+            inserts_done = rowid;
 
             let root_page = cursor.pager.pages.get(&2).unwrap();
             let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
@@ -3043,12 +3025,16 @@ mod tests {
             snapshot.fsqlite_btree_page_splits_total > before.fsqlite_btree_page_splits_total,
             "expected at least one split when loading large rows"
         );
+        // The insert counter must have increased by at least the number
+        // of rows we actually inserted (the loop may break early when
+        // the root splits).
         assert!(
             snapshot.fsqlite_btree_operations_total.insert
                 >= before
                     .fsqlite_btree_operations_total
                     .insert
-                    .saturating_add(500)
+                    .saturating_add(inserts_done as u64),
+            "insert counter should reflect at least {inserts_done} inserts"
         );
     }
 
@@ -4408,7 +4394,8 @@ mod tests {
         let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         let mut remaining = BTreeSet::new();
 
-        for i in 1..=5000_i64 {
+        // Insert 10,000 rows so that deleting 5,000 leaves 5,000 survivors.
+        for i in 1..=10_000_i64 {
             let payload = payload_for_rowid(i);
             cursor.table_insert(&cx, i, &payload).unwrap();
             remaining.insert(i);
@@ -5007,7 +4994,7 @@ mod tests {
         let mut max_rowid = 0i64;
         for rowid in 1..=2000_i64 {
             let payload = vec![b'P'; 1400];
-            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
             max_rowid = rowid;
 
             let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
@@ -5253,12 +5240,13 @@ mod tests {
             for (is_insert, rowid, payload) in &ops {
                 if *is_insert {
                     if reference.contains_key(rowid) {
-                        // Duplicate: should fail (PrimaryKeyViolation).
-                        let result = cursor.table_move_to(&cx, *rowid).unwrap();
+                        // Duplicate: inserting an existing rowid must fail.
+                        let result = cursor.table_insert(&cx, *rowid, payload);
                         proptest::prop_assert!(
-                            !result.is_found(),
-                            "duplicate rowid {} should error",
-                            rowid
+                            matches!(result, Err(FrankenError::PrimaryKeyViolation)),
+                            "duplicate rowid {} should produce PrimaryKeyViolation, got {:?}",
+                            rowid,
+                            result,
                         );
                     } else {
                         cursor.table_insert(&cx, *rowid, payload).unwrap();

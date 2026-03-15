@@ -7201,7 +7201,12 @@ impl VdbeEngine {
                             fsqlite_types::record::parse_record_into(
                                 bytes,
                                 &mut sc.target_vals_buf,
-                            );
+                            )
+                            .ok_or_else(|| {
+                                FrankenError::internal(
+                                    "index seek: malformed probe key record",
+                                )
+                            })?;
                         }
 
                         sc.payload_buf.clear();
@@ -8436,7 +8441,11 @@ impl VdbeEngine {
                 fsqlite_types::record::parse_record_into(
                     &cursor.payload_buf,
                     &mut cursor.row_vals_buf,
-                );
+                )
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "malformed record payload in cursor (>64-column eager decode)"
+                        .to_owned(),
+                })?;
                 cursor.decoded_mask = u64::MAX;
             } else {
                 cursor.row_vals_buf.resize(col_count, SqliteValue::Null);
@@ -8624,7 +8633,11 @@ impl VdbeEngine {
                     fsqlite_types::record::parse_record_into(
                         &cursor.payload_buf,
                         &mut cursor.row_vals_buf,
-                    );
+                    )
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "malformed record payload in cursor (>64-column eager decode)"
+                            .to_owned(),
+                    })?;
                     cursor.decoded_mask = u64::MAX; // mark all as decoded
                 } else {
                     // Narrow record (≤64 cols): lazy path.
