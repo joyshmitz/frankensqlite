@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_types::LockLevel;
 
 use crate::shm::{
-    SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
+    ShmRegion, SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK,
     WAL_TOTAL_LOCKS,
 };
 use crate::traits::{Vfs, VfsFile};
@@ -246,7 +246,7 @@ impl MemoryFile {
         Ok(info)
     }
 
-    fn release_shm_owner_state(&mut self, _delete: bool) -> Result<()> {
+    fn release_shm_owner_state(&mut self, delete: bool) -> Result<()> {
         let Some(info_arc) = self.shm_info.take() else {
             return Ok(());
         };
@@ -273,7 +273,7 @@ impl MemoryFile {
             info.owner_refs.is_empty()
         };
 
-        if orphaned {
+        if delete || orphaned {
             inner.shm.remove(&self.shm_path);
         }
 
@@ -1245,6 +1245,30 @@ mod tests {
     }
 
     #[test]
+    fn shm_unmap_delete_clears_registered_shm_state() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("shm_unmap_delete.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        let shm_path = sqlite_shm_path(path);
+        let _region = file.shm_map(&cx, 0, 64, true).unwrap();
+        assert!(
+            vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "mapping SHM should register per-path SHM state"
+        );
+
+        file.shm_unmap(&cx, true).unwrap();
+        assert!(
+            !vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "shm_unmap(delete=true) should clear the registered SHM state entry"
+        );
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
     fn delete_nonexistent_is_silent() {
         let cx = Cx::new();
         let vfs = make_vfs();
@@ -1330,20 +1354,18 @@ mod tests {
         file.write(&cx, b"test", 0).unwrap();
 
         // MemoryVfs always returns true for access if file exists.
-        assert!(
-            vfs.access(&cx, Path::new("acc.db"), AccessFlags::READWRITE)
-                .unwrap()
-        );
+        assert!(vfs
+            .access(&cx, Path::new("acc.db"), AccessFlags::READWRITE)
+            .unwrap());
     }
 
     #[test]
     fn access_nonexistent() {
         let cx = Cx::new();
         let vfs = make_vfs();
-        assert!(
-            !vfs.access(&cx, Path::new("nope.db"), AccessFlags::EXISTS)
-                .unwrap()
-        );
+        assert!(!vfs
+            .access(&cx, Path::new("nope.db"), AccessFlags::EXISTS)
+            .unwrap());
     }
 
     #[test]
