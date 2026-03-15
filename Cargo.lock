@@ -104,19 +104,21 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "asupersync"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61e194ae95492f0e9bdf40266d5e04e5be34156fc650bc559200dea4146d5464"
+version = "0.2.8"
 dependencies = [
  "base64",
  "bincode-next",
+ "crossbeam-deque",
  "crossbeam-queue",
  "franken-decision",
  "franken-evidence",
  "franken-kernel",
+ "futures-lite",
  "getrandom 0.4.2",
+ "hashbrown 0.15.5",
  "hmac",
  "io-uring 0.7.11",
+ "js-sys",
  "libc",
  "memchr",
  "nix 0.31.2",
@@ -128,6 +130,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "signal-hook 0.3.18",
  "slab",
  "smallvec",
  "socket2",
@@ -136,6 +139,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "visibility",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -714,9 +720,7 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea96efd310f2cf2350b8bd2341e1583ca12724434f2d45f51942114a93c25bd0"
+version = "0.2.8"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -725,9 +729,7 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a1e7874d7f415853faa414a93cf991580dd3d1f32cd38bbb48964a897bda9c5"
+version = "0.2.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -735,9 +737,7 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c48be8ed896a34076793faa618d48159fd482c184143b9bf7f4b15eb462a9497"
+version = "0.2.8"
 dependencies = [
  "serde",
 ]
@@ -1332,6 +1332,25 @@ name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-io"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cecba35d7ad927e23624b22ad55235f2239cfa44fd10428eecbeba6d6a717718"
+
+[[package]]
+name = "futures-lite"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f78e10609fe0e0b3f4157ffab1876319b5b0db102a2c60dc4626306dc46b44ad"
+dependencies = [
+ "fastrand",
+ "futures-core",
+ "futures-io",
+ "parking",
+ "pin-project-lite",
+]
 
 [[package]]
 name = "futures-task"
@@ -2005,6 +2024,12 @@ name = "outref"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
+
+[[package]]
+name = "parking"
+version = "2.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f38d5652c16fde515bb1ecef450ab0f6a219d619a7274976324d5e377f7dceba"
 
 [[package]]
 name = "parking_lot"
