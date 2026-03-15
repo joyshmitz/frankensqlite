@@ -26,8 +26,10 @@
 set -euo pipefail
 
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BEAD_ID="bd-db300.4.1"
+BEAD_ID="${BEAD_ID:-bd-db300.4.1}"
+SCRIPT_ENTRYPOINT="${SCRIPT_ENTRYPOINT:-scripts/verify_bd_db300_4_1_hot_path_profiles.sh}"
 RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+RUN_ID_TARGET_SAFE="${RUN_ID//[^[:alnum:]]/_}"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 SOURCE_GOLDEN_DIR_DEFAULT="${WORKSPACE_ROOT}/sample_sqlite_db_files/working/beads_bench_20260310/golden"
 SOURCE_GOLDEN_DIR="${GOLDEN_DIR:-${SOURCE_GOLDEN_DIR_DEFAULT}}"
@@ -44,21 +46,33 @@ ACTIONABLE_RANKING_JSON="${OUTPUT_DIR}/actionable_ranking.json"
 BENCHMARK_CONTEXT_JSON="${OUTPUT_DIR}/benchmark_context.json"
 REPORT_JSON="${OUTPUT_DIR}/report.json"
 SUMMARY_MD="${OUTPUT_DIR}/summary.md"
-WORKLOAD_ID="mixed_read_write"
+WORKLOAD_ID="${WORKLOAD_ID:-mixed_read_write}"
 CONCURRENCY="${CONCURRENCY:-4}"
 SEED="${SEED:-42}"
 SCALE="${SCALE:-50}"
 CARGO_PROFILE="${CARGO_PROFILE:-release}"
-RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_bd_db300_4_1}"
+BEAD_ID_TARGET_SAFE="${BEAD_ID//[^[:alnum:]]/_}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_${BEAD_ID_TARGET_SAFE}}"
 HOT_PATH_PROFILE_SCHEMA="fsqlite-e2e.hot_path_profile.v1"
 HOT_PATH_PROFILE_MANIFEST_SCHEMA="fsqlite-e2e.hot_path_profile_manifest.v1"
 HOT_PATH_OPCODE_PROFILE_SCHEMA="fsqlite-e2e.hot_path_opcode_profile.v1"
 HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA="fsqlite-e2e.hot_path_subsystem_profile.v1"
-HOT_PATH_ACTIONABLE_RANKING_SCHEMA="fsqlite-e2e.hot_path_actionable_ranking.v2"
+HOT_PATH_ACTIONABLE_RANKING_SCHEMA="fsqlite-e2e.hot_path_actionable_ranking.v3"
 HOT_PATH_COMMAND_PACK_SCHEMA="fsqlite-e2e.hot_path_command_pack.v2"
 HOT_PATH_CAMPAIGN_RANKING_SCHEMA="fsqlite-e2e.hot_path_campaign_ranking.v2"
 HOT_PATH_INLINE_BUNDLE_SCHEMA="fsqlite-e2e.hot_path_inline_bundle.v1"
 HOT_PATH_INLINE_BUNDLE_PREFIX="HOT_PATH_INLINE_BUNDLE_JSON="
+BEADS_DATA_PATH="${WORKSPACE_ROOT}/.beads/issues.jsonl"
+FSQLITE_HOT_PATH_BEAD_ID="${FSQLITE_HOT_PATH_BEAD_ID:-${BEAD_ID}}"
+FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH="${FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH:-sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json}"
+FSQLITE_HOT_PATH_CARGO_PROFILE="${FSQLITE_HOT_PATH_CARGO_PROFILE:-${CARGO_PROFILE}}"
+FSQLITE_HOT_PATH_WORKSPACE_ROOT="${FSQLITE_HOT_PATH_WORKSPACE_ROOT:-${WORKSPACE_ROOT}}"
+FSQLITE_HOT_PATH_SOURCE_REVISION="${FSQLITE_HOT_PATH_SOURCE_REVISION:-$(git -C "${WORKSPACE_ROOT}" rev-parse HEAD)}"
+FSQLITE_HOT_PATH_BEADS_DATA_HASH="${FSQLITE_HOT_PATH_BEADS_DATA_HASH:-$(sha256sum "${BEADS_DATA_PATH}" | awk '{print $1}')}"
+FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID="${FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID:-}"
+FSQLITE_HOT_PATH_HARDWARE_CLASS_ID="${FSQLITE_HOT_PATH_HARDWARE_CLASS_ID:-}"
+FSQLITE_HOT_PATH_HARDWARE_SIGNATURE="${FSQLITE_HOT_PATH_HARDWARE_SIGNATURE:-}"
+CAMPAIGN_MANIFEST_FILE=""
 
 mkdir -p "${RUNS_DIR}"
 : > "${LOG_FILE}"
@@ -102,6 +116,30 @@ require_file() {
 require_nonempty_file() {
     local path="$1"
     [[ -s "${path}" ]] || fail "inputs" "missing or empty required file: ${path}"
+}
+
+resolve_campaign_manifest_file() {
+    if [[ "${FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH}" = /* ]]; then
+        printf '%s\n' "${FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH}"
+    else
+        printf '%s\n' "${WORKSPACE_ROOT}/${FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH}"
+    fi
+}
+
+resolve_hot_path_microarchitectural_overrides() {
+    jq -r --arg row_id "${WORKLOAD_ID}_c${CONCURRENCY}" '
+        (.matrix_rows[] | select(.row_id == $row_id) | .placement_variants
+            | (map(select(.placement_profile_id == "baseline_unpinned"))[0]
+                // map(select(.required))[0]
+                // .[0])) as $variant
+        | (.hardware_classes[] | select(.id == $variant.hardware_class_id)) as $hardware
+        | [
+            $variant.placement_profile_id,
+            $variant.hardware_class_id,
+            "\($hardware.id_fields.os_family):\($hardware.id_fields.cpu_arch):\($hardware.id_fields.topology_class)"
+        ]
+        | @tsv
+    ' "${CAMPAIGN_MANIFEST_FILE}"
 }
 
 require_json_schema() {
@@ -242,7 +280,10 @@ require_manifest_provenance() {
     jq -e '
         (.provenance != null)
         and (.provenance.row_id | type == "string" and length > 0)
-        and (.provenance.mode_id | IN("fsqlite_mvcc"; "fsqlite_single_writer"))
+        and (
+            .provenance.mode_id == "fsqlite_mvcc"
+            or .provenance.mode_id == "fsqlite_single_writer"
+        )
         and (.provenance.artifact_root | type == "string" and length > 0)
         and (.provenance.command_entrypoint | contains("hot-profile"))
         and (.provenance.workspace_root | type == "string" and length > 0)
@@ -426,7 +467,7 @@ run_hot_profile() {
     local mode_id="$2"
     local scenario_id
     scenario_id="$(scenario_id_for_mode "${mode_id}")"
-    local scenario_dir="${RUNS_DIR}/${scenario_id}__${fixture_id}"
+    local scenario_dir="${RUNS_DIR}/${mode_id}__${WORKLOAD_ID}__c${CONCURRENCY}__${fixture_id}__${CARGO_PROFILE}__${RUN_ID_TARGET_SAFE}"
     local stdout_log="${scenario_dir}/stdout.log"
     local stderr_log="${scenario_dir}/stderr.log"
     local cli_flag
@@ -436,7 +477,18 @@ run_hot_profile() {
     preseed_output_bundle "${scenario_dir}"
     log_event "INFO" "run" "starting ${scenario_id} fixture=${fixture_id} mode=${mode_id}"
 
-    if ! rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo run \
+    if ! rch exec -- env \
+        CARGO_TARGET_DIR="${RCH_TARGET_DIR}" \
+        FSQLITE_HOT_PATH_BEAD_ID="${FSQLITE_HOT_PATH_BEAD_ID}" \
+        FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH="${FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH}" \
+        FSQLITE_HOT_PATH_CARGO_PROFILE="${FSQLITE_HOT_PATH_CARGO_PROFILE}" \
+        FSQLITE_HOT_PATH_WORKSPACE_ROOT="${FSQLITE_HOT_PATH_WORKSPACE_ROOT}" \
+        FSQLITE_HOT_PATH_SOURCE_REVISION="${FSQLITE_HOT_PATH_SOURCE_REVISION}" \
+        FSQLITE_HOT_PATH_BEADS_DATA_HASH="${FSQLITE_HOT_PATH_BEADS_DATA_HASH}" \
+        FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID="${FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID}" \
+        FSQLITE_HOT_PATH_HARDWARE_CLASS_ID="${FSQLITE_HOT_PATH_HARDWARE_CLASS_ID}" \
+        FSQLITE_HOT_PATH_HARDWARE_SIGNATURE="${FSQLITE_HOT_PATH_HARDWARE_SIGNATURE}" \
+        cargo run \
         -p fsqlite-e2e \
         --profile "${CARGO_PROFILE}" \
         --bin realdb-e2e \
@@ -557,12 +609,37 @@ build_command_packs() {
                 fallback_notes: ($summaries | map(.fallback_notes // []) | add | unique),
                 raw_output_relpaths: ($summaries | map(.raw_output_relpaths // []) | add | unique)
             };
+        def aggregate_provenance_summary:
+            [ .[] | .manifest.provenance // empty ] as $summaries
+            | {
+                row_ids: ($summaries | map(.row_id) | unique),
+                mode_ids: ($summaries | map(.mode_id) | unique),
+                artifact_roots: ($summaries | map(.artifact_root) | unique),
+                command_entrypoints: ($summaries | map(.command_entrypoint) | unique),
+                workspace_roots: ($summaries | map(.workspace_root // empty) | map(select(length > 0)) | unique),
+                campaign_manifest_paths: ($summaries | map(.campaign_manifest_path // empty) | map(select(length > 0)) | unique),
+                source_revisions: ($summaries | map(.source_revision // empty) | map(select(length > 0)) | unique),
+                beads_data_hashes: ($summaries | map(.beads_data_hash // empty) | map(select(length > 0)) | unique),
+                kernel_releases: ($summaries | map(.kernel_release) | unique),
+                rustc_versions: ($summaries | map(.rustc_version) | unique),
+                cargo_profiles: ($summaries | map(.cargo_profile) | unique),
+                command_tools: ($summaries | map(.commands // []) | add | map(.tool) | unique),
+                tool_versions: (
+                    $summaries
+                    | map(.tool_versions // [])
+                    | add
+                    | map("\(.tool)=\(.version)")
+                    | unique
+                ),
+                fallback_notes: ($summaries | map(.fallback_notes // []) | add | unique)
+            };
         {
             schema_version: "fsqlite-e2e.hot_path_campaign_command_packs.v1",
             bead_id: $bead_id,
             run_id: $run_id,
             generated_at: $generated_at,
             counter_capture_summary: aggregate_counter_capture_summary,
+            provenance_summary: aggregate_provenance_summary,
             runs: [
                 .[] | {
                     scenario_id,
@@ -571,6 +648,7 @@ build_command_packs() {
                     engine_label,
                     output_dir,
                     counter_capture_summary: .manifest.counter_capture_summary,
+                    provenance: .manifest.provenance,
                     command_pack
                 }
             ]
@@ -600,6 +678,30 @@ build_benchmark_context() {
                 fallback_notes: ($summaries | map(.fallback_notes // []) | add | unique),
                 raw_output_relpaths: ($summaries | map(.raw_output_relpaths // []) | add | unique)
             };
+        def aggregate_provenance_summary:
+            [ .[] | .manifest.provenance // empty ] as $summaries
+            | {
+                row_ids: ($summaries | map(.row_id) | unique),
+                mode_ids: ($summaries | map(.mode_id) | unique),
+                artifact_roots: ($summaries | map(.artifact_root) | unique),
+                command_entrypoints: ($summaries | map(.command_entrypoint) | unique),
+                workspace_roots: ($summaries | map(.workspace_root // empty) | map(select(length > 0)) | unique),
+                campaign_manifest_paths: ($summaries | map(.campaign_manifest_path // empty) | map(select(length > 0)) | unique),
+                source_revisions: ($summaries | map(.source_revision // empty) | map(select(length > 0)) | unique),
+                beads_data_hashes: ($summaries | map(.beads_data_hash // empty) | map(select(length > 0)) | unique),
+                kernel_releases: ($summaries | map(.kernel_release) | unique),
+                rustc_versions: ($summaries | map(.rustc_version) | unique),
+                cargo_profiles: ($summaries | map(.cargo_profile) | unique),
+                command_tools: ($summaries | map(.commands // []) | add | map(.tool) | unique),
+                tool_versions: (
+                    $summaries
+                    | map(.tool_versions // [])
+                    | add
+                    | map("\(.tool)=\(.version)")
+                    | unique
+                ),
+                fallback_notes: ($summaries | map(.fallback_notes // []) | add | unique)
+            };
         {
             schema_version: "fsqlite-e2e.hot_path_campaign_context.v1",
             bead_id: $bead_id,
@@ -613,6 +715,7 @@ build_benchmark_context() {
             expected_runs: $expected_runs,
             completed_runs: length,
             counter_capture_summary: aggregate_counter_capture_summary,
+            provenance_summary: aggregate_provenance_summary,
             runs: [
                 .[] | {
                     scenario_id,
@@ -627,6 +730,11 @@ build_benchmark_context() {
                     retries: .profile.engine_report.retries,
                     aborts: .profile.engine_report.aborts,
                     error: (.profile.engine_report.error // null),
+                    row_id: (.manifest.provenance.row_id // null),
+                    artifact_root: (.manifest.provenance.artifact_root // null),
+                    command_entrypoint: (.manifest.provenance.command_entrypoint // null),
+                    source_revision: (.manifest.provenance.source_revision // null),
+                    beads_data_hash: (.manifest.provenance.beads_data_hash // null),
                     output_dir
                 }
             ]
@@ -701,6 +809,24 @@ build_actionable_ranking() {
                     scenario_id: $run.scenario_id
                 }
             ];
+        def wall_time_entries:
+            [ .[] as $run
+              | $run.actionable_ranking.wall_time_components[]
+              | . + {
+                    fixture_id: $run.fixture_id,
+                    mode_id: $run.mode_id,
+                    scenario_id: $run.scenario_id
+                }
+            ];
+        def microarchitectural_entries:
+            [ .[] as $run
+              | $run.actionable_ranking.microarchitectural_signatures[]
+              | . + {
+                    fixture_id: $run.fixture_id,
+                    mode_id: $run.mode_id,
+                    scenario_id: $run.scenario_id
+                }
+            ];
         def cost_component_entries:
             [ .[] as $run
               | $run.actionable_ranking.cost_components[]
@@ -754,6 +880,86 @@ build_actionable_ranking() {
                     )
                 } + confidence_fields(.; $expected_runs; $expected_modes; $expected_fixtures))
                 | sort_by(.avg_metric_value)
+                | reverse
+                | to_entries
+                | map(.value + { rank: (.key + 1) })
+            ),
+            wall_time_components: (
+                wall_time_entries
+                | sort_by(.component)
+                | group_by(.component)
+                | map({
+                    component: .[0].component,
+                    avg_time_ns: ((map(.time_ns) | add) / length),
+                    max_time_ns: (map(.time_ns) | max),
+                    avg_wall_share_basis_points: ((map(.wall_share_basis_points) | add) / length),
+                    run_breakdown: (
+                        map({
+                            fixture_id,
+                            mode_id,
+                            scenario_id,
+                            rank,
+                            time_ns,
+                            wall_share_basis_points,
+                            rationale,
+                            implication,
+                            mapped_beads
+                        })
+                        | sort_by(.time_ns)
+                        | reverse
+                    )
+                } + confidence_fields(.; $expected_runs; $expected_modes; $expected_fixtures))
+                | sort_by(.avg_time_ns)
+                | reverse
+                | to_entries
+                | map(.value + { rank: (.key + 1) })
+            ),
+            microarchitectural_signatures: (
+                microarchitectural_entries
+                | sort_by([.target, .primary_signature])
+                | group_by([.target, .primary_signature])
+                | map({
+                    target: .[0].target,
+                    primary_signature: .[0].primary_signature,
+                    secondary_signatures: (map(.secondary_signatures // []) | add | unique),
+                    mixed_or_ambiguous: any(.mixed_or_ambiguous),
+                    row_ids: (map(.row_id // empty) | map(select(length > 0)) | unique),
+                    placement_profile_ids: (map(.placement_profile_id // empty) | map(select(length > 0)) | unique),
+                    hardware_class_ids: (map(.hardware_class_id // empty) | map(select(length > 0)) | unique),
+                    hardware_signatures: (map(.hardware_signature // empty) | map(select(length > 0)) | unique),
+                    evidence_sources: (map(.evidence_sources // []) | add | unique),
+                    avg_entry_confidence_score_basis_points: (
+                        (map(.confidence_score_basis_points) | add) / length
+                    ),
+                    max_entry_confidence_score_basis_points: (
+                        map(.confidence_score_basis_points) | max
+                    ),
+                    run_breakdown: (
+                        map({
+                            fixture_id,
+                            mode_id,
+                            scenario_id,
+                            rank,
+                            target,
+                            primary_signature,
+                            secondary_signatures,
+                            confidence_label,
+                            confidence_score_basis_points,
+                            mixed_or_ambiguous,
+                            row_id,
+                            placement_profile_id,
+                            hardware_class_id,
+                            hardware_signature,
+                            rationale,
+                            implication,
+                            evidence_sources,
+                            mapped_beads
+                        })
+                        | sort_by(.confidence_score_basis_points)
+                        | reverse
+                    )
+                } + confidence_fields(.; $expected_runs; $expected_modes; $expected_fixtures))
+                | sort_by([.avg_entry_confidence_score_basis_points, .target, .primary_signature])
                 | reverse
                 | to_entries
                 | map(.value + { rank: (.key + 1) })
@@ -859,6 +1065,13 @@ build_summary_md() {
             "- mode_ids: `\(.mode_ids | join(","))`",
             "- expected_runs: `\(.expected_runs)`",
             "- completed_runs: `\(.completed_runs)`",
+            "- provenance_row_ids: `\(.provenance_summary.row_ids | join(","))`",
+            "- provenance_source_revisions: `\(.provenance_summary.source_revisions | join(","))`",
+            "- provenance_beads_hashes: `\(.provenance_summary.beads_data_hashes | join(","))`",
+            "- provenance_kernel_releases: `\(.provenance_summary.kernel_releases | join(","))`",
+            "- provenance_rustc_versions: `\(.provenance_summary.rustc_versions | join(","))`",
+            "- provenance_cargo_profiles: `\(.provenance_summary.cargo_profiles | join(","))`",
+            "- provenance_command_tools: `\(.provenance_summary.command_tools | join(","))`",
             "- counter_capture_host_sensitive: `\(.counter_capture_summary.host_capability_sensitive_captures | join(","))`",
             "- counter_capture_topology_sensitive: `\(.counter_capture_summary.topology_sensitive_captures | join(","))`",
             "- counter_capture_fallback_tools: `\(.counter_capture_summary.fallback_tools | join(","))`",
@@ -881,6 +1094,24 @@ build_summary_md() {
         .named_hotspots[:5]
         | map(
             "- rank \(.rank): `\(.subsystem)` avg=\(.avg_metric_value) \(.metric_kind) max=\(.max_metric_value) confidence=\(.confidence_label) (\(.confidence_score_basis_points)bp) -> \(.run_breakdown[0].implication)"
+          )
+        | .[]
+    ' "${ACTIONABLE_RANKING_JSON}")"
+
+    local wall_time_summary
+    wall_time_summary="$(jq -r '
+        .wall_time_components[:6]
+        | map(
+            "- rank \(.rank): `\(.component)` avg_time_ns=\(.avg_time_ns) avg_wall_share_bps=\(.avg_wall_share_basis_points) confidence=\(.confidence_label) (\(.confidence_score_basis_points)bp) -> \(.run_breakdown[0].implication)"
+          )
+        | .[]
+    ' "${ACTIONABLE_RANKING_JSON}")"
+
+    local microarchitectural_summary
+    microarchitectural_summary="$(jq -r '
+        .microarchitectural_signatures[:6]
+        | map(
+            "- rank \(.rank): `\(.target)` primary=\(.primary_signature) secondary=\((.secondary_signatures | join(","))) coverage_confidence=\(.confidence_label) (\(.confidence_score_basis_points)bp) entry_confidence_max=\(.max_entry_confidence_score_basis_points) mixed=\(.mixed_or_ambiguous) rows=\((.row_ids | join(","))) placement=\((.placement_profile_ids | join(","))) hardware=\((.hardware_signatures | join(","))) -> \(.run_breakdown[0].implication)"
           )
         | .[]
     ' "${ACTIONABLE_RANKING_JSON}")"
@@ -930,6 +1161,14 @@ ${run_summary}
 ## Ranked Hotspots
 
 ${hotspot_summary}
+
+## Wall-Time Decomposition
+
+${wall_time_summary}
+
+## Microarchitectural Signatures
+
+${microarchitectural_summary}
 
 ## Quantified Cost Components
 
@@ -1005,6 +1244,7 @@ build_report_json() {
             expected_runs: $expected_runs,
             completed_runs: ($benchmark_context_doc[0].completed_runs // null),
             counter_capture_summary: ($benchmark_context_doc[0].counter_capture_summary // null),
+            provenance_summary: ($benchmark_context_doc[0].provenance_summary // null),
             replay: {
                 command: $replay_command
             },
@@ -1028,8 +1268,21 @@ build_report_json() {
         ' > "${REPORT_JSON}"
 }
 
-log_event "INFO" "start" "starting inline D1 hot-path campaign"
+log_event "INFO" "start" "starting inline hot-path campaign"
 require_dir "${SOURCE_GOLDEN_DIR}"
+require_file "${BEADS_DATA_PATH}"
+CAMPAIGN_MANIFEST_FILE="$(resolve_campaign_manifest_file)"
+require_file "${CAMPAIGN_MANIFEST_FILE}"
+
+if [[ -z "${FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID}" || -z "${FSQLITE_HOT_PATH_HARDWARE_CLASS_ID}" || -z "${FSQLITE_HOT_PATH_HARDWARE_SIGNATURE}" ]]; then
+    IFS=$'\t' read -r default_placement_profile_id default_hardware_class_id default_hardware_signature < <(resolve_hot_path_microarchitectural_overrides)
+    [[ -n "${default_placement_profile_id:-}" ]] || fail "inputs" "failed to resolve placement profile for row ${WORKLOAD_ID}_c${CONCURRENCY} from ${CAMPAIGN_MANIFEST_FILE}"
+    [[ -n "${default_hardware_class_id:-}" ]] || fail "inputs" "failed to resolve hardware class for row ${WORKLOAD_ID}_c${CONCURRENCY} from ${CAMPAIGN_MANIFEST_FILE}"
+    [[ -n "${default_hardware_signature:-}" ]] || fail "inputs" "failed to resolve hardware signature for row ${WORKLOAD_ID}_c${CONCURRENCY} from ${CAMPAIGN_MANIFEST_FILE}"
+    FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID="${FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID:-${default_placement_profile_id}}"
+    FSQLITE_HOT_PATH_HARDWARE_CLASS_ID="${FSQLITE_HOT_PATH_HARDWARE_CLASS_ID:-${default_hardware_class_id}}"
+    FSQLITE_HOT_PATH_HARDWARE_SIGNATURE="${FSQLITE_HOT_PATH_HARDWARE_SIGNATURE:-${default_hardware_signature}}"
+fi
 
 mapfile -t FIXTURE_IDS_ARRAY < <(discover_fixture_ids)
 mapfile -t MODE_IDS_ARRAY < <(discover_mode_ids)
@@ -1041,10 +1294,15 @@ expected_runs=$(( ${#FIXTURE_IDS_ARRAY[@]} * ${#MODE_IDS_ARRAY[@]} ))
 FIXTURE_IDS_CSV="$(join_csv "${FIXTURE_IDS_ARRAY[@]}")"
 MODE_IDS_CSV="$(join_csv "${MODE_IDS_ARRAY[@]}")"
 printf -v REPLAY_COMMAND \
-    'cd %q && GOLDEN_DIR=%q SYNC_GOLDEN_DIR=%q OUTPUT_DIR=%q FIXTURE_IDS=%q MODE_IDS=%q CONCURRENCY=%q SEED=%q SCALE=%q CARGO_PROFILE=%q RCH_TARGET_DIR=%q bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh' \
-    "${WORKSPACE_ROOT}" "${SOURCE_GOLDEN_DIR}" "${SYNC_GOLDEN_DIR}" "${OUTPUT_DIR}" \
-    "${FIXTURE_IDS_CSV}" "${MODE_IDS_CSV}" "${CONCURRENCY}" "${SEED}" "${SCALE}" \
-    "${CARGO_PROFILE}" "${RCH_TARGET_DIR}"
+    'cd %q && BEAD_ID=%q SCRIPT_ENTRYPOINT=%q GOLDEN_DIR=%q SYNC_GOLDEN_DIR=%q OUTPUT_DIR=%q FIXTURE_IDS=%q MODE_IDS=%q WORKLOAD_ID=%q CONCURRENCY=%q SEED=%q SCALE=%q CARGO_PROFILE=%q RCH_TARGET_DIR=%q FSQLITE_HOT_PATH_BEAD_ID=%q FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH=%q FSQLITE_HOT_PATH_CARGO_PROFILE=%q FSQLITE_HOT_PATH_WORKSPACE_ROOT=%q FSQLITE_HOT_PATH_SOURCE_REVISION=%q FSQLITE_HOT_PATH_BEADS_DATA_HASH=%q FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID=%q FSQLITE_HOT_PATH_HARDWARE_CLASS_ID=%q FSQLITE_HOT_PATH_HARDWARE_SIGNATURE=%q bash %q' \
+    "${WORKSPACE_ROOT}" "${BEAD_ID}" "${SCRIPT_ENTRYPOINT}" "${SOURCE_GOLDEN_DIR}" \
+    "${SYNC_GOLDEN_DIR}" "${OUTPUT_DIR}" "${FIXTURE_IDS_CSV}" "${MODE_IDS_CSV}" "${WORKLOAD_ID}" \
+    "${CONCURRENCY}" "${SEED}" "${SCALE}" "${CARGO_PROFILE}" "${RCH_TARGET_DIR}" \
+    "${FSQLITE_HOT_PATH_BEAD_ID}" "${FSQLITE_HOT_PATH_CAMPAIGN_MANIFEST_PATH}" \
+    "${FSQLITE_HOT_PATH_CARGO_PROFILE}" "${FSQLITE_HOT_PATH_WORKSPACE_ROOT}" \
+    "${FSQLITE_HOT_PATH_SOURCE_REVISION}" "${FSQLITE_HOT_PATH_BEADS_DATA_HASH}" \
+    "${FSQLITE_HOT_PATH_PLACEMENT_PROFILE_ID}" "${FSQLITE_HOT_PATH_HARDWARE_CLASS_ID}" "${FSQLITE_HOT_PATH_HARDWARE_SIGNATURE}" \
+    "${SCRIPT_ENTRYPOINT}"
 log_event "INFO" "plan" "fixtures=${#FIXTURE_IDS_ARRAY[@]} modes=${#MODE_IDS_ARRAY[@]} expected_runs=${expected_runs}"
 
 for fixture_id in "${FIXTURE_IDS_ARRAY[@]}"; do
@@ -1071,17 +1329,29 @@ build_report_json
 jq -e '.runs | length >= 1' "${SCENARIO_PROFILES_JSON}" >/dev/null
 jq -e '.runs | length >= 1' "${COMMAND_PACKS_JSON}" >/dev/null
 jq -e '.counter_capture_summary.host_capability_sensitive_captures | length >= 1' "${COMMAND_PACKS_JSON}" >/dev/null
+jq -e '.provenance_summary.row_ids | length >= 1' "${COMMAND_PACKS_JSON}" >/dev/null
+jq -e '.provenance_summary.command_tools | index("realdb-e2e") != null' "${COMMAND_PACKS_JSON}" >/dev/null
+jq -e '.runs | all(.provenance.row_id != null and .provenance.command_entrypoint != null)' "${COMMAND_PACKS_JSON}" >/dev/null
 jq -e '.named_hotspots | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.wall_time_components | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.microarchitectural_signatures | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.cost_components | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.allocator_pressure | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.named_hotspots | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.wall_time_components | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.microarchitectural_signatures | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.microarchitectural_signatures | all((.row_ids | length) >= 1 and (.placement_profile_ids | length) >= 1 and (.hardware_class_ids | length) >= 1 and (.hardware_signatures | length) >= 1 and (.evidence_sources | length) >= 1)' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.microarchitectural_signatures | all(.run_breakdown | all(.row_id != null and .placement_profile_id != null and .hardware_class_id != null and .hardware_signature != null and (.evidence_sources | length) >= 1))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.cost_components | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.allocator_pressure | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.runs | length == '"${expected_runs}" "${BENCHMARK_CONTEXT_JSON}" >/dev/null
 jq -e '.counter_capture_summary.host_capability_sensitive_captures | length >= 1' "${BENCHMARK_CONTEXT_JSON}" >/dev/null
+jq -e '.provenance_summary.source_revisions | length >= 1' "${BENCHMARK_CONTEXT_JSON}" >/dev/null
+jq -e '.runs | all(.row_id != null and .artifact_root != null and .source_revision != null)' "${BENCHMARK_CONTEXT_JSON}" >/dev/null
 jq -e '.counter_capture_summary.host_capability_sensitive_captures | length >= 1' "${REPORT_JSON}" >/dev/null
+jq -e '.provenance_summary.beads_data_hashes | length >= 1' "${REPORT_JSON}" >/dev/null
 
-log_event "INFO" "complete" "inline D1 hot-path campaign completed"
+log_event "INFO" "complete" "inline hot-path campaign completed"
 echo "RUN_ID:              ${RUN_ID}"
 echo "Source golden dir:   ${SOURCE_GOLDEN_DIR}"
 echo "Synced golden dir:   ${SYNC_GOLDEN_DIR}"

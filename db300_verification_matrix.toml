@@ -1,0 +1,372 @@
+# DB300 Verification Matrix v1.0.0
+#
+# Bead: bd-db300.7.5.1
+# Purpose: map every code-changing revised-plan bead in Track I / Track J to
+# concrete unit/property/fuzz obligations, ownership, and explicit gap rules so
+# future implementation does not have to guess what "enough coverage" means.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-db300.7.5.1"
+track_id = "bd-db300.7.5"
+generated_at = "2026-03-15"
+contract_owner = "db300-track-g-verification"
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.3"
+title = "I3: truth workload semantics for disjoint inserts and publish the revised conflict geometry note"
+reason = "Analysis and publication bead only; it may generate reports or notes, but it is not expected to land a production-code delta by itself."
+gap_rule = "If I3 grows executable probes, parsers, or permanent runtime instrumentation beyond report assembly, add a dedicated coverage row before implementation closes."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.4"
+title = "I4: design extent leases and header or freelist delta reconciliation for the ordinary insert path"
+reason = "Design bead only; executable obligations start at I5 where extent leases actually land in code."
+gap_rule = "If I4 lands prototype code, split that code into a new implementation bead or add a coverage row here before close."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.9"
+title = "I9: design version-gated parent micro-publish with local structural restart"
+reason = "Architecture/design bead only; concrete code obligations begin at I10."
+gap_rule = "If I9 lands a runnable prototype or new runtime switches, create or amend the matching coverage row before close."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.11"
+title = "I11: extend the structural path into explicit intents and document the later-stage research branches"
+reason = "Program-shaping umbrella bead; direct code obligations are deferred to explicit future research or implementation children."
+gap_rule = "Any executable branch taken out of I11 must acquire its own coverage row or bead before merge."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.11.1"
+title = "I11.1: evaluate broader optimistic structural validation without regressing into blind pure-OCC everywhere"
+reason = "Late research-only option with no approved implementation lane yet."
+gap_rule = "Do not land code from I11.1 without first creating a concrete implementation bead with dedicated coverage obligations."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.11.2"
+title = "I11.2: research nested-top-action-like autonomous physical split/install operations with a full recovery story"
+reason = "Late research-only option; recovery semantics are unresolved and no production implementation is approved."
+gap_rule = "Any prototype beyond paper design must fork into a dedicated implementation bead plus coverage row before close."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.11.3"
+title = "I11.3: research runtime B-link/Bw-tree-style half-splits, side links, and delta-style internal updates without on-disk compatibility hacks"
+reason = "Late research-only option; no approved executable lane exists yet."
+gap_rule = "Any prototype or experiment that changes runtime routing must create a coverage row before code lands."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.11.4"
+title = "I11.4: prove byte-accurate compatibility budget before any proposal that reuses page-header or reserved-file bytes"
+reason = "Compatibility proof / audit bead only; executable work is intentionally forbidden until proof exists."
+gap_rule = "If code appears here, that is already a process violation and must be split into a new implementation bead with explicit tests."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.11.5"
+title = "I11.5: evaluate precise structural wait queues only for short publish windows, with hard convoy falsifiers"
+reason = "Late research-only option, deliberately gated behind earlier structural work."
+gap_rule = "Any wait-queue implementation must first become a dedicated code bead with explicit correctness and convoy-regression coverage."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.11.6"
+title = "I11.6: evaluate true internal-page delta chains or mapping-table-like indirection only after lighter structural approaches fail"
+reason = "High-risk research branch, not an approved first-wave implementation."
+gap_rule = "Any executable branch from I11.6 must be split into a dedicated implementation bead with its own verification row before coding."
+
+[[excluded_bead]]
+bead_id = "bd-db300.9.12"
+title = "I12: verify the revised structural track with targeted unit tests, e2e scripts, rich logs, and focused matrix attribution"
+reason = "Verification bead rather than code-changing implementation bead."
+gap_rule = "Coverage for I12 belongs in G5.2/G5.3 and the final verification suites rather than this code-change matrix."
+
+[[excluded_bead]]
+bead_id = "bd-db300.10.10"
+title = "J10: verify baseline-tax reductions across c1, mixed, and single-writer rows with attribution-quality evidence"
+reason = "Verification bead rather than code-changing implementation bead."
+gap_rule = "J10 obligations belong in the evidence ownership and rerun matrix, not in the unit/property/fuzz matrix."
+
+[[coverage_row]]
+bead_id = "bd-db300.10.1"
+title = "J1: instrument baseline cache-hit, reuse, and hot-path waste rates for the non-structural engine gap"
+verification_owner = "fsqlite-e2e"
+owner_crates = ["fsqlite-e2e"]
+unit_test_targets = [
+  "crates/fsqlite-e2e/src/perf_runner.rs::tests::hot_path_profile_smoke_writes_artifacts",
+  "crates/fsqlite-e2e/src/perf_runner.rs::tests::hot_path_baseline_ledgers_classify_structural_vs_baseline_costs",
+]
+requires_property_coverage = false
+property_test_targets = []
+property_coverage_reason = "J1 is report-layer accounting rather than an algebraic data structure change; deterministic aggregation tests are the required proof surface."
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "Fuzzing is not required unless future J1 work begins parsing untrusted artifact payloads or log schemas instead of consuming structured counters."
+gap_conversion_rule = "If a new J1 metric or ledger lane is added without one of the named aggregation tests, open a child bead under bd-db300.10.1 before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.10.2"
+title = "J2: add statement and transaction-local arenas or lookaside storage for parser, VDBE, and materialization scratch"
+verification_owner = "fsqlite-core"
+owner_crates = ["fsqlite-core", "fsqlite-vdbe", "fsqlite-parser"]
+unit_test_targets = [
+  "crates/fsqlite-core/src/connection.rs::tests::arena_scratch_resets_on_commit_and_rollback",
+  "crates/fsqlite-vdbe/src/engine.rs::tests::materialization_arena_reuses_transient_value_storage",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::proptest_arena_reset_preserves_result_equivalence_across_statement_reuse",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "Arena lifetime bugs should be caught by deterministic reset/equivalence tests and UBS; dedicated fuzz is only required if arena-backed objects start crossing parser input boundaries."
+gap_conversion_rule = "If arena-backed scratch changes ownership or lifetime rules without the named reset/equivalence tests, open a dedicated coverage gap bead before merge."
+
+[[coverage_row]]
+bead_id = "bd-db300.10.3"
+title = "J3: add reusable page-image buffers and page-buffer pools for hot staging paths"
+verification_owner = "fsqlite-pager"
+owner_crates = ["fsqlite-pager", "fsqlite-vdbe"]
+unit_test_targets = [
+  "crates/fsqlite-pager/src/pager.rs::tests::page_buffer_pool_reuses_same_size_buffers_without_aliasing",
+  "crates/fsqlite-vdbe/src/engine.rs::tests::staged_write_reuses_page_image_buffer_without_cross_txn_leakage",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-pager/src/pager.rs::tests::proptest_buffer_pool_reuse_preserves_page_bytes_under_random_checkout_sequences",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "Randomized pool checkout sequences are the relevant coverage shape; byte-oriented fuzzing adds little until buffers are exposed to untrusted parsers."
+gap_conversion_rule = "If reusable buffers land without alias-safety and randomized-reuse tests, convert the gap into a child bead under bd-db300.10.3."
+
+[[coverage_row]]
+bead_id = "bd-db300.10.4"
+title = "J4: implement prepared-statement and execution-plan caching with explicit invalidation"
+verification_owner = "fsqlite-core"
+owner_crates = ["fsqlite-core", "fsqlite-planner", "fsqlite-vdbe"]
+unit_test_targets = [
+  "crates/fsqlite-core/src/connection.rs::tests::statement_cache_reuses_prepare_for_rebound_sql",
+  "crates/fsqlite-core/src/connection.rs::tests::statement_cache_invalidates_on_schema_change",
+  "crates/fsqlite-core/src/connection.rs::tests::compiled_plan_cache_miss_turns_into_hit_under_steady_state_loop",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-core/src/connection.rs::tests::proptest_statement_cache_never_changes_result_set_or_error_surface",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "Existing parser fuzzing already covers SQL text shape; this bead only needs a dedicated fuzz target if cache keys begin depending on normalized SQL bytes or schema fingerprints beyond deterministic invalidation rules."
+gap_conversion_rule = "If cache-keying or invalidation changes land without the named reuse + schema-change tests, open a coverage gap bead under bd-db300.10.4 before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.10.5"
+title = "J5: add cursor-level record decode caching with explicit invalidation on page or image change"
+verification_owner = "fsqlite-vdbe"
+owner_crates = ["fsqlite-vdbe"]
+unit_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::record_decode_cache_hits_same_cell_until_page_image_changes",
+  "crates/fsqlite-vdbe/src/engine.rs::tests::record_decode_cache_invalidates_on_cursor_reposition_and_write",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::proptest_decode_cache_matches_uncached_decode_for_random_record_shapes",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "Property-style random record coverage is the high-value safety surface here; a dedicated fuzz target is only required if cache metadata starts reading raw untrusted bytes outside the existing decoder path."
+gap_conversion_rule = "If decode-cache logic lands without invalidation and random-shape equivalence tests, convert the omission into a child gap bead before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.10.6"
+title = "J6: audit and reduce PageData ownership transitions, full-page normalization, and clone-heavy representation flips"
+verification_owner = "fsqlite-types"
+owner_crates = ["fsqlite-types", "fsqlite-vdbe", "fsqlite-pager"]
+unit_test_targets = [
+  "crates/fsqlite-types/src/lib.rs::tests::page_data_shared_owned_transitions_preserve_bytes",
+  "crates/fsqlite-vdbe/src/engine.rs::tests::write_path_avoids_redundant_page_data_clone_vec_arc_cycles",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-types/src/lib.rs::tests::proptest_page_data_transition_sequences_preserve_equivalence_and_size",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "Ownership-flip correctness is better captured by randomized transition-sequence properties than by byte-fuzzing."
+gap_conversion_rule = "If PageData transition changes land without transition-equivalence tests, open a gap bead under bd-db300.10.6 before merge."
+
+[[coverage_row]]
+bead_id = "bd-db300.10.7"
+title = "J7: simplify copy-heavy decode and cell-assembly kernels while reusing cursor and frame structures"
+verification_owner = "fsqlite-vdbe"
+owner_crates = ["fsqlite-vdbe"]
+unit_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::cursor_frame_reuse_avoids_repeated_setup_for_same_statement",
+  "crates/fsqlite-vdbe/src/engine.rs::tests::cell_assembly_fast_path_matches_existing_row_output",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::proptest_frame_reuse_preserves_opcode_result_equivalence",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "The relevant risk is semantic drift under repeated execution, which is better handled by opcode/result equivalence properties than by generic fuzzing."
+gap_conversion_rule = "If cursor/frame reuse or cell assembly lands without steady-state equivalence tests, record the omission as a child gap bead before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.10.8"
+title = "J8: add VDBE fast paths, reusable execution frames, and safe direct read-path improvements where profitable"
+verification_owner = "fsqlite-vdbe"
+owner_crates = ["fsqlite-vdbe", "fsqlite-pager"]
+unit_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::fast_path_execution_matches_generic_opcode_path",
+  "crates/fsqlite-pager/src/pager.rs::tests::direct_read_path_preserves_page_image_equivalence",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::proptest_fast_path_and_generic_path_are_result_equivalent",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "Fuzzing is not required unless a direct read path begins parsing external byte streams outside the existing pager invariants."
+gap_conversion_rule = "If J8 lands fast paths without generic-path equivalence tests, create a child bead under bd-db300.10.8 before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.10.9"
+title = "J9: harden perf-binary build hygiene so tracing, debug tax, and profile noise do not hide real wins"
+verification_owner = "fsqlite-e2e"
+owner_crates = ["fsqlite-e2e", "fsqlite-harness"]
+unit_test_targets = [
+  "crates/fsqlite-harness/tests/bd_db300_10_9_release_perf_profile_contract.rs::release_perf_profile_is_optimized",
+  "crates/fsqlite-e2e/tests/bd_db300_10_9_perf_binary_metadata.rs::perf_binary_reports_profile_and_trace_hygiene",
+]
+requires_property_coverage = false
+property_test_targets = []
+property_coverage_reason = "Build-profile hygiene is a deterministic contract over profile flags and emitted metadata, not a randomized semantic surface."
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "No parser or untrusted-input surface is introduced by J9."
+gap_conversion_rule = "If J9 changes build-profile behavior without profile-contract tests or metadata assertions, open a child bead before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.9.1"
+title = "I1: instrument retry-cause taxonomy and per-transaction page-touch classes"
+verification_owner = "fsqlite-e2e"
+owner_crates = ["fsqlite-e2e"]
+unit_test_targets = [
+  "crates/fsqlite-e2e/src/perf_runner.rs::tests::retry_cause_histogram_emits_expected_classes",
+  "crates/fsqlite-e2e/src/perf_runner.rs::tests::page_touch_summary_records_table_index_internal_and_allocator_classes",
+]
+requires_property_coverage = false
+property_test_targets = []
+property_coverage_reason = "I1 is deterministic telemetry classification; targeted aggregation tests are the required proof surface."
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "No new untrusted-input parser is introduced; metric classification is already deterministic."
+gap_conversion_rule = "If new retry or page-touch classes are added without aggregation tests, open a coverage gap bead under bd-db300.9.1."
+
+[[coverage_row]]
+bead_id = "bd-db300.9.2"
+title = "I2: instrument split-path taxonomy, hold/wait distributions, copy-allocation churn, and cache-hit truthing"
+verification_owner = "fsqlite-e2e"
+owner_crates = ["fsqlite-e2e"]
+unit_test_targets = [
+  "crates/fsqlite-e2e/src/perf_runner.rs::tests::split_path_taxonomy_reports_leaf_local_local_split_and_rebalance_counts",
+  "crates/fsqlite-e2e/src/perf_runner.rs::tests::hold_wait_copy_and_cache_ledgers_roundtrip_in_manifest",
+]
+requires_property_coverage = false
+property_test_targets = []
+property_coverage_reason = "I2 is instrumentation and report assembly; deterministic schema and aggregation tests are the high-value proof surface."
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "No new input parser or byte-oriented state machine is introduced."
+gap_conversion_rule = "If any new I2 ledger or taxonomy field is added without manifest-roundtrip coverage, record that as a child gap bead before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.9.5"
+title = "I5: implement extent leases and remove page-1 or freelist work from the ordinary insert fast path"
+verification_owner = "fsqlite-vdbe"
+owner_crates = ["fsqlite-vdbe", "fsqlite-mvcc"]
+unit_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::extent_lease_allocates_fast_path_without_page1_touch",
+  "crates/fsqlite-vdbe/src/engine.rs::tests::header_and_freelist_deltas_reconcile_on_commit_and_return",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::proptest_extent_lease_sequences_preserve_dbsize_and_freelist_accounting",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "Lease accounting is an internal state transition problem; randomized sequence properties are the relevant proof, not fuzzing."
+gap_conversion_rule = "If lease or delta reconciliation lands without fast-path page1 avoidance and accounting properties, create a child bead under bd-db300.9.5 before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.9.6"
+title = "I6: rewrite the write hot path into explicit tiers with cheap owned-page checks and reduced restart scope"
+verification_owner = "fsqlite-vdbe"
+owner_crates = ["fsqlite-vdbe", "fsqlite-mvcc"]
+unit_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::already_owned_page_fast_path_skips_global_relookup",
+  "crates/fsqlite-vdbe/src/engine.rs::tests::structural_loss_restarts_from_local_planning_point_not_whole_txn",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-vdbe/src/engine.rs::tests::proptest_hot_path_tiers_preserve_write_visibility_and_restart_equivalence",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "The main risk is semantic drift between tiered paths; randomized equivalence properties are the better proof surface."
+gap_conversion_rule = "If tiered hot-path logic lands without owned-page fast-path and restart-scope tests, open a child coverage bead before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.9.7"
+title = "I7: make concurrent inserts prefer leaf-local insert and local split while suppressing broad non-root rebalance"
+verification_owner = "fsqlite-btree"
+owner_crates = ["fsqlite-btree"]
+unit_test_targets = [
+  "crates/fsqlite-btree/src/balance.rs::tests::concurrent_insert_prefers_local_split_over_broad_nonroot_rebalance",
+  "crates/fsqlite-btree/src/cursor.rs::tests::concurrent_insert_path_only_escalates_when_no_safe_local_alternative_exists",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-btree/src/balance.rs::tests::proptest_local_split_policy_preserves_btree_invariants_under_random_insert_sequences",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "Randomized B-tree invariant properties are the correct proof surface; a dedicated fuzz target is only needed if raw page parsing logic changes outside those invariants."
+gap_conversion_rule = "If local-split suppression lands without invariant-preserving randomized insert tests, create a child gap bead before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.9.8"
+title = "I8: add concurrency-aware slack, asymmetric right-edge split policy, pre-split threshold, dynamic fill factor, and deferred cleanup"
+verification_owner = "fsqlite-btree"
+owner_crates = ["fsqlite-btree"]
+unit_test_targets = [
+  "crates/fsqlite-btree/src/balance.rs::tests::right_edge_asymmetric_split_reserves_slack_on_fresh_leaf",
+  "crates/fsqlite-btree/src/balance.rs::tests::dynamic_fill_factor_only_relaxes_hot_regions_under_contention_signal",
+  "crates/fsqlite-btree/src/balance.rs::tests::deferred_cleanup_never_runs_on_hot_insert_path",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-btree/src/balance.rs::tests::proptest_slack_policy_preserves_ordering_and_parent_separator_correctness",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "The critical risk is structural invariant drift rather than parser robustness; B-tree property coverage is the required proof."
+gap_conversion_rule = "If I8 lands without slack-policy invariants and deferred-cleanup tests, convert the omission into a child bead before close."
+
+[[coverage_row]]
+bead_id = "bd-db300.9.10"
+title = "I10: implement private split planning, short final parent publish, and local structural restart"
+verification_owner = "fsqlite-btree"
+owner_crates = ["fsqlite-btree", "fsqlite-vdbe", "fsqlite-mvcc"]
+unit_test_targets = [
+  "crates/fsqlite-btree/src/cursor.rs::tests::parent_micro_publish_restarts_locally_on_version_mismatch",
+  "crates/fsqlite-btree/src/balance.rs::tests::private_split_planning_does_not_hold_parent_during_preparation",
+  "crates/fsqlite-vdbe/src/engine.rs::tests::structural_publish_wait_is_limited_to_short_parent_window",
+]
+requires_property_coverage = true
+property_test_targets = [
+  "crates/fsqlite-btree/src/cursor.rs::tests::proptest_local_restart_micro_publish_preserves_insert_equivalence_under_parent_version_churn",
+]
+requires_fuzz_coverage = false
+fuzz_test_targets = []
+fuzz_coverage_reason = "The key failure mode is local-restart semantic drift under parent churn, which is best captured by randomized equivalence properties."
+gap_conversion_rule = "If micro-publish or local restart lands without version-mismatch restart and parent-window tests, open a child gap bead before close."
