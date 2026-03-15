@@ -16471,6 +16471,7 @@ impl Connection {
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx: None,
+            ..CodegenContext::default()
         };
         let canonical_select = canonicalize_select_placeholders(select)?;
         // Expose custom aggregate UDF names to the codegen so it emits
@@ -20432,6 +20433,7 @@ impl Connection {
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx,
+            ..CodegenContext::default()
         };
         codegen_insert(&mut builder, &insert, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
@@ -20500,6 +20502,7 @@ impl Connection {
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx,
+            ..CodegenContext::default()
         };
         codegen_update(&mut builder, update, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
@@ -20513,6 +20516,7 @@ impl Connection {
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx: None,
+            ..CodegenContext::default()
         };
         codegen_delete(&mut builder, delete, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
@@ -32904,28 +32908,6 @@ fn eval_join_expr_with_using(
         }
     }
     eval_join_expr(expr, row, col_map).unwrap_or(SqliteValue::Null)
-}
-
-/// Project a single result column from a combined join row.
-fn project_join_column(
-    col: &ResultColumn,
-    row: &[SqliteValue],
-    col_map: &[(String, String, bool)],
-) -> SqliteValue {
-    match col {
-        ResultColumn::Expr { expr, .. } => {
-            eval_join_expr(expr, row, col_map).unwrap_or(SqliteValue::Null)
-        }
-        ResultColumn::Star => {
-            // Star should have been expanded earlier; this is a fallback.
-            SqliteValue::Null
-        }
-        ResultColumn::TableStar(table_name) => {
-            // TableStar should have been expanded; fallback.
-            let _ = table_name;
-            SqliteValue::Null
-        }
-    }
 }
 
 // ── Time-travel query helper functions (#23) ──────────────────────────────

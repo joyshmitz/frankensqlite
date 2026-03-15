@@ -2446,13 +2446,13 @@ where
             && committed_snapshot.journal_mode != JournalMode::Wal
             && page_no.get() <= committed_snapshot.db_size
         {
-            if let Some(data) = self
+            let cached_page = self
                 .cache
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction cache lock poisoned"))?
                 .get(page_no)
-                .map(|page| page.to_vec())
-            {
+                .map(|page| page.to_vec());
+            if let Some(data) = cached_page {
                 return Ok(PageData::from_vec(data));
             }
         }

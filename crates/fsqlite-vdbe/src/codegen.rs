@@ -856,6 +856,12 @@ pub struct CodegenContext {
     /// target table. Used by INSERT DEFAULT VALUES to keep the aliased column
     /// in sync with the generated rowid.
     pub rowid_alias_col_idx: Option<usize>,
+    /// Whether index-ordered scans produce correctly sorted output.
+    /// When false, the codegen falls back to the sorter for ORDER BY
+    /// instead of attempting index-assisted optimization.
+    /// Set to false for MemDatabase backends where indexes don't maintain
+    /// key-sorted iteration order.
+    pub index_ordered_scan_reliable: bool,
 }
 
 /// Errors during code generation.
@@ -1133,7 +1139,7 @@ pub fn codegen_select(
     b: &mut ProgramBuilder,
     stmt: &SelectStatement,
     schema: &[TableSchema],
-    _ctx: &CodegenContext,
+    ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
     let (columns, from, where_clause, group_by, having, distinct) = match &stmt.body.select {
         SelectCore::Select {
@@ -1304,8 +1310,9 @@ pub fn codegen_select(
             idx_schema,
             index_range,
         );
-    } else if let Some((col_name, target_expr)) = index_eq {
-        // --- Index-seek SELECT ---
+    } else if let Some((col_name, target_expr)) = index_eq.filter(|_| stmt.order_by.is_empty()) {
+        // --- Index-seek SELECT (only when no ORDER BY, since the index
+        //     seek returns rows in index insertion order, not sort order) ---
         if let Some(idx_schema) = table.index_for_column(&col_name) {
             let idx_cursor = 1_i32;
             index_cursor_to_close = Some(idx_cursor);
@@ -1494,14 +1501,20 @@ pub fn codegen_select(
             end_label,
         );
     } else if !stmt.order_by.is_empty() {
-        if let Some(index_plan) = resolve_order_by_index_plan(
-            table,
-            table_alias,
-            columns,
-            where_clause.as_deref(),
-            &stmt.order_by,
-            distinct,
-        ) {
+        if let Some(index_plan) = ctx
+            .index_ordered_scan_reliable
+            .then(|| {
+                resolve_order_by_index_plan(
+                    table,
+                    table_alias,
+                    columns,
+                    where_clause.as_deref(),
+                    &stmt.order_by,
+                    distinct,
+                )
+            })
+            .flatten()
+        {
             tracing::info!(
                 table = %table.name,
                 index = %index_plan.index_name,
@@ -5458,6 +5471,7 @@ pub fn codegen_insert(
                 CodegenContext {
                     concurrent_mode: ctx.concurrent_mode,
                     rowid_alias_col_idx: select_pos,
+                    ..CodegenContext::default()
                 }
             } else {
                 ctx.clone()
@@ -13512,6 +13526,7 @@ mod tests {
         let ctx = CodegenContext {
             concurrent_mode: true,
             rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
         };
         let mut b = ProgramBuilder::new();
         codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
@@ -14939,7 +14954,10 @@ mod tests {
     fn test_codegen_select_order_by_uses_index_without_sorter() {
         let stmt = star_select_order_by("t", "b", false);
         let schema = test_schema_with_index();
-        let ctx = CodegenContext::default();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
@@ -14988,7 +15006,10 @@ mod tests {
     fn test_codegen_select_order_by_desc_uses_index_reverse_scan_without_sorter() {
         let stmt = star_select_order_by("t", "b", true);
         let schema = test_schema_with_index();
-        let ctx = CodegenContext::default();
+        let ctx = CodegenContext {
+            index_ordered_scan_reliable: true,
+            ..CodegenContext::default()
+        };
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
@@ -16841,6 +16862,7 @@ mod tests {
         let ctx = CodegenContext {
             concurrent_mode: false,
             rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
         };
         let mut b = ProgramBuilder::new();
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
@@ -16954,6 +16976,7 @@ mod tests {
         let ctx = CodegenContext {
             concurrent_mode: false,
             rowid_alias_col_idx: Some(0), // IPK is column 0 in schema
+            ..CodegenContext::default()
         };
         let mut b = ProgramBuilder::new();
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
@@ -16989,6 +17012,7 @@ mod tests {
         let ctx = CodegenContext {
             concurrent_mode: false,
             rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
         };
         let mut b = ProgramBuilder::new();
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
@@ -17030,6 +17054,7 @@ mod tests {
         let ctx = CodegenContext {
             concurrent_mode: false,
             rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
         };
         let mut b = ProgramBuilder::new();
         codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
