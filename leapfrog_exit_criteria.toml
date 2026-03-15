@@ -257,14 +257,14 @@ not_applicable_semantics = "Not applicable only when the scenario does not emit 
 metric_id = "wait_fraction_of_wall_time"
 label = "Wait fraction of wall time"
 family = "wait"
-availability = "supporting_artifact_field"
+availability = "required_artifact_field"
 unit = "fraction"
 aggregation = "Use the per-cell aggregate wait share as a supporting explanation for retry or tail failures."
 collection_artifact = "artifacts/{bead_id}/{run_id}/retry_report.json"
 collection_field = "wait_fraction_of_wall_time"
 derivation = "time_spent_waiting_or_backing_off / wall_time for the matched cell."
 comparability = "advisory_only"
-required_for_claim = false
+required_for_claim = true
 zero_semantics = "Zero means the engine spent no measurable time queued, sleeping, or blocked."
 missing_semantics = "Missing means the wait-share diagnostic was not emitted; do not treat as zero."
 suppressed_semantics = "Suppressed means profiler-safe mode skipped fine-grained wait attribution."
@@ -375,10 +375,13 @@ not_applicable_semantics = "Not applicable only for single-process dry runs with
 [[cell_gates]]
 cell = "c1"
 goal = "Contain single-worker overhead while keeping retries, tails, and responsiveness disciplined."
+frontier_target_summary = "c1 is a baseline-tax check: accept only a modest throughput win, but require the single-worker profile to stay visibly disciplined on tails, waits, and responsiveness."
+must_not_regress_summary = "Do not trade a tiny c1 throughput gain for queueing, topology churn, or tail collapse that would make the patch unusable outside a narrow lab run."
 recommended_min_throughput_ratio_vs_sqlite = 1.05
 baseline_catastrophic_floor_ratio_vs_sqlite = 0.95
 adversarial_catastrophic_floor_ratio_vs_sqlite = 0.90
 max_retry_rate = 0.01
+max_wait_fraction_of_wall_time = 0.08
 min_cpu_utilization_pct = 45.0
 max_p50_latency_ratio_vs_sqlite = 1.10
 max_p95_latency_ratio_vs_sqlite = 1.20
@@ -389,10 +392,13 @@ max_topology_reassignments_per_run = 2
 [[cell_gates]]
 cell = "c4"
 goal = "Show a clear many-core win on the recommended pinned profile without turning baseline or adversarial placements into pathological retry or tail regimes."
+frontier_target_summary = "c4 is the first explicit structural-concurrency target: throughput and CPU-occupancy should move clearly upward, not merely hold flat."
+must_not_regress_summary = "The c4 win is invalid if baseline or adversarial placements pay for it through retry storms, large wait fractions, or visibly degraded tail latency."
 recommended_min_throughput_ratio_vs_sqlite = 1.25
 baseline_catastrophic_floor_ratio_vs_sqlite = 0.90
 adversarial_catastrophic_floor_ratio_vs_sqlite = 0.80
 max_retry_rate = 0.03
+max_wait_fraction_of_wall_time = 0.18
 min_cpu_utilization_pct = 60.0
 max_p50_latency_ratio_vs_sqlite = 1.15
 max_p95_latency_ratio_vs_sqlite = 1.30
@@ -403,16 +409,79 @@ max_topology_reassignments_per_run = 6
 [[cell_gates]]
 cell = "c8"
 goal = "Earn the headline claim by sustaining an obvious concurrency win on recommended_pinned while proving the worst placement still avoids catastrophic collapse."
+frontier_target_summary = "c8 is the headline frontier cell: it should show the strongest concurrency dividend and CPU-efficiency gain on recommended_pinned."
+must_not_regress_summary = "Even at c8, the program may not hide catastrophic baseline/adversarial damage behind a local headline win; wait, retry, and tail floors stay operator-facing."
 recommended_min_throughput_ratio_vs_sqlite = 1.50
 baseline_catastrophic_floor_ratio_vs_sqlite = 0.85
 adversarial_catastrophic_floor_ratio_vs_sqlite = 0.75
 max_retry_rate = 0.05
+max_wait_fraction_of_wall_time = 0.28
 min_cpu_utilization_pct = 70.0
 max_p50_latency_ratio_vs_sqlite = 1.20
 max_p95_latency_ratio_vs_sqlite = 1.40
 max_p99_latency_ratio_vs_sqlite = 1.60
 max_responsiveness_regression_ratio_vs_sqlite = 1.30
 max_topology_reassignments_per_run = 10
+
+[[workload_families]]
+workload = "commutative_inserts_disjoint_keys"
+family_label = "insert_heavy_disjoint"
+interpretation = "Treat this family as baseline-tax and ownership-bound work: c1 may show only a modest gain, while c4/c8 should prove that reduced shared-state overhead and better locality convert into real parallel throughput."
+frontier_metrics = [
+  "throughput_ratio_vs_sqlite",
+  "cpu_utilization_pct",
+]
+must_not_regress_metrics = [
+  "retry_rate",
+  "wait_fraction_of_wall_time",
+  "p95_latency_ratio_vs_sqlite",
+  "p99_latency_ratio_vs_sqlite",
+  "responsiveness_regression_ratio_vs_sqlite",
+  "topology_reassignments",
+]
+c1_target_direction = "Allow only a modest single-worker throughput gain requirement while protecting latency and responsiveness from regression."
+c4_target_direction = "Require a clear throughput and CPU-occupancy win without visible retry or wait inflation."
+c8_target_direction = "Require the strongest throughput frontier gain of the matrix while keeping protected metrics inside the c8 anti-regression floors."
+
+[[workload_families]]
+workload = "hot_page_contention"
+family_label = "structural_convoy"
+interpretation = "Treat this family as contention-dominated: throughput still matters, but the primary question is whether retry, queueing, and tail behavior stay bounded under structurally hot pages."
+frontier_metrics = [
+  "retry_rate",
+  "wait_fraction_of_wall_time",
+  "p99_latency_ratio_vs_sqlite",
+  "throughput_ratio_vs_sqlite",
+]
+must_not_regress_metrics = [
+  "cpu_utilization_pct",
+  "p95_latency_ratio_vs_sqlite",
+  "responsiveness_regression_ratio_vs_sqlite",
+  "topology_reassignments",
+]
+c1_target_direction = "Keep contention tax low enough that c1 still looks disciplined rather than queue-bound."
+c4_target_direction = "Show that concurrent-writer coordination contains retry and wait growth while preserving a visible throughput gain."
+c8_target_direction = "Accept some contention pressure, but require that wait and tail amplification remain bounded enough to avoid a non-claimable result."
+
+[[workload_families]]
+workload = "mixed_read_write"
+family_label = "balanced_mixed"
+interpretation = "Treat this family as operator-facing balance work: wins should improve throughput and occupancy without sacrificing read-side responsiveness, retry stability, or placement robustness."
+frontier_metrics = [
+  "throughput_ratio_vs_sqlite",
+  "p95_latency_ratio_vs_sqlite",
+  "cpu_utilization_pct",
+]
+must_not_regress_metrics = [
+  "retry_rate",
+  "wait_fraction_of_wall_time",
+  "p99_latency_ratio_vs_sqlite",
+  "responsiveness_regression_ratio_vs_sqlite",
+  "topology_reassignments",
+]
+c1_target_direction = "Prioritize keeping mixed-workload tails and responsiveness steady while still collecting a measurable throughput improvement."
+c4_target_direction = "Require a balanced win that improves throughput without shifting the workload into retry- or wait-dominated behavior."
+c8_target_direction = "Require a durable many-core gain that still reads as usable for mixed traffic rather than a benchmark-only spike."
 
 [verification_plan]
 unit_tests = [
@@ -421,6 +490,7 @@ unit_tests = [
   "test_bd_db300_7_3_cell_targets_are_monotone",
   "test_bd_db300_7_3_verification_plan_is_actionable",
   "test_bd_db300_7_3_transferability_rubric_is_actionable",
+  "test_bd_db300_7_3_workload_family_thresholds_are_actionable",
 ]
 e2e_scenarios = [
   "commutative_inserts_disjoint_keys_c1",
@@ -438,6 +508,7 @@ logging_artifacts = [
   "artifacts/{bead_id}/{run_id}/manifest.json",
   "artifacts/{bead_id}/{run_id}/summary.md",
   "artifacts/{bead_id}/{run_id}/metric_dictionary.json",
+  "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
   "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl",
   "artifacts/{bead_id}/{run_id}/retry_report.json",
   "artifacts/{bead_id}/{run_id}/topology.json",
@@ -445,6 +516,7 @@ logging_artifacts = [
 required_log_fields = [
   "throughput_ratio_vs_sqlite",
   "retry_rate",
+  "wait_fraction_of_wall_time",
   "cpu_utilization_pct",
   "p50_latency_ratio_vs_sqlite",
   "p95_latency_ratio_vs_sqlite",

@@ -18,8 +18,10 @@ EVENTS_JSONL="${ARTIFACT_DIR}/events.jsonl"
 REPORT_JSON="${ARTIFACT_DIR}/manifest.json"
 SUMMARY_MD="${ARTIFACT_DIR}/summary.md"
 METRIC_DICTIONARY_JSON="${ARTIFACT_DIR}/metric_dictionary.json"
+THRESHOLDS_JSON="${ARTIFACT_DIR}/scorecard_thresholds.json"
 TMP_REPORT_JSON="${REPORT_JSON}.tmp"
 TMP_METRIC_DICTIONARY_JSON="${METRIC_DICTIONARY_JSON}.tmp"
+TMP_THRESHOLDS_JSON="${THRESHOLDS_JSON}.tmp"
 TEST_LOG="${ARTIFACT_DIR}/cargo-test.log"
 CONTRACT_FILE="leapfrog_exit_criteria.toml"
 TEST_FILE="crates/fsqlite-harness/tests/bd_db300_7_3_leapfrog_exit_criteria.rs"
@@ -57,6 +59,8 @@ fi
 emit_event "contract_schema" "start" "running" "validating contract schema"
 export METRIC_DICTIONARY_JSON
 export TMP_METRIC_DICTIONARY_JSON
+export THRESHOLDS_JSON
+export TMP_THRESHOLDS_JSON
 if ! python3 - <<'PY' > "${TMP_REPORT_JSON}"; then
 import json
 import os
@@ -80,6 +84,7 @@ required_unit_tests = {
     "test_bd_db300_7_3_cell_targets_are_monotone",
     "test_bd_db300_7_3_verification_plan_is_actionable",
     "test_bd_db300_7_3_transferability_rubric_is_actionable",
+    "test_bd_db300_7_3_workload_family_thresholds_are_actionable",
 }
 required_profiles = {
     "baseline_unpinned",
@@ -170,6 +175,7 @@ required_artifacts = {
     "artifacts/{bead_id}/{run_id}/manifest.json",
     "artifacts/{bead_id}/{run_id}/summary.md",
     "artifacts/{bead_id}/{run_id}/metric_dictionary.json",
+    "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
     "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl",
     "artifacts/{bead_id}/{run_id}/retry_report.json",
     "artifacts/{bead_id}/{run_id}/topology.json",
@@ -270,6 +276,19 @@ metric_dictionary_path.write_text(
     encoding="utf-8",
 )
 
+thresholds_path = Path(os.environ["TMP_THRESHOLDS_JSON"])
+thresholds_path.write_text(
+    json.dumps(
+        {
+            "cell_gates": contract.get("cell_gates", []),
+            "workload_families": contract.get("workload_families", []),
+            "required_log_fields": contract["verification_plan"].get("required_log_fields", []),
+        },
+        indent=2,
+    ),
+    encoding="utf-8",
+)
+
 summary = {
     "bead_id": contract["meta"]["bead_id"],
     "policy_id": contract["meta"]["policy_id"],
@@ -295,6 +314,10 @@ if ! mv "${TMP_METRIC_DICTIONARY_JSON}" "${METRIC_DICTIONARY_JSON}"; then
   emit_event "contract_schema" "fail" "fail" "failed to publish metric_dictionary.json"
   exit 1
 fi
+if ! mv "${TMP_THRESHOLDS_JSON}" "${THRESHOLDS_JSON}"; then
+  emit_event "contract_schema" "fail" "fail" "failed to publish scorecard_thresholds.json"
+  exit 1
+fi
 emit_event "contract_schema" "pass" "pass" "contract schema validated"
 
 cat > "${SUMMARY_MD}" <<EOF
@@ -307,6 +330,7 @@ cat > "${SUMMARY_MD}" <<EOF
 - test: \`${TEST_FILE}\`
 - report: \`${REPORT_JSON}\`
 - metric_dictionary: \`${METRIC_DICTIONARY_JSON}\`
+- scorecard_thresholds: \`${THRESHOLDS_JSON}\`
 EOF
 
 emit_event "cargo_test" "start" "running" "running harness test via rch"

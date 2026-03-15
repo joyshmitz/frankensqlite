@@ -29,6 +29,7 @@ const CANONICAL_CAMPAIGN_MANIFEST_PATH: &str =
 const REQUIRED_LOG_FIELDS: [&str; 8] = [
     "throughput_ratio_vs_sqlite",
     "retry_rate",
+    "wait_fraction_of_wall_time",
     "cpu_utilization_pct",
     "p50_latency_ratio_vs_sqlite",
     "p95_latency_ratio_vs_sqlite",
@@ -36,12 +37,13 @@ const REQUIRED_LOG_FIELDS: [&str; 8] = [
     "responsiveness_regression_ratio_vs_sqlite",
     "topology_reassignments",
 ];
-const REQUIRED_UNIT_TESTS: [&str; 5] = [
+const REQUIRED_UNIT_TESTS: [&str; 6] = [
     "test_bd_db300_7_3_contract_schema_and_links",
     "test_bd_db300_7_3_required_campaign_surface_exists",
     "test_bd_db300_7_3_cell_targets_are_monotone",
     "test_bd_db300_7_3_verification_plan_is_actionable",
     "test_bd_db300_7_3_transferability_rubric_is_actionable",
+    "test_bd_db300_7_3_workload_family_thresholds_are_actionable",
 ];
 const REQUIRED_CELL_SUFFIXES: [&str; 3] = ["c1", "c4", "c8"];
 const REQUIRED_MODES: [&str; 3] = ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"];
@@ -61,11 +63,12 @@ const REQUIRED_E2E_SCENARIOS: [&str; 9] = [
     "mixed_read_write_c4",
     "mixed_read_write_c8",
 ];
-const REQUIRED_LOGGING_ARTIFACTS: [&str; 7] = [
+const REQUIRED_LOGGING_ARTIFACTS: [&str; 8] = [
     "artifacts/{bead_id}/{run_id}/events.jsonl",
     "artifacts/{bead_id}/{run_id}/manifest.json",
     "artifacts/{bead_id}/{run_id}/summary.md",
     "artifacts/{bead_id}/{run_id}/metric_dictionary.json",
+    "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
     "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl",
     "artifacts/{bead_id}/{run_id}/retry_report.json",
     "artifacts/{bead_id}/{run_id}/topology.json",
@@ -93,6 +96,11 @@ const REQUIRED_TRANSFERABILITY_CLASSES: [&str; 4] = [
 const REQUIRED_HARDWARE_CLASSES: [&str; 3] =
     ["same_host", "same_topology_class", "cross_hardware_class"];
 const REQUIRED_RUBRIC_DOWNSTREAM_BEADS: [&str; 2] = ["bd-db300.7.3", "bd-db300.7.4"];
+const REQUIRED_WORKLOADS: [&str; 3] = [
+    "commutative_inserts_disjoint_keys",
+    "hot_page_contention",
+    "mixed_read_write",
+];
 
 /// Typed decision record for Track G3 leapfrog claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +111,7 @@ pub struct LeapfrogExitCriteria {
     pub metric_dictionary: ScorecardMetricDictionary,
     pub transferability_rubric: TransferabilityRubric,
     pub cell_gates: Vec<CellGate>,
+    pub workload_families: Vec<WorkloadFamilyThresholdProfile>,
     pub verification_plan: VerificationPlan,
     pub references: ExitCriteriaReferences,
 }
@@ -206,16 +215,34 @@ pub struct TransferabilityClass {
 pub struct CellGate {
     pub cell: String,
     pub goal: String,
+    pub frontier_target_summary: String,
+    pub must_not_regress_summary: String,
     pub recommended_min_throughput_ratio_vs_sqlite: f64,
     pub baseline_catastrophic_floor_ratio_vs_sqlite: f64,
     pub adversarial_catastrophic_floor_ratio_vs_sqlite: f64,
     pub max_retry_rate: f64,
+    pub max_wait_fraction_of_wall_time: f64,
     pub min_cpu_utilization_pct: f64,
     pub max_p50_latency_ratio_vs_sqlite: f64,
     pub max_p95_latency_ratio_vs_sqlite: f64,
     pub max_p99_latency_ratio_vs_sqlite: f64,
     pub max_responsiveness_regression_ratio_vs_sqlite: f64,
     pub max_topology_reassignments_per_run: u32,
+}
+
+/// Workload-family-specific interpretation that tells downstream steering and
+/// reporting consumers which signals are frontier targets versus protected
+/// anti-regression metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkloadFamilyThresholdProfile {
+    pub workload: String,
+    pub family_label: String,
+    pub interpretation: String,
+    pub frontier_metrics: Vec<String>,
+    pub must_not_regress_metrics: Vec<String>,
+    pub c1_target_direction: String,
+    pub c4_target_direction: String,
+    pub c8_target_direction: String,
 }
 
 /// Follow-on verification obligations that must remain attached to the gate.
@@ -487,6 +514,14 @@ impl LeapfrogExitCriteria {
                 ));
             }
             require_non_empty("cell_gates.goal", &gate.goal)?;
+            require_non_empty(
+                "cell_gates.frontier_target_summary",
+                &gate.frontier_target_summary,
+            )?;
+            require_non_empty(
+                "cell_gates.must_not_regress_summary",
+                &gate.must_not_regress_summary,
+            )?;
             require_ratio_at_least_one(
                 "cell_gates.recommended_min_throughput_ratio_vs_sqlite",
                 gate.recommended_min_throughput_ratio_vs_sqlite,
@@ -516,6 +551,12 @@ impl LeapfrogExitCriteria {
                 ));
             }
             require_pct("cell_gates.max_retry_rate", gate.max_retry_rate, 0.0, 1.0)?;
+            require_pct(
+                "cell_gates.max_wait_fraction_of_wall_time",
+                gate.max_wait_fraction_of_wall_time,
+                0.0,
+                1.0,
+            )?;
             require_pct(
                 "cell_gates.min_cpu_utilization_pct",
                 gate.min_cpu_utilization_pct,
@@ -587,6 +628,79 @@ impl LeapfrogExitCriteria {
             &self.verification_plan.required_log_fields,
         )?;
         let metric_ids = unique_metric_ids(&self.metric_dictionary.metrics)?;
+        let required_workloads = REQUIRED_WORKLOADS
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<BTreeSet<_>>();
+        let mut seen_workloads = BTreeSet::new();
+        for family in &self.workload_families {
+            require_non_empty("workload_families.workload", &family.workload)?;
+            if !seen_workloads.insert(family.workload.as_str()) {
+                return Err(format!(
+                    "duplicate workload family threshold profile `{}`",
+                    family.workload
+                ));
+            }
+            if !required_workloads.contains(family.workload.as_str()) {
+                return Err(format!(
+                    "unexpected workload family `{}` in threshold profiles",
+                    family.workload
+                ));
+            }
+            require_non_empty("workload_families.family_label", &family.family_label)?;
+            require_non_empty("workload_families.interpretation", &family.interpretation)?;
+            require_non_empty(
+                "workload_families.c1_target_direction",
+                &family.c1_target_direction,
+            )?;
+            require_non_empty(
+                "workload_families.c4_target_direction",
+                &family.c4_target_direction,
+            )?;
+            require_non_empty(
+                "workload_families.c8_target_direction",
+                &family.c8_target_direction,
+            )?;
+            let frontier_metrics = unique_set(
+                "workload_families.frontier_metrics",
+                &family.frontier_metrics,
+            )?;
+            let must_not_regress_metrics = unique_set(
+                "workload_families.must_not_regress_metrics",
+                &family.must_not_regress_metrics,
+            )?;
+            if frontier_metrics.is_empty() {
+                return Err(format!(
+                    "workload family `{}` must name at least one frontier metric",
+                    family.workload
+                ));
+            }
+            if must_not_regress_metrics.is_empty() {
+                return Err(format!(
+                    "workload family `{}` must name at least one must-not-regress metric",
+                    family.workload
+                ));
+            }
+            for metric_id in frontier_metrics.iter().chain(must_not_regress_metrics.iter()) {
+                if !metric_ids.contains(metric_id) {
+                    return Err(format!(
+                        "workload family `{}` references undefined metric `{metric_id}`",
+                        family.workload
+                    ));
+                }
+                if !log_fields.contains(metric_id.as_str()) {
+                    return Err(format!(
+                        "workload family `{}` references non-gated metric `{metric_id}`; keep family guidance on claim-visible metrics",
+                        family.workload
+                    ));
+                }
+            }
+        }
+        if seen_workloads != required_workloads {
+            return Err(format!(
+                "workload family coverage mismatch actual={seen_workloads:?} expected={required_workloads:?}"
+            ));
+        }
         if unit_tests.is_empty() || e2e_scenarios.is_empty() || logging_artifacts.is_empty() {
             return Err(
                 "verification_plan must list unit tests, scenarios, and artifacts".to_owned(),
@@ -1140,16 +1254,35 @@ mod tests {
             cell_gates: vec![CellGate {
                 cell: "c1".to_owned(),
                 goal: "goal".to_owned(),
+                frontier_target_summary: "frontier".to_owned(),
+                must_not_regress_summary: "protected".to_owned(),
                 recommended_min_throughput_ratio_vs_sqlite: 1.05,
                 baseline_catastrophic_floor_ratio_vs_sqlite: 0.95,
                 adversarial_catastrophic_floor_ratio_vs_sqlite: 0.90,
                 max_retry_rate: 0.01,
+                max_wait_fraction_of_wall_time: 0.08,
                 min_cpu_utilization_pct: 45.0,
                 max_p50_latency_ratio_vs_sqlite: 1.10,
                 max_p95_latency_ratio_vs_sqlite: 1.20,
                 max_p99_latency_ratio_vs_sqlite: 1.30,
                 max_responsiveness_regression_ratio_vs_sqlite: 1.15,
                 max_topology_reassignments_per_run: 2,
+            }],
+            workload_families: vec![WorkloadFamilyThresholdProfile {
+                workload: "commutative_inserts_disjoint_keys".to_owned(),
+                family_label: "insert_heavy_disjoint".to_owned(),
+                interpretation: "interpretation".to_owned(),
+                frontier_metrics: vec![
+                    "throughput_ratio_vs_sqlite".to_owned(),
+                    "retry_rate".to_owned(),
+                ],
+                must_not_regress_metrics: vec![
+                    "wait_fraction_of_wall_time".to_owned(),
+                    "p95_latency_ratio_vs_sqlite".to_owned(),
+                ],
+                c1_target_direction: "protect".to_owned(),
+                c4_target_direction: "clear win".to_owned(),
+                c8_target_direction: "headline win".to_owned(),
             }],
             verification_plan: VerificationPlan {
                 unit_tests: vec!["test".to_owned()],
@@ -1158,6 +1291,7 @@ mod tests {
                     "artifact".to_owned(),
                     "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl".to_owned(),
                     "artifacts/{bead_id}/{run_id}/metric_dictionary.json".to_owned(),
+                    "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json".to_owned(),
                 ],
                 required_log_fields: REQUIRED_LOG_FIELDS
                     .iter()

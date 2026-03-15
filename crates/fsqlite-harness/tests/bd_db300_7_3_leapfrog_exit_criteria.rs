@@ -4,16 +4,18 @@ use std::path::{Path, PathBuf};
 use fsqlite_harness::leapfrog_exit_criteria::{BEAD_ID, LeapfrogExitCriteria};
 
 const CONTRACT_PATH: &str = "leapfrog_exit_criteria.toml";
-const REQUIRED_TESTS: [&str; 5] = [
+const REQUIRED_TESTS: [&str; 6] = [
     "test_bd_db300_7_3_contract_schema_and_links",
     "test_bd_db300_7_3_required_campaign_surface_exists",
     "test_bd_db300_7_3_cell_targets_are_monotone",
     "test_bd_db300_7_3_verification_plan_is_actionable",
     "test_bd_db300_7_3_transferability_rubric_is_actionable",
+    "test_bd_db300_7_3_workload_family_thresholds_are_actionable",
 ];
-const REQUIRED_LOG_FIELDS: [&str; 8] = [
+const REQUIRED_LOG_FIELDS: [&str; 9] = [
     "throughput_ratio_vs_sqlite",
     "retry_rate",
+    "wait_fraction_of_wall_time",
     "cpu_utilization_pct",
     "p50_latency_ratio_vs_sqlite",
     "p95_latency_ratio_vs_sqlite",
@@ -45,6 +47,11 @@ const REQUIRED_TRANSFERABILITY_CLASSES: [&str; 4] = [
 const REQUIRED_HARDWARE_CLASSES: [&str; 3] =
     ["same_host", "same_topology_class", "cross_hardware_class"];
 const REQUIRED_DOWNSTREAM_BEADS: [&str; 2] = ["bd-db300.7.3", "bd-db300.7.4"];
+const REQUIRED_WORKLOADS: [&str; 3] = [
+    "commutative_inserts_disjoint_keys",
+    "hot_page_contention",
+    "mixed_read_write",
+];
 
 fn workspace_root() -> Result<PathBuf, String> {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -193,6 +200,12 @@ fn test_bd_db300_7_3_cell_targets_are_monotone() -> Result<(), String> {
         return Err("retry budget must widen monotonically c1 < c4 < c8".to_owned());
     }
 
+    if !(c1.max_wait_fraction_of_wall_time < c4.max_wait_fraction_of_wall_time
+        && c4.max_wait_fraction_of_wall_time < c8.max_wait_fraction_of_wall_time)
+    {
+        return Err("wait budget must widen monotonically c1 < c4 < c8".to_owned());
+    }
+
     if !(c1.min_cpu_utilization_pct < c4.min_cpu_utilization_pct
         && c4.min_cpu_utilization_pct < c8.min_cpu_utilization_pct)
     {
@@ -301,6 +314,7 @@ fn test_bd_db300_7_3_verification_plan_is_actionable() -> Result<(), String> {
         "artifacts/{bead_id}/{run_id}/manifest.json",
         "artifacts/{bead_id}/{run_id}/summary.md",
         "artifacts/{bead_id}/{run_id}/metric_dictionary.json",
+        "artifacts/{bead_id}/{run_id}/scorecard_thresholds.json",
         "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl",
         "artifacts/{bead_id}/{run_id}/retry_report.json",
         "artifacts/{bead_id}/{run_id}/topology.json",
@@ -324,6 +338,119 @@ fn test_bd_db300_7_3_verification_plan_is_actionable() -> Result<(), String> {
                 "metric dictionary missing required family={required_family}"
             ));
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_bd_db300_7_3_workload_family_thresholds_are_actionable() -> Result<(), String> {
+    let criteria = load_contract()?;
+    let metric_ids = criteria
+        .metric_dictionary
+        .metrics
+        .iter()
+        .map(|metric| metric.metric_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let required_log_fields = criteria
+        .verification_plan
+        .required_log_fields
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+
+    let actual_workloads = criteria
+        .workload_families
+        .iter()
+        .map(|family| family.workload.as_str())
+        .collect::<Vec<_>>();
+    if actual_workloads != REQUIRED_WORKLOADS {
+        return Err(format!(
+            "workload family order mismatch actual={actual_workloads:?} expected={REQUIRED_WORKLOADS:?}"
+        ));
+    }
+
+    for family in &criteria.workload_families {
+        if family.family_label.trim().is_empty() || family.interpretation.trim().is_empty() {
+            return Err(format!(
+                "workload family {} must describe label and interpretation",
+                family.workload
+            ));
+        }
+        if family.c1_target_direction.trim().is_empty()
+            || family.c4_target_direction.trim().is_empty()
+            || family.c8_target_direction.trim().is_empty()
+        {
+            return Err(format!(
+                "workload family {} must define c1/c4/c8 target directions",
+                family.workload
+            ));
+        }
+        if family.frontier_metrics.is_empty() || family.must_not_regress_metrics.is_empty() {
+            return Err(format!(
+                "workload family {} must define frontier and protected metrics",
+                family.workload
+            ));
+        }
+        for metric_id in family
+            .frontier_metrics
+            .iter()
+            .chain(family.must_not_regress_metrics.iter())
+        {
+            if !metric_ids.contains(metric_id.as_str()) {
+                return Err(format!(
+                    "workload family {} references undefined metric {}",
+                    family.workload, metric_id
+                ));
+            }
+            if !required_log_fields.contains(metric_id.as_str()) {
+                return Err(format!(
+                    "workload family {} references non-gated metric {}",
+                    family.workload, metric_id
+                ));
+            }
+        }
+    }
+
+    let insert_family = criteria
+        .workload_families
+        .iter()
+        .find(|family| family.workload == "commutative_inserts_disjoint_keys")
+        .ok_or_else(|| "missing insert-heavy workload family".to_owned())?;
+    if !insert_family
+        .frontier_metrics
+        .iter()
+        .any(|metric| metric == "throughput_ratio_vs_sqlite")
+    {
+        return Err("insert-heavy family must treat throughput as a frontier metric".to_owned());
+    }
+
+    let hot_page_family = criteria
+        .workload_families
+        .iter()
+        .find(|family| family.workload == "hot_page_contention")
+        .ok_or_else(|| "missing hot-page workload family".to_owned())?;
+    if !hot_page_family
+        .frontier_metrics
+        .iter()
+        .any(|metric| metric == "wait_fraction_of_wall_time")
+    {
+        return Err("hot-page family must treat wait share as a frontier diagnostic".to_owned());
+    }
+
+    let mixed_family = criteria
+        .workload_families
+        .iter()
+        .find(|family| family.workload == "mixed_read_write")
+        .ok_or_else(|| "missing mixed workload family".to_owned())?;
+    if !mixed_family
+        .must_not_regress_metrics
+        .iter()
+        .any(|metric| metric == "responsiveness_regression_ratio_vs_sqlite")
+    {
+        return Err(
+            "mixed family must protect responsiveness as a must-not-regress metric".to_owned(),
+        );
     }
 
     Ok(())
