@@ -7100,14 +7100,7 @@ mod tests {
         {
             let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
             let page_two = txn.allocate_page(&cx).unwrap();
-            txn.mark_dirty(
-                &cx,
-                page_two,
-                vec![0xCD; ps].into_boxed_slice(),
-                None,
-                MarkDirtyOptions::default(),
-            )
-            .unwrap();
+            txn.write_page(&cx, page_two, &vec![0xCD; ps]).unwrap();
             txn.commit(&cx).unwrap();
         }
 
@@ -7116,6 +7109,12 @@ mod tests {
             let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
             txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec()
         };
+        let header: [u8; DATABASE_HEADER_SIZE] = page1_data[..DATABASE_HEADER_SIZE]
+            .try_into()
+            .expect("page 1 header must be present");
+        let expected_change_counter = DatabaseHeader::from_bytes(&header)
+            .expect("header must parse")
+            .change_counter;
         page1_data[24..28].copy_from_slice(&0_u32.to_be_bytes());
         page1_data[92..96].copy_from_slice(&0_u32.to_be_bytes());
 
@@ -7153,7 +7152,7 @@ mod tests {
             "bead_id={BEAD_ID} case=checkpoint_sync_repairs_page_count"
         );
         assert_eq!(
-            parsed.change_counter, 1,
+            parsed.change_counter, expected_change_counter,
             "bead_id={BEAD_ID} case=checkpoint_sync_repairs_change_counter"
         );
         assert_eq!(
