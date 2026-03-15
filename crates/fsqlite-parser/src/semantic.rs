@@ -741,6 +741,27 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    // SQLite compound SELECTs allow ORDER BY terms to reuse a projected
+    // expression verbatim, even though underlying table aliases are no longer
+    // in scope at the compound boundary.
+    fn compound_order_by_matches_output_expr(select: &SelectStatement, order_expr: &Expr) -> bool {
+        if select.body.compounds.is_empty() {
+            return false;
+        }
+
+        std::iter::once(&select.body.select)
+            .chain(select.body.compounds.iter().map(|(_, core)| core))
+            .filter_map(|core| match core {
+                SelectCore::Select { columns, .. } => Some(columns.iter()),
+                _ => None,
+            })
+            .flatten()
+            .any(|column| match column {
+                ResultColumn::Expr { expr, .. } => expr == order_expr,
+                _ => false,
+            })
+    }
+
     fn resolve_select(&mut self, select: &SelectStatement, scope: &mut Scope) {
         // Register CTEs if present.
         if let Some(ref with) = select.with {
@@ -794,6 +815,9 @@ impl<'a> Resolver<'a> {
         }
 
         for term in &select.order_by {
+            if Self::compound_order_by_matches_output_expr(select, &term.expr) {
+                continue;
+            }
             self.resolve_expr(&term.expr, &order_by_scope);
         }
 
@@ -1921,9 +1945,8 @@ mod tests {
         let mut resolver = Resolver::new(&schema);
         let errors = resolver.resolve_statement(&stmt);
 
-        // Let's print out the errors. We want to see if it causes AmbiguousColumn.
-        // Wait, standard SQLite allows this (it prefers the SELECT alias in ORDER BY, or treats them as equivalent).
-        // If our semantic resolver returns an AmbiguousColumn error, we have a bug to fix.
+        // SQLite permits ORDER BY to resolve the SELECT-list alias here rather
+        // than treating the alias/column name overlap as ambiguous.
         if !errors.is_empty() {
             panic!("Expected no errors, but got: {:?}", errors);
         }
@@ -1933,6 +1956,35 @@ mod tests {
     fn test_compound_order_by_can_resolve_alias_from_later_arm() {
         let schema = make_schema();
         let stmt = parse_one("SELECT 1 AS a UNION SELECT 2 AS b ORDER BY b");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_compound_order_by_can_match_output_expression_from_later_arm() {
+        let mut schema = Schema::new();
+        schema.add_table(TableDef {
+            name: "tbl".to_owned(),
+            columns: vec![
+                ColumnDef {
+                    name: "a".to_owned(),
+                    affinity: TypeAffinity::Integer,
+                    is_ipk: false,
+                    not_null: false,
+                },
+                ColumnDef {
+                    name: "b".to_owned(),
+                    affinity: TypeAffinity::Integer,
+                    is_ipk: false,
+                    not_null: false,
+                },
+            ],
+            without_rowid: false,
+            strict: false,
+        });
+
+        let stmt = parse_one("SELECT a + 1 FROM tbl UNION SELECT b + 1 FROM tbl ORDER BY b + 1");
         let mut resolver = Resolver::new(&schema);
         let errors = resolver.resolve_statement(&stmt);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
