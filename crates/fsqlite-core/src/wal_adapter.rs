@@ -501,7 +501,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     }
 
     fn finalize_prepared_batch_against_current_state(
-        &mut self,
+        &self,
         prepared: &mut PreparedWalFrameBatch,
     ) -> Result<()> {
         let checksum_transforms = Self::checksum_transforms_for_prepared(prepared);
@@ -516,7 +516,6 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         Ok(())
     }
 
-    #[must_use]
     fn finalized_running_checksum(prepared: &PreparedWalFrameBatch) -> Result<SqliteWalChecksum> {
         let Some(checksum) = prepared.finalized_running_checksum else {
             return Err(FrankenError::internal(
