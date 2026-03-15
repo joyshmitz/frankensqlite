@@ -3119,8 +3119,11 @@ where
         }
 
         let new_page_count = inner.db_size;
+        let current_change_counter = inner.commit_seq.get() as u32;
 
+        page1[24..28].copy_from_slice(&current_change_counter.to_be_bytes());
         page1[28..32].copy_from_slice(&new_page_count.to_be_bytes());
+        page1[92..96].copy_from_slice(&current_change_counter.to_be_bytes());
         inner.db_file.write(cx, &page1, 0)?;
         cache.evict(PageNumber::ONE);
         Ok(())
@@ -7094,11 +7097,27 @@ mod tests {
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
 
+        {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.mark_dirty(
+                &cx,
+                page_two,
+                vec![0xCD; ps].into_boxed_slice(),
+                None,
+                MarkDirtyOptions::default(),
+            )
+            .unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
         // Snapshot current page 1 as a realistic checkpoint payload.
-        let page1_data = {
+        let mut page1_data = {
             let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
             txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec()
         };
+        page1_data[24..28].copy_from_slice(&0_u32.to_be_bytes());
+        page1_data[92..96].copy_from_slice(&0_u32.to_be_bytes());
 
         let mut writer = pager.checkpoint_writer();
 
@@ -7132,6 +7151,14 @@ mod tests {
             parsed.page_count,
             page_three.get(),
             "bead_id={BEAD_ID} case=checkpoint_sync_repairs_page_count"
+        );
+        assert_eq!(
+            parsed.change_counter, 1,
+            "bead_id={BEAD_ID} case=checkpoint_sync_repairs_change_counter"
+        );
+        assert_eq!(
+            parsed.version_valid_for, parsed.change_counter,
+            "bead_id={BEAD_ID} case=checkpoint_sync_repairs_version_valid_for"
         );
     }
 
