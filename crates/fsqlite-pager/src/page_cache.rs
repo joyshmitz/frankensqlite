@@ -364,9 +364,7 @@ pub fn read_db_header(cx: &Cx, file: &mut impl VfsFile) -> Result<[u8; 100]> {
     let bytes_read = file.read(cx, &mut header, 0)?;
     if bytes_read < 100 {
         return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "database header short read: expected 100 bytes, got {bytes_read}"
-            ),
+            detail: format!("database header short read: expected 100 bytes, got {bytes_read}"),
         });
     }
     Ok(header)

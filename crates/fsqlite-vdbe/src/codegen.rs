@@ -3060,6 +3060,48 @@ struct AggColumn {
     /// expression is evaluated on each scanned row and stored in the accumulator
     /// register so it retains the value from the final row.
     bare_expr: Option<Box<Expr>>,
+    /// Collation sequence for the aggregate argument column (e.g. "NOCASE").
+    /// When set and the aggregate is DISTINCT, the VDBE engine uses
+    /// collation-aware distinct key encoding.
+    collation: Option<String>,
+}
+
+/// Determine the effective collation for an aggregate argument expression.
+/// Explicit COLLATE in the expression takes priority; otherwise, if the
+/// argument resolved to a column index, inherit that column's declared
+/// collation.  Returns `None` for the default BINARY collation.
+fn expr_collation_for_agg(
+    expr: &Expr,
+    col_idx: Option<usize>,
+    table: &TableSchema,
+) -> Option<String> {
+    // Explicit COLLATE wrapper takes priority.
+    if let Expr::Collate { collation, .. } = expr {
+        if !collation.eq_ignore_ascii_case("BINARY") {
+            return Some(collation.clone());
+        }
+        return None;
+    }
+    // Column reference: inherit from schema.
+    if let Some(idx) = col_idx {
+        if let Some(ci) = table.columns.get(idx) {
+            if let Some(ref coll) = ci.collation {
+                if !coll.eq_ignore_ascii_case("BINARY") {
+                    return Some(coll.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build the P4 payload for an AggStep opcode, including collation if present.
+fn agg_func_p4(name: &str, collation: &Option<String>) -> P4 {
+    if let Some(coll) = collation {
+        P4::FuncNameCollated(name.to_owned(), coll.clone())
+    } else {
+        P4::FuncName(name.to_owned())
+    }
 }
 
 /// Generate VDBE bytecode for a standalone `VALUES` clause.
@@ -3281,6 +3323,7 @@ fn codegen_select_aggregate(
         };
 
         let distinct_flag = i32::from(agg.distinct);
+        let agg_p4 = agg_func_p4(&agg.name, &agg.collation);
         if agg.num_args == 0 {
             // count(*): no arguments, p2 is unused (0), p5=0.
             b.emit_op(
@@ -3288,7 +3331,7 @@ fn codegen_select_aggregate(
                 distinct_flag,
                 0,
                 accum_reg,
-                P4::FuncName(agg.name.clone()),
+                agg_p4.clone(),
                 0,
             );
         } else {
@@ -3347,7 +3390,7 @@ fn codegen_select_aggregate(
                 distinct_flag,
                 arg_base,
                 accum_reg,
-                P4::FuncName(agg.name.clone()),
+                agg_p4,
                 num_args,
             );
         }
@@ -3526,6 +3569,7 @@ fn parse_aggregate_columns(
                             hidden: false,
                             multi_agg_indices: Vec::new(),
                             bare_expr: None,
+                            collation: None,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -3544,6 +3588,7 @@ fn parse_aggregate_columns(
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
                                 bare_expr: None,
+                                collation: None,
                             });
                         } else {
                             // First argument: try column reference first,
@@ -3554,6 +3599,14 @@ fn parse_aggregate_columns(
                                     Some(SortKeySource::Rowid) => (None, true, None),
                                     _ => (None, false, Some(Box::new(exprs[0].clone()))),
                                 };
+                            // Resolve collation for the aggregate argument column.
+                            // Explicit COLLATE in the expression takes priority,
+                            // otherwise inherit from the column's schema definition.
+                            let agg_coll = if *distinct {
+                                expr_collation_for_agg(&exprs[0], col_idx, table)
+                            } else {
+                                None
+                            };
                             // Extra arguments (e.g. separator for group_concat).
                             let extra: Vec<Expr> = exprs[1..].to_vec();
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -3570,6 +3623,7 @@ fn parse_aggregate_columns(
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
                                 bare_expr: None,
+                                collation: agg_coll,
                             });
                         }
                     }
@@ -3621,6 +3675,7 @@ fn parse_aggregate_columns(
                         hidden: false,
                         multi_agg_indices: indices,
                         bare_expr: None,
+                        collation: None,
                     });
                 }
             }
@@ -3639,6 +3694,7 @@ fn parse_aggregate_columns(
                     hidden: false,
                     multi_agg_indices: Vec::new(),
                     bare_expr: Some(Box::new(expr.clone())),
+                    collation: None,
                 });
             }
             ResultColumn::Star | ResultColumn::TableStar(_) => {
@@ -3833,6 +3889,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     hidden: false,
                     multi_agg_indices: Vec::new(),
                     bare_expr: None,
+                    collation: None,
                 },
                 FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
                     name: canon_name,
@@ -3847,6 +3904,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                     hidden: false,
                     multi_agg_indices: Vec::new(),
                     bare_expr: None,
+                    collation: None,
                 },
                 FunctionArgs::List(exprs) => {
                     let (col_idx, is_rowid, a_expr) =
@@ -3870,6 +3928,7 @@ fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColum
                         hidden: false,
                         multi_agg_indices: Vec::new(),
                         bare_expr: None,
+                        collation: None,
                     }
                 }
             };
@@ -4114,6 +4173,7 @@ fn rewrite_aggregates_recursive(
                     hidden: true,
                     multi_agg_indices: Vec::new(),
                     bare_expr: None,
+                    collation: None,
                 },
                 FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
                     name: canon_name,
@@ -4128,6 +4188,7 @@ fn rewrite_aggregates_recursive(
                     hidden: true,
                     multi_agg_indices: Vec::new(),
                     bare_expr: None,
+                    collation: None,
                 },
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 FunctionArgs::List(exprs) => {
@@ -4151,6 +4212,7 @@ fn rewrite_aggregates_recursive(
                         hidden: true,
                         multi_agg_indices: Vec::new(),
                         bare_expr: None,
+                        collation: None,
                     }
                 }
             };
@@ -4314,6 +4376,7 @@ fn parse_group_by_output(
                             hidden: false,
                             multi_agg_indices: Vec::new(),
                             bare_expr: None,
+                            collation: None,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -4331,6 +4394,7 @@ fn parse_group_by_output(
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
                                 bare_expr: None,
+                                collation: None,
                             });
                         } else {
                             // Try column reference first, fall back to expression.
@@ -4355,6 +4419,7 @@ fn parse_group_by_output(
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
                                 bare_expr: None,
+                                collation: None,
                             });
                         }
                     }
@@ -4469,6 +4534,7 @@ fn collect_having_aggregates(
                             hidden: false,
                             multi_agg_indices: Vec::new(),
                             bare_expr: None,
+                            collation: None,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -4486,6 +4552,7 @@ fn collect_having_aggregates(
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
                                 bare_expr: None,
+                                collation: None,
                             });
                         } else {
                             let (col_idx, is_rowid, arg_e) =
@@ -4509,6 +4576,7 @@ fn collect_having_aggregates(
                                 hidden: false,
                                 multi_agg_indices: Vec::new(),
                                 bare_expr: None,
+                                collation: None,
                             });
                         }
                     }

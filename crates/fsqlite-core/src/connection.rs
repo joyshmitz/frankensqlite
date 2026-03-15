@@ -16574,6 +16574,9 @@ impl Connection {
             })
             .collect();
 
+        // Snapshot schema for collation lookup during aggregate descriptor construction.
+        let schema_snap = self.schema.borrow().clone();
+
         // Step 4b: Parse result columns into GroupByColumn descriptors.
         let result_descriptors: Vec<GroupByColumn> = expanded_columns
             .iter()
@@ -16651,6 +16654,13 @@ impl Connection {
                             )));
                         }
                     };
+                    // Determine collation for the aggregate argument.
+                    let agg_collation = match args {
+                        FunctionArgs::List(exprs) if !exprs.is_empty() => {
+                            agg_arg_collation(&exprs[0], &schema_snap)
+                        }
+                        _ => None,
+                    };
                     Ok(GroupByColumn::Agg {
                         name: func,
                         arg_col,
@@ -16659,6 +16669,7 @@ impl Connection {
                         separator,
                         separator_expr,
                         filter: filter.clone(),
+                        collation: agg_collation,
                     })
                 }
                 ResultColumn::Expr { expr, .. } => Ok(GroupByColumn::Plain(Box::new(expr.clone()))),
@@ -16827,6 +16838,7 @@ impl Connection {
                         separator,
                         separator_expr,
                         filter,
+                        collation,
                     } => {
                         // Apply FILTER clause: only include rows where filter is true.
                         let filtered_rows: Vec<&Vec<SqliteValue>> = if let Some(filt) = filter {
@@ -16866,7 +16878,11 @@ impl Connection {
                             };
                             if *distinct {
                                 let mut refs: Vec<&SqliteValue> = owned_values.iter().collect();
-                                dedup_values(&mut refs);
+                                dedup_values_collated(
+                                    &mut refs,
+                                    collation.as_deref(),
+                                    &self.collation_registry,
+                                );
                                 owned_values = refs.into_iter().cloned().collect();
                             }
                             let agg_values: Vec<&SqliteValue> = owned_values.iter().collect();
@@ -16879,10 +16895,12 @@ impl Connection {
                                     })
                                 })
                             });
-                            values.push(compute_aggregate_ext(
+                            values.push(compute_aggregate_ext_collated(
                                 name,
                                 &agg_values,
                                 evaluated_separator.as_deref(),
+                                collation.as_deref(),
+                                &self.collation_registry,
                             ));
                         }
                     }
@@ -17798,6 +17816,13 @@ impl Connection {
                             )));
                         }
                     };
+                    // Determine collation for the aggregate argument.
+                    let agg_collation = match args {
+                        FunctionArgs::List(exprs) if !exprs.is_empty() => {
+                            expr_effective_collation_for_table(&exprs[0], &table_schema)
+                        }
+                        _ => None,
+                    };
                     Ok(GroupByColumn::Agg {
                         name: func,
                         arg_col,
@@ -17806,6 +17831,7 @@ impl Connection {
                         separator,
                         separator_expr,
                         filter: filter.clone(),
+                        collation: agg_collation,
                     })
                 }
                 ResultColumn::Expr { expr, .. } => {
@@ -17957,6 +17983,7 @@ impl Connection {
                         separator,
                         separator_expr,
                         filter,
+                        collation,
                     } => {
                         // Apply FILTER clause: only include rows where filter is true.
                         let filtered_rows: Vec<&Vec<SqliteValue>> = if let Some(filt) = filter {
@@ -17996,7 +18023,11 @@ impl Connection {
                             };
                             if *distinct {
                                 let mut refs: Vec<&SqliteValue> = owned_values.iter().collect();
-                                dedup_values(&mut refs);
+                                dedup_values_collated(
+                                    &mut refs,
+                                    collation.as_deref(),
+                                    &self.collation_registry,
+                                );
                                 owned_values = refs.into_iter().cloned().collect();
                             }
                             let agg_values: Vec<&SqliteValue> = owned_values.iter().collect();
@@ -18009,10 +18040,12 @@ impl Connection {
                                     })
                                 })
                             });
-                            values.push(compute_aggregate_ext(
+                            values.push(compute_aggregate_ext_collated(
                                 name,
                                 &agg_values,
                                 evaluated_separator.as_deref(),
+                                collation.as_deref(),
+                                &self.collation_registry,
                             ));
                         }
                     }
@@ -20531,6 +20564,7 @@ impl Connection {
                     P4::Blob(b) => format!("x'{}'", hex_encode(b)),
                     P4::Collation(c) => c.clone(),
                     P4::FuncName(f) => f.clone(),
+                    P4::FuncNameCollated(f, c) => format!("{f} coll={c}"),
                     P4::Table(t) => t.clone(),
                     P4::Index(i) => i.clone(),
                     P4::Affinity(a) => a.clone(),
@@ -25501,6 +25535,9 @@ enum GroupByColumn {
         separator_expr: Option<Box<Expr>>,
         /// FILTER clause expression, e.g. `COUNT(*) FILTER (WHERE x > 5)`.
         filter: Option<Box<Expr>>,
+        /// Collation sequence for the aggregate argument column (e.g. "NOCASE").
+        /// Used for DISTINCT dedup and MIN/MAX comparison.
+        collation: Option<String>,
     },
 }
 
@@ -27260,6 +27297,86 @@ fn dedup_values(values: &mut Vec<&SqliteValue>) {
             true
         }
     });
+}
+
+/// Collation-aware duplicate removal. When a collation is specified (e.g.
+/// `NOCASE`), text values are compared through the collation registry so
+/// that `'Alice'` and `'alice'` are treated as equal.
+fn dedup_values_collated(
+    values: &mut Vec<&SqliteValue>,
+    collation: Option<&str>,
+    collation_registry: &Mutex<CollationRegistry>,
+) {
+    if collation.is_none() {
+        dedup_values(values);
+        return;
+    }
+    let mut seen: Vec<&SqliteValue> = Vec::new();
+    values.retain(|v| {
+        let already = seen.iter().any(|s| {
+            cmp_sqlite_values_collated(v, s, collation, collation_registry)
+                == std::cmp::Ordering::Equal
+        });
+        if already {
+            false
+        } else {
+            seen.push(*v);
+            true
+        }
+    });
+}
+
+/// Determine the effective collation for an aggregate argument expression
+/// by checking explicit COLLATE first, then looking up the column's
+/// declared collation in the schema.
+fn agg_arg_collation(expr: &Expr, schemas: &[TableSchema]) -> Option<String> {
+    // Explicit COLLATE takes priority.
+    if let Expr::Collate { collation, .. } = expr {
+        return Some(collation.clone());
+    }
+    // Column reference: look up in the schema.
+    if let Expr::Column(cr, _) = expr {
+        for ts in schemas {
+            let matches = cr
+                .table
+                .as_ref()
+                .map_or(true, |t| t.eq_ignore_ascii_case(&ts.name));
+            if matches {
+                if let Some(ci) = ts
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&cr.column))
+                {
+                    if ci.collation.is_some() {
+                        return ci.collation.clone();
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extended aggregate computation with optional collation for MIN/MAX.
+#[allow(clippy::cast_possible_wrap)]
+fn compute_aggregate_ext_collated(
+    name: &str,
+    values: &[&SqliteValue],
+    separator: Option<&str>,
+    collation: Option<&str>,
+    collation_registry: &Mutex<CollationRegistry>,
+) -> SqliteValue {
+    // For MIN/MAX with a non-default collation, use collation-aware comparison.
+    if collation.is_some() && (name == "min" || name == "max") {
+        let filtered = values.iter().filter(|v| !matches!(v, SqliteValue::Null));
+        let result = if name == "min" {
+            filtered.min_by(|a, b| cmp_sqlite_values_collated(a, b, collation, collation_registry))
+        } else {
+            filtered.max_by(|a, b| cmp_sqlite_values_collated(a, b, collation, collation_registry))
+        };
+        return result.map_or(SqliteValue::Null, |v| (*v).clone());
+    }
+    compute_aggregate_ext(name, values, separator)
 }
 
 /// Compare two `SqliteValue`s for ordering.

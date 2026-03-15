@@ -55,7 +55,7 @@ HOT_PATH_PROFILE_MANIFEST_SCHEMA="fsqlite-e2e.hot_path_profile_manifest.v1"
 HOT_PATH_OPCODE_PROFILE_SCHEMA="fsqlite-e2e.hot_path_opcode_profile.v1"
 HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA="fsqlite-e2e.hot_path_subsystem_profile.v1"
 HOT_PATH_ACTIONABLE_RANKING_SCHEMA="fsqlite-e2e.hot_path_actionable_ranking.v2"
-HOT_PATH_COMMAND_PACK_SCHEMA="fsqlite-e2e.hot_path_command_pack.v1"
+HOT_PATH_COMMAND_PACK_SCHEMA="fsqlite-e2e.hot_path_command_pack.v2"
 HOT_PATH_CAMPAIGN_RANKING_SCHEMA="fsqlite-e2e.hot_path_campaign_ranking.v2"
 HOT_PATH_INLINE_BUNDLE_SCHEMA="fsqlite-e2e.hot_path_inline_bundle.v1"
 HOT_PATH_INLINE_BUNDLE_PREFIX="HOT_PATH_INLINE_BUNDLE_JSON="
@@ -113,6 +113,102 @@ require_json_schema() {
         type == "object" and .schema_version == $schema
     ' "${path}" > /dev/null \
         || fail "inputs" "invalid schema in ${path}; expected ${schema}"
+}
+
+require_topology_counter_pack_contract() {
+    local path="$1"
+
+    require_nonempty_file "${path}"
+    jq -e '
+        def require_plain_capture($capture; $tool):
+            ([.commands[] | select(.capture == $capture)] | length == 2)
+            and all(.commands[] | select(.capture == $capture);
+                .tool == $tool and .counter_pack == null
+            );
+        def require_topdown:
+            ([.commands[] | select(.capture == "topdown")] | length == 2)
+            and all(.commands[] | select(.capture == "topdown");
+                .tool == "perf-stat"
+                and (.counter_pack != null)
+                and .counter_pack.host_capability_sensitive
+                and (.counter_pack.topology_sensitive == false)
+                and .counter_pack.primary_tool == "perf-stat"
+                and .counter_pack.primary_selection == "TopdownL1"
+                and (.counter_pack.fallback_tools == ["perf-stat"])
+                and (.counter_pack.fallback_selections | index("core_event_fallback") != null)
+                and (.counter_pack.fallback_event_pack
+                    == ["cycles","instructions","branches","branch-misses","cache-references","cache-misses"])
+                and (.counter_pack.fallback_reason_hints
+                    | index("TopdownL1 unsupported on this host") != null)
+                and (.counter_pack.raw_output_relpaths == [])
+            );
+        def require_cache_to_cache:
+            ([.commands[] | select(.capture == "cache_to_cache")] | length == 2)
+            and all(.commands[] | select(.capture == "cache_to_cache");
+                .tool == "perf-c2c"
+                and (.counter_pack != null)
+                and .counter_pack.host_capability_sensitive
+                and .counter_pack.topology_sensitive
+                and .counter_pack.primary_tool == "perf-c2c"
+                and (.counter_pack.fallback_tools == ["perf-mem","perf-stat"])
+                and (.counter_pack.fallback_selections == ["perf_mem_fallback","cache_event_fallback"])
+                and (.counter_pack.capability_probe == "perf c2c record/report, else perf mem record/report")
+                and (.counter_pack.fallback_event_pack == ["cache-references","cache-misses"])
+                and (.counter_pack.fallback_reason_hints
+                    == [
+                        "perf c2c unavailable or failed on this host",
+                        "perf c2c and perf mem unavailable or failed on this host"
+                    ])
+                and (.counter_pack.raw_output_relpaths
+                    == ["profiles/perf-c2c." + .mode + ".data"])
+            );
+        def require_migration:
+            ([.commands[] | select(.capture == "migration")] | length == 2)
+            and all(.commands[] | select(.capture == "migration");
+                .tool == "perf-stat"
+                and (.counter_pack != null)
+                and .counter_pack.host_capability_sensitive
+                and .counter_pack.topology_sensitive
+                and .counter_pack.primary_tool == "perf-stat"
+                and .counter_pack.primary_selection == "cpu_migrations"
+                and (.counter_pack.fallback_tools == ["perf-stat"])
+                and (.counter_pack.fallback_selections == ["context_switch_fallback"])
+                and (.counter_pack.capability_probe
+                    == "perf stat -e cpu-migrations,context-switches -o \"$tmp\" -- true")
+                and (.counter_pack.fallback_event_pack == ["context-switches","task-clock"])
+                and (.counter_pack.fallback_reason_hints
+                    == ["cpu-migrations unsupported on this host"])
+                and (.counter_pack.raw_output_relpaths == [])
+            );
+        def require_remote_access:
+            ([.commands[] | select(.capture == "remote_access")] | length == 2)
+            and all(.commands[] | select(.capture == "remote_access");
+                .tool == "perf-mem"
+                and (.counter_pack != null)
+                and .counter_pack.host_capability_sensitive
+                and .counter_pack.topology_sensitive
+                and .counter_pack.primary_tool == "perf-mem"
+                and (.counter_pack.fallback_tools == ["perf-stat"])
+                and (.counter_pack.fallback_selections == ["cache_event_fallback"])
+                and (.counter_pack.capability_probe == "perf mem record/report")
+                and (.counter_pack.fallback_event_pack
+                    == ["cache-references","cache-misses","page-faults"])
+                and (.counter_pack.fallback_reason_hints
+                    == ["perf mem unavailable or failed on this host"])
+                and (.counter_pack.raw_output_relpaths
+                    == ["profiles/perf-mem-remote-access." + .mode + ".data"])
+            );
+        require_plain_capture("wall_clock"; "hyperfine")
+        and require_plain_capture("on_cpu"; "perf-record")
+        and require_plain_capture("scheduler"; "perf-sched-record")
+        and require_plain_capture("syscall"; "strace")
+        and require_plain_capture("allocation"; "heaptrack")
+        and require_topdown
+        and require_cache_to_cache
+        and require_migration
+        and require_remote_access
+    ' "${path}" > /dev/null \
+        || fail "verification" "command-pack topology counter metadata contract failed for ${path}"
 }
 
 preseed_output_bundle() {
@@ -308,6 +404,7 @@ run_hot_profile() {
     require_json_schema "${scenario_dir}/subsystem_profile.json" "${HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA}"
     require_json_schema "${scenario_dir}/actionable_ranking.json" "${HOT_PATH_ACTIONABLE_RANKING_SCHEMA}"
     require_json_schema "${scenario_dir}/command_pack.json" "${HOT_PATH_COMMAND_PACK_SCHEMA}"
+    require_topology_counter_pack_contract "${scenario_dir}/command_pack.json"
     require_nonempty_file "${scenario_dir}/summary.md"
     require_json_schema "${scenario_dir}/manifest.json" "${HOT_PATH_PROFILE_MANIFEST_SCHEMA}"
     capture_run_record "${scenario_id}" "${fixture_id}" "${mode_id}" "${scenario_dir}" "${stdout_log}" "${stderr_log}"

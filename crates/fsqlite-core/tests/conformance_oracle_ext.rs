@@ -12475,7 +12475,6 @@ fn test_conformance_collation_in_expressions_s54() {
 /// Bug: COUNT(DISTINCT col) where col has COLLATE NOCASE treats
 /// 'Alice', 'ALICE', 'alice' as 3 distinct values instead of 1.
 #[test]
-#[ignore = "COUNT(DISTINCT) with NOCASE collation groups case-insensitively in C SQLite but not in FrankenSQLite"]
 fn test_conformance_count_distinct_nocase_bug() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

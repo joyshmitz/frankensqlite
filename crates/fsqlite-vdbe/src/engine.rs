@@ -3180,6 +3180,13 @@ fn hash_program(program: &VdbeProgram) -> u64 {
                 mix_len(hash, value.len());
                 mix(hash, value.as_bytes());
             }
+            P4::FuncNameCollated(value, coll) => {
+                mix(hash, &[7]);
+                mix_len(hash, value.len());
+                mix(hash, value.as_bytes());
+                mix_len(hash, coll.len());
+                mix(hash, coll.as_bytes());
+            }
             P4::Table(value) => {
                 mix(hash, &[8]);
                 mix_len(hash, value.len());
@@ -3727,11 +3734,11 @@ struct WindowContext {
     state: Box<dyn Any + Send>,
 }
 
-/// Encode aggregate arguments into a canonical byte key for DISTINCT deduplication.
-///
-/// Each value is tagged with a type discriminant followed by its payload so that
-/// values of different types with the same byte representation don't collide.
-fn distinct_key(args: &[SqliteValue]) -> DistinctKeyBuf {
+/// Encode aggregate arguments into a canonical byte key for DISTINCT deduplication,
+/// applying collation when specified. For NOCASE collation, text values are
+/// case-folded (lowercased) so that `'Alice'` and `'alice'` produce the same key.
+fn distinct_key_collated(args: &[SqliteValue], collation: Option<&str>) -> DistinctKeyBuf {
+    let is_nocase = collation.is_some_and(|c| c.eq_ignore_ascii_case("NOCASE"));
     let mut key = DistinctKeyBuf::new();
     for val in args {
         match val {
@@ -3756,9 +3763,16 @@ fn distinct_key(args: &[SqliteValue]) -> DistinctKeyBuf {
             }
             SqliteValue::Text(s) => {
                 key.push(3);
-                #[allow(clippy::cast_possible_truncation)]
-                key.extend_from_slice(&(s.len() as u64).to_le_bytes());
-                key.extend_from_slice(s.as_bytes());
+                if is_nocase {
+                    let folded = s.to_ascii_lowercase();
+                    #[allow(clippy::cast_possible_truncation)]
+                    key.extend_from_slice(&(folded.len() as u64).to_le_bytes());
+                    key.extend_from_slice(folded.as_bytes());
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    key.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                    key.extend_from_slice(s.as_bytes());
+                }
             }
             SqliteValue::Blob(b) => {
                 key.push(4);
@@ -7203,9 +7217,7 @@ impl VdbeEngine {
                                 &mut sc.target_vals_buf,
                             )
                             .ok_or_else(|| {
-                                FrankenError::internal(
-                                    "index seek: malformed probe key record",
-                                )
+                                FrankenError::internal("index seek: malformed probe key record")
                             })?;
                         }
 
@@ -7394,8 +7406,9 @@ impl VdbeEngine {
                 // by the accumulator register.
                 // AggStep1 is a single-argument fast-path with identical semantics.
                 Opcode::AggStep | Opcode::AggStep1 => {
-                    let func_name = match &op.p4 {
-                        P4::FuncName(name) => name.as_str(),
+                    let (func_name, agg_collation): (&str, Option<&str>) = match &op.p4 {
+                        P4::FuncName(name) => (name.as_str(), None),
+                        P4::FuncNameCollated(name, coll) => (name.as_str(), Some(coll.as_str())),
                         _ => {
                             return Err(FrankenError::Internal(
                                 "AggStep opcode missing P4::FuncName".to_owned(),
@@ -7452,7 +7465,7 @@ impl VdbeEngine {
                         if args.iter().any(|a| matches!(a, SqliteValue::Null)) {
                             false
                         } else {
-                            seen.insert(distinct_key(args))
+                            seen.insert(distinct_key_collated(args, agg_collation))
                         }
                     } else {
                         true
@@ -7468,7 +7481,7 @@ impl VdbeEngine {
 
                 Opcode::AggFinal => {
                     let func_name = match &op.p4 {
-                        P4::FuncName(name) => name.as_str(),
+                        P4::FuncName(name) | P4::FuncNameCollated(name, _) => name.as_str(),
                         _ => {
                             return Err(FrankenError::Internal(
                                 "AggFinal opcode missing P4::FuncName".to_owned(),
@@ -7517,7 +7530,7 @@ impl VdbeEngine {
                     // P4 = function name, P2 = first arg register,
                     // P5 = arg count, P3 = accumulator register.
                     let func_name = match &op.p4 {
-                        P4::FuncName(name) => name.as_str(),
+                        P4::FuncName(name) | P4::FuncNameCollated(name, _) => name.as_str(),
                         _ => {
                             return Err(FrankenError::Internal(
                                 "AggInverse opcode missing P4::FuncName".to_owned(),
@@ -7567,7 +7580,7 @@ impl VdbeEngine {
                     // P4 = function name, P1 = accumulator register,
                     // P3 = destination register.
                     let func_name = match &op.p4 {
-                        P4::FuncName(name) => name.as_str(),
+                        P4::FuncName(name) | P4::FuncNameCollated(name, _) => name.as_str(),
                         _ => {
                             return Err(FrankenError::Internal(
                                 "AggValue opcode missing P4::FuncName".to_owned(),
@@ -7606,7 +7619,7 @@ impl VdbeEngine {
                 // Arguments are in registers p2..p2+p5.
                 Opcode::Function | Opcode::PureFunc => {
                     let func_name = match &op.p4 {
-                        P4::FuncName(name) => name.as_str(),
+                        P4::FuncName(name) | P4::FuncNameCollated(name, _) => name.as_str(),
                         _ => {
                             return Err(FrankenError::Internal(
                                 "Function opcode missing P4::FuncName".to_owned(),
@@ -8835,11 +8848,23 @@ impl VdbeEngine {
         if let Some(sorter) = self.sorters.get(&cursor_id) {
             if let Some(pos) = sorter.position {
                 if let Some(row) = sorter.rows.get(pos) {
-                    let value = row
-                        .values
-                        .get(col_idx)
-                        .cloned()
-                        .unwrap_or(SqliteValue::Null);
+                    // Sorter rows cache only the sort-key prefix. Decode any
+                    // non-key output columns lazily from the serialized row.
+                    let value = if let Some(value) = row.values.get(col_idx).cloned() {
+                        value
+                    } else if let Some(value) =
+                        fsqlite_types::record::parse_record_column(&row.blob, col_idx)
+                    {
+                        value
+                    } else if parse_record(&row.blob).is_some() {
+                        SqliteValue::Null
+                    } else {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "malformed sorter record while reading column {col_idx}"
+                            ),
+                        });
+                    };
                     if collect_vdbe_metrics {
                         record_decoded_value_metrics(&value);
                     }
@@ -11272,6 +11297,48 @@ mod tests {
         });
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(2)]]);
+    }
+
+    #[test]
+    fn test_sorter_column_reads_decode_non_key_payload_columns() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let loop_start = b.emit_label();
+            let empty = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_key = b.alloc_reg();
+            let r_payload = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::None, 0);
+
+            for (key, payload) in [(30, 300), (10, 100), (20, 200)] {
+                b.emit_op(Opcode::Integer, key, r_key, 0, P4::None, 0);
+                b.emit_op(Opcode::Integer, payload, r_payload, 0, P4::None, 0);
+                b.emit_op(Opcode::MakeRecord, r_key, 2, r_record, P4::None, 0);
+                b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            }
+
+            b.emit_jump_to_label(Opcode::SorterSort, 0, 0, empty, P4::None, 0);
+            b.resolve_label(loop_start);
+            b.emit_op(Opcode::Column, 0, 1, r_out, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterNext, 0, 0, loop_start, P4::None, 0);
+            b.resolve_label(empty);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(100)],
+                vec![SqliteValue::Integer(200)],
+                vec![SqliteValue::Integer(300)],
+            ]
+        );
     }
 
     #[test]

@@ -513,6 +513,7 @@ impl VdbeProgram {
                 P4::Blob(b) => format!("(blob)[{}B]", b.len()),
                 P4::Collation(c) => format!("(coll){c}"),
                 P4::FuncName(f) => format!("(func){f}"),
+                P4::FuncNameCollated(f, c) => format!("(func){f} coll={c}"),
                 P4::Table(t) => format!("(tbl){t}"),
                 P4::Index(i) => format!("(idx){i}"),
                 P4::Affinity(a) => format!("(aff){a}"),

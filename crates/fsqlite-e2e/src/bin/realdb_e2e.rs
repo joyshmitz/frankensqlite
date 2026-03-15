@@ -55,7 +55,7 @@ use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
 
 const HOT_PATH_INLINE_BUNDLE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_inline_bundle.v1";
 const HOT_PATH_INLINE_BUNDLE_PREFIX: &str = "HOT_PATH_INLINE_BUNDLE_JSON=";
-const HOT_PATH_COMMAND_PACK_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_command_pack.v1";
+const HOT_PATH_COMMAND_PACK_SCHEMA_V2: &str = "fsqlite-e2e.hot_path_command_pack.v2";
 const HOT_PATH_COMMAND_PACK_NAME: &str = "command_pack.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +249,20 @@ struct HotPathEvidenceCommandPack {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HotPathCounterPackMetadata {
+    host_capability_sensitive: bool,
+    topology_sensitive: bool,
+    primary_tool: String,
+    fallback_tools: Vec<String>,
+    primary_selection: String,
+    fallback_selections: Vec<String>,
+    capability_probe: String,
+    fallback_event_pack: Vec<String>,
+    fallback_reason_hints: Vec<String>,
+    raw_output_relpaths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct HotPathEvidenceCommand {
     capture: String,
     mode: String,
@@ -256,6 +270,7 @@ struct HotPathEvidenceCommand {
     output_relpath: String,
     command_line: String,
     description: String,
+    counter_pack: Option<HotPathCounterPackMetadata>,
 }
 
 fn format_hot_profile_replay_command(command: &HotProfileReplayCommand<'_>) -> String {
@@ -549,7 +564,11 @@ fn build_hot_path_command_pack(
         ("profiler_safe", profiler_safe_replay_command.as_str()),
         ("full_validation", full_validation_replay_command.as_str()),
     ] {
-        for (capture, tool, output_relpath, description, command_line) in [
+        let c2c_output_relpath = format!("profiles/perf-c2c.{mode}.summary.txt");
+        let c2c_raw_relpath = hot_path_sidecar_relpath(&c2c_output_relpath, ".data");
+        let remote_output_relpath = format!("profiles/perf-mem-remote-access.{mode}.summary.txt");
+        let remote_raw_relpath = hot_path_sidecar_relpath(&remote_output_relpath, ".data");
+        for (capture, tool, output_relpath, description, command_line, counter_pack) in [
             (
                 "wall_clock",
                 "hyperfine",
@@ -560,6 +579,7 @@ fn build_hot_path_command_pack(
                     &format!("profiles/hyperfine.{mode}.json"),
                     replay,
                 ),
+                None,
             ),
             (
                 "on_cpu",
@@ -571,6 +591,7 @@ fn build_hot_path_command_pack(
                     &format!("profiles/perf-record.{mode}.data"),
                     replay,
                 ),
+                None,
             ),
             (
                 "scheduler",
@@ -582,6 +603,7 @@ fn build_hot_path_command_pack(
                     &format!("profiles/perf-sched.{mode}.data"),
                     replay,
                 ),
+                None,
             ),
             (
                 "syscall",
@@ -593,6 +615,7 @@ fn build_hot_path_command_pack(
                     &format!("logs/strace.{mode}.log"),
                     replay,
                 ),
+                None,
             ),
             (
                 "allocation",
@@ -604,6 +627,7 @@ fn build_hot_path_command_pack(
                     &format!("profiles/heaptrack.{mode}.gz"),
                     replay,
                 ),
+                None,
             ),
             (
                 "topdown",
@@ -615,19 +639,60 @@ fn build_hot_path_command_pack(
                     &format!("profiles/perf-stat-topdown.{mode}.summary.txt"),
                     replay,
                 ),
+                Some(HotPathCounterPackMetadata {
+                    host_capability_sensitive: true,
+                    topology_sensitive: false,
+                    primary_tool: "perf-stat".to_owned(),
+                    fallback_tools: vec!["perf-stat".to_owned()],
+                    primary_selection: "TopdownL1".to_owned(),
+                    fallback_selections: vec!["core_event_fallback".to_owned()],
+                    capability_probe: "perf stat -M TopdownL1 -o \"$tmp\" -- true".to_owned(),
+                    fallback_event_pack: vec![
+                        "cycles".to_owned(),
+                        "instructions".to_owned(),
+                        "branches".to_owned(),
+                        "branch-misses".to_owned(),
+                        "cache-references".to_owned(),
+                        "cache-misses".to_owned(),
+                    ],
+                    fallback_reason_hints: vec!["TopdownL1 unsupported on this host".to_owned()],
+                    raw_output_relpaths: Vec::new(),
+                }),
             ),
             (
                 "cache_to_cache",
                 "perf-c2c",
-                format!("profiles/perf-c2c.{mode}.summary.txt"),
+                c2c_output_relpath.clone(),
                 format!(
                     "cache-to-cache or HITM evidence with perf mem/cache-stat fallbacks for {mode} capture"
                 ),
                 format_hot_path_perf_c2c_command(
                     replay_command.output_dir,
-                    &format!("profiles/perf-c2c.{mode}.summary.txt"),
+                    &c2c_output_relpath,
                     replay,
                 ),
+                Some(HotPathCounterPackMetadata {
+                    host_capability_sensitive: true,
+                    topology_sensitive: true,
+                    primary_tool: "perf-c2c".to_owned(),
+                    fallback_tools: vec!["perf-mem".to_owned(), "perf-stat".to_owned()],
+                    primary_selection: "perf_c2c".to_owned(),
+                    fallback_selections: vec![
+                        "perf_mem_fallback".to_owned(),
+                        "cache_event_fallback".to_owned(),
+                    ],
+                    capability_probe: "perf c2c record/report, else perf mem record/report"
+                        .to_owned(),
+                    fallback_event_pack: vec![
+                        "cache-references".to_owned(),
+                        "cache-misses".to_owned(),
+                    ],
+                    fallback_reason_hints: vec![
+                        "perf c2c unavailable or failed on this host".to_owned(),
+                        "perf c2c and perf mem unavailable or failed on this host".to_owned(),
+                    ],
+                    raw_output_relpaths: vec![c2c_raw_relpath],
+                }),
             ),
             (
                 "migration",
@@ -641,19 +706,56 @@ fn build_hot_path_command_pack(
                     &format!("profiles/perf-stat-migration.{mode}.summary.txt"),
                     replay,
                 ),
+                Some(HotPathCounterPackMetadata {
+                    host_capability_sensitive: true,
+                    topology_sensitive: true,
+                    primary_tool: "perf-stat".to_owned(),
+                    fallback_tools: vec!["perf-stat".to_owned()],
+                    primary_selection: "cpu_migrations".to_owned(),
+                    fallback_selections: vec!["context_switch_fallback".to_owned()],
+                    capability_probe:
+                        "perf stat -e cpu-migrations,context-switches -o \"$tmp\" -- true"
+                            .to_owned(),
+                    fallback_event_pack: vec![
+                        "context-switches".to_owned(),
+                        "task-clock".to_owned(),
+                    ],
+                    fallback_reason_hints: vec![
+                        "cpu-migrations unsupported on this host".to_owned(),
+                    ],
+                    raw_output_relpaths: Vec::new(),
+                }),
             ),
             (
                 "remote_access",
                 "perf-mem",
-                format!("profiles/perf-mem-remote-access.{mode}.summary.txt"),
+                remote_output_relpath.clone(),
                 format!(
                     "remote-access memory evidence with cache-stat fallback metrics for {mode} capture"
                 ),
                 format_hot_path_perf_mem_remote_access_command(
                     replay_command.output_dir,
-                    &format!("profiles/perf-mem-remote-access.{mode}.summary.txt"),
+                    &remote_output_relpath,
                     replay,
                 ),
+                Some(HotPathCounterPackMetadata {
+                    host_capability_sensitive: true,
+                    topology_sensitive: true,
+                    primary_tool: "perf-mem".to_owned(),
+                    fallback_tools: vec!["perf-stat".to_owned()],
+                    primary_selection: "perf_mem".to_owned(),
+                    fallback_selections: vec!["cache_event_fallback".to_owned()],
+                    capability_probe: "perf mem record/report".to_owned(),
+                    fallback_event_pack: vec![
+                        "cache-references".to_owned(),
+                        "cache-misses".to_owned(),
+                        "page-faults".to_owned(),
+                    ],
+                    fallback_reason_hints: vec![
+                        "perf mem unavailable or failed on this host".to_owned(),
+                    ],
+                    raw_output_relpaths: vec![remote_raw_relpath],
+                }),
             ),
         ] {
             commands.push(HotPathEvidenceCommand {
@@ -663,12 +765,13 @@ fn build_hot_path_command_pack(
                 output_relpath,
                 command_line,
                 description,
+                counter_pack,
             });
         }
     }
 
     HotPathEvidenceCommandPack {
-        schema_version: HOT_PATH_COMMAND_PACK_SCHEMA_V1.to_owned(),
+        schema_version: HOT_PATH_COMMAND_PACK_SCHEMA_V2.to_owned(),
         bead_id: report.bead_id.clone(),
         run_id: report.run_id.clone(),
         trace_id: report.trace_id.clone(),
@@ -4653,7 +4756,7 @@ mod tests {
 
     fn sample_hot_path_command_pack() -> HotPathEvidenceCommandPack {
         HotPathEvidenceCommandPack {
-            schema_version: HOT_PATH_COMMAND_PACK_SCHEMA_V1.to_owned(),
+            schema_version: HOT_PATH_COMMAND_PACK_SCHEMA_V2.to_owned(),
             bead_id: "bd-db300.4.1".to_owned(),
             run_id: "run-1".to_owned(),
             trace_id: "trace-1".to_owned(),
@@ -4680,6 +4783,7 @@ mod tests {
                     "mkdir -p /tmp/out/profiles && hyperfine --warmup 1 --runs 5 --export-json /tmp/out/profiles/hyperfine.profiler_safe.json 'rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc'"
                         .to_owned(),
                 description: "wall-clock benchmark replay for profiler_safe capture".to_owned(),
+                counter_pack: None,
             }],
         }
     }
@@ -4808,7 +4912,21 @@ mod tests {
     fn serialize_hot_path_inline_bundle_includes_expected_sections() {
         let report = sample_hot_path_report();
         let manifest = sample_hot_path_manifest();
-        let command_pack = sample_hot_path_command_pack();
+        let command_pack = build_hot_path_command_pack(
+            &report,
+            &HotProfileReplayCommand {
+                db: "fixture-a",
+                workload: "mixed_read_write",
+                golden_dir: Path::new("/tmp/golden"),
+                working_base: Path::new("/tmp/working"),
+                concurrency: 4,
+                seed: 42,
+                scale: 50,
+                output_dir: Path::new("/tmp/out"),
+                mvcc: true,
+                run_integrity_check: false,
+            },
+        );
         let text = serialize_hot_path_inline_bundle(&report, &manifest, &command_pack)
             .expect("inline bundle serialization should succeed");
         let value: Value = serde_json::from_str(&text).expect("bundle JSON must parse");
@@ -4835,7 +4953,7 @@ mod tests {
         );
         assert_eq!(
             value["command_pack"]["schema_version"],
-            HOT_PATH_COMMAND_PACK_SCHEMA_V1
+            HOT_PATH_COMMAND_PACK_SCHEMA_V2
         );
         assert_eq!(value["manifest"]["fixture_id"], "fixture-a");
         assert_eq!(value["profile"]["concurrent_mode"], true);
@@ -4848,6 +4966,27 @@ mod tests {
         assert_eq!(
             value["command_pack"]["commands"][0]["output_relpath"],
             "profiles/hyperfine.profiler_safe.json"
+        );
+        assert!(
+            value["command_pack"]["commands"]
+                .as_array()
+                .is_some_and(|commands| commands.iter().any(|command| {
+                    command["capture"] == "topdown"
+                        && command["mode"] == "profiler_safe"
+                        && command["counter_pack"]["primary_selection"] == "TopdownL1"
+                        && command["counter_pack"]["fallback_selections"][0]
+                            == "core_event_fallback"
+                }))
+        );
+        assert!(
+            value["command_pack"]["commands"]
+                .as_array()
+                .is_some_and(|commands| commands.iter().any(|command| {
+                    command["capture"] == "cache_to_cache"
+                        && command["mode"] == "full_validation"
+                        && command["counter_pack"]["raw_output_relpaths"][0]
+                            == "profiles/perf-c2c.full_validation.data"
+                }))
         );
         assert_eq!(
             value["subsystem_profile"]["subsystem_ranking"][0]["subsystem"],
@@ -4877,7 +5016,7 @@ mod tests {
         };
 
         let pack = build_hot_path_command_pack(&report, &replay_command);
-        assert_eq!(pack.schema_version, HOT_PATH_COMMAND_PACK_SCHEMA_V1);
+        assert_eq!(pack.schema_version, HOT_PATH_COMMAND_PACK_SCHEMA_V2);
         assert!(
             pack.profiler_safe_replay_command
                 .contains("--output-dir '/tmp/out dir'")
@@ -4907,6 +5046,14 @@ mod tests {
                 && command.mode == "profiler_safe"
                 && command.command_line.contains("TopdownL1")
                 && command.command_line.contains("cycles,instructions")
+                && command.counter_pack.as_ref().is_some_and(|counter_pack| {
+                    counter_pack.host_capability_sensitive
+                        && !counter_pack.topology_sensitive
+                        && counter_pack.primary_selection == "TopdownL1"
+                        && counter_pack
+                            .fallback_selections
+                            .contains(&"core_event_fallback".to_owned())
+                })
         }));
         assert!(pack.commands.iter().any(|command| {
             command.capture == "cache_to_cache"
@@ -4914,6 +5061,13 @@ mod tests {
                 && command.command_line.contains("perf c2c record")
                 && command.command_line.contains("perf mem record")
                 && command.output_relpath == "profiles/perf-c2c.full_validation.summary.txt"
+                && command.counter_pack.as_ref().is_some_and(|counter_pack| {
+                    counter_pack.topology_sensitive
+                        && counter_pack.fallback_tools
+                            == vec!["perf-mem".to_owned(), "perf-stat".to_owned()]
+                        && counter_pack.raw_output_relpaths
+                            == vec!["profiles/perf-c2c.full_validation.data".to_owned()]
+                })
         }));
         assert!(pack.commands.iter().any(|command| {
             command.capture == "migration"
@@ -4922,6 +5076,12 @@ mod tests {
                     .command_line
                     .contains("cpu-migrations,context-switches")
                 && command.command_line.contains("context-switches,task-clock")
+                && command.counter_pack.as_ref().is_some_and(|counter_pack| {
+                    counter_pack.topology_sensitive
+                        && counter_pack.primary_selection == "cpu_migrations"
+                        && counter_pack.fallback_event_pack
+                            == vec!["context-switches".to_owned(), "task-clock".to_owned()]
+                })
         }));
         assert!(pack.commands.iter().any(|command| {
             command.capture == "remote_access"
@@ -4932,6 +5092,14 @@ mod tests {
                     .contains("cache-references,cache-misses,page-faults")
                 && command.output_relpath
                     == "profiles/perf-mem-remote-access.full_validation.summary.txt"
+                && command.counter_pack.as_ref().is_some_and(|counter_pack| {
+                    counter_pack.topology_sensitive
+                        && counter_pack.primary_tool == "perf-mem"
+                        && counter_pack.raw_output_relpaths
+                            == vec![
+                                "profiles/perf-mem-remote-access.full_validation.data".to_owned(),
+                            ]
+                })
         }));
     }
 

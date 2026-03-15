@@ -1724,6 +1724,7 @@ impl<P: PageWriter> BtCursor<P> {
     }
 
     /// Backwards-compatible wrapper — allocates a fresh Vec per call.
+    #[allow(dead_code)]
     fn encode_index_leaf_cell(
         &mut self,
         cx: &Cx,
@@ -2433,13 +2434,19 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 }
             }
 
-            let (cell_data, overflow_head) = cursor.encode_index_leaf_cell(cx, key)?;
+            // Take cell_buf for reuse — same pattern as table_insert.
+            let mut cell_data = std::mem::take(&mut cursor.cell_buf);
+            let overflow_head = cursor.encode_index_leaf_cell_into(cx, key, &mut cell_data)?;
 
             match cursor.try_insert_on_leaf(cx, insert_idx, &cell_data) {
-                Ok(true) => Ok(()),
+                Ok(true) => {
+                    cursor.cell_buf = cell_data;
+                    Ok(())
+                }
                 Ok(false) => {
                     // Page full — balance and redistribute.
                     let balance_result = cursor.balance_for_insert(cx, &cell_data, insert_idx);
+                    cursor.cell_buf = cell_data;
                     if balance_result.is_err() {
                         if let Some(first) = overflow_head {
                             let _ = cursor.free_overflow_chain(cx, first);
@@ -2448,6 +2455,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     balance_result
                 }
                 Err(error) => {
+                    cursor.cell_buf = cell_data;
                     if let Some(first) = overflow_head {
                         let _ = cursor.free_overflow_chain(cx, first);
                     }

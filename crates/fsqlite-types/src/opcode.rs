@@ -1029,6 +1029,10 @@ pub enum P4 {
     Collation(String),
     /// A function name (for Function/PureFunc opcodes).
     FuncName(String),
+    /// A function name with an associated collation sequence for DISTINCT
+    /// deduplication in aggregate functions (e.g. `COUNT(DISTINCT col)` where
+    /// `col` has `COLLATE NOCASE`).
+    FuncNameCollated(String, String),
     /// A table name.
     Table(String),
     /// An index name (for IdxInsert/IdxDelete opcodes).
@@ -1390,6 +1394,7 @@ impl VdbeProgram {
                 P4::Blob(b) => format!("(blob)[{}B]", b.len()),
                 P4::Collation(c) => format!("(coll){c}"),
                 P4::FuncName(f) => format!("(func){f}"),
+                P4::FuncNameCollated(f, c) => format!("(func){f} coll={c}"),
                 P4::Table(t) => format!("(tbl){t}"),
                 P4::Index(i) => format!("(idx){i}"),
                 P4::Affinity(a) => format!("(aff){a}"),
