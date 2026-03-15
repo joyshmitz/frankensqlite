@@ -34,6 +34,14 @@ impl HazardFunction {
             Self::Geometric { h } => *h,
         }
     }
+
+    #[must_use]
+    fn sanitize(self) -> Self {
+        match self {
+            Self::Geometric { h } if h.is_finite() && (0.0..1.0).contains(&h) => self,
+            _ => Self::default(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +87,34 @@ impl ConjugateModel {
         Self::BetaBinomial {
             alpha_0: 0.5,
             beta_0: 0.5,
+        }
+    }
+
+    #[must_use]
+    fn sanitize(self) -> Self {
+        match self {
+            Self::NormalGamma {
+                mu_0,
+                kappa_0,
+                alpha_0,
+                beta_0,
+            } if mu_0.is_finite()
+                && kappa_0.is_finite()
+                && alpha_0.is_finite()
+                && beta_0.is_finite()
+                && kappa_0 > 0.0
+                && alpha_0 > 0.0
+                && beta_0 > 0.0 =>
+            {
+                self
+            }
+            Self::BetaBinomial { alpha_0, beta_0 }
+                if alpha_0.is_finite() && beta_0.is_finite() && alpha_0 > 0.0 && beta_0 > 0.0 =>
+            {
+                self
+            }
+            Self::NormalGamma { .. } => Self::jeffreys_normal_gamma(),
+            Self::BetaBinomial { .. } => Self::jeffreys_beta_binomial(),
         }
     }
 }
@@ -300,6 +336,33 @@ impl Default for BocpdConfig {
     }
 }
 
+impl BocpdConfig {
+    #[must_use]
+    fn sanitize(self) -> Self {
+        let defaults = Self::default();
+        let change_point_threshold = if self.change_point_threshold.is_finite()
+            && (0.0..1.0).contains(&self.change_point_threshold)
+        {
+            self.change_point_threshold
+        } else {
+            defaults.change_point_threshold
+        };
+        let prune_threshold =
+            if self.prune_threshold.is_finite() && (0.0..1.0).contains(&self.prune_threshold) {
+                self.prune_threshold
+            } else {
+                defaults.prune_threshold
+            };
+
+        Self {
+            hazard: self.hazard.sanitize(),
+            model: self.model.sanitize(),
+            change_point_threshold,
+            prune_threshold,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BOCPD monitor
 // ---------------------------------------------------------------------------
@@ -338,6 +401,7 @@ impl BocpdMonitor {
     /// Create a new BOCPD monitor.
     #[must_use]
     pub fn new(config: BocpdConfig) -> Self {
+        let config = config.sanitize();
         // Start with a single entry: run length 0 with probability 1.
         let initial_entry = RunEntry {
             run_length: 0,
@@ -946,6 +1010,57 @@ mod tests {
             freq > 2000.0,
             "bead_id={BEAD_ID} gc_freq_reflects_new_regime: {freq:.0}"
         );
+    }
+
+    #[test]
+    fn test_bocpd_new_sanitizes_invalid_config_values() {
+        let defaults = BocpdConfig::default();
+        let monitor = BocpdMonitor::new(BocpdConfig {
+            hazard: HazardFunction::Geometric { h: 2.0 },
+            model: ConjugateModel::NormalGamma {
+                mu_0: f64::NAN,
+                kappa_0: 0.0,
+                alpha_0: -1.0,
+                beta_0: f64::INFINITY,
+            },
+            change_point_threshold: 1.5,
+            prune_threshold: f64::NAN,
+        });
+
+        let HazardFunction::Geometric { h } = monitor.config.hazard;
+        assert_eq!(h, 1.0 / 250.0);
+        assert_eq!(
+            monitor.config.change_point_threshold,
+            defaults.change_point_threshold
+        );
+        assert_eq!(monitor.config.prune_threshold, defaults.prune_threshold);
+        assert!(matches!(
+            monitor.config.model,
+            ConjugateModel::NormalGamma { .. }
+        ));
+    }
+
+    #[test]
+    fn test_bocpd_invalid_config_does_not_poison_observe() {
+        let mut monitor = BocpdMonitor::new(BocpdConfig {
+            hazard: HazardFunction::Geometric { h: -0.5 },
+            model: ConjugateModel::BetaBinomial {
+                alpha_0: -1.0,
+                beta_0: 0.0,
+            },
+            change_point_threshold: 0.0,
+            prune_threshold: 2.0,
+        });
+
+        monitor.observe(0.0);
+        monitor.observe(1.0);
+
+        assert_eq!(monitor.observation_count(), 2);
+        assert!(monitor.current_regime_stats().mean.is_finite());
+        assert!(monitor
+            .entries
+            .iter()
+            .all(|entry| entry.log_prob.is_finite()));
     }
 
     // -----------------------------------------------------------------------

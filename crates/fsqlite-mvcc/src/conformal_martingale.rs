@@ -32,6 +32,29 @@ impl Default for ConformalMartingaleConfig {
     }
 }
 
+impl ConformalMartingaleConfig {
+    fn sanitize(self) -> Self {
+        let defaults = Self::default();
+        let window_size = self.window_size.max(1);
+        let alpha = if self.alpha.is_finite() && (0.0..1.0).contains(&self.alpha) {
+            self.alpha
+        } else {
+            defaults.alpha
+        };
+        let lambda = if self.lambda.is_finite() && (0.0..2.0).contains(&self.lambda) {
+            self.lambda
+        } else {
+            defaults.lambda
+        };
+
+        Self {
+            window_size,
+            alpha,
+            lambda,
+        }
+    }
+}
+
 pub struct ConformalMartingaleMonitor {
     config: ConformalMartingaleConfig,
     history: VecDeque<f64>,
@@ -44,6 +67,7 @@ pub struct ConformalMartingaleMonitor {
 
 impl ConformalMartingaleMonitor {
     pub fn new(config: ConformalMartingaleConfig) -> Self {
+        let config = config.sanitize();
         Self {
             config,
             history: VecDeque::with_capacity(config.window_size),
@@ -134,5 +158,50 @@ impl ConformalMartingaleMonitor {
 
     pub fn current_wealth(&self) -> f64 {
         self.wealth
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_sanitizes_invalid_config_values() {
+        let defaults = ConformalMartingaleConfig::default();
+        let monitor = ConformalMartingaleMonitor::new(ConformalMartingaleConfig {
+            window_size: 0,
+            alpha: 0.0,
+            lambda: f64::INFINITY,
+        });
+
+        assert_eq!(monitor.config.window_size, 1);
+        assert_eq!(monitor.config.alpha, defaults.alpha);
+        assert_eq!(monitor.config.lambda, defaults.lambda);
+    }
+
+    #[test]
+    fn zero_window_size_does_not_panic_during_observe() {
+        let mut monitor = ConformalMartingaleMonitor::new(ConformalMartingaleConfig {
+            window_size: 0,
+            ..ConformalMartingaleConfig::default()
+        });
+
+        monitor.observe(10.0);
+        monitor.observe(12.0);
+
+        assert_eq!(monitor.observation_count(), 2);
+        assert!(monitor.current_wealth().is_finite());
+        assert!(monitor.current_regime_stats().mean.is_finite());
+    }
+
+    #[test]
+    fn invalid_alpha_uses_default_threshold_behavior() {
+        let default_alpha = ConformalMartingaleConfig::default().alpha;
+        let monitor = ConformalMartingaleMonitor::new(ConformalMartingaleConfig {
+            alpha: -1.0,
+            ..ConformalMartingaleConfig::default()
+        });
+
+        assert_eq!(monitor.config.alpha, default_alpha);
     }
 }
