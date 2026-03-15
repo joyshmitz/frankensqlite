@@ -17814,8 +17814,8 @@ fn test_conformance_group_by_expression_s162() {
         "SELECT CASE WHEN amount >= 200 THEN 'high' ELSE 'low' END AS tier, COUNT(*) FROM sales GROUP BY CASE WHEN amount >= 200 THEN 'high' ELSE 'low' END ORDER BY tier",
         // GROUP BY multiple expressions
         "SELECT product, SUBSTR(sale_date, 1, 7) AS month, SUM(amount) FROM sales GROUP BY product, SUBSTR(sale_date, 1, 7) ORDER BY product, month",
-        // GROUP BY with aggregate in ORDER BY
-        "SELECT product, COUNT(*) AS cnt FROM sales GROUP BY product ORDER BY COUNT(*) DESC",
+        // GROUP BY with aggregate in ORDER BY (add secondary sort for deterministic ordering)
+        "SELECT product, COUNT(*) AS cnt FROM sales GROUP BY product ORDER BY COUNT(*) DESC, product",
     ];
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);

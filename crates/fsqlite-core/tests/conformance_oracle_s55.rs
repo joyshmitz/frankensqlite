@@ -2300,7 +2300,7 @@ fn test_conformance_self_join_s55d() {
     let queries = [
         "SELECT e.name, m.name AS manager FROM emp e LEFT JOIN emp m ON e.mgr_id = m.id ORDER BY e.id",
         "SELECT e.name FROM emp e WHERE e.mgr_id IS NOT NULL AND e.mgr_id IN (SELECT id FROM emp WHERE mgr_id IS NOT NULL) ORDER BY e.id",
-        "SELECT m.name, COUNT(e.id) AS reports FROM emp m JOIN emp e ON e.mgr_id = m.id GROUP BY m.name ORDER BY reports DESC",
+        "SELECT m.name, COUNT(e.id) AS reports FROM emp m JOIN emp e ON e.mgr_id = m.id GROUP BY m.name ORDER BY reports DESC, m.name",
     ];
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
@@ -15781,11 +15781,6 @@ fn test_conformance_aggregate_integer_edges_s70d() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    let setup = &[
-        "CREATE TABLE aie(val INTEGER)",
-        "INSERT INTO aie VALUES(9223372036854775807),(−1),(0),(NULL),(1)",
-    ];
-    // The −1 above is a Unicode minus, use the setup with ASCII minus
     let setup_fixed = &[
         "CREATE TABLE aie(val INTEGER)",
         "INSERT INTO aie VALUES(9223372036854775807),(-1),(0),(NULL),(1)",
@@ -16149,5 +16144,69 @@ fn test_conformance_nested_aggregate_expr_s70p() {
             eprintln!("{m}\n");
         }
         panic!("{} nested_aggregate_expr mismatches", mismatches.len());
+    }
+}
+
+// s70q: Minimal ORDER BY text regression probe
+#[test]
+fn test_conformance_order_by_text_probe_s70q() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = &[
+        "CREATE TABLE obt(id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO obt VALUES(1,'Gadget'),(2,'Bolt'),(3,'Alpha'),(4,'Zebra')",
+    ];
+    for s in setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = &[
+        "SELECT name FROM obt ORDER BY name",
+        "SELECT name FROM obt ORDER BY name DESC",
+        "SELECT name FROM obt WHERE name > 'B' ORDER BY name",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} order_by_text_probe mismatches", mismatches.len());
+    }
+}
+
+// s70r: UPDATE with CASE then ORDER BY — probes the s69bc ORDER BY text regression
+// The UPDATE itself works correctly but ORDER BY text after UPDATE returns wrong order.
+// Simple ORDER BY text (s70q) passes — the issue is specific to post-UPDATE queries.
+#[test]
+fn test_conformance_update_case_order_by_s70r() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = &[
+        "CREATE TABLE inv(id INTEGER PRIMARY KEY, product TEXT, qty INTEGER, reorder_point INTEGER, status TEXT DEFAULT 'ok')",
+        "INSERT INTO inv VALUES(1,'Widget',100,50,'ok'),(2,'Gadget',10,20,'ok'),(3,'Bolt',5,10,'ok'),(4,'Nut',200,25,'ok')",
+        "UPDATE inv SET status = CASE WHEN qty < reorder_point THEN 'reorder' ELSE 'ok' END",
+    ];
+    for s in setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = &[
+        // Check which rows got updated
+        "SELECT product, status FROM inv ORDER BY id",
+        // The actual failing query from s69bc
+        "SELECT product FROM inv WHERE status = 'reorder' ORDER BY product",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} update_case_order_by mismatches", mismatches.len());
     }
 }
