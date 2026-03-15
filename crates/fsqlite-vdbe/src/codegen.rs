@@ -3109,7 +3109,7 @@ fn expr_collation_for_agg(
 }
 
 /// Build the P4 payload for an AggStep opcode, including collation if present.
-fn agg_func_p4(name: &str, collation: &Option<String>) -> P4 {
+fn agg_func_p4(name: &str, collation: Option<&String>) -> P4 {
     if let Some(coll) = collation {
         P4::FuncNameCollated(name.to_owned(), coll.clone())
     } else {
@@ -3336,7 +3336,7 @@ fn codegen_select_aggregate(
         };
 
         let distinct_flag = i32::from(agg.distinct);
-        let agg_p4 = agg_func_p4(&agg.name, &agg.collation);
+        let agg_p4 = agg_func_p4(&agg.name, agg.collation.as_ref());
         if agg.num_args == 0 {
             // count(*): no arguments, p2 is unused (0), p5=0.
             b.emit_op(
