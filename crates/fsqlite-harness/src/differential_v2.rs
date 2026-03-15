@@ -832,9 +832,7 @@ fn parse_stmt_returns_rows(sql: &str) -> Option<bool> {
 
 fn statement_returns_rows(statement: &Statement) -> bool {
     match statement {
-        Statement::Select(_)
-        | Statement::Pragma(_)
-        | Statement::Explain { .. } => true,
+        Statement::Select(_) | Statement::Pragma(_) | Statement::Explain { .. } => true,
         Statement::Insert(insert) => !insert.returning.is_empty(),
         Statement::Update(update) => !update.returning.is_empty(),
         Statement::Delete(delete) => !delete.returning.is_empty(),

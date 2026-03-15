@@ -14718,10 +14718,8 @@ mod tests {
     #[test]
     fn test_distinct_key_collated_honors_rtrim() {
         let base = distinct_key_collated(&[SqliteValue::Text("abc".to_owned())], Some("RTRIM"));
-        let padded =
-            distinct_key_collated(&[SqliteValue::Text("abc  ".to_owned())], Some("rtrim"));
-        let tabbed =
-            distinct_key_collated(&[SqliteValue::Text("abc\t".to_owned())], Some("RTRIM"));
+        let padded = distinct_key_collated(&[SqliteValue::Text("abc  ".to_owned())], Some("rtrim"));
+        let tabbed = distinct_key_collated(&[SqliteValue::Text("abc\t".to_owned())], Some("RTRIM"));
 
         assert_eq!(
             base, padded,

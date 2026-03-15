@@ -143,6 +143,10 @@ impl WeightedRow {
         Self { values, weight }
     }
 
+    fn is_zero(&self) -> bool {
+        self.weight == 0
+    }
+
     fn project(&self, columns: &[usize]) -> Result<Vec<SqliteValue>, DifferentialPlanError> {
         columns
             .iter()
@@ -205,7 +209,7 @@ impl DifferentialAutomaton {
             input_rows = rows.len()
         );
 
-        let mut current = rows.to_vec();
+        let mut current: Vec<_> = rows.iter().filter(|row| !row.is_zero()).cloned().collect();
         for operator in &self.operators {
             current = operator.apply(&current)?;
         }
@@ -307,6 +311,9 @@ fn index_weighted_rows(
 ) -> Result<BTreeMap<Vec<SqliteValue>, Vec<WeightedRow>>, DifferentialPlanError> {
     let mut index: BTreeMap<Vec<SqliteValue>, Vec<WeightedRow>> = BTreeMap::new();
     for row in rows {
+        if row.is_zero() {
+            continue;
+        }
         let key = row.project(key_columns)?;
         index.entry(key).or_default().push(row.clone());
     }
@@ -324,6 +331,9 @@ pub fn delta_join_left(
     let mut joined = Vec::new();
 
     for left in delta_left {
+        if left.is_zero() {
+            continue;
+        }
         let left_key = left.project(&key_spec.left_columns)?;
         if let Some(matches) = right_index.get(&left_key) {
             for right in matches {
@@ -358,6 +368,9 @@ pub fn delta_join_right(
     let mut joined = Vec::new();
 
     for right in delta_right {
+        if right.is_zero() {
+            continue;
+        }
         let right_key = right.project(&key_spec.right_columns)?;
         if let Some(matches) = left_index.get(&right_key) {
             for left in matches {
@@ -852,19 +865,25 @@ impl std::error::Error for BindingError {}
 /// - UPDATE + DELETE → DELETE
 /// - DELETE + INSERT → UPDATE (row replaced)
 pub fn coalesce_deltas(deltas: &[AlgebraicDelta]) -> Vec<AlgebraicDelta> {
-    // Group by (source_table, row_id), preserving order of first appearance.
+    // Group by (source_table, row_id) while preserving order of first appearance.
     let mut groups: BTreeMap<(&str, i64), Vec<&AlgebraicDelta>> = BTreeMap::new();
+    let mut group_order = Vec::new();
     for d in deltas {
-        groups
-            .entry((d.source_table.as_str(), d.row_id))
-            .or_default()
-            .push(d);
+        let key = (d.source_table.as_str(), d.row_id);
+        let entry = groups.entry(key).or_insert_with(|| {
+            group_order.push(key);
+            Vec::new()
+        });
+        entry.push(d);
     }
 
     let mut result = Vec::new();
     let mut next_seq = 0u64;
 
-    for ((table, row_id), group) in &groups {
+    for (table, row_id) in group_order {
+        let Some(group) = groups.get(&(table, row_id)) else {
+            continue;
+        };
         let mut current_kind: Option<DeltaKind> = None;
         let mut merged_cols: BTreeSet<usize> = BTreeSet::new();
 
@@ -908,7 +927,7 @@ pub fn coalesce_deltas(deltas: &[AlgebraicDelta]) -> Vec<AlgebraicDelta> {
         if let Some(kind) = current_kind {
             result.push(AlgebraicDelta {
                 source_table: table.to_string(),
-                row_id: *row_id,
+                row_id,
                 kind,
                 affected_columns: merged_cols.into_iter().collect(),
                 seq: next_seq,
@@ -1139,6 +1158,15 @@ mod tests {
     }
 
     #[test]
+    fn differential_automaton_ignores_zero_weight_input_rows() {
+        let automaton =
+            DifferentialAutomaton::new(vec![DifferentialOperator::Project { columns: vec![0] }]);
+        let rows = vec![WeightedRow::new(vec![SqliteValue::Integer(7)], 0)];
+
+        assert_eq!(automaton.execute(&rows).unwrap(), Vec::<WeightedRow>::new());
+    }
+
+    #[test]
     fn delta_join_left_multiplies_weights_and_concatenates_rows() {
         let delta_left = vec![
             WeightedRow::new(
@@ -1194,6 +1222,30 @@ mod tests {
                     -2,
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn delta_join_left_ignores_zero_weight_rows() {
+        let delta_left = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 0)];
+        let stable_right = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)];
+        let key_spec = JoinKeySpec::new(vec![0], vec![0]);
+
+        assert_eq!(
+            delta_join_left(&delta_left, &stable_right, &key_spec).unwrap(),
+            Vec::<WeightedRow>::new()
+        );
+    }
+
+    #[test]
+    fn delta_join_left_ignores_zero_weight_stable_rows() {
+        let delta_left = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)];
+        let stable_right = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 0)];
+        let key_spec = JoinKeySpec::new(vec![0], vec![0]);
+
+        assert_eq!(
+            delta_join_left(&delta_left, &stable_right, &key_spec).unwrap(),
+            Vec::<WeightedRow>::new()
         );
     }
 
@@ -1300,6 +1352,33 @@ mod tests {
         ];
         let coalesced = coalesce_deltas(&deltas);
         assert!(coalesced.is_empty(), "INSERT+DELETE should cancel");
+    }
+
+    #[test]
+    fn coalesce_preserves_first_appearance_order() {
+        let deltas = vec![
+            AlgebraicDelta {
+                source_table: "t".to_string(),
+                row_id: 2,
+                kind: DeltaKind::Update,
+                affected_columns: vec![0],
+                seq: 11,
+            },
+            AlgebraicDelta {
+                source_table: "t".to_string(),
+                row_id: 1,
+                kind: DeltaKind::Update,
+                affected_columns: vec![1],
+                seq: 12,
+            },
+        ];
+
+        let coalesced = coalesce_deltas(&deltas);
+        assert_eq!(coalesced.len(), 2);
+        assert_eq!(coalesced[0].row_id, 2);
+        assert_eq!(coalesced[0].seq, 0);
+        assert_eq!(coalesced[1].row_id, 1);
+        assert_eq!(coalesced[1].seq, 1);
     }
 
     #[test]
