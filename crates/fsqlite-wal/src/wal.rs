@@ -17,7 +17,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::checksum::{
     SqliteWalChecksum, WAL_FORMAT_VERSION, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WAL_MAGIC_LE,
@@ -562,7 +562,7 @@ impl<F: VfsFile> WalFile<F> {
             // Verify salt match.
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             if frame_header.salts != header.salts {
-                error!(frame_index, "WAL frame salt mismatch — chain terminated");
+                warn!(frame_index, "WAL frame salt mismatch — chain terminated");
                 log_replay_decision(
                     "startup_open",
                     frame_no,
@@ -580,7 +580,7 @@ impl<F: VfsFile> WalFile<F> {
                 big_endian_checksum,
             )?;
             if frame_header.checksum != expected {
-                error!(
+                warn!(
                     frame_index,
                     "WAL frame checksum mismatch — chain terminated"
                 );
