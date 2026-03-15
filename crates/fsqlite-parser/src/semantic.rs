@@ -764,29 +764,33 @@ impl<'a> Resolver<'a> {
             scope.clone() // Compounds can only see outer scope + result columns
         };
 
-        if let SelectCore::Select { columns, .. } = &select.body.select {
-            let mut output_cols = HashSet::new();
-            for col in columns {
-                match col {
-                    ResultColumn::Expr {
-                        alias: Some(alias_id),
-                        ..
-                    } => {
-                        output_cols.insert(alias_id.to_ascii_lowercase());
+        let mut output_cols = HashSet::new();
+        for core in std::iter::once(&select.body.select)
+            .chain(select.body.compounds.iter().map(|(_, core)| core))
+        {
+            if let SelectCore::Select { columns, .. } = core {
+                for col in columns {
+                    match col {
+                        ResultColumn::Expr {
+                            alias: Some(alias_id),
+                            ..
+                        } => {
+                            output_cols.insert(alias_id.to_ascii_lowercase());
+                        }
+                        ResultColumn::Expr {
+                            expr: Expr::Column(col_ref, _),
+                            ..
+                        } => {
+                            output_cols.insert(col_ref.column.to_ascii_lowercase());
+                        }
+                        _ => {}
                     }
-                    ResultColumn::Expr {
-                        expr: Expr::Column(col_ref, _),
-                        ..
-                    } => {
-                        output_cols.insert(col_ref.column.to_ascii_lowercase());
-                    }
-                    _ => {}
                 }
             }
-            if !output_cols.is_empty() {
-                // Add the output columns as a pseudo-table so ORDER BY can reference them.
-                order_by_scope.add_alias("<output>", "<output>", Some(output_cols));
-            }
+        }
+        if !output_cols.is_empty() {
+            // Add the output columns as a pseudo-table so ORDER BY can reference them.
+            order_by_scope.add_alias("<output>", "<output>", Some(output_cols));
         }
 
         for term in &select.order_by {
@@ -1923,6 +1927,15 @@ mod tests {
         if !errors.is_empty() {
             panic!("Expected no errors, but got: {:?}", errors);
         }
+    }
+
+    #[test]
+    fn test_compound_order_by_can_resolve_alias_from_later_arm() {
+        let schema = make_schema();
+        let stmt = parse_one("SELECT 1 AS a UNION SELECT 2 AS b ORDER BY b");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     }
 
     // ── Metrics tests ──
