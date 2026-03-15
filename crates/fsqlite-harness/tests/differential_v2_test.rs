@@ -9,7 +9,7 @@
 use fsqlite_harness::differential_v2::{
     self, CanonicalizationRules, DIFFERENTIAL_METADATA_SCHEMA_VERSION, DifferentialResult,
     EngineIdentity, ExecutionEnvelope, FORMAT_VERSION, FsqliteExecutor, NormalizedValue, Outcome,
-    PragmaConfig, SqlExecutor,
+    PragmaConfig, SqlExecutor, StmtOutcome,
 };
 
 /// Rusqlite executor for the C SQLite oracle.
@@ -242,6 +242,91 @@ fn differential_pass_on_multiple_tables() {
 
     assert_eq!(result.outcome, Outcome::Pass);
     assert!(result.logical_state_matched);
+}
+
+#[test]
+fn differential_passes_rtrim_collation_cte_repro() {
+    let envelope = make_test_envelope(
+        42,
+        vec![],
+        vec![
+            "WITH vals(v) AS (VALUES('abc'), ('abc  '), ('abc\t')) SELECT COUNT(DISTINCT v COLLATE RTRIM), COUNT(DISTINCT v COLLATE BINARY), SUM(v = 'abc' COLLATE RTRIM) FROM vals",
+        ],
+    );
+    let result = run_test(&envelope);
+
+    assert_eq!(result.outcome, Outcome::Pass, "{:#?}", result.divergences);
+    assert!(
+        result.divergences.is_empty(),
+        "CTE query statements must route through query() instead of execute()"
+    );
+    assert!(result.logical_state_matched);
+}
+
+#[test]
+fn differential_passes_total_no_overflow_cte_repro() {
+    let envelope = make_test_envelope(
+        42,
+        vec![],
+        vec![
+            "WITH nums(x) AS (VALUES(9223372036854775807), (1)) SELECT typeof(total(x)), total(x) > 9e18 FROM nums",
+        ],
+    );
+    let result = run_test(&envelope);
+
+    assert_eq!(result.outcome, Outcome::Pass, "{:#?}", result.divergences);
+    assert!(
+        result.divergences.is_empty(),
+        "CTE query statements must route through query() instead of execute()"
+    );
+    assert!(result.logical_state_matched);
+}
+
+#[test]
+fn run_stmt_routes_returning_statements_to_rows() {
+    let f = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+    let c = RusqliteExecutor::open_in_memory();
+
+    f.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
+        .expect("create table");
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
+        .expect("create table");
+
+    let expected = StmtOutcome::Rows(vec![vec![
+        NormalizedValue::Integer(1),
+        NormalizedValue::Text("alice".to_owned()),
+    ]]);
+
+    assert_eq!(
+        f.run_stmt("INSERT INTO t(id, name) VALUES(1, 'alice') RETURNING id, name"),
+        expected
+    );
+    assert_eq!(
+        c.run_stmt("INSERT INTO t(id, name) VALUES(1, 'alice') RETURNING id, name"),
+        expected
+    );
+}
+
+#[test]
+fn run_stmt_routes_plain_insert_to_execute() {
+    let f = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+    let c = RusqliteExecutor::open_in_memory();
+
+    f.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
+        .expect("create table");
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT)")
+        .expect("create table");
+
+    let expected = StmtOutcome::Execute(1);
+
+    assert_eq!(
+        f.run_stmt("INSERT INTO t(id, name) VALUES(1, 'alice')"),
+        expected
+    );
+    assert_eq!(
+        c.run_stmt("INSERT INTO t(id, name) VALUES(1, 'alice')"),
+        expected
+    );
 }
 
 #[test]

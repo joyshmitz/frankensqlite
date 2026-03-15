@@ -29,6 +29,8 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
+use fsqlite_ast::Statement;
+use fsqlite_parser::Parser;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -736,14 +738,27 @@ pub trait SqlExecutor {
         EngineIdentity::Unknown
     }
 
+    /// Best-effort classification of whether a statement produces result rows.
+    ///
+    /// Real executors should prefer prepared-statement metadata over keyword
+    /// heuristics so CTE queries and `RETURNING` statements are routed through
+    /// `query()` instead of `execute()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an executor overrides this method and its own
+    /// classification path fails.
+    fn stmt_returns_rows(&self, sql: &str) -> Result<bool, String> {
+        Ok(classify_stmt_returns_rows(sql))
+    }
+
     /// Run a statement (auto-detecting query vs DML).
     fn run_stmt(&self, sql: &str) -> StmtOutcome {
         let trimmed = sql.trim();
-        let is_query = trimmed.split_whitespace().next().is_some_and(|w| {
-            w.eq_ignore_ascii_case("SELECT")
-                || w.eq_ignore_ascii_case("PRAGMA")
-                || w.eq_ignore_ascii_case("EXPLAIN")
-        });
+        let is_query = match self.stmt_returns_rows(trimmed) {
+            Ok(is_query) => is_query,
+            Err(e) => return StmtOutcome::Error(e),
+        };
 
         if is_query {
             match self.query(trimmed) {
@@ -793,6 +808,53 @@ pub trait SqlExecutor {
             }
         }
         dump
+    }
+}
+
+fn fallback_stmt_returns_rows(sql: &str) -> bool {
+    sql.split_whitespace().next().is_some_and(|w| {
+        w.eq_ignore_ascii_case("SELECT")
+            || w.eq_ignore_ascii_case("PRAGMA")
+            || w.eq_ignore_ascii_case("EXPLAIN")
+            || w.eq_ignore_ascii_case("VALUES")
+    })
+}
+
+fn classify_stmt_returns_rows(sql: &str) -> bool {
+    parse_stmt_returns_rows(sql).unwrap_or_else(|| fallback_stmt_returns_rows(sql))
+}
+
+fn parse_stmt_returns_rows(sql: &str) -> Option<bool> {
+    let mut parser = Parser::from_sql(sql);
+    let statement = parser.parse_statement().ok()?;
+    Some(statement_returns_rows(&statement))
+}
+
+fn statement_returns_rows(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(_)
+        | Statement::Pragma(_)
+        | Statement::Explain { .. } => true,
+        Statement::Insert(insert) => !insert.returning.is_empty(),
+        Statement::Update(update) => !update.returning.is_empty(),
+        Statement::Delete(delete) => !delete.returning.is_empty(),
+        Statement::CreateTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::CreateView(_)
+        | Statement::CreateTrigger(_)
+        | Statement::CreateVirtualTable(_)
+        | Statement::Drop(_)
+        | Statement::AlterTable(_)
+        | Statement::Begin(_)
+        | Statement::Commit
+        | Statement::Rollback(_)
+        | Statement::Savepoint(_)
+        | Statement::Release(_)
+        | Statement::Attach(_)
+        | Statement::Detach(_)
+        | Statement::Vacuum(_)
+        | Statement::Reindex(_)
+        | Statement::Analyze(_) => false,
     }
 }
 

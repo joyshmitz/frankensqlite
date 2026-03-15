@@ -252,6 +252,9 @@ fn test_metrics_integration() {
     let json = serde_json::to_string(&after).unwrap();
     assert!(json.contains("fsqlite_flat_combining_batches_total"));
     assert!(json.contains("fsqlite_flat_combining_ops_total"));
+    assert!(json.contains("fsqlite_htm_attempts"));
+    assert!(json.contains("fsqlite_htm_aborts_conflict"));
+    assert!(json.contains("fsqlite_htm_aborts_capacity"));
 
     drop(h);
 

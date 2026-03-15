@@ -41,8 +41,8 @@ use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
 use fsqlite_func::builtins::{ChangeTrackingState, set_change_tracking_state};
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::{
-    ColumnContext, ConstraintOp, ErasedVtabInstance, IndexConstraint, IndexInfo, VtabModuleFactory,
-    module_factory_from,
+    ColumnContext, ConstraintOp, ErasedVtabInstance, IndexConstraint, IndexInfo, VirtualTable,
+    VirtualTableCursor, VtabModuleFactory, module_factory_from,
 };
 use fsqlite_func::{
     ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
@@ -96,13 +96,13 @@ use fsqlite_wal::{WalFile, WalSalts};
 
 // MVCC concurrent-writer support (bd-14zc / 5E.1, bd-kivg / 5E.2, bd-3bql / 5E.5)
 use fsqlite_mvcc::{
-    CommitIndex, ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult, GcScheduler,
-    GcTickResult, GcTodo, InProcessPageLockTable, MvccError, PreparedConcurrentCommit,
-    SharedConcurrentHandle, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery,
-    SsiDecisionType, SsiEvidenceLedger, SsiReadSetSummary, VersionStore, concurrent_abort,
-    concurrent_rollback_to_savepoint, concurrent_savepoint, concurrent_track_write_conflict_page,
-    finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
-    ssi_metrics_snapshot,
+    CommitIndex, ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult,
+    FlatCombiningMetrics, GcScheduler, GcTickResult, GcTodo, InProcessPageLockTable, MvccError,
+    PreparedConcurrentCommit, SharedConcurrentHandle, SsiDecisionCard, SsiDecisionCardDraft,
+    SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger, SsiReadSetSummary, VersionStore,
+    concurrent_abort, concurrent_rollback_to_savepoint, concurrent_savepoint,
+    concurrent_track_write_conflict_page, finalize_prepared_concurrent_commit_with_ssi,
+    flat_combining_metrics, prepare_concurrent_commit_with_ssi, ssi_metrics_snapshot,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 use fsqlite_observability::{
@@ -861,6 +861,78 @@ fn default_function_registry(
 }
 
 const GENERATE_SERIES_TABLE_COLUMN_NAMES: [&str; 4] = ["value", "start", "stop", "step"];
+const HTM_METRICS_TABLE_COLUMN_NAMES: [&str; 8] = [
+    "attempts",
+    "aborts_conflict",
+    "aborts_capacity",
+    "aborts_explicit",
+    "aborts_other",
+    "aborts_total",
+    "success_estimate",
+    "abort_rate_pct",
+];
+
+struct HtmMetricsVtab;
+
+#[derive(Default)]
+struct HtmMetricsCursor {
+    row: Vec<SqliteValue>,
+    emitted: bool,
+}
+
+impl VirtualTable for HtmMetricsVtab {
+    type Cursor = HtmMetricsCursor;
+
+    fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        info.estimated_cost = 1.0;
+        info.estimated_rows = 1;
+        Ok(())
+    }
+
+    fn open(&self) -> Result<Self::Cursor> {
+        Ok(HtmMetricsCursor::default())
+    }
+}
+
+impl VirtualTableCursor for HtmMetricsCursor {
+    fn filter(
+        &mut self,
+        _cx: &Cx,
+        _idx_num: i32,
+        _idx_str: Option<&str>,
+        _args: &[SqliteValue],
+    ) -> Result<()> {
+        self.row = htm_metrics_row_values(flat_combining_metrics());
+        self.emitted = false;
+        Ok(())
+    }
+
+    fn next(&mut self, _cx: &Cx) -> Result<()> {
+        self.emitted = true;
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        self.emitted
+    }
+
+    fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+        let value = usize::try_from(col)
+            .ok()
+            .and_then(|idx| self.row.get(idx).cloned())
+            .unwrap_or(SqliteValue::Null);
+        ctx.set_value(value);
+        Ok(())
+    }
+
+    fn rowid(&self) -> Result<i64> {
+        Ok(1)
+    }
+}
 
 fn default_vtab_module_registry() -> HashMap<String, Box<dyn VtabModuleFactory>> {
     let mut modules: HashMap<String, Box<dyn VtabModuleFactory>> = HashMap::new();
@@ -879,6 +951,10 @@ fn default_vtab_module_registry() -> HashMap<String, Box<dyn VtabModuleFactory>>
     modules.insert(
         "GENERATE_SERIES".to_owned(),
         Box::new(module_factory_from::<GenerateSeriesTable>()),
+    );
+    modules.insert(
+        "FSQLITE_HTM_METRICS".to_owned(),
+        Box::new(module_factory_from::<HtmMetricsVtab>()),
     );
     modules.insert(
         "RTREE".to_owned(),
@@ -926,6 +1002,103 @@ impl Row {
     pub fn get(&self, index: usize) -> Option<&SqliteValue> {
         self.values.get(index)
     }
+}
+
+fn flat_combining_abort_total(snapshot: FlatCombiningMetrics) -> u64 {
+    snapshot
+        .fsqlite_htm_aborts_conflict
+        .saturating_add(snapshot.fsqlite_htm_aborts_capacity)
+        .saturating_add(snapshot.fsqlite_htm_aborts_explicit)
+        .saturating_add(snapshot.fsqlite_htm_aborts_other)
+}
+
+fn flat_combining_success_estimate(snapshot: FlatCombiningMetrics) -> u64 {
+    snapshot
+        .fsqlite_htm_attempts
+        .saturating_sub(flat_combining_abort_total(snapshot))
+}
+
+fn flat_combining_abort_rate_pct(snapshot: FlatCombiningMetrics) -> u64 {
+    let attempts = snapshot.fsqlite_htm_attempts;
+    if attempts == 0 {
+        0
+    } else {
+        flat_combining_abort_total(snapshot)
+            .saturating_mul(100)
+            .checked_div(attempts)
+            .unwrap_or(0)
+    }
+}
+
+fn flat_combining_stats_rows() -> Vec<Row> {
+    let snapshot = flat_combining_metrics();
+    let metrics = [
+        (
+            "fsqlite_flat_combining_batches_total",
+            snapshot.fsqlite_flat_combining_batches_total,
+        ),
+        (
+            "fsqlite_flat_combining_ops_total",
+            snapshot.fsqlite_flat_combining_ops_total,
+        ),
+        (
+            "fsqlite_flat_combining_batch_size_sum",
+            snapshot.fsqlite_flat_combining_batch_size_sum,
+        ),
+        (
+            "fsqlite_flat_combining_batch_size_max",
+            snapshot.fsqlite_flat_combining_batch_size_max,
+        ),
+        (
+            "fsqlite_flat_combining_wait_ns_total",
+            snapshot.fsqlite_flat_combining_wait_ns_total,
+        ),
+        (
+            "fsqlite_flat_combining_wait_ns_max",
+            snapshot.fsqlite_flat_combining_wait_ns_max,
+        ),
+        ("fsqlite_htm_attempts", snapshot.fsqlite_htm_attempts),
+        (
+            "fsqlite_htm_aborts_conflict",
+            snapshot.fsqlite_htm_aborts_conflict,
+        ),
+        (
+            "fsqlite_htm_aborts_capacity",
+            snapshot.fsqlite_htm_aborts_capacity,
+        ),
+        (
+            "fsqlite_htm_aborts_explicit",
+            snapshot.fsqlite_htm_aborts_explicit,
+        ),
+        (
+            "fsqlite_htm_aborts_other",
+            snapshot.fsqlite_htm_aborts_other,
+        ),
+    ];
+
+    metrics
+        .into_iter()
+        .map(|(name, value)| Row {
+            values: vec![
+                SqliteValue::Text(name.to_owned()),
+                SqliteValue::Integer(to_i64_clamped(value)),
+            ],
+        })
+        .collect()
+}
+
+fn htm_metrics_row_values(snapshot: FlatCombiningMetrics) -> Vec<SqliteValue> {
+    let aborts_total = flat_combining_abort_total(snapshot);
+    vec![
+        SqliteValue::Integer(to_i64_clamped(snapshot.fsqlite_htm_attempts)),
+        SqliteValue::Integer(to_i64_clamped(snapshot.fsqlite_htm_aborts_conflict)),
+        SqliteValue::Integer(to_i64_clamped(snapshot.fsqlite_htm_aborts_capacity)),
+        SqliteValue::Integer(to_i64_clamped(snapshot.fsqlite_htm_aborts_explicit)),
+        SqliteValue::Integer(to_i64_clamped(snapshot.fsqlite_htm_aborts_other)),
+        SqliteValue::Integer(to_i64_clamped(aborts_total)),
+        SqliteValue::Integer(to_i64_clamped(flat_combining_success_estimate(snapshot))),
+        SqliteValue::Integer(to_i64_clamped(flat_combining_abort_rate_pct(snapshot))),
+    ]
 }
 
 /// A prepared SQL statement.
@@ -15587,6 +15760,9 @@ impl Connection {
                     values: vec![SqliteValue::Text("ok".into())],
                 }])
             }
+            "fsqlite.flat_combining_stats"
+            | "flat_combining_stats"
+            | "fsqlite_flat_combining_stats" => Ok(flat_combining_stats_rows()),
             // ── Page-cache observability PRAGMAs (bd-t6sv2.8) ─────────────
             "fsqlite.cache_stats" | "cache_stats" | "fsqlite_cache_stats" => {
                 let to_i64_u64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
@@ -23484,6 +23660,9 @@ fn table_function_column_names(name: &str) -> Option<&'static [&'static str]> {
     }
     if name.eq_ignore_ascii_case("generate_series") {
         return Some(&GENERATE_SERIES_TABLE_COLUMN_NAMES);
+    }
+    if name.eq_ignore_ascii_case("fsqlite_htm_metrics") {
+        return Some(&HTM_METRICS_TABLE_COLUMN_NAMES);
     }
     None
 }
@@ -43769,6 +43948,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_fsqlite_htm_metrics_table_function_available_via_registry() {
+        let conn = Connection::open(":memory:").unwrap();
+        let before = conn
+            .query(
+                "SELECT attempts, aborts_conflict, aborts_capacity, aborts_explicit, aborts_other, aborts_total, success_estimate, abort_rate_pct FROM fsqlite_htm_metrics();",
+            )
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            1,
+            "htm metrics should expose a single snapshot row"
+        );
+
+        fsqlite_mvcc::flat_combining::note_htm_attempt();
+        fsqlite_mvcc::flat_combining::note_htm_attempt();
+        fsqlite_mvcc::flat_combining::note_htm_attempt();
+        fsqlite_mvcc::flat_combining::note_htm_abort((1 << 2) | (1 << 1));
+        fsqlite_mvcc::flat_combining::note_htm_abort(1 << 3);
+
+        let after = conn
+            .query(
+                "SELECT attempts, aborts_conflict, aborts_capacity, aborts_explicit, aborts_other, aborts_total, success_estimate, abort_rate_pct FROM fsqlite_htm_metrics();",
+            )
+            .unwrap();
+        assert_eq!(after.len(), 1, "htm metrics should stay single-row");
+
+        let before_values = row_values(&before[0]);
+        let after_values = row_values(&after[0]);
+
+        let delta = |idx: usize| {
+            let before = match &before_values[idx] {
+                SqliteValue::Integer(value) => *value,
+                other => panic!("expected integer before value at {idx}, got {other:?}"),
+            };
+            let after = match &after_values[idx] {
+                SqliteValue::Integer(value) => *value,
+                other => panic!("expected integer after value at {idx}, got {other:?}"),
+            };
+            after - before
+        };
+
+        assert_eq!(delta(0), 3, "attempts delta should match injected attempts");
+        assert_eq!(delta(1), 1, "conflict abort delta should be tracked");
+        assert_eq!(delta(2), 1, "capacity abort delta should be tracked");
+        assert_eq!(delta(3), 0, "explicit abort delta should remain unchanged");
+        assert_eq!(delta(4), 0, "other abort delta should remain unchanged");
+
+        let attempts = match after_values[0] {
+            SqliteValue::Integer(value) => value,
+            ref other => panic!("expected attempts integer, got {other:?}"),
+        };
+        let conflict = match after_values[1] {
+            SqliteValue::Integer(value) => value,
+            ref other => panic!("expected conflict integer, got {other:?}"),
+        };
+        let capacity = match after_values[2] {
+            SqliteValue::Integer(value) => value,
+            ref other => panic!("expected capacity integer, got {other:?}"),
+        };
+        let explicit = match after_values[3] {
+            SqliteValue::Integer(value) => value,
+            ref other => panic!("expected explicit integer, got {other:?}"),
+        };
+        let other = match after_values[4] {
+            SqliteValue::Integer(value) => value,
+            ref other => panic!("expected other integer, got {other:?}"),
+        };
+        let aborts_total = match after_values[5] {
+            SqliteValue::Integer(value) => value,
+            ref other => panic!("expected abort total integer, got {other:?}"),
+        };
+        let success_estimate = match after_values[6] {
+            SqliteValue::Integer(value) => value,
+            ref other => panic!("expected success estimate integer, got {other:?}"),
+        };
+        let abort_rate_pct = match after_values[7] {
+            SqliteValue::Integer(value) => value,
+            ref other => panic!("expected abort rate integer, got {other:?}"),
+        };
+
+        assert_eq!(aborts_total, conflict + capacity + explicit + other);
+        assert_eq!(success_estimate, attempts - aborts_total);
+        assert_eq!(
+            abort_rate_pct,
+            if attempts == 0 {
+                0
+            } else {
+                aborts_total * 100 / attempts
+            }
+        );
+    }
+
     // ── BETWEEN expression tests ────────────────────────────────────────
 
     #[test]
@@ -53062,6 +53334,37 @@ mod schema_loading_tests {
                 Some((name, value))
             })
             .collect()
+    }
+
+    #[test]
+    fn test_pragma_flat_combining_stats_reports_htm_counters() {
+        let conn = Connection::open(":memory:").unwrap();
+        let before = txn_metrics_map(&conn.query("PRAGMA fsqlite_flat_combining_stats;").unwrap());
+
+        fsqlite_mvcc::flat_combining::note_htm_attempt();
+        fsqlite_mvcc::flat_combining::note_htm_attempt();
+        fsqlite_mvcc::flat_combining::note_htm_attempt();
+        fsqlite_mvcc::flat_combining::note_htm_attempt();
+        fsqlite_mvcc::flat_combining::note_htm_abort(1 << 2);
+        fsqlite_mvcc::flat_combining::note_htm_abort(1 << 3);
+        fsqlite_mvcc::flat_combining::note_htm_abort(1 << 0);
+        fsqlite_mvcc::flat_combining::note_htm_abort(0);
+
+        let after = txn_metrics_map(&conn.query("PRAGMA fsqlite_flat_combining_stats;").unwrap());
+
+        let delta = |name: &str| {
+            after.get(name).copied().unwrap_or(0) - before.get(name).copied().unwrap_or(0)
+        };
+
+        assert_eq!(delta("fsqlite_htm_attempts"), 4);
+        assert_eq!(delta("fsqlite_htm_aborts_conflict"), 1);
+        assert_eq!(delta("fsqlite_htm_aborts_capacity"), 1);
+        assert_eq!(delta("fsqlite_htm_aborts_explicit"), 1);
+        assert_eq!(delta("fsqlite_htm_aborts_other"), 1);
+        assert!(
+            after.contains_key("fsqlite_flat_combining_batches_total"),
+            "pragma should retain existing flat combining metrics"
+        );
     }
 
     fn txn_advisor_codes(rows: &[Row]) -> HashSet<String> {

@@ -13,6 +13,7 @@
 //!            histogram `bloodstream_propagation_duration_us`,
 //!            gauge `bloodstream_active_bindings`.
 
+use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -122,6 +123,262 @@ impl DeltaBatch {
         }
         counts
     }
+}
+
+// ── Weighted Rows & Differential Operators ──────────────────────────────────
+
+/// A row plus its algebraic weight in the differential stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightedRow {
+    /// Row payload.
+    pub values: Vec<SqliteValue>,
+    /// Algebraic multiplicity (`+1` insert, `-1` delete, higher magnitudes for
+    /// aggregated or coalesced deltas).
+    pub weight: i64,
+}
+
+impl WeightedRow {
+    /// Construct a weighted row.
+    pub fn new(values: Vec<SqliteValue>, weight: i64) -> Self {
+        Self { values, weight }
+    }
+
+    fn project(&self, columns: &[usize]) -> Result<Vec<SqliteValue>, DifferentialPlanError> {
+        columns
+            .iter()
+            .map(|&column| {
+                self.values
+                    .get(column)
+                    .cloned()
+                    .ok_or(DifferentialPlanError::ColumnOutOfBounds {
+                        column,
+                        width: self.values.len(),
+                    })
+            })
+            .collect()
+    }
+}
+
+/// Errors from the weighted-row differential automata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DifferentialPlanError {
+    /// A requested column index exceeded the row width.
+    ColumnOutOfBounds { column: usize, width: usize },
+    /// Join keys must specify the same number of left/right columns.
+    JoinKeyArityMismatch { left: usize, right: usize },
+}
+
+impl fmt::Display for DifferentialPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ColumnOutOfBounds { column, width } => {
+                write!(f, "column {column} out of bounds for row width {width}")
+            }
+            Self::JoinKeyArityMismatch { left, right } => {
+                write!(f, "join key arity mismatch: left={left}, right={right}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DifferentialPlanError {}
+
+/// A simple weighted-row operator sequence representing the initial
+/// differential automata surface for Bloodstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DifferentialAutomaton {
+    operators: Vec<DifferentialOperator>,
+}
+
+impl DifferentialAutomaton {
+    /// Create an automaton from an ordered operator list.
+    pub fn new(operators: Vec<DifferentialOperator>) -> Self {
+        Self { operators }
+    }
+
+    /// Execute the operator sequence over a weighted-row batch.
+    pub fn execute(&self, rows: &[WeightedRow]) -> Result<Vec<WeightedRow>, DifferentialPlanError> {
+        tracing::debug!(
+            target: "fsqlite::differential::automata",
+            event = "execute",
+            operators = self.operators.len(),
+            input_rows = rows.len()
+        );
+
+        let mut current = rows.to_vec();
+        for operator in &self.operators {
+            current = operator.apply(&current)?;
+        }
+
+        tracing::debug!(
+            target: "fsqlite::differential::automata",
+            event = "execute_complete",
+            operators = self.operators.len(),
+            output_rows = current.len()
+        );
+        Ok(current)
+    }
+
+    /// Access the operator list.
+    pub fn operators(&self) -> &[DifferentialOperator] {
+        &self.operators
+    }
+}
+
+/// Initial operator set for the Bloodstream differential automata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DifferentialOperator {
+    /// Keep only rows where `column == value`.
+    FilterEq { column: usize, value: SqliteValue },
+    /// Keep only the requested columns, preserving row weight.
+    Project { columns: Vec<usize> },
+    /// Consolidate algebraic weights by key and elide zero-weight results.
+    ConsolidateByKey { key_columns: Vec<usize> },
+}
+
+impl DifferentialOperator {
+    fn apply(&self, rows: &[WeightedRow]) -> Result<Vec<WeightedRow>, DifferentialPlanError> {
+        match self {
+            Self::FilterEq { column, value } => rows
+                .iter()
+                .filter_map(|row| match row.values.get(*column) {
+                    Some(candidate) if candidate == value => Some(Ok(row.clone())),
+                    Some(_) => None,
+                    None => Some(Err(DifferentialPlanError::ColumnOutOfBounds {
+                        column: *column,
+                        width: row.values.len(),
+                    })),
+                })
+                .collect(),
+            Self::Project { columns } => rows
+                .iter()
+                .map(|row| Ok(WeightedRow::new(row.project(columns)?, row.weight)))
+                .collect(),
+            Self::ConsolidateByKey { key_columns } => {
+                let mut grouped: BTreeMap<Vec<SqliteValue>, i64> = BTreeMap::new();
+                for row in rows {
+                    let key = row.project(key_columns)?;
+                    let weight = grouped.entry(key).or_insert(0);
+                    *weight = weight.saturating_add(row.weight);
+                }
+                Ok(grouped
+                    .into_iter()
+                    .filter_map(|(values, weight)| {
+                        (weight != 0).then(|| WeightedRow::new(values, weight))
+                    })
+                    .collect())
+            }
+        }
+    }
+}
+
+/// Column mapping for delta-aware inner joins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinKeySpec {
+    /// Key columns read from the left relation.
+    pub left_columns: Vec<usize>,
+    /// Key columns read from the right relation.
+    pub right_columns: Vec<usize>,
+}
+
+impl JoinKeySpec {
+    /// Construct a join-key spec.
+    pub fn new(left_columns: Vec<usize>, right_columns: Vec<usize>) -> Self {
+        Self {
+            left_columns,
+            right_columns,
+        }
+    }
+
+    fn validate(&self) -> Result<(), DifferentialPlanError> {
+        if self.left_columns.len() != self.right_columns.len() {
+            return Err(DifferentialPlanError::JoinKeyArityMismatch {
+                left: self.left_columns.len(),
+                right: self.right_columns.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn index_weighted_rows(
+    rows: &[WeightedRow],
+    key_columns: &[usize],
+) -> Result<BTreeMap<Vec<SqliteValue>, Vec<WeightedRow>>, DifferentialPlanError> {
+    let mut index: BTreeMap<Vec<SqliteValue>, Vec<WeightedRow>> = BTreeMap::new();
+    for row in rows {
+        let key = row.project(key_columns)?;
+        index.entry(key).or_default().push(row.clone());
+    }
+    Ok(index)
+}
+
+/// Compute `ΔLeft ⋈ Right`, preserving algebraic weights.
+pub fn delta_join_left(
+    delta_left: &[WeightedRow],
+    stable_right: &[WeightedRow],
+    key_spec: &JoinKeySpec,
+) -> Result<Vec<WeightedRow>, DifferentialPlanError> {
+    key_spec.validate()?;
+    let right_index = index_weighted_rows(stable_right, &key_spec.right_columns)?;
+    let mut joined = Vec::new();
+
+    for left in delta_left {
+        let left_key = left.project(&key_spec.left_columns)?;
+        if let Some(matches) = right_index.get(&left_key) {
+            for right in matches {
+                let mut values = left.values.clone();
+                values.extend(right.values.clone());
+                joined.push(WeightedRow::new(
+                    values,
+                    left.weight.saturating_mul(right.weight),
+                ));
+            }
+        }
+    }
+
+    tracing::debug!(
+        target: "fsqlite::differential::automata",
+        event = "delta_join_left",
+        delta_rows = delta_left.len(),
+        stable_rows = stable_right.len(),
+        output_rows = joined.len()
+    );
+    Ok(joined)
+}
+
+/// Compute `Left ⋈ ΔRight`, preserving algebraic weights.
+pub fn delta_join_right(
+    stable_left: &[WeightedRow],
+    delta_right: &[WeightedRow],
+    key_spec: &JoinKeySpec,
+) -> Result<Vec<WeightedRow>, DifferentialPlanError> {
+    key_spec.validate()?;
+    let left_index = index_weighted_rows(stable_left, &key_spec.left_columns)?;
+    let mut joined = Vec::new();
+
+    for right in delta_right {
+        let right_key = right.project(&key_spec.right_columns)?;
+        if let Some(matches) = left_index.get(&right_key) {
+            for left in matches {
+                let mut values = left.values.clone();
+                values.extend(right.values.clone());
+                joined.push(WeightedRow::new(
+                    values,
+                    left.weight.saturating_mul(right.weight),
+                ));
+            }
+        }
+    }
+
+    tracing::debug!(
+        target: "fsqlite::differential::automata",
+        event = "delta_join_right",
+        stable_rows = stable_left.len(),
+        delta_rows = delta_right.len(),
+        output_rows = joined.len()
+    );
+    Ok(joined)
 }
 
 // ── Materialized View Binding ────────────────────────────────────────────────
@@ -780,6 +1037,247 @@ mod tests {
         assert!(tables.contains("users"));
         assert!(tables.contains("orders"));
         assert_eq!(tables.len(), 2);
+    }
+
+    #[test]
+    fn differential_automaton_filter_project_consolidate_by_key() {
+        let automaton = DifferentialAutomaton::new(vec![
+            DifferentialOperator::FilterEq {
+                column: 0,
+                value: SqliteValue::Text("users".to_owned()),
+            },
+            DifferentialOperator::Project { columns: vec![1] },
+            DifferentialOperator::ConsolidateByKey {
+                key_columns: vec![0],
+            },
+        ]);
+
+        let rows = vec![
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Text("users".to_owned()),
+                    SqliteValue::Integer(10),
+                ],
+                1,
+            ),
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Text("users".to_owned()),
+                    SqliteValue::Integer(10),
+                ],
+                1,
+            ),
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Text("users".to_owned()),
+                    SqliteValue::Integer(11),
+                ],
+                -1,
+            ),
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Text("orders".to_owned()),
+                    SqliteValue::Integer(10),
+                ],
+                1,
+            ),
+        ];
+
+        let output = automaton.execute(&rows).expect("execute automaton");
+        assert_eq!(
+            output,
+            vec![
+                WeightedRow::new(vec![SqliteValue::Integer(10)], 2),
+                WeightedRow::new(vec![SqliteValue::Integer(11)], -1),
+            ]
+        );
+    }
+
+    #[test]
+    fn differential_automaton_rejects_bad_projection_column() {
+        let automaton =
+            DifferentialAutomaton::new(vec![DifferentialOperator::Project { columns: vec![2] }]);
+        let rows = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)];
+
+        assert_eq!(
+            automaton.execute(&rows),
+            Err(DifferentialPlanError::ColumnOutOfBounds {
+                column: 2,
+                width: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn differential_automaton_rejects_bad_filter_column() {
+        let automaton = DifferentialAutomaton::new(vec![DifferentialOperator::FilterEq {
+            column: 1,
+            value: SqliteValue::Integer(1),
+        }]);
+        let rows = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)];
+
+        assert_eq!(
+            automaton.execute(&rows),
+            Err(DifferentialPlanError::ColumnOutOfBounds {
+                column: 1,
+                width: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn differential_automaton_consolidate_by_key_elides_zero_weights() {
+        let automaton = DifferentialAutomaton::new(vec![DifferentialOperator::ConsolidateByKey {
+            key_columns: vec![0],
+        }]);
+        let rows = vec![
+            WeightedRow::new(vec![SqliteValue::Integer(7)], 1),
+            WeightedRow::new(vec![SqliteValue::Integer(7)], -1),
+        ];
+
+        assert_eq!(automaton.execute(&rows).unwrap(), Vec::<WeightedRow>::new());
+    }
+
+    #[test]
+    fn delta_join_left_multiplies_weights_and_concatenates_rows() {
+        let delta_left = vec![
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alice".to_owned()),
+                ],
+                1,
+            ),
+            WeightedRow::new(
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                -1,
+            ),
+        ];
+        let stable_right = vec![
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("admin".to_owned()),
+                ],
+                3,
+            ),
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("user".to_owned()),
+                ],
+                2,
+            ),
+        ];
+        let key_spec = JoinKeySpec::new(vec![0], vec![0]);
+
+        let joined = delta_join_left(&delta_left, &stable_right, &key_spec).unwrap();
+        assert_eq!(
+            joined,
+            vec![
+                WeightedRow::new(
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("alice".to_owned()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("admin".to_owned()),
+                    ],
+                    3,
+                ),
+                WeightedRow::new(
+                    vec![
+                        SqliteValue::Integer(2),
+                        SqliteValue::Text("bob".to_owned()),
+                        SqliteValue::Integer(2),
+                        SqliteValue::Text("user".to_owned()),
+                    ],
+                    -2,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn delta_join_right_uses_delta_weight_from_right_relation() {
+        let stable_left = vec![
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alice".to_owned()),
+                ],
+                2,
+            ),
+            WeightedRow::new(
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                3,
+            ),
+        ];
+        let delta_right = vec![
+            WeightedRow::new(
+                vec![SqliteValue::Integer(2), SqliteValue::Text("pro".to_owned())],
+                1,
+            ),
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("guest".to_owned()),
+                ],
+                -1,
+            ),
+        ];
+        let key_spec = JoinKeySpec::new(vec![0], vec![0]);
+
+        let joined = delta_join_right(&stable_left, &delta_right, &key_spec).unwrap();
+        assert_eq!(
+            joined,
+            vec![
+                WeightedRow::new(
+                    vec![
+                        SqliteValue::Integer(2),
+                        SqliteValue::Text("bob".to_owned()),
+                        SqliteValue::Integer(2),
+                        SqliteValue::Text("pro".to_owned()),
+                    ],
+                    3,
+                ),
+                WeightedRow::new(
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("alice".to_owned()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("guest".to_owned()),
+                    ],
+                    -2,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn delta_join_rejects_mismatched_key_arity() {
+        let delta_left = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)];
+        let stable_right = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)];
+        let key_spec = JoinKeySpec::new(vec![0], vec![0, 1]);
+
+        assert_eq!(
+            delta_join_left(&delta_left, &stable_right, &key_spec),
+            Err(DifferentialPlanError::JoinKeyArityMismatch { left: 1, right: 2 })
+        );
+    }
+
+    #[test]
+    fn delta_join_left_rejects_out_of_bounds_key_column() {
+        let delta_left = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)];
+        let stable_right = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)];
+        let key_spec = JoinKeySpec::new(vec![0], vec![1]);
+
+        assert_eq!(
+            delta_join_left(&delta_left, &stable_right, &key_spec),
+            Err(DifferentialPlanError::ColumnOutOfBounds {
+                column: 1,
+                width: 1,
+            })
+        );
     }
 
     #[test]

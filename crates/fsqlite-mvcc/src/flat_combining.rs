@@ -37,6 +37,11 @@
 //!   - `fsqlite_flat_combining_batch_size_max`
 //!   - `fsqlite_flat_combining_wait_ns_total`
 //!   - `fsqlite_flat_combining_wait_ns_max`
+//!   - `fsqlite_htm_attempts`
+//!   - `fsqlite_htm_aborts_conflict`
+//!   - `fsqlite_htm_aborts_capacity`
+//!   - `fsqlite_htm_aborts_explicit`
+//!   - `fsqlite_htm_aborts_other`
 
 use fsqlite_types::sync_primitives::Instant;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -70,6 +75,36 @@ static FC_BATCH_SIZE_SUM: AtomicU64 = AtomicU64::new(0);
 static FC_BATCH_SIZE_MAX: AtomicU64 = AtomicU64::new(0);
 static FC_WAIT_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FC_WAIT_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static FC_HTM_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static FC_HTM_ABORTS_CONFLICT: AtomicU64 = AtomicU64::new(0);
+static FC_HTM_ABORTS_CAPACITY: AtomicU64 = AtomicU64::new(0);
+static FC_HTM_ABORTS_EXPLICIT: AtomicU64 = AtomicU64::new(0);
+static FC_HTM_ABORTS_OTHER: AtomicU64 = AtomicU64::new(0);
+
+const XABORT_EXPLICIT: u32 = 1 << 0;
+const XABORT_RETRY: u32 = 1 << 1;
+const XABORT_CONFLICT: u32 = 1 << 2;
+const XABORT_CAPACITY: u32 = 1 << 3;
+const XABORT_DEBUG: u32 = 1 << 4;
+const XABORT_NESTED: u32 = 1 << 5;
+const XABORT_CODE_SHIFT: u32 = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HtmAbortReason {
+    Conflict,
+    Capacity,
+    Explicit,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HtmAbortClassification {
+    reason: HtmAbortReason,
+    retryable: bool,
+    explicit_code: Option<u8>,
+    debug: bool,
+    nested: bool,
+}
 
 /// Snapshot of flat combining metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -80,6 +115,11 @@ pub struct FlatCombiningMetrics {
     pub fsqlite_flat_combining_batch_size_max: u64,
     pub fsqlite_flat_combining_wait_ns_total: u64,
     pub fsqlite_flat_combining_wait_ns_max: u64,
+    pub fsqlite_htm_attempts: u64,
+    pub fsqlite_htm_aborts_conflict: u64,
+    pub fsqlite_htm_aborts_capacity: u64,
+    pub fsqlite_htm_aborts_explicit: u64,
+    pub fsqlite_htm_aborts_other: u64,
 }
 
 /// Read current flat combining metrics.
@@ -92,6 +132,11 @@ pub fn flat_combining_metrics() -> FlatCombiningMetrics {
         fsqlite_flat_combining_batch_size_max: FC_BATCH_SIZE_MAX.load(Ordering::Relaxed),
         fsqlite_flat_combining_wait_ns_total: FC_WAIT_NS_TOTAL.load(Ordering::Relaxed),
         fsqlite_flat_combining_wait_ns_max: FC_WAIT_NS_MAX.load(Ordering::Relaxed),
+        fsqlite_htm_attempts: FC_HTM_ATTEMPTS.load(Ordering::Relaxed),
+        fsqlite_htm_aborts_conflict: FC_HTM_ABORTS_CONFLICT.load(Ordering::Relaxed),
+        fsqlite_htm_aborts_capacity: FC_HTM_ABORTS_CAPACITY.load(Ordering::Relaxed),
+        fsqlite_htm_aborts_explicit: FC_HTM_ABORTS_EXPLICIT.load(Ordering::Relaxed),
+        fsqlite_htm_aborts_other: FC_HTM_ABORTS_OTHER.load(Ordering::Relaxed),
     }
 }
 
@@ -103,6 +148,11 @@ pub fn reset_flat_combining_metrics() {
     FC_BATCH_SIZE_MAX.store(0, Ordering::Relaxed);
     FC_WAIT_NS_TOTAL.store(0, Ordering::Relaxed);
     FC_WAIT_NS_MAX.store(0, Ordering::Relaxed);
+    FC_HTM_ATTEMPTS.store(0, Ordering::Relaxed);
+    FC_HTM_ABORTS_CONFLICT.store(0, Ordering::Relaxed);
+    FC_HTM_ABORTS_CAPACITY.store(0, Ordering::Relaxed);
+    FC_HTM_ABORTS_EXPLICIT.store(0, Ordering::Relaxed);
+    FC_HTM_ABORTS_OTHER.store(0, Ordering::Relaxed);
 }
 
 fn update_max(metric: &AtomicU64, val: u64) {
@@ -113,6 +163,66 @@ fn update_max(metric: &AtomicU64, val: u64) {
             Err(actual) => prev = actual,
         }
     }
+}
+
+const fn classify_htm_abort_status(status: u32) -> HtmAbortClassification {
+    let reason = if (status & XABORT_CONFLICT) != 0 {
+        HtmAbortReason::Conflict
+    } else if (status & XABORT_CAPACITY) != 0 {
+        HtmAbortReason::Capacity
+    } else if (status & XABORT_EXPLICIT) != 0 {
+        HtmAbortReason::Explicit
+    } else {
+        HtmAbortReason::Other
+    };
+    let explicit_code = if (status & XABORT_EXPLICIT) != 0 {
+        Some(((status >> XABORT_CODE_SHIFT) & 0xff) as u8)
+    } else {
+        None
+    };
+
+    HtmAbortClassification {
+        reason,
+        retryable: (status & XABORT_RETRY) != 0,
+        explicit_code,
+        debug: (status & XABORT_DEBUG) != 0,
+        nested: (status & XABORT_NESTED) != 0,
+    }
+}
+
+/// Record a single HTM entry attempt before invoking `_xbegin()`.
+fn record_htm_attempt() {
+    FC_HTM_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Classify and record a failed HTM attempt returned by `_xbegin()`.
+fn record_htm_abort_status(status: u32) -> HtmAbortClassification {
+    let classification = classify_htm_abort_status(status);
+    match classification.reason {
+        HtmAbortReason::Conflict => {
+            FC_HTM_ABORTS_CONFLICT.fetch_add(1, Ordering::Relaxed);
+        }
+        HtmAbortReason::Capacity => {
+            FC_HTM_ABORTS_CAPACITY.fetch_add(1, Ordering::Relaxed);
+        }
+        HtmAbortReason::Explicit => {
+            FC_HTM_ABORTS_EXPLICIT.fetch_add(1, Ordering::Relaxed);
+        }
+        HtmAbortReason::Other => {
+            FC_HTM_ABORTS_OTHER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    classification
+}
+
+/// Record a public HTM attempt for future fast-path integrations.
+pub fn note_htm_attempt() {
+    record_htm_attempt();
+}
+
+/// Record a public HTM abort status returned by a failed `_xbegin()`.
+pub fn note_htm_abort(status: u32) {
+    let _ = record_htm_abort_status(status);
 }
 
 // ---------------------------------------------------------------------------
@@ -658,5 +768,53 @@ mod tests {
         let dbg = format!("{fc:?}");
         assert!(dbg.contains("FlatCombiner"));
         assert!(dbg.contains("42"));
+    }
+
+    #[test]
+    fn classify_htm_abort_status_prefers_conflict() {
+        let status =
+            XABORT_CONFLICT | XABORT_CAPACITY | XABORT_RETRY | XABORT_DEBUG | XABORT_NESTED;
+        let classification = classify_htm_abort_status(status);
+        assert_eq!(classification.reason, HtmAbortReason::Conflict);
+        assert!(classification.retryable);
+        assert!(classification.debug);
+        assert!(classification.nested);
+        assert_eq!(classification.explicit_code, None);
+    }
+
+    #[test]
+    fn classify_htm_abort_status_extracts_explicit_code() {
+        let status = XABORT_EXPLICIT | XABORT_RETRY | (0x2a_u32 << XABORT_CODE_SHIFT);
+        let classification = classify_htm_abort_status(status);
+        assert_eq!(classification.reason, HtmAbortReason::Explicit);
+        assert!(classification.retryable);
+        assert_eq!(classification.explicit_code, Some(0x2a));
+    }
+
+    #[test]
+    fn record_htm_abort_status_updates_counters() {
+        reset_flat_combining_metrics();
+
+        record_htm_attempt();
+        record_htm_attempt();
+        record_htm_attempt();
+        record_htm_attempt();
+        let conflict = record_htm_abort_status(XABORT_CONFLICT | XABORT_RETRY);
+        let capacity = record_htm_abort_status(XABORT_CAPACITY);
+        let explicit = record_htm_abort_status(XABORT_EXPLICIT | (0x07_u32 << XABORT_CODE_SHIFT));
+        let other = record_htm_abort_status(0);
+
+        assert_eq!(conflict.reason, HtmAbortReason::Conflict);
+        assert_eq!(capacity.reason, HtmAbortReason::Capacity);
+        assert_eq!(explicit.reason, HtmAbortReason::Explicit);
+        assert_eq!(explicit.explicit_code, Some(0x07));
+        assert_eq!(other.reason, HtmAbortReason::Other);
+
+        let metrics = flat_combining_metrics();
+        assert_eq!(metrics.fsqlite_htm_attempts, 4);
+        assert_eq!(metrics.fsqlite_htm_aborts_conflict, 1);
+        assert_eq!(metrics.fsqlite_htm_aborts_capacity, 1);
+        assert_eq!(metrics.fsqlite_htm_aborts_explicit, 1);
+        assert_eq!(metrics.fsqlite_htm_aborts_other, 1);
     }
 }

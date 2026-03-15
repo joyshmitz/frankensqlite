@@ -3735,10 +3735,15 @@ struct WindowContext {
 }
 
 /// Encode aggregate arguments into a canonical byte key for DISTINCT deduplication,
-/// applying collation when specified. For NOCASE collation, text values are
-/// case-folded (lowercased) so that `'Alice'` and `'alice'` produce the same key.
+/// applying collation when specified.
+///
+/// Built-in text collations normalize into the same key space that the collation
+/// compares over:
+/// - `NOCASE` lowercases ASCII text so `'Alice'` and `'alice'` deduplicate
+/// - `RTRIM` strips trailing ASCII spaces so `'abc'` and `'abc  '` deduplicate
 fn distinct_key_collated(args: &[SqliteValue], collation: Option<&str>) -> DistinctKeyBuf {
     let is_nocase = collation.is_some_and(|c| c.eq_ignore_ascii_case("NOCASE"));
+    let is_rtrim = collation.is_some_and(|c| c.eq_ignore_ascii_case("RTRIM"));
     let mut key = DistinctKeyBuf::new();
     for val in args {
         match val {
@@ -3768,6 +3773,11 @@ fn distinct_key_collated(args: &[SqliteValue], collation: Option<&str>) -> Disti
                     #[allow(clippy::cast_possible_truncation)]
                     key.extend_from_slice(&(folded.len() as u64).to_le_bytes());
                     key.extend_from_slice(folded.as_bytes());
+                } else if is_rtrim {
+                    let trimmed = trim_rtrim_collation_text(s.as_bytes());
+                    #[allow(clippy::cast_possible_truncation)]
+                    key.extend_from_slice(&(trimmed.len() as u64).to_le_bytes());
+                    key.extend_from_slice(trimmed);
                 } else {
                     #[allow(clippy::cast_possible_truncation)]
                     key.extend_from_slice(&(s.len() as u64).to_le_bytes());
@@ -3783,6 +3793,14 @@ fn distinct_key_collated(args: &[SqliteValue], collation: Option<&str>) -> Disti
         }
     }
     key
+}
+
+fn trim_rtrim_collation_text(text: &[u8]) -> &[u8] {
+    let mut end = text.len();
+    while end > 0 && text[end - 1] == b' ' {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 impl VdbeEngine {
@@ -14694,6 +14712,24 @@ mod tests {
             compare_index_prefix_keys(&lhs, &rhs, 0, &[true], &[], &registry),
             Ordering::Less,
             "zero key_columns should still compare the leading term"
+        );
+    }
+
+    #[test]
+    fn test_distinct_key_collated_honors_rtrim() {
+        let base = distinct_key_collated(&[SqliteValue::Text("abc".to_owned())], Some("RTRIM"));
+        let padded =
+            distinct_key_collated(&[SqliteValue::Text("abc  ".to_owned())], Some("rtrim"));
+        let tabbed =
+            distinct_key_collated(&[SqliteValue::Text("abc\t".to_owned())], Some("RTRIM"));
+
+        assert_eq!(
+            base, padded,
+            "RTRIM DISTINCT keys must ignore trailing ASCII spaces"
+        );
+        assert_ne!(
+            base, tabbed,
+            "RTRIM DISTINCT keys must not trim non-space suffixes like tabs"
         );
     }
 
