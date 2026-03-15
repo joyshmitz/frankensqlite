@@ -301,6 +301,100 @@ files: results.jsonl, summary.md, manifest.json, logs/, profiles/
 Retention classes are part of the contract as well: `quick_run`,
 `full_proof`, `failure_bundle`, and `final_scorecard`.
 
+### Placement Profile Execution Contract
+
+The checked-in campaign manifest now carries an exact
+`placement_profiles[].execution_contract` for the three canonical profiles.
+Full suites select a profile by matching
+`matrix_rows[].placement_variants[].placement_profile_id`. Focused reruns and
+topology-bundle capture bind the profile mechanically with:
+
+```text
+RUN_ID
+ARTIFACT_BUNDLE_DIR
+ARTIFACT_BUNDLE_RELPATH
+PLACEMENT_PROFILE_ID
+HARDWARE_CLASS_ID
+MANIFEST_JSON
+SOURCE_REVISION
+BEADS_HASH
+```
+
+Every placement-sensitive run must disclose
+`placement_profile_id`, `hardware_class_id`, `hardware_signature`,
+`cpu_affinity_mask`, `smt_policy_state`, `memory_policy`,
+`helper_lane_cpu_set`, and `numa_balancing_state`. If any run drifts from the
+declared placement contract, treat it as `not_comparable` rather than folding
+it into a clean comparison.
+
+`baseline_unpinned`
+
+- CPU pinning: scheduler default, with no `taskset` or `numactl` overrides.
+- SMT and memory policy: host defaults; record them instead of forcing them.
+- Helper lane: disclose where housekeeping work landed, but do not relocate it.
+- Fixed knobs: `no_taskset_or_numactl_binding`, `report_host_default_smt_policy`, `report_host_default_memory_policy`, `disclose_helper_lane_policy_without_relocation`.
+- Optional knobs: exact scheduler-chosen CPU set and extra profiler capture.
+- Mandatory for: portable baseline claims and host-default regression checks.
+- Avoid for: transferable many-core win claims and cross-node sensitivity claims.
+
+`recommended_pinned`
+
+- CPU pinning: one thread per physical core, all workers kept in one NUMA/LLC locality domain.
+- SMT and memory policy: disable sibling reuse inside the primary worker set and bind memory to the same locality domain.
+- Helper lane: keep housekeeping on a non-worker CPU in the same locality domain.
+- Fixed knobs: `pin_workers_to_one_thread_per_physical_core`, `keep_workers_inside_one_locality_domain`, `bind_memory_to_worker_locality`, `place_helper_lane_on_housekeeping_cpu_in_same_locality`.
+- Optional knobs: exact locality-domain choice, exact worker CPU set, and extra profiler capture.
+- Mandatory for: transferable many-core win claims and final scorecard primary claims.
+- Avoid for: portable baseline claims.
+
+`adversarial_cross_node`
+
+- CPU pinning: split workers across multiple locality domains to expose remote ownership and cache-line movement penalties.
+- SMT and memory policy: avoid sibling reuse inside the primary worker set and use a memory policy that matches the cross-domain split instead of pretending locality.
+- Helper lane: place housekeeping outside the primary worker domains.
+- Fixed knobs: `split_workers_across_locality_domains`, `avoid_smt_sibling_reuse_inside_primary_worker_set`, `match_memory_policy_to_cross_domain_worker_split`, `place_helper_lane_outside_primary_worker_domains`.
+- Optional knobs: exact remote-domain pair, exact cross-domain worker split, and extra profiler capture.
+- Mandatory for: cross-node sensitivity claims and placement regression guard claims.
+- Avoid for: headline speedup claims and portable baseline claims.
+
+### Capture The Hardware Discovery Bundle
+
+`bd-db300.1.6.1` defines a reusable discovery bundle so canonical benchmark runs
+carry explicit hardware identity instead of relying on operator memory. The
+capture entrypoint is:
+
+```bash
+bash scripts/verify_bd_db300_1_6_1_topology_bundle.sh
+```
+
+When you already know the artifact bundle directory and run-identity fields,
+bind the capture mechanically to the benchmark session:
+
+```bash
+RUN_ID=run-20260315T020400Z \
+ARTIFACT_BUNDLE_DIR=artifacts/perf/bd-db300.1.2/example_bundle \
+ARTIFACT_BUNDLE_RELPATH=artifacts/perf/bd-db300.1.2/example_bundle \
+PLACEMENT_PROFILE_ID=recommended_pinned \
+HARDWARE_CLASS_ID=linux_x86_64_many_core_numa \
+MANIFEST_JSON=artifacts/perf/bd-db300.1.2/example_bundle/manifest.json \
+bash scripts/verify_bd_db300_1_6_1_topology_bundle.sh
+```
+
+The script emits:
+
+```text
+hardware_discovery_bundle.json
+hardware_discovery_summary.md
+```
+
+The JSON bundle records CPU model and stepping, microcode or firmware where
+available, socket or NUMA layout, SMT sibling sets, LLC sharing domains,
+boost/EPP/governor state, THP state, relevant scheduler settings, and a stable
+`hardware_signature` hash derived from the captured identity fields. Missing or
+partially inferred fields are listed explicitly so later scorecards, logging
+contracts, and reports do not overstate how complete the machine fingerprint
+really is.
+
 For CPU-heavy canonical runs, offload through `rch` and use the manifest as the
 source of truth for dimensions and naming:
 

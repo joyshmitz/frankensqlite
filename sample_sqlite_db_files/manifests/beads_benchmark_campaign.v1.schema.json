@@ -125,6 +125,188 @@
         "topology_aware"
       ]
     },
+    "placement_cpu_affinity_policy": {
+      "type": "string",
+      "enum": [
+        "scheduler_default",
+        "dedicated_local_one_thread_per_core",
+        "split_across_locality_domains"
+      ]
+    },
+    "placement_smt_policy": {
+      "type": "string",
+      "enum": [
+        "host_default",
+        "one_thread_per_core",
+        "avoid_primary_sibling_reuse"
+      ]
+    },
+    "placement_memory_policy": {
+      "type": "string",
+      "enum": [
+        "host_default",
+        "bind_local",
+        "match_cross_domain_placement"
+      ]
+    },
+    "placement_helper_lane_policy": {
+      "type": "string",
+      "enum": [
+        "disclose_host_default",
+        "same_locality_housekeeping_core",
+        "outside_primary_worker_domains"
+      ]
+    },
+    "placement_suite_selector_kind": {
+      "type": "string",
+      "enum": [
+        "matrix_placement_variant"
+      ]
+    },
+    "placement_focused_rerun_selector_kind": {
+      "type": "string",
+      "enum": [
+        "explicit_bindings"
+      ]
+    },
+    "placement_violation_disposition": {
+      "type": "string",
+      "enum": [
+        "not_comparable"
+      ]
+    },
+    "placement_suite_selection_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selector_kind",
+        "selector_field"
+      ],
+      "properties": {
+        "selector_kind": {
+          "$ref": "#/$defs/placement_suite_selector_kind"
+        },
+        "selector_field": {
+          "$ref": "#/$defs/non_empty_string"
+        }
+      }
+    },
+    "placement_focused_rerun_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selector_kind",
+        "required_bindings"
+      ],
+      "properties": {
+        "selector_kind": {
+          "$ref": "#/$defs/placement_focused_rerun_selector_kind"
+        },
+        "required_bindings": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/non_empty_string"
+          }
+        }
+      }
+    },
+    "placement_claim_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mandatory_for",
+        "optional_for",
+        "avoid_for"
+      ],
+      "properties": {
+        "mandatory_for": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/non_empty_string"
+          }
+        },
+        "optional_for": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/non_empty_string"
+          }
+        },
+        "avoid_for": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/non_empty_string"
+          }
+        }
+      }
+    },
+    "placement_execution_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cpu_affinity_policy",
+        "smt_policy",
+        "memory_policy",
+        "helper_lane_policy",
+        "required_environment_disclosures",
+        "suite_selection",
+        "focused_rerun",
+        "fixed_knobs",
+        "optional_knobs",
+        "claim_contract",
+        "violation_disposition"
+      ],
+      "properties": {
+        "cpu_affinity_policy": {
+          "$ref": "#/$defs/placement_cpu_affinity_policy"
+        },
+        "smt_policy": {
+          "$ref": "#/$defs/placement_smt_policy"
+        },
+        "memory_policy": {
+          "$ref": "#/$defs/placement_memory_policy"
+        },
+        "helper_lane_policy": {
+          "$ref": "#/$defs/placement_helper_lane_policy"
+        },
+        "required_environment_disclosures": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/non_empty_string"
+          }
+        },
+        "suite_selection": {
+          "$ref": "#/$defs/placement_suite_selection_contract"
+        },
+        "focused_rerun": {
+          "$ref": "#/$defs/placement_focused_rerun_contract"
+        },
+        "fixed_knobs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/non_empty_string"
+          }
+        },
+        "optional_knobs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/non_empty_string"
+          }
+        },
+        "claim_contract": {
+          "$ref": "#/$defs/placement_claim_contract"
+        },
+        "violation_disposition": {
+          "$ref": "#/$defs/placement_violation_disposition"
+        }
+      }
+    },
     "retention_class": {
       "type": "string",
       "enum": [
@@ -232,7 +414,8 @@
         "kind",
         "description",
         "command_hint",
-        "availability"
+        "availability",
+        "execution_contract"
       ],
       "properties": {
         "id": {
@@ -249,6 +432,9 @@
         },
         "availability": {
           "$ref": "#/$defs/placement_profile_availability"
+        },
+        "execution_contract": {
+          "$ref": "#/$defs/placement_execution_contract"
         }
       }
     },

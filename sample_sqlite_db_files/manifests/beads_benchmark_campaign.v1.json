@@ -48,21 +48,193 @@
       "kind": "baseline",
       "description": "Scheduler-default placement with no taskset/numactl overrides. This is the honest portable baseline for claims that should survive a generic host.",
       "command_hint": "Run directly without affinity or memory-placement overrides.",
-      "availability": "universal"
+      "availability": "universal",
+      "execution_contract": {
+        "cpu_affinity_policy": "scheduler_default",
+        "smt_policy": "host_default",
+        "memory_policy": "host_default",
+        "helper_lane_policy": "disclose_host_default",
+        "required_environment_disclosures": [
+          "placement_profile_id",
+          "hardware_class_id",
+          "hardware_signature",
+          "cpu_affinity_mask",
+          "smt_policy_state",
+          "memory_policy",
+          "helper_lane_cpu_set",
+          "numa_balancing_state"
+        ],
+        "suite_selection": {
+          "selector_kind": "matrix_placement_variant",
+          "selector_field": "matrix_rows[].placement_variants[].placement_profile_id"
+        },
+        "focused_rerun": {
+          "selector_kind": "explicit_bindings",
+          "required_bindings": [
+            "RUN_ID",
+            "ARTIFACT_BUNDLE_DIR",
+            "ARTIFACT_BUNDLE_RELPATH",
+            "PLACEMENT_PROFILE_ID",
+            "HARDWARE_CLASS_ID",
+            "MANIFEST_JSON",
+            "SOURCE_REVISION",
+            "BEADS_HASH"
+          ]
+        },
+        "fixed_knobs": [
+          "no_taskset_or_numactl_binding",
+          "report_host_default_smt_policy",
+          "report_host_default_memory_policy",
+          "disclose_helper_lane_policy_without_relocation"
+        ],
+        "optional_knobs": [
+          "exact_scheduler_chosen_cpu_set",
+          "extra_profiler_capture"
+        ],
+        "claim_contract": {
+          "mandatory_for": [
+            "portable_baseline_claims",
+            "host_default_regression_checks"
+          ],
+          "optional_for": [
+            "smoke_reruns"
+          ],
+          "avoid_for": [
+            "transferable_many_core_win_claims",
+            "cross_node_sensitivity_claims"
+          ]
+        },
+        "violation_disposition": "not_comparable"
+      }
     },
     {
       "id": "recommended_pinned",
       "kind": "recommended_pinned",
       "description": "Pin workers to dedicated non-SMT cores inside one NUMA node or LLC when topology permits. This is the recommended profile for transferable many-core claims.",
       "command_hint": "Use taskset/numactl to pin workers to sibling-free cores in one locality domain and keep memory local.",
-      "availability": "topology_aware"
+      "availability": "topology_aware",
+      "execution_contract": {
+        "cpu_affinity_policy": "dedicated_local_one_thread_per_core",
+        "smt_policy": "one_thread_per_core",
+        "memory_policy": "bind_local",
+        "helper_lane_policy": "same_locality_housekeeping_core",
+        "required_environment_disclosures": [
+          "placement_profile_id",
+          "hardware_class_id",
+          "hardware_signature",
+          "cpu_affinity_mask",
+          "smt_policy_state",
+          "memory_policy",
+          "helper_lane_cpu_set",
+          "numa_balancing_state"
+        ],
+        "suite_selection": {
+          "selector_kind": "matrix_placement_variant",
+          "selector_field": "matrix_rows[].placement_variants[].placement_profile_id"
+        },
+        "focused_rerun": {
+          "selector_kind": "explicit_bindings",
+          "required_bindings": [
+            "RUN_ID",
+            "ARTIFACT_BUNDLE_DIR",
+            "ARTIFACT_BUNDLE_RELPATH",
+            "PLACEMENT_PROFILE_ID",
+            "HARDWARE_CLASS_ID",
+            "MANIFEST_JSON",
+            "SOURCE_REVISION",
+            "BEADS_HASH"
+          ]
+        },
+        "fixed_knobs": [
+          "pin_workers_to_one_thread_per_physical_core",
+          "keep_workers_inside_one_locality_domain",
+          "bind_memory_to_worker_locality",
+          "place_helper_lane_on_housekeeping_cpu_in_same_locality"
+        ],
+        "optional_knobs": [
+          "exact_locality_domain_choice",
+          "exact_worker_cpu_set",
+          "extra_profiler_capture"
+        ],
+        "claim_contract": {
+          "mandatory_for": [
+            "transferable_many_core_win_claims",
+            "final_scorecard_primary_claims"
+          ],
+          "optional_for": [
+            "topology_aware_smoke_reruns"
+          ],
+          "avoid_for": [
+            "portable_baseline_claims"
+          ]
+        },
+        "violation_disposition": "not_comparable"
+      }
     },
     {
       "id": "adversarial_cross_node",
       "kind": "adversarial_topology",
       "description": "Deliberately spread workers across NUMA nodes or CCD boundaries to surface remote ownership, wake, and cache-line movement penalties.",
       "command_hint": "Use taskset/numactl to place workers across nodes or CCDs instead of one locality domain.",
-      "availability": "topology_aware"
+      "availability": "topology_aware",
+      "execution_contract": {
+        "cpu_affinity_policy": "split_across_locality_domains",
+        "smt_policy": "avoid_primary_sibling_reuse",
+        "memory_policy": "match_cross_domain_placement",
+        "helper_lane_policy": "outside_primary_worker_domains",
+        "required_environment_disclosures": [
+          "placement_profile_id",
+          "hardware_class_id",
+          "hardware_signature",
+          "cpu_affinity_mask",
+          "smt_policy_state",
+          "memory_policy",
+          "helper_lane_cpu_set",
+          "numa_balancing_state"
+        ],
+        "suite_selection": {
+          "selector_kind": "matrix_placement_variant",
+          "selector_field": "matrix_rows[].placement_variants[].placement_profile_id"
+        },
+        "focused_rerun": {
+          "selector_kind": "explicit_bindings",
+          "required_bindings": [
+            "RUN_ID",
+            "ARTIFACT_BUNDLE_DIR",
+            "ARTIFACT_BUNDLE_RELPATH",
+            "PLACEMENT_PROFILE_ID",
+            "HARDWARE_CLASS_ID",
+            "MANIFEST_JSON",
+            "SOURCE_REVISION",
+            "BEADS_HASH"
+          ]
+        },
+        "fixed_knobs": [
+          "split_workers_across_locality_domains",
+          "avoid_smt_sibling_reuse_inside_primary_worker_set",
+          "match_memory_policy_to_cross_domain_worker_split",
+          "place_helper_lane_outside_primary_worker_domains"
+        ],
+        "optional_knobs": [
+          "exact_remote_domain_pair",
+          "exact_cross_domain_worker_split",
+          "extra_profiler_capture"
+        ],
+        "claim_contract": {
+          "mandatory_for": [
+            "cross_node_sensitivity_claims",
+            "placement_regression_guard_claims"
+          ],
+          "optional_for": [
+            "stress_reruns"
+          ],
+          "avoid_for": [
+            "headline_speedup_claims",
+            "portable_baseline_claims"
+          ]
+        },
+        "violation_disposition": "not_comparable"
+      }
     }
   ],
   "hardware_classes": [

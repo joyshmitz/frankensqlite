@@ -83,6 +83,78 @@ pub const REQUIRED_PLACEMENT_PROFILE_IDS: [&str; 3] = [
     PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE,
 ];
 
+const PLACEMENT_CONTRACT_SELECTOR_FIELD: &str =
+    "matrix_rows[].placement_variants[].placement_profile_id";
+const PLACEMENT_CONTRACT_REQUIRED_ENV_DISCLOSURES: [&str; 8] = [
+    "placement_profile_id",
+    "hardware_class_id",
+    "hardware_signature",
+    "cpu_affinity_mask",
+    "smt_policy_state",
+    "memory_policy",
+    "helper_lane_cpu_set",
+    "numa_balancing_state",
+];
+const PLACEMENT_CONTRACT_FOCUSED_RERUN_BINDINGS: [&str; 8] = [
+    "RUN_ID",
+    "ARTIFACT_BUNDLE_DIR",
+    "ARTIFACT_BUNDLE_RELPATH",
+    "PLACEMENT_PROFILE_ID",
+    "HARDWARE_CLASS_ID",
+    "MANIFEST_JSON",
+    "SOURCE_REVISION",
+    "BEADS_HASH",
+];
+const BASELINE_FIXED_KNOBS: [&str; 4] = [
+    "no_taskset_or_numactl_binding",
+    "report_host_default_smt_policy",
+    "report_host_default_memory_policy",
+    "disclose_helper_lane_policy_without_relocation",
+];
+const BASELINE_OPTIONAL_KNOBS: [&str; 2] =
+    ["exact_scheduler_chosen_cpu_set", "extra_profiler_capture"];
+const BASELINE_MANDATORY_FOR: [&str; 2] =
+    ["portable_baseline_claims", "host_default_regression_checks"];
+const BASELINE_OPTIONAL_FOR: [&str; 1] = ["smoke_reruns"];
+const BASELINE_AVOID_FOR: [&str; 2] = [
+    "transferable_many_core_win_claims",
+    "cross_node_sensitivity_claims",
+];
+const RECOMMENDED_FIXED_KNOBS: [&str; 4] = [
+    "pin_workers_to_one_thread_per_physical_core",
+    "keep_workers_inside_one_locality_domain",
+    "bind_memory_to_worker_locality",
+    "place_helper_lane_on_housekeeping_cpu_in_same_locality",
+];
+const RECOMMENDED_OPTIONAL_KNOBS: [&str; 3] = [
+    "exact_locality_domain_choice",
+    "exact_worker_cpu_set",
+    "extra_profiler_capture",
+];
+const RECOMMENDED_MANDATORY_FOR: [&str; 2] = [
+    "transferable_many_core_win_claims",
+    "final_scorecard_primary_claims",
+];
+const RECOMMENDED_OPTIONAL_FOR: [&str; 1] = ["topology_aware_smoke_reruns"];
+const RECOMMENDED_AVOID_FOR: [&str; 1] = ["portable_baseline_claims"];
+const ADVERSARIAL_FIXED_KNOBS: [&str; 4] = [
+    "split_workers_across_locality_domains",
+    "avoid_smt_sibling_reuse_inside_primary_worker_set",
+    "match_memory_policy_to_cross_domain_worker_split",
+    "place_helper_lane_outside_primary_worker_domains",
+];
+const ADVERSARIAL_OPTIONAL_KNOBS: [&str; 3] = [
+    "exact_remote_domain_pair",
+    "exact_cross_domain_worker_split",
+    "extra_profiler_capture",
+];
+const ADVERSARIAL_MANDATORY_FOR: [&str; 2] = [
+    "cross_node_sensitivity_claims",
+    "placement_regression_guard_claims",
+];
+const ADVERSARIAL_OPTIONAL_FOR: [&str; 1] = ["stress_reruns"];
+const ADVERSARIAL_AVOID_FOR: [&str; 2] = ["headline_speedup_claims", "portable_baseline_claims"];
+
 const BUNDLE_DIR_ROW_ID_PLACEHOLDER: &str = "{row_id}";
 const BUNDLE_DIR_WORKLOAD_PLACEHOLDER: &str = "{workload}";
 const BUNDLE_DIR_CONCURRENCY_PLACEHOLDER: &str = "{concurrency}";
@@ -185,6 +257,101 @@ pub enum PlacementAvailability {
     TopologyAware,
 }
 
+/// CPU affinity contract for one placement profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementCpuAffinityPolicy {
+    SchedulerDefault,
+    DedicatedLocalOneThreadPerCore,
+    SplitAcrossLocalityDomains,
+}
+
+/// SMT policy contract for one placement profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementSmtPolicy {
+    HostDefault,
+    OneThreadPerCore,
+    AvoidPrimarySiblingReuse,
+}
+
+/// Memory placement contract for one placement profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementMemoryPolicy {
+    HostDefault,
+    BindLocal,
+    MatchCrossDomainPlacement,
+}
+
+/// Helper-lane placement contract for one placement profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementHelperLanePolicy {
+    DiscloseHostDefault,
+    SameLocalityHousekeepingCore,
+    OutsidePrimaryWorkerDomains,
+}
+
+/// How full benchmark suites select a placement profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementSuiteSelectorKind {
+    MatrixPlacementVariant,
+}
+
+/// How focused reruns bind a placement profile mechanically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementFocusedRerunSelectorKind {
+    ExplicitBindings,
+}
+
+/// What happens when a run drifts from the declared placement contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementViolationDisposition {
+    NotComparable,
+}
+
+/// Stable selector used by full-matrix benchmark suites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementSuiteSelectionContract {
+    pub selector_kind: PlacementSuiteSelectorKind,
+    pub selector_field: String,
+}
+
+/// Stable selector used by focused reruns and bundle capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementFocusedRerunContract {
+    pub selector_kind: PlacementFocusedRerunSelectorKind,
+    pub required_bindings: Vec<String>,
+}
+
+/// When one placement profile is mandatory, optional, or intentionally avoided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementClaimContract {
+    pub mandatory_for: Vec<String>,
+    pub optional_for: Vec<String>,
+    pub avoid_for: Vec<String>,
+}
+
+/// Exact execution contract for one placement profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementExecutionContract {
+    pub cpu_affinity_policy: PlacementCpuAffinityPolicy,
+    pub smt_policy: PlacementSmtPolicy,
+    pub memory_policy: PlacementMemoryPolicy,
+    pub helper_lane_policy: PlacementHelperLanePolicy,
+    pub required_environment_disclosures: Vec<String>,
+    pub suite_selection: PlacementSuiteSelectionContract,
+    pub focused_rerun: PlacementFocusedRerunContract,
+    pub fixed_knobs: Vec<String>,
+    pub optional_knobs: Vec<String>,
+    pub claim_contract: PlacementClaimContract,
+    pub violation_disposition: PlacementViolationDisposition,
+}
+
 /// Placement vocabulary for the canonical matrix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementProfile {
@@ -193,6 +360,7 @@ pub struct PlacementProfile {
     pub description: String,
     pub command_hint: String,
     pub availability: PlacementAvailability,
+    pub execution_contract: PlacementExecutionContract,
 }
 
 /// Operating-system family encoded in a hardware-class identifier.
@@ -383,6 +551,7 @@ pub struct BenchmarkArtifactPlacementPolicy {
     pub availability: PlacementAvailability,
     pub command_hint: String,
     pub required: bool,
+    pub execution_contract: PlacementExecutionContract,
 }
 
 /// Reusable provenance envelope for benchmark artifact bundles.
@@ -677,10 +846,10 @@ pub fn benchmark_manifest_path(
     .join(&campaign.artifact_contract.manifest_name)
 }
 
-fn artifact_retention_policy<'a>(
-    contract: &'a BenchmarkArtifactContract,
+fn artifact_retention_policy(
+    contract: &BenchmarkArtifactContract,
     retention_class: BenchmarkArtifactRetentionClass,
-) -> Result<&'a BenchmarkArtifactRetentionPolicy, String> {
+) -> Result<&BenchmarkArtifactRetentionPolicy, String> {
     contract
         .retention_policies
         .iter()
@@ -850,12 +1019,214 @@ pub fn build_benchmark_artifact_manifest(
                 availability: placement_profile.availability,
                 command_hint: placement_profile.command_hint.clone(),
                 required: variant.required,
+                execution_contract: placement_profile.execution_contract.clone(),
             },
             commands: capture.commands,
             tool_versions: capture.tool_versions,
             fallback_notes: capture.fallback_notes,
         },
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpectedPlacementProfileContract {
+    kind: PlacementProfileKind,
+    availability: PlacementAvailability,
+    cpu_affinity_policy: PlacementCpuAffinityPolicy,
+    smt_policy: PlacementSmtPolicy,
+    memory_policy: PlacementMemoryPolicy,
+    helper_lane_policy: PlacementHelperLanePolicy,
+    fixed_knobs: &'static [&'static str],
+    optional_knobs: &'static [&'static str],
+    mandatory_for: &'static [&'static str],
+    optional_for: &'static [&'static str],
+    avoid_for: &'static [&'static str],
+}
+
+fn expected_placement_profile_contract(
+    profile_id: &str,
+) -> Option<ExpectedPlacementProfileContract> {
+    match profile_id {
+        PLACEMENT_PROFILE_BASELINE_UNPINNED => Some(ExpectedPlacementProfileContract {
+            kind: PlacementProfileKind::Baseline,
+            availability: PlacementAvailability::Universal,
+            cpu_affinity_policy: PlacementCpuAffinityPolicy::SchedulerDefault,
+            smt_policy: PlacementSmtPolicy::HostDefault,
+            memory_policy: PlacementMemoryPolicy::HostDefault,
+            helper_lane_policy: PlacementHelperLanePolicy::DiscloseHostDefault,
+            fixed_knobs: &BASELINE_FIXED_KNOBS,
+            optional_knobs: &BASELINE_OPTIONAL_KNOBS,
+            mandatory_for: &BASELINE_MANDATORY_FOR,
+            optional_for: &BASELINE_OPTIONAL_FOR,
+            avoid_for: &BASELINE_AVOID_FOR,
+        }),
+        PLACEMENT_PROFILE_RECOMMENDED_PINNED => Some(ExpectedPlacementProfileContract {
+            kind: PlacementProfileKind::RecommendedPinned,
+            availability: PlacementAvailability::TopologyAware,
+            cpu_affinity_policy: PlacementCpuAffinityPolicy::DedicatedLocalOneThreadPerCore,
+            smt_policy: PlacementSmtPolicy::OneThreadPerCore,
+            memory_policy: PlacementMemoryPolicy::BindLocal,
+            helper_lane_policy: PlacementHelperLanePolicy::SameLocalityHousekeepingCore,
+            fixed_knobs: &RECOMMENDED_FIXED_KNOBS,
+            optional_knobs: &RECOMMENDED_OPTIONAL_KNOBS,
+            mandatory_for: &RECOMMENDED_MANDATORY_FOR,
+            optional_for: &RECOMMENDED_OPTIONAL_FOR,
+            avoid_for: &RECOMMENDED_AVOID_FOR,
+        }),
+        PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE => Some(ExpectedPlacementProfileContract {
+            kind: PlacementProfileKind::AdversarialTopology,
+            availability: PlacementAvailability::TopologyAware,
+            cpu_affinity_policy: PlacementCpuAffinityPolicy::SplitAcrossLocalityDomains,
+            smt_policy: PlacementSmtPolicy::AvoidPrimarySiblingReuse,
+            memory_policy: PlacementMemoryPolicy::MatchCrossDomainPlacement,
+            helper_lane_policy: PlacementHelperLanePolicy::OutsidePrimaryWorkerDomains,
+            fixed_knobs: &ADVERSARIAL_FIXED_KNOBS,
+            optional_knobs: &ADVERSARIAL_OPTIONAL_KNOBS,
+            mandatory_for: &ADVERSARIAL_MANDATORY_FOR,
+            optional_for: &ADVERSARIAL_OPTIONAL_FOR,
+            avoid_for: &ADVERSARIAL_AVOID_FOR,
+        }),
+        _ => None,
+    }
+}
+
+fn validate_placement_contract_strings(
+    label: &str,
+    actual: &[String],
+    expected: &[&str],
+    errors: &mut Vec<String>,
+) {
+    let expected_vec: Vec<String> = expected.iter().map(|value| (*value).to_owned()).collect();
+    if actual != expected_vec.as_slice() {
+        errors.push(format!(
+            "{label} mismatch: expected {:?}, got {:?}",
+            expected_vec, actual
+        ));
+    }
+}
+
+fn validate_placement_profile_contract(
+    profile: &PlacementProfile,
+    expected: ExpectedPlacementProfileContract,
+    errors: &mut Vec<String>,
+) {
+    if profile.kind != expected.kind {
+        errors.push(format!(
+            "placement profile {} must use kind {:?}",
+            profile.id, expected.kind
+        ));
+    }
+    if profile.availability != expected.availability {
+        errors.push(format!(
+            "placement profile {} must use availability {:?}",
+            profile.id, expected.availability
+        ));
+    }
+
+    let contract = &profile.execution_contract;
+    if contract.cpu_affinity_policy != expected.cpu_affinity_policy {
+        errors.push(format!(
+            "placement profile {} must use cpu_affinity_policy {:?}",
+            profile.id, expected.cpu_affinity_policy
+        ));
+    }
+    if contract.smt_policy != expected.smt_policy {
+        errors.push(format!(
+            "placement profile {} must use smt_policy {:?}",
+            profile.id, expected.smt_policy
+        ));
+    }
+    if contract.memory_policy != expected.memory_policy {
+        errors.push(format!(
+            "placement profile {} must use memory_policy {:?}",
+            profile.id, expected.memory_policy
+        ));
+    }
+    if contract.helper_lane_policy != expected.helper_lane_policy {
+        errors.push(format!(
+            "placement profile {} must use helper_lane_policy {:?}",
+            profile.id, expected.helper_lane_policy
+        ));
+    }
+    validate_placement_contract_strings(
+        &format!(
+            "placement profile {} required_environment_disclosures",
+            profile.id
+        ),
+        &contract.required_environment_disclosures,
+        &PLACEMENT_CONTRACT_REQUIRED_ENV_DISCLOSURES,
+        errors,
+    );
+    if contract.suite_selection.selector_kind != PlacementSuiteSelectorKind::MatrixPlacementVariant
+    {
+        errors.push(format!(
+            "placement profile {} must use matrix_placement_variant suite selection",
+            profile.id
+        ));
+    }
+    if contract.suite_selection.selector_field != PLACEMENT_CONTRACT_SELECTOR_FIELD {
+        errors.push(format!(
+            "placement profile {} must use suite selector field {:?}",
+            profile.id, PLACEMENT_CONTRACT_SELECTOR_FIELD
+        ));
+    }
+    if contract.focused_rerun.selector_kind != PlacementFocusedRerunSelectorKind::ExplicitBindings {
+        errors.push(format!(
+            "placement profile {} must use explicit_bindings focused rerun selection",
+            profile.id
+        ));
+    }
+    validate_placement_contract_strings(
+        &format!(
+            "placement profile {} focused_rerun.required_bindings",
+            profile.id
+        ),
+        &contract.focused_rerun.required_bindings,
+        &PLACEMENT_CONTRACT_FOCUSED_RERUN_BINDINGS,
+        errors,
+    );
+    validate_placement_contract_strings(
+        &format!("placement profile {} fixed_knobs", profile.id),
+        &contract.fixed_knobs,
+        expected.fixed_knobs,
+        errors,
+    );
+    validate_placement_contract_strings(
+        &format!("placement profile {} optional_knobs", profile.id),
+        &contract.optional_knobs,
+        expected.optional_knobs,
+        errors,
+    );
+    validate_placement_contract_strings(
+        &format!(
+            "placement profile {} claim_contract.mandatory_for",
+            profile.id
+        ),
+        &contract.claim_contract.mandatory_for,
+        expected.mandatory_for,
+        errors,
+    );
+    validate_placement_contract_strings(
+        &format!(
+            "placement profile {} claim_contract.optional_for",
+            profile.id
+        ),
+        &contract.claim_contract.optional_for,
+        expected.optional_for,
+        errors,
+    );
+    validate_placement_contract_strings(
+        &format!("placement profile {} claim_contract.avoid_for", profile.id),
+        &contract.claim_contract.avoid_for,
+        expected.avoid_for,
+        errors,
+    );
+    if contract.violation_disposition != PlacementViolationDisposition::NotComparable {
+        errors.push(format!(
+            "placement profile {} must mark drifted runs as not_comparable",
+            profile.id
+        ));
+    }
 }
 
 /// Validate the canonical benchmark campaign manifest for internal consistency.
@@ -933,50 +1304,8 @@ pub fn validate_beads_benchmark_campaign(
     let mut working_copy_paths = BTreeSet::new();
 
     for profile in &campaign.placement_profiles {
-        match profile.id.as_str() {
-            PLACEMENT_PROFILE_BASELINE_UNPINNED => {
-                if profile.kind != PlacementProfileKind::Baseline {
-                    errors.push(format!(
-                        "placement profile {} must use kind baseline",
-                        profile.id
-                    ));
-                }
-                if profile.availability != PlacementAvailability::Universal {
-                    errors.push(format!(
-                        "placement profile {} must use universal availability",
-                        profile.id
-                    ));
-                }
-            }
-            PLACEMENT_PROFILE_RECOMMENDED_PINNED => {
-                if profile.kind != PlacementProfileKind::RecommendedPinned {
-                    errors.push(format!(
-                        "placement profile {} must use kind recommended_pinned",
-                        profile.id
-                    ));
-                }
-                if profile.availability != PlacementAvailability::TopologyAware {
-                    errors.push(format!(
-                        "placement profile {} must use topology_aware availability",
-                        profile.id
-                    ));
-                }
-            }
-            PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE => {
-                if profile.kind != PlacementProfileKind::AdversarialTopology {
-                    errors.push(format!(
-                        "placement profile {} must use kind adversarial_topology",
-                        profile.id
-                    ));
-                }
-                if profile.availability != PlacementAvailability::TopologyAware {
-                    errors.push(format!(
-                        "placement profile {} must use topology_aware availability",
-                        profile.id
-                    ));
-                }
-            }
-            _ => {}
+        if let Some(expected) = expected_placement_profile_contract(profile.id.as_str()) {
+            validate_placement_profile_contract(profile, expected, &mut errors);
         }
     }
     for required_profile_id in REQUIRED_PLACEMENT_PROFILE_IDS {
@@ -2019,6 +2348,51 @@ mod tests {
                     description: "scheduler default".to_owned(),
                     command_hint: "run directly".to_owned(),
                     availability: PlacementAvailability::Universal,
+                    execution_contract: PlacementExecutionContract {
+                        cpu_affinity_policy: PlacementCpuAffinityPolicy::SchedulerDefault,
+                        smt_policy: PlacementSmtPolicy::HostDefault,
+                        memory_policy: PlacementMemoryPolicy::HostDefault,
+                        helper_lane_policy: PlacementHelperLanePolicy::DiscloseHostDefault,
+                        required_environment_disclosures:
+                            PLACEMENT_CONTRACT_REQUIRED_ENV_DISCLOSURES
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                        suite_selection: PlacementSuiteSelectionContract {
+                            selector_kind: PlacementSuiteSelectorKind::MatrixPlacementVariant,
+                            selector_field: PLACEMENT_CONTRACT_SELECTOR_FIELD.to_owned(),
+                        },
+                        focused_rerun: PlacementFocusedRerunContract {
+                            selector_kind: PlacementFocusedRerunSelectorKind::ExplicitBindings,
+                            required_bindings: PLACEMENT_CONTRACT_FOCUSED_RERUN_BINDINGS
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                        },
+                        fixed_knobs: BASELINE_FIXED_KNOBS
+                            .iter()
+                            .map(|value| (*value).to_owned())
+                            .collect(),
+                        optional_knobs: BASELINE_OPTIONAL_KNOBS
+                            .iter()
+                            .map(|value| (*value).to_owned())
+                            .collect(),
+                        claim_contract: PlacementClaimContract {
+                            mandatory_for: BASELINE_MANDATORY_FOR
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                            optional_for: BASELINE_OPTIONAL_FOR
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                            avoid_for: BASELINE_AVOID_FOR
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                        },
+                        violation_disposition: PlacementViolationDisposition::NotComparable,
+                    },
                 },
                 PlacementProfile {
                     id: PLACEMENT_PROFILE_RECOMMENDED_PINNED.to_owned(),
@@ -2026,6 +2400,53 @@ mod tests {
                     description: "pin to sibling-free cores".to_owned(),
                     command_hint: "taskset pin".to_owned(),
                     availability: PlacementAvailability::TopologyAware,
+                    execution_contract: PlacementExecutionContract {
+                        cpu_affinity_policy:
+                            PlacementCpuAffinityPolicy::DedicatedLocalOneThreadPerCore,
+                        smt_policy: PlacementSmtPolicy::OneThreadPerCore,
+                        memory_policy: PlacementMemoryPolicy::BindLocal,
+                        helper_lane_policy:
+                            PlacementHelperLanePolicy::SameLocalityHousekeepingCore,
+                        required_environment_disclosures:
+                            PLACEMENT_CONTRACT_REQUIRED_ENV_DISCLOSURES
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                        suite_selection: PlacementSuiteSelectionContract {
+                            selector_kind: PlacementSuiteSelectorKind::MatrixPlacementVariant,
+                            selector_field: PLACEMENT_CONTRACT_SELECTOR_FIELD.to_owned(),
+                        },
+                        focused_rerun: PlacementFocusedRerunContract {
+                            selector_kind: PlacementFocusedRerunSelectorKind::ExplicitBindings,
+                            required_bindings: PLACEMENT_CONTRACT_FOCUSED_RERUN_BINDINGS
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                        },
+                        fixed_knobs: RECOMMENDED_FIXED_KNOBS
+                            .iter()
+                            .map(|value| (*value).to_owned())
+                            .collect(),
+                        optional_knobs: RECOMMENDED_OPTIONAL_KNOBS
+                            .iter()
+                            .map(|value| (*value).to_owned())
+                            .collect(),
+                        claim_contract: PlacementClaimContract {
+                            mandatory_for: RECOMMENDED_MANDATORY_FOR
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                            optional_for: RECOMMENDED_OPTIONAL_FOR
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                            avoid_for: RECOMMENDED_AVOID_FOR
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                        },
+                        violation_disposition: PlacementViolationDisposition::NotComparable,
+                    },
                 },
                 PlacementProfile {
                     id: PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE.to_owned(),
@@ -2033,6 +2454,53 @@ mod tests {
                     description: "spread across nodes".to_owned(),
                     command_hint: "numactl --cpunodebind".to_owned(),
                     availability: PlacementAvailability::TopologyAware,
+                    execution_contract: PlacementExecutionContract {
+                        cpu_affinity_policy:
+                            PlacementCpuAffinityPolicy::SplitAcrossLocalityDomains,
+                        smt_policy: PlacementSmtPolicy::AvoidPrimarySiblingReuse,
+                        memory_policy: PlacementMemoryPolicy::MatchCrossDomainPlacement,
+                        helper_lane_policy:
+                            PlacementHelperLanePolicy::OutsidePrimaryWorkerDomains,
+                        required_environment_disclosures:
+                            PLACEMENT_CONTRACT_REQUIRED_ENV_DISCLOSURES
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                        suite_selection: PlacementSuiteSelectionContract {
+                            selector_kind: PlacementSuiteSelectorKind::MatrixPlacementVariant,
+                            selector_field: PLACEMENT_CONTRACT_SELECTOR_FIELD.to_owned(),
+                        },
+                        focused_rerun: PlacementFocusedRerunContract {
+                            selector_kind: PlacementFocusedRerunSelectorKind::ExplicitBindings,
+                            required_bindings: PLACEMENT_CONTRACT_FOCUSED_RERUN_BINDINGS
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                        },
+                        fixed_knobs: ADVERSARIAL_FIXED_KNOBS
+                            .iter()
+                            .map(|value| (*value).to_owned())
+                            .collect(),
+                        optional_knobs: ADVERSARIAL_OPTIONAL_KNOBS
+                            .iter()
+                            .map(|value| (*value).to_owned())
+                            .collect(),
+                        claim_contract: PlacementClaimContract {
+                            mandatory_for: ADVERSARIAL_MANDATORY_FOR
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                            optional_for: ADVERSARIAL_OPTIONAL_FOR
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                            avoid_for: ADVERSARIAL_AVOID_FOR
+                                .iter()
+                                .map(|value| (*value).to_owned())
+                                .collect(),
+                        },
+                        violation_disposition: PlacementViolationDisposition::NotComparable,
+                    },
                 },
             ],
             hardware_classes: vec![
@@ -2619,6 +3087,16 @@ mod tests {
             PLACEMENT_PROFILE_BASELINE_UNPINNED
         );
         assert_eq!(
+            manifest.provenance.placement_policy.execution_contract,
+            campaign
+                .placement_profiles
+                .iter()
+                .find(|profile| profile.id == PLACEMENT_PROFILE_BASELINE_UNPINNED)
+                .expect("baseline profile should exist")
+                .execution_contract
+                .clone()
+        );
+        assert_eq!(
             manifest.provenance.command_entrypoint,
             "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile"
         );
@@ -2724,6 +3202,88 @@ mod tests {
         assert_eq!(
             many_core.id_fields.topology_class,
             HardwareTopologyClass::ManyCoreNuma
+        );
+    }
+
+    #[test]
+    fn test_beads_benchmark_campaign_placement_execution_contract_is_explicit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let campaign = sample_campaign(tempdir.path());
+
+        let baseline = campaign
+            .placement_profiles
+            .iter()
+            .find(|profile| profile.id == PLACEMENT_PROFILE_BASELINE_UNPINNED)
+            .unwrap();
+        assert_eq!(
+            baseline.execution_contract.cpu_affinity_policy,
+            PlacementCpuAffinityPolicy::SchedulerDefault
+        );
+        assert_eq!(
+            baseline.execution_contract.suite_selection.selector_field,
+            PLACEMENT_CONTRACT_SELECTOR_FIELD
+        );
+        assert_eq!(
+            baseline.execution_contract.required_environment_disclosures,
+            PLACEMENT_CONTRACT_REQUIRED_ENV_DISCLOSURES
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            baseline.execution_contract.claim_contract.avoid_for,
+            BASELINE_AVOID_FOR
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        );
+
+        let recommended = campaign
+            .placement_profiles
+            .iter()
+            .find(|profile| profile.id == PLACEMENT_PROFILE_RECOMMENDED_PINNED)
+            .unwrap();
+        assert_eq!(
+            recommended.execution_contract.smt_policy,
+            PlacementSmtPolicy::OneThreadPerCore
+        );
+        assert_eq!(
+            recommended.execution_contract.fixed_knobs,
+            RECOMMENDED_FIXED_KNOBS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            recommended.execution_contract.claim_contract.mandatory_for,
+            RECOMMENDED_MANDATORY_FOR
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        );
+
+        let adversarial = campaign
+            .placement_profiles
+            .iter()
+            .find(|profile| profile.id == PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE)
+            .unwrap();
+        assert_eq!(
+            adversarial.execution_contract.memory_policy,
+            PlacementMemoryPolicy::MatchCrossDomainPlacement
+        );
+        assert_eq!(
+            adversarial
+                .execution_contract
+                .focused_rerun
+                .required_bindings,
+            PLACEMENT_CONTRACT_FOCUSED_RERUN_BINDINGS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            adversarial.execution_contract.violation_disposition,
+            PlacementViolationDisposition::NotComparable
         );
     }
 
