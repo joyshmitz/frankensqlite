@@ -26,7 +26,7 @@ pub const LEAPFROG_EXIT_CRITERIA_PATH: &str = "leapfrog_exit_criteria.toml";
 const CANONICAL_CAMPAIGN_MANIFEST_PATH: &str =
     "sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json";
 
-const REQUIRED_LOG_FIELDS: [&str; 8] = [
+const REQUIRED_LOG_FIELDS: [&str; 9] = [
     "throughput_ratio_vs_sqlite",
     "retry_rate",
     "wait_fraction_of_wall_time",
@@ -635,7 +635,7 @@ impl LeapfrogExitCriteria {
         let mut seen_workloads = BTreeSet::new();
         for family in &self.workload_families {
             require_non_empty("workload_families.workload", &family.workload)?;
-            if !seen_workloads.insert(family.workload.as_str()) {
+            if !seen_workloads.insert(family.workload.clone()) {
                 return Err(format!(
                     "duplicate workload family threshold profile `{}`",
                     family.workload
@@ -681,7 +681,10 @@ impl LeapfrogExitCriteria {
                     family.workload
                 ));
             }
-            for metric_id in frontier_metrics.iter().chain(must_not_regress_metrics.iter()) {
+            for metric_id in frontier_metrics
+                .iter()
+                .chain(must_not_regress_metrics.iter())
+            {
                 if !metric_ids.contains(metric_id) {
                     return Err(format!(
                         "workload family `{}` references undefined metric `{metric_id}`",
