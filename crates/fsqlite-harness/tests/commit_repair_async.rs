@@ -3,10 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use asupersync::runtime::RuntimeBuilder;
 use fsqlite_core::commit_repair::{
     CommitReceipt, CommitRepairConfig, CommitRepairCoordinator, CommitRepairEvent,
     CommitRepairEventKind, DeterministicRepairGenerator, InMemoryCommitRepairIo, RepairState,
 };
+use fsqlite_types::cx::Cx;
 
 struct CommitRepairHarness {
     coordinator: CommitRepairCoordinator<InMemoryCommitRepairIo, DeterministicRepairGenerator>,
@@ -16,10 +18,17 @@ struct CommitRepairHarness {
 
 impl CommitRepairHarness {
     fn new(repair_enabled: bool, repair_delay: Duration) -> Self {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(4, 32)
+            .build()
+            .expect("commit repair test runtime");
+        let root_cx = Cx::new();
         let io = Arc::new(InMemoryCommitRepairIo::default());
         let generator = Arc::new(DeterministicRepairGenerator::new(repair_delay, 512));
         let coordinator = CommitRepairCoordinator::with_shared(
             CommitRepairConfig { repair_enabled },
+            runtime.clone(),
+            &root_cx,
             Arc::clone(&io),
             Arc::clone(&generator),
         );
@@ -44,6 +53,10 @@ impl CommitRepairHarness {
         self.coordinator
             .wait_for_background_repair()
             .expect("background repair should join");
+    }
+
+    fn pending_background_repair_count(&self) -> usize {
+        self.coordinator.pending_background_repair_count()
     }
 
     fn repair_state_for(&self, commit_seq: u64) -> RepairState {
@@ -201,6 +214,7 @@ fn test_durable_but_not_repairable_state() {
 fn test_background_repair_completes() {
     let engine = CommitRepairHarness::new(true, Duration::from_millis(10));
     let receipt = engine.commit(&[0x33; 1024]);
+    assert_eq!(engine.pending_background_repair_count(), 1);
     engine.wait_for_background_repair();
 
     assert_eq!(
@@ -216,6 +230,7 @@ fn test_background_repair_completes() {
         engine.repair_sync_count() > 0,
         "repair symbols should be fsync'd by background task"
     );
+    assert_eq!(engine.pending_background_repair_count(), 0);
 }
 
 #[test]

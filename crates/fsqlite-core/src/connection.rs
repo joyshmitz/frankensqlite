@@ -11,6 +11,7 @@ use lru::LruCache;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -113,7 +114,7 @@ use fsqlite_observability::{
 };
 use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
 
-use crate::region::{RegionKind, RegionTree};
+use crate::region::{RegionKind, RegionTree, TaskHandle};
 use crate::wal_adapter::WalBackendAdapter;
 
 const EPROCESS_DEFAULT_CONFIG: EProcessConfig = EProcessConfig {
@@ -25112,6 +25113,7 @@ struct SharedRuntimeState {
     key: SharedMvccKey,
     regions: RegionTree,
     db_root_region: Region,
+    write_coordinator_region: Region,
     open_connections: usize,
     poisoned: Option<String>,
 }
@@ -25148,6 +25150,16 @@ impl SharedMvccState {
             .create_child()
             .with_trace_context(next_trace_id(), 0, 0);
         let db_root_region = regions.create_root(RegionKind::DbRoot, db_root_cx)?;
+        let write_coordinator_cx = regions
+            .cx(db_root_region)
+            .ok_or_else(|| FrankenError::internal("database root region missing Cx"))?
+            .create_child()
+            .with_trace_context(next_trace_id(), 0, 0);
+        let write_coordinator_region = regions.create_child(
+            db_root_region,
+            RegionKind::WriteCoordinator,
+            write_coordinator_cx,
+        )?;
 
         tracing::info!(
             target: "fsqlite::runtime",
@@ -25155,6 +25167,13 @@ impl SharedMvccState {
             db_path = %key.path_key,
             region_id = db_root_region.get(),
             region_kind = "db_root"
+        );
+        tracing::info!(
+            target: "fsqlite::runtime",
+            event = "region_created",
+            db_path = %key.path_key,
+            region_id = write_coordinator_region.get(),
+            region_kind = "write_coordinator"
         );
 
         Ok(Self {
@@ -25167,6 +25186,7 @@ impl SharedMvccState {
                 key,
                 regions,
                 db_root_region,
+                write_coordinator_region,
                 open_connections: 0,
                 poisoned: None,
             }),
@@ -25211,6 +25231,66 @@ impl SharedMvccState {
         );
 
         Ok((connection_region, connection_cx))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn register_write_coordinator_task(&self) -> Result<(TaskHandle, Cx)> {
+        let state = lock_unpoisoned(&self.runtime_state);
+        if let Some(details) = &state.poisoned {
+            return Err(FrankenError::BackgroundWorkerFailed(details.clone()));
+        }
+
+        let region = state.write_coordinator_region;
+        let task = state.regions.register_task(region)?;
+        let cx = state
+            .regions
+            .cx(region)
+            .ok_or_else(|| FrankenError::internal("write coordinator region missing Cx"))?
+            .create_child();
+        Ok((task, cx))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn spawn_write_coordinator_task<F, Fut>(&self, task: F) -> Result<()>
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
+        {
+            let _ = task;
+            return Err(FrankenError::internal(
+                "write coordinator tasks require native asupersync runtime support",
+            ));
+        }
+
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        {
+            let runtime_handle =
+                asupersync::runtime::Runtime::current_handle().ok_or_else(|| {
+                    FrankenError::internal(
+                        "write coordinator tasks require an active asupersync runtime",
+                    )
+                })?;
+            let (region_task, task_cx) = self.register_write_coordinator_task()?;
+            runtime_handle
+                .try_spawn(async move {
+                    let _region_task = region_task;
+                    if let Some(native_task_cx) = asupersync::Cx::current() {
+                        task_cx.set_native_cx(native_task_cx);
+                    }
+                    if task_cx.checkpoint().is_err() {
+                        return;
+                    }
+                    task(task_cx).await;
+                })
+                .map_err(|err| {
+                    FrankenError::internal(format!(
+                        "failed to spawn write coordinator task on active asupersync runtime: {err}"
+                    ))
+                })?;
+            Ok(())
+        }
     }
 
     fn release_connection(&self, connection_region: Region, best_effort: bool) -> Result<()> {
@@ -33847,6 +33927,7 @@ mod tests {
         join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
         statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
     };
+    use crate::region::RegionKind;
     use fsqlite_ast::Statement;
     use fsqlite_btree::BtreeCursorOps;
     use fsqlite_error::{FrankenError, Result};
@@ -34177,6 +34258,133 @@ mod tests {
         let state = lock_unpoisoned(&conn2._shared_mvcc_state.runtime_state);
         assert_eq!(state.open_connections, 1);
         assert_eq!(state.db_root_region, root_region);
+    }
+
+    #[test]
+    fn test_shared_runtime_creates_write_coordinator_region() {
+        let conn = Connection::open(":memory:").unwrap();
+        let state = lock_unpoisoned(&conn._shared_mvcc_state.runtime_state);
+
+        assert_eq!(
+            state.regions.kind(state.write_coordinator_region),
+            Some(RegionKind::WriteCoordinator)
+        );
+        assert_eq!(
+            state.regions.parent(state.write_coordinator_region),
+            Some(Some(state.db_root_region))
+        );
+    }
+
+    #[test]
+    fn test_register_write_coordinator_task_uses_service_region() {
+        let conn = Connection::open(":memory:").unwrap();
+        let region = {
+            let state = lock_unpoisoned(&conn._shared_mvcc_state.runtime_state);
+            state.write_coordinator_region
+        };
+
+        let (task, cx) = conn
+            ._shared_mvcc_state
+            .register_write_coordinator_task()
+            .unwrap();
+        assert_eq!(task.region(), region);
+        assert!(cx.checkpoint().is_ok());
+
+        {
+            let state = lock_unpoisoned(&conn._shared_mvcc_state.runtime_state);
+            assert_eq!(state.regions.active_tasks(region), 1);
+        }
+
+        drop(task);
+
+        let state = lock_unpoisoned(&conn._shared_mvcc_state.runtime_state);
+        assert_eq!(state.regions.active_tasks(region), 0);
+    }
+
+    #[test]
+    fn test_register_write_coordinator_task_returns_isolated_child_contexts() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let (_task_a, cx_a) = conn
+            ._shared_mvcc_state
+            .register_write_coordinator_task()
+            .unwrap();
+        let (_task_b, cx_b) = conn
+            ._shared_mvcc_state
+            .register_write_coordinator_task()
+            .unwrap();
+
+        cx_a.cancel();
+
+        assert!(
+            cx_a.checkpoint().is_err(),
+            "cancelled task Cx should reject new work"
+        );
+        assert!(
+            cx_b.checkpoint().is_ok(),
+            "write coordinator tasks must receive independent child Cx values"
+        );
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_spawn_write_coordinator_task_drains_on_last_connection_close() {
+        use asupersync::runtime::RuntimeBuilder;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc::channel;
+
+        let runtime = RuntimeBuilder::new()
+            .worker_threads(1)
+            .build()
+            .expect("runtime build");
+        let runtime_context = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let started = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = channel();
+        let (finished_tx, finished_rx) = channel();
+
+        let conn = runtime.block_on(async {
+            let conn = Connection::open_with_env(
+                ":memory:",
+                ConnectionEnv::new(Arc::clone(&runtime_context)),
+            )
+            .expect("connection should open");
+
+            conn._shared_mvcc_state
+                .spawn_write_coordinator_task({
+                    let started = Arc::clone(&started);
+                    let cancelled = Arc::clone(&cancelled);
+                    let finished = Arc::clone(&finished);
+                    move |task_cx| async move {
+                        started.store(true, Ordering::SeqCst);
+                        started_tx.send(()).expect("start signal should send");
+                        while task_cx.checkpoint().is_ok() {
+                            std::hint::spin_loop();
+                        }
+                        cancelled.store(task_cx.is_cancel_requested(), Ordering::SeqCst);
+                        finished.store(true, Ordering::SeqCst);
+                        finished_tx.send(()).expect("finish signal should send");
+                    }
+                })
+                .expect("write coordinator task should spawn");
+
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("task should start before shutdown");
+            conn
+        });
+
+        drop(conn);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("task should finish during connection shutdown");
+        assert!(started.load(Ordering::SeqCst));
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(finished.load(Ordering::SeqCst));
     }
 
     #[test]

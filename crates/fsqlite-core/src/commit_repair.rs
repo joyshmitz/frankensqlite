@@ -4,12 +4,16 @@
 //! generated/append-synced asynchronously after commit acknowledgment.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
+use asupersync::cx::Cx as NativeCx;
+use asupersync::runtime::{JoinHandle as AsyncJoinHandle, Runtime, spawn_blocking};
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::cx::Cx;
 use tracing::{debug, error, info, warn};
 
 const BEAD_ID: &str = "bd-22n.11";
@@ -462,6 +466,8 @@ pub struct CommitRepairEvent {
     pub commit_seq: u64,
     /// Monotonic per-commit event sequence number (logical time, no ambient authority).
     pub seq: u64,
+    /// Monotonic wall-clock capture for latency/window measurements.
+    pub recorded_at: Instant,
     pub kind: CommitRepairEventKind,
 }
 
@@ -655,13 +661,15 @@ pub struct CommitRepairCoordinator<
     GEN: RepairSymbolGenerator + Send + Sync + 'static,
 > {
     config: CommitRepairConfig,
+    runtime: Runtime,
+    coordinator_cx: Cx,
     io: Arc<IO>,
     generator: Arc<GEN>,
     next_commit_seq: AtomicU64,
     next_async_task_id: AtomicU64,
     repair_states: Arc<Mutex<HashMap<u64, RepairState>>>,
     events: Arc<Mutex<Vec<CommitRepairEvent>>>,
-    handles: Mutex<Vec<JoinHandle<()>>>,
+    handles: Mutex<Vec<AsyncJoinHandle<()>>>,
 }
 
 impl<IO, GEN> CommitRepairCoordinator<IO, GEN>
@@ -670,14 +678,34 @@ where
     GEN: RepairSymbolGenerator + Send + Sync + 'static,
 {
     #[must_use]
-    pub fn new(config: CommitRepairConfig, io: IO, generator: GEN) -> Self {
-        Self::with_shared(config, Arc::new(io), Arc::new(generator))
+    pub fn new(
+        config: CommitRepairConfig,
+        runtime: Runtime,
+        parent_cx: &Cx,
+        io: IO,
+        generator: GEN,
+    ) -> Self {
+        Self::with_shared(
+            config,
+            runtime,
+            parent_cx,
+            Arc::new(io),
+            Arc::new(generator),
+        )
     }
 
     #[must_use]
-    pub fn with_shared(config: CommitRepairConfig, io: Arc<IO>, generator: Arc<GEN>) -> Self {
+    pub fn with_shared(
+        config: CommitRepairConfig,
+        runtime: Runtime,
+        parent_cx: &Cx,
+        io: Arc<IO>,
+        generator: Arc<GEN>,
+    ) -> Self {
         Self {
             config,
+            runtime,
+            coordinator_cx: parent_cx.create_child(),
             io,
             generator,
             next_commit_seq: AtomicU64::new(1),
@@ -690,6 +718,7 @@ where
 
     /// Execute critical-path durability and schedule async repair work.
     pub fn commit(&self, systematic_symbols: &[u8]) -> Result<CommitReceipt> {
+        let started_at = Instant::now();
         let commit_seq = self.next_commit_seq.fetch_add(1, Ordering::Relaxed);
 
         self.io
@@ -703,7 +732,7 @@ where
                 commit_seq,
                 durable: true,
                 repair_pending: false,
-                latency: Duration::ZERO,
+                latency: started_at.elapsed(),
             });
         }
 
@@ -722,87 +751,76 @@ where
         let repair_states = Arc::clone(&self.repair_states);
         let events = Arc::clone(&self.events);
         let systematic_snapshot = systematic_symbols.to_vec();
-        let handle = thread::spawn(move || {
-            info!(
-                bead_id = BEAD_ID,
-                commit_seq, async_task_id, "repair symbols generation started"
-            );
-            record_event_into(&events, commit_seq, CommitRepairEventKind::RepairStarted);
-
-            let repair_outcome =
-                generator.generate_repair_symbols(commit_seq, &systematic_snapshot);
-            match repair_outcome {
-                Ok(repair_symbols) => {
-                    let append_sync = io
-                        .append_repair_symbols(commit_seq, &repair_symbols)
-                        .and_then(|()| io.sync_repair_symbols(commit_seq));
-                    match append_sync {
-                        Ok(()) => {
-                            set_repair_state(&repair_states, commit_seq, RepairState::Completed);
-                            record_event_into(
-                                &events,
-                                commit_seq,
-                                CommitRepairEventKind::RepairCompleted,
-                            );
-                            info!(
-                                bead_id = BEAD_ID,
-                                commit_seq,
-                                async_task_id,
-                                repair_symbol_bytes = repair_symbols.len(),
-                                "repair symbols append+sync completed"
-                            );
-                        }
-                        Err(err) => {
-                            set_repair_state(&repair_states, commit_seq, RepairState::Failed);
-                            record_event_into(
-                                &events,
-                                commit_seq,
-                                CommitRepairEventKind::RepairFailed,
-                            );
-                            error!(
-                                bead_id = BEAD_ID,
-                                commit_seq,
-                                async_task_id,
-                                error = %err,
-                                "repair symbol append/sync failed"
-                            );
-                        }
-                    }
-                }
-                Err(err) => {
-                    set_repair_state(&repair_states, commit_seq, RepairState::Failed);
-                    record_event_into(&events, commit_seq, CommitRepairEventKind::RepairFailed);
-                    error!(
-                        bead_id = BEAD_ID,
-                        commit_seq,
-                        async_task_id,
-                        error = %err,
-                        "repair symbol generation failed"
-                    );
-                }
+        let worker_cx = self.coordinator_cx.create_child();
+        let handle = self.runtime.handle().try_spawn(run_repair_task(RepairTask {
+            commit_seq,
+            async_task_id,
+            io,
+            generator,
+            repair_states,
+            events,
+            systematic_snapshot,
+            worker_cx,
+        }));
+        match handle {
+            Ok(handle) => {
+                lock_with_recovery(&self.handles, "repair_handles").push(handle);
             }
-        });
-        lock_with_recovery(&self.handles, "repair_handles").push(handle);
+            Err(err) => {
+                set_repair_state(&self.repair_states, commit_seq, RepairState::Failed);
+                self.record(commit_seq, CommitRepairEventKind::RepairFailed);
+                error!(
+                    bead_id = BEAD_ID,
+                    commit_seq,
+                    async_task_id,
+                    error = ?err,
+                    "failed to schedule repair task on caller-owned runtime"
+                );
+                return Ok(CommitReceipt {
+                    commit_seq,
+                    durable: true,
+                    repair_pending: false,
+                    latency: started_at.elapsed(),
+                });
+            }
+        }
 
         Ok(CommitReceipt {
             commit_seq,
             durable: true,
             repair_pending: true,
-            latency: Duration::ZERO,
+            latency: started_at.elapsed(),
         })
     }
 
     /// Join all currently scheduled background repair workers.
     pub fn wait_for_background_repair(&self) -> Result<()> {
-        let mut handles = lock_with_recovery(&self.handles, "repair_handles");
-        while let Some(handle) = handles.pop() {
-            if handle.join().is_err() {
-                return Err(FrankenError::Internal(
-                    "background repair worker panicked".to_owned(),
-                ));
+        let handles = {
+            let mut guard = lock_with_recovery(&self.handles, "repair_handles");
+            std::mem::take(&mut *guard)
+        };
+        let mut observed_panic = false;
+        for handle in handles {
+            let joined =
+                std::panic::catch_unwind(AssertUnwindSafe(|| self.runtime.block_on(handle)));
+            if joined.is_err() {
+                observed_panic = true;
             }
         }
+        if observed_panic {
+            return Err(FrankenError::Internal(
+                "background repair worker panicked".to_owned(),
+            ));
+        }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn pending_background_repair_count(&self) -> usize {
+        lock_with_recovery(&self.repair_states, "repair_states")
+            .values()
+            .filter(|state| matches!(state, RepairState::Pending))
+            .count()
     }
 
     #[must_use]
@@ -825,15 +843,17 @@ where
     #[must_use]
     pub fn durable_not_repairable_window(&self, commit_seq: u64) -> Option<Duration> {
         let events = self.events_for_commit(commit_seq);
-        let ack = events
+        let pending = events
             .iter()
-            .find(|event| event.kind == CommitRepairEventKind::CommitAcked)?;
+            .find(|event| event.kind == CommitRepairEventKind::DurableButNotRepairable)?;
         let repair_done = events
             .iter()
             .find(|event| event.kind == CommitRepairEventKind::RepairCompleted)?;
-        Some(Duration::from_millis(
-            repair_done.seq.saturating_sub(ack.seq),
-        ))
+        Some(
+            repair_done
+                .recorded_at
+                .saturating_duration_since(pending.recorded_at),
+        )
     }
 
     #[must_use]
@@ -857,14 +877,123 @@ where
     GEN: RepairSymbolGenerator + Send + Sync + 'static,
 {
     fn drop(&mut self) {
-        let mut handles = lock_with_recovery(&self.handles, "repair_handles");
-        while let Some(handle) = handles.pop() {
-            if handle.join().is_err() {
+        let handles = {
+            let mut guard = lock_with_recovery(&self.handles, "repair_handles");
+            std::mem::take(&mut *guard)
+        };
+        for handle in handles {
+            let joined =
+                std::panic::catch_unwind(AssertUnwindSafe(|| self.runtime.block_on(handle)));
+            if joined.is_err() {
                 error!(
                     bead_id = BEAD_ID,
                     "background repair worker panicked during drop"
                 );
             }
+        }
+    }
+}
+
+struct RepairTask<IO, GEN> {
+    commit_seq: u64,
+    async_task_id: u64,
+    io: Arc<IO>,
+    generator: Arc<GEN>,
+    repair_states: Arc<Mutex<HashMap<u64, RepairState>>>,
+    events: Arc<Mutex<Vec<CommitRepairEvent>>>,
+    systematic_snapshot: Vec<u8>,
+    worker_cx: Cx,
+}
+
+async fn run_repair_task<IO, GEN>(task: RepairTask<IO, GEN>)
+where
+    IO: CommitRepairIo + Send + Sync + 'static,
+    GEN: RepairSymbolGenerator + Send + Sync + 'static,
+{
+    let RepairTask {
+        commit_seq,
+        async_task_id,
+        io,
+        generator,
+        repair_states,
+        events,
+        systematic_snapshot,
+        worker_cx,
+    } = task;
+
+    let Some(native_worker_cx) = NativeCx::current() else {
+        set_repair_state(&repair_states, commit_seq, RepairState::Failed);
+        record_event_into(&events, commit_seq, CommitRepairEventKind::RepairFailed);
+        error!(
+            bead_id = BEAD_ID,
+            commit_seq, async_task_id, "repair task missing native runtime context"
+        );
+        return;
+    };
+    worker_cx.set_native_cx(native_worker_cx.clone());
+    if worker_cx.checkpoint().is_err() {
+        set_repair_state(&repair_states, commit_seq, RepairState::Failed);
+        record_event_into(&events, commit_seq, CommitRepairEventKind::RepairFailed);
+        warn!(
+            bead_id = BEAD_ID,
+            commit_seq, async_task_id, "repair task was cancelled before blocking work started"
+        );
+        return;
+    }
+
+    info!(
+        bead_id = BEAD_ID,
+        commit_seq, async_task_id, "repair symbols generation started"
+    );
+    record_event_into(&events, commit_seq, CommitRepairEventKind::RepairStarted);
+
+    let blocking_cx = worker_cx.create_child();
+    let repair_outcome = spawn_blocking(move || {
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            blocking_cx.set_native_cx(native_worker_cx);
+            let repair_symbols =
+                generator.generate_repair_symbols(commit_seq, &systematic_snapshot)?;
+            let repair_symbol_bytes = repair_symbols.len();
+            io.append_repair_symbols(commit_seq, &repair_symbols)?;
+            io.sync_repair_symbols(commit_seq)?;
+            Ok::<usize, FrankenError>(repair_symbol_bytes)
+        }))
+    })
+    .await;
+
+    match repair_outcome {
+        Ok(Ok(repair_symbol_bytes)) => {
+            set_repair_state(&repair_states, commit_seq, RepairState::Completed);
+            record_event_into(&events, commit_seq, CommitRepairEventKind::RepairCompleted);
+            info!(
+                bead_id = BEAD_ID,
+                commit_seq,
+                async_task_id,
+                repair_symbol_bytes,
+                "repair symbols append+sync completed"
+            );
+        }
+        // `spawn_blocking` returns the closure result directly, so the outer
+        // `catch_unwind` layer is the panic boundary and the inner `Result`
+        // carries generator / append / sync failures.
+        Ok(Err(err)) => {
+            set_repair_state(&repair_states, commit_seq, RepairState::Failed);
+            record_event_into(&events, commit_seq, CommitRepairEventKind::RepairFailed);
+            error!(
+                bead_id = BEAD_ID,
+                commit_seq,
+                async_task_id,
+                error = ?err,
+                "repair symbol generation or append/sync failed"
+            );
+        }
+        Err(_panic_payload) => {
+            set_repair_state(&repair_states, commit_seq, RepairState::Failed);
+            record_event_into(&events, commit_seq, CommitRepairEventKind::RepairFailed);
+            error!(
+                bead_id = BEAD_ID,
+                commit_seq, async_task_id, "repair symbol worker panicked"
+            );
         }
     }
 }
@@ -905,6 +1034,7 @@ fn record_event_into(
     guard.push(CommitRepairEvent {
         commit_seq,
         seq,
+        recorded_at: Instant::now(),
         kind,
     });
 }
@@ -914,6 +1044,7 @@ fn record_event_into(
 // ---------------------------------------------------------------------------
 
 const GROUP_COMMIT_BEAD_ID: &str = "bd-l4gl";
+const GROUP_COMMIT_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Phase label recorded during coordinator batch processing for ordering
 /// verification.
@@ -1075,6 +1206,216 @@ impl WalBatchWriter for InMemoryWalWriter {
     }
 }
 
+#[cfg(test)]
+mod commit_repair_async_tests {
+    use super::*;
+
+    use asupersync::runtime::RuntimeBuilder;
+    use std::thread;
+
+    #[test]
+    fn test_commit_repair_runs_on_caller_owned_runtime() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("commit repair runtime");
+        let root_cx = Cx::new();
+        let io = Arc::new(InMemoryCommitRepairIo::default());
+        let generator = Arc::new(DeterministicRepairGenerator::new(
+            Duration::from_millis(25),
+            64,
+        ));
+        let coordinator = CommitRepairCoordinator::with_shared(
+            CommitRepairConfig {
+                repair_enabled: true,
+            },
+            runtime,
+            &root_cx,
+            Arc::clone(&io),
+            generator,
+        );
+
+        let receipt = coordinator
+            .commit(&[0xAB; 256])
+            .expect("commit should succeed");
+        assert_eq!(coordinator.pending_background_repair_count(), 1);
+
+        coordinator
+            .wait_for_background_repair()
+            .expect("background repair should finish");
+
+        assert_eq!(coordinator.pending_background_repair_count(), 0);
+        assert_eq!(
+            coordinator.repair_state_for(receipt.commit_seq),
+            RepairState::Completed
+        );
+        assert!(
+            coordinator
+                .events_for_commit(receipt.commit_seq)
+                .iter()
+                .any(|event| event.kind == CommitRepairEventKind::RepairStarted)
+        );
+        assert!(
+            io.total_repair_bytes() > 0,
+            "repair task should append repair symbols"
+        );
+    }
+
+    #[test]
+    fn test_commit_receipt_latency_tracks_critical_path_io() {
+        #[derive(Debug)]
+        struct DelayedIo {
+            delay: Duration,
+        }
+
+        impl CommitRepairIo for DelayedIo {
+            fn append_systematic_symbols(
+                &self,
+                _commit_seq: u64,
+                _systematic_symbols: &[u8],
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn sync_systematic_symbols(&self, _commit_seq: u64) -> Result<()> {
+                thread::sleep(self.delay);
+                Ok(())
+            }
+
+            fn append_repair_symbols(
+                &self,
+                _commit_seq: u64,
+                _repair_symbols: &[u8],
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn sync_repair_symbols(&self, _commit_seq: u64) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("commit repair runtime");
+        let root_cx = Cx::new();
+        let coordinator = CommitRepairCoordinator::new(
+            CommitRepairConfig {
+                repair_enabled: false,
+            },
+            runtime,
+            &root_cx,
+            DelayedIo {
+                delay: Duration::from_millis(10),
+            },
+            DeterministicRepairGenerator::new(Duration::ZERO, 64),
+        );
+
+        let receipt = coordinator
+            .commit(&[0xAB; 256])
+            .expect("commit should succeed");
+
+        assert!(
+            receipt.latency >= Duration::from_millis(8),
+            "commit latency should include the critical-path systematic sync cost"
+        );
+    }
+
+    #[test]
+    fn test_durable_not_repairable_window_tracks_wall_clock_delay() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("commit repair runtime");
+        let root_cx = Cx::new();
+        let coordinator = CommitRepairCoordinator::new(
+            CommitRepairConfig {
+                repair_enabled: true,
+            },
+            runtime,
+            &root_cx,
+            InMemoryCommitRepairIo::default(),
+            DeterministicRepairGenerator::new(Duration::from_millis(20), 64),
+        );
+
+        let receipt = coordinator
+            .commit(&[0xAB; 256])
+            .expect("commit should succeed");
+        coordinator
+            .wait_for_background_repair()
+            .expect("background repair should finish");
+
+        let window = coordinator
+            .durable_not_repairable_window(receipt.commit_seq)
+            .expect("window should be measurable");
+        assert!(
+            window >= Duration::from_millis(15),
+            "window should reflect real repair delay rather than logical event ordinals"
+        );
+    }
+
+    #[test]
+    fn test_panicking_repair_marks_failed_without_abandoning_other_work() {
+        #[derive(Debug)]
+        struct PanicFirstGenerator;
+
+        impl RepairSymbolGenerator for PanicFirstGenerator {
+            fn generate_repair_symbols(
+                &self,
+                commit_seq: u64,
+                _systematic_symbols: &[u8],
+            ) -> Result<Vec<u8>> {
+                if commit_seq == 1 {
+                    panic!("intentional repair panic");
+                }
+                thread::sleep(Duration::from_millis(25));
+                Ok(vec![0xCD; 32])
+            }
+        }
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("commit repair runtime");
+        let root_cx = Cx::new();
+        let coordinator = CommitRepairCoordinator::new(
+            CommitRepairConfig {
+                repair_enabled: true,
+            },
+            runtime,
+            &root_cx,
+            InMemoryCommitRepairIo::default(),
+            PanicFirstGenerator,
+        );
+
+        let first = coordinator
+            .commit(&[0xAA; 64])
+            .expect("first commit should schedule repair");
+        let second = coordinator
+            .commit(&[0xBB; 64])
+            .expect("second commit should schedule repair");
+
+        coordinator
+            .wait_for_background_repair()
+            .expect("panic inside repair work should be converted into RepairFailed state");
+        assert_eq!(coordinator.pending_background_repair_count(), 0);
+        assert_eq!(
+            coordinator.repair_state_for(first.commit_seq),
+            RepairState::Failed,
+            "panicking repair task must be marked failed rather than left pending"
+        );
+        assert!(
+            coordinator
+                .events_for_commit(first.commit_seq)
+                .iter()
+                .any(|event| event.kind == CommitRepairEventKind::RepairFailed),
+            "panicking repair task must emit a RepairFailed event"
+        );
+        assert_eq!(
+            coordinator.repair_state_for(second.commit_seq),
+            RepairState::Completed,
+            "wait_for_background_repair must still drain non-panicking tasks"
+        );
+    }
+}
+
 /// Group commit coordinator configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct GroupCommitConfig {
@@ -1223,6 +1564,13 @@ where
         phase_order.push(BatchPhase::WalAppend);
         let refs: Vec<&CommitRequest> = valid_requests.iter().collect();
         let wal_offsets = self.wal.append_batch(&refs)?;
+        if wal_offsets.len() != valid_requests.len() {
+            return Err(FrankenError::internal(format!(
+                "wal append returned {} offsets for {} valid requests",
+                wal_offsets.len(),
+                valid_requests.len()
+            )));
+        }
 
         // ---- Phase 3: Fsync ----
         phase_order.push(BatchPhase::Fsync);
@@ -1256,16 +1604,16 @@ where
         drop(committed_guard);
         drop(published_guard);
 
-        for (req, &wal_offset) in valid_requests.into_iter().zip(wal_offsets.iter()) {
-            let commit_seq = committed_entries
-                .iter()
-                .find(|(tid, _, _)| *tid == req.txn_id)
-                .map_or(0, |entry| entry.2);
+        for ((req, &wal_offset), (_, _, commit_seq)) in valid_requests
+            .into_iter()
+            .zip(wal_offsets.iter())
+            .zip(committed_entries.iter())
+        {
             responses.push((
                 req,
                 GroupCommitResponse::Committed {
                     wal_offset,
-                    commit_seq,
+                    commit_seq: *commit_seq,
                 },
             ));
         }
@@ -1305,8 +1653,16 @@ where
         &self,
         receiver: &TwoPhaseCommitReceiver,
     ) -> Result<Option<BatchResult>> {
+        self.drain_and_process_with_first_wait(receiver, Duration::from_secs(1))
+    }
+
+    fn drain_and_process_with_first_wait(
+        &self,
+        receiver: &TwoPhaseCommitReceiver,
+        first_wait: Duration,
+    ) -> Result<Option<BatchResult>> {
         // Blocking wait for first request
-        let Some(first) = receiver.try_recv_for(Duration::from_secs(1)) else {
+        let Some(first) = receiver.try_recv_for(first_wait) else {
             return Ok(None);
         };
 
@@ -1325,19 +1681,24 @@ where
         Ok(Some(result))
     }
 
-    /// Run the coordinator loop, processing batches until `shutdown` is set.
+    /// Run the coordinator loop until the owning region `Cx` is cancelled.
     ///
     /// This is the production entry point. The loop blocks on the first
     /// request of each batch, drains additional requests, and processes
     /// the batch through all 4 phases.
-    pub fn run_loop(&self, receiver: &TwoPhaseCommitReceiver, shutdown: &AtomicBool) -> Result<()> {
+    pub fn run_loop(&self, receiver: &TwoPhaseCommitReceiver, cx: &Cx) -> Result<()> {
         info!(
             bead_id = GROUP_COMMIT_BEAD_ID,
             max_batch_size = self.config.max_batch_size,
             "group commit coordinator loop started"
         );
-        while !shutdown.load(Ordering::Acquire) {
-            if let Some(result) = self.drain_and_process(receiver)? {
+        while !cx.is_cancel_requested() {
+            if cx.checkpoint().is_err() {
+                break;
+            }
+            if let Some(result) =
+                self.drain_and_process_with_first_wait(receiver, GROUP_COMMIT_IDLE_POLL_INTERVAL)?
+            {
                 debug!(
                     bead_id = GROUP_COMMIT_BEAD_ID,
                     committed = result.committed.len(),
@@ -1593,6 +1954,7 @@ mod two_phase_pipeline_tests {
 #[allow(clippy::cast_possible_truncation)]
 mod group_commit_tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
     use std::time::Instant;
 
     fn req(txn_id: u64, pages: &[u32]) -> CommitRequest {
@@ -1624,6 +1986,36 @@ mod group_commit_tests {
                 ..GroupCommitConfig::default()
             },
         )
+    }
+
+    #[derive(Debug)]
+    struct OffsetMismatchWalWriter {
+        returned_offsets: Vec<u64>,
+        sync_count: AtomicU32,
+    }
+
+    impl OffsetMismatchWalWriter {
+        fn new(returned_offsets: Vec<u64>) -> Self {
+            Self {
+                returned_offsets,
+                sync_count: AtomicU32::new(0),
+            }
+        }
+
+        fn sync_count(&self) -> u32 {
+            self.sync_count.load(Ordering::Acquire)
+        }
+    }
+
+    impl WalBatchWriter for OffsetMismatchWalWriter {
+        fn append_batch(&self, _requests: &[&CommitRequest]) -> Result<Vec<u64>> {
+            Ok(self.returned_offsets.clone())
+        }
+
+        fn sync(&self) -> Result<()> {
+            self.sync_count.fetch_add(1, Ordering::Release);
+            Ok(())
+        }
     }
 
     #[test]
@@ -1894,6 +2286,52 @@ mod group_commit_tests {
     }
 
     #[test]
+    fn test_group_commit_duplicate_txn_ids_keep_distinct_commit_sequences() {
+        let coord = make_coordinator(16);
+        let batch = vec![req(7, &[10]), req(7, &[20])];
+
+        let (responses, result) = coord.process_batch(batch).expect("batch should succeed");
+
+        assert_eq!(result.committed.len(), 2);
+        let committed_commit_seqs = result
+            .committed
+            .iter()
+            .map(|(_, _, commit_seq)| *commit_seq)
+            .collect::<Vec<_>>();
+        assert_eq!(committed_commit_seqs.len(), 2);
+        assert_ne!(committed_commit_seqs[0], committed_commit_seqs[1]);
+
+        let response_commit_seqs = responses
+            .iter()
+            .map(|(_, response)| match response {
+                GroupCommitResponse::Committed { commit_seq, .. } => *commit_seq,
+                GroupCommitResponse::Conflict { .. } => 0,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(response_commit_seqs, committed_commit_seqs);
+    }
+
+    #[test]
+    fn test_group_commit_rejects_wal_offset_count_mismatch() {
+        let wal = OffsetMismatchWalWriter::new(vec![42]);
+        let coord = GroupCommitCoordinator::new(
+            wal,
+            FirstCommitterWinsValidator,
+            GroupCommitConfig::default(),
+        );
+
+        let err = coord
+            .process_batch(vec![req(1, &[10]), req(2, &[20])])
+            .expect_err("mismatched WAL offsets must fail the batch");
+        assert!(matches!(err, FrankenError::Internal(_)));
+        assert_eq!(coord.wal_handle().sync_count(), 0, "fsync must not run");
+        assert!(
+            coord.published_versions().is_empty(),
+            "no versions may be published after a malformed WAL append result"
+        );
+    }
+
+    #[test]
     fn test_group_commit_all_conflict_no_fsync() {
         let coord = make_coordinator(16);
 
@@ -1920,7 +2358,7 @@ mod group_commit_tests {
     fn test_group_commit_run_loop_shutdown() {
         let coord = Arc::new(make_coordinator(16));
         let (sender, receiver) = two_phase_commit_channel(16);
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let loop_cx = Arc::new(Cx::new());
 
         // Send some requests
         for txn_id in 1..=3_u64 {
@@ -1928,13 +2366,13 @@ mod group_commit_tests {
             permit.send(req(txn_id, &[txn_id as u32 * 100]));
         }
 
-        let shutdown_clone = Arc::clone(&shutdown);
+        let loop_cx_clone = Arc::clone(&loop_cx);
         let coord_clone = Arc::clone(&coord);
-        let handle = thread::spawn(move || coord_clone.run_loop(&receiver, &shutdown_clone));
+        let handle = thread::spawn(move || coord_clone.run_loop(&receiver, &loop_cx_clone));
 
         // Let the loop process
         thread::sleep(Duration::from_millis(200));
-        shutdown.store(true, Ordering::Release);
+        loop_cx.cancel();
 
         handle
             .join()
