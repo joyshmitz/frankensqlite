@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use fsqlite_types::LockLevel;
 
 use crate::shm::{
-    ShmRegion, SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK,
+    SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
     WAL_TOTAL_LOCKS,
 };
 use crate::traits::{Vfs, VfsFile};
@@ -273,8 +273,12 @@ impl MemoryFile {
             info.owner_refs.is_empty()
         };
 
-        if delete || orphaned {
+        if orphaned {
             inner.shm.remove(&self.shm_path);
+        } else if delete {
+            // Match SQLite's xShmUnmap(deleteFlag): the shared backing only
+            // disappears when the last reference goes away.
+            debug_assert!(inner.shm.contains_key(&self.shm_path));
         }
 
         Ok(())
@@ -1269,6 +1273,51 @@ mod tests {
     }
 
     #[test]
+    fn shm_unmap_delete_keeps_shared_state_while_other_owner_remains() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("shm_unmap_shared_delete.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let (mut file1, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut file2, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        let shm_path = sqlite_shm_path(path);
+        let region1 = file1.shm_map(&cx, 0, 64, true).unwrap();
+        {
+            let mut guard = region1.lock();
+            guard[0] = 0x5A;
+        }
+        let region2 = file2.shm_map(&cx, 0, 64, true).unwrap();
+        assert_eq!(region2.lock()[0], 0x5A);
+
+        file1.shm_unmap(&cx, true).unwrap();
+        assert!(
+            vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "delete=true must not clear SHM state while another owner still references it"
+        );
+
+        let (mut file3, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let region3 = file3.shm_map(&cx, 0, 64, true).unwrap();
+        assert_eq!(
+            region3.lock()[0],
+            0x5A,
+            "new handles must join the existing SHM node rather than a split replacement"
+        );
+
+        file2.shm_unmap(&cx, false).unwrap();
+        assert!(
+            vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "shared SHM state should persist until the final owner unmaps"
+        );
+
+        file3.shm_unmap(&cx, false).unwrap();
+        assert!(
+            !vfs.inner.lock().unwrap().shm.contains_key(&shm_path),
+            "shared SHM state should clear once the final owner releases it"
+        );
+    }
+
+    #[test]
     fn delete_nonexistent_is_silent() {
         let cx = Cx::new();
         let vfs = make_vfs();
@@ -1354,18 +1403,20 @@ mod tests {
         file.write(&cx, b"test", 0).unwrap();
 
         // MemoryVfs always returns true for access if file exists.
-        assert!(vfs
-            .access(&cx, Path::new("acc.db"), AccessFlags::READWRITE)
-            .unwrap());
+        assert!(
+            vfs.access(&cx, Path::new("acc.db"), AccessFlags::READWRITE)
+                .unwrap()
+        );
     }
 
     #[test]
     fn access_nonexistent() {
         let cx = Cx::new();
         let vfs = make_vfs();
-        assert!(!vfs
-            .access(&cx, Path::new("nope.db"), AccessFlags::EXISTS)
-            .unwrap());
+        assert!(
+            !vfs.access(&cx, Path::new("nope.db"), AccessFlags::EXISTS)
+                .unwrap()
+        );
     }
 
     #[test]
