@@ -803,6 +803,7 @@ mod tests {
             error: None,
             first_failure_diagnostic: None,
             storage_wiring: None,
+            runtime_phase_timing: None,
             hot_path_profile: None,
         }
     }

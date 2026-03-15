@@ -210,6 +210,7 @@ pub fn run_oplog_sqlite(
         first_failure_diagnostic: error.clone(),
         error,
         storage_wiring: None,
+        runtime_phase_timing: None,
         hot_path_profile: None,
     })
 }

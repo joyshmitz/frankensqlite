@@ -388,6 +388,23 @@ pub struct WalHotPathProfile {
     pub group_commit_latency_us_total: u64,
 }
 
+/// Runtime phase timings captured directly by the FrankenSQLite executor.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct RuntimePhaseTimingEvidence {
+    /// Total configured backoff sleep requested after BUSY-family retries.
+    pub retry_backoff_time_ns: u64,
+    /// Time spent inside batch attempts that ended in BUSY and were retried.
+    pub busy_attempt_time_ns: u64,
+    /// BEGIN boundary time across all attempts.
+    pub begin_boundary_time_ns: u64,
+    /// Statement/body execution time excluding explicit BEGIN/COMMIT/ROLLBACK.
+    pub body_execution_time_ns: u64,
+    /// Final COMMIT boundary time across successful attempts.
+    pub commit_finalize_time_ns: u64,
+    /// Final ROLLBACK boundary time across failed or explicit rollback attempts.
+    pub rollback_time_ns: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineInfo {
     pub name: String,
@@ -493,6 +510,8 @@ pub struct EngineRunReport {
     pub first_failure_diagnostic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_wiring: Option<StorageWiringReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_phase_timing: Option<RuntimePhaseTimingEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hot_path_profile: Option<FsqliteHotPathProfile>,
 }
@@ -710,6 +729,7 @@ mod tests {
                 backend_mode: "parity_cert_strict".to_owned(),
                 backend_identity: "unix:parity_cert_strict".to_owned(),
             }),
+            runtime_phase_timing: None,
             hot_path_profile: None,
         };
 
@@ -769,6 +789,7 @@ mod tests {
             error: None,
             first_failure_diagnostic: None,
             storage_wiring: None,
+            runtime_phase_timing: None,
             hot_path_profile: None,
         };
 
@@ -816,6 +837,7 @@ mod tests {
             error: None,
             first_failure_diagnostic: None,
             storage_wiring: None,
+            runtime_phase_timing: None,
             hot_path_profile: None,
         };
         let profile = FsqliteHotPathProfile {
