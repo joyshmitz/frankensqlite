@@ -7632,6 +7632,13 @@ mod tests {
                 "move_candidate": "completed",
                 "rationale": "per-frame checksum transforms are now derived outside the lock so publish only rebinds the live seed",
             }),
+            json!({
+                "component": "wal_prelock_checksum_finalize",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::finalize_prepared_frames",
+                "classification": "pure_compute",
+                "move_candidate": "completed",
+                "rationale": "prepared batches now refresh/publish the base snapshot and stamp checksum fields before EXCLUSIVE when the live append window is still open to optimistic reuse",
+            }),
         ];
 
         let inside_window = vec![
@@ -7647,25 +7654,32 @@ mod tests {
                 "location": "crates/fsqlite-core/src/wal_adapter.rs::append_prepared_frames",
                 "classification": "state_refresh_read_only",
                 "move_candidate": "conditional",
-                "rationale": "refresh chooses append offset/checksum seed but is still read/refresh work rather than durable publication",
+                "rationale": "prepared batches can skip the lock-held refresh when the pre-lock append-window token still matches on disk, but stale windows still require a refresh before durable append",
             }),
             json!({
-                "component": "wal_checksum_seed_rebind",
+                "component": "wal_append_window_validation",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_prepared_frames",
+                "classification": "state_validation",
+                "move_candidate": "conditional",
+                "rationale": "the lock-held path now performs a cheap file-size/header check to decide whether the pre-lock finalized batch can be reused or whether it must fall back to refresh/re-finalize",
+            }),
+            json!({
+                "component": "wal_checksum_seed_rebind_fallback",
                 "location": "crates/fsqlite-core/src/wal_adapter.rs::append_prepared_frames",
                 "classification": "publish_seed_binding",
-                "move_candidate": "no",
-                "rationale": "publish still has to bind the authoritative post-refresh seed and rewrite checksum header words before the single durable write",
+                "move_candidate": "conditional",
+                "rationale": "checksum rebinding remains inside the publish window only for stale-window fallback cases where another writer changed the live append seed before EXCLUSIVE was acquired",
             }),
             json!({
                 "component": "wal_file_write",
-                "location": "crates/fsqlite-wal/src/wal.rs::append_prepared_frame_bytes",
+                "location": "crates/fsqlite-wal/src/wal.rs::append_finalized_prepared_frame_bytes",
                 "classification": "durable_state_transition",
                 "move_candidate": "no",
                 "rationale": "single contiguous file write is the core serialized append that must observe the authoritative WAL end",
             }),
             json!({
                 "component": "wal_state_advance_after_write",
-                "location": "crates/fsqlite-wal/src/wal.rs::append_prepared_frame_bytes",
+                "location": "crates/fsqlite-wal/src/wal.rs::append_finalized_prepared_frame_bytes",
                 "classification": "durable_state_transition",
                 "move_candidate": "no",
                 "rationale": "frame_count/running_checksum advancement must match the durable append that just occurred",

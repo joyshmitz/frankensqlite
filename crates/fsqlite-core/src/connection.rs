@@ -1716,6 +1716,26 @@ fn trigger_statement_raise_directive(
     }))
 }
 
+/// Returns true if the statement is a `SELECT RAISE(...)` (with or without a
+/// WHERE clause).  Used by `execute_bound_trigger_statement` to skip
+/// RAISE-containing SELECTs whose WHERE clause evaluated to false.
+fn statement_is_raise_select(statement: &Statement) -> bool {
+    let Statement::Select(select) = statement else {
+        return false;
+    };
+    let SelectCore::Select { columns, .. } = &select.body.select else {
+        return false;
+    };
+    columns.len() == 1
+        && matches!(
+            &columns[0],
+            ResultColumn::Expr {
+                expr: Expr::Raise { .. },
+                ..
+            }
+        )
+}
+
 /// Snapshot of the database + schema state at a point in time.
 /// Used for transaction rollback and savepoint restore.
 #[derive(Debug, Clone)]
@@ -9158,7 +9178,8 @@ impl Connection {
                 if result.is_ok() {
                     match txn.commit(&cx) {
                         Ok(()) => {
-                            let _ = self.advance_commit_clock();
+                            let committed_seq = self.advance_commit_clock();
+                            self.emit_differential_commit_invalidations(committed_seq);
                             auto_commit_succeeded = true;
                             None
                         }
@@ -12246,6 +12267,14 @@ impl Connection {
     ) -> Result<TriggerStatementOutcome> {
         if let Some(directive) = trigger_statement_raise_directive(&statement)? {
             return self.apply_trigger_raise(directive);
+        }
+        // If trigger_statement_raise_directive returned None for a SELECT
+        // whose result column is a RAISE expression, the WHERE condition
+        // evaluated to false — the RAISE was not fired.  We must NOT fall
+        // through to execute_statement because the general execution path
+        // cannot evaluate Expr::Raise as a value.  Just skip it (no-op).
+        if statement_is_raise_select(&statement) {
+            return Ok(TriggerStatementOutcome::Continue);
         }
         if matches!(
             &statement,
@@ -16621,18 +16650,17 @@ impl Connection {
     /// Returns a stable status snapshot of active differential subscribers.
     #[must_use]
     pub fn differential_subscribers(&self) -> Vec<DifferentialSubscriberStatus> {
-        let mut snapshot: Vec<DifferentialSubscriberStatus> = lock_unpoisoned(
-            &self.differential_registry.subscribers,
-        )
-        .values()
-        .map(|subscriber| DifferentialSubscriberStatus {
-            subscriber_id: subscriber.id,
-            view_name: subscriber.view_name.clone(),
-            snapshot_seq: subscriber.snapshot_seq.get(),
-            next_commit_seq: subscriber.stream_begin_seq.get(),
-            bootstrap_row_count: subscriber.bootstrap_row_count,
-        })
-        .collect();
+        let mut snapshot: Vec<DifferentialSubscriberStatus> =
+            lock_unpoisoned(&self.differential_registry.subscribers)
+                .values()
+                .map(|subscriber| DifferentialSubscriberStatus {
+                    subscriber_id: subscriber.id,
+                    view_name: subscriber.view_name.clone(),
+                    snapshot_seq: subscriber.snapshot_seq.get(),
+                    next_commit_seq: subscriber.stream_begin_seq.get(),
+                    bootstrap_row_count: subscriber.bootstrap_row_count,
+                })
+                .collect();
         snapshot.sort_by_key(|subscriber| subscriber.subscriber_id);
         snapshot
     }
@@ -16753,13 +16781,12 @@ impl Connection {
     }
 
     fn emit_differential_commit_invalidations(&self, committed_seq: CommitSeq) {
-        let subscribers: Vec<DifferentialSubscriber> = lock_unpoisoned(
-            &self.differential_registry.subscribers,
-        )
-        .values()
-        .filter(|subscriber| committed_seq >= subscriber.stream_begin_seq)
-        .cloned()
-        .collect();
+        let subscribers: Vec<DifferentialSubscriber> =
+            lock_unpoisoned(&self.differential_registry.subscribers)
+                .values()
+                .filter(|subscriber| committed_seq >= subscriber.stream_begin_seq)
+                .cloned()
+                .collect();
 
         if subscribers.is_empty() {
             return;
@@ -16912,6 +16939,7 @@ impl Connection {
                             args,
                             distinct: is_distinct,
                             filter,
+                            order_by: agg_order_by,
                             ..
                         },
                     ..
@@ -16994,6 +17022,7 @@ impl Connection {
                         separator_expr,
                         filter: filter.clone(),
                         collation: agg_collation,
+                        order_by: agg_order_by.clone(),
                     })
                 }
                 ResultColumn::Expr { expr, .. } => Ok(GroupByColumn::Plain(Box::new(expr.clone()))),
@@ -17163,6 +17192,7 @@ impl Connection {
                         separator_expr,
                         filter,
                         collation,
+                        order_by,
                     } => {
                         // Apply FILTER clause: only include rows where filter is true.
                         let filtered_rows: Vec<&Vec<SqliteValue>> = if let Some(filt) = filter {
@@ -17180,6 +17210,87 @@ impl Connection {
                         if name == "count" && arg_col.is_none() && arg_expr.is_none() {
                             #[allow(clippy::cast_possible_wrap)]
                             values.push(SqliteValue::Integer(filtered_rows.len() as i64));
+                        } else if !order_by.is_empty()
+                            && (name == "group_concat" || name == "string_agg")
+                        {
+                            // In-aggregate ORDER BY for GROUP_CONCAT/STRING_AGG:
+                            // collect (value, separator, sort_key) per row, sort,
+                            // then concatenate in sorted order.
+                            let mut entries: Vec<(SqliteValue, Option<String>, Vec<SqliteValue>)> =
+                                Vec::new();
+                            for row in &filtered_rows {
+                                let val = if let Some(idx) = *arg_col {
+                                    row.get(idx).cloned().unwrap_or(SqliteValue::Null)
+                                } else if let Some(expr) = arg_expr {
+                                    eval_join_expr(expr, row, &col_map)?
+                                } else {
+                                    SqliteValue::Null
+                                };
+                                if matches!(val, SqliteValue::Null) {
+                                    continue;
+                                }
+                                let sep = separator.clone().or_else(|| {
+                                    separator_expr.as_ref().and_then(|expr| {
+                                        let sv = eval_join_expr(expr, row, &col_map).ok()?;
+                                        (!matches!(sv, SqliteValue::Null))
+                                            .then(|| sqlite_value_to_text(&sv))
+                                    })
+                                });
+                                let mut keys = Vec::with_capacity(order_by.len());
+                                for term in order_by {
+                                    keys.push(eval_join_expr(&term.expr, row, &col_map)?);
+                                }
+                                entries.push((val, sep, keys));
+                            }
+                            entries.sort_by(|a, b| {
+                                for (i, term) in order_by.iter().enumerate() {
+                                    let ord = cmp_sqlite_values(
+                                        a.2.get(i).unwrap_or(&SqliteValue::Null),
+                                        b.2.get(i).unwrap_or(&SqliteValue::Null),
+                                    );
+                                    let ord = if matches!(
+                                        term.direction,
+                                        Some(fsqlite_ast::SortDirection::Desc)
+                                    ) {
+                                        ord.reverse()
+                                    } else {
+                                        ord
+                                    };
+                                    if ord != std::cmp::Ordering::Equal {
+                                        return ord;
+                                    }
+                                }
+                                std::cmp::Ordering::Equal
+                            });
+                            if *distinct {
+                                let coll = collation.as_deref();
+                                let cr = &self.collation_registry;
+                                let mut seen = Vec::new();
+                                entries.retain(|e| {
+                                    let dup = seen.iter().any(|s: &SqliteValue| {
+                                        cmp_sqlite_values_collated(s, &e.0, coll, cr)
+                                            == std::cmp::Ordering::Equal
+                                    });
+                                    if !dup {
+                                        seen.push(e.0.clone());
+                                    }
+                                    !dup
+                                });
+                            }
+                            // Concatenate with per-row separators in sorted order.
+                            let default_sep = ",";
+                            let mut result = String::new();
+                            for (i, (val, sep, _)) in entries.iter().enumerate() {
+                                if i > 0 {
+                                    result.push_str(sep.as_deref().unwrap_or(default_sep));
+                                }
+                                result.push_str(&val.to_text());
+                            }
+                            values.push(if entries.is_empty() {
+                                SqliteValue::Null
+                            } else {
+                                SqliteValue::Text(result)
+                            });
                         } else {
                             let mut owned_values: Vec<SqliteValue> = if let Some(idx) = *arg_col {
                                 filtered_rows
@@ -17200,6 +17311,58 @@ impl Connection {
                                     "aggregate {name} requires an argument"
                                 )));
                             };
+                            // For non-GROUP_CONCAT aggregates with ORDER BY,
+                            // sort values by the in-aggregate ORDER BY keys.
+                            if !order_by.is_empty() {
+                                let mut keyed: Vec<(SqliteValue, Vec<SqliteValue>)> =
+                                    Vec::with_capacity(owned_values.len());
+                                // Pair each non-NULL value with its sort keys
+                                // by iterating rows in the same NULL-skip order
+                                // used to build owned_values.
+                                let mut vi = 0;
+                                for row in &filtered_rows {
+                                    let is_null = if let Some(idx) = *arg_col {
+                                        row.get(idx).is_none_or(|v| matches!(v, SqliteValue::Null))
+                                    } else if let Some(expr) = arg_expr {
+                                        matches!(
+                                            eval_join_expr(expr, row, &col_map)?,
+                                            SqliteValue::Null
+                                        )
+                                    } else {
+                                        true
+                                    };
+                                    if is_null || vi >= owned_values.len() {
+                                        continue;
+                                    }
+                                    let mut keys = Vec::with_capacity(order_by.len());
+                                    for term in order_by {
+                                        keys.push(eval_join_expr(&term.expr, row, &col_map)?);
+                                    }
+                                    keyed.push((owned_values[vi].clone(), keys));
+                                    vi += 1;
+                                }
+                                keyed.sort_by(|a, b| {
+                                    for (i, term) in order_by.iter().enumerate() {
+                                        let cmp = cmp_sqlite_values(
+                                            a.1.get(i).unwrap_or(&SqliteValue::Null),
+                                            b.1.get(i).unwrap_or(&SqliteValue::Null),
+                                        );
+                                        let cmp = if matches!(
+                                            term.direction,
+                                            Some(fsqlite_ast::SortDirection::Desc)
+                                        ) {
+                                            cmp.reverse()
+                                        } else {
+                                            cmp
+                                        };
+                                        if cmp != std::cmp::Ordering::Equal {
+                                            return cmp;
+                                        }
+                                    }
+                                    std::cmp::Ordering::Equal
+                                });
+                                owned_values = keyed.into_iter().map(|(v, _)| v).collect();
+                            }
                             if *distinct {
                                 let mut refs: Vec<&SqliteValue> = owned_values.iter().collect();
                                 dedup_values_collated(
@@ -18058,6 +18221,7 @@ impl Connection {
                             args,
                             distinct: is_distinct,
                             filter,
+                            order_by: agg_order_by,
                             ..
                         },
                     ..
@@ -18156,6 +18320,7 @@ impl Connection {
                         separator_expr,
                         filter: filter.clone(),
                         collation: agg_collation,
+                        order_by: agg_order_by.clone(),
                     })
                 }
                 ResultColumn::Expr { expr, .. } => {
@@ -18308,6 +18473,7 @@ impl Connection {
                         separator_expr,
                         filter,
                         collation,
+                        order_by,
                     } => {
                         // Apply FILTER clause: only include rows where filter is true.
                         let filtered_rows: Vec<&Vec<SqliteValue>> = if let Some(filt) = filter {
@@ -18325,6 +18491,84 @@ impl Connection {
                         if name == "count" && arg_col.is_none() && arg_expr.is_none() {
                             #[allow(clippy::cast_possible_wrap)]
                             values.push(SqliteValue::Integer(filtered_rows.len() as i64));
+                        } else if !order_by.is_empty()
+                            && (name == "group_concat" || name == "string_agg")
+                        {
+                            // In-aggregate ORDER BY for GROUP_CONCAT/STRING_AGG.
+                            let mut entries: Vec<(SqliteValue, Option<String>, Vec<SqliteValue>)> =
+                                Vec::new();
+                            for row in &filtered_rows {
+                                let val = if let Some(idx) = *arg_col {
+                                    row.get(idx).cloned().unwrap_or(SqliteValue::Null)
+                                } else if let Some(expr) = arg_expr {
+                                    eval_join_expr(expr, row, &col_map)?
+                                } else {
+                                    SqliteValue::Null
+                                };
+                                if matches!(val, SqliteValue::Null) {
+                                    continue;
+                                }
+                                let sep = separator.clone().or_else(|| {
+                                    separator_expr.as_ref().and_then(|expr| {
+                                        let sv = eval_join_expr(expr, row, &col_map).ok()?;
+                                        (!matches!(sv, SqliteValue::Null))
+                                            .then(|| sqlite_value_to_text(&sv))
+                                    })
+                                });
+                                let mut keys = Vec::with_capacity(order_by.len());
+                                for term in order_by {
+                                    keys.push(eval_join_expr(&term.expr, row, &col_map)?);
+                                }
+                                entries.push((val, sep, keys));
+                            }
+                            entries.sort_by(|a, b| {
+                                for (i, term) in order_by.iter().enumerate() {
+                                    let ord = cmp_sqlite_values(
+                                        a.2.get(i).unwrap_or(&SqliteValue::Null),
+                                        b.2.get(i).unwrap_or(&SqliteValue::Null),
+                                    );
+                                    let ord = if matches!(
+                                        term.direction,
+                                        Some(fsqlite_ast::SortDirection::Desc)
+                                    ) {
+                                        ord.reverse()
+                                    } else {
+                                        ord
+                                    };
+                                    if ord != std::cmp::Ordering::Equal {
+                                        return ord;
+                                    }
+                                }
+                                std::cmp::Ordering::Equal
+                            });
+                            if *distinct {
+                                let coll = collation.as_deref();
+                                let cr = &self.collation_registry;
+                                let mut seen = Vec::new();
+                                entries.retain(|e| {
+                                    let dup = seen.iter().any(|s: &SqliteValue| {
+                                        cmp_sqlite_values_collated(s, &e.0, coll, cr)
+                                            == std::cmp::Ordering::Equal
+                                    });
+                                    if !dup {
+                                        seen.push(e.0.clone());
+                                    }
+                                    !dup
+                                });
+                            }
+                            let default_sep = ",";
+                            let mut result = String::new();
+                            for (i, (val, sep, _)) in entries.iter().enumerate() {
+                                if i > 0 {
+                                    result.push_str(sep.as_deref().unwrap_or(default_sep));
+                                }
+                                result.push_str(&val.to_text());
+                            }
+                            values.push(if entries.is_empty() {
+                                SqliteValue::Null
+                            } else {
+                                SqliteValue::Text(result)
+                            });
                         } else {
                             let mut owned_values: Vec<SqliteValue> = if let Some(idx) = *arg_col {
                                 filtered_rows
@@ -25923,6 +26167,8 @@ enum GroupByColumn {
         /// Collation sequence for the aggregate argument column (e.g. "NOCASE").
         /// Used for DISTINCT dedup and MIN/MAX comparison.
         collation: Option<String>,
+        /// In-aggregate ORDER BY (SQLite 3.44+), e.g. `GROUP_CONCAT(x ORDER BY y)`.
+        order_by: Vec<fsqlite_ast::OrderingTerm>,
     },
 }
 
@@ -27729,7 +27975,7 @@ fn agg_arg_collation(expr: &Expr, schemas: &[TableSchema]) -> Option<String> {
             let matches = cr
                 .table
                 .as_ref()
-                .map_or(true, |t| t.eq_ignore_ascii_case(&ts.name));
+                .is_none_or(|t| t.eq_ignore_ascii_case(&ts.name));
             if matches {
                 if let Some(ci) = ts
                     .columns
@@ -33417,11 +33663,10 @@ fn format_time_travel_target(target: &TimeTravelTarget) -> String {
 mod tests {
     use super::{
         CommitSeq, Connection, ConnectionEnv, DifferentialEvent, InProcessPageLockTable,
-        IoPollStrategy, PagerBackend, Row, RuntimeConfig, RuntimeContext, SchemaEpoch,
-        SimplePager, Snapshot,
-        init_global_runtime, is_sqlite_master_entry_missing, join_hidden_rowid_projection,
-        join_table_supports_hidden_rowid, lock_unpoisoned, statement_contains_rewritable_subquery,
-        wal_file_present_with_vfs, wal_path_for_db_path,
+        IoPollStrategy, PagerBackend, Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SimplePager,
+        Snapshot, init_global_runtime, is_sqlite_master_entry_missing,
+        join_hidden_rowid_projection, join_table_supports_hidden_rowid, lock_unpoisoned,
+        statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use fsqlite_ast::Statement;
     use fsqlite_btree::BtreeCursorOps;
@@ -47288,7 +47533,8 @@ mod tests {
             .unwrap();
         conn.execute("CREATE VIEW v_items AS SELECT id, name FROM items ORDER BY id;")
             .unwrap();
-        conn.execute("PRAGMA fsqlite_differential_views = ON;").unwrap();
+        conn.execute("PRAGMA fsqlite_differential_views = ON;")
+            .unwrap();
 
         let expected_snapshot_seq = conn.current_global_commit_seq().get();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -47326,7 +47572,8 @@ mod tests {
         assert_eq!(statuses[0].next_commit_seq, expected_snapshot_seq + 1);
         assert_eq!(statuses[0].bootstrap_row_count, 2);
 
-        conn.execute("INSERT INTO items VALUES (3, 'gamma');").unwrap();
+        conn.execute("INSERT INTO items VALUES (3, 'gamma');")
+            .unwrap();
         let invalidation = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
         match invalidation {
             DifferentialEvent::Invalidation {
@@ -47351,8 +47598,14 @@ mod tests {
         };
         assert_eq!(find_value("enabled"), SqliteValue::Integer(1));
         assert_eq!(find_value("active_subscriptions"), SqliteValue::Integer(1));
-        assert_eq!(find_value("snapshot_bootstraps_total"), SqliteValue::Integer(1));
-        assert_eq!(find_value("fallback_invalidations_total"), SqliteValue::Integer(1));
+        assert_eq!(
+            find_value("snapshot_bootstraps_total"),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            find_value("fallback_invalidations_total"),
+            SqliteValue::Integer(1)
+        );
         assert_eq!(
             find_value("active_views"),
             SqliteValue::Text("v_items".to_owned())
@@ -47364,10 +47617,12 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);")
             .unwrap();
-        conn.execute("INSERT INTO items VALUES (1, 'alpha');").unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'alpha');")
+            .unwrap();
         conn.execute("CREATE VIEW v_items AS SELECT id, name FROM items ORDER BY id;")
             .unwrap();
-        conn.execute("PRAGMA fsqlite_differential_views = ON;").unwrap();
+        conn.execute("PRAGMA fsqlite_differential_views = ON;")
+            .unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
         let subscriber_id = conn
@@ -47379,10 +47634,12 @@ mod tests {
         assert!(conn.unregister_differential_subscriber(subscriber_id));
         assert_eq!(conn.differential_subscriber_count(), 0);
 
-        conn.execute("INSERT INTO items VALUES (2, 'beta');").unwrap();
-        assert!(rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
+        conn.execute("INSERT INTO items VALUES (2, 'beta');")
+            .unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
 
         let status_rows = conn.query("PRAGMA fsqlite_differential_status;").unwrap();
         assert!(status_rows.iter().any(|row| {
