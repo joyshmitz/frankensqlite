@@ -18,9 +18,13 @@
     "retry_policy_id",
     "build_profile_id",
     "seed_policy_id",
+    "run_id",
+    "artifact_bundle_key",
+    "artifact_bundle_name",
     "artifact_bundle_dir",
     "artifact_bundle_relpath",
     "artifact_names",
+    "retention_policy",
     "provenance"
   ],
   "properties": {
@@ -70,6 +74,15 @@
     "seed_policy_id": {
       "$ref": "#/$defs/id"
     },
+    "run_id": {
+      "$ref": "#/$defs/id"
+    },
+    "artifact_bundle_key": {
+      "$ref": "#/$defs/non_empty_string"
+    },
+    "artifact_bundle_name": {
+      "$ref": "#/$defs/non_empty_string"
+    },
     "artifact_bundle_dir": {
       "$ref": "#/$defs/non_empty_string"
     },
@@ -78,6 +91,9 @@
     },
     "artifact_names": {
       "$ref": "#/$defs/artifact_names"
+    },
+    "retention_policy": {
+      "$ref": "#/$defs/retention_policy"
     },
     "provenance": {
       "$ref": "#/$defs/provenance"
@@ -95,6 +111,15 @@
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "retention_class": {
+      "type": "string",
+      "enum": [
+        "quick_run",
+        "full_proof",
+        "failure_bundle",
+        "final_scorecard"
+      ]
     },
     "artifact_names": {
       "type": "object",
@@ -121,6 +146,34 @@
         },
         "profiles_dir": {
           "$ref": "#/$defs/non_empty_string"
+        }
+      }
+    },
+    "retention_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "description",
+        "superseded_by_newer",
+        "immutable",
+        "authoritative"
+      ],
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/retention_class"
+        },
+        "description": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "superseded_by_newer": {
+          "type": "boolean"
+        },
+        "immutable": {
+          "type": "boolean"
+        },
+        "authoritative": {
+          "type": "boolean"
         }
       }
     },
@@ -152,6 +205,156 @@
           "$ref": "#/$defs/non_empty_string"
         },
         "version": {
+          "$ref": "#/$defs/non_empty_string"
+        }
+      }
+    },
+    "hardware_os_family": {
+      "type": "string",
+      "enum": [
+        "linux"
+      ]
+    },
+    "hardware_cpu_architecture": {
+      "type": "string",
+      "enum": [
+        "x86_64"
+      ]
+    },
+    "hardware_topology_class": {
+      "type": "string",
+      "enum": [
+        "any",
+        "many_core_numa"
+      ]
+    },
+    "hardware_class_id_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os_family",
+        "cpu_arch",
+        "topology_class"
+      ],
+      "properties": {
+        "os_family": {
+          "$ref": "#/$defs/hardware_os_family"
+        },
+        "cpu_arch": {
+          "$ref": "#/$defs/hardware_cpu_architecture"
+        },
+        "topology_class": {
+          "$ref": "#/$defs/hardware_topology_class"
+        }
+      }
+    },
+    "hardware_class": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "id_fields",
+        "min_logical_cores",
+        "min_numa_nodes",
+        "description"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "id_fields": {
+          "$ref": "#/$defs/hardware_class_id_fields"
+        },
+        "min_logical_cores": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_numa_nodes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "description": {
+          "$ref": "#/$defs/non_empty_string"
+        }
+      }
+    },
+    "build_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "cargo_profile",
+        "cargo_args",
+        "notes"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "cargo_profile": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "cargo_args": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/non_empty_string"
+          }
+        },
+        "notes": {
+          "$ref": "#/$defs/non_empty_string"
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_id",
+        "source_path",
+        "source_sha256",
+        "source_size_bytes",
+        "working_copy_relpath",
+        "working_copy_sha256",
+        "working_copy_size_bytes",
+        "page_size",
+        "journal_mode",
+        "capture_rule"
+      ],
+      "properties": {
+        "fixture_id": {
+          "$ref": "#/$defs/id"
+        },
+        "source_path": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "working_copy_relpath": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "working_copy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "working_copy_size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "journal_mode": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "capture_rule": {
           "$ref": "#/$defs/non_empty_string"
         }
       }
@@ -192,15 +395,22 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "command_entrypoint",
         "source_revision",
         "beads_data_hash",
         "kernel_release",
+        "fixture",
+        "build_profile",
+        "hardware_class",
         "placement_policy",
         "commands",
         "tool_versions",
         "fallback_notes"
       ],
       "properties": {
+        "command_entrypoint": {
+          "$ref": "#/$defs/non_empty_string"
+        },
         "source_revision": {
           "$ref": "#/$defs/non_empty_string"
         },
@@ -209,6 +419,15 @@
         },
         "kernel_release": {
           "$ref": "#/$defs/non_empty_string"
+        },
+        "fixture": {
+          "$ref": "#/$defs/fixture"
+        },
+        "build_profile": {
+          "$ref": "#/$defs/build_profile"
+        },
+        "hardware_class": {
+          "$ref": "#/$defs/hardware_class"
         },
         "placement_policy": {
           "$ref": "#/$defs/placement_policy"

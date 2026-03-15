@@ -20,6 +20,7 @@ use std::io::{self, Read as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -36,7 +37,8 @@ use fsqlite_e2e::fixture_metadata::{
     FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
 };
 use fsqlite_e2e::fixture_select::{
-    BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BeadsBenchmarkCampaign, load_beads_benchmark_campaign,
+    BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE, BeadsBenchmarkCampaign, BenchmarkArtifactCommand,
+    BenchmarkArtifactToolVersion, load_beads_benchmark_campaign,
 };
 use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
@@ -44,7 +46,8 @@ use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::perf_runner::{
     FsqliteHotPathProfileConfig, HotPathArtifactFile, HotPathArtifactManifest,
-    HotPathProfileReport, build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
+    HotPathArtifactProvenance, HotPathCounterCaptureManifestSummary, HotPathProfileReport,
+    build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
     build_hot_path_subsystem_profile, profile_fsqlite_hot_path, render_hot_path_profile_markdown,
     write_hot_path_profile_artifacts,
 };
@@ -802,9 +805,282 @@ fn write_hot_path_command_pack(
     Ok(u64::try_from(command_pack_json.len()).unwrap_or(u64::MAX))
 }
 
+fn push_unique_string(values: &mut Vec<String>, value: impl Into<String>) {
+    let value = value.into();
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn build_hot_path_counter_capture_summary(
+    command_pack: &HotPathEvidenceCommandPack,
+) -> Option<HotPathCounterCaptureManifestSummary> {
+    let mut host_capability_sensitive_captures = Vec::new();
+    let mut topology_sensitive_captures = Vec::new();
+    let mut fallback_tools = Vec::new();
+    let mut fallback_metric_pack = Vec::new();
+    let mut fallback_notes = Vec::new();
+    let mut raw_output_relpaths = Vec::new();
+
+    for command in &command_pack.commands {
+        let Some(counter_pack) = &command.counter_pack else {
+            continue;
+        };
+        if counter_pack.host_capability_sensitive {
+            push_unique_string(
+                &mut host_capability_sensitive_captures,
+                command.capture.clone(),
+            );
+        }
+        if counter_pack.topology_sensitive {
+            push_unique_string(&mut topology_sensitive_captures, command.capture.clone());
+        }
+        for tool in &counter_pack.fallback_tools {
+            push_unique_string(&mut fallback_tools, tool.clone());
+        }
+        for event in &counter_pack.fallback_event_pack {
+            push_unique_string(&mut fallback_metric_pack, event.clone());
+        }
+        for hint in &counter_pack.fallback_reason_hints {
+            push_unique_string(
+                &mut fallback_notes,
+                format!("{}:{}: {hint}", command.capture, command.mode),
+            );
+        }
+        for relpath in &counter_pack.raw_output_relpaths {
+            push_unique_string(&mut raw_output_relpaths, relpath.clone());
+        }
+    }
+
+    (!host_capability_sensitive_captures.is_empty()
+        || !topology_sensitive_captures.is_empty()
+        || !fallback_tools.is_empty()
+        || !fallback_metric_pack.is_empty()
+        || !fallback_notes.is_empty()
+        || !raw_output_relpaths.is_empty())
+    .then_some(HotPathCounterCaptureManifestSummary {
+        host_capability_sensitive_captures,
+        topology_sensitive_captures,
+        fallback_tools,
+        fallback_metric_pack,
+        fallback_notes,
+        raw_output_relpaths,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct HotPathArtifactProvenanceInputs {
+    artifact_root: String,
+    workspace_root: Option<String>,
+    campaign_manifest_path: Option<String>,
+    source_revision: Option<String>,
+    beads_data_hash: Option<String>,
+    kernel_release: String,
+    rustc_version: String,
+    cargo_profile: String,
+    tool_versions: Vec<BenchmarkArtifactToolVersion>,
+}
+
+fn hot_path_row_id(workload: &str, concurrency: u16) -> String {
+    format!("{workload}_c{concurrency}")
+}
+
+fn hot_path_mode_id(concurrent_mode: bool) -> &'static str {
+    if concurrent_mode {
+        "fsqlite_mvcc"
+    } else {
+        "fsqlite_single_writer"
+    }
+}
+
+fn current_hot_path_cargo_profile() -> String {
+    std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_owned())
+}
+
+fn resolve_hot_path_workspace_root(
+    output_dir: &Path,
+    golden_dir: &Path,
+    working_base: &Path,
+) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(current_dir);
+    }
+    for path in [output_dir, golden_dir, working_base] {
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Ok(current_dir) = std::env::current_dir() {
+            current_dir.join(path)
+        } else {
+            path.to_path_buf()
+        };
+        candidates.push(candidate);
+    }
+
+    for candidate in candidates {
+        let normalized = candidate.canonicalize().unwrap_or(candidate);
+        if let Some(workspace_root) = find_bench_workspace_root(&normalized) {
+            return Some(workspace_root);
+        }
+    }
+    None
+}
+
+fn tool_version_command(tool: &str) -> Option<(&'static str, &'static [&'static str])> {
+    match tool {
+        "cargo" => Some(("cargo", &["--version"])),
+        "git" => Some(("git", &["--version"])),
+        "heaptrack" => Some(("heaptrack", &["--version"])),
+        "hyperfine" => Some(("hyperfine", &["--version"])),
+        "rch" => Some(("rch", &["--version"])),
+        "rustc" => Some(("rustc", &["--version"])),
+        "strace" => Some(("strace", &["-V"])),
+        "perf-record" | "perf-stat" | "perf-c2c" | "perf-mem" | "perf-sched-record" => {
+            Some(("perf", &["--version"]))
+        }
+        _ => None,
+    }
+}
+
+fn resolve_hot_path_tool_version(tool: &str) -> Option<String> {
+    let (program, args) = tool_version_command(tool)?;
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if !stdout.is_empty() {
+        return Some(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !stderr.is_empty() {
+        return Some(stderr);
+    }
+    Some("available".to_owned())
+}
+
+fn push_hot_path_tool_version(tool_versions: &mut Vec<BenchmarkArtifactToolVersion>, tool: &str) {
+    if tool_versions.iter().any(|entry| entry.tool == tool) {
+        return;
+    }
+    let version = resolve_hot_path_tool_version(tool).unwrap_or_else(|| "unavailable".to_owned());
+    tool_versions.push(BenchmarkArtifactToolVersion {
+        tool: tool.to_owned(),
+        version,
+    });
+}
+
+fn resolve_hot_path_source_revision(workspace_root: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &workspace_root.display().to_string(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn resolve_hot_path_beads_data_hash(workspace_root: &Path) -> Option<String> {
+    let campaign = load_beads_benchmark_campaign(workspace_root).ok()?;
+    let beads_path = workspace_root.join(campaign.beads_data_relpath);
+    let bytes = fs::read(beads_path).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn resolve_hot_path_artifact_provenance_inputs(
+    command_pack: &HotPathEvidenceCommandPack,
+    output_dir: &Path,
+    golden_dir: &Path,
+    working_base: &Path,
+) -> HotPathArtifactProvenanceInputs {
+    let cargo_profile = current_hot_path_cargo_profile();
+    let environment = EnvironmentMeta::capture(&cargo_profile);
+    let workspace_root = resolve_hot_path_workspace_root(output_dir, golden_dir, working_base);
+    let workspace_root_string = workspace_root
+        .as_ref()
+        .map(|root| root.display().to_string());
+    let campaign_manifest_path = workspace_root.as_ref().and_then(|root| {
+        root.join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE)
+            .is_file()
+            .then(|| BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE.to_owned())
+    });
+    let source_revision = workspace_root
+        .as_ref()
+        .and_then(|root| resolve_hot_path_source_revision(root));
+    let beads_data_hash = workspace_root
+        .as_ref()
+        .and_then(|root| resolve_hot_path_beads_data_hash(root));
+    let mut tool_versions = Vec::new();
+    for tool in ["cargo", "git", "rch", "rustc"] {
+        push_hot_path_tool_version(&mut tool_versions, tool);
+    }
+    for command in &command_pack.commands {
+        push_hot_path_tool_version(&mut tool_versions, &command.tool);
+    }
+    tool_versions.sort_by(|left, right| left.tool.cmp(&right.tool));
+    HotPathArtifactProvenanceInputs {
+        artifact_root: output_dir.display().to_string(),
+        workspace_root: workspace_root_string,
+        campaign_manifest_path,
+        source_revision,
+        beads_data_hash,
+        kernel_release: environment.os,
+        rustc_version: environment.rustc_version,
+        cargo_profile,
+        tool_versions,
+    }
+}
+
+fn build_hot_path_artifact_provenance(
+    report: &HotPathProfileReport,
+    command_pack: &HotPathEvidenceCommandPack,
+    counter_capture_summary: Option<&HotPathCounterCaptureManifestSummary>,
+    inputs: HotPathArtifactProvenanceInputs,
+) -> HotPathArtifactProvenance {
+    let mut commands = Vec::with_capacity(command_pack.commands.len() + 1);
+    commands.push(BenchmarkArtifactCommand {
+        tool: "realdb-e2e".to_owned(),
+        command_line: report.replay_command.clone(),
+    });
+    commands.extend(
+        command_pack
+            .commands
+            .iter()
+            .map(|command| BenchmarkArtifactCommand {
+                tool: command.tool.clone(),
+                command_line: command.command_line.clone(),
+            }),
+    );
+    HotPathArtifactProvenance {
+        row_id: hot_path_row_id(&report.workload, report.concurrency),
+        mode_id: hot_path_mode_id(report.concurrent_mode).to_owned(),
+        artifact_root: inputs.artifact_root,
+        command_entrypoint: report.replay_command.clone(),
+        workspace_root: inputs.workspace_root,
+        campaign_manifest_path: inputs.campaign_manifest_path,
+        source_revision: inputs.source_revision,
+        beads_data_hash: inputs.beads_data_hash,
+        kernel_release: inputs.kernel_release,
+        rustc_version: inputs.rustc_version,
+        cargo_profile: inputs.cargo_profile,
+        commands,
+        tool_versions: inputs.tool_versions,
+        fallback_notes: counter_capture_summary
+            .map_or_else(Vec::new, |summary| summary.fallback_notes.clone()),
+    }
+}
+
 fn finalize_hot_path_manifest(
     output_dir: &Path,
     manifest: HotPathArtifactManifest,
+    counter_capture_summary: Option<HotPathCounterCaptureManifestSummary>,
     extra_files: Vec<HotPathArtifactFile>,
 ) -> io::Result<HotPathArtifactManifest> {
     let mut files: Vec<HotPathArtifactFile> = manifest
@@ -819,7 +1095,11 @@ fn finalize_hot_path_manifest(
             files.push(extra);
         }
     }
-    let mut disk_manifest = HotPathArtifactManifest { files, ..manifest };
+    let mut disk_manifest = HotPathArtifactManifest {
+        files,
+        counter_capture_summary,
+        ..manifest
+    };
     let manifest_json = serde_json::to_string_pretty(&disk_manifest)
         .map_err(|error| io::Error::other(format!("artifact manifest: {error}")))?;
     fs::write(output_dir.join("manifest.json"), manifest_json.as_bytes())?;
@@ -3379,14 +3659,28 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    let manifest = match write_hot_path_profile_artifacts(&report, &output_dir) {
+    let command_pack = build_hot_path_command_pack(&report, &replay_command);
+    let counter_capture_summary = build_hot_path_counter_capture_summary(&command_pack);
+    let provenance_inputs = resolve_hot_path_artifact_provenance_inputs(
+        &command_pack,
+        replay_command.output_dir,
+        replay_command.golden_dir,
+        replay_command.working_base,
+    );
+    let provenance = build_hot_path_artifact_provenance(
+        &report,
+        &command_pack,
+        counter_capture_summary.as_ref(),
+        provenance_inputs,
+    );
+    let mut manifest = match write_hot_path_profile_artifacts(&report, &output_dir) {
         Ok(manifest) => manifest,
         Err(error) => {
             eprintln!("error: failed to write hot-path artifacts: {error}");
             return 1;
         }
     };
-    let command_pack = build_hot_path_command_pack(&report, &replay_command);
+    manifest.provenance = Some(provenance);
     let command_pack_bytes = match write_hot_path_command_pack(&output_dir, &command_pack) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -3397,6 +3691,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
     let manifest = match finalize_hot_path_manifest(
         &output_dir,
         manifest,
+        counter_capture_summary,
         vec![HotPathArtifactFile {
             path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
             bytes: command_pack_bytes,
@@ -4566,7 +4861,41 @@ mod tests {
         HotPathRowMaterializationProfile, HotPathTypeProfile, HotPathValueTypeProfile,
     };
     use fsqlite_e2e::report::{CorrectnessReport, EngineRunReport};
+    use jsonschema::{Draft, options};
     use serde_json::Value;
+
+    fn workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    fn hot_path_manifest_schema_path() -> PathBuf {
+        workspace_root()
+            .join("sample_sqlite_db_files/manifests/hot_path_profile_manifest.v1.schema.json")
+    }
+
+    fn assert_json_schema_valid(schema_raw: &str, doc_raw: &str) {
+        let schema_json: serde_json::Value =
+            serde_json::from_str(schema_raw).expect("parse hot_path_profile_manifest schema");
+        let doc_json: serde_json::Value =
+            serde_json::from_str(doc_raw).expect("parse hot_path_profile manifest");
+        let validator = options()
+            .with_draft(Draft::Draft202012)
+            .build(&schema_json)
+            .expect("build hot_path_profile_manifest validator");
+        let errors: Vec<String> = validator
+            .iter_errors(&doc_json)
+            .map(|error| error.to_string())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "hot_path_profile_manifest schema validation failed:\n- {}",
+            errors.join("\n- ")
+        );
+    }
 
     fn run_with(args: &[&str]) -> i32 {
         let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
@@ -4714,6 +5043,8 @@ mod tests {
             replay_command:
                 "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
                     .to_owned(),
+            counter_capture_summary: None,
+            provenance: None,
             files: vec![
                 HotPathArtifactFile {
                     path: "profile.json".to_owned(),
@@ -4754,37 +5085,26 @@ mod tests {
         }
     }
 
-    fn sample_hot_path_command_pack() -> HotPathEvidenceCommandPack {
-        HotPathEvidenceCommandPack {
-            schema_version: HOT_PATH_COMMAND_PACK_SCHEMA_V2.to_owned(),
-            bead_id: "bd-db300.4.1".to_owned(),
-            run_id: "run-1".to_owned(),
-            trace_id: "trace-1".to_owned(),
-            scenario_id: "bd-db300.4.1.mixed_read_write".to_owned(),
-            fixture_id: "fixture-a".to_owned(),
-            workload: "mixed_read_write".to_owned(),
-            seed: 42,
-            scale: 50,
-            concurrency: 4,
-            concurrent_mode: true,
+    fn sample_hot_path_provenance_inputs() -> HotPathArtifactProvenanceInputs {
+        HotPathArtifactProvenanceInputs {
             artifact_root: "/tmp/out".to_owned(),
-            profiler_safe_replay_command:
-                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
-                    .to_owned(),
-            full_validation_replay_command:
-                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc --integrity-check"
-                    .to_owned(),
-            commands: vec![HotPathEvidenceCommand {
-                capture: "wall_clock".to_owned(),
-                mode: "profiler_safe".to_owned(),
-                tool: "hyperfine".to_owned(),
-                output_relpath: "profiles/hyperfine.profiler_safe.json".to_owned(),
-                command_line:
-                    "mkdir -p /tmp/out/profiles && hyperfine --warmup 1 --runs 5 --export-json /tmp/out/profiles/hyperfine.profiler_safe.json 'rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --workload mixed_read_write --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc'"
-                        .to_owned(),
-                description: "wall-clock benchmark replay for profiler_safe capture".to_owned(),
-                counter_pack: None,
-            }],
+            workspace_root: Some("/workspace".to_owned()),
+            campaign_manifest_path: Some(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE.to_owned()),
+            source_revision: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            beads_data_hash: Some("a".repeat(64)),
+            kernel_release: "Linux 6.13.5-test".to_owned(),
+            rustc_version: "rustc 1.91.0-nightly".to_owned(),
+            cargo_profile: "release-perf".to_owned(),
+            tool_versions: vec![
+                BenchmarkArtifactToolVersion {
+                    tool: "cargo".to_owned(),
+                    version: "cargo 1.91.0-nightly".to_owned(),
+                },
+                BenchmarkArtifactToolVersion {
+                    tool: "hyperfine".to_owned(),
+                    version: "hyperfine 1.19.0".to_owned(),
+                },
+            ],
         }
     }
 
@@ -4911,7 +5231,7 @@ mod tests {
     #[test]
     fn serialize_hot_path_inline_bundle_includes_expected_sections() {
         let report = sample_hot_path_report();
-        let manifest = sample_hot_path_manifest();
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
         let command_pack = build_hot_path_command_pack(
             &report,
             &HotProfileReplayCommand {
@@ -4927,6 +5247,25 @@ mod tests {
                 run_integrity_check: false,
             },
         );
+        let counter_capture_summary = build_hot_path_counter_capture_summary(&command_pack);
+        let mut base_manifest = sample_hot_path_manifest();
+        base_manifest.provenance = Some(build_hot_path_artifact_provenance(
+            &report,
+            &command_pack,
+            counter_capture_summary.as_ref(),
+            sample_hot_path_provenance_inputs(),
+        ));
+        let manifest = finalize_hot_path_manifest(
+            tempdir.path(),
+            base_manifest,
+            counter_capture_summary,
+            vec![HotPathArtifactFile {
+                path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
+                bytes: 1,
+                description: "command pack".to_owned(),
+            }],
+        )
+        .expect("manifest finalization should succeed");
         let text = serialize_hot_path_inline_bundle(&report, &manifest, &command_pack)
             .expect("inline bundle serialization should succeed");
         let value: Value = serde_json::from_str(&text).expect("bundle JSON must parse");
@@ -4962,6 +5301,23 @@ mod tests {
         assert_eq!(value["profile"]["working_base"], "/tmp/working");
         assert_eq!(value["manifest"]["concurrent_mode"], true);
         assert_eq!(value["manifest"]["golden_dir"], "/tmp/golden");
+        assert_eq!(
+            value["manifest"]["counter_capture_summary"]["host_capability_sensitive_captures"][0],
+            "topdown"
+        );
+        assert_eq!(
+            value["manifest"]["counter_capture_summary"]["topology_sensitive_captures"][0],
+            "cache_to_cache"
+        );
+        assert_eq!(
+            value["manifest"]["provenance"]["row_id"],
+            "mixed_read_write_c4"
+        );
+        assert_eq!(value["manifest"]["provenance"]["mode_id"], "fsqlite_mvcc");
+        assert_eq!(
+            value["manifest"]["provenance"]["source_revision"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
         assert_eq!(value["opcode_profile"]["opcodes"][0]["opcode"], "Column");
         assert_eq!(
             value["command_pack"]["commands"][0]["output_relpath"],
@@ -5104,12 +5460,160 @@ mod tests {
     }
 
     #[test]
+    fn build_hot_path_counter_capture_summary_rolls_up_capability_and_fallback_metadata() {
+        let report = sample_hot_path_report();
+        let replay_command = HotProfileReplayCommand {
+            db: "fixture-a",
+            workload: "mixed_read_write",
+            golden_dir: Path::new("/tmp/golden"),
+            working_base: Path::new("/tmp/working"),
+            concurrency: 4,
+            seed: 42,
+            scale: 50,
+            output_dir: Path::new("/tmp/out dir"),
+            mvcc: true,
+            run_integrity_check: false,
+        };
+
+        let pack = build_hot_path_command_pack(&report, &replay_command);
+        let summary = build_hot_path_counter_capture_summary(&pack)
+            .expect("counter pack summary should exist");
+
+        assert_eq!(
+            summary.host_capability_sensitive_captures,
+            vec![
+                "topdown".to_owned(),
+                "cache_to_cache".to_owned(),
+                "migration".to_owned(),
+                "remote_access".to_owned(),
+            ]
+        );
+        assert_eq!(
+            summary.topology_sensitive_captures,
+            vec![
+                "cache_to_cache".to_owned(),
+                "migration".to_owned(),
+                "remote_access".to_owned(),
+            ]
+        );
+        assert!(summary.fallback_tools.iter().any(|tool| tool == "perf-mem"));
+        assert!(
+            summary
+                .fallback_metric_pack
+                .iter()
+                .any(|event| event == "cache-misses")
+        );
+        assert!(summary.fallback_notes.iter().any(|note| {
+            note == "cache_to_cache:profiler_safe: perf c2c unavailable or failed on this host"
+        }));
+        assert!(
+            summary
+                .raw_output_relpaths
+                .iter()
+                .any(|path| { path == "profiles/perf-c2c.profiler_safe.data" })
+        );
+    }
+
+    #[test]
+    fn build_hot_path_artifact_provenance_rolls_up_commands_and_context() {
+        let report = sample_hot_path_report();
+        let replay_command = HotProfileReplayCommand {
+            db: "fixture-a",
+            workload: "mixed_read_write",
+            golden_dir: Path::new("/tmp/golden"),
+            working_base: Path::new("/tmp/working"),
+            concurrency: 4,
+            seed: 42,
+            scale: 50,
+            output_dir: Path::new("/tmp/out"),
+            mvcc: true,
+            run_integrity_check: false,
+        };
+        let command_pack = build_hot_path_command_pack(&report, &replay_command);
+        let counter_capture_summary = build_hot_path_counter_capture_summary(&command_pack);
+        let provenance = build_hot_path_artifact_provenance(
+            &report,
+            &command_pack,
+            counter_capture_summary.as_ref(),
+            sample_hot_path_provenance_inputs(),
+        );
+        let beads_hash = "a".repeat(64);
+
+        assert_eq!(provenance.row_id, "mixed_read_write_c4");
+        assert_eq!(provenance.mode_id, "fsqlite_mvcc");
+        assert_eq!(provenance.artifact_root, "/tmp/out");
+        assert_eq!(provenance.workspace_root.as_deref(), Some("/workspace"));
+        assert_eq!(
+            provenance.campaign_manifest_path.as_deref(),
+            Some(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE)
+        );
+        assert_eq!(
+            provenance.source_revision.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            provenance.beads_data_hash.as_deref(),
+            Some(beads_hash.as_str())
+        );
+        assert_eq!(provenance.kernel_release, "Linux 6.13.5-test");
+        assert_eq!(provenance.rustc_version, "rustc 1.91.0-nightly");
+        assert_eq!(provenance.cargo_profile, "release-perf");
+        assert!(
+            provenance
+                .commands
+                .iter()
+                .any(|command| command.tool == "realdb-e2e"
+                    && command.command_line == report.replay_command)
+        );
+        assert!(provenance.commands.iter().any(
+            |command| command.tool == "hyperfine" && command.command_line.contains("hyperfine")
+        ));
+        assert_eq!(
+            provenance.fallback_notes,
+            counter_capture_summary
+                .expect("counter capture summary should exist")
+                .fallback_notes
+        );
+        assert_eq!(provenance.tool_versions.len(), 2);
+    }
+
+    #[test]
     fn finalize_hot_path_manifest_rewrites_disk_manifest_with_command_pack() {
         let tempdir = tempfile::tempdir().expect("tempdir should succeed");
-        let manifest = sample_hot_path_manifest();
+        let report = sample_hot_path_report();
+        let replay_command = HotProfileReplayCommand {
+            db: "fixture-a",
+            workload: "mixed_read_write",
+            golden_dir: Path::new("/tmp/golden"),
+            working_base: Path::new("/tmp/working"),
+            concurrency: 4,
+            seed: 42,
+            scale: 50,
+            output_dir: Path::new("/tmp/out"),
+            mvcc: true,
+            run_integrity_check: false,
+        };
+        let command_pack = build_hot_path_command_pack(&report, &replay_command);
+        let mut manifest = sample_hot_path_manifest();
+        let provenance = build_hot_path_artifact_provenance(
+            &report,
+            &command_pack,
+            None,
+            sample_hot_path_provenance_inputs(),
+        );
+        manifest.provenance = Some(provenance.clone());
+        let counter_capture_summary = HotPathCounterCaptureManifestSummary {
+            host_capability_sensitive_captures: vec!["topdown".to_owned()],
+            topology_sensitive_captures: vec!["cache_to_cache".to_owned()],
+            fallback_tools: vec!["perf-stat".to_owned()],
+            fallback_metric_pack: vec!["cache-misses".to_owned()],
+            fallback_notes: vec!["cache_to_cache:profiler_safe: perf c2c unavailable".to_owned()],
+            raw_output_relpaths: vec!["profiles/perf-c2c.profiler_safe.data".to_owned()],
+        };
         let finalized = finalize_hot_path_manifest(
             tempdir.path(),
             manifest,
+            Some(counter_capture_summary.clone()),
             vec![HotPathArtifactFile {
                 path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
                 bytes: 77,
@@ -5135,12 +5639,87 @@ mod tests {
                 .iter()
                 .any(|file| file.path == "manifest.json")
         );
+        assert_eq!(
+            disk_manifest.counter_capture_summary,
+            Some(counter_capture_summary.clone())
+        );
+        assert_eq!(disk_manifest.provenance, Some(provenance.clone()));
         assert!(
             finalized
                 .files
                 .iter()
                 .any(|file| file.path == "manifest.json" && file.bytes > 0)
         );
+        assert_eq!(
+            finalized.counter_capture_summary,
+            Some(counter_capture_summary)
+        );
+        assert_eq!(finalized.provenance, Some(provenance));
+    }
+
+    #[test]
+    fn finalized_hot_path_manifest_matches_tracked_json_schema() {
+        let schema_path = hot_path_manifest_schema_path();
+        if !schema_path.is_file() {
+            return;
+        }
+        let schema_raw =
+            fs::read_to_string(&schema_path).expect("read hot_path_profile_manifest schema");
+
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let report = sample_hot_path_report();
+        let replay_command = HotProfileReplayCommand {
+            db: "fixture-a",
+            workload: "mixed_read_write",
+            golden_dir: Path::new("/tmp/golden"),
+            working_base: Path::new("/tmp/working"),
+            concurrency: 4,
+            seed: 42,
+            scale: 50,
+            output_dir: Path::new("/tmp/out"),
+            mvcc: true,
+            run_integrity_check: false,
+        };
+        let command_pack = build_hot_path_command_pack(&report, &replay_command);
+        let counter_capture_summary = HotPathCounterCaptureManifestSummary {
+            host_capability_sensitive_captures: vec![
+                "topdown".to_owned(),
+                "cache_to_cache".to_owned(),
+            ],
+            topology_sensitive_captures: vec!["cache_to_cache".to_owned()],
+            fallback_tools: vec!["perf-stat".to_owned(), "perf-mem".to_owned()],
+            fallback_metric_pack: vec!["cache-misses".to_owned()],
+            fallback_notes: vec![
+                "topdown:profiler_safe: TopdownL1 unsupported on this host".to_owned(),
+                "cache_to_cache:profiler_safe: perf c2c unavailable".to_owned(),
+            ],
+            raw_output_relpaths: vec![
+                "profiles/perf-c2c.profiler_safe.data".to_owned(),
+                "profiles/perf-mem-remote-access.profiler_safe.data".to_owned(),
+            ],
+        };
+        let mut manifest = sample_hot_path_manifest();
+        manifest.provenance = Some(build_hot_path_artifact_provenance(
+            &report,
+            &command_pack,
+            Some(&counter_capture_summary),
+            sample_hot_path_provenance_inputs(),
+        ));
+        let finalized = finalize_hot_path_manifest(
+            tempdir.path(),
+            manifest,
+            Some(counter_capture_summary),
+            vec![HotPathArtifactFile {
+                path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
+                bytes: 77,
+                description: "command pack".to_owned(),
+            }],
+        )
+        .expect("manifest finalization should succeed");
+
+        let manifest_raw =
+            serde_json::to_string_pretty(&finalized).expect("serialize finalized manifest");
+        assert_json_schema_valid(&schema_raw, &manifest_raw);
     }
 
     #[test]

@@ -28,6 +28,7 @@ use fsqlite_core::connection::{
 
 use crate::HarnessSettings;
 use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
+use crate::fixture_select::{BenchmarkArtifactCommand, BenchmarkArtifactToolVersion};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
 use crate::report::EngineRunReport;
@@ -369,6 +370,38 @@ pub struct HotPathArtifactFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathCounterCaptureManifestSummary {
+    pub host_capability_sensitive_captures: Vec<String>,
+    pub topology_sensitive_captures: Vec<String>,
+    pub fallback_tools: Vec<String>,
+    pub fallback_metric_pack: Vec<String>,
+    pub fallback_notes: Vec<String>,
+    pub raw_output_relpaths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathArtifactProvenance {
+    pub row_id: String,
+    pub mode_id: String,
+    pub artifact_root: String,
+    pub command_entrypoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beads_data_hash: Option<String>,
+    pub kernel_release: String,
+    pub rustc_version: String,
+    pub cargo_profile: String,
+    pub commands: Vec<BenchmarkArtifactCommand>,
+    pub tool_versions: Vec<BenchmarkArtifactToolVersion>,
+    pub fallback_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathArtifactManifest {
     pub schema_version: String,
     pub bead_id: String,
@@ -385,6 +418,10 @@ pub struct HotPathArtifactManifest {
     pub golden_dir: Option<String>,
     pub working_base: Option<String>,
     pub replay_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_capture_summary: Option<HotPathCounterCaptureManifestSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<HotPathArtifactProvenance>,
     pub files: Vec<HotPathArtifactFile>,
 }
 
@@ -1182,6 +1219,8 @@ pub fn write_hot_path_profile_artifacts(
         golden_dir: report.golden_dir.clone(),
         working_base: report.working_base.clone(),
         replay_command: report.replay_command.clone(),
+        counter_capture_summary: None,
+        provenance: None,
         files: vec![
             HotPathArtifactFile {
                 path: "profile.json".to_owned(),

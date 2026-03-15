@@ -14,6 +14,7 @@ workspace = true
 
 [features]
 default = []
+tui = ["dep:ftui"]
 
 [dependencies]
 fsqlite = { path = "../fsqlite", version = "0.1.1", default-features = false, features = ["json", "fts5", "rtree"] }
@@ -26,7 +27,7 @@ fsqlite-vdbe = { workspace = true }
 fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.2", default-features = false }
 fsqlite-types = { workspace = true }
 fsqlite-wal = { workspace = true }
-ftui = { workspace = true, features = ["crossterm"] }
+ftui = { workspace = true, features = ["crossterm"], optional = true }
 rusqlite = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
@@ -54,6 +55,7 @@ path = "src/bin/profile_db.rs"
 [[bin]]
 name = "e2e-dashboard"
 path = "src/bin/e2e_dashboard.rs"
+required-features = ["tui"]
 
 [[bin]]
 name = "e2e-runner"
@@ -62,6 +64,7 @@ path = "src/bin/e2e_runner.rs"
 [[bin]]
 name = "e2e-viewer"
 path = "src/bin/e2e_viewer.rs"
+required-features = ["tui"]
 
 [[bin]]
 name = "corruption-demo"

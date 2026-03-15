@@ -20042,6 +20042,15 @@ impl Connection {
             || extra_order_exprs.iter().any(expr_has_any_subquery);
 
         let mut result: Vec<Row> = Vec::with_capacity(combined.len());
+        // For JOIN USING queries, build a skip set reference for use in
+        // column resolution.  The skip set prevents unqualified column
+        // references from finding right-table USING duplicates.
+        let using_skip: Option<&HashSet<usize>> = if using_skip_indices.is_empty() {
+            None
+        } else {
+            Some(&using_skip_indices)
+        };
+
         for row in &combined {
             let mut values = Vec::new();
             for col in columns {
@@ -20070,12 +20079,11 @@ impl Connection {
                     ResultColumn::Expr { expr, .. } => {
                         if has_subqueries && expr_has_any_subquery(expr) {
                             let inlined = self.inline_subqueries_in_expr(expr, row, &col_map)?;
-                            values.push(
-                                eval_join_expr(&inlined, row, &col_map)
-                                    .unwrap_or(SqliteValue::Null),
-                            );
+                            values.push(eval_join_expr_with_using(
+                                &inlined, row, &col_map, using_skip,
+                            ));
                         } else {
-                            values.push(project_join_column(col, row, &col_map));
+                            values.push(eval_join_expr_with_using(expr, row, &col_map, using_skip));
                         }
                     }
                 }
@@ -20083,10 +20091,11 @@ impl Connection {
             for expr in &extra_order_exprs {
                 if has_subqueries && expr_has_any_subquery(expr) {
                     let inlined = self.inline_subqueries_in_expr(expr, row, &col_map)?;
-                    values
-                        .push(eval_join_expr(&inlined, row, &col_map).unwrap_or(SqliteValue::Null));
+                    values.push(eval_join_expr_with_using(
+                        &inlined, row, &col_map, using_skip,
+                    ));
                 } else {
-                    values.push(eval_join_expr(expr, row, &col_map).unwrap_or(SqliteValue::Null));
+                    values.push(eval_join_expr_with_using(expr, row, &col_map, using_skip));
                 }
             }
             result.push(Row { values });
@@ -27328,10 +27337,14 @@ fn dedup_values_collated(
 
 /// Determine the effective collation for an aggregate argument expression
 /// by checking explicit COLLATE first, then looking up the column's
-/// declared collation in the schema.
+/// declared collation in the schema.  Returns `None` for the default
+/// BINARY collation to allow the fast binary-comparison path.
 fn agg_arg_collation(expr: &Expr, schemas: &[TableSchema]) -> Option<String> {
     // Explicit COLLATE takes priority.
     if let Expr::Collate { collation, .. } = expr {
+        if collation.eq_ignore_ascii_case("BINARY") {
+            return None;
+        }
         return Some(collation.clone());
     }
     // Column reference: look up in the schema.
@@ -27347,8 +27360,10 @@ fn agg_arg_collation(expr: &Expr, schemas: &[TableSchema]) -> Option<String> {
                     .iter()
                     .find(|c| c.name.eq_ignore_ascii_case(&cr.column))
                 {
-                    if ci.collation.is_some() {
-                        return ci.collation.clone();
+                    if let Some(ref coll) = ci.collation {
+                        if !coll.eq_ignore_ascii_case("BINARY") {
+                            return Some(coll.clone());
+                        }
                     }
                 }
             }
@@ -32866,6 +32881,29 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         "likely" | "unlikely" => args.first().cloned().unwrap_or(SqliteValue::Null),
         _ => SqliteValue::Null,
     }
+}
+
+/// Evaluate a join expression with optional USING column skip support.
+///
+/// For column references, uses `find_col_in_map` with the `using_skip` set
+/// so that right-table USING duplicates are excluded from unqualified lookup.
+/// For all other expression types, delegates to `eval_join_expr`.
+fn eval_join_expr_with_using(
+    expr: &Expr,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+    using_skip: Option<&HashSet<usize>>,
+) -> SqliteValue {
+    if let Some(skip) = using_skip {
+        if let Expr::Column(col_ref, _) = expr {
+            let col_name = &col_ref.column;
+            let table_prefix = col_ref.table.as_deref();
+            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, Some(skip)) {
+                return row.get(idx).cloned().unwrap_or(SqliteValue::Null);
+            }
+        }
+    }
+    eval_join_expr(expr, row, col_map).unwrap_or(SqliteValue::Null)
 }
 
 /// Project a single result column from a combined join row.

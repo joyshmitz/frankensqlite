@@ -15731,16 +15731,17 @@ fn test_conformance_count_distinct_nocase_group_by_s70b() {
         rconn.execute_batch(s).unwrap();
     }
 
-    let queries = &[
-        "SELECT dept, COUNT(DISTINCT name) FROM cdng GROUP BY dept ORDER BY dept",
-    ];
+    let queries = &["SELECT dept, COUNT(DISTINCT name) FROM cdng GROUP BY dept ORDER BY dept"];
 
     let mismatches = oracle_compare(&fconn, &rconn, queries);
     if !mismatches.is_empty() {
         for m in &mismatches {
             eprintln!("{m}\n");
         }
-        panic!("{} count_distinct_nocase_group mismatches", mismatches.len());
+        panic!(
+            "{} count_distinct_nocase_group mismatches",
+            mismatches.len()
+        );
     }
 }
 
@@ -15957,9 +15958,7 @@ fn test_conformance_insert_returning_expr_s70j() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    let setup = &[
-        "CREATE TABLE ire(id INTEGER PRIMARY KEY, val REAL, label TEXT)",
-    ];
+    let setup = &["CREATE TABLE ire(id INTEGER PRIMARY KEY, val REAL, label TEXT)"];
     for s in setup {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
@@ -15994,9 +15993,7 @@ fn test_conformance_delete_returning_s70k() {
         rconn.execute_batch(s).unwrap();
     }
 
-    let queries = &[
-        "DELETE FROM dr WHERE id > 2 RETURNING id, upper(name)",
-    ];
+    let queries = &["DELETE FROM dr WHERE id > 2 RETURNING id, upper(name)"];
 
     let mismatches = oracle_compare(&fconn, &rconn, queries);
     if !mismatches.is_empty() {
@@ -16053,9 +16050,7 @@ fn test_conformance_update_returning_s70m() {
         rconn.execute_batch(s).unwrap();
     }
 
-    let queries = &[
-        "UPDATE ur SET val = val + 5 WHERE id >= 2 RETURNING id, val",
-    ];
+    let queries = &["UPDATE ur SET val = val + 5 WHERE id >= 2 RETURNING id, val"];
 
     let mismatches = oracle_compare(&fconn, &rconn, queries);
     if !mismatches.is_empty() {

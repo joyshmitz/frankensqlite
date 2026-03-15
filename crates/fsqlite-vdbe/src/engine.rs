@@ -3181,7 +3181,7 @@ fn hash_program(program: &VdbeProgram) -> u64 {
                 mix(hash, value.as_bytes());
             }
             P4::FuncNameCollated(value, coll) => {
-                mix(hash, &[7]);
+                mix(hash, &[13]); // distinct from FuncName tag [7]
                 mix_len(hash, value.len());
                 mix(hash, value.as_bytes());
                 mix_len(hash, coll.len());
@@ -8856,7 +8856,9 @@ impl VdbeEngine {
                         fsqlite_types::record::parse_record_column(&row.blob, col_idx)
                     {
                         value
-                    } else if parse_record(&row.blob).is_some() {
+                    } else if fsqlite_types::record::record_column_count(&row.blob)
+                        .is_some_and(|column_count| col_idx >= column_count)
+                    {
                         SqliteValue::Null
                     } else {
                         return Err(FrankenError::DatabaseCorrupt {

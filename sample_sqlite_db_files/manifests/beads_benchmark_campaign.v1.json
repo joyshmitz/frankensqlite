@@ -349,12 +349,44 @@
   ],
   "artifact_contract": {
     "artifact_root_relpath": "artifacts/perf/bd-db300.1.2",
-    "bundle_dir_template": "{row_id}__{fixture_id}__{mode}__{placement_profile_id}__rev_{source_revision}__beads_{beads_hash}",
+    "bundle_dir_template": "{row_id}__{workload}__c{concurrency}__{fixture_id}__{mode}__{placement_profile_id}__{build_profile_id}__run_{run_id}__rev_{source_revision}__beads_{beads_hash}",
+    "bundle_key_template": "{row_id}:{fixture_id}:{workload}:c{concurrency}:{mode}:{placement_profile_id}:{build_profile_id}:run_{run_id}:rev_{source_revision}:beads_{beads_hash}",
+    "bundle_name_template": "{row_id} {fixture_id} {workload} c{concurrency} {mode} {placement_profile_id} {build_profile_id} run {run_id} rev {source_revision} beads {beads_hash}",
     "manifest_schema_version": "fsqlite-e2e.beads_benchmark_artifact_manifest.v1",
     "result_jsonl_name": "results.jsonl",
     "summary_md_name": "summary.md",
     "manifest_name": "manifest.json",
     "logs_dir_name": "logs",
-    "profiles_dir_name": "profiles"
+    "profiles_dir_name": "profiles",
+    "retention_policies": [
+      {
+        "class": "quick_run",
+        "description": "Ephemeral smoke/profiler-safe run that may be superseded by newer reruns.",
+        "superseded_by_newer": true,
+        "immutable": false,
+        "authoritative": false
+      },
+      {
+        "class": "full_proof",
+        "description": "Full validation/proof-quality bundle kept for before/after comparison.",
+        "superseded_by_newer": false,
+        "immutable": true,
+        "authoritative": true
+      },
+      {
+        "class": "failure_bundle",
+        "description": "Failure bundle kept immutably for diagnosis and replay.",
+        "superseded_by_newer": false,
+        "immutable": true,
+        "authoritative": true
+      },
+      {
+        "class": "final_scorecard",
+        "description": "Published scorecard artifact bundle for final operator-facing comparisons.",
+        "superseded_by_newer": false,
+        "immutable": true,
+        "authoritative": true
+      }
+    ]
   }
 }

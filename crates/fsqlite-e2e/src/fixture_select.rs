@@ -84,9 +84,13 @@ pub const REQUIRED_PLACEMENT_PROFILE_IDS: [&str; 3] = [
 ];
 
 const BUNDLE_DIR_ROW_ID_PLACEHOLDER: &str = "{row_id}";
+const BUNDLE_DIR_WORKLOAD_PLACEHOLDER: &str = "{workload}";
+const BUNDLE_DIR_CONCURRENCY_PLACEHOLDER: &str = "{concurrency}";
 const BUNDLE_DIR_FIXTURE_ID_PLACEHOLDER: &str = "{fixture_id}";
 const BUNDLE_DIR_MODE_PLACEHOLDER: &str = "{mode}";
 const BUNDLE_DIR_PLACEMENT_PROFILE_ID_PLACEHOLDER: &str = "{placement_profile_id}";
+const BUNDLE_DIR_BUILD_PROFILE_ID_PLACEHOLDER: &str = "{build_profile_id}";
+const BUNDLE_DIR_RUN_ID_PLACEHOLDER: &str = "{run_id}";
 const BUNDLE_DIR_SOURCE_REVISION_PLACEHOLDER: &str = "{source_revision}";
 const BUNDLE_DIR_BEADS_HASH_PLACEHOLDER: &str = "{beads_hash}";
 
@@ -120,8 +124,37 @@ impl BenchmarkMode {
     }
 }
 
+/// Retention class for one artifact bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkArtifactRetentionClass {
+    QuickRun,
+    FullProof,
+    FailureBundle,
+    FinalScorecard,
+}
+
+impl BenchmarkArtifactRetentionClass {
+    const ALL: [Self; 4] = [
+        Self::QuickRun,
+        Self::FullProof,
+        Self::FailureBundle,
+        Self::FinalScorecard,
+    ];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::QuickRun => "quick_run",
+            Self::FullProof => "full_proof",
+            Self::FailureBundle => "failure_bundle",
+            Self::FinalScorecard => "final_scorecard",
+        }
+    }
+}
+
 /// One pinned Beads fixture used by the many-core benchmark campaign.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeadsBenchmarkFixture {
     pub fixture_id: String,
     pub source_path: String,
@@ -233,7 +266,7 @@ impl HardwareClassIdFields {
 }
 
 /// Hardware taxonomy attached to canonical matrix rows.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardwareClass {
     pub id: String,
     pub id_fields: HardwareClassIdFields,
@@ -253,7 +286,7 @@ pub struct RetryPolicy {
 }
 
 /// Cargo build profile pinned for benchmark runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildProfile {
     pub id: String,
     pub cargo_profile: String,
@@ -297,12 +330,25 @@ pub struct BeadsBenchmarkMatrixRow {
 pub struct BenchmarkArtifactContract {
     pub artifact_root_relpath: String,
     pub bundle_dir_template: String,
+    pub bundle_key_template: String,
+    pub bundle_name_template: String,
     pub manifest_schema_version: String,
     pub result_jsonl_name: String,
     pub summary_md_name: String,
     pub manifest_name: String,
     pub logs_dir_name: String,
     pub profiles_dir_name: String,
+    pub retention_policies: Vec<BenchmarkArtifactRetentionPolicy>,
+}
+
+/// Retention and mutability contract for one bundle class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkArtifactRetentionPolicy {
+    pub class: BenchmarkArtifactRetentionClass,
+    pub description: String,
+    pub superseded_by_newer: bool,
+    pub immutable: bool,
+    pub authoritative: bool,
 }
 
 /// Stable filenames/directories expected in every per-cell artifact bundle.
@@ -342,9 +388,13 @@ pub struct BenchmarkArtifactPlacementPolicy {
 /// Reusable provenance envelope for benchmark artifact bundles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchmarkArtifactProvenanceEnvelope {
+    pub command_entrypoint: String,
     pub source_revision: String,
     pub beads_data_hash: String,
     pub kernel_release: String,
+    pub fixture: BeadsBenchmarkFixture,
+    pub build_profile: BuildProfile,
+    pub hardware_class: HardwareClass,
     pub placement_policy: BenchmarkArtifactPlacementPolicy,
     pub commands: Vec<BenchmarkArtifactCommand>,
     pub tool_versions: Vec<BenchmarkArtifactToolVersion>,
@@ -368,15 +418,22 @@ pub struct BenchmarkArtifactManifest {
     pub retry_policy_id: String,
     pub build_profile_id: String,
     pub seed_policy_id: String,
+    pub run_id: String,
+    pub artifact_bundle_key: String,
+    pub artifact_bundle_name: String,
     pub artifact_bundle_dir: String,
     pub artifact_bundle_relpath: String,
     pub artifact_names: BenchmarkArtifactNames,
+    pub retention_policy: BenchmarkArtifactRetentionPolicy,
     pub provenance: BenchmarkArtifactProvenanceEnvelope,
 }
 
 /// Dynamic provenance inputs captured while producing a benchmark artifact bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BenchmarkArtifactProvenanceCapture {
+    pub run_id: String,
+    pub retention_class: BenchmarkArtifactRetentionClass,
+    pub command_entrypoint: String,
     pub source_revision: String,
     pub beads_data_hash: String,
     pub kernel_release: String,
@@ -485,18 +542,80 @@ pub fn expand_beads_benchmark_campaign(
 pub fn render_benchmark_bundle_dir(
     contract: &BenchmarkArtifactContract,
     cell: &ExpandedBenchmarkCell,
+    run_id: &str,
     source_revision: &str,
     beads_hash: &str,
 ) -> String {
-    contract
-        .bundle_dir_template
+    render_benchmark_artifact_template(
+        &contract.bundle_dir_template,
+        cell,
+        run_id,
+        source_revision,
+        beads_hash,
+    )
+}
+
+/// Render the stable machine-readable key for one expanded cell.
+#[must_use]
+pub fn render_benchmark_bundle_key(
+    contract: &BenchmarkArtifactContract,
+    cell: &ExpandedBenchmarkCell,
+    run_id: &str,
+    source_revision: &str,
+    beads_hash: &str,
+) -> String {
+    render_benchmark_artifact_template(
+        &contract.bundle_key_template,
+        cell,
+        run_id,
+        source_revision,
+        beads_hash,
+    )
+}
+
+/// Render the stable human-facing bundle name for one expanded cell.
+#[must_use]
+pub fn render_benchmark_bundle_name(
+    contract: &BenchmarkArtifactContract,
+    cell: &ExpandedBenchmarkCell,
+    run_id: &str,
+    source_revision: &str,
+    beads_hash: &str,
+) -> String {
+    render_benchmark_artifact_template(
+        &contract.bundle_name_template,
+        cell,
+        run_id,
+        source_revision,
+        beads_hash,
+    )
+}
+
+fn render_benchmark_artifact_template(
+    template: &str,
+    cell: &ExpandedBenchmarkCell,
+    run_id: &str,
+    source_revision: &str,
+    beads_hash: &str,
+) -> String {
+    template
         .replace(BUNDLE_DIR_ROW_ID_PLACEHOLDER, &cell.row_id)
+        .replace(BUNDLE_DIR_WORKLOAD_PLACEHOLDER, &cell.workload)
+        .replace(
+            BUNDLE_DIR_CONCURRENCY_PLACEHOLDER,
+            &cell.concurrency.to_string(),
+        )
         .replace(BUNDLE_DIR_FIXTURE_ID_PLACEHOLDER, &cell.fixture_id)
         .replace(BUNDLE_DIR_MODE_PLACEHOLDER, cell.mode.as_str())
         .replace(
             BUNDLE_DIR_PLACEMENT_PROFILE_ID_PLACEHOLDER,
             &cell.placement_profile_id,
         )
+        .replace(
+            BUNDLE_DIR_BUILD_PROFILE_ID_PLACEHOLDER,
+            &cell.build_profile_id,
+        )
+        .replace(BUNDLE_DIR_RUN_ID_PLACEHOLDER, run_id)
         .replace(
             BUNDLE_DIR_SOURCE_REVISION_PLACEHOLDER,
             &short_hash(source_revision),
@@ -510,6 +629,7 @@ pub fn benchmark_bundle_path(
     workspace_root: &Path,
     campaign: &BeadsBenchmarkCampaign,
     cell: &ExpandedBenchmarkCell,
+    run_id: &str,
     source_revision: &str,
     beads_hash: &str,
 ) -> PathBuf {
@@ -518,6 +638,7 @@ pub fn benchmark_bundle_path(
         .join(render_benchmark_bundle_dir(
             &campaign.artifact_contract,
             cell,
+            run_id,
             source_revision,
             beads_hash,
         ))
@@ -541,11 +662,35 @@ pub fn benchmark_manifest_path(
     workspace_root: &Path,
     campaign: &BeadsBenchmarkCampaign,
     cell: &ExpandedBenchmarkCell,
+    run_id: &str,
     source_revision: &str,
     beads_hash: &str,
 ) -> PathBuf {
-    benchmark_bundle_path(workspace_root, campaign, cell, source_revision, beads_hash)
-        .join(&campaign.artifact_contract.manifest_name)
+    benchmark_bundle_path(
+        workspace_root,
+        campaign,
+        cell,
+        run_id,
+        source_revision,
+        beads_hash,
+    )
+    .join(&campaign.artifact_contract.manifest_name)
+}
+
+fn artifact_retention_policy<'a>(
+    contract: &'a BenchmarkArtifactContract,
+    retention_class: BenchmarkArtifactRetentionClass,
+) -> Result<&'a BenchmarkArtifactRetentionPolicy, String> {
+    contract
+        .retention_policies
+        .iter()
+        .find(|policy| policy.class == retention_class)
+        .ok_or_else(|| {
+            format!(
+                "artifact contract does not define retention policy `{}`",
+                retention_class.as_str()
+            )
+        })
 }
 
 /// Build the reusable artifact manifest/provenance envelope for one cell.
@@ -560,6 +705,18 @@ pub fn build_benchmark_artifact_manifest(
     cell: &ExpandedBenchmarkCell,
     capture: BenchmarkArtifactProvenanceCapture,
 ) -> Result<BenchmarkArtifactManifest, String> {
+    if capture.run_id.trim().is_empty() {
+        return Err("run_id must not be empty".to_owned());
+    }
+    if !is_contract_id(&capture.run_id) {
+        return Err(format!(
+            "run_id must match [A-Za-z0-9][A-Za-z0-9._:-]*, got {:?}",
+            capture.run_id
+        ));
+    }
+    if capture.command_entrypoint.trim().is_empty() {
+        return Err("command_entrypoint must not be empty".to_owned());
+    }
     if capture.source_revision.trim().is_empty() {
         return Err("source_revision must not be empty".to_owned());
     }
@@ -599,11 +756,29 @@ pub fn build_benchmark_artifact_manifest(
         .iter()
         .find(|profile| profile.id == cell.placement_profile_id)
         .ok_or_else(|| format!("unknown placement profile {}", cell.placement_profile_id))?;
+    let fixture = campaign
+        .fixtures
+        .iter()
+        .find(|fixture| fixture.fixture_id == cell.fixture_id)
+        .ok_or_else(|| format!("unknown fixture {}", cell.fixture_id))?;
+    let build_profile = campaign
+        .build_profiles
+        .iter()
+        .find(|profile| profile.id == cell.build_profile_id)
+        .ok_or_else(|| format!("unknown build profile {}", cell.build_profile_id))?;
+    let hardware_class = campaign
+        .hardware_classes
+        .iter()
+        .find(|hardware| hardware.id == cell.hardware_class_id)
+        .ok_or_else(|| format!("unknown hardware class {}", cell.hardware_class_id))?;
+    let retention_policy =
+        artifact_retention_policy(&campaign.artifact_contract, capture.retention_class)?;
 
     let bundle_path = benchmark_bundle_path(
         workspace_root,
         campaign,
         cell,
+        &capture.run_id,
         &capture.source_revision,
         &capture.beads_data_hash,
     );
@@ -625,6 +800,20 @@ pub fn build_benchmark_artifact_manifest(
                 workspace_root.display()
             )
         })?);
+    let artifact_bundle_key = render_benchmark_bundle_key(
+        &campaign.artifact_contract,
+        cell,
+        &capture.run_id,
+        &capture.source_revision,
+        &capture.beads_data_hash,
+    );
+    let artifact_bundle_name = render_benchmark_bundle_name(
+        &campaign.artifact_contract,
+        cell,
+        &capture.run_id,
+        &capture.source_revision,
+        &capture.beads_data_hash,
+    );
 
     Ok(BenchmarkArtifactManifest {
         schema_version: campaign.artifact_contract.manifest_schema_version.clone(),
@@ -640,13 +829,21 @@ pub fn build_benchmark_artifact_manifest(
         retry_policy_id: cell.retry_policy_id.clone(),
         build_profile_id: cell.build_profile_id.clone(),
         seed_policy_id: cell.seed_policy_id.clone(),
+        run_id: capture.run_id.clone(),
+        artifact_bundle_key,
+        artifact_bundle_name,
         artifact_bundle_dir,
         artifact_bundle_relpath,
         artifact_names: benchmark_artifact_names(&campaign.artifact_contract),
+        retention_policy: retention_policy.clone(),
         provenance: BenchmarkArtifactProvenanceEnvelope {
+            command_entrypoint: capture.command_entrypoint,
             source_revision: capture.source_revision,
             beads_data_hash: capture.beads_data_hash,
             kernel_release: capture.kernel_release,
+            fixture: fixture.clone(),
+            build_profile: build_profile.clone(),
+            hardware_class: hardware_class.clone(),
             placement_policy: BenchmarkArtifactPlacementPolicy {
                 placement_profile_id: cell.placement_profile_id.clone(),
                 hardware_class_id: cell.hardware_class_id.clone(),
@@ -1028,9 +1225,13 @@ pub fn validate_beads_benchmark_campaign(
 
     for placeholder in [
         BUNDLE_DIR_ROW_ID_PLACEHOLDER,
+        BUNDLE_DIR_WORKLOAD_PLACEHOLDER,
+        BUNDLE_DIR_CONCURRENCY_PLACEHOLDER,
         BUNDLE_DIR_FIXTURE_ID_PLACEHOLDER,
         BUNDLE_DIR_MODE_PLACEHOLDER,
         BUNDLE_DIR_PLACEMENT_PROFILE_ID_PLACEHOLDER,
+        BUNDLE_DIR_BUILD_PROFILE_ID_PLACEHOLDER,
+        BUNDLE_DIR_RUN_ID_PLACEHOLDER,
         BUNDLE_DIR_SOURCE_REVISION_PLACEHOLDER,
         BUNDLE_DIR_BEADS_HASH_PLACEHOLDER,
     ] {
@@ -1044,6 +1245,33 @@ pub fn validate_beads_benchmark_campaign(
             ));
         }
     }
+    for (label, template) in [
+        (
+            "artifact bundle_key_template",
+            &campaign.artifact_contract.bundle_key_template,
+        ),
+        (
+            "artifact bundle_name_template",
+            &campaign.artifact_contract.bundle_name_template,
+        ),
+    ] {
+        for placeholder in [
+            BUNDLE_DIR_ROW_ID_PLACEHOLDER,
+            BUNDLE_DIR_WORKLOAD_PLACEHOLDER,
+            BUNDLE_DIR_CONCURRENCY_PLACEHOLDER,
+            BUNDLE_DIR_FIXTURE_ID_PLACEHOLDER,
+            BUNDLE_DIR_MODE_PLACEHOLDER,
+            BUNDLE_DIR_PLACEMENT_PROFILE_ID_PLACEHOLDER,
+            BUNDLE_DIR_BUILD_PROFILE_ID_PLACEHOLDER,
+            BUNDLE_DIR_RUN_ID_PLACEHOLDER,
+            BUNDLE_DIR_SOURCE_REVISION_PLACEHOLDER,
+            BUNDLE_DIR_BEADS_HASH_PLACEHOLDER,
+        ] {
+            if !template.contains(placeholder) {
+                errors.push(format!("{label} must contain placeholder {placeholder}"));
+            }
+        }
+    }
     if campaign.artifact_contract.manifest_schema_version
         != BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1
     {
@@ -1053,12 +1281,51 @@ pub fn validate_beads_benchmark_campaign(
             BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1
         ));
     }
+    for required_class in BenchmarkArtifactRetentionClass::ALL {
+        let matches = campaign
+            .artifact_contract
+            .retention_policies
+            .iter()
+            .filter(|policy| policy.class == required_class)
+            .count();
+        if matches == 0 {
+            errors.push(format!(
+                "artifact retention_policies must define class {}",
+                required_class.as_str()
+            ));
+        }
+        if matches > 1 {
+            errors.push(format!(
+                "artifact retention_policies must not duplicate class {}",
+                required_class.as_str()
+            ));
+        }
+    }
+    for policy in &campaign.artifact_contract.retention_policies {
+        if policy.description.trim().is_empty() {
+            errors.push(format!(
+                "artifact retention policy {} description must not be empty",
+                policy.class.as_str()
+            ));
+        }
+    }
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors.join("\n"))
     }
+}
+
+fn is_contract_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
 }
 
 fn unique_ids<'a>(
@@ -1845,7 +2112,13 @@ mod tests {
             artifact_contract: BenchmarkArtifactContract {
                 artifact_root_relpath: "artifacts/perf/bd-db300.1.2".to_owned(),
                 bundle_dir_template:
-                    "{row_id}__{fixture_id}__{mode}__{placement_profile_id}__rev_{source_revision}__beads_{beads_hash}"
+                    "{row_id}__{workload}__c{concurrency}__{fixture_id}__{mode}__{placement_profile_id}__{build_profile_id}__run_{run_id}__rev_{source_revision}__beads_{beads_hash}"
+                        .to_owned(),
+                bundle_key_template:
+                    "{row_id}:{fixture_id}:{workload}:c{concurrency}:{mode}:{placement_profile_id}:{build_profile_id}:run_{run_id}:rev_{source_revision}:beads_{beads_hash}"
+                        .to_owned(),
+                bundle_name_template:
+                    "{row_id} {fixture_id} {workload} c{concurrency} {mode} {placement_profile_id} {build_profile_id} run {run_id} rev {source_revision} beads {beads_hash}"
                         .to_owned(),
                 manifest_schema_version: BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1.to_owned(),
                 result_jsonl_name: "results.jsonl".to_owned(),
@@ -1853,6 +2126,44 @@ mod tests {
                 manifest_name: "manifest.json".to_owned(),
                 logs_dir_name: "logs".to_owned(),
                 profiles_dir_name: "profiles".to_owned(),
+                retention_policies: vec![
+                    BenchmarkArtifactRetentionPolicy {
+                        class: BenchmarkArtifactRetentionClass::QuickRun,
+                        description:
+                            "Ephemeral smoke/profiler-safe run that may be superseded by newer reruns."
+                                .to_owned(),
+                        superseded_by_newer: true,
+                        immutable: false,
+                        authoritative: false,
+                    },
+                    BenchmarkArtifactRetentionPolicy {
+                        class: BenchmarkArtifactRetentionClass::FullProof,
+                        description:
+                            "Full validation/proof-quality bundle kept for before/after comparison."
+                                .to_owned(),
+                        superseded_by_newer: false,
+                        immutable: true,
+                        authoritative: true,
+                    },
+                    BenchmarkArtifactRetentionPolicy {
+                        class: BenchmarkArtifactRetentionClass::FailureBundle,
+                        description:
+                            "Failure bundle kept immutably for diagnosis and replay."
+                                .to_owned(),
+                        superseded_by_newer: false,
+                        immutable: true,
+                        authoritative: true,
+                    },
+                    BenchmarkArtifactRetentionPolicy {
+                        class: BenchmarkArtifactRetentionClass::FinalScorecard,
+                        description:
+                            "Published scorecard artifact bundle for final operator-facing comparisons."
+                                .to_owned(),
+                        superseded_by_newer: false,
+                        immutable: true,
+                        authoritative: true,
+                    },
+                ],
             },
         }
     }
@@ -2216,9 +2527,12 @@ mod tests {
         let rendered = render_benchmark_bundle_dir(
             &campaign.artifact_contract,
             &cell,
+            "run-20260315T015800Z",
             "0123456789abcdef",
             "fedcba9876543210",
         );
+        assert!(rendered.starts_with("mixed_read_write_c4__mixed_read_write__c4__frankensqlite"));
+        assert!(rendered.contains("__release_perf__run_run-20260315T015800Z"));
         assert!(rendered.contains("__rev_0123456789ab"));
         assert!(rendered.contains("__beads_fedcba987654"));
     }
@@ -2243,6 +2557,10 @@ mod tests {
             &campaign,
             &cell,
             BenchmarkArtifactProvenanceCapture {
+                run_id: "run-20260315T015800Z".to_owned(),
+                retention_class: BenchmarkArtifactRetentionClass::FullProof,
+                command_entrypoint: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile"
+                    .to_owned(),
                 source_revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
                 beads_data_hash: "a".repeat(64),
                 kernel_release: "Linux 6.13.5-test".to_owned(),
@@ -2273,24 +2591,86 @@ mod tests {
         assert_eq!(manifest.row_id, "mixed_read_write_c4");
         assert_eq!(manifest.fixture_id, "frankensqlite");
         assert_eq!(manifest.mode, BenchmarkMode::SqliteReference);
+        assert_eq!(manifest.run_id, "run-20260315T015800Z");
         assert_eq!(manifest.artifact_names.manifest_json, "manifest.json");
         assert!(
             manifest
                 .artifact_bundle_relpath
                 .starts_with("artifacts/perf/bd-db300.1.2/")
         );
+        assert!(manifest.artifact_bundle_dir.contains(
+            "__release_perf__run_run-20260315T015800Z__rev_0123456789ab__beads_aaaaaaaaaaaa"
+        ));
+        assert_eq!(
+            manifest.artifact_bundle_key,
+            "mixed_read_write_c4:frankensqlite:mixed_read_write:c4:sqlite_reference:baseline_unpinned:release_perf:run_run-20260315T015800Z:rev_0123456789ab:beads_aaaaaaaaaaaa"
+        );
         assert!(
             manifest
-                .artifact_bundle_dir
-                .contains("__rev_0123456789ab__beads_aaaaaaaaaaaa")
+                .artifact_bundle_name
+                .contains("mixed_read_write_c4 frankensqlite mixed_read_write c4")
+        );
+        assert_eq!(
+            manifest.retention_policy.class,
+            BenchmarkArtifactRetentionClass::FullProof
         );
         assert_eq!(
             manifest.provenance.placement_policy.placement_profile_id,
             PLACEMENT_PROFILE_BASELINE_UNPINNED
         );
+        assert_eq!(
+            manifest.provenance.command_entrypoint,
+            "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile"
+        );
+        assert_eq!(manifest.provenance.fixture.source_sha256.len(), 64);
+        assert_eq!(
+            manifest.provenance.build_profile.cargo_profile,
+            "release-perf"
+        );
+        assert_eq!(
+            manifest.provenance.hardware_class.id,
+            HARDWARE_CLASS_LINUX_X86_64_ANY
+        );
         assert_eq!(manifest.provenance.commands.len(), 1);
         assert_eq!(manifest.provenance.tool_versions.len(), 2);
         assert_eq!(manifest.provenance.fallback_notes.len(), 1);
+    }
+
+    #[test]
+    fn test_build_benchmark_artifact_manifest_rejects_invalid_run_id() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let campaign = sample_campaign(tempdir.path());
+        let cell = expand_beads_benchmark_campaign(&campaign)
+            .into_iter()
+            .next()
+            .expect("sample campaign should produce one cell");
+
+        let error = build_benchmark_artifact_manifest(
+            tempdir.path(),
+            &campaign,
+            &cell,
+            BenchmarkArtifactProvenanceCapture {
+                run_id: "bad/run/id".to_owned(),
+                retention_class: BenchmarkArtifactRetentionClass::QuickRun,
+                command_entrypoint: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile"
+                    .to_owned(),
+                source_revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                beads_data_hash: "a".repeat(64),
+                kernel_release: "Linux 6.13.5-test".to_owned(),
+                commands: vec![BenchmarkArtifactCommand {
+                    tool: "rch".to_owned(),
+                    command_line: "rch exec -- cargo test -p fsqlite-e2e".to_owned(),
+                }],
+                tool_versions: vec![BenchmarkArtifactToolVersion {
+                    tool: "cargo".to_owned(),
+                    version: "cargo 1.91.0-nightly".to_owned(),
+                }],
+                fallback_notes: Vec::new(),
+            },
+        )
+        .expect_err("invalid run ids must be rejected");
+
+        assert!(error.contains("run_id must match"));
     }
 
     #[test]
@@ -2428,6 +2808,10 @@ mod tests {
             &campaign,
             &cell,
             BenchmarkArtifactProvenanceCapture {
+                run_id: "run-20260315T020100Z".to_owned(),
+                retention_class: BenchmarkArtifactRetentionClass::FailureBundle,
+                command_entrypoint: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile"
+                    .to_owned(),
                 source_revision: "fedcba9876543210fedcba9876543210fedcba98".to_owned(),
                 beads_data_hash: "b".repeat(64),
                 kernel_release: "Linux 6.13.5-test".to_owned(),
@@ -2484,6 +2868,7 @@ mod tests {
             workspace_root,
             &campaign,
             &cell,
+            "run-20260315T020400Z",
             "0123456789abcdef",
             "abcdef0123456789fedcba9876543210",
         );
@@ -2493,7 +2878,7 @@ mod tests {
         assert_eq!(
             relative,
             Path::new(
-                "artifacts/perf/bd-db300.1.2/mixed_read_write_c8__frankensqlite__fsqlite_mvcc__recommended_pinned__rev_0123456789ab__beads_abcdef012345"
+                "artifacts/perf/bd-db300.1.2/mixed_read_write_c8__mixed_read_write__c8__frankensqlite__fsqlite_mvcc__recommended_pinned__release_perf__run_run-20260315T020400Z__rev_0123456789ab__beads_abcdef012345"
             )
         );
     }

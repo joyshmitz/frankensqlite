@@ -211,6 +211,62 @@ require_topology_counter_pack_contract() {
         || fail "verification" "command-pack topology counter metadata contract failed for ${path}"
 }
 
+require_manifest_counter_capture_summary() {
+    local path="$1"
+
+    require_nonempty_file "${path}"
+    jq -e '
+        (.counter_capture_summary != null)
+        and (.counter_capture_summary.host_capability_sensitive_captures
+            == ["topdown","cache_to_cache","migration","remote_access"])
+        and (.counter_capture_summary.topology_sensitive_captures
+            == ["cache_to_cache","migration","remote_access"])
+        and (.counter_capture_summary.fallback_tools | index("perf-stat") != null)
+        and (.counter_capture_summary.fallback_tools | index("perf-mem") != null)
+        and (.counter_capture_summary.fallback_metric_pack | index("cache-misses") != null)
+        and (.counter_capture_summary.fallback_notes
+            | map(select(startswith("cache_to_cache:") or startswith("migration:") or startswith("remote_access:") or startswith("topdown:")))
+            | length >= 4)
+        and (.counter_capture_summary.raw_output_relpaths
+            | index("profiles/perf-c2c.profiler_safe.data") != null)
+        and (.counter_capture_summary.raw_output_relpaths
+            | index("profiles/perf-mem-remote-access.profiler_safe.data") != null)
+    ' "${path}" > /dev/null \
+        || fail "verification" "manifest counter-capture summary contract failed for ${path}"
+}
+
+require_manifest_provenance() {
+    local path="$1"
+
+    require_nonempty_file "${path}"
+    jq -e '
+        (.provenance != null)
+        and (.provenance.row_id | type == "string" and length > 0)
+        and (.provenance.mode_id | IN("fsqlite_mvcc"; "fsqlite_single_writer"))
+        and (.provenance.artifact_root | type == "string" and length > 0)
+        and (.provenance.command_entrypoint | contains("hot-profile"))
+        and (.provenance.workspace_root | type == "string" and length > 0)
+        and (.provenance.campaign_manifest_path
+            == "sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json")
+        and (.provenance.source_revision | type == "string" and length >= 12)
+        and (.provenance.beads_data_hash | test("^[0-9a-f]{64}$"))
+        and (.provenance.kernel_release | type == "string" and length > 0)
+        and (.provenance.rustc_version | contains("rustc "))
+        and (.provenance.cargo_profile | type == "string" and length > 0)
+        and (.provenance.commands | length >= 19)
+        and ([.provenance.commands[] | select(.tool == "realdb-e2e")] | length == 1)
+        and ([.provenance.commands[] | select(.tool == "hyperfine")] | length == 2)
+        and ([.provenance.commands[] | select(.tool == "perf-c2c")] | length == 2)
+        and (.provenance.tool_versions | length >= 2)
+        and ([.provenance.tool_versions[] | select(.tool == "cargo")] | length == 1)
+        and ([.provenance.tool_versions[] | select(.tool == "hyperfine")] | length == 1)
+        and (.provenance.fallback_notes
+            | map(select(startswith("cache_to_cache:") or startswith("migration:") or startswith("remote_access:") or startswith("topdown:")))
+            | length >= 4)
+    ' "${path}" > /dev/null \
+        || fail "verification" "manifest provenance contract failed for ${path}"
+}
+
 preseed_output_bundle() {
     local scenario_dir="$1"
 
@@ -407,6 +463,8 @@ run_hot_profile() {
     require_topology_counter_pack_contract "${scenario_dir}/command_pack.json"
     require_nonempty_file "${scenario_dir}/summary.md"
     require_json_schema "${scenario_dir}/manifest.json" "${HOT_PATH_PROFILE_MANIFEST_SCHEMA}"
+    require_manifest_counter_capture_summary "${scenario_dir}/manifest.json"
+    require_manifest_provenance "${scenario_dir}/manifest.json"
     capture_run_record "${scenario_id}" "${fixture_id}" "${mode_id}" "${scenario_dir}" "${stdout_log}" "${stderr_log}"
     log_event "INFO" "run" "completed ${scenario_id} fixture=${fixture_id} mode=${mode_id}"
 }
@@ -489,11 +547,22 @@ build_command_packs() {
         --arg run_id "${RUN_ID}" \
         --arg generated_at "${GENERATED_AT}" \
         '
+        def aggregate_counter_capture_summary:
+            [ .[] | .manifest.counter_capture_summary // empty ] as $summaries
+            | {
+                host_capability_sensitive_captures: ($summaries | map(.host_capability_sensitive_captures // []) | add | unique),
+                topology_sensitive_captures: ($summaries | map(.topology_sensitive_captures // []) | add | unique),
+                fallback_tools: ($summaries | map(.fallback_tools // []) | add | unique),
+                fallback_metric_pack: ($summaries | map(.fallback_metric_pack // []) | add | unique),
+                fallback_notes: ($summaries | map(.fallback_notes // []) | add | unique),
+                raw_output_relpaths: ($summaries | map(.raw_output_relpaths // []) | add | unique)
+            };
         {
             schema_version: "fsqlite-e2e.hot_path_campaign_command_packs.v1",
             bead_id: $bead_id,
             run_id: $run_id,
             generated_at: $generated_at,
+            counter_capture_summary: aggregate_counter_capture_summary,
             runs: [
                 .[] | {
                     scenario_id,
@@ -501,6 +570,7 @@ build_command_packs() {
                     mode_id,
                     engine_label,
                     output_dir,
+                    counter_capture_summary: .manifest.counter_capture_summary,
                     command_pack
                 }
             ]
@@ -520,6 +590,16 @@ build_benchmark_context() {
         --arg mode_ids_csv "${MODE_IDS_CSV}" \
         --argjson expected_runs "${expected_runs}" \
         '
+        def aggregate_counter_capture_summary:
+            [ .[] | .manifest.counter_capture_summary // empty ] as $summaries
+            | {
+                host_capability_sensitive_captures: ($summaries | map(.host_capability_sensitive_captures // []) | add | unique),
+                topology_sensitive_captures: ($summaries | map(.topology_sensitive_captures // []) | add | unique),
+                fallback_tools: ($summaries | map(.fallback_tools // []) | add | unique),
+                fallback_metric_pack: ($summaries | map(.fallback_metric_pack // []) | add | unique),
+                fallback_notes: ($summaries | map(.fallback_notes // []) | add | unique),
+                raw_output_relpaths: ($summaries | map(.raw_output_relpaths // []) | add | unique)
+            };
         {
             schema_version: "fsqlite-e2e.hot_path_campaign_context.v1",
             bead_id: $bead_id,
@@ -532,6 +612,7 @@ build_benchmark_context() {
             mode_ids: ($mode_ids_csv | split(",") | map(select(length > 0))),
             expected_runs: $expected_runs,
             completed_runs: length,
+            counter_capture_summary: aggregate_counter_capture_summary,
             runs: [
                 .[] | {
                     scenario_id,
@@ -777,7 +858,11 @@ build_summary_md() {
             "- fixture_ids: `\(.fixture_ids | join(","))`",
             "- mode_ids: `\(.mode_ids | join(","))`",
             "- expected_runs: `\(.expected_runs)`",
-            "- completed_runs: `\(.completed_runs)`"
+            "- completed_runs: `\(.completed_runs)`",
+            "- counter_capture_host_sensitive: `\(.counter_capture_summary.host_capability_sensitive_captures | join(","))`",
+            "- counter_capture_topology_sensitive: `\(.counter_capture_summary.topology_sensitive_captures | join(","))`",
+            "- counter_capture_fallback_tools: `\(.counter_capture_summary.fallback_tools | join(","))`",
+            "- counter_capture_fallback_metrics: `\(.counter_capture_summary.fallback_metric_pack | join(","))`"
         ]
         | .[]
     ' "${BENCHMARK_CONTEXT_JSON}")"
@@ -919,6 +1004,7 @@ build_report_json() {
             mode_ids: ($mode_ids_csv | split(",") | map(select(length > 0))),
             expected_runs: $expected_runs,
             completed_runs: ($benchmark_context_doc[0].completed_runs // null),
+            counter_capture_summary: ($benchmark_context_doc[0].counter_capture_summary // null),
             replay: {
                 command: $replay_command
             },
@@ -984,6 +1070,7 @@ build_report_json
 
 jq -e '.runs | length >= 1' "${SCENARIO_PROFILES_JSON}" >/dev/null
 jq -e '.runs | length >= 1' "${COMMAND_PACKS_JSON}" >/dev/null
+jq -e '.counter_capture_summary.host_capability_sensitive_captures | length >= 1' "${COMMAND_PACKS_JSON}" >/dev/null
 jq -e '.named_hotspots | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.cost_components | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.allocator_pressure | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
@@ -991,6 +1078,8 @@ jq -e '.named_hotspots | all(has("confidence_label") and has("confidence_score_b
 jq -e '.cost_components | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.allocator_pressure | all(has("confidence_label") and has("confidence_score_basis_points"))' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.runs | length == '"${expected_runs}" "${BENCHMARK_CONTEXT_JSON}" >/dev/null
+jq -e '.counter_capture_summary.host_capability_sensitive_captures | length >= 1' "${BENCHMARK_CONTEXT_JSON}" >/dev/null
+jq -e '.counter_capture_summary.host_capability_sensitive_captures | length >= 1' "${REPORT_JSON}" >/dev/null
 
 log_event "INFO" "complete" "inline D1 hot-path campaign completed"
 echo "RUN_ID:              ${RUN_ID}"

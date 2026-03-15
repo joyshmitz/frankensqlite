@@ -125,6 +125,15 @@
         "topology_aware"
       ]
     },
+    "retention_class": {
+      "type": "string",
+      "enum": [
+        "quick_run",
+        "full_proof",
+        "failure_bundle",
+        "final_scorecard"
+      ]
+    },
     "hardware_os_family": {
       "type": "string",
       "enum": [
@@ -442,18 +451,27 @@
       "required": [
         "artifact_root_relpath",
         "bundle_dir_template",
+        "bundle_key_template",
+        "bundle_name_template",
         "manifest_schema_version",
         "result_jsonl_name",
         "summary_md_name",
         "manifest_name",
         "logs_dir_name",
-        "profiles_dir_name"
+        "profiles_dir_name",
+        "retention_policies"
       ],
       "properties": {
         "artifact_root_relpath": {
           "$ref": "#/$defs/non_empty_string"
         },
         "bundle_dir_template": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "bundle_key_template": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "bundle_name_template": {
           "$ref": "#/$defs/non_empty_string"
         },
         "manifest_schema_version": {
@@ -474,6 +492,41 @@
         },
         "profiles_dir_name": {
           "$ref": "#/$defs/non_empty_string"
+        },
+        "retention_policies": {
+          "type": "array",
+          "minItems": 4,
+          "items": {
+            "$ref": "#/$defs/retention_policy"
+          }
+        }
+      }
+    },
+    "retention_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "description",
+        "superseded_by_newer",
+        "immutable",
+        "authoritative"
+      ],
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/retention_class"
+        },
+        "description": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "superseded_by_newer": {
+          "type": "boolean"
+        },
+        "immutable": {
+          "type": "boolean"
+        },
+        "authoritative": {
+          "type": "boolean"
         }
       }
     }

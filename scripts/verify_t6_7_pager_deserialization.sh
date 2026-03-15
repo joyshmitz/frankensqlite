@@ -45,7 +45,7 @@ capture_source_snapshot() {
       return 1
     fi
 
-    rel_path="${path#${WORKSPACE_ROOT}/}"
+    rel_path="${path#"${WORKSPACE_ROOT}"/}"
     sha256="$(sha256sum "${path}" | awk '{print $1}')"
     mtime_epoch="$(stat -c '%Y' "${path}")"
     mtime_iso="$(date -u -d "@${mtime_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
@@ -385,10 +385,10 @@ jq -n \
   echo "- watched source snapshot JSON: \`${SOURCE_SNAPSHOT_JSON}\`"
   echo
   echo "This gate combines three evidence layers:"
-  echo "- published-read and snapshot-publication traces from `fsqlite-pager`"
-  echo "- file-backed strict-visibility routing traces from `fsqlite-core`"
-  echo "- explicit hold/wait metrics harvested from the existing deterministic publish-window benchmark"
-  echo "- a watched-source snapshot that invalidates the run if `pager.rs`, `connection.rs`, or this gate changes mid-flight"
+  printf '%s\n' "- published-read and snapshot-publication traces from \`fsqlite-pager\`"
+  printf '%s\n' "- file-backed strict-visibility routing traces from \`fsqlite-core\`"
+  printf '%s\n' "- explicit hold/wait metrics harvested from the existing deterministic publish-window benchmark"
+  printf '%s\n' "- a watched-source snapshot that invalidates the run if \`pager.rs\`, \`connection.rs\`, or this gate changes mid-flight"
   echo
   echo "| Scenario | Candidate Hold Median (ns) | Candidate Wait Median (ns) | Serialized Reason | Backend Identity |"
   echo "| --- | ---: | ---: | --- | --- |"
@@ -398,7 +398,7 @@ jq -n \
   ' "${REPORT_JSON}"
   echo
   echo "Checkpoint gate evidence:"
-  echo "- `test_checkpoint_busy_with_active_writer` passed and the gate emitted a structured event with `serialized_reason=checkpoint_active_busy`"
+  printf '%s\n' "- \`test_checkpoint_busy_with_active_writer\` passed and the gate emitted a structured event with \`serialized_reason=checkpoint_active_busy\`"
   echo
   echo "Watched source snapshot:"
   jq -r '

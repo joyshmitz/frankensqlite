@@ -287,13 +287,19 @@ ad hoc shell history:
   with identifier fields `os_family`, `cpu_arch`, `topology_class`
 
 Artifact names for canonical runs must include the source revision and the
-`.beads/issues.jsonl` hash so results stay mechanically diffable over time. The
-tracked templates are:
+`.beads/issues.jsonl` hash so results stay mechanically diffable over time, and
+they now also carry the build-profile id and explicit run id. The tracked
+templates are:
 
 ```text
-bundle dir: {row_id}__{fixture_id}__{mode}__{placement_profile_id}__rev_{source_revision}__beads_{beads_hash}
+bundle dir: {row_id}__{workload}__c{concurrency}__{fixture_id}__{mode}__{placement_profile_id}__{build_profile_id}__run_{run_id}__rev_{source_revision}__beads_{beads_hash}
+bundle key: {row_id}:{fixture_id}:{workload}:c{concurrency}:{mode}:{placement_profile_id}:{build_profile_id}:run_{run_id}:rev_{source_revision}:beads_{beads_hash}
+bundle name: {row_id} {fixture_id} {workload} c{concurrency} {mode} {placement_profile_id} {build_profile_id} run {run_id} rev {source_revision} beads {beads_hash}
 files: results.jsonl, summary.md, manifest.json, logs/, profiles/
 ```
+
+Retention classes are part of the contract as well: `quick_run`,
+`full_proof`, `failure_bundle`, and `final_scorecard`.
 
 For CPU-heavy canonical runs, offload through `rch` and use the manifest as the
 source of truth for dimensions and naming:
