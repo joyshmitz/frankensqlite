@@ -153,6 +153,20 @@ pub trait WalBackend: Send {
         Ok(None)
     }
 
+    /// Optionally finalize a prepared batch before the serialized append.
+    ///
+    /// Backends can use this hook to move seed-dependent checksum stamping or
+    /// similar pure compute out of the exclusive publish window. Callers must
+    /// still tolerate the backend redoing that work later if the live append
+    /// state changed before the actual write.
+    fn finalize_prepared_frames(
+        &mut self,
+        _cx: &Cx,
+        _prepared: &mut PreparedWalFrameBatch,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Append a previously prepared frame batch.
     ///
     /// The default path rebuilds borrowed frame refs and delegates back to
@@ -258,6 +272,33 @@ pub struct PreparedWalChecksumTransform {
     pub c2: u32,
 }
 
+/// Rolling-checksum seed/result captured for a prepared WAL batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreparedWalChecksumSeed {
+    /// First checksum word.
+    pub s1: u32,
+    /// Second checksum word.
+    pub s2: u32,
+}
+
+/// Live WAL state that a prepared batch was finalized against.
+///
+/// This lets the append path cheaply decide whether a pre-lock finalize pass
+/// is still valid once the serialized publish window opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreparedWalFinalizationState {
+    /// WAL checkpoint sequence for the generation being appended to.
+    pub checkpoint_seq: u32,
+    /// WAL salt1 for the generation being appended to.
+    pub salt1: u32,
+    /// WAL salt2 for the generation being appended to.
+    pub salt2: u32,
+    /// Frame index where this batch expects to start appending.
+    pub start_frame_index: usize,
+    /// Rolling checksum seed seen before finalizing this batch.
+    pub seed: PreparedWalChecksumSeed,
+}
+
 /// Owned WAL batch representation that can be prepared before append.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedWalFrameBatch {
@@ -271,6 +312,12 @@ pub struct PreparedWalFrameBatch {
     pub checksum_transforms: Vec<PreparedWalChecksumTransform>,
     /// Serialized frame bytes in order.
     pub frame_bytes: Vec<u8>,
+    /// Offset of the last commit frame inside this batch, if any.
+    pub last_commit_frame_offset: Option<usize>,
+    /// WAL state that `frame_bytes` were last finalized against.
+    pub finalized_for: Option<PreparedWalFinalizationState>,
+    /// Final running checksum after the last finalize pass.
+    pub finalized_running_checksum: Option<PreparedWalChecksumSeed>,
 }
 
 impl PreparedWalFrameBatch {

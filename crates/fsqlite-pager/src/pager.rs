@@ -2278,6 +2278,12 @@ where
                 })?;
                 wal.prepare_append_frames(&batch.frames)?
             };
+            if let Some(prepared_batch) = prepared_batch.as_mut() {
+                let wal = inner.wal_backend.as_mut().ok_or_else(|| {
+                    FrankenError::internal("WAL mode active but no WAL backend installed")
+                })?;
+                wal.finalize_prepared_frames(cx, prepared_batch)?;
+            }
 
             // Escalate to EXCLUSIVE before writing WAL frames.
             // This prevents concurrent processes from appending to the WAL
@@ -6192,6 +6198,13 @@ mod tests {
                 frame_metas,
                 checksum_transforms,
                 frame_bytes,
+                last_commit_frame_offset: frames
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(offset, frame)| (frame.db_size_if_commit != 0).then_some(offset)),
+                finalized_for: None,
+                finalized_running_checksum: None,
             }))
         }
 
@@ -6823,6 +6836,13 @@ mod tests {
                 frame_metas,
                 checksum_transforms,
                 frame_bytes,
+                last_commit_frame_offset: frames
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(offset, frame)| (frame.db_size_if_commit != 0).then_some(offset)),
+                finalized_for: None,
+                finalized_running_checksum: None,
             }))
         }
 

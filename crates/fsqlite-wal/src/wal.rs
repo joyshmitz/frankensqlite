@@ -797,29 +797,57 @@ impl<F: VfsFile> WalFile<F> {
         Ok(frame_buf)
     }
 
-    /// Finalize checksums for a previously prepared frame buffer and append it.
+    /// Check whether the on-disk WAL still matches a previously observed
+    /// append window.
     ///
-    /// `prepared_frame_bytes` must contain `frame_transforms.len()` frame
-    /// records in WAL frame layout with page number, db_size, salts, and
-    /// payload already serialized. The checksum bytes are overwritten in-place
-    /// using the live rolling checksum seed from this WAL handle.
-    pub fn append_prepared_frame_bytes(
+    /// This is a cheap ABA-resistant probe used after a pre-lock finalize
+    /// pass. If the generation identity and frame count still match, no other
+    /// writer could have changed the append seed or target offset.
+    pub fn prepared_append_window_still_current(
         &mut self,
         cx: &Cx,
-        prepared_frame_bytes: &mut [u8],
-        frame_transforms: &[WalChecksumTransform],
-    ) -> Result<()> {
-        let frame_count = frame_transforms.len();
-        if frame_count == 0 {
-            return Ok(());
+        generation: WalGenerationIdentity,
+        start_frame_index: usize,
+    ) -> Result<bool> {
+        let expected_size = u64::try_from(WAL_HEADER_SIZE)
+            .expect("WAL header size fits u64")
+            .saturating_add(
+                u64::try_from(start_frame_index)
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(u64::try_from(self.frame_size()).unwrap_or(u64::MAX)),
+            );
+        if self.file.file_size(cx)? != expected_size {
+            return Ok(false);
         }
 
-        let new_count = self
-            .frame_count
-            .checked_add(frame_count)
-            .ok_or(FrankenError::DatabaseFull)?;
-        if new_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
-            return Err(FrankenError::DatabaseFull);
+        let mut header_buf = [0u8; WAL_HEADER_SIZE];
+        let header_read = self.file.read(cx, &mut header_buf, 0)?;
+        if header_read < WAL_HEADER_SIZE {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL file too small for header during prepared append validation: read {header_read}, need {WAL_HEADER_SIZE}"
+                ),
+            });
+        }
+
+        let disk_header = WalHeader::from_bytes(&header_buf)?;
+        Ok(WalGenerationIdentity::from_header(&disk_header) == generation)
+    }
+
+    /// Finalize a previously prepared frame buffer against the current live
+    /// rolling checksum seed.
+    ///
+    /// This mutates the frame checksum fields in-place and returns the final
+    /// running checksum that should become authoritative after the eventual
+    /// durable append succeeds.
+    pub fn finalize_prepared_frame_bytes(
+        &self,
+        prepared_frame_bytes: &mut [u8],
+        frame_transforms: &[WalChecksumTransform],
+    ) -> Result<SqliteWalChecksum> {
+        let frame_count = frame_transforms.len();
+        if frame_count == 0 {
+            return Ok(self.running_checksum);
         }
 
         let frame_size = self.frame_size();
@@ -845,23 +873,48 @@ impl<F: VfsFile> WalFile<F> {
             write_wal_frame_checksum_fields(frame_slice, running_checksum)?;
         }
 
-        let start_frame_index = self.frame_count;
-        let last_commit_offset = prepared_frame_bytes
-            .chunks_exact(frame_size)
-            .enumerate()
-            .rev()
-            .find_map(|(offset, frame_slice)| {
-                let db_size_if_commit = u32::from_be_bytes([
-                    frame_slice[4],
-                    frame_slice[5],
-                    frame_slice[6],
-                    frame_slice[7],
-                ]);
-                (db_size_if_commit != 0).then_some(offset)
+        Ok(running_checksum)
+    }
+
+    /// Append a batch whose frame bytes were already finalized against the
+    /// current append window.
+    pub fn append_finalized_prepared_frame_bytes(
+        &mut self,
+        cx: &Cx,
+        prepared_frame_bytes: &[u8],
+        frame_count: usize,
+        final_running_checksum: SqliteWalChecksum,
+        last_commit_offset: Option<usize>,
+    ) -> Result<()> {
+        if frame_count == 0 {
+            return Ok(());
+        }
+
+        let new_count = self
+            .frame_count
+            .checked_add(frame_count)
+            .ok_or(FrankenError::DatabaseFull)?;
+        if new_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+
+        let frame_size = self.frame_size();
+        let expected_bytes = frame_count
+            .checked_mul(frame_size)
+            .ok_or(FrankenError::DatabaseFull)?;
+        if prepared_frame_bytes.len() != expected_bytes {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "prepared batch byte length mismatch: expected {expected_bytes}, got {}",
+                    prepared_frame_bytes.len()
+                ),
             });
+        }
+
+        let start_frame_index = self.frame_count;
         let offset = self.frame_offset(start_frame_index);
         self.file.write(cx, prepared_frame_bytes, offset)?;
-        self.advance_state_after_write(frame_count, running_checksum)?;
+        self.advance_state_after_write(frame_count, final_running_checksum)?;
         if let Some(last_commit_offset) = last_commit_offset {
             self.last_commit_frame = Some(start_frame_index + last_commit_offset);
         }
@@ -888,6 +941,56 @@ impl<F: VfsFile> WalFile<F> {
         }
 
         Ok(())
+    }
+
+    /// Finalize checksums for a previously prepared frame buffer and append it.
+    ///
+    /// `prepared_frame_bytes` must contain `frame_transforms.len()` frame
+    /// records in WAL frame layout with page number, db_size, salts, and
+    /// payload already serialized. The checksum bytes are overwritten in-place
+    /// using the live rolling checksum seed from this WAL handle.
+    pub fn append_prepared_frame_bytes(
+        &mut self,
+        cx: &Cx,
+        prepared_frame_bytes: &mut [u8],
+        frame_transforms: &[WalChecksumTransform],
+    ) -> Result<()> {
+        let frame_count = frame_transforms.len();
+        if frame_count == 0 {
+            return Ok(());
+        }
+
+        let new_count = self
+            .frame_count
+            .checked_add(frame_count)
+            .ok_or(FrankenError::DatabaseFull)?;
+        if new_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+
+        let frame_size = self.frame_size();
+        let running_checksum =
+            self.finalize_prepared_frame_bytes(prepared_frame_bytes, frame_transforms)?;
+        let last_commit_offset = prepared_frame_bytes
+            .chunks_exact(frame_size)
+            .enumerate()
+            .rev()
+            .find_map(|(offset, frame_slice)| {
+                let db_size_if_commit = u32::from_be_bytes([
+                    frame_slice[4],
+                    frame_slice[5],
+                    frame_slice[6],
+                    frame_slice[7],
+                ]);
+                (db_size_if_commit != 0).then_some(offset)
+            });
+        self.append_finalized_prepared_frame_bytes(
+            cx,
+            prepared_frame_bytes,
+            frame_count,
+            running_checksum,
+            last_commit_offset,
+        )
     }
 
     /// Append a batch of frames to the WAL using a single contiguous write.

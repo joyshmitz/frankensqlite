@@ -13,14 +13,15 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::traits::{
-    PreparedWalChecksumTransform, PreparedWalFrameBatch, PreparedWalFrameMeta, WalFrameRef,
+    PreparedWalChecksumSeed, PreparedWalChecksumTransform, PreparedWalFinalizationState,
+    PreparedWalFrameBatch, PreparedWalFrameMeta, WalFrameRef,
 };
 use fsqlite_pager::{CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
-use fsqlite_wal::checksum::{WAL_FRAME_HEADER_SIZE, WalChecksumTransform};
+use fsqlite_wal::checksum::{SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WalChecksumTransform};
 use fsqlite_wal::wal::WalAppendFrameRef;
 use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget, WalFile,
@@ -440,6 +441,94 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         self.invalidate_publication();
     }
 
+    #[must_use]
+    fn current_prepared_finalization_state(&self) -> PreparedWalFinalizationState {
+        let generation = self.wal.generation_identity();
+        let seed = self.wal.running_checksum();
+        PreparedWalFinalizationState {
+            checkpoint_seq: generation.checkpoint_seq,
+            salt1: generation.salts.salt1,
+            salt2: generation.salts.salt2,
+            start_frame_index: self.wal.frame_count(),
+            seed: PreparedWalChecksumSeed {
+                s1: seed.s1,
+                s2: seed.s2,
+            },
+        }
+    }
+
+    #[must_use]
+    fn prepared_batch_matches_current_state(&self, prepared: &PreparedWalFrameBatch) -> bool {
+        prepared
+            .finalized_for
+            .is_some_and(|state| state == self.current_prepared_finalization_state())
+    }
+
+    fn prepared_batch_matches_disk_state(
+        &mut self,
+        cx: &Cx,
+        prepared: &PreparedWalFrameBatch,
+    ) -> Result<bool> {
+        let Some(state) = prepared.finalized_for else {
+            return Ok(false);
+        };
+        let generation = WalGenerationIdentity {
+            checkpoint_seq: state.checkpoint_seq,
+            salts: fsqlite_wal::checksum::WalSalts {
+                salt1: state.salt1,
+                salt2: state.salt2,
+            },
+        };
+        self.wal
+            .prepared_append_window_still_current(cx, generation, state.start_frame_index)
+    }
+
+    fn checksum_transforms_for_prepared(
+        prepared: &PreparedWalFrameBatch,
+    ) -> Vec<WalChecksumTransform> {
+        prepared
+            .checksum_transforms
+            .iter()
+            .map(|transform| WalChecksumTransform {
+                a11: transform.a11,
+                a12: transform.a12,
+                a21: transform.a21,
+                a22: transform.a22,
+                c1: transform.c1,
+                c2: transform.c2,
+            })
+            .collect()
+    }
+
+    fn finalize_prepared_batch_against_current_state(
+        &mut self,
+        prepared: &mut PreparedWalFrameBatch,
+    ) -> Result<()> {
+        let checksum_transforms = Self::checksum_transforms_for_prepared(prepared);
+        let final_running_checksum = self
+            .wal
+            .finalize_prepared_frame_bytes(&mut prepared.frame_bytes, &checksum_transforms)?;
+        prepared.finalized_for = Some(self.current_prepared_finalization_state());
+        prepared.finalized_running_checksum = Some(PreparedWalChecksumSeed {
+            s1: final_running_checksum.s1,
+            s2: final_running_checksum.s2,
+        });
+        Ok(())
+    }
+
+    #[must_use]
+    fn finalized_running_checksum(prepared: &PreparedWalFrameBatch) -> Result<SqliteWalChecksum> {
+        let Some(checksum) = prepared.finalized_running_checksum else {
+            return Err(FrankenError::internal(
+                "prepared WAL batch missing finalized running checksum",
+            ));
+        };
+        Ok(SqliteWalChecksum {
+            s1: checksum.s1,
+            s2: checksum.s2,
+        })
+    }
+
     fn publish_latest_committed_snapshot(
         &mut self,
         cx: &Cx,
@@ -743,6 +832,11 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 db_size_if_commit: frame.db_size_if_commit,
             })
             .collect();
+        let last_commit_frame_offset = frames
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(offset, frame)| (frame.db_size_if_commit != 0).then_some(offset));
 
         Ok(Some(PreparedWalFrameBatch {
             frame_size: self.wal.frame_size(),
@@ -750,7 +844,26 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             frame_metas,
             checksum_transforms,
             frame_bytes,
+            last_commit_frame_offset,
+            finalized_for: None,
+            finalized_running_checksum: None,
         }))
+    }
+
+    fn finalize_prepared_frames(
+        &mut self,
+        cx: &Cx,
+        prepared: &mut PreparedWalFrameBatch,
+    ) -> Result<()> {
+        if prepared.frame_count() == 0 {
+            return Ok(());
+        }
+
+        if self.refresh_before_append {
+            self.synchronize_publication_before_append(cx, "finalize_prepared_pre_lock")?;
+        }
+
+        self.finalize_prepared_batch_against_current_state(prepared)
     }
 
     fn append_prepared_frames(
@@ -762,27 +875,24 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             return Ok(());
         }
 
-        if self.refresh_before_append {
+        let can_reuse_prelock_finalize = self.refresh_before_append
+            && self.prepared_batch_matches_current_state(prepared)
+            && self.prepared_batch_matches_disk_state(cx, prepared)?;
+        if self.refresh_before_append && !can_reuse_prelock_finalize {
             self.synchronize_publication_before_append(cx, "append_prepared_pre_refresh")?;
         }
 
+        if !self.prepared_batch_matches_current_state(prepared) {
+            self.finalize_prepared_batch_against_current_state(prepared)?;
+        }
+
         let start_frame_index = self.wal.frame_count();
-        let checksum_transforms = prepared
-            .checksum_transforms
-            .iter()
-            .map(|transform| WalChecksumTransform {
-                a11: transform.a11,
-                a12: transform.a12,
-                a21: transform.a21,
-                a22: transform.a22,
-                c1: transform.c1,
-                c2: transform.c2,
-            })
-            .collect::<Vec<_>>();
-        self.wal.append_prepared_frame_bytes(
+        self.wal.append_finalized_prepared_frame_bytes(
             cx,
-            &mut prepared.frame_bytes,
-            &checksum_transforms,
+            &prepared.frame_bytes,
+            prepared.frame_count(),
+            Self::finalized_running_checksum(prepared)?,
+            prepared.last_commit_frame_offset,
         )?;
         self.refresh_before_append = false;
         let last_commit_frame = self.record_appended_frames(
@@ -1375,6 +1485,144 @@ mod tests {
                 "frame payload {frame_index} must match"
             );
         }
+    }
+
+    #[test]
+    fn test_adapter_pre_finalize_reused_when_append_window_is_stable() {
+        let cx = test_cx();
+        let vfs_single = MemoryVfs::new();
+        let vfs_prepared = MemoryVfs::new();
+
+        let mut adapter_single = make_adapter(&vfs_single, &cx);
+        let mut adapter_prepared = make_adapter(&vfs_prepared, &cx);
+
+        let pages: Vec<Vec<u8>> = (0..3u8).map(sample_page).collect();
+        let commit_sizes = [0_u32, 0, 3];
+
+        for (index, page) in pages.iter().enumerate() {
+            adapter_single
+                .append_frame(
+                    &cx,
+                    u32::try_from(index + 1).expect("page number fits u32"),
+                    page,
+                    commit_sizes[index],
+                )
+                .expect("single append");
+        }
+
+        let batch_frames: Vec<_> = pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| WalFrameRef {
+                page_number: u32::try_from(index + 1).expect("page number fits u32"),
+                page_data: page,
+                db_size_if_commit: commit_sizes[index],
+            })
+            .collect();
+        let mut prepared = adapter_prepared
+            .prepare_append_frames(&batch_frames)
+            .expect("prepare append")
+            .expect("prepared batch");
+        adapter_prepared
+            .finalize_prepared_frames(&cx, &mut prepared)
+            .expect("pre-finalize prepared batch");
+        let finalized_for = prepared.finalized_for.expect("finalization state");
+        let finalized_running_checksum = prepared
+            .finalized_running_checksum
+            .expect("finalized checksum");
+
+        adapter_prepared
+            .append_prepared_frames(&cx, &mut prepared)
+            .expect("append prepared");
+
+        assert_eq!(
+            prepared.finalized_for,
+            Some(finalized_for),
+            "stable append window should reuse the pre-lock finalization state"
+        );
+        assert_eq!(
+            prepared.finalized_running_checksum,
+            Some(finalized_running_checksum),
+            "stable append window should reuse the pre-lock finalized checksum"
+        );
+        assert_eq!(
+            adapter_single.wal.running_checksum(),
+            adapter_prepared.wal.running_checksum(),
+            "stable reuse path must preserve checksum chain"
+        );
+    }
+
+    #[test]
+    fn test_adapter_pre_finalize_reseeds_after_intervening_external_append() {
+        let cx = test_cx();
+        let baseline_vfs = MemoryVfs::new();
+        let shared_vfs = MemoryVfs::new();
+
+        let mut baseline = make_adapter(&baseline_vfs, &cx);
+        let mut prepared_writer = make_adapter(&shared_vfs, &cx);
+        let intruder_file = open_wal_file(&shared_vfs, &cx);
+        let intruder_wal = WalFile::open(&cx, intruder_file).expect("open shared WAL");
+        let mut intruder = WalBackendAdapter::new(intruder_wal);
+
+        let pages: Vec<Vec<u8>> = (0..3u8).map(sample_page).collect();
+        let commit_sizes = [0_u32, 0, 3];
+        let intruder_page = sample_page(0xEE);
+
+        baseline
+            .append_frame(&cx, 99, &intruder_page, 0)
+            .expect("baseline intruder append");
+        for (index, page) in pages.iter().enumerate() {
+            baseline
+                .append_frame(
+                    &cx,
+                    u32::try_from(index + 1).expect("page number fits u32"),
+                    page,
+                    commit_sizes[index],
+                )
+                .expect("baseline append");
+        }
+
+        let batch_frames: Vec<_> = pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| WalFrameRef {
+                page_number: u32::try_from(index + 1).expect("page number fits u32"),
+                page_data: page,
+                db_size_if_commit: commit_sizes[index],
+            })
+            .collect();
+        let mut prepared = prepared_writer
+            .prepare_append_frames(&batch_frames)
+            .expect("prepare append")
+            .expect("prepared batch");
+        prepared_writer
+            .finalize_prepared_frames(&cx, &mut prepared)
+            .expect("pre-finalize prepared batch");
+        let stale_finalization_state = prepared.finalized_for;
+
+        intruder
+            .append_frame(&cx, 99, &intruder_page, 0)
+            .expect("intruder append");
+        intruder.sync(&cx).expect("intruder sync");
+
+        prepared_writer
+            .append_prepared_frames(&cx, &mut prepared)
+            .expect("append prepared after external growth");
+
+        assert_ne!(
+            prepared.finalized_for, stale_finalization_state,
+            "intervening external growth should force prepared batch reseeding"
+        );
+        assert_eq!(
+            baseline.wal.running_checksum(),
+            prepared_writer.wal.running_checksum(),
+            "reseeding path must preserve checksum chain"
+        );
+        assert_eq!(
+            baseline.frame_count(),
+            prepared_writer.frame_count(),
+            "reseeding path must preserve frame count"
+        );
     }
 
     #[test]
