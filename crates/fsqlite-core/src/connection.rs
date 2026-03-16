@@ -37231,8 +37231,8 @@ mod tests {
             .query("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_t_old_col';")
             .unwrap();
         let sql = row_values(&rows[0])[0].to_text();
-        assert!(sql.contains("new_col"), "{sql}");
-        assert!(!sql.contains("old_col"), "{sql}");
+        assert!(sql.contains("(new_col)"), "{sql}");
+        assert!(!sql.contains("(old_col)"), "{sql}");
 
         let schema = conn.schema.borrow();
         let table = schema.iter().find(|table| table.name == "t").unwrap();
@@ -53521,9 +53521,7 @@ mod schema_cookie_tests {
     }
 
     #[test]
-    #[ignore = "5D.4: schema_cookie persistence needs pager header write wiring"]
     fn test_schema_cookie_persists_round_trip() {
-        // NOTE: With 5D.4, schema_cookie round-trip requires pager header writes.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("cookie_rt.db");
         let db_str = db_path.to_str().unwrap();
