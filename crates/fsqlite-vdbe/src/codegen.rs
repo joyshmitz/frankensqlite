@@ -5367,15 +5367,11 @@ pub fn codegen_insert(
             if rows.is_empty() {
                 return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
             }
-
-            // When an explicit column list is provided, reorder each VALUES
-            // row from column-list order to table-schema order, filling
-            // unmentioned columns with NULL.  This ensures MakeRecord always
-            // packs fields in the order the table schema expects.
             if stmt.columns.is_empty() {
                 codegen_insert_values(
                     b,
                     rows,
+                    None,
                     None,
                     table_cursor,
                     table,
@@ -5386,41 +5382,26 @@ pub fn codegen_insert(
                 )?;
             } else {
                 // Build default expressions: use column DEFAULT if available, else NULL.
-                let defaults: Vec<Expr> = table.columns.iter().map(default_value_to_expr).collect();
-                let mut explicit_rowids: Vec<Option<Expr>> = Vec::with_capacity(rows.len());
-                let mut reordered: Vec<Vec<Expr>> = Vec::with_capacity(rows.len());
-                for row in rows {
-                    if row.len() != stmt.columns.len() {
-                        return Err(CodegenError::Unsupported(format!(
-                            "{} values for {} columns",
-                            row.len(),
-                            stmt.columns.len()
-                        )));
-                    }
-                    let mut table_order = defaults.clone();
-                    let mut explicit_rowid = None;
-                    for (val_pos, col_name) in stmt.columns.iter().enumerate() {
-                        if let Some(expr) = row.get(val_pos) {
-                            if table.resolves_to_hidden_rowid(col_name) {
-                                explicit_rowid = Some(expr.clone());
-                            } else {
-                                let tbl_pos = table.column_index(col_name).ok_or_else(|| {
-                                    CodegenError::ColumnNotFound {
-                                        table: table.name.clone(),
-                                        column: col_name.clone(),
-                                    }
-                                })?;
-                                table_order[tbl_pos] = expr.clone();
+                let mut explicit_rowid_source_pos = None;
+                let mut col_mapping = vec![None; table.columns.len()];
+                for (source_pos, col_name) in stmt.columns.iter().enumerate() {
+                    if table.resolves_to_hidden_rowid(col_name) {
+                        explicit_rowid_source_pos = Some(source_pos);
+                    } else {
+                        let tbl_pos = table.column_index(col_name).ok_or_else(|| {
+                            CodegenError::ColumnNotFound {
+                                table: table.name.clone(),
+                                column: col_name.clone(),
                             }
-                        }
+                        })?;
+                        col_mapping[tbl_pos] = Some(source_pos);
                     }
-                    explicit_rowids.push(explicit_rowid);
-                    reordered.push(table_order);
                 }
                 codegen_insert_values(
                     b,
-                    &reordered,
-                    Some(&explicit_rowids),
+                    rows,
+                    explicit_rowid_source_pos,
+                    Some(&col_mapping),
                     table_cursor,
                     table,
                     &stmt.returning,
@@ -5616,7 +5597,8 @@ pub fn codegen_insert(
 fn codegen_insert_values(
     b: &mut ProgramBuilder,
     rows: &[Vec<Expr>],
-    explicit_rowids: Option<&[Option<Expr>]>,
+    explicit_rowid_source_pos: Option<usize>,
+    col_mapping: Option<&[Option<usize>]>,
     cursor: i32,
     table: &TableSchema,
     returning: &[ResultColumn],
@@ -5624,31 +5606,30 @@ fn codegen_insert_values(
     oe_flag: u16,
     upsert: Option<&UpsertClause>,
 ) -> Result<(), CodegenError> {
-    let n_cols = rows
+    let n_source_cols = rows
         .first()
         .ok_or_else(|| CodegenError::Unsupported("empty VALUES".to_owned()))?
         .len();
 
-    // If no explicit rowids were mapped (meaning no column list was provided in the INSERT statement),
-    // the number of values MUST exactly match the number of columns in the table.
-    if explicit_rowids.is_none() && n_cols != table.columns.len() {
+    // If no explicit column mapping was provided, the number of values must
+    // exactly match the number of columns in the table.
+    if col_mapping.is_none() && n_source_cols != table.columns.len() {
         return Err(CodegenError::Unsupported(format!(
             "table {} has {} columns but {} values were supplied",
             table.name,
             table.columns.len(),
-            n_cols
+            n_source_cols
         )));
     }
 
     let rowid_reg = b.alloc_reg();
-    let val_regs = b.alloc_regs(n_cols as i32);
+    let source_regs = b.alloc_regs(n_source_cols as i32);
+    let mapped_regs = col_mapping.map(|_| b.alloc_regs(table.columns.len() as i32));
     let rec_reg = b.alloc_reg();
     let concurrent_flag = i32::from(ctx.concurrent_mode);
 
-    let explicit_rowid_reg = explicit_rowids.map(|_| b.alloc_reg());
-
-    for (row_idx, row_values) in rows.iter().enumerate() {
-        if row_values.len() != n_cols {
+    for row_values in rows {
+        if row_values.len() != n_source_cols {
             return Err(CodegenError::Unsupported(
                 "VALUES rows must have the same arity".to_owned(),
             ));
@@ -5656,21 +5637,40 @@ fn codegen_insert_values(
 
         // Emit value expressions into registers.
         for (i, val_expr) in row_values.iter().enumerate() {
-            let reg = val_regs + i as i32;
+            let reg = source_regs + i as i32;
             emit_expr(b, val_expr, reg, None);
         }
 
-        let explicit_rowid_expr = explicit_rowids
-            .and_then(|rows| rows.get(row_idx))
-            .and_then(Option::as_ref);
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let (val_regs, n_cols) = if let Some(mapping) = col_mapping {
+            let table_regs = mapped_regs.expect("mapped registers allocated");
+            for (tbl_idx, src) in mapping.iter().enumerate() {
+                let dest = table_regs + tbl_idx as i32;
+                if let Some(source_pos) = src {
+                    b.emit_op(
+                        Opcode::Copy,
+                        source_regs + *source_pos as i32,
+                        dest,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                } else {
+                    emit_default_value(b, &table.columns[tbl_idx], dest);
+                }
+            }
+            (table_regs, table.columns.len())
+        } else {
+            (source_regs, n_source_cols)
+        };
 
         // Rowid determination precedence:
         // 1. explicit rowid/_rowid_/oid in INSERT column list
         // 2. INTEGER PRIMARY KEY column value
         // 3. auto-generated rowid
-        if let Some(rowid_expr) = explicit_rowid_expr {
-            let rowid_value_reg = explicit_rowid_reg.expect("explicit rowid register allocated");
-            emit_expr(b, rowid_expr, rowid_value_reg, None);
+        if let Some(source_pos) = explicit_rowid_source_pos {
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            let rowid_value_reg = source_regs + source_pos as i32;
             let auto_label = b.emit_label();
             let done_label = b.emit_label();
 

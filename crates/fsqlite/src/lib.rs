@@ -1889,6 +1889,43 @@ mod tests {
     }
 
     #[test]
+    fn execute_with_params_insert_respects_explicit_column_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE message_payloads(
+                id INTEGER PRIMARY KEY,
+                attachments TEXT NOT NULL DEFAULT '[]',
+                recipients_json TEXT NOT NULL DEFAULT '{}'
+            );",
+        )
+        .unwrap();
+
+        let recipients = r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#;
+        let attachments =
+            r#"[{"name":"artifact.txt","path":"attachments/demo.txt","content_type":"text/plain","size":"128"}]"#;
+
+        conn.execute_with_params(
+            "INSERT INTO message_payloads(recipients_json, attachments) VALUES (?1, ?2);",
+            &[
+                SqliteValue::Text(recipients.to_owned()),
+                SqliteValue::Text(attachments.to_owned()),
+            ],
+        )
+        .unwrap();
+
+        let row = conn
+            .query_row("SELECT recipients_json, attachments FROM message_payloads LIMIT 1;")
+            .unwrap();
+        assert_eq!(
+            row_values(&row),
+            vec![
+                SqliteValue::Text(recipients.to_owned()),
+                SqliteValue::Text(attachments.to_owned())
+            ]
+        );
+    }
+
+    #[test]
     fn execute_select_returns_row_count() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE es (v INTEGER);").unwrap();

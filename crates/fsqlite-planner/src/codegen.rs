@@ -7,7 +7,7 @@
 use fsqlite_ast::{
     BinaryOp as AstBinaryOp, ColumnRef, ConflictAction, DeleteStatement, Expr, FunctionArgs,
     InsertSource, InsertStatement, Literal, PlaceholderType, QualifiedTableRef, ResultColumn,
-    SelectCore, SelectStatement, UnaryOp as AstUnaryOp, UpdateStatement,
+    SelectCore, SelectStatement, Span, UnaryOp as AstUnaryOp, UpdateStatement,
 };
 use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
 
@@ -514,12 +514,22 @@ pub fn codegen_insert(
             if rows.is_empty() {
                 return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
             }
-            codegen_insert_values(b, rows, cursor, table, &stmt.returning, ctx, oe_flag)?;
+            codegen_insert_values(
+                b,
+                rows,
+                &stmt.columns,
+                cursor,
+                table,
+                &stmt.returning,
+                ctx,
+                oe_flag,
+            )?;
         }
         InsertSource::Select(select_stmt) => {
             codegen_insert_select(
                 b,
                 select_stmt,
+                &stmt.columns,
                 cursor,
                 table,
                 schema,
@@ -543,6 +553,104 @@ pub fn codegen_insert(
     Ok(())
 }
 
+fn insert_target_indices(
+    insert_columns: &[String],
+    table: &TableSchema,
+) -> Result<Vec<usize>, CodegenError> {
+    if insert_columns.is_empty() {
+        return Ok((0..table.columns.len()).collect());
+    }
+
+    insert_columns
+        .iter()
+        .map(|column| {
+            table
+                .column_index(column)
+                .ok_or_else(|| CodegenError::ColumnNotFound {
+                    table: table.name.clone(),
+                    column: column.clone(),
+                })
+        })
+        .collect()
+}
+
+fn insert_default_exprs(table: &TableSchema) -> Result<Vec<Expr>, CodegenError> {
+    Ok(table
+        .columns
+        .iter()
+        .map(|_| Expr::Literal(Literal::Null, Span::ZERO))
+        .collect())
+}
+
+fn expand_insert_values_row(
+    row_values: &[Expr],
+    insert_columns: &[String],
+    table: &TableSchema,
+) -> Result<Vec<Expr>, CodegenError> {
+    if insert_columns.is_empty() {
+        return Ok(row_values.to_vec());
+    }
+
+    let target_indices = insert_target_indices(insert_columns, table)?;
+    if row_values.len() != target_indices.len() {
+        return Err(CodegenError::Unsupported(format!(
+            "INSERT VALUES column count mismatch: {} expressions for {} target columns",
+            row_values.len(),
+            target_indices.len(),
+        )));
+    }
+
+    let mut expanded = insert_default_exprs(table)?;
+    for (source_idx, target_idx) in target_indices.into_iter().enumerate() {
+        expanded[target_idx] = row_values[source_idx].clone();
+    }
+    Ok(expanded)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_insert_target_regs_from_source(
+    b: &mut ProgramBuilder,
+    source_reg_base: i32,
+    source_count: usize,
+    insert_columns: &[String],
+    target_table: &TableSchema,
+) -> Result<(i32, i32), CodegenError> {
+    if insert_columns.is_empty() {
+        let count = i32::try_from(source_count)
+            .map_err(|_| CodegenError::Unsupported("too many INSERT source columns".to_owned()))?;
+        return Ok((source_reg_base, count));
+    }
+
+    let target_indices = insert_target_indices(insert_columns, target_table)?;
+    if source_count != target_indices.len() {
+        return Err(CodegenError::Unsupported(format!(
+            "INSERT source column count mismatch: {source_count} values for {} target columns",
+            target_indices.len(),
+        )));
+    }
+
+    let target_count = i32::try_from(target_table.columns.len())
+        .map_err(|_| CodegenError::Unsupported("too many target columns".to_owned()))?;
+    let val_regs = b.alloc_regs(target_count);
+    let default_exprs = insert_default_exprs(target_table)?;
+    let mut source_for_target = vec![None; target_table.columns.len()];
+    for (source_idx, target_idx) in target_indices.into_iter().enumerate() {
+        source_for_target[target_idx] = Some(source_idx);
+    }
+
+    for (target_idx, default_expr) in default_exprs.iter().enumerate() {
+        let target_reg = val_regs + i32::try_from(target_idx).unwrap_or(0);
+        if let Some(source_idx) = source_for_target[target_idx] {
+            let source_reg = source_reg_base + i32::try_from(source_idx).unwrap_or(0);
+            b.emit_op(Opcode::Copy, source_reg, target_reg, 0, P4::None, 0);
+        } else {
+            emit_expr(b, default_expr, target_reg)?;
+        }
+    }
+
+    Ok((val_regs, target_count))
+}
+
 /// Emit the INSERT loop for `VALUES (row), (row), ...` (planner path).
 #[allow(
     clippy::cast_possible_truncation,
@@ -552,6 +660,7 @@ pub fn codegen_insert(
 fn codegen_insert_values(
     b: &mut ProgramBuilder,
     rows: &[Vec<Expr>],
+    insert_columns: &[String],
     cursor: i32,
     table: &TableSchema,
     returning: &[ResultColumn],
@@ -561,12 +670,12 @@ fn codegen_insert_values(
     let rowid_reg = b.alloc_reg();
     let concurrent_flag = i32::from(ctx.concurrent_mode);
 
-    // Use first row to determine column count.
-    let n_cols = rows[0].len();
-    let val_regs = b.alloc_regs(n_cols as i32);
     let mut param_idx = 1_i32;
 
     for row_values in rows {
+        let expanded_values = expand_insert_values_row(row_values, insert_columns, table)?;
+        let n_cols = expanded_values.len();
+        let val_regs = b.alloc_regs(n_cols as i32);
         b.emit_op(
             Opcode::NewRowid,
             cursor,
@@ -576,7 +685,7 @@ fn codegen_insert_values(
             0,
         );
 
-        for (i, val_expr) in row_values.iter().enumerate() {
+        for (i, val_expr) in expanded_values.iter().enumerate() {
             let reg = val_regs + i as i32;
             match val_expr {
                 Expr::Placeholder(pt, _) => {
@@ -702,6 +811,7 @@ fn codegen_insert_default_values(
 fn codegen_insert_select(
     b: &mut ProgramBuilder,
     select_stmt: &SelectStatement,
+    insert_columns: &[String],
     write_cursor: i32,
     target_table: &TableSchema,
     schema: &[TableSchema],
@@ -727,6 +837,7 @@ fn codegen_insert_select(
             return codegen_insert_values(
                 b,
                 rows,
+                insert_columns,
                 write_cursor,
                 target_table,
                 returning,
@@ -742,6 +853,7 @@ fn codegen_insert_select(
             b,
             columns,
             where_clause.as_deref(),
+            insert_columns,
             write_cursor,
             target_table,
             returning,
@@ -762,9 +874,9 @@ fn codegen_insert_select(
     let src_table = find_table(schema, src_table_name)?;
     let read_cursor = write_cursor + 1;
 
-    let n_cols = result_column_count(columns, src_table);
+    let n_source_cols = result_column_count(columns, src_table);
     let rowid_reg = b.alloc_reg();
-    let val_regs = b.alloc_regs(n_cols);
+    let source_regs = b.alloc_regs(n_source_cols);
     let rec_reg = b.alloc_reg();
     let concurrent_flag = i32::from(ctx.concurrent_mode);
 
@@ -785,7 +897,14 @@ fn codegen_insert_select(
     b.emit_jump_to_label(Opcode::Rewind, read_cursor, 0, done_label, P4::None, 0);
 
     // Read projected columns from source into val_regs.
-    emit_column_reads(b, read_cursor, columns, src_table, val_regs)?;
+    emit_column_reads(b, read_cursor, columns, src_table, source_regs)?;
+    let (val_regs, n_cols) = emit_insert_target_regs_from_source(
+        b,
+        source_regs,
+        n_source_cols as usize,
+        insert_columns,
+        target_table,
+    )?;
 
     // NewRowid for target table.
     b.emit_op(
@@ -844,6 +963,7 @@ fn codegen_insert_select_expr_only(
     b: &mut ProgramBuilder,
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
+    insert_columns: &[String],
     write_cursor: i32,
     target_table: &TableSchema,
     returning: &[ResultColumn],
@@ -851,21 +971,21 @@ fn codegen_insert_select_expr_only(
     oe_flag: u16,
 ) -> Result<(), CodegenError> {
     // Count output columns: Expr → 1, Star/TableStar → 1 (yields NULL without table).
-    let n_cols = columns
+    let n_source_cols = columns
         .iter()
         .map(|c| match c {
             ResultColumn::Expr { .. } | ResultColumn::Star | ResultColumn::TableStar(_) => 1i32,
         })
         .sum::<i32>();
 
-    if n_cols == 0 {
+    if n_source_cols == 0 {
         return Err(CodegenError::Unsupported(
             "INSERT ... SELECT with no columns".to_owned(),
         ));
     }
 
     let rowid_reg = b.alloc_reg();
-    let val_regs = b.alloc_regs(n_cols);
+    let source_regs = b.alloc_regs(n_source_cols);
     let rec_reg = b.alloc_reg();
     let concurrent_flag = i32::from(ctx.concurrent_mode);
     let done_label = b.emit_label();
@@ -878,7 +998,7 @@ fn codegen_insert_select_expr_only(
     }
 
     // Evaluate each result column expression into val_regs.
-    let mut reg = val_regs;
+    let mut reg = source_regs;
     for col in columns {
         match col {
             ResultColumn::Expr { expr, .. } => {
@@ -892,6 +1012,13 @@ fn codegen_insert_select_expr_only(
             }
         }
     }
+    let (val_regs, n_cols) = emit_insert_target_regs_from_source(
+        b,
+        source_regs,
+        usize::try_from(n_source_cols).unwrap_or(0),
+        insert_columns,
+        target_table,
+    )?;
 
     // Auto-generate rowid.
     b.emit_op(
