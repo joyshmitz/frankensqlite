@@ -9793,7 +9793,7 @@ impl Connection {
             root_page,
             "CREATE TABLE sqlite_stat1(tbl,idx,stat)",
         )?;
-        self.increment_schema_cookie();
+        self.increment_schema_cookie()?;
         tracing::trace!("sqlite_stat1 table auto-created");
         Ok(())
     }
@@ -10928,7 +10928,7 @@ impl Connection {
             }
         }
 
-        self.increment_schema_cookie();
+        self.increment_schema_cookie()?;
         Ok(())
     }
 
@@ -11005,7 +11005,7 @@ impl Connection {
                 root_page,
                 &create.to_string(),
             )?;
-            self.increment_schema_cookie();
+            self.increment_schema_cookie()?;
             return Ok(());
         }
         drop(modules);
@@ -11042,7 +11042,7 @@ impl Connection {
             root_page,
             &create.to_string(),
         )?;
-        self.increment_schema_cookie();
+        self.increment_schema_cookie()?;
         Ok(())
     }
 
@@ -11235,7 +11235,7 @@ impl Connection {
             self.original_ddl_sql
                 .borrow_mut()
                 .remove(&obj_name.to_ascii_lowercase());
-            self.increment_schema_cookie();
+            self.increment_schema_cookie()?;
         }
         Ok(())
     }
@@ -11282,9 +11282,46 @@ impl Connection {
                         }
                     }
                 }
+                for index in &mut table.indexes {
+                    for index_column in &mut index.columns {
+                        if index_column.eq_ignore_ascii_case(old) {
+                            index_column.clone_from(new);
+                        }
+                    }
+                    for key_expression in &mut index.key_expressions {
+                        if key_expression.eq_ignore_ascii_case(old) {
+                            key_expression.clone_from(new);
+                        }
+                    }
+                }
+                for fk in &mut table.foreign_keys {
+                    if fk.parent_table.eq_ignore_ascii_case(&table.name) {
+                        for parent_column in &mut fk.parent_columns {
+                            if parent_column.eq_ignore_ascii_case(old) {
+                                parent_column.clone_from(new);
+                            }
+                        }
+                    }
+                }
                 table.clone()
             }
             AlterTableAction::AddColumn(col_def) => {
+                if col_def.constraints.iter().any(|constraint| {
+                    matches!(constraint.kind, ColumnConstraintKind::PrimaryKey { .. })
+                }) {
+                    return Err(FrankenError::Internal(format!(
+                        "Cannot add a PRIMARY KEY column {}",
+                        col_def.name
+                    )));
+                }
+                if col_def.constraints.iter().any(|constraint| {
+                    matches!(constraint.kind, ColumnConstraintKind::Unique { .. })
+                }) {
+                    return Err(FrankenError::Internal(format!(
+                        "Cannot add a UNIQUE column {}",
+                        col_def.name
+                    )));
+                }
                 let affinity = col_def
                     .type_name
                     .as_ref()
@@ -11305,6 +11342,40 @@ impl Connection {
                         Ok(format_default_value(dv))
                     })
                     .transpose()?;
+                let (generated_expr, generated_stored) = col_def
+                    .constraints
+                    .iter()
+                    .find_map(|constraint| match &constraint.kind {
+                        ColumnConstraintKind::Generated { expr, storage } => {
+                            let stored = storage
+                                .as_ref()
+                                .is_some_and(|storage| *storage == GeneratedStorage::Stored);
+                            Some((Some(expr.to_string()), Some(stored)))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or((None, None));
+                if generated_stored == Some(true) {
+                    return Err(FrankenError::Internal(format!(
+                        "Cannot add a STORED generated column {}",
+                        col_def.name
+                    )));
+                }
+                let collation = col_def.constraints.iter().find_map(|constraint| {
+                    if let ColumnConstraintKind::Collate(name) = &constraint.kind {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                });
+                let column_check_constraints = col_def
+                    .constraints
+                    .iter()
+                    .filter_map(|constraint| match &constraint.kind {
+                        ColumnConstraintKind::Check(expr) => Some(expr.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
                 // SQLite rule: cannot add a NOT NULL column without a DEFAULT value.
                 if notnull && default_value.is_none() {
                     return Err(FrankenError::Internal(
@@ -11322,10 +11393,6 @@ impl Connection {
                     .type_name
                     .as_ref()
                     .map(std::string::ToString::to_string);
-                let unique = col_def
-                    .constraints
-                    .iter()
-                    .any(|c| matches!(c.kind, ColumnConstraintKind::Unique { .. }));
                 let strict_type = if table.strict {
                     let type_decl = type_name.as_deref().ok_or_else(|| {
                         FrankenError::Internal(format!(
@@ -11342,19 +11409,50 @@ impl Connection {
                 } else {
                     None
                 };
+                let new_column_index = table.columns.len();
                 table.columns.push(ColumnInfo {
                     name: col_def.name.clone(),
                     affinity,
                     is_ipk: false,
                     type_name,
                     notnull,
-                    unique,
+                    unique: false,
                     default_value,
                     strict_type,
-                    generated_expr: None,
-                    generated_stored: None,
-                    collation: None,
+                    generated_expr,
+                    generated_stored,
+                    collation,
                 });
+                table.check_constraints.extend(column_check_constraints);
+                for constraint in &col_def.constraints {
+                    let ColumnConstraintKind::ForeignKey(clause) = &constraint.kind else {
+                        continue;
+                    };
+                    let mut on_delete = FkActionType::NoAction;
+                    let mut on_update = FkActionType::NoAction;
+                    for action in &clause.actions {
+                        let action_type = match action.action {
+                            fsqlite_ast::ForeignKeyActionType::SetNull => FkActionType::SetNull,
+                            fsqlite_ast::ForeignKeyActionType::SetDefault => {
+                                FkActionType::SetDefault
+                            }
+                            fsqlite_ast::ForeignKeyActionType::Cascade => FkActionType::Cascade,
+                            fsqlite_ast::ForeignKeyActionType::Restrict => FkActionType::Restrict,
+                            fsqlite_ast::ForeignKeyActionType::NoAction => FkActionType::NoAction,
+                        };
+                        match action.trigger {
+                            fsqlite_ast::ForeignKeyTrigger::OnDelete => on_delete = action_type,
+                            fsqlite_ast::ForeignKeyTrigger::OnUpdate => on_update = action_type,
+                        }
+                    }
+                    table.foreign_keys.push(FkDef {
+                        child_columns: vec![new_column_index],
+                        parent_table: clause.table.clone(),
+                        parent_columns: clause.columns.clone(),
+                        on_delete,
+                        on_update,
+                    });
+                }
                 table.clone()
             }
             AlterTableAction::DropColumn(col_name) => {
@@ -11496,9 +11594,18 @@ impl Connection {
             // A delete+reinsert would assign a new (higher) rowid,
             // corrupting the schema for tables that already have indexes.
             self.update_sqlite_master_sql(&old_name, &create_sql)?;
+            if matches!(alter.action, AlterTableAction::RenameColumn { .. }) {
+                for index in &new_schema.indexes {
+                    if is_implicit_autoindex_name(&index.name) {
+                        continue;
+                    }
+                    let idx_sql = render_create_index_sql(index, &new_schema.name);
+                    self.update_sqlite_master_sql(&index.name, &idx_sql)?;
+                }
+            }
         }
 
-        self.increment_schema_cookie();
+        self.increment_schema_cookie()?;
         Ok(())
     }
 
@@ -11881,7 +11988,7 @@ impl Connection {
         let create_sql = stmt.to_string();
         self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)?;
 
-        self.increment_schema_cookie();
+        self.increment_schema_cookie()?;
 
         // Phase 7: Backfill existing table rows into the new index.
         // SQLite populates a new index with all current table data during
@@ -12037,7 +12144,7 @@ impl Connection {
 
         self.insert_sqlite_master_row("view", view_name, view_name, 0, &create_sql)?;
 
-        self.increment_schema_cookie();
+        self.increment_schema_cookie()?;
         Ok(())
     }
 
@@ -12081,7 +12188,7 @@ impl Connection {
             self.insert_sqlite_master_row("trigger", trigger_name, table_name, 0, &create_sql)?;
         }
 
-        self.increment_schema_cookie();
+        self.increment_schema_cookie()?;
         Ok(())
     }
 
@@ -15583,14 +15690,22 @@ impl Connection {
                     let user_version = self.pragma_state.borrow().user_version;
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     {
-                        self.update_database_header_metadata(Some(user_version as u32), None)?;
+                        self.update_database_header_metadata(
+                            None,
+                            Some(user_version as u32),
+                            None,
+                        )?;
                     }
                 }
                 "application_id" => {
                     let application_id = self.pragma_state.borrow().application_id;
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     {
-                        self.update_database_header_metadata(None, Some(application_id as u32))?;
+                        self.update_database_header_metadata(
+                            None,
+                            None,
+                            Some(application_id as u32),
+                        )?;
                     }
                 }
                 _ => {}
@@ -21764,10 +21879,11 @@ impl Connection {
     /// Persist selected database header metadata fields on page 1.
     fn update_database_header_metadata(
         &self,
+        schema_cookie: Option<u32>,
         user_version: Option<u32>,
         application_id: Option<u32>,
     ) -> Result<()> {
-        if user_version.is_none() && application_id.is_none() {
+        if schema_cookie.is_none() && user_version.is_none() && application_id.is_none() {
             return Ok(());
         }
         self.with_pager_write_txn(|cx, txn| {
@@ -21783,6 +21899,9 @@ impl Connection {
             header_bytes.copy_from_slice(&page_bytes[..DATABASE_HEADER_SIZE]);
             let mut header = DatabaseHeader::from_bytes(&header_bytes)
                 .map_err(|e| FrankenError::internal(format!("invalid database header: {e}")))?;
+            if let Some(cookie) = schema_cookie {
+                header.schema_cookie = cookie;
+            }
             if let Some(version) = user_version {
                 header.user_version = version;
             }
@@ -21801,15 +21920,17 @@ impl Connection {
     /// Increment the schema cookie.  Must be called for every DDL
     /// operation (CREATE TABLE, DROP TABLE, ALTER TABLE, CREATE INDEX,
     /// CREATE VIEW, DROP INDEX, DROP VIEW, etc.).
-    fn increment_schema_cookie(&self) {
-        let mut cookie = self.schema_cookie.borrow_mut();
-        *cookie = cookie.wrapping_add(1);
+    fn increment_schema_cookie(&self) -> Result<()> {
+        let new_cookie = self.schema_cookie.borrow().wrapping_add(1);
+        self.update_database_header_metadata(Some(new_cookie), None, None)?;
+        *self.schema_cookie.borrow_mut() = new_cookie;
         self.schema_generation
             .set(self.schema_generation.get().wrapping_add(1));
         // Invalidate parse + compiled caches — schema change may affect resolution/codegen.
         self.parse_cache.borrow_mut().clear();
         self.compiled_cache.borrow_mut().clear();
         self.table_execution_metadata_cache.borrow_mut().take();
+        Ok(())
     }
 
     /// Increment the file change counter.  Must be called for every
@@ -37093,6 +37214,90 @@ mod tests {
         let rows = conn.query("SELECT new_col FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+    }
+
+    #[test]
+    fn test_alter_table_rename_column_updates_explicit_index_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (old_col INTEGER, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_old_col ON t(old_col);")
+            .unwrap();
+
+        conn.execute("ALTER TABLE t RENAME COLUMN old_col TO new_col;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_t_old_col';")
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        assert!(sql.contains("new_col"), "{sql}");
+        assert!(!sql.contains("old_col"), "{sql}");
+
+        let schema = conn.schema.borrow();
+        let table = schema.iter().find(|table| table.name == "t").unwrap();
+        assert_eq!(table.indexes[0].columns, vec!["new_col".to_owned()]);
+        assert_eq!(table.indexes[0].key_expressions, vec!["new_col".to_owned()]);
+    }
+
+    #[test]
+    fn test_alter_table_add_column_check_constraint_is_enforced() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        conn.execute("ALTER TABLE t ADD COLUMN score INTEGER CHECK(score > 0);")
+            .unwrap();
+
+        let err = conn.execute("INSERT INTO t (id, score) VALUES (1, -1);");
+        assert!(err.is_err(), "CHECK on added column should be enforced");
+
+        conn.execute("INSERT INTO t (id, score) VALUES (2, 7);")
+            .unwrap();
+        let rows = conn.query("SELECT score FROM t WHERE id = 2;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn test_alter_table_add_column_foreign_key_is_enforced() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("CREATE TABLE child (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        conn.execute("ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id);")
+            .unwrap();
+
+        let err = conn.execute("INSERT INTO child (id, parent_id) VALUES (1, 99);");
+        assert!(
+            err.is_err(),
+            "REFERENCES on added column should be enforced"
+        );
+
+        conn.execute("INSERT INTO parent (id) VALUES (7);").unwrap();
+        conn.execute("INSERT INTO child (id, parent_id) VALUES (2, 7);")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_alter_table_add_column_unique_is_rejected() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let err = conn.execute("ALTER TABLE t ADD COLUMN code TEXT UNIQUE;");
+        assert!(err.is_err(), "ADD COLUMN UNIQUE should be rejected");
+    }
+
+    #[test]
+    fn test_alter_table_add_column_primary_key_is_rejected() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+
+        let err = conn.execute("ALTER TABLE t ADD COLUMN extra INTEGER PRIMARY KEY;");
+        assert!(err.is_err(), "ADD COLUMN PRIMARY KEY should be rejected");
     }
 
     #[test]
