@@ -75,6 +75,8 @@ pub enum TwoPhaseError {
     DetachWithActiveTransaction { db_id: DatabaseId },
     /// Database is not a participant in this 2PC.
     UnknownDatabase(DatabaseId),
+    /// Database was registered more than once for the same 2PC.
+    DuplicateDatabase(DatabaseId),
     /// I/O error writing commit marker.
     MarkerWriteError(String),
     /// I/O error during WAL-index update in Phase 2.
@@ -97,6 +99,9 @@ impl std::fmt::Display for TwoPhaseError {
                 write!(f, "cannot detach db {db_id}: active transaction")
             }
             Self::UnknownDatabase(db_id) => write!(f, "unknown database: {db_id}"),
+            Self::DuplicateDatabase(db_id) => {
+                write!(f, "database {db_id} already registered for 2PC")
+            }
             Self::MarkerWriteError(reason) => write!(f, "commit marker write error: {reason}"),
             Self::WalIndexUpdateError { db_id, reason } => {
                 write!(f, "WAL-index update error for db {db_id}: {reason}")
@@ -344,8 +349,10 @@ impl TwoPhaseCoordinator {
         if !wal_mode {
             return Err(TwoPhaseError::NotWalMode(db_id));
         }
-        if self.participants.len() >= MAX_TOTAL_DATABASES && !self.participants.contains_key(&db_id)
-        {
+        if self.participants.contains_key(&db_id) {
+            return Err(TwoPhaseError::DuplicateDatabase(db_id));
+        }
+        if self.participants.len() >= MAX_TOTAL_DATABASES {
             return Err(TwoPhaseError::TooManyDatabases {
                 count: self.participants.len() + 1,
                 max: MAX_TOTAL_DATABASES,
@@ -382,11 +389,11 @@ impl TwoPhaseCoordinator {
         if self.state != TwoPhaseState::Idle && self.state != TwoPhaseState::Preparing {
             return Err(TwoPhaseError::InvalidState(self.state));
         }
-        self.state = TwoPhaseState::Preparing;
         let participant = self
             .participants
             .get_mut(&db_id)
             .ok_or(TwoPhaseError::UnknownDatabase(db_id))?;
+        self.state = TwoPhaseState::Preparing;
         participant.prepare_result = Some(result);
         Ok(())
     }
@@ -459,11 +466,11 @@ impl TwoPhaseCoordinator {
         if self.state != TwoPhaseState::MarkerWritten && self.state != TwoPhaseState::Committing {
             return Err(TwoPhaseError::InvalidState(self.state));
         }
-        self.state = TwoPhaseState::Committing;
         let participant = self
             .participants
             .get_mut(&db_id)
             .ok_or(TwoPhaseError::UnknownDatabase(db_id))?;
+        self.state = TwoPhaseState::Committing;
         participant.wal_index_updated = true;
         Ok(())
     }
@@ -723,6 +730,22 @@ mod tests {
             matches!(result, Err(TwoPhaseError::NotWalMode(MAIN_DB_ID))),
             "expected NotWalMode error: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_add_participant_rejects_duplicate_database() {
+        let mut coord = TwoPhaseCoordinator::new(55);
+        coord
+            .add_participant(MAIN_DB_ID, "main".to_owned(), true)
+            .unwrap();
+
+        let result = coord.add_participant(MAIN_DB_ID, "main_shadow".to_owned(), true);
+        assert!(
+            matches!(result, Err(TwoPhaseError::DuplicateDatabase(MAIN_DB_ID))),
+            "expected duplicate database error: {result:?}"
+        );
+        assert_eq!(coord.participant_count(), 1);
+        assert_eq!(coord.participants[&MAIN_DB_ID].schema_name, "main");
     }
 
     // -----------------------------------------------------------------------
@@ -1090,5 +1113,48 @@ mod tests {
             err,
             Err(TwoPhaseError::InvalidState(TwoPhaseState::MarkerWritten))
         ));
+    }
+
+    #[test]
+    fn test_prepare_unknown_database_does_not_advance_state() {
+        let mut coord = TwoPhaseCoordinator::new(16);
+        coord
+            .add_participant(MAIN_DB_ID, "main".to_owned(), true)
+            .unwrap();
+
+        let err = coord.prepare_participant(
+            99,
+            PrepareResult::Ok {
+                wal_offset: 4096,
+                frame_count: 1,
+            },
+        );
+        assert!(matches!(err, Err(TwoPhaseError::UnknownDatabase(99))));
+        assert_eq!(coord.state(), TwoPhaseState::Idle);
+        assert_eq!(coord.participants[&MAIN_DB_ID].prepare_result, None);
+    }
+
+    #[test]
+    fn test_commit_unknown_database_does_not_advance_state() {
+        let mut coord = TwoPhaseCoordinator::new(17);
+        coord
+            .add_participant(MAIN_DB_ID, "main".to_owned(), true)
+            .unwrap();
+        coord
+            .prepare_participant(
+                MAIN_DB_ID,
+                PrepareResult::Ok {
+                    wal_offset: 4096,
+                    frame_count: 1,
+                },
+            )
+            .unwrap();
+        coord.check_all_prepared().unwrap();
+        coord.write_commit_marker(CommitSeq::new(1), 0).unwrap();
+
+        let err = coord.commit_participant(99);
+        assert!(matches!(err, Err(TwoPhaseError::UnknownDatabase(99))));
+        assert_eq!(coord.state(), TwoPhaseState::MarkerWritten);
+        assert!(!coord.participants[&MAIN_DB_ID].wal_index_updated);
     }
 }
