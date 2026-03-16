@@ -266,9 +266,9 @@ impl FecCommitHook {
         }
 
         // Commit frame — encode all buffered pages.
-        let result = self.encode_buffered(cx)?;
+        let result = self.encode_buffered(cx);
         self.buffered_pages.clear();
-        Ok(Some(result))
+        result.map(Some)
     }
 
     /// Discard buffered pages (e.g. on rollback).
@@ -353,6 +353,8 @@ pub fn attempt_fec_recovery(
 )]
 mod tests {
     use super::*;
+    use asupersync::Cx as AsCx;
+    use asupersync::types::CancelReason as AsCancelReason;
     use fsqlite_types::cx::Cx;
 
     fn test_cx() -> Cx {
@@ -514,6 +516,50 @@ mod tests {
     }
 
     #[test]
+    fn test_hook_clears_buffer_after_failed_commit_encode() {
+        let mut hook = FecCommitHook::new(default_config()).unwrap();
+
+        let aborted_cx = Cx::new();
+        aborted_cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+
+        hook.on_frame(&aborted_cx, 1, &sample_page(0x10, 512), 0)
+            .unwrap();
+        let err = hook.on_frame(&aborted_cx, 2, &sample_page(0x20, 512), 2);
+        assert!(
+            matches!(err, Err(FrankenError::Abort)),
+            "cancelled encode should fail with Abort"
+        );
+
+        let cx = test_cx();
+        let result = hook.on_frame(&cx, 3, &sample_page(0x30, 512), 3).unwrap();
+        let commit = result.expect("next commit should only include new frames");
+        assert_eq!(commit.page_numbers, vec![3]);
+    }
+
+    #[test]
+    fn test_hook_clears_buffer_after_attached_native_cancelled_commit_encode() {
+        let mut hook = FecCommitHook::new(default_config()).unwrap();
+
+        let aborted_cx = test_cx();
+        let native = AsCx::for_testing();
+        aborted_cx.set_native_cx(native.clone());
+        native.set_cancel_reason(AsCancelReason::timeout());
+
+        hook.on_frame(&aborted_cx, 1, &sample_page(0x10, 512), 0)
+            .unwrap();
+        let err = hook.on_frame(&aborted_cx, 2, &sample_page(0x20, 512), 2);
+        assert!(
+            matches!(err, Err(FrankenError::Abort)),
+            "attached native cancellation should abort commit-group encode"
+        );
+
+        let cx = test_cx();
+        let result = hook.on_frame(&cx, 3, &sample_page(0x30, 512), 3).unwrap();
+        let commit = result.expect("next commit should only include new frames");
+        assert_eq!(commit.page_numbers, vec![3]);
+    }
+
+    #[test]
     fn test_hook_enable_disable() {
         let cx = test_cx();
         let mut hook = FecCommitHook::new(default_config()).unwrap();
@@ -614,6 +660,29 @@ mod tests {
                 panic!("FEC recovery with erasures failed: {:?}", fail.reason);
             }
         }
+    }
+
+    #[test]
+    fn test_fec_recovery_respects_attached_native_cancellation() {
+        let encode_cx = test_cx();
+        let config = default_config();
+        let mut hook = FecCommitHook::new(config.clone()).unwrap();
+
+        let page1 = sample_page(0xAA, 512);
+        let page2 = sample_page(0xBB, 512);
+        hook.on_frame(&encode_cx, 1, &page1, 0).unwrap();
+        let result = hook.on_frame(&encode_cx, 2, &page2, 2).unwrap();
+        let commit = result.expect("commit");
+
+        let decode_cx = test_cx();
+        let native = AsCx::for_testing();
+        decode_cx.set_native_cx(native.clone());
+        native.set_cancel_reason(AsCancelReason::timeout());
+
+        let symbol_map: BTreeMap<u32, Vec<u8>> = commit.symbols.into_iter().collect();
+        let err =
+            attempt_fec_recovery(&decode_cx, &config, symbol_map, commit.k_source).unwrap_err();
+        assert!(matches!(err, FrankenError::Abort));
     }
 
     // -- Configuration tests --

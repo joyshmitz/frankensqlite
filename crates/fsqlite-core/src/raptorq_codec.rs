@@ -19,7 +19,10 @@ use asupersync::transport::error::{SinkError, StreamError};
 use asupersync::transport::sink::SymbolSink;
 use asupersync::transport::stream::SymbolStream;
 use asupersync::types::Time as AsTime;
-use asupersync::types::{ObjectId as AsObjectId, ObjectParams, Symbol, SymbolId, SymbolKind};
+use asupersync::types::{
+    CancelKind as AsCancelKind, CancelReason as AsCancelReason, ObjectId as AsObjectId,
+    ObjectParams, Symbol, SymbolId, SymbolKind,
+};
 use asupersync::{Budget as AsBudget, Cx as AsCx, RaptorQConfig};
 
 use fsqlite_error::{FrankenError, Result};
@@ -245,6 +248,30 @@ fn is_native_abort(kind: AsErrorKind) -> bool {
     )
 }
 
+fn native_reason_to_local(reason: &AsCancelReason) -> fsqlite_types::cx::CancelReason {
+    match reason.kind {
+        AsCancelKind::User => fsqlite_types::cx::CancelReason::UserInterrupt,
+        AsCancelKind::Timeout
+        | AsCancelKind::Deadline
+        | AsCancelKind::PollQuota
+        | AsCancelKind::CostBudget => fsqlite_types::cx::CancelReason::Timeout,
+        AsCancelKind::FailFast
+        | AsCancelKind::RaceLost
+        | AsCancelKind::ParentCancelled
+        | AsCancelKind::Shutdown
+        | AsCancelKind::LinkedExit => fsqlite_types::cx::CancelReason::RegionClose,
+        AsCancelKind::ResourceUnavailable => fsqlite_types::cx::CancelReason::Abort,
+    }
+}
+
+fn sync_local_cancel_from_attached_native(codec_cx: &Cx, native_cx: &AsCx) {
+    if let Some(reason) = native_cx.cancel_reason() {
+        codec_cx.cancel_with_reason(native_reason_to_local(&reason));
+    } else if native_cx.is_cancel_requested() {
+        codec_cx.cancel();
+    }
+}
+
 fn derive_native_request_cx(cx: &Cx) -> (Cx, AsCx) {
     let codec_cx = cx.create_child();
     if let Some(reason) = cx.cancel_reason() {
@@ -252,8 +279,11 @@ fn derive_native_request_cx(cx: &Cx) -> (Cx, AsCx) {
     } else if cx.is_cancel_requested() {
         codec_cx.cancel();
     }
-    let native_cx = cx
-        .attached_native_cx()
+    let attached_native_cx = cx.attached_native_cx();
+    if let Some(native_cx) = attached_native_cx.as_ref() {
+        sync_local_cancel_from_attached_native(&codec_cx, native_cx);
+    }
+    let native_cx = attached_native_cx
         .unwrap_or_else(|| AsCx::for_request_with_budget(native_budget_from_local(&codec_cx)));
     codec_cx.set_native_cx(native_cx.clone());
     (codec_cx, native_cx)
@@ -433,7 +463,6 @@ impl SymbolCodec for AsupersyncCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asupersync::types::CancelReason as AsCancelReason;
     use fsqlite_types::cx::{CancelReason, Cx};
 
     fn test_cx() -> Cx {
@@ -740,5 +769,20 @@ mod tests {
             .decode(&cx, &encoded.source_symbols, encoded.k_source, 512)
             .unwrap_err();
         assert!(matches!(err, FrankenError::Abort));
+    }
+
+    #[test]
+    fn test_derive_native_request_cx_mirrors_attached_native_cancellation() {
+        let cx = test_cx();
+        let native = AsCx::for_testing();
+        cx.set_native_cx(native.clone());
+        native.set_cancel_reason(AsCancelReason::timeout());
+
+        let (codec_cx, derived_native) = derive_native_request_cx(&cx);
+
+        assert_eq!(codec_cx.cancel_reason(), Some(CancelReason::Timeout));
+        assert!(codec_cx.is_cancel_requested());
+        assert!(codec_cx.checkpoint().is_err());
+        assert!(derived_native.is_cancel_requested());
     }
 }
