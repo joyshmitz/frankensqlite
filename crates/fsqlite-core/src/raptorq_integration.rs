@@ -1091,7 +1091,7 @@ mod tests {
             // The test codec exposes the same metadata surface as the
             // production `SymbolCodec`, so it must rebuild decode parameters
             // using the same single-block geometry.
-            let source_blocks = 1_u8;
+            let source_blocks = 1_u16;
             let symbols_per_block = k_source.max(1);
             let object_size = u64::from(k_source)
                 .checked_mul(u64::from(symbol_size))
@@ -1106,7 +1106,7 @@ mod tests {
                     what: "symbol_size as u16".to_owned(),
                     value: symbol_size.to_string(),
                 })?,
-                source_blocks,
+                u16::from(source_blocks),
                 u16::try_from(symbols_per_block).map_err(|_| FrankenError::OutOfRange {
                     what: "symbols_per_block as u16".to_owned(),
                     value: symbols_per_block.to_string(),
