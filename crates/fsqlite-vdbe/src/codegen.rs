@@ -14,7 +14,7 @@ use fsqlite_ast::{
     Span, Statement, TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement,
     UpsertAction, UpsertClause, UpsertTarget,
 };
-use fsqlite_parser::Parser as SqlParser;
+use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::StrictColumnType;
 use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
 
@@ -5434,7 +5434,7 @@ pub fn codegen_insert(
             for (idx, col) in table.columns.iter().enumerate() {
                 #[allow(clippy::cast_possible_wrap)]
                 let reg = col_regs + idx as i32;
-                emit_default_value(b, col, reg);
+                emit_default_value(b, col, reg)?;
             }
             let rowid_reg = b.alloc_reg();
             if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
@@ -5664,7 +5664,7 @@ fn codegen_insert_values(
                         0,
                     );
                 } else {
-                    emit_default_value(b, &table.columns[tbl_idx], dest);
+                    emit_default_value(b, &table.columns[tbl_idx], dest)?;
                 }
             }
             (table_regs, table.columns.len())
@@ -6249,7 +6249,7 @@ fn codegen_insert_select(
                     0,
                 );
             } else {
-                emit_default_value(b, &target_table.columns[tbl_idx], dest);
+                emit_default_value(b, &target_table.columns[tbl_idx], dest)?;
             }
         }
         (table_regs, n_table_cols)
@@ -6460,7 +6460,7 @@ fn codegen_insert_select_without_from(
                     0,
                 );
             } else {
-                emit_default_value(b, &target_table.columns[tbl_idx], dest);
+                emit_default_value(b, &target_table.columns[tbl_idx], dest)?;
             }
         }
         (table_regs, n_table_cols)
@@ -7527,18 +7527,23 @@ pub fn codegen_delete(
 /// Emit a column's DEFAULT value into a register.
 ///
 /// Parses the column's `default_value` SQL text and emits the appropriate
-/// opcode. Falls back to `Null` when no default is specified.
-fn emit_default_value(b: &mut ProgramBuilder, col: &ColumnInfo, reg: i32) {
+/// opcode. Emits `Null` when no default is specified.
+fn emit_default_value(b: &mut ProgramBuilder, col: &ColumnInfo, reg: i32) -> Result<(), CodegenError> {
     match col.default_value.as_deref() {
         None => {
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            Ok(())
         }
         Some(dv) => {
-            if let Some(expr) = parse_default_expr(dv) {
-                emit_expr(b, &expr, reg, None);
-            } else {
-                b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(dv.trim().to_owned()), 0);
-            }
+            let expr = parse_default_expr(dv).ok_or_else(|| {
+                CodegenError::Unsupported(format!(
+                    "failed to parse DEFAULT expression `{}` for column `{}`",
+                    dv.trim(),
+                    col.name
+                ))
+            })?;
+            emit_expr(b, &expr, reg, None);
+            Ok(())
         }
     }
 }
@@ -7552,35 +7557,7 @@ fn parse_default_expr(default_sql: &str) -> Option<Expr> {
     if trimmed.is_empty() {
         return None;
     }
-
-    let mut parser = SqlParser::from_sql(&format!("SELECT {trimmed}"));
-    let (stmts, errs) = parser.parse_all();
-    if !errs.is_empty() || stmts.len() != 1 {
-        return None;
-    }
-
-    let stmt = stmts.into_iter().next()?;
-    let Statement::Select(select_stmt) = stmt else {
-        return None;
-    };
-    if !select_stmt.order_by.is_empty()
-        || select_stmt.limit.is_some()
-        || !select_stmt.body.compounds.is_empty()
-    {
-        return None;
-    }
-
-    let SelectCore::Select { columns, from, .. } = select_stmt.body.select else {
-        return None;
-    };
-    if from.is_some() || columns.len() != 1 {
-        return None;
-    }
-
-    match columns.into_iter().next()? {
-        ResultColumn::Expr { expr, .. } => Some(expr),
-        _ => None,
-    }
+    parse_sql_expr(trimmed).ok()
 }
 
 fn emit_index_predicate_guard(

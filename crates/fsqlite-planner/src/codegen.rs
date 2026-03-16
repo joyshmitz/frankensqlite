@@ -7,9 +7,9 @@
 use fsqlite_ast::{
     BinaryOp as AstBinaryOp, ColumnRef, ConflictAction, DeleteStatement, Expr, FunctionArgs,
     InsertSource, InsertStatement, Literal, PlaceholderType, QualifiedTableRef, ResultColumn,
-    SelectCore, SelectStatement, Span, Statement, UnaryOp as AstUnaryOp, UpdateStatement,
+    SelectCore, SelectStatement, Span, UnaryOp as AstUnaryOp, UpdateStatement,
 };
-use fsqlite_parser::{ParseError, Parser};
+use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
 
 // ---------------------------------------------------------------------------
@@ -577,55 +577,34 @@ fn insert_target_indices(
         .collect()
 }
 
-fn insert_default_exprs(table: &TableSchema) -> Vec<Expr> {
-    table.columns.iter().map(default_value_to_expr).collect()
+fn insert_default_exprs(table: &TableSchema) -> Result<Vec<Expr>, CodegenError> {
+    table
+        .columns
+        .iter()
+        .map(|col| default_value_to_expr(table, col))
+        .collect()
 }
 
 /// Convert a column's DEFAULT value SQL text to an AST expression.
-fn default_value_to_expr(col: &ColumnInfo) -> Expr {
+fn default_value_to_expr(table: &TableSchema, col: &ColumnInfo) -> Result<Expr, CodegenError> {
     let span = Span::ZERO;
     let Some(dv) = col.default_value.as_deref() else {
-        return Expr::Literal(Literal::Null, span);
+        return Ok(Expr::Literal(Literal::Null, span));
     };
-    parse_default_expr(dv)
-        .unwrap_or_else(|| Expr::Literal(Literal::String(dv.trim().to_owned()), span))
+    parse_default_expr(dv).map_err(|err| {
+        CodegenError::Unsupported(format!(
+            "failed to parse DEFAULT expression `{}` for {}.{}: {err}",
+            dv.trim(),
+            table.name,
+            col.name
+        ))
+    })
 }
 
 /// Parse column DEFAULT SQL text into an expression AST.
-fn parse_default_expr(default_sql: &str) -> Option<Expr> {
+fn parse_default_expr(default_sql: &str) -> Result<Expr, fsqlite_parser::ParseError> {
     let trimmed = default_sql.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut parser = Parser::from_sql(&format!("SELECT {trimmed}"));
-    let (stmts, errs): (Vec<Statement>, Vec<ParseError>) = parser.parse_all();
-    if !errs.is_empty() || stmts.len() != 1 {
-        return None;
-    }
-
-    let stmt = stmts.into_iter().next()?;
-    let Statement::Select(select_stmt) = stmt else {
-        return None;
-    };
-    if !select_stmt.order_by.is_empty()
-        || select_stmt.limit.is_some()
-        || !select_stmt.body.compounds.is_empty()
-    {
-        return None;
-    }
-
-    let SelectCore::Select { columns, from, .. } = select_stmt.body.select else {
-        return None;
-    };
-    if from.is_some() || columns.len() != 1 {
-        return None;
-    }
-
-    match columns.into_iter().next()? {
-        ResultColumn::Expr { expr, .. } => Some(expr),
-        _ => None,
-    }
+    parse_sql_expr(trimmed)
 }
 
 fn expand_insert_values_row(
@@ -646,7 +625,7 @@ fn expand_insert_values_row(
         )));
     }
 
-    let mut expanded = insert_default_exprs(table);
+    let mut expanded = insert_default_exprs(table)?;
     let mut filled_targets = vec![false; table.columns.len()];
     for (source_idx, target_idx) in target_indices.into_iter().enumerate() {
         if filled_targets[target_idx] {
@@ -683,7 +662,7 @@ fn emit_insert_target_regs_from_source(
     let target_count = i32::try_from(target_table.columns.len())
         .map_err(|_| CodegenError::Unsupported("too many target columns".to_owned()))?;
     let val_regs = b.alloc_regs(target_count);
-    let default_exprs = insert_default_exprs(target_table);
+    let default_exprs = insert_default_exprs(target_table)?;
     let mut source_for_target = vec![None; target_table.columns.len()];
     for (source_idx, target_idx) in target_indices.into_iter().enumerate() {
         source_for_target[target_idx].get_or_insert(source_idx);
@@ -816,7 +795,7 @@ fn codegen_insert_default_values(
 
     // Allocate registers for columns and evaluate each declared default.
     let val_regs = b.alloc_regs(n_cols);
-    let default_exprs = insert_default_exprs(table);
+    let default_exprs = insert_default_exprs(table)?;
     for (idx, default_expr) in default_exprs.iter().enumerate() {
         let reg = val_regs + idx as i32;
         emit_expr(b, default_expr, reg)?;
@@ -2354,6 +2333,77 @@ mod tests {
             prog.ops()
                 .iter()
                 .any(|op| op.opcode == Opcode::Integer && op.p1 == 42)
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_default_values_uses_expression_defaults() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::DefaultValues,
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "total".to_owned(),
+                    affinity: 'd',
+                    default_value: Some("(40 + 2)".to_owned()),
+                },
+            ],
+            indexes: vec![],
+        }];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Add),
+            "expression defaults should compile as expressions, not string literals"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_default_values_rejects_unparseable_defaults() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::DefaultValues,
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![ColumnInfo {
+                name: "broken".to_owned(),
+                affinity: 'C',
+                default_value: Some("('unterminated".to_owned()),
+            }],
+            indexes: vec![],
+        }];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported(ref msg) if msg.contains("failed to parse DEFAULT expression")),
+            "unexpected error: {err:?}"
         );
     }
 
