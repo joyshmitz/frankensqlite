@@ -1106,7 +1106,12 @@ mod tests {
                     what: "symbol_size as u16".to_owned(),
                     value: symbol_size.to_string(),
                 })?,
-                u16::from(source_blocks),
+                source_blocks
+                    .try_into()
+                    .map_err(|_| FrankenError::OutOfRange {
+                        what: "source_blocks".to_owned(),
+                        value: source_blocks.to_string(),
+                    })?,
                 u16::try_from(symbols_per_block).map_err(|_| FrankenError::OutOfRange {
                     what: "symbols_per_block as u16".to_owned(),
                     value: symbols_per_block.to_string(),
