@@ -37,7 +37,9 @@ mod tests {
         Connection, ConnectionEnv, IoPollStrategy, RuntimeConfig, RuntimeContext,
         init_global_runtime,
     };
+    use fsqlite_ast::{CreateTableBody, Statement};
     use fsqlite_error::FrankenError;
+    use fsqlite_parser::parse_first_statement_with_tail;
     use fsqlite_types::value::SqliteValue;
     use std::sync::Arc;
 
@@ -3081,6 +3083,51 @@ mod tests {
     }
 
     #[test]
+    fn insert_default_values_uses_expression_defaults() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE td (id INTEGER PRIMARY KEY, total INTEGER DEFAULT (40 + 2), label TEXT DEFAULT lower('HELLO'));",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO td DEFAULT VALUES;").unwrap();
+        let rows = conn.query("SELECT id, total, label FROM td;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(42));
+        assert_eq!(
+            row_values(&rows[0])[2],
+            SqliteValue::Text("hello".to_owned())
+        );
+    }
+
+    #[test]
+    fn create_table_rejects_non_constant_default_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn
+            .execute("CREATE TABLE t(a INTEGER, b INTEGER DEFAULT (a + 1));")
+            .expect_err("column-reference DEFAULT should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default value of column [b] is not constant"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn alter_table_add_column_rejects_non_constant_default_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER);").unwrap();
+        let err = conn
+            .execute("ALTER TABLE t ADD COLUMN b INTEGER DEFAULT (a + 1);")
+            .expect_err("column-reference DEFAULT should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("default value of column [b] is not constant"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
     fn insert_explicit_cols_uses_defaults_for_omitted() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
@@ -3380,6 +3427,82 @@ mod tests {
         assert_eq!(stored[0], SqliteValue::Integer(7));
         assert_eq!(stored[1], SqliteValue::Integer(7));
         assert_eq!(stored[2], SqliteValue::Text("Bob".to_owned()));
+    }
+
+    #[test]
+    fn upsert_do_update_resolves_hidden_rowid_aliases() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (u TEXT UNIQUE, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t(rowid, u, v) VALUES (1, 'dup', 10);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t(rowid, u, v) VALUES (7, 'dup', 99)
+             ON CONFLICT(u) DO UPDATE SET v = excluded.rowid + rowid;",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT rowid, u, v FROM t ORDER BY rowid;")
+            .unwrap();
+        let vals = row_values(&rows[0]);
+        assert_eq!(vals[0], SqliteValue::Integer(1));
+        assert_eq!(vals[1], SqliteValue::Text("dup".to_owned()));
+        assert_eq!(vals[2], SqliteValue::Integer(8));
+    }
+
+    #[test]
+    fn alter_table_preserves_primary_key_sql_in_sqlite_master() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(id TEXT PRIMARY KEY, body TEXT);")
+            .unwrap();
+        conn.execute("ALTER TABLE t RENAME COLUMN body TO payload;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 't';")
+            .unwrap();
+        let row = row_values(&rows[0]);
+        let sql = match &row[0] {
+            SqliteValue::Text(sql) => sql,
+            other => panic!("expected SQL text, got {other:?}"),
+        };
+        assert!(sql.contains("PRIMARY KEY"), "{sql}");
+        assert!(!sql.contains("UNIQUE"), "{sql}");
+    }
+
+    #[test]
+    fn alter_table_preserves_typeless_without_rowid_sql_in_sqlite_master() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wr(id TEXT, body, PRIMARY KEY(id, body)) WITHOUT ROWID;")
+            .unwrap();
+        conn.execute("ALTER TABLE wr ADD COLUMN note TEXT;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE name = 'wr';")
+            .unwrap();
+        let row = row_values(&rows[0]);
+        let sql = match &row[0] {
+            SqliteValue::Text(sql) => sql,
+            other => panic!("expected SQL text, got {other:?}"),
+        };
+        assert!(sql.contains("PRIMARY KEY"), "{sql}");
+        assert!(sql.contains("WITHOUT ROWID"), "{sql}");
+        assert!(sql.contains("body"), "{sql}");
+        assert!(!sql.contains("body BLOB"), "{sql}");
+    }
+
+    #[test]
+    fn alter_table_drop_primary_key_column_is_rejected() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(id TEXT PRIMARY KEY, body TEXT);")
+            .unwrap();
+        let err = conn
+            .execute("ALTER TABLE t DROP COLUMN id;")
+            .expect_err("dropping a primary key column must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("cannot drop PRIMARY KEY column id"), "{msg}");
     }
 
     /// Explicit column list omitting IPK should auto-generate rowid.
@@ -7166,6 +7289,130 @@ mod tests {
         assert_eq!(row_values(&r[0])[1].to_text(), "1");
         assert_eq!(row_values(&r[1])[0].to_text(), "Bob");
         assert_eq!(row_values(&r[1])[1].to_text(), "1");
+    }
+
+    #[test]
+    fn alter_table_preserves_without_rowid_in_schema_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wr(id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID;")
+            .unwrap();
+        conn.execute("ALTER TABLE wr ADD COLUMN extra INTEGER DEFAULT 0;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wr';")
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        assert!(
+            sql.to_ascii_uppercase().contains("WITHOUT ROWID"),
+            "ALTER TABLE must preserve WITHOUT ROWID in sqlite_master SQL: {sql}"
+        );
+    }
+
+    #[test]
+    fn alter_table_preserves_typeless_columns_in_schema_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE typeless(payload);").unwrap();
+        conn.execute("ALTER TABLE typeless ADD COLUMN note;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'typeless';")
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        let Some((Statement::CreateTable(create), _)) =
+            parse_first_statement_with_tail(&sql).expect("sqlite_master sql should parse")
+        else {
+            panic!("expected CREATE TABLE sql, got: {sql}");
+        };
+        let CreateTableBody::Columns { columns, .. } = create.body else {
+            panic!("expected CREATE TABLE column definition body, got: {sql}");
+        };
+        assert_eq!(
+            columns.len(),
+            2,
+            "ALTER TABLE should preserve both columns in sqlite_master sql: {sql}"
+        );
+        assert_eq!(columns[0].name, "payload", "{sql}");
+        assert!(
+            columns[0].type_name.is_none(),
+            "ALTER TABLE must not synthesize a declared type for existing typeless columns: {sql}"
+        );
+        assert_eq!(columns[1].name, "note", "{sql}");
+        assert!(
+            columns[1].type_name.is_none(),
+            "ALTER TABLE must not synthesize a declared type for added typeless columns: {sql}"
+        );
+    }
+
+    #[test]
+    fn alter_table_preserves_embedded_quote_identifiers_in_schema_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(r#"CREATE TABLE "te""st"("co""l" TEXT PRIMARY KEY);"#)
+            .unwrap();
+        conn.execute(r#"ALTER TABLE "te""st" ADD COLUMN "no""te" TEXT;"#)
+            .unwrap();
+
+        let rows = conn
+            .query(r#"SELECT sql FROM sqlite_master WHERE type='table' AND name='te"st';"#)
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        let Some((Statement::CreateTable(create), _)) =
+            parse_first_statement_with_tail(&sql).expect("sqlite_master sql should parse")
+        else {
+            panic!("expected CREATE TABLE sql, got: {sql}");
+        };
+        let CreateTableBody::Columns { columns, .. } = create.body else {
+            panic!("expected CREATE TABLE column definition body, got: {sql}");
+        };
+        assert_eq!(create.name.name, "te\"st", "{sql}");
+        assert_eq!(columns[0].name, "co\"l", "{sql}");
+        assert_eq!(columns[1].name, "no\"te", "{sql}");
+    }
+
+    #[test]
+    fn alter_table_rename_preserves_embedded_quote_identifiers_in_index_sql() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(r#"CREATE TABLE "te""st"("co""l" TEXT);"#)
+            .unwrap();
+        conn.execute(r#"CREATE INDEX "ix""q" ON "te""st"("co""l");"#)
+            .unwrap();
+        conn.execute(r#"ALTER TABLE "te""st" RENAME TO "ta""rget";"#)
+            .unwrap();
+
+        let rows = conn
+            .query(r#"SELECT sql FROM sqlite_master WHERE type='index' AND name='ix"q';"#)
+            .unwrap();
+        let sql = row_values(&rows[0])[0].to_text();
+        let Some((Statement::CreateIndex(create), _)) =
+            parse_first_statement_with_tail(&sql).expect("sqlite_master sql should parse")
+        else {
+            panic!("expected CREATE INDEX sql, got: {sql}");
+        };
+        assert_eq!(create.name.name, "ix\"q", "{sql}");
+        assert_eq!(create.table, "ta\"rget", "{sql}");
+    }
+
+    #[test]
+    fn foreign_key_cascade_supports_embedded_quote_identifiers() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute(r#"CREATE TABLE "par""ent"("id""x" INTEGER PRIMARY KEY);"#)
+            .unwrap();
+        conn.execute(
+            r#"CREATE TABLE "chi""ld"("fk""x" INTEGER REFERENCES "par""ent"("id""x") ON DELETE CASCADE);"#,
+        )
+        .unwrap();
+        conn.execute(r#"INSERT INTO "par""ent"("id""x") VALUES (1);"#)
+            .unwrap();
+        conn.execute(r#"INSERT INTO "chi""ld"("fk""x") VALUES (1);"#)
+            .unwrap();
+
+        conn.execute(r#"DELETE FROM "par""ent" WHERE "id""x" = 1;"#)
+            .unwrap();
+
+        let rows = conn.query(r#"SELECT COUNT(*) FROM "chi""ld";"#).unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(0));
     }
 
     // -----------------------------------------------------------------------

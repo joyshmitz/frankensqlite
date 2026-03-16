@@ -7,10 +7,9 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, TryLockError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsqlite_types::{CommitSeq, PageNumber, TxnToken};
 use tracing::{debug, warn};
@@ -954,63 +953,47 @@ impl SsiEvidenceLedgerState {
 /// Bounded append-only ledger for SSI decision cards.
 #[derive(Debug)]
 pub struct SsiEvidenceLedger {
-    state: Arc<Mutex<SsiEvidenceLedgerState>>,
-    pending: Arc<AtomicUsize>,
-    tx: Option<mpsc::Sender<SsiDecisionCardDraft>>,
+    state: Mutex<SsiEvidenceLedgerState>,
+    pending_queue: Mutex<VecDeque<SsiDecisionCardDraft>>,
+    pending: AtomicUsize,
+    flush_in_progress: AtomicBool,
 }
 
 impl SsiEvidenceLedger {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        let state = Arc::new(Mutex::new(SsiEvidenceLedgerState::new(capacity)));
-        let pending = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::channel();
-
-        let worker_state = Arc::clone(&state);
-        let worker_pending = Arc::clone(&pending);
-        let worker = thread::Builder::new()
-            .name("fsqlite-ssi-ledger".to_owned())
-            .spawn(move || {
-                while let Ok(draft) = rx.recv() {
-                    with_locked_state(&worker_state, |inner| inner.append(draft));
-                    let _ = worker_pending.fetch_sub(1, Ordering::AcqRel);
-                }
-            });
-
-        let tx = if worker.is_ok() { Some(tx) } else { None };
-
-        Self { state, pending, tx }
+        Self {
+            state: Mutex::new(SsiEvidenceLedgerState::new(capacity)),
+            pending_queue: Mutex::new(VecDeque::new()),
+            pending: AtomicUsize::new(0),
+            flush_in_progress: AtomicBool::new(false),
+        }
     }
 
     /// Non-blocking append path used from commit/abort critical sections.
     pub fn record_async(&self, draft: SsiDecisionCardDraft) {
-        if let Some(tx) = &self.tx {
-            let _ = self.pending.fetch_add(1, Ordering::AcqRel);
-            if tx.send(draft.clone()).is_ok() {
-                return;
-            }
-            let _ = self.pending.fetch_sub(1, Ordering::AcqRel);
-        }
-        self.record_sync(draft);
+        self.enqueue_pending(draft);
+        self.try_flush_pending();
     }
 
-    /// Immediate append fallback used when the async worker is unavailable.
+    /// Synchronous append used by callers that need visibility before return.
     pub fn record_sync(&self, draft: SsiDecisionCardDraft) {
-        with_locked_state(&self.state, |inner| inner.append(draft));
+        self.enqueue_pending(draft);
+        self.flush_pending();
     }
 
     /// Return all retained cards in insertion order.
     #[must_use]
     pub fn snapshot(&self) -> Vec<SsiDecisionCard> {
-        self.await_quiescence(Duration::from_millis(25));
-        with_locked_state(&self.state, |inner| inner.entries.iter().cloned().collect())
+        self.flush_pending();
+        with_locked(&self.state, |inner| inner.entries.iter().cloned().collect())
     }
 
     /// Return cards matching the given query.
     #[must_use]
     pub fn query(&self, query: &SsiDecisionQuery) -> Vec<SsiDecisionCard> {
-        self.await_quiescence(Duration::from_millis(25));
-        with_locked_state(&self.state, |inner| {
+        self.flush_pending();
+        with_locked(&self.state, |inner| {
             inner
                 .entries
                 .iter()
@@ -1037,8 +1020,8 @@ impl SsiEvidenceLedger {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.await_quiescence(Duration::from_millis(25));
-        with_locked_state(&self.state, |inner| inner.entries.len())
+        self.flush_pending();
+        with_locked(&self.state, |inner| inner.entries.len())
     }
 
     #[must_use]
@@ -1046,10 +1029,73 @@ impl SsiEvidenceLedger {
         self.len() == 0
     }
 
-    fn await_quiescence(&self, timeout: Duration) {
-        let start = Instant::now();
-        while self.pending.load(Ordering::Acquire) > 0 && start.elapsed() < timeout {
-            thread::sleep(Duration::from_micros(50));
+    fn enqueue_pending(&self, draft: SsiDecisionCardDraft) {
+        with_locked(&self.pending_queue, |queue| {
+            queue.push_back(draft);
+            let _ = self.pending.fetch_add(1, Ordering::AcqRel);
+        });
+    }
+
+    fn try_flush_pending(&self) {
+        while self.pending.load(Ordering::Acquire) > 0 {
+            if self
+                .flush_in_progress
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+
+            let drained = self.try_with_locked_state(|state| self.drain_pending_into(state));
+            self.flush_in_progress.store(false, Ordering::Release);
+            if drained.is_none() {
+                return;
+            }
+        }
+    }
+
+    fn flush_pending(&self) {
+        while self.pending.load(Ordering::Acquire) > 0 {
+            if self
+                .flush_in_progress
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                std::thread::yield_now();
+                continue;
+            }
+
+            with_locked(&self.state, |state| self.drain_pending_into(state));
+            self.flush_in_progress.store(false, Ordering::Release);
+        }
+    }
+
+    fn try_with_locked_state<T>(
+        &self,
+        f: impl FnOnce(&mut SsiEvidenceLedgerState) -> T,
+    ) -> Option<T> {
+        match self.state.try_lock() {
+            Ok(mut guard) => Some(f(&mut guard)),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let mut guard = poisoned.into_inner();
+                Some(f(&mut guard))
+            }
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    fn drain_pending_into(&self, state: &mut SsiEvidenceLedgerState) {
+        loop {
+            let mut batch = with_locked(&self.pending_queue, std::mem::take);
+            if batch.is_empty() {
+                return;
+            }
+
+            let drained = batch.len();
+            while let Some(draft) = batch.pop_front() {
+                state.append(draft);
+            }
+            let _ = self.pending.fetch_sub(drained, Ordering::AcqRel);
         }
     }
 }
@@ -1060,10 +1106,7 @@ impl Default for SsiEvidenceLedger {
     }
 }
 
-fn with_locked_state<T>(
-    state: &Arc<Mutex<SsiEvidenceLedgerState>>,
-    f: impl FnOnce(&mut SsiEvidenceLedgerState) -> T,
-) -> T {
+fn with_locked<T, U>(state: &Mutex<T>, f: impl FnOnce(&mut T) -> U) -> U {
     match state.lock() {
         Ok(mut guard) => f(&mut guard),
         Err(poisoned) => {
@@ -1704,6 +1747,48 @@ mod tests {
             cards[0].chain_hash, cards[1].chain_hash,
             "bead_id={BEAD_ID} chain_hash_must_advance"
         );
+    }
+
+    #[test]
+    fn test_ssi_evidence_ledger_record_async_buffers_and_flushes_in_order() {
+        let ledger = SsiEvidenceLedger::new(4);
+        let held_state = ledger.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        ledger.record_async(
+            SsiDecisionCardDraft::new(
+                SsiDecisionType::CommitAllowed,
+                token(21, 1),
+                CommitSeq::new(30),
+                Vec::new(),
+                Vec::new(),
+                vec![page(3)],
+                vec![page(5)],
+                "buffered_commit",
+            )
+            .with_commit_seq(CommitSeq::new(31))
+            .with_timestamp_unix_ns(30_000),
+        );
+        ledger.record_async(
+            SsiDecisionCardDraft::new(
+                SsiDecisionType::AbortWriteSkew,
+                token(22, 1),
+                CommitSeq::new(31),
+                vec![token(21, 1)],
+                vec![page(5)],
+                vec![page(5)],
+                vec![page(6)],
+                "buffered_abort",
+            )
+            .with_timestamp_unix_ns(31_000),
+        );
+        assert_eq!(ledger.pending.load(Ordering::Acquire), 2);
+        drop(held_state);
+
+        let cards = ledger.snapshot();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].txn.id.get(), 21);
+        assert_eq!(cards[1].txn.id.get(), 22);
+        assert_eq!(ledger.pending.load(Ordering::Acquire), 0);
     }
 
     #[test]

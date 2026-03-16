@@ -421,10 +421,11 @@ pub fn render_perf_report_markdown(result: &PerfResult, config: &PerfReportConfi
         result.total_cells, result.success_count, result.error_count
     );
 
-    // Collect successful cells grouped by (fixture, workload, concurrency).
+    // Collect only fully comparable cells grouped by
+    // (fixture, workload, concurrency).
     let mut groups: BTreeMap<FixtureWorkloadConcurrencyKey, Vec<&CellOutcome>> = BTreeMap::new();
     for cell in &result.cells {
-        if cell.summary.is_some() {
+        if cell.is_fully_comparable() {
             let key = (
                 cell.fixture_id.clone(),
                 cell.workload.clone(),
@@ -473,15 +474,20 @@ fn render_baseline_settings(out: &mut String, config: &PerfReportConfig) {
     let _ = writeln!(out, "| Synchronous | {} |", s.synchronous);
     let _ = writeln!(out, "| Cache size | {} |", s.cache_size);
     let _ = writeln!(out, "| Page size | {} |", s.page_size);
-    let _ = writeln!(out, "| Busy timeout (ms) | {} |", s.busy_timeout_ms);
+    let _ = writeln!(
+        out,
+        "| Busy timeout (ms) | {} |",
+        HarnessSettings::benchmark_busy_timeout_ms()
+    );
     let _ = writeln!(out, "| Seed | {} |", config.seed);
     let _ = writeln!(out, "| Scale | {} |", config.scale);
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "> **Note:** sqlite3 concurrency is serialized via busy-timeout/retry. \
-         Reported sqlite3 \"concurrent\" results reflect retry-based serialization, \
-         not genuine parallel writes.\n"
+        "> **Note:** benchmark runs force `PRAGMA busy_timeout=0` for both engines so \
+         contention shows up in the harness retry counters. sqlite3 still serializes \
+         writes under contention; the report reflects retry-based serialization, not \
+         genuine parallel writes.\n"
     );
 }
 
@@ -497,14 +503,14 @@ fn render_speedup_summary(
         let sqlite3 = cells
             .iter()
             .find(|c| c.engine == "sqlite3")
-            .and_then(|c| c.summary.as_ref());
+            .and_then(|c| c.comparable_summary());
         let fsqlite = cells
             .iter()
             .find(|c| c.engine == "fsqlite")
-            .and_then(|c| c.summary.as_ref());
+            .and_then(|c| c.comparable_summary());
 
         if let (Some(sq), Some(fs)) = (sqlite3, fsqlite) {
-            let speedup = if sq.latency.median_ms > 0.0 {
+            let speedup = if fs.latency.median_ms > 0.0 {
                 sq.latency.median_ms / fs.latency.median_ms
             } else {
                 0.0
@@ -645,7 +651,7 @@ fn render_scaling_analysis(out: &mut String, cells: &[CellOutcome]) {
     let mut scale_groups: BTreeMap<ScaleKey, Vec<(u16, f64, f64)>> = BTreeMap::new();
 
     for cell in cells {
-        if let Some(ref summary) = cell.summary {
+        if let Some(summary) = cell.comparable_summary() {
             let key = (
                 cell.engine.clone(),
                 cell.fixture_id.clone(),
@@ -1081,9 +1087,10 @@ mod tests {
         assert!(md.contains("| Journal mode | wal |"));
         assert!(md.contains("| Synchronous | NORMAL |"));
         assert!(md.contains("| Cache size | -2000 |"));
+        assert!(md.contains("| Busy timeout (ms) | 0 |"));
         assert!(md.contains("| Seed | 42 |"));
         assert!(md.contains("| Scale | 100 |"));
-        assert!(md.contains("busy-timeout/retry"));
+        assert!(md.contains("`PRAGMA busy_timeout=0`"));
     }
 
     #[test]
@@ -1103,6 +1110,32 @@ mod tests {
         assert!(md.contains("## Speedup Summary"), "missing speedup section");
         assert!(md.contains("sqlite3 med (ms)"), "missing sqlite3 column");
         assert!(md.contains("fsqlite med (ms)"), "missing fsqlite column");
+    }
+
+    #[test]
+    fn perf_report_speedup_summary_omits_zero_denominator() {
+        let sqlite_cell = make_cell_outcome("sqlite3", "db-a", "inserts", 1);
+        let mut fsqlite_cell = make_cell_outcome("fsqlite", "db-a", "inserts", 1);
+        let summary = fsqlite_cell.summary.as_mut().unwrap();
+        summary.latency.min_ms = 0.0;
+        summary.latency.max_ms = 0.0;
+        summary.latency.mean_ms = 0.0;
+        summary.latency.median_ms = 0.0;
+        summary.latency.p95_ms = 0.0;
+        summary.latency.p99_ms = 0.0;
+
+        let result = PerfResult {
+            schema_version: PERF_RESULT_SCHEMA_V1.to_owned(),
+            total_cells: 2,
+            success_count: 2,
+            error_count: 0,
+            cells: vec![sqlite_cell, fsqlite_cell],
+        };
+        let md = render_perf_report_markdown(&result, &default_perf_report_config());
+
+        assert!(!md.contains("inf"));
+        assert!(!md.contains("0.00x"));
+        assert!(md.contains("| db-a | inserts | 1 |"));
     }
 
     #[test]
@@ -1231,5 +1264,47 @@ mod tests {
         let md = render_perf_report_markdown(&result, &default_perf_report_config());
         // Should NOT show concurrency scaling when there's only one concurrency level.
         assert!(!md.contains("## Concurrency Scaling"));
+    }
+
+    #[test]
+    fn perf_report_excludes_partial_failure_cells_from_comparison_tables() {
+        let mut sqlite_cell = make_cell_outcome("sqlite3", "db-a", "inserts", 1);
+        sqlite_cell.error =
+            Some("1/3 measurement iterations failed; first=setup failed".to_owned());
+        let fsqlite_cell = make_cell_outcome("fsqlite", "db-a", "inserts", 1);
+
+        let result = PerfResult {
+            schema_version: PERF_RESULT_SCHEMA_V1.to_owned(),
+            total_cells: 2,
+            success_count: 1,
+            error_count: 1,
+            cells: vec![sqlite_cell, fsqlite_cell],
+        };
+        let md = render_perf_report_markdown(&result, &default_perf_report_config());
+
+        assert!(md.contains("## Errors"));
+        assert!(md.contains("1/3 measurement iterations failed; first=setup failed"));
+        assert!(!md.contains("| sqlite3 | inserts | 1 |"));
+        assert!(md.contains("| fsqlite | inserts | 1 |"));
+    }
+
+    #[test]
+    fn perf_report_scaling_analysis_excludes_partial_failure_cells() {
+        let baseline = make_cell_outcome("fsqlite", "db-a", "inserts", 1);
+        let mut partial_failure = make_cell_outcome("fsqlite", "db-a", "inserts", 4);
+        partial_failure.error =
+            Some("1/3 measurement iterations failed; first=worker stalled".to_owned());
+
+        let result = PerfResult {
+            schema_version: PERF_RESULT_SCHEMA_V1.to_owned(),
+            total_cells: 2,
+            success_count: 1,
+            error_count: 1,
+            cells: vec![baseline, partial_failure],
+        };
+        let md = render_perf_report_markdown(&result, &default_perf_report_config());
+
+        assert!(!md.contains("## Concurrency Scaling"));
+        assert!(md.contains("1/3 measurement iterations failed; first=worker stalled"));
     }
 }

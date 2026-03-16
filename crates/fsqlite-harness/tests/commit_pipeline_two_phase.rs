@@ -41,12 +41,15 @@ fn test_reserve_then_abort_releases_slot() {
 #[test]
 fn test_reserve_blocks_at_capacity() {
     let (sender, _receiver) = two_phase_commit_channel(2);
-    let _a = sender.reserve();
-    let _b = sender.reserve();
+    let sender_a = sender.clone();
+    let sender_b = sender.clone();
+    let _a = sender_a.reserve();
+    let _b = sender_b.reserve();
 
     let (tx, rx) = std_mpsc::channel();
+    let sender_worker = sender.clone();
     thread::spawn(move || {
-        let permit = sender.try_reserve_for(Duration::from_millis(20));
+        let permit = sender_worker.try_reserve_for(Duration::from_millis(20));
         tx.send(permit.is_none())
             .expect("channel send in reserve timeout test");
     });
@@ -77,6 +80,41 @@ fn test_cancel_between_reserve_and_send() {
     assert!(
         retry.is_some(),
         "drop between reserve/send must release slot"
+    );
+}
+
+#[test]
+fn test_out_of_order_send_completion_still_delivers_by_reservation_sequence() {
+    let (sender, receiver) = two_phase_commit_channel(4);
+    let permit1 = sender.reserve();
+    let permit2 = sender.reserve();
+    let permit3 = sender.reserve();
+
+    let seq1 = permit1.reservation_seq();
+    let seq2 = permit2.reservation_seq();
+    let seq3 = permit3.reservation_seq();
+    assert_eq!((seq1, seq2, seq3), (1, 2, 3));
+
+    permit2.send(req(seq2));
+    permit3.send(req(seq3));
+    assert_eq!(
+        receiver.try_recv_for(Duration::from_millis(20)),
+        None,
+        "later sends must not bypass an earlier unresolved reservation"
+    );
+
+    permit1.send(req(seq1));
+    assert_eq!(
+        receiver.try_recv_for(Duration::from_millis(100)),
+        Some(req(seq1))
+    );
+    assert_eq!(
+        receiver.try_recv_for(Duration::from_millis(100)),
+        Some(req(seq2))
+    );
+    assert_eq!(
+        receiver.try_recv_for(Duration::from_millis(100)),
+        Some(req(seq3))
     );
 }
 

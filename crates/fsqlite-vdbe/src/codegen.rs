@@ -11,8 +11,8 @@ use fsqlite_ast::{
     AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FromClause,
     FunctionArgs, InsertSource, InsertStatement, JsonArrow, LimitClause, Literal, NullsOrder,
     OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, SortDirection,
-    Span, Statement, TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement,
-    UpsertAction, UpsertClause, UpsertTarget,
+    Span, TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction,
+    UpsertClause, UpsertTarget,
 };
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::StrictColumnType;
@@ -270,6 +270,14 @@ pub struct TableSchema {
     pub indexes: Vec<IndexSchema>,
     /// Whether this table uses SQLite STRICT typing rules.
     pub strict: bool,
+    /// Whether this table is declared WITHOUT ROWID.
+    pub without_rowid: bool,
+    /// PRIMARY KEY constraints expressed as ordered column-name groups.
+    ///
+    /// INTEGER PRIMARY KEY rowid aliases continue to use `ColumnInfo::is_ipk`;
+    /// this field preserves non-rowid and composite PRIMARY KEY shape for SQL
+    /// re-rendering during ALTER TABLE / persistence round-trips.
+    pub primary_key_constraints: Vec<Vec<String>>,
     /// Foreign key constraints declared on this table (child side).
     pub foreign_keys: Vec<FkDef>,
     /// CHECK constraint expressions as SQL text, collected from both
@@ -402,7 +410,11 @@ fn find_upsert_target_index<'a>(
 /// - `excluded_ctx`: resolves `excluded.col` refs to the attempted insert values
 ///
 /// The result is written into the appropriate slot of `target_regs`.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments
+)]
 fn emit_upsert_assignments(
     b: &mut ProgramBuilder,
     assignments: &[fsqlite_ast::Assignment],
@@ -410,6 +422,8 @@ fn emit_upsert_assignments(
     target_regs: i32,
     existing_ctx: &ScanCtx<'_>,
     excluded_ctx: &ScanCtx<'_>,
+    existing_hidden_rowid_reg: Option<i32>,
+    excluded_hidden_rowid_reg: i32,
 ) -> Result<(), CodegenError> {
     for assign in assignments {
         let col_name = match &assign.target {
@@ -429,6 +443,8 @@ fn emit_upsert_assignments(
                 existing_ctx,
                 excluded_ctx,
                 table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
             );
         }
     }
@@ -442,7 +458,7 @@ fn emit_upsert_assignments(
 /// ensures that expressions like `CASE WHEN excluded.val > val THEN excluded.val
 /// ELSE val END` or `coalesce(excluded.val, val)` resolve correctly in UPSERT
 /// DO UPDATE SET clauses.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn emit_upsert_expr(
     b: &mut ProgramBuilder,
     expr: &Expr,
@@ -450,11 +466,26 @@ fn emit_upsert_expr(
     existing_ctx: &ScanCtx<'_>,
     excluded_ctx: &ScanCtx<'_>,
     _table: &TableSchema,
+    existing_hidden_rowid_reg: Option<i32>,
+    excluded_hidden_rowid_reg: i32,
 ) {
     match expr {
         // ── Leaf: column reference — dispatch to correct context ────────
         Expr::Column(col_ref, _) => {
-            if col_ref
+            if _table.resolves_to_hidden_rowid(&col_ref.column)
+                && col_ref
+                    .table
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("excluded"))
+            {
+                b.emit_op(Opcode::Copy, excluded_hidden_rowid_reg, reg, 0, P4::None, 0);
+            } else if _table.resolves_to_hidden_rowid(&col_ref.column) {
+                if let Some(existing_hidden_rowid_reg) = existing_hidden_rowid_reg {
+                    b.emit_op(Opcode::Copy, existing_hidden_rowid_reg, reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Rowid, existing_ctx.cursor, reg, 0, P4::None, 0);
+                }
+            } else if col_ref
                 .table
                 .as_deref()
                 .is_some_and(|t| t.eq_ignore_ascii_case("excluded"))
@@ -477,8 +508,26 @@ fn emit_upsert_expr(
             // Pre-emit both operands with dual-context resolution.
             let left_reg = b.alloc_reg();
             let right_reg = b.alloc_reg();
-            emit_upsert_expr(b, left, left_reg, existing_ctx, excluded_ctx, _table);
-            emit_upsert_expr(b, right, right_reg, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(
+                b,
+                left,
+                left_reg,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
+            emit_upsert_expr(
+                b,
+                right,
+                right_reg,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
 
             match op {
                 // Value-producing ops: arithmetic, concat, bitwise, AND, OR.
@@ -564,7 +613,16 @@ fn emit_upsert_expr(
         Expr::UnaryOp {
             op, expr: inner, ..
         } => {
-            emit_upsert_expr(b, inner, reg, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(
+                b,
+                inner,
+                reg,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
             match op {
                 fsqlite_ast::UnaryOp::Negate => {
                     let tmp = b.alloc_temp();
@@ -588,7 +646,16 @@ fn emit_upsert_expr(
             type_name,
             ..
         } => {
-            emit_upsert_expr(b, inner, reg, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(
+                b,
+                inner,
+                reg,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
             let affinity = type_name_to_affinity(type_name);
             b.emit_op(Opcode::Cast, reg, i32::from(affinity), 0, P4::None, 0);
         }
@@ -597,7 +664,16 @@ fn emit_upsert_expr(
         Expr::IsNull {
             expr: inner, not, ..
         } => {
-            emit_upsert_expr(b, inner, reg, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(
+                b,
+                inner,
+                reg,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
             let lbl_null = b.emit_label();
             let lbl_done = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, lbl_null, P4::None, 0);
@@ -610,7 +686,16 @@ fn emit_upsert_expr(
 
         // ── COLLATE ────────────────────────────────────────────────────
         Expr::Collate { expr: inner, .. } => {
-            emit_upsert_expr(b, inner, reg, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(
+                b,
+                inner,
+                reg,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
         }
 
         // ── Scalar function calls ──────────────────────────────────────
@@ -642,6 +727,8 @@ fn emit_upsert_expr(
                             existing_ctx,
                             excluded_ctx,
                             _table,
+                            existing_hidden_rowid_reg,
+                            excluded_hidden_rowid_reg,
                         );
                     }
                     b.emit_op(
@@ -666,7 +753,16 @@ fn emit_upsert_expr(
             let done_label = b.emit_label();
             let r_operand = operand.as_deref().map(|op_expr| {
                 let r = b.alloc_temp();
-                emit_upsert_expr(b, op_expr, r, existing_ctx, excluded_ctx, _table);
+                emit_upsert_expr(
+                    b,
+                    op_expr,
+                    r,
+                    existing_ctx,
+                    excluded_ctx,
+                    _table,
+                    existing_hidden_rowid_reg,
+                    excluded_hidden_rowid_reg,
+                );
                 r
             });
 
@@ -674,22 +770,58 @@ fn emit_upsert_expr(
                 let next_when = b.emit_label();
                 if let Some(r_op) = r_operand {
                     let r_when = b.alloc_temp();
-                    emit_upsert_expr(b, when_expr, r_when, existing_ctx, excluded_ctx, _table);
+                    emit_upsert_expr(
+                        b,
+                        when_expr,
+                        r_when,
+                        existing_ctx,
+                        excluded_ctx,
+                        _table,
+                        existing_hidden_rowid_reg,
+                        excluded_hidden_rowid_reg,
+                    );
                     b.emit_jump_to_label(Opcode::IsNull, r_op, 0, next_when, P4::None, 0);
                     b.emit_jump_to_label(Opcode::IsNull, r_when, 0, next_when, P4::None, 0);
                     b.emit_jump_to_label(Opcode::Ne, r_when, r_op, next_when, P4::None, 0);
                     b.free_temp(r_when);
                 } else {
-                    emit_upsert_expr(b, when_expr, reg, existing_ctx, excluded_ctx, _table);
+                    emit_upsert_expr(
+                        b,
+                        when_expr,
+                        reg,
+                        existing_ctx,
+                        excluded_ctx,
+                        _table,
+                        existing_hidden_rowid_reg,
+                        excluded_hidden_rowid_reg,
+                    );
                     b.emit_jump_to_label(Opcode::IfNot, reg, 1, next_when, P4::None, 0);
                 }
-                emit_upsert_expr(b, then_expr, reg, existing_ctx, excluded_ctx, _table);
+                emit_upsert_expr(
+                    b,
+                    then_expr,
+                    reg,
+                    existing_ctx,
+                    excluded_ctx,
+                    _table,
+                    existing_hidden_rowid_reg,
+                    excluded_hidden_rowid_reg,
+                );
                 b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                 b.resolve_label(next_when);
             }
 
             if let Some(el) = else_expr.as_deref() {
-                emit_upsert_expr(b, el, reg, existing_ctx, excluded_ctx, _table);
+                emit_upsert_expr(
+                    b,
+                    el,
+                    reg,
+                    existing_ctx,
+                    excluded_ctx,
+                    _table,
+                    existing_hidden_rowid_reg,
+                    excluded_hidden_rowid_reg,
+                );
             } else {
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             }
@@ -716,10 +848,37 @@ fn emit_upsert_expr(
             };
             let nargs: u16 = if escape.is_some() { 3 } else { 2 };
             let arg_base = b.alloc_regs(i32::from(nargs));
-            emit_upsert_expr(b, pattern, arg_base, existing_ctx, excluded_ctx, _table);
-            emit_upsert_expr(b, operand, arg_base + 1, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(
+                b,
+                pattern,
+                arg_base,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
+            emit_upsert_expr(
+                b,
+                operand,
+                arg_base + 1,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
             if let Some(esc) = escape {
-                emit_upsert_expr(b, esc, arg_base + 2, existing_ctx, excluded_ctx, _table);
+                emit_upsert_expr(
+                    b,
+                    esc,
+                    arg_base + 2,
+                    existing_ctx,
+                    excluded_ctx,
+                    _table,
+                    existing_hidden_rowid_reg,
+                    excluded_hidden_rowid_reg,
+                );
             }
             b.emit_op(
                 Opcode::PureFunc,
@@ -745,9 +904,36 @@ fn emit_upsert_expr(
             let r_operand = b.alloc_temp();
             let r_low = b.alloc_temp();
             let r_high = b.alloc_temp();
-            emit_upsert_expr(b, operand, r_operand, existing_ctx, excluded_ctx, _table);
-            emit_upsert_expr(b, low, r_low, existing_ctx, excluded_ctx, _table);
-            emit_upsert_expr(b, high, r_high, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(
+                b,
+                operand,
+                r_operand,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
+            emit_upsert_expr(
+                b,
+                low,
+                r_low,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
+            emit_upsert_expr(
+                b,
+                high,
+                r_high,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
             let false_label = b.emit_label();
             let null_label = b.emit_label();
             let done_label = b.emit_label();
@@ -782,7 +968,16 @@ fn emit_upsert_expr(
                     return;
                 }
                 let r_operand = b.alloc_temp();
-                emit_upsert_expr(b, operand, r_operand, existing_ctx, excluded_ctx, _table);
+                emit_upsert_expr(
+                    b,
+                    operand,
+                    r_operand,
+                    existing_ctx,
+                    excluded_ctx,
+                    _table,
+                    existing_hidden_rowid_reg,
+                    excluded_hidden_rowid_reg,
+                );
                 let null_label = b.emit_label();
                 let true_label = b.emit_label();
                 let done_label = b.emit_label();
@@ -791,7 +986,16 @@ fn emit_upsert_expr(
                 b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
                 let r_val = b.alloc_temp();
                 for val_expr in values {
-                    emit_upsert_expr(b, val_expr, r_val, existing_ctx, excluded_ctx, _table);
+                    emit_upsert_expr(
+                        b,
+                        val_expr,
+                        r_val,
+                        existing_ctx,
+                        excluded_ctx,
+                        _table,
+                        existing_hidden_rowid_reg,
+                        excluded_hidden_rowid_reg,
+                    );
                     b.emit_jump_to_label(Opcode::Eq, r_val, r_operand, true_label, P4::None, 0);
                     let next_val = b.emit_label();
                     let set_flag = b.emit_label();
@@ -827,8 +1031,26 @@ fn emit_upsert_expr(
             ..
         } => {
             let arg_base = b.alloc_regs(2);
-            emit_upsert_expr(b, inner, arg_base, existing_ctx, excluded_ctx, _table);
-            emit_upsert_expr(b, path, arg_base + 1, existing_ctx, excluded_ctx, _table);
+            emit_upsert_expr(
+                b,
+                inner,
+                arg_base,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
+            emit_upsert_expr(
+                b,
+                path,
+                arg_base + 1,
+                existing_ctx,
+                excluded_ctx,
+                _table,
+                existing_hidden_rowid_reg,
+                excluded_hidden_rowid_reg,
+            );
             b.emit_op(
                 Opcode::PureFunc,
                 0,
@@ -3743,6 +3965,8 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
         }],
         indexes: vec![],
         strict: false,
+        without_rowid: false,
+        primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
     };
@@ -3791,6 +4015,8 @@ fn emit_simple_agg_wrapper(
         columns,
         indexes: vec![],
         strict: false,
+        without_rowid: false,
+        primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
     };
@@ -3840,6 +4066,8 @@ fn emit_multi_agg_wrapper(
         columns,
         indexes: vec![],
         strict: false,
+        without_rowid: false,
+        primary_key_constraints: Vec::new(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
     };
@@ -5907,6 +6135,10 @@ fn codegen_insert_values(
                     register_base: Some(existing_regs),
                     secondary: None,
                 };
+                let existing_hidden_rowid_reg = ctx
+                    .rowid_alias_col_idx
+                    .map(|ipk_idx| existing_regs + ipk_idx as i32);
+                let excluded_hidden_rowid_reg = rowid_reg;
 
                 // Optional WHERE clause on the DO UPDATE action.
                 if let Some(where_expr) = where_clause {
@@ -5919,6 +6151,8 @@ fn codegen_insert_values(
                         &existing_ctx,
                         &excluded_ctx,
                         table,
+                        existing_hidden_rowid_reg,
+                        excluded_hidden_rowid_reg,
                     );
                     // If WHERE is false/NULL, skip the update (jump to done).
                     b.emit_jump_to_label(
@@ -5937,6 +6171,8 @@ fn codegen_insert_values(
                         existing_regs,
                         &existing_ctx,
                         &excluded_ctx,
+                        existing_hidden_rowid_reg,
+                        excluded_hidden_rowid_reg,
                     )?;
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
@@ -5980,6 +6216,8 @@ fn codegen_insert_values(
                         existing_regs,
                         &existing_ctx,
                         &excluded_ctx,
+                        existing_hidden_rowid_reg,
+                        excluded_hidden_rowid_reg,
                     )?;
                     // Delete old index entries while cursor is still on
                     // the old row (reads column values from the cursor).
@@ -7528,7 +7766,11 @@ pub fn codegen_delete(
 ///
 /// Parses the column's `default_value` SQL text and emits the appropriate
 /// opcode. Emits `Null` when no default is specified.
-fn emit_default_value(b: &mut ProgramBuilder, col: &ColumnInfo, reg: i32) -> Result<(), CodegenError> {
+fn emit_default_value(
+    b: &mut ProgramBuilder,
+    col: &ColumnInfo,
+    reg: i32,
+) -> Result<(), CodegenError> {
     match col.default_value.as_deref() {
         None => {
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
@@ -7542,6 +7784,13 @@ fn emit_default_value(b: &mut ProgramBuilder, col: &ColumnInfo, reg: i32) -> Res
                     col.name
                 ))
             })?;
+            if !default_expr_is_self_contained(&expr) {
+                return Err(CodegenError::Unsupported(format!(
+                    "DEFAULT expression `{}` for column `{}` is not self-contained",
+                    dv.trim(),
+                    col.name
+                )));
+            }
             emit_expr(b, &expr, reg, None);
             Ok(())
         }
@@ -7549,15 +7798,101 @@ fn emit_default_value(b: &mut ProgramBuilder, col: &ColumnInfo, reg: i32) -> Res
 }
 
 /// Parse column DEFAULT SQL text into an expression AST.
-///
-/// Returns `None` if parsing fails or if the text does not map to a single
-/// expression-only `SELECT`.
 fn parse_default_expr(default_sql: &str) -> Option<Expr> {
     let trimmed = default_sql.trim();
     if trimmed.is_empty() {
         return None;
     }
     parse_sql_expr(trimmed).ok()
+}
+
+fn default_expr_is_self_contained(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_, _) => true,
+        Expr::Column(_, _)
+        | Expr::Exists { .. }
+        | Expr::Subquery(_, _)
+        | Expr::Raise { .. }
+        | Expr::RowValue(_, _)
+        | Expr::Placeholder(_, _) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            default_expr_is_self_contained(left) && default_expr_is_self_contained(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => default_expr_is_self_contained(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            default_expr_is_self_contained(inner)
+                && default_expr_is_self_contained(low)
+                && default_expr_is_self_contained(high)
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            default_expr_is_self_contained(inner)
+                && match set {
+                    fsqlite_ast::InSet::List(exprs) => {
+                        exprs.iter().all(default_expr_is_self_contained)
+                    }
+                    fsqlite_ast::InSet::Subquery(_) | fsqlite_ast::InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            default_expr_is_self_contained(inner)
+                && default_expr_is_self_contained(pattern)
+                && escape.as_deref().is_none_or(default_expr_is_self_contained)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(default_expr_is_self_contained)
+                && whens.iter().all(|(when_expr, then_expr)| {
+                    default_expr_is_self_contained(when_expr)
+                        && default_expr_is_self_contained(then_expr)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(default_expr_is_self_contained)
+        }
+        Expr::FunctionCall {
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            !distinct
+                && order_by.is_empty()
+                && filter.is_none()
+                && over.is_none()
+                && match args {
+                    fsqlite_ast::FunctionArgs::Star => false,
+                    fsqlite_ast::FunctionArgs::List(exprs) => {
+                        exprs.iter().all(default_expr_is_self_contained)
+                    }
+                }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => default_expr_is_self_contained(inner) && default_expr_is_self_contained(path),
+    }
 }
 
 fn emit_index_predicate_guard(
@@ -11785,6 +12120,8 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
@@ -11808,6 +12145,8 @@ mod tests {
                 is_unique: false,
             }],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
@@ -11835,6 +12174,8 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
@@ -11867,6 +12208,8 @@ mod tests {
                 is_unique: false,
             }],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
@@ -11899,6 +12242,8 @@ mod tests {
                 is_unique: false,
             }],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
@@ -11939,6 +12284,8 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -11948,6 +12295,8 @@ mod tests {
                 columns: vec![ColumnInfo::basic("b", 'd', false)],
                 indexes: vec![],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -12141,6 +12490,8 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
@@ -12156,6 +12507,8 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
@@ -12699,6 +13052,8 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -12735,6 +13090,8 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -12842,6 +13199,8 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }];
@@ -12906,6 +13265,8 @@ mod tests {
             columns: vec![ColumnInfo::basic("a", 'd', false)],
             indexes: vec![],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }];
@@ -12964,6 +13325,8 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -12976,6 +13339,8 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -13053,6 +13418,8 @@ mod tests {
                     is_unique: false,
                 }],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -13065,6 +13432,8 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -13163,6 +13532,8 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -13200,6 +13571,8 @@ mod tests {
                 ],
                 indexes: vec![],
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             },
@@ -17248,6 +17621,146 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_codegen_insert_default_values_uses_expression_default() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::DefaultValues,
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("id", 'd', false),
+                ColumnInfo {
+                    name: "total".to_owned(),
+                    affinity: 'd',
+                    is_ipk: false,
+                    type_name: None,
+                    notnull: false,
+                    unique: false,
+                    default_value: Some("(40 + 2)".to_owned()),
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+            ],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Add),
+            "expression defaults should compile as expressions, not string literals"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_default_values_rejects_unparseable_default() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::DefaultValues,
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![ColumnInfo {
+                name: "broken".to_owned(),
+                affinity: 'C',
+                is_ipk: false,
+                type_name: None,
+                notnull: false,
+                unique: false,
+                default_value: Some("('unterminated".to_owned()),
+                strict_type: None,
+                generated_expr: None,
+                generated_stored: None,
+                collation: None,
+            }],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported(ref msg) if msg.contains("failed to parse DEFAULT expression")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_default_values_rejects_non_self_contained_default() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::DefaultValues,
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'D', false),
+                ColumnInfo {
+                    name: "b".to_owned(),
+                    affinity: 'D',
+                    is_ipk: false,
+                    type_name: None,
+                    notnull: false,
+                    unique: false,
+                    default_value: Some("(a + 1)".to_owned()),
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+            ],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported(ref msg) if msg.contains("is not self-contained")),
+            "unexpected error: {err:?}"
+        );
+    }
+
     /// Schema: CREATE TABLE t (a INTEGER, b INTEGER, c GENERATED ALWAYS AS (a + b) STORED)
     fn test_schema_with_stored_generated() -> Vec<TableSchema> {
         vec![TableSchema {
@@ -17272,6 +17785,8 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
@@ -17301,6 +17816,8 @@ mod tests {
             ],
             indexes: vec![],
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]

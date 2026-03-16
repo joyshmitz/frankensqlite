@@ -150,6 +150,8 @@ pub struct HarnessSettings {
     pub run_integrity_check: bool,
 }
 
+pub(crate) const BENCHMARK_BUSY_TIMEOUT_MS: u32 = 0;
+
 impl Default for HarnessSettings {
     fn default() -> Self {
         Self {
@@ -165,6 +167,11 @@ impl Default for HarnessSettings {
 }
 
 impl HarnessSettings {
+    #[must_use]
+    pub(crate) const fn benchmark_busy_timeout_ms() -> u32 {
+        BENCHMARK_BUSY_TIMEOUT_MS
+    }
+
     /// Produce the PRAGMA statements for a sqlite3 CLI or rusqlite run.
     #[must_use]
     pub fn to_sqlite3_pragmas(&self) -> Vec<String> {
@@ -194,6 +201,19 @@ impl HarnessSettings {
         ]
     }
 
+    #[must_use]
+    fn to_instrumented_retry_pragmas(&self) -> Vec<String> {
+        vec![
+            // Benchmark comparisons must surface contention via the harness's
+            // explicit retry loop rather than SQLite-style internal sleeping.
+            format!("PRAGMA busy_timeout={};", Self::benchmark_busy_timeout_ms()),
+            format!("PRAGMA journal_mode={};", self.journal_mode),
+            format!("PRAGMA synchronous={};", self.synchronous),
+            format!("PRAGMA cache_size={};", self.cache_size),
+            format!("PRAGMA page_size={};", self.page_size),
+        ]
+    }
+
     /// Build an [`executor::ExecutorConfig`] for the sqlite3 CLI from these settings.
     #[must_use]
     pub fn to_executor_config(&self) -> executor::ExecutorConfig {
@@ -210,7 +230,10 @@ impl HarnessSettings {
     pub fn to_fsqlite_exec_config(&self) -> fsqlite_executor::FsqliteExecConfig {
         let defaults = fsqlite_executor::FsqliteExecConfig::default();
         fsqlite_executor::FsqliteExecConfig {
-            pragmas: self.to_fsqlite_pragmas(),
+            // Keep engine-internal busy handlers disabled so `retries`,
+            // `aborts`, and retry-backoff timing remain comparable across
+            // SQLite, MVCC, and forced single-writer runs.
+            pragmas: self.to_instrumented_retry_pragmas(),
             concurrent_mode: self.concurrent_mode,
             max_busy_retries: defaults.max_busy_retries,
             busy_backoff: defaults.busy_backoff,
@@ -228,7 +251,9 @@ impl HarnessSettings {
     pub fn to_sqlite_exec_config(&self) -> sqlite_executor::SqliteExecConfig {
         let defaults = sqlite_executor::SqliteExecConfig::default();
         sqlite_executor::SqliteExecConfig {
-            pragmas: self.to_sqlite3_pragmas(),
+            // Keep engine-internal busy handlers disabled so the harness sees
+            // and counts every retryable stall itself.
+            pragmas: self.to_instrumented_retry_pragmas(),
             max_busy_retries: defaults.max_busy_retries,
             busy_backoff: defaults.busy_backoff,
             busy_backoff_max: defaults.busy_backoff_max,
@@ -291,5 +316,49 @@ mod tests {
                 .iter()
                 .any(|p| p == "PRAGMA fsqlite.concurrent_mode=OFF;")
         );
+    }
+
+    #[test]
+    fn sqlite_exec_config_disables_internal_busy_timeout_for_retry_accounting() {
+        let settings = HarnessSettings {
+            busy_timeout_ms: 5_000,
+            ..HarnessSettings::default()
+        };
+
+        let config = settings.to_sqlite_exec_config();
+
+        assert!(config.pragmas.iter().any(|p| p == "PRAGMA busy_timeout=0;"));
+        assert!(
+            !config
+                .pragmas
+                .iter()
+                .any(|p| p == "PRAGMA busy_timeout=5000;")
+        );
+    }
+
+    #[test]
+    fn fsqlite_exec_config_disables_internal_busy_timeout_and_uses_mode_field() {
+        let settings = HarnessSettings {
+            busy_timeout_ms: 5_000,
+            concurrent_mode: false,
+            ..HarnessSettings::default()
+        };
+
+        let config = settings.to_fsqlite_exec_config();
+
+        assert!(config.pragmas.iter().any(|p| p == "PRAGMA busy_timeout=0;"));
+        assert!(
+            !config
+                .pragmas
+                .iter()
+                .any(|p| p == "PRAGMA busy_timeout=5000;")
+        );
+        assert!(
+            !config
+                .pragmas
+                .iter()
+                .any(|p| p.contains("fsqlite.concurrent_mode"))
+        );
+        assert!(!config.concurrent_mode);
     }
 }

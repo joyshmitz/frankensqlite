@@ -158,11 +158,7 @@ impl QualifiedName {
 
 impl fmt::Display for QualifiedName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ref s) = self.schema {
-            write!(f, "{s}.{}", self.name)
-        } else {
-            f.write_str(&self.name)
-        }
+        display::write_qualified_name(f, self)
     }
 }
 
@@ -2574,6 +2570,15 @@ mod tests {
 
         let qual = QualifiedName::qualified("main", "users");
         assert_eq!(qual.to_string(), "main.users");
+
+        let keyword = QualifiedName::bare("order");
+        assert_eq!(keyword.to_string(), "\"order\"");
+
+        let qualified_keyword = QualifiedName::qualified("main", "group");
+        assert_eq!(qualified_keyword.to_string(), "main.\"group\"");
+
+        let keyword_schema = QualifiedName::qualified("order", "group");
+        assert_eq!(keyword_schema.to_string(), "\"order\".\"group\"");
     }
 
     // --- Operator display tests ---

@@ -746,6 +746,7 @@ dependencies = [
 name = "fsqlite"
 version = "0.1.1"
 dependencies = [
+ "fsqlite-ast",
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-ext-fts3",
@@ -755,6 +756,7 @@ dependencies = [
  "fsqlite-ext-misc",
  "fsqlite-ext-rtree",
  "fsqlite-ext-session",
+ "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-vfs",
  "rand 0.8.5",
@@ -1111,6 +1113,7 @@ dependencies = [
 name = "fsqlite-vdbe"
 version = "0.1.1"
 dependencies = [
+ "asupersync",
  "criterion",
  "crossbeam-deque",
  "fsqlite-ast",

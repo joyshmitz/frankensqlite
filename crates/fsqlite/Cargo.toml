@@ -33,6 +33,8 @@ raptorq = []
 mvcc = []
 
 [dev-dependencies]
+fsqlite-ast = { workspace = true }
+fsqlite-parser = { workspace = true }
 rand = { workspace = true }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }

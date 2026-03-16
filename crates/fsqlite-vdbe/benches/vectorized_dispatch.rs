@@ -1,3 +1,4 @@
+use asupersync::runtime::RuntimeBuilder;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_types::PageNumber;
 use fsqlite_vdbe::vectorized_dispatch::{
@@ -42,13 +43,19 @@ fn bench_dispatcher_scaling(c: &mut Criterion) {
             BenchmarkId::from_parameter(worker_threads),
             &config,
             |b, config| {
+                let runtime = RuntimeBuilder::new()
+                    .worker_threads(config.worker_threads)
+                    .build()
+                    .expect("dispatcher runtime should build");
                 b.iter(|| {
                     let dispatcher =
                         WorkStealingDispatcher::try_new(*config).expect("dispatcher should build");
                     let reports = dispatcher
-                        .execute_with_barriers(std::slice::from_ref(&tasks), |task, worker_id| {
-                            synthetic_task_cost(task.task_id, worker_id)
-                        })
+                        .execute_with_barriers_on_runtime(
+                            &runtime,
+                            std::slice::from_ref(&tasks),
+                            |task, worker_id| synthetic_task_cost(task.task_id, worker_id),
+                        )
                         .expect("dispatch should succeed");
                     let checksum = reports[0]
                         .completed

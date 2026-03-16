@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use fsqlite_types::PageNumber;
 use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::vectorized::{Batch, ColumnSpec, ColumnVectorType, vectorized_metrics_snapshot};
@@ -32,6 +33,13 @@ use fsqlite_vdbe::vectorized_ops::{CompareOp, filter_batch_float64, filter_batch
 use fsqlite_vdbe::vectorized_sort::{NullOrdering, SortDirection, SortKeySpec, sort_batch};
 
 const BEAD_ID: &str = "bd-14vp7.7";
+
+fn dispatch_runtime(worker_threads: usize) -> Runtime {
+    RuntimeBuilder::new()
+        .worker_threads(worker_threads)
+        .build()
+        .expect("bead_id={BEAD_ID} runtime should build")
+}
 
 /// Lineitem-like schema: quantity(i64), extendedprice(f64), discount(f64),
 /// tax(f64), returnflag(i64), linestatus(i64).
@@ -401,11 +409,12 @@ fn test_parallel_vectorized_scaling() {
             numa_nodes: 1,
         })
         .unwrap();
+        let runtime = dispatch_runtime(workers);
 
         let batches_clone = Arc::clone(&batches);
         let t_start = Instant::now();
         let reports = dispatcher
-            .execute_with_barriers(&[tasks], move |task, _wid| {
+            .execute_with_barriers_on_runtime(&runtime, &[tasks], move |task, _wid| {
                 let batch_idx = task.morsel.page_range.start_page.get() as usize - 1;
                 if batch_idx < batches_clone.len() {
                     let batch = &batches_clone[batch_idx];
@@ -699,9 +708,10 @@ fn test_conformance_summary() {
             numa_nodes: 1,
         })
         .unwrap();
+        let runtime = dispatch_runtime(workers);
         let sb = Arc::clone(&small_batches);
         let reports = d
-            .execute_with_barriers(&[tasks], move |task, _| {
+            .execute_with_barriers_on_runtime(&runtime, &[tasks], move |task, _| {
                 let idx = task.morsel.page_range.start_page.get() as usize - 1;
                 if idx < sb.len() {
                     sb[idx].row_count() as u64

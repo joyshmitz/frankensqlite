@@ -1666,6 +1666,7 @@ impl TriggerDef {
 struct TriggerFrame {
     table_name: String,
     column_names: Vec<String>,
+    rowid_alias_col_idx: Option<usize>,
     old_row: Option<Vec<SqliteValue>>,
     new_row: Option<Vec<SqliteValue>>,
 }
@@ -1678,7 +1679,8 @@ impl TriggerFrame {
     }
 
     fn references_pseudo_column(&self, table_prefix: Option<&str>, column_name: &str) -> bool {
-        if self.column_index(column_name).is_none() {
+        let hidden_rowid = self.hidden_rowid_column_index(column_name);
+        if self.column_index(column_name).is_none() && hidden_rowid.is_none() {
             return false;
         }
         match table_prefix {
@@ -1692,7 +1694,9 @@ impl TriggerFrame {
     }
 
     fn lookup_value(&self, table_prefix: Option<&str>, column_name: &str) -> Option<SqliteValue> {
-        let column_index = self.column_index(column_name)?;
+        let column_index = self
+            .column_index(column_name)
+            .or_else(|| self.hidden_rowid_column_index(column_name))?;
         match table_prefix {
             Some(prefix) if prefix.eq_ignore_ascii_case("old") => {
                 Self::lookup_from_row(self.old_row.as_deref(), column_index)
@@ -1716,6 +1720,14 @@ impl TriggerFrame {
 
     fn lookup_from_row(row: Option<&[SqliteValue]>, column_index: usize) -> Option<SqliteValue> {
         row.and_then(|values| values.get(column_index).cloned())
+    }
+
+    fn hidden_rowid_column_index(&self, column_name: &str) -> Option<usize> {
+        self.column_index(column_name)
+            .is_none()
+            .then_some(self.rowid_alias_col_idx)
+            .flatten()
+            .filter(|_| is_rowid_alias(column_name))
     }
 }
 
@@ -5738,6 +5750,16 @@ impl Connection {
                 self.reject_without_rowid_dml(table_name, "INSERT")?;
                 let insert_event = fsqlite_ast::TriggerEvent::Insert;
                 let is_live_vtab = self.has_live_vtab_instance(table_name);
+                let has_before_insert = self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::Before,
+                    &insert_event,
+                );
+                let has_after_insert = self.has_matching_triggers(
+                    table_name,
+                    fsqlite_ast::TriggerTiming::After,
+                    &insert_event,
+                );
                 if is_live_vtab {
                     if !insert.returning.is_empty() {
                         return Err(FrankenError::NotImplemented(
@@ -5764,7 +5786,10 @@ impl Connection {
                     // per-row INSERT ... VALUES operations. Those inner
                     // statements already handle trigger firing and change
                     // tracking, so route around the outer trigger path here.
-                    if insert.returning.is_empty() && !is_simple_values {
+                    let needs_row_by_row_replay = insert.returning.is_empty()
+                        && (has_before_insert || has_after_insert || self.fk_enforcement_enabled());
+                    if insert.returning.is_empty() && (!is_simple_values || needs_row_by_row_replay)
+                    {
                         self.log_mem_execution_fallback(
                             "insert_select",
                             "insert_select_row_by_row_fallback",
@@ -5773,16 +5798,20 @@ impl Connection {
                         return Ok(Vec::new());
                     }
                 }
-                let has_before_insert = self.has_matching_triggers(
-                    table_name,
-                    fsqlite_ast::TriggerTiming::Before,
-                    &insert_event,
-                );
-                let has_after_insert = self.has_matching_triggers(
-                    table_name,
-                    fsqlite_ast::TriggerTiming::After,
-                    &insert_event,
-                );
+                if !is_live_vtab
+                    && insert.returning.is_empty()
+                    && (has_before_insert || has_after_insert || self.fk_enforcement_enabled())
+                    && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
+                    && rows.len() > 1
+                {
+                    self.log_mem_execution_fallback(
+                        "insert_values",
+                        "insert_values_row_by_row_trigger_or_fk_fallback",
+                    )?;
+                    let source_rows = self.materialize_insert_values_source_rows(rows, params)?;
+                    let _ = self.execute_insert_select_materialized_rows(insert, &source_rows)?;
+                    return Ok(Vec::new());
+                }
                 let mut live_insert_rows = if is_live_vtab {
                     Some(self.collect_live_vtab_insert_rows(insert, params)?)
                 } else {
@@ -5898,15 +5927,20 @@ impl Connection {
                 // Patch trigger NEW rows: fill in auto-assigned INTEGER
                 // PRIMARY KEY rowids that were NULL at pre-computation time.
                 if has_after_insert && !trigger_new_rows.is_empty() {
-                    let tbl_key = table_name.to_ascii_lowercase();
-                    if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key) {
-                        let last_rowid = self.current_last_insert_rowid();
-                        let count = trigger_new_rows.len();
-                        for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
-                            if ipk_idx < new_row.len() && new_row[ipk_idx] == SqliteValue::Null {
-                                #[allow(clippy::cast_possible_wrap)]
-                                let rowid = last_rowid - (count as i64 - 1) + i as i64;
-                                new_row[ipk_idx] = SqliteValue::Integer(rowid);
+                    if affected == 0 {
+                        trigger_new_rows.clear();
+                    } else {
+                        let tbl_key = table_name.to_ascii_lowercase();
+                        if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key) {
+                            let last_rowid = self.current_last_insert_rowid();
+                            let count = trigger_new_rows.len();
+                            for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
+                                if ipk_idx < new_row.len() && new_row[ipk_idx] == SqliteValue::Null
+                                {
+                                    #[allow(clippy::cast_possible_wrap)]
+                                    let rowid = last_rowid - (count as i64 - 1) + i as i64;
+                                    new_row[ipk_idx] = SqliteValue::Integer(rowid);
+                                }
                             }
                         }
                     }
@@ -6427,6 +6461,20 @@ impl Connection {
         self.execute_statement(&Statement::Select(effective_select), params)
     }
 
+    fn materialize_insert_values_source_rows(
+        &self,
+        rows: &[Vec<Expr>],
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        rows.iter()
+            .map(|row_exprs| {
+                Ok(Row {
+                    values: self.evaluate_insert_source_row(row_exprs, params)?,
+                })
+            })
+            .collect()
+    }
+
     fn execute_insert_select_materialized_rows(
         &self,
         insert: &fsqlite_ast::InsertStatement,
@@ -6437,27 +6485,18 @@ impl Connection {
                 "INSERT ... SELECT fallback does not support UPSERT/RETURNING".to_owned(),
             ));
         }
-        let (table_columns, source_target_indices) =
-            self.resolve_insert_select_target_layout(insert)?;
-        if table_columns.is_empty() {
+        let layout = self.resolve_insert_target_layout(insert)?;
+        if layout.table_columns.is_empty() {
             return Err(FrankenError::Internal(format!(
                 "table '{}' has no insertable columns",
                 insert.table.name
-            )));
-        }
-        let default_sqls = self.collect_insert_default_sqls(&insert.table.name)?;
-        if default_sqls.len() != table_columns.len() {
-            return Err(FrankenError::Internal(format!(
-                "INSERT ... SELECT default column width {} does not match table width {}",
-                default_sqls.len(),
-                table_columns.len()
             )));
         }
         if source_rows.is_empty() {
             return Ok(0);
         }
 
-        let source_column_count = source_target_indices.len();
+        let source_column_count = layout.targets.len();
         for (row_idx, row) in source_rows.iter().enumerate() {
             if row.values().len() != source_column_count {
                 return Err(FrankenError::Internal(format!(
@@ -6468,10 +6507,7 @@ impl Connection {
         }
 
         let qualified_table = quote_qualified_name(&insert.table);
-        let placeholders = (1..=table_columns.len())
-            .map(|idx| format!("?{idx}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = (1..=layout.table_columns.len()).map(|idx| format!("?{idx}"));
         let conflict_clause = match &insert.or_conflict {
             Some(fsqlite_ast::ConflictAction::Replace) => "OR REPLACE ",
             Some(fsqlite_ast::ConflictAction::Ignore) => "OR IGNORE ",
@@ -6480,8 +6516,24 @@ impl Connection {
             Some(fsqlite_ast::ConflictAction::Rollback) => "OR ROLLBACK ",
             None => "",
         };
-        let insert_sql =
-            format!("INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders});");
+        let insert_sql = if insert.columns.is_empty() {
+            let placeholders = placeholders.collect::<Vec<_>>().join(", ");
+            format!("INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders});")
+        } else {
+            let quoted_targets = insert
+                .columns
+                .iter()
+                .map(|column| quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let placeholders = (1..=layout.targets.len())
+                .map(|idx| format!("?{idx}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders});"
+            )
+        };
 
         let preserve_prior_changes_on_constraint_violation =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
@@ -6490,16 +6542,7 @@ impl Connection {
         let execute_rows = || -> Result<usize> {
             let mut statement_changes = 0usize;
             for row in source_rows {
-                let mut ordered_values = self.evaluate_default_row_from_sqls(&default_sqls)?;
-                let mut filled_targets = vec![false; ordered_values.len()];
-                for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
-                    if filled_targets[target_idx] {
-                        continue;
-                    }
-                    ordered_values[target_idx] = row.values()[source_idx].clone();
-                    filled_targets[target_idx] = true;
-                }
-                match self.execute_with_params(&insert_sql, &ordered_values) {
+                match self.execute_with_params(&insert_sql, row.values()) {
                     Ok(affected) => {
                         statement_changes = statement_changes.saturating_add(affected);
                     }
@@ -6591,11 +6634,6 @@ impl Connection {
             .borrow()
             .get(&table_name.to_ascii_lowercase())
             .copied();
-        enum InsertTarget {
-            Column(usize),
-            HiddenRowid,
-        }
-
         // Map from VALUES position to table target.
         let target_map: Vec<InsertTarget> = if insert.columns.is_empty() {
             (0..num_cols).map(InsertTarget::Column).collect()
@@ -6641,12 +6679,9 @@ impl Connection {
                 .unwrap_or_default();
 
             // Extract the user-supplied rowid from the IPK column (if any).
-            let explicit_rowid = ipk_values_pos.and_then(|pos| {
-                values.get(pos).and_then(|v| match v {
-                    SqliteValue::Integer(n) => Some(*n),
-                    _ => None,
-                })
-            });
+            let explicit_rowid = ipk_values_pos
+                .and_then(|pos| values.get(pos))
+                .and_then(Self::coerce_explicit_rowid_value);
 
             // Build the full column value vector in table order. For ordinary
             // columns, duplicate targets keep the first assignment like SQLite.
@@ -6857,10 +6892,10 @@ impl Connection {
         Ok(affected)
     }
 
-    fn resolve_insert_select_target_layout(
+    fn resolve_insert_target_layout(
         &self,
         insert: &fsqlite_ast::InsertStatement,
-    ) -> Result<(Vec<String>, Vec<usize>)> {
+    ) -> Result<InsertTargetLayout> {
         let schema = self.schema.borrow();
         let table = schema
             .iter()
@@ -6871,23 +6906,41 @@ impl Connection {
         Self::validate_insert_target_columns(table, &insert.table.name, &insert.columns)?;
 
         let table_columns: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
+        let rowid_alias_col_idx = table.columns.iter().position(|column| column.is_ipk);
 
         if insert.columns.is_empty() {
-            let target_indices = (0..table_columns.len()).collect();
-            return Ok((table_columns, target_indices));
+            let targets = (0..table_columns.len()).map(InsertTarget::Column).collect();
+            return Ok(InsertTargetLayout {
+                explicit_rowid_source: rowid_alias_col_idx,
+                rowid_alias_col_idx,
+                table_columns,
+                targets,
+            });
         }
 
-        let mut target_indices = Vec::with_capacity(insert.columns.len());
+        let mut targets = Vec::with_capacity(insert.columns.len());
         for col in &insert.columns {
-            let idx = table.column_index(col).ok_or_else(|| {
-                FrankenError::Internal(format!(
+            if let Some(idx) = table.column_index(col) {
+                targets.push(InsertTarget::Column(idx));
+            } else if is_hidden_rowid_alias_name(col) {
+                targets.push(InsertTarget::HiddenRowid);
+            } else {
+                return Err(FrankenError::Internal(format!(
                     "column '{col}' not found in table '{}'",
                     insert.table.name
-                ))
-            })?;
-            target_indices.push(idx);
+                )));
+            }
         }
-        Ok((table_columns, target_indices))
+        let explicit_rowid_source = targets.iter().rposition(|target| match target {
+            InsertTarget::HiddenRowid => true,
+            InsertTarget::Column(idx) => Some(*idx) == rowid_alias_col_idx,
+        });
+        Ok(InsertTargetLayout {
+            table_columns,
+            targets,
+            rowid_alias_col_idx,
+            explicit_rowid_source,
+        })
     }
 
     /// Compile and wrap a statement into a `PreparedStatement`.
@@ -7461,34 +7514,14 @@ impl Connection {
         limit: Option<&fsqlite_ast::LimitClause>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let alias_clause = table_ref
-            .alias
-            .as_ref()
-            .map_or(String::new(), |alias| format!(" AS {alias}"));
-        let mut sql = if let Some(cond) = where_clause {
-            format!(
-                "SELECT * FROM {}{alias_clause} WHERE {cond}",
-                table_ref.name
-            )
-        } else {
-            format!("SELECT * FROM {}{alias_clause}", table_ref.name)
-        };
-
-        if !order_by.is_empty() {
-            let order_strs: Vec<String> = order_by.iter().map(|o| format!("{o}")).collect();
-            sql.push_str(" ORDER BY ");
-            sql.push_str(&order_strs.join(", "));
-        }
-
-        if let Some(l) = limit {
-            sql.push_str(&format!(" {}", l));
-        }
-
-        if let Some(params) = params {
-            self.query_with_params(&sql, params)
-        } else {
-            self.query(&sql)
-        }
+        let select = Self::build_single_table_select(
+            table_ref,
+            vec![ResultColumn::Star],
+            where_clause,
+            order_by,
+            limit,
+        );
+        self.execute_statement(&Statement::Select(select), params)
     }
 
     /// Count rows matching UPDATE/DELETE scope using the existing SELECT
@@ -7523,7 +7556,7 @@ impl Connection {
             ));
         }
 
-        let (key_column, is_hidden_rowid) = self.resolve_dml_limit_key(&update.table.name.name)?;
+        let (key_column, _is_hidden_rowid) = self.resolve_dml_limit_key(&update.table.name.name)?;
         let selected_keys = self.select_matching_limit_keys(
             &update.table,
             update.where_clause.as_ref(),
@@ -7531,7 +7564,6 @@ impl Connection {
             update.limit.as_ref(),
             params,
             &key_column,
-            is_hidden_rowid,
         )?;
 
         let mut effective = update.clone();
@@ -7557,7 +7589,7 @@ impl Connection {
             return Ok((delete.clone(), None));
         }
 
-        let (key_column, is_hidden_rowid) = self.resolve_dml_limit_key(&delete.table.name.name)?;
+        let (key_column, _is_hidden_rowid) = self.resolve_dml_limit_key(&delete.table.name.name)?;
         let selected_keys = self.select_matching_limit_keys(
             &delete.table,
             delete.where_clause.as_ref(),
@@ -7565,7 +7597,6 @@ impl Connection {
             delete.limit.as_ref(),
             params,
             &key_column,
-            is_hidden_rowid,
         )?;
 
         let mut effective = delete.clone();
@@ -7624,42 +7655,18 @@ impl Connection {
         limit: Option<&fsqlite_ast::LimitClause>,
         params: Option<&[SqliteValue]>,
         key_column: &str,
-        is_hidden_rowid: bool,
     ) -> Result<Vec<i64>> {
-        let projection = Self::format_limit_scope_projection(
-            table_ref.alias.as_deref(),
-            key_column,
-            is_hidden_rowid,
+        let select = Self::build_single_table_select(
+            table_ref,
+            vec![ResultColumn::Expr {
+                expr: Self::build_limit_scope_projection_expr(table_ref, key_column),
+                alias: None,
+            }],
+            where_clause,
+            order_by,
+            limit,
         );
-        let alias_clause = table_ref
-            .alias
-            .as_ref()
-            .map_or(String::new(), |alias| format!(" AS {alias}"));
-        let mut sql = if let Some(cond) = where_clause {
-            format!(
-                "SELECT {projection} FROM {}{alias_clause} WHERE {cond}",
-                table_ref.name
-            )
-        } else {
-            format!("SELECT {projection} FROM {}{alias_clause}", table_ref.name)
-        };
-
-        if !order_by.is_empty() {
-            let order_terms: Vec<String> = order_by.iter().map(ToString::to_string).collect();
-            sql.push_str(" ORDER BY ");
-            sql.push_str(&order_terms.join(", "));
-        }
-
-        if let Some(limit_clause) = limit {
-            sql.push(' ');
-            sql.push_str(&limit_clause.to_string());
-        }
-
-        let rows = if let Some(bindings) = params {
-            self.query_with_params(&sql, bindings)?
-        } else {
-            self.query(&sql)?
-        };
+        let rows = self.execute_statement(&Statement::Select(select), params)?;
 
         rows.iter()
             .map(|row| {
@@ -7673,22 +7680,51 @@ impl Connection {
             .collect()
     }
 
-    fn format_limit_scope_projection(
-        table_alias: Option<&str>,
-        key_column: &str,
-        is_hidden_rowid: bool,
-    ) -> String {
-        let key_sql = if is_hidden_rowid {
-            key_column.to_owned()
-        } else {
-            quote_identifier(key_column)
-        };
-
-        if let Some(alias) = table_alias {
-            format!("{}.{}", quote_identifier(alias), key_sql)
-        } else {
-            key_sql
+    fn build_single_table_select(
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        columns: Vec<ResultColumn>,
+        where_clause: Option<&Expr>,
+        order_by: &[OrderingTerm],
+        limit: Option<&LimitClause>,
+    ) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns,
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: table_ref.name.clone(),
+                            alias: table_ref.alias.clone(),
+                            index_hint: table_ref.index_hint.clone(),
+                            time_travel: table_ref.time_travel.clone(),
+                        },
+                        joins: Vec::new(),
+                    }),
+                    where_clause: where_clause.cloned().map(Box::new),
+                    group_by: Vec::new(),
+                    having: None,
+                    windows: Vec::new(),
+                },
+                compounds: Vec::new(),
+            },
+            order_by: order_by.to_vec(),
+            limit: limit.cloned(),
         }
+    }
+
+    fn build_limit_scope_projection_expr(
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        key_column: &str,
+    ) -> Expr {
+        Expr::Column(
+            ColumnRef {
+                table: table_ref.alias.clone(),
+                column: key_column.to_owned(),
+            },
+            Span::ZERO,
+        )
     }
 
     fn build_limit_scope_filter_expr(
@@ -7752,10 +7788,9 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Vec<SqliteValue>>> {
-        let (table_columns, source_target_indices) =
-            self.resolve_insert_select_target_layout(insert)?;
+        let layout = self.resolve_insert_target_layout(insert)?;
         let default_sqls = self.collect_insert_default_sqls(&insert.table.name)?;
-        let table_column_count = table_columns.len();
+        let table_column_count = layout.table_columns.len();
         if default_sqls.len() != table_column_count {
             return Err(FrankenError::Internal(format!(
                 "INSERT trigger snapshot: default row width {} does not match table width {table_column_count}",
@@ -7771,7 +7806,9 @@ impl Connection {
                     let default_row = self.evaluate_default_row_from_sqls(&default_sqls)?;
                     self.map_insert_source_row_to_table_row(
                         &default_row,
-                        &source_target_indices,
+                        &layout.targets,
+                        layout.rowid_alias_col_idx,
+                        layout.explicit_rowid_source,
                         &source_values,
                         &format!("INSERT VALUES row {}", row_idx + 1),
                     )
@@ -7787,7 +7824,9 @@ impl Connection {
                         let default_row = self.evaluate_default_row_from_sqls(&default_sqls)?;
                         self.map_insert_source_row_to_table_row(
                             &default_row,
-                            &source_target_indices,
+                            &layout.targets,
+                            layout.rowid_alias_col_idx,
+                            layout.explicit_rowid_source,
                             row.values(),
                             &format!("INSERT SELECT row {}", row_idx + 1),
                         )
@@ -7850,7 +7889,6 @@ impl Connection {
         let source_targets = if insert.columns.is_empty() {
             (0..table_columns.len()).map(Some).collect::<Vec<_>>()
         } else {
-            let mut hidden_rowid_seen = false;
             let mut targets = Vec::with_capacity(insert.columns.len());
             for column in &insert.columns {
                 if let Some(idx) = table.column_index(column) {
@@ -7858,13 +7896,6 @@ impl Connection {
                     continue;
                 }
                 if is_rowid_alias(column) {
-                    if hidden_rowid_seen {
-                        return Err(FrankenError::Internal(format!(
-                            "column '{column}' specified multiple hidden rowid aliases for table '{}'",
-                            insert.table.name
-                        )));
-                    }
-                    hidden_rowid_seen = true;
                     targets.push(None);
                     continue;
                 }
@@ -7888,9 +7919,14 @@ impl Connection {
 
                 let mut row = self.evaluate_default_row_from_sqls(&default_sqls)?;
                 let mut explicit_rowid = None;
+                let mut filled_columns = vec![false; row.len()];
                 for (source_idx, target_idx) in source_targets.iter().copied().enumerate() {
                     if let Some(target_idx) = target_idx {
+                        if filled_columns[target_idx] {
+                            continue;
+                        }
                         row[target_idx] = source_values[source_idx].clone();
+                        filled_columns[target_idx] = true;
                     } else {
                         explicit_rowid = Some(source_values[source_idx].clone());
                     }
@@ -7978,21 +8014,37 @@ impl Connection {
     fn map_insert_source_row_to_table_row(
         &self,
         default_row: &[SqliteValue],
-        source_target_indices: &[usize],
+        source_targets: &[InsertTarget],
+        rowid_alias_col_idx: Option<usize>,
+        explicit_rowid_source: Option<usize>,
         source_values: &[SqliteValue],
         context: &str,
     ) -> Result<Vec<SqliteValue>> {
-        if source_values.len() != source_target_indices.len() {
+        if source_values.len() != source_targets.len() {
             return Err(FrankenError::Internal(format!(
                 "{context}: column count mismatch (source has {}, target expects {})",
                 source_values.len(),
-                source_target_indices.len()
+                source_targets.len()
             )));
         }
 
         let mut row = default_row.to_vec();
-        for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
+        let explicit_rowid = explicit_rowid_source
+            .and_then(|source_idx| source_values.get(source_idx))
+            .and_then(Self::coerce_explicit_rowid_value);
+        let mut filled_targets = vec![false; row.len()];
+        for (source_idx, target) in source_targets.iter().copied().enumerate() {
+            let InsertTarget::Column(target_idx) = target else {
+                continue;
+            };
+            if Some(target_idx) == rowid_alias_col_idx || filled_targets[target_idx] {
+                continue;
+            }
             row[target_idx] = source_values[source_idx].clone();
+            filled_targets[target_idx] = true;
+        }
+        if let (Some(ipk_idx), Some(rowid)) = (rowid_alias_col_idx, explicit_rowid) {
+            row[ipk_idx] = SqliteValue::Integer(rowid);
         }
         Ok(row)
     }
@@ -8012,6 +8064,14 @@ impl Connection {
         };
 
         Ok(default_sqls)
+    }
+
+    fn coerce_explicit_rowid_value(value: &SqliteValue) -> Option<i64> {
+        if matches!(value, SqliteValue::Null) {
+            None
+        } else {
+            Some(value.to_integer())
+        }
     }
 
     fn evaluate_default_row_from_sqls(
@@ -9692,6 +9752,8 @@ impl Connection {
             ],
             indexes: Vec::new(),
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         });
@@ -9719,6 +9781,8 @@ impl Connection {
             columns: sqlite_stat1_column_infos(),
             indexes: Vec::new(),
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         });
@@ -10445,6 +10509,7 @@ impl Connection {
                         "AUTOINCREMENT on WITHOUT ROWID tables is not yet supported".to_owned(),
                     ));
                 }
+                let primary_key_constraints = collect_primary_key_constraints(columns, constraints);
 
                 let col_infos: Vec<ColumnInfo> = columns
                     .iter()
@@ -10471,10 +10536,18 @@ impl Connection {
                                 .constraints
                                 .iter()
                                 .any(|c| matches!(c.kind, ColumnConstraintKind::Unique { .. }));
-                        let default_value = col.constraints.iter().find_map(|c| match &c.kind {
-                            ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
-                            _ => None,
-                        });
+                        let default_value = col
+                            .constraints
+                            .iter()
+                            .find_map(|c| match &c.kind {
+                                ColumnConstraintKind::Default(dv) => Some(dv),
+                                _ => None,
+                            })
+                            .map(|dv| -> Result<String> {
+                                validate_default_value_is_constant(&col.name, dv)?;
+                                Ok(format_default_value(dv))
+                            })
+                            .transpose()?;
                         let strict_type = if create.strict {
                             let type_decl = type_name.as_deref().ok_or_else(|| {
                                 FrankenError::Internal(format!(
@@ -10727,6 +10800,8 @@ impl Connection {
                     columns: col_infos,
                     indexes: implicit_indexes,
                     strict: create.strict,
+                    without_rowid: create.without_rowid,
+                    primary_key_constraints,
                     foreign_keys: fk_defs,
                     check_constraints: check_defs,
                 };
@@ -10828,6 +10903,8 @@ impl Connection {
                     columns: col_infos,
                     indexes: Vec::new(),
                     strict: false,
+                    without_rowid: false,
+                    primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
                 };
@@ -10905,6 +10982,8 @@ impl Connection {
                 columns: col_infos,
                 indexes: Vec::new(),
                 strict: false,
+                without_rowid: false,
+                primary_key_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
             });
@@ -10950,6 +11029,8 @@ impl Connection {
             columns: col_infos,
             indexes: Vec::new(),
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         });
@@ -11194,6 +11275,13 @@ impl Connection {
                     .find(|c| c.name.eq_ignore_ascii_case(old))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {old}")))?;
                 col.name.clone_from(new);
+                for pk in &mut table.primary_key_constraints {
+                    for pk_col in pk {
+                        if pk_col.eq_ignore_ascii_case(old) {
+                            pk_col.clone_from(new);
+                        }
+                    }
+                }
                 table.clone()
             }
             AlterTableAction::AddColumn(col_def) => {
@@ -11205,10 +11293,18 @@ impl Connection {
                     .constraints
                     .iter()
                     .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
-                let default_value = col_def.constraints.iter().find_map(|c| match &c.kind {
-                    ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
-                    _ => None,
-                });
+                let default_value = col_def
+                    .constraints
+                    .iter()
+                    .find_map(|c| match &c.kind {
+                        ColumnConstraintKind::Default(dv) => Some(dv),
+                        _ => None,
+                    })
+                    .map(|dv| -> Result<String> {
+                        validate_default_value_is_constant(&col_def.name, dv)?;
+                        Ok(format_default_value(dv))
+                    })
+                    .transpose()?;
                 // SQLite rule: cannot add a NOT NULL column without a DEFAULT value.
                 if notnull && default_value.is_none() {
                     return Err(FrankenError::Internal(
@@ -11278,6 +11374,14 @@ impl Connection {
                 if table.columns.len() == 1 {
                     return Err(FrankenError::Internal(format!(
                         "cannot drop column {col_name}: only one column remains"
+                    )));
+                }
+                if table.primary_key_constraints.iter().any(|pk| {
+                    pk.iter()
+                        .any(|pk_col| pk_col.eq_ignore_ascii_case(col_name))
+                }) {
+                    return Err(FrankenError::Internal(format!(
+                        "cannot drop PRIMARY KEY column {col_name}"
                     )));
                 }
                 table.columns.remove(col_idx);
@@ -12003,9 +12107,11 @@ impl Connection {
             .iter()
             .map(|column| column.name.clone())
             .collect();
+        let rowid_alias_col_idx = table_schema.columns.iter().position(|column| column.is_ipk);
         Ok(TriggerFrame {
             table_name: table_schema.name.clone(),
             column_names,
+            rowid_alias_col_idx,
             old_row: old_values.map(ToOwned::to_owned),
             new_row: new_values.map(ToOwned::to_owned),
         })
@@ -12118,11 +12224,11 @@ impl Connection {
             let where_parts: Vec<String> = parent_cols
                 .iter()
                 .enumerate()
-                .map(|(i, col)| format!("\"{col}\" = ?{}", i + 1))
+                .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                 .collect();
             let sql = format!(
-                "SELECT 1 FROM \"{}\" WHERE {} LIMIT 1",
-                fk.parent_table,
+                "SELECT 1 FROM {} WHERE {} LIMIT 1",
+                quote_identifier(&fk.parent_table),
                 where_parts.join(" AND ")
             );
             let params: Vec<SqliteValue> = fk_values.iter().map(|v| (*v).clone()).collect();
@@ -12216,11 +12322,11 @@ impl Connection {
             let where_parts: Vec<String> = child_col_names
                 .iter()
                 .enumerate()
-                .map(|(i, col)| format!("\"{col}\" = ?{}", i + 1))
+                .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                 .collect();
             let sql = format!(
-                "SELECT 1 FROM \"{}\" WHERE {} LIMIT 1",
-                child_table,
+                "SELECT 1 FROM {} WHERE {} LIMIT 1",
+                quote_identifier(child_table),
                 where_parts.join(" AND ")
             );
             let rows = self.query_with_params(&sql, &parent_values)?;
@@ -12262,11 +12368,11 @@ impl Connection {
                 let where_parts: Vec<String> = child_columns
                     .iter()
                     .enumerate()
-                    .map(|(i, col)| format!("\"{col}\" = ?{}", i + 1))
+                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                     .collect();
                 let sql = format!(
-                    "DELETE FROM \"{}\" WHERE {}",
-                    child_table,
+                    "DELETE FROM {} WHERE {}",
+                    quote_identifier(child_table),
                     where_parts.join(" AND ")
                 );
                 self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
@@ -12282,16 +12388,16 @@ impl Connection {
             } => {
                 let set_parts: Vec<String> = child_columns
                     .iter()
-                    .map(|col| format!("\"{col}\" = NULL"))
+                    .map(|col| format!("{} = NULL", quote_identifier(col)))
                     .collect();
                 let where_parts: Vec<String> = child_columns
                     .iter()
                     .enumerate()
-                    .map(|(i, col)| format!("\"{col}\" = ?{}", i + 1))
+                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                     .collect();
                 let sql = format!(
-                    "UPDATE \"{}\" SET {} WHERE {}",
-                    child_table,
+                    "UPDATE {} SET {} WHERE {}",
+                    quote_identifier(child_table),
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
@@ -12404,11 +12510,11 @@ impl Connection {
             let where_parts: Vec<String> = child_col_names
                 .iter()
                 .enumerate()
-                .map(|(i, col)| format!("\"{}\" = ?{}", col, i + 1))
+                .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                 .collect();
             let sql = format!(
-                "SELECT 1 FROM \"{}\" WHERE {} LIMIT 1",
-                child_table,
+                "SELECT 1 FROM {} WHERE {} LIMIT 1",
+                quote_identifier(child_table),
                 where_parts.join(" AND ")
             );
             let rows = self.query_with_params(&sql, &old_parent_vals)?;
@@ -12453,16 +12559,22 @@ impl Connection {
                 let set_parts: Vec<String> = child_columns
                     .iter()
                     .enumerate()
-                    .map(|(i, col)| format!("\"{}\" = ?{}", col, i + 1))
+                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                     .collect();
                 let where_parts: Vec<String> = child_columns
                     .iter()
                     .enumerate()
-                    .map(|(i, col)| format!("\"{}\" = ?{}", col, i + 1 + child_columns.len()))
+                    .map(|(i, col)| {
+                        format!(
+                            "{} = ?{}",
+                            quote_identifier(col),
+                            i + 1 + child_columns.len()
+                        )
+                    })
                     .collect();
                 let sql = format!(
-                    "UPDATE \"{}\" SET {} WHERE {}",
-                    child_table,
+                    "UPDATE {} SET {} WHERE {}",
+                    quote_identifier(child_table),
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
@@ -12481,16 +12593,16 @@ impl Connection {
             } => {
                 let set_parts: Vec<String> = child_columns
                     .iter()
-                    .map(|col| format!("\"{}\" = NULL", col))
+                    .map(|col| format!("{} = NULL", quote_identifier(col)))
                     .collect();
                 let where_parts: Vec<String> = child_columns
                     .iter()
                     .enumerate()
-                    .map(|(i, col)| format!("\"{}\" = ?{}", col, i + 1))
+                    .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                     .collect();
                 let sql = format!(
-                    "UPDATE \"{}\" SET {} WHERE {}",
-                    child_table,
+                    "UPDATE {} SET {} WHERE {}",
+                    quote_identifier(child_table),
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
@@ -12830,6 +12942,8 @@ impl Connection {
                     columns: col_infos,
                     indexes: Vec::new(),
                     strict: false,
+                    without_rowid: false,
+                    primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
                 });
@@ -12930,6 +13044,8 @@ impl Connection {
                     columns: virtual_columns.clone(),
                     indexes: Vec::new(),
                     strict: false,
+                    without_rowid: false,
+                    primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
                 });
@@ -14415,16 +14531,24 @@ impl Connection {
         rowid_alias_col_idx: Option<usize>,
         defaults: Option<&[Option<SqliteValue>]>,
     ) -> Result<Vec<SqliteValue>> {
-        let payload_includes_rowid_alias = rowid_alias_col_idx.is_some_and(|ipk_idx| {
-            if payload_values.len() >= table.columns.len() {
-                return true;
+        let payload_includes_rowid_alias = if rowid_alias_col_idx.is_some() {
+            match payload_values.len() {
+                len if len == table.columns.len() => true,
+                len if len + 1 == table.columns.len() => false,
+                len => {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "table `{}` rowid {rowid} payload has {len} columns; expected {} or {}",
+                            table.name,
+                            table.columns.len().saturating_sub(1),
+                            table.columns.len()
+                        ),
+                    });
+                }
             }
-            match payload_values.get(ipk_idx) {
-                Some(SqliteValue::Null) => true,
-                Some(SqliteValue::Integer(encoded_rowid)) => *encoded_rowid == rowid,
-                _ => false,
-            }
-        });
+        } else {
+            false
+        };
         let mut values = Vec::with_capacity(table.columns.len());
         let mut payload_idx = 0_usize;
 
@@ -14443,16 +14567,31 @@ impl Connection {
                 SqliteValue::Null
             };
 
-            if rowid_alias_col_idx == Some(col_idx)
-                && let Some(encoded_rowid) = value.as_integer()
-                && encoded_rowid != rowid
-            {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "table `{}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}",
-                        table.name
-                    ),
-                });
+            if rowid_alias_col_idx == Some(col_idx) {
+                match &value {
+                    SqliteValue::Null => {
+                        values.push(SqliteValue::Integer(rowid));
+                        continue;
+                    }
+                    _ => {
+                        let Some(encoded_rowid) = value.as_integer() else {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "table `{}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {value:?}",
+                                    table.name
+                                ),
+                            });
+                        };
+                        if encoded_rowid != rowid {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "table `{}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}",
+                                    table.name
+                                ),
+                            });
+                        }
+                    }
+                }
             }
 
             values.push(value);
@@ -20157,6 +20296,8 @@ impl Connection {
                     columns: col_infos,
                     indexes: Vec::new(),
                     strict: false,
+                    without_rowid: false,
+                    primary_key_constraints: Vec::new(),
                     foreign_keys: Vec::new(),
                     check_constraints: Vec::new(),
                 });
@@ -20236,6 +20377,8 @@ impl Connection {
             columns: col_infos,
             indexes: Vec::new(),
             strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         });
@@ -21953,12 +22096,15 @@ impl Connection {
 
             // Parse FK definitions and UNIQUE column groups from the CREATE TABLE AST.
             let mut fk_defs = Vec::new();
+            let mut primary_key_constraints = Vec::new();
             if let Ok(Statement::CreateTable(create_stmt)) = parse_single_statement(&create_sql) {
                 if let CreateTableBody::Columns {
                     columns: ref col_defs,
                     ref constraints,
                 } = create_stmt.body
                 {
+                    primary_key_constraints =
+                        collect_primary_key_constraints(col_defs, constraints);
                     // Column-level FK constraints.
                     for (i, col) in col_defs.iter().enumerate() {
                         for c in &col.constraints {
@@ -22039,6 +22185,8 @@ impl Connection {
                 columns,
                 indexes: Vec::new(),
                 strict: crate::compat_persist::is_strict_table_sql(&create_sql),
+                without_rowid,
+                primary_key_constraints,
                 foreign_keys: fk_defs,
                 check_constraints: check_defs,
             });
@@ -22089,29 +22237,47 @@ impl Connection {
                             // the rowid at that position since it's not stored in the
                             // record payload.
                             if let Some(ipk_idx) = ipk_col_idx {
-                                let payload_includes_rowid_alias = if values.len() >= num_columns
-                                {
-                                    true
-                                } else {
-                                    match values.get(ipk_idx) {
-                                        Some(SqliteValue::Null) => true,
-                                        Some(SqliteValue::Integer(encoded_rowid)) => {
-                                            *encoded_rowid == rowid
-                                        }
-                                        _ => false,
+                                match values.len() {
+                                    len if len + 1 == num_columns => {
+                                        values.insert(ipk_idx, SqliteValue::Integer(rowid));
                                     }
-                                };
-                                if !payload_includes_rowid_alias {
-                                    values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                                } else if let Some(SqliteValue::Integer(encoded_rowid)) =
-                                    values.get(ipk_idx)
-                                    && *encoded_rowid != rowid
-                                {
-                                    return Err(FrankenError::DatabaseCorrupt {
-                                        detail: format!(
-                                            "table `{name}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}"
-                                        ),
-                                    });
+                                    len if len == num_columns => match values.get_mut(ipk_idx) {
+                                        Some(slot @ SqliteValue::Null) => {
+                                            *slot = SqliteValue::Integer(rowid);
+                                        }
+                                        Some(SqliteValue::Integer(encoded_rowid))
+                                            if *encoded_rowid == rowid => {}
+                                        Some(SqliteValue::Integer(encoded_rowid)) => {
+                                            return Err(FrankenError::DatabaseCorrupt {
+                                                detail: format!(
+                                                    "table `{name}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}"
+                                                ),
+                                            });
+                                        }
+                                        Some(other) => {
+                                            return Err(FrankenError::DatabaseCorrupt {
+                                                detail: format!(
+                                                    "table `{name}` rowid {rowid} stores non-integer INTEGER PRIMARY KEY alias value {other:?}"
+                                                ),
+                                            });
+                                        }
+                                        None => {
+                                            return Err(FrankenError::DatabaseCorrupt {
+                                                detail: format!(
+                                                    "table `{name}` rowid {rowid} payload is missing INTEGER PRIMARY KEY alias column"
+                                                ),
+                                            });
+                                        }
+                                    },
+                                    len => {
+                                        return Err(FrankenError::DatabaseCorrupt {
+                                            detail: format!(
+                                                "table `{name}` rowid {rowid} payload has {len} columns; expected {} or {}",
+                                                num_columns.saturating_sub(1),
+                                                num_columns
+                                            ),
+                                        });
+                                    }
                                 }
                             }
                             if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
@@ -24201,15 +24367,30 @@ pub(crate) fn maybe_quote_ident(name: &str) -> String {
 }
 
 fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> String {
+    let is_single_column_primary_key = |column_name: &str| {
+        table
+            .primary_key_constraints
+            .iter()
+            .any(|pk| pk.len() == 1 && pk[0].eq_ignore_ascii_case(column_name))
+    };
+    let primary_key_matches_index = |index: &IndexSchema| {
+        table.primary_key_constraints.iter().any(|pk| {
+            pk.len() == index.columns.len()
+                && pk
+                    .iter()
+                    .zip(&index.columns)
+                    .all(|(lhs, rhs)| lhs.eq_ignore_ascii_case(rhs))
+        })
+    };
     let mut defs: Vec<String> = table
         .columns
         .iter()
         .map(|col| {
-            let type_decl = col
-                .type_name
-                .as_deref()
-                .unwrap_or_else(|| affinity_decl_type(col.affinity));
-            let mut part = format!("{} {}", maybe_quote_ident(&col.name), type_decl);
+            let mut part = maybe_quote_ident(&col.name);
+            if let Some(type_decl) = col.type_name.as_deref() {
+                part.push(' ');
+                part.push_str(type_decl);
+            }
             if col.is_ipk {
                 part.push_str(" PRIMARY KEY");
                 if is_autoincrement {
@@ -24219,7 +24400,7 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
             if col.notnull && !col.is_ipk {
                 part.push_str(" NOT NULL");
             }
-            if col.unique && !col.is_ipk {
+            if col.unique && !col.is_ipk && !is_single_column_primary_key(&col.name) {
                 part.push_str(" UNIQUE");
             }
             if let Some(ref default) = col.default_value {
@@ -24250,6 +24431,9 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
         if !index.is_unique || index.columns.is_empty() {
             continue;
         }
+        if primary_key_matches_index(index) {
+            continue;
+        }
         // Single-column UNIQUE constraints are already rendered inline above.
         if index.columns.len() == 1
             && table.columns.iter().any(|column| {
@@ -24267,6 +24451,22 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
             .collect::<Vec<_>>()
             .join(", ");
         defs.push(format!("UNIQUE ({cols})"));
+    }
+    for pk in &table.primary_key_constraints {
+        if pk.len() == 1
+            && table
+                .columns
+                .iter()
+                .any(|column| column.is_ipk && column.name.eq_ignore_ascii_case(&pk[0]))
+        {
+            continue;
+        }
+        let cols = pk
+            .iter()
+            .map(|name| maybe_quote_ident(name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        defs.push(format!("PRIMARY KEY ({cols})"));
     }
 
     let column_defs = defs.join(", ");
@@ -24319,9 +24519,20 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
         use std::fmt::Write;
         write!(check_clauses, ", CHECK({check_expr})").ok();
     }
-    let strict_suffix = if table.strict { " STRICT" } else { "" };
+    let mut table_options = Vec::new();
+    if table.without_rowid {
+        table_options.push("WITHOUT ROWID");
+    }
+    if table.strict {
+        table_options.push("STRICT");
+    }
+    let table_options_suffix = if table_options.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", table_options.join(", "))
+    };
     format!(
-        "CREATE TABLE {}({column_defs}{fk_clauses}{check_clauses}){strict_suffix}",
+        "CREATE TABLE {}({column_defs}{fk_clauses}{check_clauses}){table_options_suffix}",
         maybe_quote_ident(&table.name)
     )
 }
@@ -24342,7 +24553,7 @@ fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
         index
             .columns
             .iter()
-            .map(|c| format!("\"{}\"", c))
+            .map(|column| quote_identifier(column))
             .collect::<Vec<_>>()
             .join(", ")
     } else {
@@ -24354,20 +24565,11 @@ fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
         .map(|predicate| format!(" WHERE {predicate}"))
         .unwrap_or_default();
     format!(
-        "CREATE {unique}INDEX \"{}\" ON \"{}\"({}){where_clause}",
-        index.name, table_name, cols
+        "CREATE {unique}INDEX {} ON {}({}){where_clause}",
+        quote_identifier(&index.name),
+        quote_identifier(table_name),
+        cols
     )
-}
-
-fn affinity_decl_type(affinity: char) -> &'static str {
-    match affinity.to_ascii_uppercase() {
-        'A' => "BLOB",
-        'B' => "TEXT",
-        'D' => "INTEGER",
-        'E' => "REAL",
-        // 'C' and any unknown affinity map to NUMERIC
-        _ => "NUMERIC",
-    }
 }
 
 /// Check whether a `SelectCore` references a named table/CTE in any FROM source.
@@ -25462,28 +25664,31 @@ impl SharedMvccState {
     }
 
     fn ensure_write_coordinator_service_started(&self) -> Result<()> {
-        const MAX_WRITE_COORDINATOR_START_WAIT_ATTEMPTS: usize = 32;
+        let wait_deadline = Instant::now()
+            + if cfg!(test) {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_secs(1)
+            };
 
-        let mut reservation = None;
-        for attempt in 0..MAX_WRITE_COORDINATOR_START_WAIT_ATTEMPTS {
+        let reservation = loop {
             match self.reserve_write_coordinator_service_start()? {
                 WriteCoordinatorServiceReservation::Running => return Ok(()),
-                WriteCoordinatorServiceReservation::Reserved(start) => {
-                    reservation = Some(start);
-                    break;
-                }
+                WriteCoordinatorServiceReservation::Reserved(start) => break start,
                 WriteCoordinatorServiceReservation::Starting => {
-                    if attempt + 1 == MAX_WRITE_COORDINATOR_START_WAIT_ATTEMPTS {
-                        return Ok(());
+                    if Instant::now() >= wait_deadline {
+                        return Err(FrankenError::internal(
+                            "write coordinator service start timed out while another launcher remained in Starting state",
+                        ));
                     }
                     std::hint::spin_loop();
                     #[cfg(not(target_arch = "wasm32"))]
                     std::thread::yield_now();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    std::thread::sleep(Duration::from_millis(1));
                 }
             }
-        }
-        let reservation =
-            reservation.ok_or_else(|| FrankenError::internal("write coordinator start lost"))?;
+        };
 
         let (shutdown_tx, mut shutdown_rx) = asupersync::channel::oneshot::channel::<()>();
         let task_path_key = reservation.path_key.clone();
@@ -27045,6 +27250,41 @@ fn extract_simple_index_columns(indexed_terms: &[fsqlite_ast::IndexedColumn]) ->
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn collect_primary_key_constraints(
+    columns: &[fsqlite_ast::ColumnDef],
+    constraints: &[fsqlite_ast::TableConstraint],
+) -> Vec<Vec<String>> {
+    let mut primary_keys = columns
+        .iter()
+        .filter(|column| {
+            column.constraints.iter().any(|constraint| {
+                matches!(constraint.kind, ColumnConstraintKind::PrimaryKey { .. })
+            })
+        })
+        .map(|column| vec![column.name.clone()])
+        .collect::<Vec<_>>();
+
+    primary_keys.extend(constraints.iter().filter_map(|constraint| {
+        let TableConstraintKind::PrimaryKey {
+            columns: indexed_columns,
+            ..
+        } = &constraint.kind
+        else {
+            return None;
+        };
+        let columns = indexed_columns
+            .iter()
+            .map(normalize_indexed_column_term)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .map(|term| term.column_name)
+            .collect::<Vec<_>>();
+        (!columns.is_empty()).then_some(columns)
+    }));
+
+    primary_keys
 }
 
 /// Normalize an indexed-column AST node into execution/persistence metadata.
@@ -28898,6 +29138,104 @@ fn format_default_value(dv: &DefaultValue) -> String {
     match dv {
         DefaultValue::Expr(expr) => expr.to_string(),
         DefaultValue::ParenExpr(expr) => format!("({})", expr),
+    }
+}
+
+fn validate_default_value_is_constant(column_name: &str, dv: &DefaultValue) -> Result<()> {
+    let expr = match dv {
+        DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr) => expr,
+    };
+    if default_expr_is_self_contained(expr) {
+        Ok(())
+    } else {
+        Err(FrankenError::Internal(format!(
+            "default value of column [{column_name}] is not constant"
+        )))
+    }
+}
+
+fn default_expr_is_self_contained(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_, _) => true,
+        Expr::Column(_, _)
+        | Expr::Exists { .. }
+        | Expr::Subquery(_, _)
+        | Expr::Raise { .. }
+        | Expr::RowValue(_, _)
+        | Expr::Placeholder(_, _) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            default_expr_is_self_contained(left) && default_expr_is_self_contained(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => default_expr_is_self_contained(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            default_expr_is_self_contained(inner)
+                && default_expr_is_self_contained(low)
+                && default_expr_is_self_contained(high)
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            default_expr_is_self_contained(inner)
+                && match set {
+                    InSet::List(exprs) => exprs.iter().all(default_expr_is_self_contained),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            default_expr_is_self_contained(inner)
+                && default_expr_is_self_contained(pattern)
+                && escape.as_deref().is_none_or(default_expr_is_self_contained)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(default_expr_is_self_contained)
+                && whens.iter().all(|(when_expr, then_expr)| {
+                    default_expr_is_self_contained(when_expr)
+                        && default_expr_is_self_contained(then_expr)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(default_expr_is_self_contained)
+        }
+        Expr::FunctionCall {
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            !distinct
+                && order_by.is_empty()
+                && filter.is_none()
+                && over.is_none()
+                && match args {
+                    FunctionArgs::Star => false,
+                    FunctionArgs::List(exprs) => exprs.iter().all(default_expr_is_self_contained),
+                }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => default_expr_is_self_contained(inner) && default_expr_is_self_contained(path),
     }
 }
 
@@ -32180,6 +32518,20 @@ struct LiveVtabInsertRow {
     values: Vec<SqliteValue>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertTarget {
+    Column(usize),
+    HiddenRowid,
+}
+
+#[derive(Debug, Clone)]
+struct InsertTargetLayout {
+    table_columns: Vec<String>,
+    targets: Vec<InsertTarget>,
+    rowid_alias_col_idx: Option<usize>,
+    explicit_rowid_source: Option<usize>,
+}
+
 /// Perform a single join step: combine left-side rows with right-side rows.
 #[allow(clippy::too_many_lines)]
 fn execute_single_join(
@@ -34863,6 +35215,32 @@ mod tests {
 
         drop(conn2);
         drop(conn1);
+    }
+
+    #[test]
+    fn test_write_coordinator_service_starting_timeout_returns_error() {
+        let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("write-coordinator-stuck-starting.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let shared = super::shared_mvcc_state_for_path(&db_path, runtime).expect("shared state");
+
+        {
+            let mut state = lock_unpoisoned(&shared.runtime_state);
+            state.write_coordinator_service_starting = true;
+            state.write_coordinator_service_running = false;
+        }
+
+        let error = shared
+            .ensure_write_coordinator_service_started()
+            .expect_err("stuck Starting state should not be treated as success");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -40750,6 +41128,186 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_select_fallback_preserves_explicit_hidden_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dst (payload TEXT);").unwrap();
+
+        let inserted = conn
+            .execute("INSERT INTO dst(rowid, payload) SELECT 7, 'seven';")
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let rows = conn.query("SELECT rowid, payload FROM dst;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Text("seven".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_select_trigger_snapshot_uses_last_rowid_family_assignment() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (seen INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER dst_ai AFTER INSERT ON dst \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.id); END;",
+        )
+        .unwrap();
+
+        let inserted = conn
+            .execute("INSERT INTO dst(rowid, id, payload) SELECT 7, 8, 'x';")
+            .unwrap();
+        assert_eq!(inserted, 1);
+        let inserted = conn
+            .execute("INSERT INTO dst(id, rowid, payload) SELECT 9, 10, 'y';")
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let rows = conn
+            .query("SELECT rowid, id, payload FROM dst ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(8),
+                SqliteValue::Integer(8),
+                SqliteValue::Text("x".to_owned()),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(10),
+                SqliteValue::Integer(10),
+                SqliteValue::Text("y".to_owned()),
+            ]
+        );
+
+        let trigger_rows = conn
+            .query("SELECT seen FROM trigger_log ORDER BY seen;")
+            .unwrap();
+        assert_eq!(
+            trigger_rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(8)],
+                vec![SqliteValue::Integer(10)],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_before_insert_trigger_snapshot_coerces_text_ipk_value() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (seen_id INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_before_insert_rowid BEFORE INSERT ON t \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.id); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t(id, payload) VALUES ('7', 'seven');")
+            .unwrap();
+
+        let log_rows = conn.query("SELECT seen_id FROM trigger_log;").unwrap();
+        assert_eq!(log_rows.len(), 1);
+        assert_eq!(row_values(&log_rows[0]), vec![SqliteValue::Integer(7)]);
+
+        let table_rows = conn.query("SELECT rowid, id, payload FROM t;").unwrap();
+        assert_eq!(table_rows.len(), 1);
+        assert_eq!(
+            row_values(&table_rows[0]),
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(7),
+                SqliteValue::Text("seven".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_after_insert_trigger_multi_row_values_use_actual_rowids() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (seen_id INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_after_insert_rowid AFTER INSERT ON t \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.id); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t(id, payload) VALUES (NULL, 'auto'), (9, 'explicit');")
+            .unwrap();
+
+        let log_rows = conn
+            .query("SELECT seen_id FROM trigger_log ORDER BY seen_id;")
+            .unwrap();
+        assert_eq!(
+            log_rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(9)],]
+        );
+    }
+
+    #[test]
+    fn test_after_insert_trigger_skips_ignored_single_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (seen_id INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_after_insert_ignore AFTER INSERT ON t \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.id); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t VALUES (1, 'alpha');").unwrap();
+        conn.execute("INSERT OR IGNORE INTO t VALUES (2, 'alpha');")
+            .unwrap();
+
+        let log_rows = conn
+            .query("SELECT seen_id FROM trigger_log ORDER BY seen_id;")
+            .unwrap();
+        assert_eq!(
+            log_rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(1)]]
+        );
+    }
+
+    #[test]
+    fn test_after_insert_trigger_binds_new_hidden_rowid_to_ipk_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (seen_rowid INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_after_insert_hidden_rowid AFTER INSERT ON t \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.rowid); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t(id, payload) VALUES (7, 'seven');")
+            .unwrap();
+
+        let log_rows = conn.query("SELECT seen_rowid FROM trigger_log;").unwrap();
+        assert_eq!(log_rows.len(), 1);
+        assert_eq!(row_values(&log_rows[0]), vec![SqliteValue::Integer(7)]);
+    }
+
+    #[test]
     fn test_insert_select_respects_target_column_list_order() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE src (a INTEGER, b TEXT);")
@@ -40779,6 +41337,47 @@ mod tests {
             vec![
                 SqliteValue::Text("twenty".to_owned()),
                 SqliteValue::Integer(20),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_select_hidden_rowid_alias_preserves_explicit_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dst (name TEXT);").unwrap();
+
+        let inserted = conn
+            .execute("INSERT INTO dst(rowid, name) SELECT 7, 'seven';")
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let rows = conn.query("SELECT rowid, name FROM dst;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Text("seven".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_select_duplicate_target_columns_keep_first_assignment() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dst (a INTEGER, b TEXT);")
+            .unwrap();
+
+        let inserted = conn
+            .execute("INSERT INTO dst(a, a, b) SELECT 1, 2, 'three';")
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let rows = conn.query("SELECT a, b FROM dst;").unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("three".to_owned()),
             ]
         );
     }
@@ -40915,6 +41514,53 @@ mod tests {
     }
 
     #[test]
+    fn test_before_insert_trigger_duplicate_target_columns_keep_first_assignment() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE trigger_log (seen_a INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_before_insert_dup BEFORE INSERT ON t \
+             BEGIN INSERT INTO trigger_log VALUES (NEW.a); END;",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO t(a, a, b) VALUES (1, 2, 3);")
+            .unwrap();
+
+        let log_rows = conn.query("SELECT seen_a FROM trigger_log;").unwrap();
+        assert_eq!(log_rows.len(), 1);
+        assert_eq!(row_values(&log_rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_insert_with_hidden_rowid_alias_still_passes_fk_enforcement() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("CREATE TABLE child (parent_id INTEGER REFERENCES parent(id), note TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO parent VALUES (1);").unwrap();
+
+        conn.execute("INSERT INTO child(rowid, parent_id, note) VALUES (9, 1, 'ok');")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT rowid, parent_id, note FROM child ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(9),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("ok".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn test_before_insert_trigger_new_values_use_expression_defaults_for_omitted_columns() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (a TEXT DEFAULT ('x' || 'y'), b INTEGER);")
@@ -41006,6 +41652,34 @@ mod tests {
     }
 
     #[test]
+    fn test_update_quoted_keyword_alias_order_by_limit_materialization_succeeds() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+
+        let affected = conn
+            .execute(
+                "UPDATE t AS \"select\" \
+                 SET v = v + 100 \
+                 ORDER BY \"select\".id ASC LIMIT 1;",
+            )
+            .unwrap();
+
+        let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
+        assert_eq!(affected, 1);
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(110)],
+                vec![SqliteValue::Integer(2), SqliteValue::Integer(20)],
+                vec![SqliteValue::Integer(3), SqliteValue::Integer(30)],
+            ]
+        );
+    }
+
+    #[test]
     fn test_delete_alias_order_by_limit_without_where_uses_alias_in_internal_count_query() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
@@ -41023,6 +41697,177 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![SqliteValue::Integer(3), SqliteValue::Integer(30)]
+        );
+    }
+
+    #[test]
+    fn test_delete_quoted_keyword_alias_order_by_limit_materialization_succeeds() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+
+        let deleted = conn
+            .execute("DELETE FROM t AS \"select\" ORDER BY \"select\".id ASC LIMIT 2;")
+            .unwrap();
+
+        let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(3), SqliteValue::Integer(30)]]
+        );
+    }
+
+    #[test]
+    fn test_update_trigger_snapshot_accepts_quoted_keyword_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (old_v INTEGER, new_v INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_update AFTER UPDATE ON t \
+             BEGIN INSERT INTO log VALUES (OLD.v, NEW.v); END;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20);")
+            .unwrap();
+
+        let affected = conn
+            .execute("UPDATE t AS \"select\" SET v = v + 1 WHERE \"select\".id = 2;")
+            .unwrap();
+
+        let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
+        let log_rows = conn.query("SELECT old_v, new_v FROM log;").unwrap();
+        assert_eq!(affected, 1);
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(10)],
+                vec![SqliteValue::Integer(2), SqliteValue::Integer(21)],
+            ]
+        );
+        assert_eq!(
+            log_rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(20), SqliteValue::Integer(21)]]
+        );
+    }
+
+    #[test]
+    fn test_update_order_by_limit_materialization_accepts_quoted_keyword_table_name() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE \"group\" (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO \"group\" VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+
+        let affected = conn
+            .execute("UPDATE \"group\" SET v = v + 100 ORDER BY id ASC LIMIT 1;")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT id, v FROM \"group\" ORDER BY id;")
+            .unwrap();
+        assert_eq!(affected, 1);
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Integer(110)],
+                vec![SqliteValue::Integer(2), SqliteValue::Integer(20)],
+                vec![SqliteValue::Integer(3), SqliteValue::Integer(30)],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_delete_trigger_snapshot_accepts_quoted_keyword_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (deleted_id INTEGER, deleted_v INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_delete AFTER DELETE ON t \
+             BEGIN INSERT INTO log VALUES (OLD.id, OLD.v); END;",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 20);")
+            .unwrap();
+
+        let deleted = conn
+            .execute("DELETE FROM t AS \"select\" WHERE \"select\".id = 1;")
+            .unwrap();
+
+        let rows = conn.query("SELECT id, v FROM t ORDER BY id;").unwrap();
+        let log_rows = conn
+            .query("SELECT deleted_id, deleted_v FROM log ORDER BY deleted_id;")
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(2), SqliteValue::Integer(20)]]
+        );
+        assert_eq!(
+            log_rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(1), SqliteValue::Integer(10)]]
+        );
+    }
+
+    #[test]
+    fn test_delete_trigger_snapshot_accepts_quoted_keyword_table_name() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE \"order\" (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE log (deleted_id INTEGER, deleted_v INTEGER);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_delete_keyword AFTER DELETE ON \"order\" \
+             BEGIN INSERT INTO log VALUES (OLD.id, OLD.v); END;",
+        )
+        .unwrap();
+        let raw_master_rows = super::sqlite_master_btree_tests::read_master_rows(&conn);
+        assert_eq!(raw_master_rows.len(), 3);
+        let trigger_row = raw_master_rows
+            .iter()
+            .find(|(_, values)| values[0] == SqliteValue::Text("trigger".to_owned()))
+            .unwrap();
+        let trigger_sql = match &trigger_row.1[4] {
+            SqliteValue::Text(sql) => sql.clone(),
+            other => panic!("expected trigger sql text, got {other:?}"),
+        };
+        assert!(trigger_sql.contains("\"order\""), "{trigger_sql}");
+        let reparsed_trigger = super::parse_single_statement(&trigger_sql).unwrap();
+        assert!(matches!(reparsed_trigger, Statement::CreateTrigger(_)));
+        assert_eq!(conn.triggers.borrow().len(), 1);
+        assert_eq!(conn.triggers.borrow()[0].table_name, "order");
+        conn.execute("INSERT INTO \"order\" VALUES (1, 10), (2, 20);")
+            .unwrap();
+        assert_eq!(conn.triggers.borrow().len(), 1);
+        assert_eq!(conn.triggers.borrow()[0].table_name, "order");
+        assert!(conn.has_matching_triggers(
+            "order",
+            fsqlite_ast::TriggerTiming::After,
+            &fsqlite_ast::TriggerEvent::Delete,
+        ));
+
+        let deleted = conn.execute("DELETE FROM \"order\" WHERE id = 1;").unwrap();
+
+        let rows = conn
+            .query("SELECT id, v FROM \"order\" ORDER BY id;")
+            .unwrap();
+        let log_rows = conn
+            .query("SELECT deleted_id, deleted_v FROM log ORDER BY deleted_id;")
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(2), SqliteValue::Integer(20)]]
+        );
+        assert_eq!(
+            log_rows.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![SqliteValue::Integer(1), SqliteValue::Integer(10)]]
         );
     }
 
@@ -44658,6 +45503,31 @@ mod tests {
 
         conn.execute("INSERT INTO docs(rowid, subject, body) SELECT 7, 'Hello', 'Rust world';")
             .unwrap();
+
+        let docs = conn
+            .query("SELECT rowid, subject, body FROM docs ORDER BY rowid;")
+            .unwrap();
+        assert_eq!(
+            docs.iter().map(row_values).collect::<Vec<_>>(),
+            vec![vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Text("Hello".to_owned()),
+                SqliteValue::Text("Rust world".to_owned()),
+            ]],
+        );
+    }
+
+    #[test]
+    fn test_fts5_live_vtab_insert_select_duplicate_targets_follow_sqlite_assignment_rules() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO docs(rowid, rowid, subject, subject, body) \
+             SELECT 5, 7, 'Hello', 'Ignored', 'Rust world';",
+        )
+        .unwrap();
 
         let docs = conn
             .query("SELECT rowid, subject, body FROM docs ORDER BY rowid;")
@@ -50374,6 +51244,29 @@ mod transaction_lifecycle_tests {
     }
 
     #[test]
+    fn test_insert_or_replace_coerces_text_ipk_value() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+
+        let affected = conn
+            .execute("INSERT OR REPLACE INTO t(id, val) VALUES ('7', 'seven')")
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let rows = conn.query("SELECT rowid, id, val FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values().to_vec(),
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Integer(7),
+                SqliteValue::Text("seven".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn test_insert_or_ignore_no_conflict() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
@@ -51106,7 +51999,7 @@ mod sqlite_master_btree_tests {
         rowids
     }
 
-    fn read_master_rows(conn: &Connection) -> Vec<(i64, Vec<SqliteValue>)> {
+    pub(super) fn read_master_rows(conn: &Connection) -> Vec<(i64, Vec<SqliteValue>)> {
         let cx = Cx::new();
         let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
         let usable_size = fsqlite_types::PageSize::DEFAULT.get();
@@ -53286,6 +54179,36 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_open_c_sqlite_database_restores_table_level_integer_primary_key_alias_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_table_pk.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    "CREATE TABLE items (id INTEGER, label TEXT, PRIMARY KEY(id));
+                     INSERT INTO items (id, label) VALUES (10, 'alpha');
+                     INSERT INTO items (id, label) VALUES (20, 'beta');",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn
+            .query("SELECT rowid, id, label FROM items ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(10));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(20));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(20));
+        assert_eq!(rows[1].values()[2], SqliteValue::Text("beta".to_owned()));
+    }
+
+    #[test]
     fn test_table_level_integer_primary_key_registers_rowid_alias() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER, val TEXT, PRIMARY KEY(id));")
@@ -53415,6 +54338,29 @@ mod schema_loading_tests {
             .unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("one".to_owned()));
+    }
+
+    #[test]
+    fn test_rowid_alias_reload_keeps_null_payload_column_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ipk-null-payload.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, note TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, NULL, 'one');")
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn
+            .query("SELECT id, val, note FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Null);
         assert_eq!(rows[0].values()[2], SqliteValue::Text("one".to_owned()));
     }
 

@@ -229,7 +229,11 @@ fn render_settings(out: &mut String, settings: &HarnessSettings, result: &Showca
     let _ = writeln!(out, "| Synchronous | {} |", settings.synchronous);
     let _ = writeln!(out, "| Cache size | {} |", settings.cache_size);
     let _ = writeln!(out, "| Page size | {} |", settings.page_size);
-    let _ = writeln!(out, "| Busy timeout (ms) | {} |", settings.busy_timeout_ms);
+    let _ = writeln!(
+        out,
+        "| Busy timeout (ms) | {} |",
+        HarnessSettings::benchmark_busy_timeout_ms()
+    );
     let _ = writeln!(
         out,
         "| Concurrency levels | {} |",
@@ -243,6 +247,10 @@ fn render_settings(out: &mut String, settings: &HarnessSettings, result: &Showca
     let _ = writeln!(out, "| Seed | {} |", result.seed);
     let _ = writeln!(out, "| Scale | {} |", result.scale);
     let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "> Benchmark runs force `PRAGMA busy_timeout=0` so retry/backoff counts remain visible.\n"
+    );
 }
 
 // ── Executive summary ────────────────────────────────────────────────
@@ -276,13 +284,14 @@ fn render_executive_summary(out: &mut String, perf: &PerfResult) {
         let narrative = if sp.speedup >= 1.0 {
             format!(
                 "FrankenSQLite still achieved a **{:.1}x** speedup even under maximum contention, \
-                 with {} conflict-related aborts handled via first-committer-wins retry.",
+                 with {} retryable batch restarts recorded under contention.",
                 sp.speedup, sp.fsqlite_aborts,
             )
         } else {
             format!(
                 "Under maximum page contention, sqlite3 was **{:.1}x** faster (serialization \
-                 avoids conflict overhead). FrankenSQLite reported {} aborts from page conflicts. \
+                 avoids conflict overhead). FrankenSQLite reported {} retryable batch restarts \
+                 under contention. \
                  This is expected: MVCC shines on disjoint workloads, not single-page hotspots.",
                 1.0 / sp.speedup,
                 sp.fsqlite_aborts,
@@ -323,7 +332,7 @@ fn find_best_speedup(perf: &PerfResult, workload: &str) -> Option<SpeedupData> {
         BTreeMap::new();
 
     for cell in &perf.cells {
-        if cell.workload != workload || cell.summary.is_none() {
+        if cell.workload != workload || !cell.is_fully_comparable() {
             continue;
         }
         let entry = by_concurrency.entry(cell.concurrency).or_default();
@@ -336,8 +345,8 @@ fn find_best_speedup(perf: &PerfResult, workload: &str) -> Option<SpeedupData> {
 
     // Pick the highest concurrency where both engines have results.
     by_concurrency.into_iter().rev().find_map(|(c, (sq, fs))| {
-        let sq = sq?.summary.as_ref()?;
-        let fs = fs?.summary.as_ref()?;
+        let sq = sq?.comparable_summary()?;
+        let fs = fs?.comparable_summary()?;
 
         let speedup = if fs.latency.median_ms > 0.0 {
             sq.latency.median_ms / fs.latency.median_ms
@@ -410,9 +419,9 @@ fn render_workload_section(
                 cell.workload == workload
                     && cell.concurrency == c
                     && cell.engine == *engine_name
-                    && cell.summary.is_some()
+                    && cell.is_fully_comparable()
             }) {
-                let summary = cell.summary.as_ref().unwrap();
+                let summary = cell.comparable_summary().unwrap();
                 let total_retries: u64 = summary.iterations.iter().map(|i| i.retries).sum();
                 let total_aborts: u64 = summary.iterations.iter().map(|i| i.aborts).sum();
                 let ops = summary.throughput.median_ops_per_sec;
@@ -504,8 +513,9 @@ fn render_contention_metrics(out: &mut String, perf: &PerfResult) {
     );
     let _ = writeln!(
         out,
-        "- **fsqlite aborts:** transactions aborted due to MVCC page conflicts \
-         (first-committer-wins).\n"
+        "- **fsqlite aborts:** retryable batch restarts observed by the harness. In MVCC mode these \
+         often correspond to BUSY-family conflicts, but the counter is intentionally broader than \
+         `BUSY_SNAPSHOT` alone.\n"
     );
 
     let _ = writeln!(
@@ -523,7 +533,7 @@ fn render_contention_metrics(out: &mut String, perf: &PerfResult) {
         BTreeMap<(String, u16), (Option<&'a CellOutcome>, Option<&'a CellOutcome>)>;
     let mut grouped: PerfGroupMap<'_> = BTreeMap::new();
     for cell in &perf.cells {
-        if cell.summary.is_none() {
+        if !cell.is_fully_comparable() {
             continue;
         }
         let entry = grouped
@@ -538,14 +548,14 @@ fn render_contention_metrics(out: &mut String, perf: &PerfResult) {
 
     for ((workload, c), (sq, fs)) in &grouped {
         let (sq_retries, sq_aborts) = sq.map_or((0, 0), |cell| {
-            let s = cell.summary.as_ref().unwrap();
+            let s = cell.comparable_summary().unwrap();
             (
                 s.iterations.iter().map(|i| i.retries).sum::<u64>(),
                 s.iterations.iter().map(|i| i.aborts).sum::<u64>(),
             )
         });
         let (fs_retries, fs_aborts) = fs.map_or((0, 0), |cell| {
-            let s = cell.summary.as_ref().unwrap();
+            let s = cell.comparable_summary().unwrap();
             (
                 s.iterations.iter().map(|i| i.retries).sum::<u64>(),
                 s.iterations.iter().map(|i| i.aborts).sum::<u64>(),
@@ -821,6 +831,60 @@ mod tests {
     }
 
     #[test]
+    fn test_find_best_speedup_skips_partial_failure_highest_concurrency() {
+        let sqlite3_c4 = make_cell(
+            "sqlite3",
+            "commutative_inserts_disjoint_keys",
+            4,
+            400.0,
+            250.0,
+            20,
+            0,
+        );
+        let fsqlite_c4 = make_cell(
+            "fsqlite",
+            "commutative_inserts_disjoint_keys",
+            4,
+            120.0,
+            3333.0,
+            0,
+            0,
+        );
+        let sqlite3_c8 = make_cell(
+            "sqlite3",
+            "commutative_inserts_disjoint_keys",
+            8,
+            800.0,
+            125.0,
+            50,
+            0,
+        );
+        let mut fsqlite_c8 = make_cell(
+            "fsqlite",
+            "commutative_inserts_disjoint_keys",
+            8,
+            200.0,
+            5000.0,
+            0,
+            0,
+        );
+        fsqlite_c8.error =
+            Some("1/3 measurement iterations failed; first=worker stalled".to_owned());
+
+        let perf = PerfResult {
+            schema_version: PERF_RESULT_SCHEMA_V1.to_owned(),
+            total_cells: 4,
+            success_count: 3,
+            error_count: 1,
+            cells: vec![sqlite3_c4, fsqlite_c4, sqlite3_c8, fsqlite_c8],
+        };
+
+        let sp = find_best_speedup(&perf, "commutative_inserts_disjoint_keys").unwrap();
+        assert_eq!(sp.concurrency, 4);
+        assert!((sp.speedup - (400.0 / 120.0)).abs() < 0.01);
+    }
+
+    #[test]
     fn test_render_showcase_report_with_data() {
         let result = make_showcase_result(vec![
             make_cell(
@@ -906,6 +970,23 @@ mod tests {
     }
 
     #[test]
+    fn test_render_showcase_report_uses_effective_busy_timeout() {
+        let result = make_showcase_result(vec![make_cell(
+            "sqlite3",
+            "commutative_inserts_disjoint_keys",
+            1,
+            100.0,
+            1000.0,
+            0,
+            0,
+        )]);
+        let report = render_showcase_report(&result, &HarnessSettings::default());
+
+        assert!(report.contains("| Busy timeout (ms) | 0 |"));
+        assert!(report.contains("`PRAGMA busy_timeout=0`"));
+    }
+
+    #[test]
     fn test_render_contention_metrics() {
         let perf = PerfResult {
             schema_version: PERF_RESULT_SCHEMA_V1.to_owned(),
@@ -942,6 +1023,27 @@ mod tests {
         assert!(out.contains("Contention Metrics"));
         assert!(out.contains("disjoint"));
         assert!(out.contains("hot-page"));
+    }
+
+    #[test]
+    fn test_render_contention_metrics_excludes_partial_failure_cells() {
+        let sqlite_cell = make_cell("sqlite3", "hot_page_contention", 4, 300.0, 333.0, 10, 0);
+        let mut fsqlite_cell = make_cell("fsqlite", "hot_page_contention", 4, 250.0, 400.0, 0, 5);
+        fsqlite_cell.error =
+            Some("1/3 measurement iterations failed; first=busy loop exhausted".to_owned());
+
+        let perf = PerfResult {
+            schema_version: PERF_RESULT_SCHEMA_V1.to_owned(),
+            total_cells: 2,
+            success_count: 1,
+            error_count: 1,
+            cells: vec![sqlite_cell, fsqlite_cell],
+        };
+
+        let mut out = String::new();
+        render_contention_metrics(&mut out, &perf);
+
+        assert!(!out.contains("| hot-page | 4 | 10 | 0 | 0 | 5 |"));
     }
 
     #[test]

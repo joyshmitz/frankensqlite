@@ -40,6 +40,169 @@ fn comma_list_fn<T>(
 // Helper: quote an identifier if needed
 // ---------------------------------------------------------------------------
 
+// Keep this list in sync with `fsqlite-parser`'s `TokenKind::keyword_str`.
+const SQL_KEYWORDS: &[&str] = &[
+    "ABORT",
+    "ACTION",
+    "ADD",
+    "AFTER",
+    "ALL",
+    "ALTER",
+    "ALWAYS",
+    "ANALYZE",
+    "AND",
+    "AS",
+    "ASC",
+    "ATTACH",
+    "AUTOINCREMENT",
+    "BEFORE",
+    "BEGIN",
+    "BETWEEN",
+    "BY",
+    "CASCADE",
+    "CASE",
+    "CAST",
+    "CHECK",
+    "COLLATE",
+    "COLUMN",
+    "COMMIT",
+    "COMMITSEQ",
+    "CONCURRENT",
+    "CONFLICT",
+    "CONSTRAINT",
+    "CREATE",
+    "CROSS",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+    "CURRENT_TIMESTAMP",
+    "DATABASE",
+    "DEFAULT",
+    "DEFERRABLE",
+    "DEFERRED",
+    "DELETE",
+    "DESC",
+    "DETACH",
+    "DISTINCT",
+    "DO",
+    "DROP",
+    "EACH",
+    "ELSE",
+    "END",
+    "ESCAPE",
+    "EXCEPT",
+    "EXCLUDE",
+    "EXCLUSIVE",
+    "EXISTS",
+    "EXPLAIN",
+    "FAIL",
+    "FALSE",
+    "FILTER",
+    "FIRST",
+    "FOLLOWING",
+    "FOR",
+    "FOREIGN",
+    "FROM",
+    "FULL",
+    "GENERATED",
+    "GLOB",
+    "GROUP",
+    "GROUPS",
+    "HAVING",
+    "IF",
+    "IGNORE",
+    "IMMEDIATE",
+    "IN",
+    "INDEX",
+    "INDEXED",
+    "INITIALLY",
+    "INNER",
+    "INSERT",
+    "INSTEAD",
+    "INTERSECT",
+    "INTO",
+    "IS",
+    "ISNULL",
+    "JOIN",
+    "KEY",
+    "LAST",
+    "LEFT",
+    "LIKE",
+    "LIMIT",
+    "MATCH",
+    "MATERIALIZED",
+    "NATURAL",
+    "NO",
+    "NOT",
+    "NOTHING",
+    "NOTNULL",
+    "NULL",
+    "NULLS",
+    "OF",
+    "OFFSET",
+    "ON",
+    "OR",
+    "ORDER",
+    "OTHERS",
+    "OUTER",
+    "OVER",
+    "PARTITION",
+    "PLAN",
+    "PRAGMA",
+    "PRECEDING",
+    "PRIMARY",
+    "QUERY",
+    "RAISE",
+    "RANGE",
+    "RECURSIVE",
+    "REFERENCES",
+    "REGEXP",
+    "REINDEX",
+    "RELEASE",
+    "RENAME",
+    "REPLACE",
+    "RESTRICT",
+    "RETURNING",
+    "RIGHT",
+    "ROLLBACK",
+    "ROW",
+    "ROWS",
+    "SAVEPOINT",
+    "SELECT",
+    "SET",
+    "STORED",
+    "STRICT",
+    "TABLE",
+    "TEMP",
+    "TEMPORARY",
+    "THEN",
+    "TIES",
+    "TO",
+    "TRANSACTION",
+    "TRIGGER",
+    "TRUE",
+    "UNBOUNDED",
+    "UNION",
+    "UNIQUE",
+    "UPDATE",
+    "USING",
+    "VACUUM",
+    "VALUES",
+    "VIEW",
+    "VIRTUAL",
+    "WHEN",
+    "WHERE",
+    "WINDOW",
+    "WITH",
+    "WITHOUT",
+];
+
+fn is_sql_keyword(name: &str) -> bool {
+    name.is_ascii()
+        && SQL_KEYWORDS
+            .iter()
+            .any(|keyword| keyword.eq_ignore_ascii_case(name))
+}
+
 /// Returns true if the name needs quoting (contains special chars or is a keyword).
 fn needs_quoting(name: &str) -> bool {
     if name.is_empty() {
@@ -51,14 +214,26 @@ fn needs_quoting(name: &str) -> bool {
     }
     name.bytes()
         .any(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+        || is_sql_keyword(name)
 }
 
-fn write_ident(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
+pub fn write_ident(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
     if needs_quoting(name) {
         write!(f, "\"{}\"", name.replace('"', "\"\""))
     } else {
         f.write_str(name)
     }
+}
+
+pub fn write_qualified_name(
+    f: &mut fmt::Formatter<'_>,
+    name: &crate::QualifiedName,
+) -> fmt::Result {
+    if let Some(ref schema) = name.schema {
+        write_ident(f, schema)?;
+        f.write_str(".")?;
+    }
+    write_ident(f, &name.name)
 }
 
 /// Write an expression, wrapping in parentheses if it is a binary or unary op.
@@ -1084,11 +1259,15 @@ impl fmt::Display for CreateTableStatement {
                 write!(f, " AS {q}")?;
             }
         }
+        let mut table_options = Vec::new();
         if self.without_rowid {
-            f.write_str(" WITHOUT ROWID")?;
+            table_options.push("WITHOUT ROWID");
         }
         if self.strict {
-            f.write_str(" STRICT")?;
+            table_options.push("STRICT");
+        }
+        if !table_options.is_empty() {
+            write!(f, " {}", table_options.join(", "))?;
         }
         Ok(())
     }

@@ -3,15 +3,19 @@
 //! The critical path only appends+syncs systematic symbols. Repair symbols are
 //! generated/append-synced asynchronously after commit acknowledgment.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use asupersync::channel::mpsc;
 use asupersync::cx::Cx as NativeCx;
 use asupersync::runtime::{JoinHandle as AsyncJoinHandle, Runtime, spawn_blocking};
+use asupersync::sync::{OwnedSemaphorePermit, Semaphore};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use tracing::{debug, error, info, warn};
@@ -67,96 +71,292 @@ impl CommitPipelineConfig {
 }
 
 #[derive(Debug)]
-struct TwoPhaseQueueState {
-    capacity: usize,
-    next_wait_ticket: u64,
-    wait_queue: VecDeque<u64>,
-    next_reservation_seq: u64,
-    next_receive_seq: u64,
-    open_reservations: BTreeSet<u64>,
-    aborted_reservations: BTreeSet<u64>,
-    pending_commits: BTreeMap<u64, CommitRequest>,
-    ready_commits: VecDeque<CommitRequest>,
+struct PendingCommit {
+    request: CommitRequest,
+    logical_permit: OwnedSemaphorePermit,
 }
 
-impl TwoPhaseQueueState {
-    fn new(capacity: usize) -> Self {
+#[derive(Debug)]
+struct ReceiverOrderState {
+    next_receive_seq: u64,
+    aborted_reservations: BTreeSet<u64>,
+    pending_commits: BTreeMap<u64, PendingCommit>,
+}
+
+impl ReceiverOrderState {
+    fn new() -> Self {
         Self {
-            capacity: capacity.max(1),
-            next_wait_ticket: 1,
-            wait_queue: VecDeque::new(),
-            next_reservation_seq: 1,
             next_receive_seq: 1,
-            open_reservations: BTreeSet::new(),
             aborted_reservations: BTreeSet::new(),
             pending_commits: BTreeMap::new(),
-            ready_commits: VecDeque::new(),
         }
     }
 
-    fn occupancy(&self) -> usize {
-        self.open_reservations.len() + self.pending_commits.len() + self.ready_commits.len()
+    fn mark_aborted(&mut self, reservation_seq: u64) {
+        self.aborted_reservations.insert(reservation_seq);
     }
 
-    fn can_admit(&self, ticket: u64) -> bool {
-        self.wait_queue.front().copied() == Some(ticket) && self.occupancy() < self.capacity
+    fn queue_commit(
+        &mut self,
+        reservation_seq: u64,
+        request: CommitRequest,
+        logical_permit: OwnedSemaphorePermit,
+    ) {
+        let replaced = self.pending_commits.insert(
+            reservation_seq,
+            PendingCommit {
+                request,
+                logical_permit,
+            },
+        );
+        debug_assert!(
+            replaced.is_none(),
+            "duplicate reservation sequence enqueued: {reservation_seq}"
+        );
     }
 
-    fn reserve_slot(&mut self) -> u64 {
-        let seq = self.next_reservation_seq;
-        self.next_reservation_seq = self.next_reservation_seq.saturating_add(1);
-        self.open_reservations.insert(seq);
-        seq
+    fn rollback_pending_commit(&mut self, reservation_seq: u64) {
+        let _ = self.pending_commits.remove(&reservation_seq);
     }
 
-    fn close_reservation_with_send(&mut self, reservation_seq: u64, request: CommitRequest) {
-        if self.open_reservations.remove(&reservation_seq) {
-            self.pending_commits.insert(reservation_seq, request);
-        }
-        self.promote_ready();
-    }
-
-    fn close_reservation_with_abort(&mut self, reservation_seq: u64) {
-        if self.open_reservations.remove(&reservation_seq) {
-            self.aborted_reservations.insert(reservation_seq);
-        }
-        self.promote_ready();
-    }
-
-    fn remove_wait_ticket(&mut self, ticket: u64) {
-        if let Some(pos) = self.wait_queue.iter().position(|queued| *queued == ticket) {
-            let _ = self.wait_queue.remove(pos);
-        }
-    }
-
-    fn promote_ready(&mut self) {
+    fn take_ready(&mut self) -> Option<CommitRequest> {
         loop {
             if self.aborted_reservations.remove(&self.next_receive_seq) {
                 self.next_receive_seq = self.next_receive_seq.saturating_add(1);
                 continue;
             }
-            let Some(request) = self.pending_commits.remove(&self.next_receive_seq) else {
-                break;
-            };
-            self.ready_commits.push_back(request);
+
+            let PendingCommit {
+                request,
+                logical_permit,
+            } = self.pending_commits.remove(&self.next_receive_seq)?;
             self.next_receive_seq = self.next_receive_seq.saturating_add(1);
+            drop(logical_permit);
+            return Some(request);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitSignal {
+    CommitQueued { reservation_seq: u64 },
 }
 
 #[derive(Debug)]
 struct TwoPhaseQueueShared {
-    state: Mutex<TwoPhaseQueueState>,
-    cv: Condvar,
+    logical_capacity: Arc<Semaphore>,
+    signal_sender: mpsc::Sender<CommitSignal>,
+    signal_receiver: Mutex<mpsc::Receiver<CommitSignal>>,
+    next_reservation_seq: AtomicU64,
+    order_state: Mutex<ReceiverOrderState>,
 }
 
 impl TwoPhaseQueueShared {
     fn with_capacity(capacity: usize) -> Self {
+        let normalized_capacity = capacity.max(1);
+        let (signal_sender, signal_receiver) = mpsc::channel(normalized_capacity);
         Self {
-            state: Mutex::new(TwoPhaseQueueState::new(capacity)),
-            cv: Condvar::new(),
+            logical_capacity: Arc::new(Semaphore::new(normalized_capacity)),
+            signal_sender,
+            signal_receiver: Mutex::new(signal_receiver),
+            next_reservation_seq: AtomicU64::new(1),
+            order_state: Mutex::new(ReceiverOrderState::new()),
         }
     }
+
+    fn reserve_sequence(&self) -> u64 {
+        self.next_reservation_seq.fetch_add(1, Ordering::AcqRel)
+    }
+
+    fn occupancy(&self) -> usize {
+        self.capacity()
+            .saturating_sub(self.logical_capacity.available_permits())
+    }
+
+    fn capacity(&self) -> usize {
+        self.logical_capacity.max_permits()
+    }
+
+    fn queue_commit(
+        &self,
+        reservation_seq: u64,
+        request: CommitRequest,
+        logical_permit: OwnedSemaphorePermit,
+    ) {
+        lock_with_recovery(&self.order_state, "two_phase_order_state").queue_commit(
+            reservation_seq,
+            request,
+            logical_permit,
+        );
+    }
+
+    fn rollback_pending_commit(&self, reservation_seq: u64) {
+        lock_with_recovery(&self.order_state, "two_phase_order_state")
+            .rollback_pending_commit(reservation_seq);
+    }
+
+    fn mark_aborted(&self, reservation_seq: u64) {
+        lock_with_recovery(&self.order_state, "two_phase_order_state")
+            .mark_aborted(reservation_seq);
+        self.signal_sender.wake_receiver();
+    }
+
+    fn take_ready_request(&self) -> Option<CommitRequest> {
+        lock_with_recovery(&self.order_state, "two_phase_order_state").take_ready()
+    }
+
+    fn drain_signals(&self) -> SignalDrain {
+        let mut receiver = lock_with_recovery(&self.signal_receiver, "two_phase_signal_receiver");
+        let mut drained_any = false;
+        loop {
+            match receiver.try_recv() {
+                Ok(CommitSignal::CommitQueued { .. }) => {
+                    drained_any = true;
+                }
+                Err(mpsc::RecvError::Empty | mpsc::RecvError::Cancelled) => {
+                    return if drained_any {
+                        SignalDrain::Drained
+                    } else {
+                        SignalDrain::Empty
+                    };
+                }
+                Err(mpsc::RecvError::Disconnected) => return SignalDrain::Disconnected,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalDrain {
+    Empty,
+    Drained,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalWaitOutcome {
+    Woken,
+    TimedOut,
+    Disconnected,
+}
+
+#[derive(Debug)]
+struct ThreadParkWaker {
+    thread: thread::Thread,
+}
+
+impl Wake for ThreadParkWaker {
+    fn wake(self: Arc<Self>) {
+        self.thread.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.thread.unpark();
+    }
+}
+
+fn current_thread_waker() -> Waker {
+    Waker::from(Arc::new(ThreadParkWaker {
+        thread: thread::current(),
+    }))
+}
+
+fn block_on_future_with_timeout<F>(future: F, native_cx: &NativeCx, timeout: Duration) -> F::Output
+where
+    F: Future,
+{
+    let waker = current_thread_waker();
+    let mut task_cx = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    let started_at = Instant::now();
+    let mut cancelled_for_timeout = false;
+
+    loop {
+        match future.as_mut().poll(&mut task_cx) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => {}
+        }
+
+        if !cancelled_for_timeout && started_at.elapsed() >= timeout {
+            native_cx.set_cancel_requested(true);
+            cancelled_for_timeout = true;
+            continue;
+        }
+
+        if cancelled_for_timeout {
+            thread::yield_now();
+        } else {
+            thread::park_timeout(timeout.saturating_sub(started_at.elapsed()));
+        }
+    }
+}
+
+fn try_reserve_signal_with_timeout(
+    sender: &mpsc::Sender<CommitSignal>,
+    timeout: Duration,
+) -> Option<mpsc::SendPermit<'_, CommitSignal>> {
+    let started_at = Instant::now();
+    loop {
+        match sender.try_reserve() {
+            Ok(permit) => return Some(permit),
+            Err(mpsc::SendError::Disconnected(())) => return None,
+            Err(mpsc::SendError::Full(()) | mpsc::SendError::Cancelled(())) => {
+                if started_at.elapsed() >= timeout {
+                    return None;
+                }
+                thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn wait_for_signal_activity(shared: &TwoPhaseQueueShared, timeout: Duration) -> SignalWaitOutcome {
+    let native_cx = NativeCx::for_testing();
+    let waker = current_thread_waker();
+    let mut task_cx = Context::from_waker(&waker);
+    let started_at = Instant::now();
+    let mut receiver = lock_with_recovery(&shared.signal_receiver, "two_phase_signal_receiver");
+    let mut future = Box::pin(receiver.recv(&native_cx));
+
+    match future.as_mut().poll(&mut task_cx) {
+        Poll::Ready(Ok(CommitSignal::CommitQueued { .. })) => return SignalWaitOutcome::Woken,
+        Poll::Ready(Err(mpsc::RecvError::Disconnected)) => return SignalWaitOutcome::Disconnected,
+        Poll::Ready(Err(mpsc::RecvError::Cancelled)) => return SignalWaitOutcome::TimedOut,
+        Poll::Ready(Err(mpsc::RecvError::Empty)) => unreachable!("recv() does not return Empty"),
+        Poll::Pending => {}
+    }
+
+    let remaining = timeout.saturating_sub(started_at.elapsed());
+    if remaining.is_zero() {
+        native_cx.set_cancel_requested(true);
+        return match future.as_mut().poll(&mut task_cx) {
+            Poll::Ready(Ok(CommitSignal::CommitQueued { .. })) => SignalWaitOutcome::Woken,
+            Poll::Ready(Err(mpsc::RecvError::Disconnected)) => SignalWaitOutcome::Disconnected,
+            Poll::Ready(Err(mpsc::RecvError::Cancelled)) | Poll::Pending => {
+                SignalWaitOutcome::TimedOut
+            }
+            Poll::Ready(Err(mpsc::RecvError::Empty)) => {
+                unreachable!("recv() does not return Empty")
+            }
+        };
+    }
+
+    thread::park_timeout(remaining);
+    if started_at.elapsed() >= timeout {
+        native_cx.set_cancel_requested(true);
+        return match future.as_mut().poll(&mut task_cx) {
+            Poll::Ready(Ok(CommitSignal::CommitQueued { .. })) => SignalWaitOutcome::Woken,
+            Poll::Ready(Err(mpsc::RecvError::Disconnected)) => SignalWaitOutcome::Disconnected,
+            Poll::Ready(Err(mpsc::RecvError::Cancelled)) | Poll::Pending => {
+                SignalWaitOutcome::TimedOut
+            }
+            Poll::Ready(Err(mpsc::RecvError::Empty)) => {
+                unreachable!("recv() does not return Empty")
+            }
+        };
+    }
+
+    SignalWaitOutcome::Woken
 }
 
 /// Sender side of the two-phase bounded MPSC commit channel.
@@ -167,7 +367,7 @@ pub struct TwoPhaseCommitSender {
 
 impl TwoPhaseCommitSender {
     /// Reserve a slot (phase 1). Blocks when channel is saturated.
-    pub fn reserve(&self) -> SendPermit {
+    pub fn reserve(&self) -> SendPermit<'_> {
         loop {
             if let Some(permit) = self.try_reserve_for(Duration::from_secs(3600)) {
                 return permit;
@@ -177,50 +377,44 @@ impl TwoPhaseCommitSender {
 
     /// Reserve with timeout; `None` means caller gave up (cancel during reserve).
     #[must_use]
-    #[allow(clippy::significant_drop_tightening)]
-    pub fn try_reserve_for(&self, timeout: Duration) -> Option<SendPermit> {
-        let mut state_guard = lock_with_recovery(&self.shared.state, "two_phase_state");
-        let ticket = state_guard.next_wait_ticket;
-        state_guard.next_wait_ticket = state_guard.next_wait_ticket.saturating_add(1);
-        state_guard.wait_queue.push_back(ticket);
+    pub fn try_reserve_for(&self, timeout: Duration) -> Option<SendPermit<'_>> {
+        let started_at = Instant::now();
 
-        let (mut guard, _) =
-            match self
-                .shared
-                .cv
-                .wait_timeout_while(state_guard, timeout, |state| !state.can_admit(ticket))
-            {
-                Ok(pair) => pair,
-                Err(poisoned) => poisoned.into_inner(),
-            };
+        let logical_cx = NativeCx::for_testing();
+        let logical_permit = match block_on_future_with_timeout(
+            OwnedSemaphorePermit::acquire(
+                Arc::clone(&self.shared.logical_capacity),
+                &logical_cx,
+                1,
+            ),
+            &logical_cx,
+            timeout,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => return None,
+        };
 
-        if !guard.can_admit(ticket) {
-            guard.remove_wait_ticket(ticket);
-            drop(guard);
-            self.shared.cv.notify_all();
-            return None;
-        }
+        let remaining = timeout.saturating_sub(started_at.elapsed());
+        let signal_permit = try_reserve_signal_with_timeout(&self.shared.signal_sender, remaining)?;
 
-        let _ = guard.wait_queue.pop_front();
-        let reservation_seq = guard.reserve_slot();
-        drop(guard);
-        self.shared.cv.notify_all();
         Some(SendPermit {
             shared: Arc::clone(&self.shared),
-            reservation_seq: Some(reservation_seq),
+            signal_permit: Some(signal_permit),
+            logical_permit: Some(logical_permit),
+            reservation_seq: Some(self.shared.reserve_sequence()),
         })
     }
 
     /// Current buffered + reserved occupancy.
     #[must_use]
     pub fn occupancy(&self) -> usize {
-        lock_with_recovery(&self.shared.state, "two_phase_state").occupancy()
+        self.shared.occupancy()
     }
 
     /// Bounded channel capacity.
     #[must_use]
     pub fn capacity(&self) -> usize {
-        lock_with_recovery(&self.shared.state, "two_phase_state").capacity
+        self.shared.capacity()
     }
 }
 
@@ -242,21 +436,36 @@ impl TwoPhaseCommitReceiver {
 
     /// Timed receive used by tests and bounded coordinator loops.
     #[must_use]
-    #[allow(clippy::significant_drop_tightening)]
     pub fn try_recv_for(&self, timeout: Duration) -> Option<CommitRequest> {
-        let (mut guard, _) = match self.shared.cv.wait_timeout_while(
-            lock_with_recovery(&self.shared.state, "two_phase_state"),
-            timeout,
-            |state| state.ready_commits.is_empty(),
-        ) {
-            Ok(pair) => pair,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let started_at = Instant::now();
+        loop {
+            match self.shared.drain_signals() {
+                SignalDrain::Drained => {
+                    if let Some(request) = self.shared.take_ready_request() {
+                        return Some(request);
+                    }
+                    continue;
+                }
+                SignalDrain::Disconnected => return self.shared.take_ready_request(),
+                SignalDrain::Empty => {}
+            }
 
-        let request = guard.ready_commits.pop_front()?;
-        drop(guard);
-        self.shared.cv.notify_all();
-        Some(request)
+            if let Some(request) = self.shared.take_ready_request() {
+                return Some(request);
+            }
+
+            let remaining = timeout.saturating_sub(started_at.elapsed());
+            if remaining.is_zero() {
+                return self.shared.take_ready_request();
+            }
+
+            match wait_for_signal_activity(&self.shared, remaining) {
+                SignalWaitOutcome::Woken => {}
+                SignalWaitOutcome::Disconnected | SignalWaitOutcome::TimedOut => {
+                    return self.shared.take_ready_request();
+                }
+            }
+        }
     }
 }
 
@@ -264,12 +473,14 @@ impl TwoPhaseCommitReceiver {
 ///
 /// Dropping without `send()`/`abort()` automatically releases the reserved slot.
 #[derive(Debug)]
-pub struct SendPermit {
+pub struct SendPermit<'a> {
     shared: Arc<TwoPhaseQueueShared>,
+    signal_permit: Option<mpsc::SendPermit<'a, CommitSignal>>,
+    logical_permit: Option<OwnedSemaphorePermit>,
     reservation_seq: Option<u64>,
 }
 
-impl SendPermit {
+impl SendPermit<'_> {
     /// Stable reservation sequence used to verify FIFO behavior in tests.
     #[must_use]
     pub fn reservation_seq(&self) -> u64 {
@@ -278,36 +489,47 @@ impl SendPermit {
 
     /// Phase 2 commit. Synchronous and infallible for slot ownership.
     pub fn send(mut self, request: CommitRequest) {
-        if let Some(reservation_seq) = self.reservation_seq.take() {
+        let Some(reservation_seq) = self.reservation_seq.take() else {
+            return;
+        };
+        let Some(logical_permit) = self.logical_permit.take() else {
+            return;
+        };
+
+        self.shared
+            .queue_commit(reservation_seq, request, logical_permit);
+
+        if let Some(signal_permit) = self.signal_permit.take() {
+            if signal_permit
+                .try_send(CommitSignal::CommitQueued { reservation_seq })
+                .is_err()
             {
-                let mut guard = lock_with_recovery(&self.shared.state, "two_phase_state");
-                guard.close_reservation_with_send(reservation_seq, request);
+                self.shared.rollback_pending_commit(reservation_seq);
+                self.shared.mark_aborted(reservation_seq);
             }
-            self.shared.cv.notify_all();
         }
     }
 
     /// Explicitly release reserved slot without sending.
     pub fn abort(mut self) {
-        if let Some(reservation_seq) = self.reservation_seq.take() {
-            {
-                let mut guard = lock_with_recovery(&self.shared.state, "two_phase_state");
-                guard.close_reservation_with_abort(reservation_seq);
-            }
-            self.shared.cv.notify_all();
+        self.abort_current_reservation();
+    }
+
+    fn abort_current_reservation(&mut self) {
+        let Some(reservation_seq) = self.reservation_seq.take() else {
+            return;
+        };
+        if let Some(signal_permit) = self.signal_permit.take() {
+            signal_permit.abort();
         }
+        let _ = self.logical_permit.take();
+        self.shared.mark_aborted(reservation_seq);
     }
 }
 
-impl Drop for SendPermit {
+impl Drop for SendPermit<'_> {
     fn drop(&mut self) {
-        if let Some(reservation_seq) = self.reservation_seq.take() {
-            {
-                let mut guard = lock_with_recovery(&self.shared.state, "two_phase_state");
-                guard.close_reservation_with_abort(reservation_seq);
-            }
-            self.shared.cv.notify_all();
-        }
+        self.abort_current_reservation();
     }
 }
 
@@ -327,7 +549,7 @@ impl TrackedSender {
         }
     }
 
-    pub fn reserve(&self) -> TrackedSendPermit {
+    pub fn reserve(&self) -> TrackedSendPermit<'_> {
         TrackedSendPermit {
             leaked_permits: Arc::clone(&self.leaked_permits),
             permit: Some(self.sender.reserve()),
@@ -342,12 +564,12 @@ impl TrackedSender {
 
 /// Tracked permit wrapper for safety-critical channels.
 #[derive(Debug)]
-pub struct TrackedSendPermit {
+pub struct TrackedSendPermit<'a> {
     leaked_permits: Arc<AtomicU64>,
-    permit: Option<SendPermit>,
+    permit: Option<SendPermit<'a>>,
 }
 
-impl TrackedSendPermit {
+impl TrackedSendPermit<'_> {
     /// Commit and clear obligation.
     pub fn send(mut self, request: CommitRequest) {
         if let Some(permit) = self.permit.take() {
@@ -363,7 +585,7 @@ impl TrackedSendPermit {
     }
 }
 
-impl Drop for TrackedSendPermit {
+impl Drop for TrackedSendPermit<'_> {
     fn drop(&mut self) {
         if self.permit.is_some() {
             self.leaked_permits.fetch_add(1, Ordering::AcqRel);
@@ -1780,6 +2002,41 @@ mod two_phase_pipeline_tests {
     }
 
     #[test]
+    fn test_out_of_order_send_completion_still_delivers_by_reservation_sequence() {
+        let (sender, receiver) = two_phase_commit_channel(4);
+        let permit1 = sender.reserve();
+        let permit2 = sender.reserve();
+        let permit3 = sender.reserve();
+
+        let seq1 = permit1.reservation_seq();
+        let seq2 = permit2.reservation_seq();
+        let seq3 = permit3.reservation_seq();
+        assert_eq!((seq1, seq2, seq3), (1, 2, 3));
+
+        permit2.send(request(seq2));
+        permit3.send(request(seq3));
+        assert_eq!(
+            receiver.try_recv_for(Duration::from_millis(20)),
+            None,
+            "later sends must not bypass an earlier unresolved reservation"
+        );
+
+        permit1.send(request(seq1));
+        assert_eq!(
+            receiver.try_recv_for(Duration::from_millis(50)),
+            Some(request(seq1))
+        );
+        assert_eq!(
+            receiver.try_recv_for(Duration::from_millis(50)),
+            Some(request(seq2))
+        );
+        assert_eq!(
+            receiver.try_recv_for(Duration::from_millis(50)),
+            Some(request(seq3))
+        );
+    }
+
+    #[test]
     fn test_two_phase_cancel_during_reserve() {
         let (sender, _receiver) = two_phase_commit_channel(1);
         let blocker = sender.reserve();
@@ -1808,17 +2065,20 @@ mod two_phase_pipeline_tests {
     #[test]
     fn test_backpressure_blocks_at_capacity() {
         let (sender, _receiver) = two_phase_commit_channel(2);
-        let permit_a = sender.reserve();
-        let permit_b = sender.reserve();
+        let sender_a = sender.clone();
+        let sender_b = sender.clone();
+        let permit_a = sender_a.reserve();
+        let permit_b = sender_b.reserve();
 
         let (tx, rx) = std_mpsc::channel();
+        let sender_for_worker = sender.clone();
         let join = thread::spawn(move || {
             let started = Instant::now();
-            let permit = sender.reserve();
+            let permit = sender_for_worker.reserve();
             let elapsed = started.elapsed();
             tx.send(elapsed)
                 .expect("elapsed send should succeed for backpressure test");
-            permit
+            drop(permit);
         });
 
         thread::sleep(Duration::from_millis(30));
@@ -1832,7 +2092,7 @@ mod two_phase_pipeline_tests {
             elapsed >= Duration::from_millis(20),
             "reserve should block until capacity frees"
         );
-        let _permit = join.join().expect("thread join must succeed");
+        join.join().expect("thread join must succeed");
     }
 
     #[test]

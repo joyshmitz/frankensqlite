@@ -2390,6 +2390,18 @@ mod tests {
     }
 
     #[test]
+    fn test_create_table_without_rowid_and_strict_round_trips_display() {
+        let sql = "CREATE TABLE s (id INTEGER PRIMARY KEY) WITHOUT ROWID, STRICT";
+        let Some((statement, _)) =
+            parse_first_statement_with_tail(sql).expect("statement should parse")
+        else {
+            panic!("expected CREATE TABLE statement");
+        };
+
+        assert_eq!(statement.to_string(), sql);
+    }
+
+    #[test]
     fn test_error_recovery_does_not_fabricate_top_level_statements_from_trigger_body() {
         let mut parser = Parser::from_sql(
             "CREATE TRIGGER trg AFTER INSERT ON t BEGIN XYZZY; SELECT 1; END; SELECT 2;",
@@ -6431,6 +6443,9 @@ mod tests {
             "CREATE TRIGGER tr INSTEAD OF UPDATE ON v BEGIN INSERT INTO log VALUES (1); END",
         );
         assert_roundtrip("CREATE TRIGGER tr BEFORE UPDATE OF a, b ON t BEGIN SELECT 1; END");
+        assert_roundtrip(
+            "CREATE TRIGGER tr AFTER DELETE ON \"order\" BEGIN INSERT INTO log VALUES (OLD.id); END",
+        );
     }
 
     #[test]

@@ -8,13 +8,15 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Barrier};
-use std::thread;
 use std::time::Instant;
 
+use asupersync::runtime::Runtime;
 use crossbeam_deque::{Steal, Stealer, Worker};
 use fsqlite_types::PageNumber;
+use fsqlite_types::cx::{Cx, cap};
 
 use crate::vectorized_scan::PageMorsel;
 
@@ -27,6 +29,8 @@ pub enum DispatchError {
         found_pipeline: PipelineId,
         task_id: usize,
     },
+    RuntimeUnavailable,
+    Cancelled,
     WorkerPanicked,
 }
 
@@ -43,6 +47,10 @@ impl fmt::Display for DispatchError {
                 "task {task_id} belongs to pipeline {:?}, expected {:?}",
                 found_pipeline, expected_pipeline
             ),
+            Self::RuntimeUnavailable => {
+                f.write_str("vectorized dispatch requires an active asupersync runtime")
+            }
+            Self::Cancelled => f.write_str("vectorized dispatch cancelled"),
             Self::WorkerPanicked => f.write_str("worker thread panicked during dispatch"),
         }
     }
@@ -113,14 +121,6 @@ pub fn partition_page_morsels(
     pages_per_morsel: u32,
     numa_nodes: usize,
 ) -> DispatchResult<Vec<MorselDescriptor>> {
-    // Alien Optimization: Content-Aware Morsel Partitioning (CAMP) §1.2.
-    // Pre-calculate the total number of morsels to minimize vector re-allocations.
-    let total_pages = u64::from(end_page.get())
-        .saturating_sub(u64::from(start_page.get()))
-        .saturating_add(1);
-    let expected_morsels = (total_pages as f64 / pages_per_morsel as f64).ceil() as usize;
-    let mut out = Vec::with_capacity(expected_morsels);
-
     if pages_per_morsel == 0 {
         return Err(DispatchError::InvalidConfig(
             "pages_per_morsel must be greater than zero",
@@ -135,6 +135,14 @@ pub fn partition_page_morsels(
     let full = PageMorsel::new(start_page, end_page).map_err(|_| {
         DispatchError::InvalidConfig("start_page must be less than or equal to end_page")
     })?;
+
+    // Alien Optimization: Content-Aware Morsel Partitioning (CAMP) §1.2.
+    // Pre-calculate the total number of morsels to minimize vector re-allocations,
+    // but only after the config and page bounds are known to be valid.
+    let total_pages = u64::from(full.end_page.get()) - u64::from(full.start_page.get()) + 1;
+    let expected_morsels = usize::try_from(total_pages.div_ceil(u64::from(pages_per_morsel)))
+        .map_err(|_| DispatchError::InvalidConfig("morsel count does not fit in usize"))?;
+    let mut out = Vec::with_capacity(expected_morsels);
 
     let mut current = full.start_page.get();
     let mut morsel_id = 0usize;
@@ -376,7 +384,7 @@ pub struct DispatcherConfig {
 
 impl Default for DispatcherConfig {
     fn default() -> Self {
-        let workers = thread::available_parallelism()
+        let workers = std::thread::available_parallelism()
             .map_or(2, std::num::NonZeroUsize::get)
             .saturating_sub(1)
             .max(1);
@@ -505,8 +513,9 @@ impl WorkStealingDispatcher {
     /// # Errors
     ///
     /// Returns an error if task metadata is inconsistent or a worker panics.
-    pub fn execute_with_barriers<R, F>(
+    pub async fn execute_with_barriers<R, F>(
         &self,
+        cx: &Cx<cap::All>,
         pipelines: &[Vec<PipelineTask>],
         execute: F,
     ) -> DispatchResult<Vec<PipelineExecution<R>>>
@@ -515,7 +524,8 @@ impl WorkStealingDispatcher {
         F: Fn(&PipelineTask, usize) -> R + Send + Sync + 'static,
     {
         let context = DispatchRunContext::default();
-        self.execute_with_barriers_with_context(pipelines, &context, execute)
+        self.execute_with_barriers_with_context(cx, pipelines, &context, execute)
+            .await
     }
 
     /// Execute pipelines with an implicit barrier between each pipeline and
@@ -525,8 +535,9 @@ impl WorkStealingDispatcher {
     ///
     /// Returns an error if task metadata is inconsistent, worker execution
     /// panics, or the provided `context` is invalid.
-    pub fn execute_with_barriers_with_context<R, F>(
+    pub async fn execute_with_barriers_with_context<R, F>(
         &self,
+        cx: &Cx<cap::All>,
         pipelines: &[Vec<PipelineTask>],
         context: &DispatchRunContext,
         execute: F,
@@ -536,6 +547,7 @@ impl WorkStealingDispatcher {
         F: Fn(&PipelineTask, usize) -> R + Send + Sync + 'static,
     {
         context.validate()?;
+        dispatch_checkpoint(cx)?;
         let execute = Arc::new(execute);
         let mut reports = Vec::with_capacity(pipelines.len());
 
@@ -543,16 +555,55 @@ impl WorkStealingDispatcher {
             if tasks.is_empty() {
                 continue;
             }
-            let report = self.execute_single_pipeline(tasks, context, &execute)?;
+            let report = self
+                .execute_single_pipeline(cx, tasks, context, &execute)
+                .await?;
             reports.push(report);
         }
 
         Ok(reports)
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn execute_single_pipeline<R, F>(
+    /// Synchronous wrapper for callers that already own the runtime.
+    pub fn execute_with_barriers_on_runtime<R, F>(
         &self,
+        runtime: &Runtime,
+        pipelines: &[Vec<PipelineTask>],
+        execute: F,
+    ) -> DispatchResult<Vec<PipelineExecution<R>>>
+    where
+        R: Send + 'static,
+        F: Fn(&PipelineTask, usize) -> R + Send + Sync + 'static,
+    {
+        runtime.block_on(async {
+            let cx = Cx::<cap::All>::new();
+            self.execute_with_barriers(&cx, pipelines, execute).await
+        })
+    }
+
+    /// Synchronous wrapper with explicit run correlation fields.
+    pub fn execute_with_barriers_with_context_on_runtime<R, F>(
+        &self,
+        runtime: &Runtime,
+        pipelines: &[Vec<PipelineTask>],
+        context: &DispatchRunContext,
+        execute: F,
+    ) -> DispatchResult<Vec<PipelineExecution<R>>>
+    where
+        R: Send + 'static,
+        F: Fn(&PipelineTask, usize) -> R + Send + Sync + 'static,
+    {
+        runtime.block_on(async {
+            let cx = Cx::<cap::All>::new();
+            self.execute_with_barriers_with_context(&cx, pipelines, context, execute)
+                .await
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_single_pipeline<R, F>(
+        &self,
+        cx: &Cx<cap::All>,
         tasks: &[PipelineTask],
         context: &DispatchRunContext,
         execute: &Arc<F>,
@@ -577,6 +628,7 @@ impl WorkStealingDispatcher {
             .map(|_| Worker::new_fifo())
             .collect();
         let stealers: Vec<Stealer<PipelineTask>> = workers.iter().map(Worker::stealer).collect();
+        let runtime_handle = Runtime::current_handle().ok_or(DispatchError::RuntimeUnavailable)?;
 
         let use_hash_exchange = tasks
             .iter()
@@ -641,80 +693,103 @@ impl WorkStealingDispatcher {
             workers[target].push(task);
         }
 
+        let pipeline_cx = cx.create_child();
         let mut handles = Vec::with_capacity(self.config.worker_threads);
-        let start_barrier = Arc::new(Barrier::new(self.config.worker_threads));
         let run_id = context.run_id.clone();
         let scenario_id = context.scenario_id.clone();
         let trace_id = context.trace_id;
         for (worker_id, local_worker) in workers.into_iter().enumerate() {
             let execute = Arc::clone(execute);
             let stealers = stealers.clone();
-            let start_barrier = Arc::clone(&start_barrier);
+            let worker_cx = pipeline_cx.create_child();
+            let pipeline_cx_for_worker = pipeline_cx.clone();
             let run_id = run_id.clone();
             let scenario_id = scenario_id.clone();
-            handles.push(thread::spawn(move || {
-                start_barrier.wait();
-                let mut completed = Vec::new();
-                let mut count = 0usize;
-                let mut rows_processed = 0u64;
-                while let Some(task) = pop_or_steal(&local_worker, worker_id, &stealers) {
-                    let morsel_size = morsel_page_span(task.morsel);
-                    let span = tracing::info_span!(
-                        "morsel_exec",
-                        morsel_size,
-                        worker_id,
-                        run_id = %run_id,
-                        trace_id,
-                        scenario_id = %scenario_id,
-                        pipeline_id = task.pipeline.0,
-                        task_id = task.task_id
-                    );
-                    let result = {
-                        let _guard = span.enter();
-                        tracing::debug!(
-                            worker_id,
-                            pipeline_id = task.pipeline.0,
-                            task_id = task.task_id,
-                            run_id = %run_id,
-                            trace_id,
-                            scenario_id = %scenario_id,
-                            morsel_size,
-                            "morsel.execute.start"
-                        );
-                        let result = execute(&task, worker_id);
-                        tracing::debug!(
-                            worker_id,
-                            pipeline_id = task.pipeline.0,
-                            task_id = task.task_id,
-                            run_id = %run_id,
-                            trace_id,
-                            scenario_id = %scenario_id,
-                            morsel_size,
-                            "morsel.execute.complete"
-                        );
-                        result
-                    };
-                    completed.push(CompletedTask {
-                        task_id: task.task_id,
-                        worker_id,
-                        result,
-                    });
-                    count = count.saturating_add(1);
-                    rows_processed = rows_processed.saturating_add(morsel_size);
+            handles.push(runtime_handle.spawn(async move {
+                let worker_result =
+                    std::panic::catch_unwind(AssertUnwindSafe(|| -> DispatchResult<_> {
+                        dispatch_checkpoint(&worker_cx)?;
+                        let mut completed = Vec::new();
+                        let mut count = 0usize;
+                        let mut rows_processed = 0u64;
+                        while let Some(task) = pop_or_steal(&local_worker, worker_id, &stealers) {
+                            dispatch_checkpoint(&worker_cx)?;
+                            let morsel_size = morsel_page_span(task.morsel);
+                            let span = tracing::info_span!(
+                                "morsel_exec",
+                                morsel_size,
+                                worker_id,
+                                run_id = %run_id,
+                                trace_id,
+                                scenario_id = %scenario_id,
+                                pipeline_id = task.pipeline.0,
+                                task_id = task.task_id
+                            );
+                            let result = {
+                                let _guard = span.enter();
+                                tracing::debug!(
+                                    worker_id,
+                                    pipeline_id = task.pipeline.0,
+                                    task_id = task.task_id,
+                                    run_id = %run_id,
+                                    trace_id,
+                                    scenario_id = %scenario_id,
+                                    morsel_size,
+                                    "morsel.execute.start"
+                                );
+                                let result = execute(&task, worker_id);
+                                tracing::debug!(
+                                    worker_id,
+                                    pipeline_id = task.pipeline.0,
+                                    task_id = task.task_id,
+                                    run_id = %run_id,
+                                    trace_id,
+                                    scenario_id = %scenario_id,
+                                    morsel_size,
+                                    "morsel.execute.complete"
+                                );
+                                result
+                            };
+                            completed.push(CompletedTask {
+                                task_id: task.task_id,
+                                worker_id,
+                                result,
+                            });
+                            count = count.saturating_add(1);
+                            rows_processed = rows_processed.saturating_add(morsel_size);
+                        }
+                        Ok((completed, count, rows_processed))
+                    }))
+                    .unwrap_or(Err(DispatchError::WorkerPanicked));
+                if worker_result.is_err() {
+                    pipeline_cx_for_worker.cancel();
                 }
-                (completed, count, rows_processed)
+                worker_result
             }));
         }
 
         let mut completed = Vec::with_capacity(tasks.len());
         let mut per_worker_task_counts = vec![0usize; self.config.worker_threads];
         let mut total_rows_processed = 0u64;
+        let mut first_error = None;
         for (worker_id, handle) in handles.into_iter().enumerate() {
-            let (mut worker_completed, count, rows_processed) =
-                handle.join().map_err(|_| DispatchError::WorkerPanicked)?;
-            per_worker_task_counts[worker_id] = count;
-            total_rows_processed = total_rows_processed.saturating_add(rows_processed);
-            completed.append(&mut worker_completed);
+            match handle.await {
+                Ok((mut worker_completed, count, rows_processed)) if first_error.is_none() => {
+                    per_worker_task_counts[worker_id] = count;
+                    total_rows_processed = total_rows_processed.saturating_add(rows_processed);
+                    completed.append(&mut worker_completed);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    if first_error.is_none() {
+                        pipeline_cx.cancel();
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
         }
 
         completed.sort_by_key(|entry| entry.task_id);
@@ -800,11 +875,18 @@ fn steal_from_peers<T>(worker_id: usize, stealers: &[Stealer<T>]) -> Option<T> {
     None
 }
 
+fn dispatch_checkpoint(cx: &Cx<cap::All>) -> DispatchResult<()> {
+    cx.checkpoint().map_err(|_| DispatchError::Cancelled)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    use asupersync::runtime::{Runtime, RuntimeBuilder};
 
     use super::*;
 
@@ -825,6 +907,13 @@ mod tests {
         active_workers: usize,
         completed_tasks: usize,
         checksum: u64,
+    }
+
+    fn dispatch_runtime(worker_threads: usize) -> Runtime {
+        RuntimeBuilder::new()
+            .worker_threads(worker_threads)
+            .build()
+            .expect("bead_id={MORSEL_BEAD_ID} runtime should build")
     }
 
     fn synthetic_e2e_task_cost(task_id: usize, worker_id: usize, seed: u64) -> u64 {
@@ -930,14 +1019,19 @@ mod tests {
 
         let events = Arc::new(Mutex::new(Vec::<usize>::new()));
         let events_for_exec = Arc::clone(&events);
+        let runtime = dispatch_runtime(4);
         let reports = dispatcher
-            .execute_with_barriers(&[pipeline0, pipeline1], move |task, _worker_id| {
-                events_for_exec
-                    .lock()
-                    .expect("event lock should not be poisoned")
-                    .push(task.pipeline.0);
-                task.task_id
-            })
+            .execute_with_barriers_on_runtime(
+                &runtime,
+                &[pipeline0, pipeline1],
+                move |task, _worker_id| {
+                    events_for_exec
+                        .lock()
+                        .expect("event lock should not be poisoned")
+                        .push(task.pipeline.0);
+                    task.task_id
+                },
+            )
             .expect("dispatch should succeed");
 
         assert_eq!(
@@ -980,8 +1074,9 @@ mod tests {
             numa_nodes: 2,
         })
         .expect("dispatcher should build");
+        let runtime = dispatch_runtime(4);
         let reports = dispatcher
-            .execute_with_barriers(&[tasks], |task, worker_id| {
+            .execute_with_barriers_on_runtime(&runtime, &[tasks], |task, worker_id| {
                 let spin = synthetic_e2e_task_cost(task.task_id, worker_id, MORSEL_E2E_SEED);
                 std::hint::black_box(spin);
                 (task.task_id, worker_id)
@@ -1064,8 +1159,9 @@ mod tests {
             numa_nodes: 2,
         })
         .expect("dispatcher should build");
+        let runtime = dispatch_runtime(4);
         dispatcher
-            .execute_with_barriers(&[tasks], |task, _worker_id| task.task_id)
+            .execute_with_barriers_on_runtime(&runtime, &[tasks], |task, _worker_id| task.task_id)
             .expect("dispatch should succeed");
 
         let snapshot = morsel_dispatch_metrics_snapshot();
@@ -1195,15 +1291,20 @@ mod tests {
                 numa_nodes: 2.min(worker_threads),
             })
             .expect("dispatcher should build");
+            let runtime = dispatch_runtime(worker_threads);
 
             let reports = dispatcher
-                .execute_with_barriers(std::slice::from_ref(&tasks), |task, _worker_id| {
-                    let task_id_u64 = u64::try_from(task.task_id)
-                        .expect("bead_id={MORSEL_BEAD_ID} task_id should fit in u64");
-                    task_id_u64
-                        .wrapping_mul(6_364_136_223_846_793_005_u64)
-                        .rotate_left(11)
-                })
+                .execute_with_barriers_on_runtime(
+                    &runtime,
+                    std::slice::from_ref(&tasks),
+                    |task, _worker_id| {
+                        let task_id_u64 = u64::try_from(task.task_id)
+                            .expect("bead_id={MORSEL_BEAD_ID} task_id should fit in u64");
+                        task_id_u64
+                            .wrapping_mul(6_364_136_223_846_793_005_u64)
+                            .rotate_left(11)
+                    },
+                )
                 .expect("dispatch should succeed");
             let report = reports
                 .first()
@@ -1266,12 +1367,17 @@ mod tests {
             "bead_id={MORSEL_BEAD_ID} hash exchange assignment should include odd partitions",
         );
 
+        let runtime = dispatch_runtime(4);
         let reports = dispatcher
-            .execute_with_barriers(std::slice::from_ref(&tasks), |task, worker_id| {
-                let spin = synthetic_e2e_task_cost(task.task_id, worker_id, MORSEL_E2E_SEED);
-                std::hint::black_box(spin);
-                task.task_id
-            })
+            .execute_with_barriers_on_runtime(
+                &runtime,
+                std::slice::from_ref(&tasks),
+                |task, worker_id| {
+                    let spin = synthetic_e2e_task_cost(task.task_id, worker_id, MORSEL_E2E_SEED);
+                    std::hint::black_box(spin);
+                    task.task_id
+                },
+            )
             .expect("dispatch should succeed");
         let report = reports
             .first()
@@ -1306,6 +1412,57 @@ mod tests {
                 ))
             ),
             "bead_id={MORSEL_BEAD_ID} empty scenario_id should be rejected",
+        );
+    }
+
+    #[test]
+    fn dispatcher_cancels_sibling_workers_after_worker_panic() {
+        let morsels = partition_page_morsels(
+            PageNumber::new(1).expect("page should be valid"),
+            PageNumber::new(64).expect("page should be valid"),
+            1,
+            1,
+        )
+        .expect("partition should succeed");
+        let tasks = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
+        let task_count = tasks.len();
+
+        let dispatcher = WorkStealingDispatcher::try_new(DispatcherConfig {
+            worker_threads: 2,
+            numa_nodes: 1,
+        })
+        .expect("dispatcher should build");
+        let runtime = dispatch_runtime(2);
+        let processed = Arc::new(AtomicUsize::new(0));
+        let processed_for_exec = Arc::clone(&processed);
+
+        let result = dispatcher.execute_with_barriers_on_runtime(
+            &runtime,
+            &[tasks],
+            move |task, _worker_id| {
+                if task.task_id == 0 {
+                    panic!("bead_id={BEAD_ID} injected worker panic");
+                }
+                processed_for_exec.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                task.task_id
+            },
+        );
+
+        assert!(
+            matches!(result, Err(DispatchError::WorkerPanicked)),
+            "bead_id={BEAD_ID} panic should surface as worker failure",
+        );
+        let completed_at_return = processed.load(Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let completed_after_wait = processed.load(Ordering::Relaxed);
+        assert_eq!(
+            completed_after_wait, completed_at_return,
+            "bead_id={BEAD_ID} sibling workers should stop once dispatch fails",
+        );
+        assert!(
+            completed_after_wait < task_count.saturating_sub(1),
+            "bead_id={BEAD_ID} sibling workers should not finish the full queue after panic",
         );
     }
 
@@ -1373,10 +1530,12 @@ mod tests {
                 numa_nodes: 2.min(worker_threads),
             })
             .expect("bead_id={MORSEL_BEAD_ID} dispatcher should build");
+            let runtime = dispatch_runtime(worker_threads);
 
             let start = Instant::now();
             let reports = dispatcher
-                .execute_with_barriers_with_context(
+                .execute_with_barriers_with_context_on_runtime(
+                    &runtime,
                     &pipelines,
                     &context,
                     move |task, _worker_id| {

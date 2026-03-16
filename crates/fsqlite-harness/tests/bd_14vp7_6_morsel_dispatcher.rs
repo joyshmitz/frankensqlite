@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use fsqlite_types::PageNumber;
 use fsqlite_vdbe::vectorized_dispatch::{
     DEFAULT_EXCHANGE_HOT_PARTITION_SPLIT_THRESHOLD, DEFAULT_L2_CACHE_BYTES,
@@ -17,6 +18,13 @@ use fsqlite_vdbe::vectorized_dispatch::{
 };
 
 const BEAD_ID: &str = "bd-14vp7.6";
+
+fn dispatch_runtime(worker_threads: usize) -> Runtime {
+    RuntimeBuilder::new()
+        .worker_threads(worker_threads)
+        .build()
+        .expect("bead_id={BEAD_ID} runtime should build")
+}
 
 // ── 1. Morsel partitioning covers full range ────────────────────────────────
 
@@ -127,9 +135,10 @@ fn test_work_stealing_execution_completes_all_tasks() {
 
     let counter = Arc::new(AtomicU64::new(0));
     let counter_clone = Arc::clone(&counter);
+    let runtime = dispatch_runtime(4);
 
     let reports = dispatcher
-        .execute_with_barriers(&[tasks], move |task, _worker_id| {
+        .execute_with_barriers_on_runtime(&runtime, &[tasks], move |task, _worker_id| {
             counter_clone.fetch_add(1, Ordering::Relaxed);
             // Compute a checksum from the morsel range.
             let start = u64::from(task.morsel.page_range.start_page.get());
@@ -182,18 +191,23 @@ fn test_pipeline_barriers_enforce_ordering() {
     // Use a shared atomic to track ordering.
     let phase = Arc::new(AtomicU64::new(0));
     let phase_clone = Arc::clone(&phase);
+    let runtime = dispatch_runtime(4);
 
     let reports = dispatcher
-        .execute_with_barriers(&[pipeline_0, pipeline_1], move |task, _worker_id| {
-            let current_phase = phase_clone.load(Ordering::Relaxed);
-            let pipeline_idx = task.pipeline.0 as u64;
-            // Pipeline 0 tasks should see phase=0, pipeline 1 tasks should see phase>=1.
-            if pipeline_idx == 0 {
-                // Mark that pipeline 0 completed at least one task.
-                phase_clone.store(1, Ordering::Release);
-            }
-            (pipeline_idx, current_phase)
-        })
+        .execute_with_barriers_on_runtime(
+            &runtime,
+            &[pipeline_0, pipeline_1],
+            move |task, _worker_id| {
+                let current_phase = phase_clone.load(Ordering::Relaxed);
+                let pipeline_idx = task.pipeline.0 as u64;
+                // Pipeline 0 tasks should see phase=0, pipeline 1 tasks should see phase>=1.
+                if pipeline_idx == 0 {
+                    // Mark that pipeline 0 completed at least one task.
+                    phase_clone.store(1, Ordering::Release);
+                }
+                (pipeline_idx, current_phase)
+            },
+        )
         .unwrap();
 
     assert_eq!(reports.len(), 2, "bead_id={BEAD_ID} case=two_pipelines");
@@ -244,8 +258,11 @@ fn test_scaling_efficiency() {
         numa_nodes: 1,
     })
     .unwrap();
+    let runtime1 = dispatch_runtime(1);
     let t1_start = std::time::Instant::now();
-    let _r1 = d1.execute_with_barriers(&[tasks_1], heavy_work).unwrap();
+    let _r1 = d1
+        .execute_with_barriers_on_runtime(&runtime1, &[tasks_1], heavy_work)
+        .unwrap();
     let t1_elapsed = t1_start.elapsed();
 
     // Measure with 4 workers.
@@ -255,8 +272,11 @@ fn test_scaling_efficiency() {
         numa_nodes: 1,
     })
     .unwrap();
+    let runtime4 = dispatch_runtime(4);
     let t4_start = std::time::Instant::now();
-    let _r4 = d4.execute_with_barriers(&[tasks_4], heavy_work).unwrap();
+    let _r4 = d4
+        .execute_with_barriers_on_runtime(&runtime4, &[tasks_4], heavy_work)
+        .unwrap();
     let t4_elapsed = t4_start.elapsed();
 
     let speedup = t1_elapsed.as_nanos() as f64 / t4_elapsed.as_nanos().max(1) as f64;
@@ -374,9 +394,10 @@ fn test_metrics_gauge_updates() {
     let end = PageNumber::new(40).unwrap();
     let morsels = partition_page_morsels(start, end, 10, 1).unwrap();
     let tasks = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
+    let runtime = dispatch_runtime(2);
 
     let _reports = dispatcher
-        .execute_with_barriers(&[tasks], |_task, _worker_id| 42u64)
+        .execute_with_barriers_on_runtime(&runtime, &[tasks], |_task, _worker_id| 42u64)
         .unwrap();
 
     let after = morsel_dispatch_metrics_snapshot();
@@ -417,8 +438,11 @@ fn test_deterministic_results_across_worker_counts() {
             numa_nodes: 1,
         })
         .unwrap();
+        let runtime = dispatch_runtime(workers);
         let tasks = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
-        let reports = d.execute_with_barriers(&[tasks], compute).unwrap();
+        let reports = d
+            .execute_with_barriers_on_runtime(&runtime, &[tasks], compute)
+            .unwrap();
 
         // Aggregate results sorted by task_id for deterministic comparison.
         let mut results: Vec<(usize, u64)> = reports[0]
@@ -556,8 +580,9 @@ fn test_conformance_summary() {
         numa_nodes: 1,
     })
     .unwrap();
+    let runtime = dispatch_runtime(2);
     let reports = dispatcher
-        .execute_with_barriers(&[tasks], |_task, _wid| 1u64)
+        .execute_with_barriers_on_runtime(&runtime, &[tasks], |_task, _wid| 1u64)
         .unwrap();
     let pass_execution = reports[0].completed.len() == morsels.len();
 
@@ -566,7 +591,7 @@ fn test_conformance_summary() {
     let p0 = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &m2);
     let p1 = build_pipeline_tasks(PipelineId(1), PipelineKind::AggregateUpdate, &m2);
     let barrier_reports = dispatcher
-        .execute_with_barriers(&[p0, p1], |_task, _wid| 1u64)
+        .execute_with_barriers_on_runtime(&runtime, &[p0, p1], |_task, _wid| 1u64)
         .unwrap();
     let pass_barriers = barrier_reports.len() == 2;
 
@@ -582,8 +607,12 @@ fn test_conformance_summary() {
     };
     let t1 = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &m3);
     let t2 = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &m3);
-    let r1 = dispatcher.execute_with_barriers(&[t1], compute).unwrap();
-    let r2 = dispatcher.execute_with_barriers(&[t2], compute).unwrap();
+    let r1 = dispatcher
+        .execute_with_barriers_on_runtime(&runtime, &[t1], compute)
+        .unwrap();
+    let r2 = dispatcher
+        .execute_with_barriers_on_runtime(&runtime, &[t2], compute)
+        .unwrap();
     let mut v1: Vec<_> = r1[0]
         .completed
         .iter()

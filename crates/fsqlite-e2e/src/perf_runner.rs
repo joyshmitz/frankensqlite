@@ -116,7 +116,10 @@ impl std::fmt::Display for MatrixCell {
 pub struct CellOutcome {
     /// The benchmark summary (present on success).
     pub summary: Option<BenchmarkSummary>,
-    /// Error message if the cell failed entirely.
+    /// Error message when the cell is not fully comparable.
+    ///
+    /// This includes total cell failures and partial measurement runs where at
+    /// least one iteration errored.
     pub error: Option<String>,
     /// Engine name.
     pub engine: String,
@@ -126,6 +129,20 @@ pub struct CellOutcome {
     pub workload: String,
     /// Concurrency level.
     pub concurrency: u16,
+}
+
+impl CellOutcome {
+    /// Whether this cell can participate in engine-to-engine comparisons.
+    #[must_use]
+    pub fn is_fully_comparable(&self) -> bool {
+        self.summary.is_some() && self.error.is_none()
+    }
+
+    /// Summary data only when every measurement iteration completed cleanly.
+    #[must_use]
+    pub fn comparable_summary(&self) -> Option<&BenchmarkSummary> {
+        self.summary.as_ref().filter(|_| self.error.is_none())
+    }
 }
 
 /// Complete result of running the performance matrix.
@@ -2493,14 +2510,39 @@ fn run_cell(cell: &MatrixCell, config: &PerfMatrixConfig) -> CellOutcome {
             iteration_idx,
         )
     });
+    let error = benchmark_summary_error(&summary);
 
     CellOutcome {
         summary: Some(summary),
-        error: None,
+        error,
         engine: cell.engine.as_str().to_owned(),
         fixture_id: cell.fixture_id.clone(),
         workload: cell.workload.clone(),
         concurrency: cell.concurrency,
+    }
+}
+
+fn benchmark_summary_error(summary: &BenchmarkSummary) -> Option<String> {
+    let failed_iterations = summary
+        .iterations
+        .iter()
+        .filter_map(|iteration| iteration.error.as_deref())
+        .collect::<Vec<_>>();
+    if failed_iterations.is_empty() {
+        return None;
+    }
+
+    let failure_count = failed_iterations.len();
+    let measurement_count = summary.iterations.len();
+    let first_error = failed_iterations[0];
+    if failure_count == measurement_count {
+        Some(format!(
+            "all {measurement_count} measurement iterations failed; first={first_error}"
+        ))
+    } else {
+        Some(format!(
+            "{failure_count}/{measurement_count} measurement iterations failed; first={first_error}"
+        ))
     }
 }
 
@@ -2611,6 +2653,32 @@ mod tests {
         super::HOT_PATH_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn sample_engine_report() -> EngineRunReport {
+        EngineRunReport {
+            wall_time_ms: 42,
+            ops_total: 17,
+            ops_per_sec: 404.0,
+            retries: 0,
+            aborts: 0,
+            correctness: crate::report::CorrectnessReport {
+                raw_sha256_match: None,
+                dump_match: None,
+                canonical_sha256_match: None,
+                integrity_check_ok: None,
+                raw_sha256: None,
+                canonical_sha256: None,
+                logical_sha256: None,
+                notes: None,
+            },
+            latency_ms: None,
+            error: None,
+            first_failure_diagnostic: None,
+            storage_wiring: None,
+            runtime_phase_timing: None,
+            hot_path_profile: None,
+        }
     }
 
     fn sample_hot_path_profile_report(
@@ -2751,6 +2819,58 @@ mod tests {
             engine_report,
             snapshot,
         )
+    }
+
+    #[test]
+    fn benchmark_summary_error_reports_partial_measurement_failure() {
+        let config = BenchmarkConfig {
+            warmup_iterations: 0,
+            min_iterations: 3,
+            measurement_time_secs: 0,
+        };
+        let meta = BenchmarkMeta {
+            engine: "sqlite3".to_owned(),
+            workload: "inserts".to_owned(),
+            fixture_id: "db-a".to_owned(),
+            concurrency: 1,
+            cargo_profile: "test".to_owned(),
+        };
+        let mut call_count = 0u32;
+        let summary = run_benchmark(&config, &meta, |_| {
+            call_count = call_count.saturating_add(1);
+            if call_count == 2 {
+                Err("setup failed")
+            } else {
+                Ok::<_, &str>(sample_engine_report())
+            }
+        });
+
+        assert_eq!(
+            benchmark_summary_error(&summary).as_deref(),
+            Some("1/3 measurement iterations failed; first=setup failed")
+        );
+    }
+
+    #[test]
+    fn benchmark_summary_error_reports_total_measurement_failure() {
+        let config = BenchmarkConfig {
+            warmup_iterations: 0,
+            min_iterations: 2,
+            measurement_time_secs: 0,
+        };
+        let meta = BenchmarkMeta {
+            engine: "sqlite3".to_owned(),
+            workload: "inserts".to_owned(),
+            fixture_id: "db-a".to_owned(),
+            concurrency: 1,
+            cargo_profile: "test".to_owned(),
+        };
+        let summary = run_benchmark(&config, &meta, |_| Err::<EngineRunReport, _>("open failed"));
+
+        assert_eq!(
+            benchmark_summary_error(&summary).as_deref(),
+            Some("all 2 measurement iterations failed; first=open failed")
+        );
     }
 
     #[test]
