@@ -854,6 +854,7 @@ dependencies = [
 name = "fsqlite-e2e"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "criterion",
  "fsqlite",
  "fsqlite-btree",

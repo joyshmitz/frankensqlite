@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
 use serde::{Deserialize, Serialize};
 
 use fsqlite::Connection as FsqliteConnection;
@@ -2049,16 +2050,38 @@ fn main() -> std::io::Result<()> {
     let (tx, rx) = mpsc::channel::<DashboardEvent>();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_bg = stop.clone();
+    let runtime = RuntimeBuilder::new()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("e2e dashboard runtime should build");
 
-    let bg = std::thread::spawn(move || {
-        let _ = run_real_suite(&suite_config, &stop_bg, Some(&tx));
-    });
+    let bg = spawn_suite_background(&runtime, suite_config, stop_bg, tx);
     let model = DashboardModel::new(rx, stop.clone());
     let res = App::new(model).screen_mode(ScreenMode::AltScreen).run();
 
     stop.store(true, Ordering::Relaxed);
-    let _ = bg.join();
+    bg.wait();
     res
+}
+
+fn spawn_background_task<F>(runtime: &Runtime, task: F) -> BlockingTaskHandle
+where
+    F: FnOnce() + Send + 'static,
+{
+    runtime
+        .spawn_blocking(task)
+        .expect("e2e dashboard runtime must configure a blocking pool")
+}
+
+fn spawn_suite_background(
+    runtime: &Runtime,
+    suite_config: SuiteConfig,
+    stop: Arc<AtomicBool>,
+    tx: mpsc::Sender<DashboardEvent>,
+) -> BlockingTaskHandle {
+    spawn_background_task(runtime, move || {
+        let _ = run_real_suite(&suite_config, &stop, Some(&tx));
+    })
 }
 
 fn parse_output_path(args: &[String]) -> Option<PathBuf> {
@@ -2082,6 +2105,33 @@ fn parse_u16_csv(value: &str) -> Vec<u16> {
         .filter_map(|raw| raw.trim().parse::<u16>().ok())
         .filter(|n| *n > 0)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn spawn_background_task_runs_on_runtime_blocking_pool() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("dashboard runtime should build for test");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_task = Arc::clone(&counter);
+
+        let handle = spawn_background_task(&runtime, move || {
+            counter_for_task.fetch_add(1, Ordering::Relaxed);
+        });
+
+        handle.wait();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "background task should run exactly once",
+        );
+    }
 }
 
 fn parse_csv(value: &str) -> Vec<String> {
