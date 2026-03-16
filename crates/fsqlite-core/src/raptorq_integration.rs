@@ -1088,17 +1088,11 @@ mod tests {
             config.encoding.symbol_size = symbol_size as u16;
             config.encoding.max_block_size = TEST_MAX_BLOCK_SIZE;
 
-            let symbol_size_usize =
-                usize::try_from(symbol_size).map_err(|_| FrankenError::OutOfRange {
-                    what: "symbol_size as usize".to_owned(),
-                    value: symbol_size.to_string(),
-                })?;
-            let symbols_per_block = u32::try_from((TEST_MAX_BLOCK_SIZE / symbol_size_usize).max(1))
-                .map_err(|_| FrankenError::OutOfRange {
-                    what: "symbols_per_block as u32".to_owned(),
-                    value: (TEST_MAX_BLOCK_SIZE / symbol_size_usize).to_string(),
-                })?;
-            let source_blocks = k_source.div_ceil(symbols_per_block).max(1);
+            // The test codec exposes the same metadata surface as the
+            // production `SymbolCodec`, so it must rebuild decode parameters
+            // using the same single-block geometry.
+            let source_blocks = 1_u8;
+            let symbols_per_block = k_source.max(1);
             let object_size = u64::from(k_source)
                 .checked_mul(u64::from(symbol_size))
                 .ok_or_else(|| FrankenError::OutOfRange {
@@ -1112,10 +1106,7 @@ mod tests {
                     what: "symbol_size as u16".to_owned(),
                     value: symbol_size.to_string(),
                 })?,
-                u8::try_from(source_blocks).map_err(|_| FrankenError::OutOfRange {
-                    what: "source_blocks as u8".to_owned(),
-                    value: source_blocks.to_string(),
-                })?,
+                source_blocks,
                 u16::try_from(symbols_per_block).map_err(|_| FrankenError::OutOfRange {
                     what: "symbols_per_block as u16".to_owned(),
                     value: symbols_per_block.to_string(),
