@@ -1082,6 +1082,7 @@ dependencies = [
  "blake3",
  "fsqlite-ast",
  "fsqlite-error",
+ "fsqlite-parser",
  "fsqlite-types",
  "proptest",
  "serde",

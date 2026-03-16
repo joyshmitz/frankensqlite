@@ -7,8 +7,9 @@
 use fsqlite_ast::{
     BinaryOp as AstBinaryOp, ColumnRef, ConflictAction, DeleteStatement, Expr, FunctionArgs,
     InsertSource, InsertStatement, Literal, PlaceholderType, QualifiedTableRef, ResultColumn,
-    SelectCore, SelectStatement, Span, UnaryOp as AstUnaryOp, UpdateStatement,
+    SelectCore, SelectStatement, Span, Statement, UnaryOp as AstUnaryOp, UpdateStatement,
 };
+use fsqlite_parser::{ParseError, Parser};
 use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,8 @@ pub struct ColumnInfo {
     /// Type affinity character: 'd' (integer), 'e' (real), 'B' (blob),
     /// 'C' (text), 'A' (numeric). Lowercase = exact, uppercase = heuristic.
     pub affinity: char,
+    /// Default value expression as SQL text (e.g. "'open'", "0").
+    pub default_value: Option<String>,
 }
 
 /// Index metadata needed for codegen (index-scan SELECT).
@@ -574,12 +577,55 @@ fn insert_target_indices(
         .collect()
 }
 
-fn insert_default_exprs(table: &TableSchema) -> Result<Vec<Expr>, CodegenError> {
-    Ok(table
-        .columns
-        .iter()
-        .map(|_| Expr::Literal(Literal::Null, Span::ZERO))
-        .collect())
+fn insert_default_exprs(table: &TableSchema) -> Vec<Expr> {
+    table.columns.iter().map(default_value_to_expr).collect()
+}
+
+/// Convert a column's DEFAULT value SQL text to an AST expression.
+fn default_value_to_expr(col: &ColumnInfo) -> Expr {
+    let span = Span::ZERO;
+    let Some(dv) = col.default_value.as_deref() else {
+        return Expr::Literal(Literal::Null, span);
+    };
+    parse_default_expr(dv)
+        .unwrap_or_else(|| Expr::Literal(Literal::String(dv.trim().to_owned()), span))
+}
+
+/// Parse column DEFAULT SQL text into an expression AST.
+fn parse_default_expr(default_sql: &str) -> Option<Expr> {
+    let trimmed = default_sql.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut parser = Parser::from_sql(&format!("SELECT {trimmed}"));
+    let (stmts, errs): (Vec<Statement>, Vec<ParseError>) = parser.parse_all();
+    if !errs.is_empty() || stmts.len() != 1 {
+        return None;
+    }
+
+    let stmt = stmts.into_iter().next()?;
+    let Statement::Select(select_stmt) = stmt else {
+        return None;
+    };
+    if !select_stmt.order_by.is_empty()
+        || select_stmt.limit.is_some()
+        || !select_stmt.body.compounds.is_empty()
+    {
+        return None;
+    }
+
+    let SelectCore::Select { columns, from, .. } = select_stmt.body.select else {
+        return None;
+    };
+    if from.is_some() || columns.len() != 1 {
+        return None;
+    }
+
+    match columns.into_iter().next()? {
+        ResultColumn::Expr { expr, .. } => Some(expr),
+        _ => None,
+    }
 }
 
 fn expand_insert_values_row(
@@ -600,9 +646,14 @@ fn expand_insert_values_row(
         )));
     }
 
-    let mut expanded = insert_default_exprs(table)?;
+    let mut expanded = insert_default_exprs(table);
+    let mut filled_targets = vec![false; table.columns.len()];
     for (source_idx, target_idx) in target_indices.into_iter().enumerate() {
+        if filled_targets[target_idx] {
+            continue;
+        }
         expanded[target_idx] = row_values[source_idx].clone();
+        filled_targets[target_idx] = true;
     }
     Ok(expanded)
 }
@@ -632,10 +683,10 @@ fn emit_insert_target_regs_from_source(
     let target_count = i32::try_from(target_table.columns.len())
         .map_err(|_| CodegenError::Unsupported("too many target columns".to_owned()))?;
     let val_regs = b.alloc_regs(target_count);
-    let default_exprs = insert_default_exprs(target_table)?;
+    let default_exprs = insert_default_exprs(target_table);
     let mut source_for_target = vec![None; target_table.columns.len()];
     for (source_idx, target_idx) in target_indices.into_iter().enumerate() {
-        source_for_target[target_idx] = Some(source_idx);
+        source_for_target[target_idx].get_or_insert(source_idx);
     }
 
     for (target_idx, default_expr) in default_exprs.iter().enumerate() {
@@ -653,6 +704,7 @@ fn emit_insert_target_regs_from_source(
 
 /// Emit the INSERT loop for `VALUES (row), (row), ...` (planner path).
 #[allow(
+    clippy::too_many_arguments,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::unnecessary_wraps
@@ -735,7 +787,7 @@ fn codegen_insert_values(
     Ok(())
 }
 
-/// Emit an INSERT with DEFAULT VALUES (all columns get NULL).
+/// Emit an INSERT with DEFAULT VALUES.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -762,16 +814,13 @@ fn codegen_insert_default_values(
         0,
     );
 
-    // Allocate registers for columns and set all to NULL.
+    // Allocate registers for columns and evaluate each declared default.
     let val_regs = b.alloc_regs(n_cols);
-    b.emit_op(
-        Opcode::Null,
-        0,
-        val_regs,
-        val_regs + n_cols - 1,
-        P4::None,
-        0,
-    );
+    let default_exprs = insert_default_exprs(table);
+    for (idx, default_expr) in default_exprs.iter().enumerate() {
+        let reg = val_regs + idx as i32;
+        emit_expr(b, default_expr, reg)?;
+    }
 
     let rec_reg = b.alloc_reg();
     b.emit_op(
@@ -1858,10 +1907,12 @@ mod tests {
                 ColumnInfo {
                     name: "a".to_owned(),
                     affinity: 'd',
+                    default_value: None,
                 },
                 ColumnInfo {
                     name: "b".to_owned(),
                     affinity: 'C',
+                    default_value: None,
                 },
             ],
             indexes: vec![],
@@ -1876,10 +1927,12 @@ mod tests {
                 ColumnInfo {
                     name: "a".to_owned(),
                     affinity: 'd',
+                    default_value: None,
                 },
                 ColumnInfo {
                     name: "b".to_owned(),
                     affinity: 'C',
+                    default_value: None,
                 },
             ],
             indexes: vec![IndexSchema {
@@ -2189,6 +2242,121 @@ mod tests {
         assert_eq!(txn.p2, 1);
     }
 
+    #[test]
+    fn test_codegen_insert_values_uses_declared_defaults_for_omitted_columns() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["name".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'C',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "status".to_owned(),
+                    affinity: 'C',
+                    default_value: Some("'pending'".to_owned()),
+                },
+            ],
+            indexes: vec![],
+        }];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::String8 && op.p4 == P4::Str("pending".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_allows_duplicate_target_columns() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["b".to_owned(), "b".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+    }
+
+    #[test]
+    fn test_codegen_insert_default_values_uses_declared_defaults() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::DefaultValues,
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "id".to_owned(),
+                    affinity: 'd',
+                    default_value: None,
+                },
+                ColumnInfo {
+                    name: "status".to_owned(),
+                    affinity: 'C',
+                    default_value: Some("'active'".to_owned()),
+                },
+                ColumnInfo {
+                    name: "count".to_owned(),
+                    affinity: 'd',
+                    default_value: Some("42".to_owned()),
+                },
+            ],
+            indexes: vec![],
+        }];
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::String8 && op.p4 == P4::Str("active".to_owned()))
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Integer && op.p1 == 42)
+        );
+    }
+
     // === Test: INSERT ... SELECT ===
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -2250,10 +2418,12 @@ mod tests {
                     ColumnInfo {
                         name: "a".to_owned(),
                         affinity: 'd',
+                        default_value: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
                         affinity: 'C',
+                        default_value: None,
                     },
                 ],
                 indexes: vec![],
@@ -2265,10 +2435,12 @@ mod tests {
                     ColumnInfo {
                         name: "x".to_owned(),
                         affinity: 'd',
+                        default_value: None,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
                         affinity: 'C',
+                        default_value: None,
                     },
                 ],
                 indexes: vec![],
@@ -2871,14 +3043,17 @@ mod tests {
                 ColumnInfo {
                     name: "id".to_owned(),
                     affinity: 'd',
+                    default_value: None,
                 },
                 ColumnInfo {
                     name: "name".to_owned(),
                     affinity: 'C',
+                    default_value: None,
                 },
                 ColumnInfo {
                     name: "amount".to_owned(),
                     affinity: 'e',
+                    default_value: None,
                 },
             ],
             indexes: vec![],

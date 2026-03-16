@@ -298,6 +298,12 @@ fn format_schema_identity(cookie: u32, generation: u64) -> String {
     format!("cookie={cookie};generation={generation}")
 }
 
+fn is_hidden_rowid_alias_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("rowid")
+        || name.eq_ignore_ascii_case("_rowid_")
+        || name.eq_ignore_ascii_case("oid")
+}
+
 /// I/O polling strategy for the shared runtime context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoPollStrategy {
@@ -6485,8 +6491,13 @@ impl Connection {
             let mut statement_changes = 0usize;
             for row in source_rows {
                 let mut ordered_values = self.evaluate_default_row_from_sqls(&default_sqls)?;
+                let mut filled_targets = vec![false; ordered_values.len()];
                 for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
+                    if filled_targets[target_idx] {
+                        continue;
+                    }
                     ordered_values[target_idx] = row.values()[source_idx].clone();
+                    filled_targets[target_idx] = true;
                 }
                 match self.execute_with_params(&insert_sql, &ordered_values) {
                     Ok(affected) => {
@@ -6524,6 +6535,26 @@ impl Connection {
         }
     }
 
+    fn validate_insert_target_columns(
+        table_schema: &TableSchema,
+        table_name: &str,
+        insert_columns: &[String],
+    ) -> Result<()> {
+        if insert_columns.is_empty() {
+            return Ok(());
+        }
+
+        for column in insert_columns {
+            if table_schema.column_index(column).is_none() && !is_hidden_rowid_alias_name(column) {
+                return Err(FrankenError::Internal(format!(
+                    "column '{column}' not found in table '{table_name}'"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handle INSERT OR REPLACE / INSERT OR IGNORE for VALUES source by
     /// evaluating each row, resolving the INTEGER PRIMARY KEY rowid, and
     /// applying conflict resolution directly on the in-memory database.
@@ -6549,6 +6580,7 @@ impl Connection {
             .find(|t| t.name.eq_ignore_ascii_case(table_name))
             .ok_or_else(|| FrankenError::Internal(format!("no such table: {table_name}")))?
             .clone();
+        Self::validate_insert_target_columns(&table_schema, table_name, &insert.columns)?;
         let root_page = table_schema.root_page;
         let num_cols = table_schema.columns.len();
 
@@ -6559,24 +6591,36 @@ impl Connection {
             .borrow()
             .get(&table_name.to_ascii_lowercase())
             .copied();
-        // Map from VALUES position to table column position.
-        let target_map: Vec<usize> = if insert.columns.is_empty() {
-            (0..num_cols).collect()
+        enum InsertTarget {
+            Column(usize),
+            HiddenRowid,
+        }
+
+        // Map from VALUES position to table target.
+        let target_map: Vec<InsertTarget> = if insert.columns.is_empty() {
+            (0..num_cols).map(InsertTarget::Column).collect()
         } else {
             insert
                 .columns
                 .iter()
                 .map(|col| {
-                    table_schema.column_index(col).ok_or_else(|| {
-                        FrankenError::Internal(format!(
+                    if let Some(index) = table_schema.column_index(col) {
+                        Ok(InsertTarget::Column(index))
+                    } else if is_hidden_rowid_alias_name(col) {
+                        Ok(InsertTarget::HiddenRowid)
+                    } else {
+                        Err(FrankenError::Internal(format!(
                             "column '{col}' not found in table '{table_name}'"
-                        ))
-                    })
+                        )))
+                    }
                 })
                 .collect::<Result<Vec<_>>>()?
         };
-        // Which VALUES position (if any) maps to the IPK column.
-        let ipk_values_pos = ipk_col_idx.and_then(|ipk| target_map.iter().position(|&t| t == ipk));
+        // Which VALUES position (if any) maps to the rowid family target.
+        let ipk_values_pos = target_map.iter().rposition(|target| match target {
+            InsertTarget::HiddenRowid => true,
+            InsertTarget::Column(index) => Some(*index) == ipk_col_idx,
+        });
 
         drop(schema);
 
@@ -6604,12 +6648,25 @@ impl Connection {
                 })
             });
 
-            // Build the full column value vector in table order.
+            // Build the full column value vector in table order. For ordinary
+            // columns, duplicate targets keep the first assignment like SQLite.
             let mut col_values = vec![SqliteValue::Null; num_cols];
-            for (val_pos, &tgt) in target_map.iter().enumerate() {
-                if let Some(v) = values.get(val_pos) {
-                    col_values[tgt] = v.clone();
+            let mut filled_columns = vec![false; num_cols];
+            for (val_pos, target) in target_map.iter().enumerate() {
+                let Some(v) = values.get(val_pos) else {
+                    continue;
+                };
+                let InsertTarget::Column(tgt) = target else {
+                    continue;
+                };
+                if Some(*tgt) == ipk_col_idx || filled_columns[*tgt] {
+                    continue;
                 }
+                col_values[*tgt] = v.clone();
+                filled_columns[*tgt] = true;
+            }
+            if let (Some(ipk_idx), Some(rowid)) = (ipk_col_idx, explicit_rowid) {
+                col_values[ipk_idx] = SqliteValue::Integer(rowid);
             }
 
             // Verify we don't silently ignore STORED generated columns in the fallback path.
@@ -6739,6 +6796,9 @@ impl Connection {
                                 "table not found at root page {root_page}"
                             ))
                         })?;
+                        if let Some(ipk_idx) = ipk_col_idx {
+                            col_values[ipk_idx] = SqliteValue::Integer(rowid);
+                        }
                         table.insert_row(rowid, col_values);
                         self.record_last_insert_rowid(rowid);
                         affected += 1;
@@ -6750,6 +6810,9 @@ impl Connection {
                                     "table not found at root page {root_page}"
                                 ))
                             })?;
+                            if let Some(ipk_idx) = ipk_col_idx {
+                                col_values[ipk_idx] = SqliteValue::Integer(rowid);
+                            }
                             table.insert_row(rowid, col_values);
                             self.record_last_insert_rowid(rowid);
                             affected += 1;
@@ -6767,6 +6830,9 @@ impl Connection {
                                 "table not found at root page {root_page}"
                             ))
                         })?;
+                        if let Some(ipk_idx) = ipk_col_idx {
+                            col_values[ipk_idx] = SqliteValue::Integer(rowid);
+                        }
                         table.insert_row(rowid, col_values);
                         self.record_last_insert_rowid(rowid);
                         affected += 1;
@@ -6779,6 +6845,9 @@ impl Connection {
                     FrankenError::Internal(format!("table not found at root page {root_page}"))
                 })?;
                 let new_rowid = table.alloc_rowid();
+                if let Some(ipk_idx) = ipk_col_idx {
+                    col_values[ipk_idx] = SqliteValue::Integer(new_rowid);
+                }
                 table.insert_row(new_rowid, col_values);
                 self.record_last_insert_rowid(new_rowid);
                 affected += 1;
@@ -6799,6 +6868,7 @@ impl Connection {
             .ok_or_else(|| {
                 FrankenError::Internal(format!("table not found: {}", insert.table.name))
             })?;
+        Self::validate_insert_target_columns(table, &insert.table.name, &insert.columns)?;
 
         let table_columns: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
 
@@ -10303,34 +10373,59 @@ impl Connection {
                 // Detect INTEGER PRIMARY KEY column (rowid alias) and whether
                 // it carries AUTOINCREMENT.
                 let mut is_autoincrement = false;
-                let rowid_col_idx = columns.iter().enumerate().find_map(|(i, col)| {
-                    let is_integer = col
+                let table_pk_rowid_col_idx = constraints.iter().find_map(|constraint| {
+                    let TableConstraintKind::PrimaryKey {
+                        columns: pk_columns,
+                        ..
+                    } = &constraint.kind
+                    else {
+                        return None;
+                    };
+                    if pk_columns.len() != 1 || create.without_rowid {
+                        return None;
+                    }
+                    let column_name = normalize_indexed_column_term(&pk_columns[0])?.column_name;
+                    let index = columns
+                        .iter()
+                        .position(|col| col.name.eq_ignore_ascii_case(&column_name))?;
+                    columns[index]
                         .type_name
                         .as_ref()
-                        .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
-                    let pk = col.constraints.iter().find_map(|c| {
-                        if let ColumnConstraintKind::PrimaryKey {
-                            autoincrement,
-                            direction,
-                            ..
-                        } = c.kind
-                        {
-                            if direction != Some(fsqlite_ast::SortDirection::Desc) {
-                                Some(autoincrement)
+                        .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"))
+                        .then_some(index)
+                });
+                let rowid_col_idx = columns
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, col)| {
+                        let is_integer = col
+                            .type_name
+                            .as_ref()
+                            .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+                        let pk = col.constraints.iter().find_map(|c| {
+                            if let ColumnConstraintKind::PrimaryKey {
+                                autoincrement,
+                                direction,
+                                ..
+                            } = c.kind
+                            {
+                                if direction != Some(fsqlite_ast::SortDirection::Desc) {
+                                    Some(autoincrement)
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             }
+                        });
+                        if is_integer && pk.is_some() {
+                            is_autoincrement = pk.unwrap_or(false);
+                            Some(i)
                         } else {
                             None
                         }
-                    });
-                    if is_integer && pk.is_some() {
-                        is_autoincrement = pk.unwrap_or(false);
-                        Some(i)
-                    } else {
-                        None
-                    }
-                });
+                    })
+                    .or(table_pk_rowid_col_idx);
                 let has_primary_key = rowid_col_idx.is_some()
                     || columns.iter().any(|col| {
                         col.constraints
@@ -10359,20 +10454,18 @@ impl Connection {
                             .type_name
                             .as_ref()
                             .map_or('A', |tn| type_name_to_affinity_char(&tn.name));
-                        let type_name = col.type_name.as_ref().map(|tn| tn.name.clone());
+                        let type_name =
+                            col.type_name.as_ref().map(std::string::ToString::to_string);
                         let notnull = col
                             .constraints
                             .iter()
                             .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
-                        let col_is_integer = col
-                            .type_name
-                            .as_ref()
-                            .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
-                        let is_non_ipk_pk = !col_is_integer
-                            && col
-                                .constraints
-                                .iter()
-                                .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
+                        let has_primary_key = col
+                            .constraints
+                            .iter()
+                            .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
+                        let is_ipk = rowid_col_idx.is_some_and(|idx| idx == i);
+                        let is_non_ipk_pk = has_primary_key && !is_ipk;
                         let unique = is_non_ipk_pk
                             || col
                                 .constraints
@@ -10422,7 +10515,7 @@ impl Connection {
                         Ok(ColumnInfo {
                             name: col.name.clone(),
                             affinity,
-                            is_ipk: rowid_col_idx.is_some_and(|idx| idx == i),
+                            is_ipk,
                             type_name,
                             notnull,
                             unique,
@@ -10479,17 +10572,27 @@ impl Connection {
                         columns: idx_cols, ..
                     } = &tc.kind
                     {
-                        let col_names: Vec<String> = idx_cols
+                        let Some(normalized_terms) = idx_cols
                             .iter()
-                            .filter_map(|ic| {
-                                if let fsqlite_ast::Expr::Column(col_ref, _) = &ic.expr {
-                                    Some(col_ref.column.clone())
-                                } else {
-                                    None
-                                }
-                            })
+                            .map(normalize_indexed_column_term)
+                            .collect::<Option<Vec<_>>>()
+                        else {
+                            continue;
+                        };
+                        let col_names: Vec<String> = normalized_terms
+                            .iter()
+                            .map(|term| term.column_name.clone())
                             .collect();
                         if !col_names.is_empty() {
+                            let all_ipk = is_primary_key
+                                && normalized_terms.iter().all(|term| {
+                                    rowid_col_idx.is_some_and(|idx| {
+                                        col_infos[idx].name.eq_ignore_ascii_case(&term.column_name)
+                                    })
+                                });
+                            if all_ipk {
+                                continue;
+                            }
                             let idx_root = self.allocate_index_root_page()?;
                             self.db.borrow_mut().create_table_at(idx_root, 0);
                             implicit_indexes.push(IndexSchema {
@@ -10504,9 +10607,9 @@ impl Connection {
                                     .iter()
                                     .map(|indexed| indexed.expr.to_string())
                                     .collect(),
-                                key_sort_directions: idx_cols
+                                key_sort_directions: normalized_terms
                                     .iter()
-                                    .map(|indexed| indexed.direction.unwrap_or(SortDirection::Asc))
+                                    .map(|term| term.direction.unwrap_or(SortDirection::Asc))
                                     .collect(),
                                 where_clause: None,
                                 is_unique: true,
@@ -10553,13 +10656,10 @@ impl Connection {
                                 let col_indices: Vec<usize> = idx_cols
                                     .iter()
                                     .filter_map(|ic| {
-                                        if let fsqlite_ast::Expr::Column(col_ref, _) = &ic.expr {
-                                            col_infos.iter().position(|c| {
-                                                c.name.eq_ignore_ascii_case(&col_ref.column)
-                                            })
-                                        } else {
-                                            None
-                                        }
+                                        let term = normalize_indexed_column_term(ic)?;
+                                        col_infos.iter().position(|c| {
+                                            c.name.eq_ignore_ascii_case(&term.column_name)
+                                        })
                                     })
                                     .collect();
                                 if !col_indices.is_empty() {
@@ -11122,7 +11222,10 @@ impl Connection {
                     .ok_or_else(|| FrankenError::NoSuchTable {
                         name: table_name.clone(),
                     })?;
-                let type_name = col_def.type_name.as_ref().map(|tn| tn.name.clone());
+                let type_name = col_def
+                    .type_name
+                    .as_ref()
+                    .map(std::string::ToString::to_string);
                 let unique = col_def
                     .constraints
                     .iter()
@@ -21174,6 +21277,13 @@ impl Connection {
         // cannot handle Expr::Subquery/Expr::Exists.
         let insert = self.resolve_insert_values_subqueries(insert)?;
         let schema = self.schema.borrow();
+        let table_schema = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
+            .ok_or_else(|| {
+                FrankenError::Internal(format!("no such table: {}", insert.table.name))
+            })?;
+        Self::validate_insert_target_columns(table_schema, &insert.table.name, &insert.columns)?;
         let mut builder = ProgramBuilder::new();
         let rowid_alias_col_idx = self
             .rowid_alias_columns
@@ -21952,6 +22062,11 @@ impl Connection {
                 );
 
                 if cursor.first(cx)? {
+                    if without_rowid {
+                        return Err(FrankenError::NotImplemented(format!(
+                            "reloading populated WITHOUT ROWID table `{name}` into MemDatabase is not yet supported"
+                        )));
+                    }
                     loop {
                         let rowid = cursor.rowid(cx)?;
                         let payload = cursor.payload(cx)?;
@@ -21974,10 +22089,29 @@ impl Connection {
                             // the rowid at that position since it's not stored in the
                             // record payload.
                             if let Some(ipk_idx) = ipk_col_idx {
-                                if ipk_idx < values.len() {
-                                    values[ipk_idx] = SqliteValue::Integer(rowid);
+                                let payload_includes_rowid_alias = if values.len() >= columns.len()
+                                {
+                                    true
                                 } else {
+                                    match values.get(ipk_idx) {
+                                        Some(SqliteValue::Null) => true,
+                                        Some(SqliteValue::Integer(encoded_rowid)) => {
+                                            *encoded_rowid == rowid
+                                        }
+                                        _ => false,
+                                    }
+                                };
+                                if !payload_includes_rowid_alias {
                                     values.insert(ipk_idx, SqliteValue::Integer(rowid));
+                                } else if let Some(SqliteValue::Integer(encoded_rowid)) =
+                                    values.get(ipk_idx)
+                                    && *encoded_rowid != rowid
+                                {
+                                    return Err(FrankenError::DatabaseCorrupt {
+                                        detail: format!(
+                                            "table `{name}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}"
+                                        ),
+                                    });
                                 }
                             }
                             if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
@@ -51433,13 +51567,17 @@ mod without_rowid_runtime_tests {
         conn.execute("CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;")
             .unwrap();
 
-        let root_page = conn
-            .schema
-            .borrow()
+        let schema = conn.schema.borrow();
+        let table = schema
             .iter()
             .find(|table| table.name.eq_ignore_ascii_case("wr"))
-            .map(|table| table.root_page)
-            .expect("WITHOUT ROWID table root page");
+            .expect("WITHOUT ROWID table schema");
+        let root_page = table.root_page;
+        assert!(
+            table.columns[0].unique,
+            "WITHOUT ROWID INTEGER PRIMARY KEY must still be marked unique"
+        );
+        drop(schema);
         assert!(
             !conn.rowid_alias_columns.borrow().contains_key("wr"),
             "WITHOUT ROWID tables must not register rowid aliases"
@@ -51586,6 +51724,36 @@ mod without_rowid_runtime_tests {
             !conn.rowid_alias_columns.borrow().contains_key("wr"),
             "WITHOUT ROWID tables must not restore rowid aliases on reopen"
         );
+    }
+
+    #[test]
+    fn test_parity_cert_off_rejects_populated_without_rowid_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("without_rowid_populated_reload.db");
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    "CREATE TABLE wr (id INTEGER PRIMARY KEY, payload TEXT) WITHOUT ROWID;
+                 INSERT INTO wr VALUES (1, 'x');",
+                )
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
+        let err = conn
+            .execute("PRAGMA fsqlite.parity_cert = OFF;")
+            .unwrap_err();
+        match err {
+            FrankenError::NotImplemented(message) => {
+                assert!(
+                    message.contains("reloading populated WITHOUT ROWID table `wr`"),
+                    "unexpected diagnostic: {message}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
 
@@ -53118,6 +53286,84 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_table_level_integer_primary_key_registers_rowid_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, val TEXT, PRIMARY KEY(id));")
+            .unwrap();
+
+        let alias_map = conn.rowid_alias_columns.borrow();
+        assert_eq!(alias_map.get("t"), Some(&0));
+        drop(alias_map);
+
+        conn.execute("INSERT INTO t(val) VALUES ('hello');")
+            .unwrap();
+        let rows = conn.query("SELECT rowid, id, val FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("hello".to_owned()));
+    }
+
+    #[test]
+    fn test_table_level_integer_primary_key_desc_registers_rowid_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, val TEXT, PRIMARY KEY(id DESC));")
+            .unwrap();
+
+        let alias_map = conn.rowid_alias_columns.borrow();
+        assert_eq!(alias_map.get("t"), Some(&0));
+        drop(alias_map);
+
+        conn.execute("INSERT INTO t(val) VALUES ('hello');")
+            .unwrap();
+        let rows = conn.query("SELECT rowid, id, val FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("hello".to_owned()));
+    }
+
+    #[test]
+    fn test_column_level_integer_primary_key_desc_is_unique_but_not_rowid_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY DESC, val TEXT);")
+            .unwrap();
+
+        let schema = conn.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("t"))
+            .expect("table schema");
+        assert!(table.columns[0].unique);
+        assert!(!table.columns[0].is_ipk);
+        drop(schema);
+
+        assert!(
+            !conn.rowid_alias_columns.borrow().contains_key("t"),
+            "column-level INTEGER PRIMARY KEY DESC must not register a rowid alias"
+        );
+    }
+
+    #[test]
+    fn test_table_level_integer_primary_key_collate_desc_registers_rowid_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, val TEXT, PRIMARY KEY(id COLLATE NOCASE DESC));")
+            .unwrap();
+
+        let alias_map = conn.rowid_alias_columns.borrow();
+        assert_eq!(alias_map.get("t"), Some(&0));
+        drop(alias_map);
+
+        conn.execute("INSERT INTO t(val) VALUES ('hello');")
+            .unwrap();
+        let rows = conn.query("SELECT rowid, id, val FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("hello".to_owned()));
+    }
+
+    #[test]
     fn test_rowid_alias_loaded_from_schema() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ipk.db");
@@ -53147,6 +53393,34 @@ mod schema_loading_tests {
             let rows = conn.query("SELECT id, val FROM t1 ORDER BY id;").unwrap();
             assert_eq!(rows.len(), 2);
         }
+    }
+
+    #[test]
+    fn test_rowid_alias_reload_preserves_non_ipk_payload_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ipk-payload.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, note TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'alpha', 'one');")
+                .unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn
+            .query("SELECT id, val, note FROM t ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("alpha".to_owned()),
+                SqliteValue::Text("one".to_owned())
+            ]
+        );
     }
 
     #[test]

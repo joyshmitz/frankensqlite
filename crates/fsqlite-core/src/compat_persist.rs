@@ -14,8 +14,8 @@
 use std::path::Path;
 
 use fsqlite_ast::{
-    ColumnConstraintKind, CreateTableBody, DefaultValue, GeneratedStorage, SortDirection,
-    Statement, TableConstraintKind,
+    ColumnConstraintKind, CreateTableBody, DefaultValue, Expr, GeneratedStorage, IndexedColumn,
+    SortDirection, Statement, TableConstraintKind,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_btree::BtreeCursorOps;
@@ -338,6 +338,11 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
         if let Some(mem_table) = db.tables.get_mut(&real_root_page) {
             if cursor.first(cx)? {
+                if without_rowid {
+                    return Err(FrankenError::NotImplemented(format!(
+                        "loading populated WITHOUT ROWID table `{table_name_for_err}` is not yet supported"
+                    )));
+                }
                 loop {
                     let rowid = cursor.rowid(cx)?;
                     let payload = cursor.payload(cx)?;
@@ -349,10 +354,28 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                         }
                     })?;
                     if !without_rowid && let Some(ipk_idx) = ipk_col_idx {
-                        if ipk_idx < values.len() {
-                            values[ipk_idx] = SqliteValue::Integer(rowid);
+                        let payload_includes_rowid_alias = if values.len() >= columns.len() {
+                            true
                         } else {
+                            match values.get(ipk_idx) {
+                                Some(SqliteValue::Null) => true,
+                                Some(SqliteValue::Integer(encoded_rowid)) => {
+                                    *encoded_rowid == rowid
+                                }
+                                _ => false,
+                            }
+                        };
+                        if !payload_includes_rowid_alias {
                             values.insert(ipk_idx, SqliteValue::Integer(rowid));
+                        } else if let Some(SqliteValue::Integer(encoded_rowid)) =
+                            values.get(ipk_idx)
+                            && *encoded_rowid != rowid
+                        {
+                            return Err(FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "table `{table_name_for_err}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}"
+                                ),
+                            });
                         }
                     }
                     mem_table.insert_row(rowid, values);
@@ -421,7 +444,10 @@ pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
         if i > 0 {
             sql.push_str(", ");
         }
-        let type_kw = affinity_char_to_type(col.affinity);
+        let type_kw = col
+            .type_name
+            .as_deref()
+            .unwrap_or_else(|| affinity_char_to_type(col.affinity));
         let _ = write!(sql, "\"{}\" {type_kw}", col.name);
         if col.is_ipk {
             sql.push_str(" PRIMARY KEY");
@@ -911,6 +937,18 @@ fn format_default_value(dv: &DefaultValue) -> String {
     }
 }
 
+fn indexed_column_name(indexed_column: &IndexedColumn) -> Option<&str> {
+    fn extract(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Column(col_ref, _) if col_ref.table.is_none() => Some(&col_ref.column),
+            Expr::Collate { expr, .. } => extract(expr),
+            _ => None,
+        }
+    }
+
+    extract(&indexed_column.expr)
+}
+
 fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
     let Statement::CreateTable(create) = parse_single_statement(sql)? else {
         return None;
@@ -919,28 +957,84 @@ fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
         return None;
     };
 
-    let rowid_col_idx = columns.iter().enumerate().find_map(|(index, col)| {
-        let is_integer = col
-            .type_name
-            .as_ref()
-            .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
-        let pk = col.constraints.iter().find_map(|constraint| {
-            if let ColumnConstraintKind::PrimaryKey { direction, .. } = &constraint.kind {
-                if *direction != Some(SortDirection::Desc) {
-                    Some(())
+    let mut table_pk_cols = vec![false; columns.len()];
+    let mut table_unique_cols = vec![false; columns.len()];
+    let mut table_pk_rowid_col_idx = None;
+
+    if let CreateTableBody::Columns { constraints, .. } = &create.body {
+        for constraint in constraints {
+            match &constraint.kind {
+                TableConstraintKind::PrimaryKey {
+                    columns: pk_columns,
+                    ..
+                } if pk_columns.len() == 1 => {
+                    let Some(column_name) = indexed_column_name(&pk_columns[0]) else {
+                        continue;
+                    };
+                    let Some(index) = columns
+                        .iter()
+                        .position(|col| col.name.eq_ignore_ascii_case(column_name))
+                    else {
+                        continue;
+                    };
+
+                    table_pk_cols[index] = true;
+                    table_unique_cols[index] = true;
+
+                    let is_integer = columns[index]
+                        .type_name
+                        .as_ref()
+                        .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+                    if is_integer && !create.without_rowid {
+                        table_pk_rowid_col_idx = Some(index);
+                    }
+                }
+                TableConstraintKind::Unique {
+                    columns: unique_columns,
+                    ..
+                } if unique_columns.len() == 1 => {
+                    let Some(column_name) = indexed_column_name(&unique_columns[0]) else {
+                        continue;
+                    };
+                    let Some(index) = columns
+                        .iter()
+                        .position(|col| col.name.eq_ignore_ascii_case(column_name))
+                    else {
+                        continue;
+                    };
+                    table_unique_cols[index] = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let rowid_col_idx = columns
+        .iter()
+        .enumerate()
+        .find_map(|(index, col)| {
+            let is_integer = col
+                .type_name
+                .as_ref()
+                .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+            let pk = col.constraints.iter().find_map(|constraint| {
+                if let ColumnConstraintKind::PrimaryKey { direction, .. } = &constraint.kind {
+                    if *direction != Some(SortDirection::Desc) {
+                        Some(())
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
+            });
+            if is_integer && pk.is_some() && !create.without_rowid {
+                Some(index)
             } else {
                 None
             }
-        });
-        if is_integer && pk.is_some() && !create.without_rowid {
-            Some(index)
-        } else {
-            None
-        }
-    });
+        })
+        .or(table_pk_rowid_col_idx);
 
     Some(
         columns
@@ -951,22 +1045,17 @@ fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
                     .type_name
                     .as_ref()
                     .map_or('A', |type_name| type_to_affinity(&type_name.name));
-                let type_name = col
-                    .type_name
-                    .as_ref()
-                    .map(|type_name| type_name.name.clone());
+                let type_name = col.type_name.as_ref().map(std::string::ToString::to_string);
+                let is_ipk = rowid_col_idx.is_some_and(|rowid_index| rowid_index == index);
                 let notnull = col.constraints.iter().any(|constraint| {
                     matches!(&constraint.kind, ColumnConstraintKind::NotNull { .. })
                 });
-                let col_is_integer = col
-                    .type_name
-                    .as_ref()
-                    .is_some_and(|type_name| type_name.name.eq_ignore_ascii_case("INTEGER"));
-                let is_non_ipk_pk = !col_is_integer
-                    && col.constraints.iter().any(|constraint| {
-                        matches!(&constraint.kind, ColumnConstraintKind::PrimaryKey { .. })
-                    });
-                let unique = is_non_ipk_pk
+                let has_primary_key = col.constraints.iter().any(|constraint| {
+                    matches!(&constraint.kind, ColumnConstraintKind::PrimaryKey { .. })
+                });
+                let unique = (!is_ipk && has_primary_key)
+                    || table_pk_cols[index]
+                    || table_unique_cols[index]
                     || col.constraints.iter().any(|constraint| {
                         matches!(&constraint.kind, ColumnConstraintKind::Unique { .. })
                     });
@@ -1010,7 +1099,7 @@ fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
                 ColumnInfo {
                     name: col.name.clone(),
                     affinity,
-                    is_ipk: rowid_col_idx.is_some_and(|rowid_index| rowid_index == index),
+                    is_ipk,
                     type_name,
                     notnull,
                     unique,
@@ -1509,6 +1598,37 @@ mod tests {
     }
 
     #[test]
+    fn test_load_sqlite3_created_file_restores_table_level_integer_primary_key_alias_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("from_c_table_pk.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE items (id INTEGER, label TEXT, PRIMARY KEY(id));
+                 INSERT INTO items (id, label) VALUES (10, 'alpha');
+                 INSERT INTO items (id, label) VALUES (20, 'beta');",
+            )
+            .unwrap();
+        }
+
+        let loaded = load_test_db(&db_path).unwrap();
+        assert_eq!(loaded.schema.len(), 1);
+        assert_eq!(loaded.schema[0].name, "items");
+        assert!(loaded.schema[0].columns[0].is_ipk);
+
+        let table = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
+        let rows: Vec<_> = table.iter_rows().collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 10);
+        assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[1].0, 20);
+        assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".to_owned()));
+    }
+
+    #[test]
     fn test_is_sqlite_format_text_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("text.db");
@@ -1635,6 +1755,37 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_columns_from_create_sql_table_level_integer_primary_key_is_ipk() {
+        let sql = "CREATE TABLE metrics (id INTEGER, body TEXT, PRIMARY KEY(id))";
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "id");
+        assert!(cols[0].is_ipk);
+        assert_eq!(cols[1].name, "body");
+    }
+
+    #[test]
+    fn test_parse_columns_from_create_sql_table_level_integer_primary_key_desc_is_ipk() {
+        let sql = "CREATE TABLE metrics (id INTEGER, body TEXT, PRIMARY KEY(id DESC))";
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "id");
+        assert!(cols[0].is_ipk);
+        assert_eq!(cols[1].name, "body");
+    }
+
+    #[test]
+    fn test_parse_columns_from_create_sql_table_level_integer_primary_key_collate_desc_is_ipk() {
+        let sql =
+            "CREATE TABLE metrics (id INTEGER, body TEXT, PRIMARY KEY(id COLLATE NOCASE DESC))";
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "id");
+        assert!(cols[0].is_ipk);
+        assert_eq!(cols[1].name, "body");
+    }
+
+    #[test]
     fn test_parse_columns_from_create_sql_without_rowid_integer_pk_is_not_ipk() {
         let sql = "CREATE TABLE wr (id INTEGER PRIMARY KEY, body TEXT) WITHOUT ROWID";
         let cols = parse_columns_from_create_sql(sql);
@@ -1681,6 +1832,14 @@ mod tests {
             cols[0].default_value.as_deref(),
             Some("'NOT NULL UNIQUE PRIMARY KEY'")
         );
+    }
+
+    #[test]
+    fn test_parse_columns_from_create_sql_preserves_type_arguments() {
+        let sql = "CREATE TABLE metrics (amount DECIMAL(10, 2), name VARCHAR(255))";
+        let cols = parse_columns_from_create_sql(sql);
+        assert_eq!(cols[0].type_name.as_deref(), Some("DECIMAL(10, 2)"));
+        assert_eq!(cols[1].type_name.as_deref(), Some("VARCHAR(255)"));
     }
 
     #[test]
@@ -1873,6 +2032,50 @@ mod tests {
             sql.ends_with(" STRICT"),
             "STRICT tables must round-trip with STRICT suffix: {sql}"
         );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_preserves_declared_type_text() {
+        let table = TableSchema {
+            name: "typed_table".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo {
+                    name: "amount".to_owned(),
+                    affinity: 'C',
+                    is_ipk: false,
+                    type_name: Some("DECIMAL(10, 2)".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'B',
+                    is_ipk: false,
+                    type_name: Some("VARCHAR(255)".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: None,
+                },
+            ],
+            indexes: Vec::new(),
+            strict: false,
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+
+        let sql = build_create_table_sql(&table);
+        assert!(sql.contains("\"amount\" DECIMAL(10, 2)"), "{sql}");
+        assert!(sql.contains("\"name\" VARCHAR(255)"), "{sql}");
     }
 
     #[test]

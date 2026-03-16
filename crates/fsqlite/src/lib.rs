@@ -1901,8 +1901,7 @@ mod tests {
         .unwrap();
 
         let recipients = r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#;
-        let attachments =
-            r#"[{"name":"artifact.txt","path":"attachments/demo.txt","content_type":"text/plain","size":"128"}]"#;
+        let attachments = r#"[{"name":"artifact.txt","path":"attachments/demo.txt","content_type":"text/plain","size":"128"}]"#;
 
         conn.execute_with_params(
             "INSERT INTO message_payloads(recipients_json, attachments) VALUES (?1, ?2);",
@@ -1922,6 +1921,29 @@ mod tests {
                 SqliteValue::Text(recipients.to_owned()),
                 SqliteValue::Text(attachments.to_owned())
             ]
+        );
+    }
+
+    #[test]
+    fn execute_with_params_insert_duplicate_target_columns_keep_first_assignment() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE dup_targets(a INTEGER, b INTEGER);")
+            .unwrap();
+
+        conn.execute_with_params(
+            "INSERT INTO dup_targets(a, a, b) VALUES (?1, ?2, ?3);",
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(3),
+            ],
+        )
+        .unwrap();
+
+        let row = conn.query_row("SELECT a, b FROM dup_targets;").unwrap();
+        assert_eq!(
+            row_values(&row),
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(3)]
         );
     }
 
@@ -3252,6 +3274,112 @@ mod tests {
         let sv = row_values(&sel[0]);
         assert_eq!(sv[0], SqliteValue::Integer(42));
         assert_eq!(sv[1], SqliteValue::Text("Alice".to_owned()));
+    }
+
+    #[test]
+    fn insert_select_without_from_reorders_targets_and_fills_defaults() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE dst (id INTEGER PRIMARY KEY, label TEXT DEFAULT 'seed', qty INTEGER);",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("INSERT INTO dst(qty) SELECT 11 RETURNING label, qty;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("seed".to_owned()),
+                SqliteValue::Integer(11)
+            ]
+        );
+
+        let rows = conn
+            .query("INSERT INTO dst(qty, label) SELECT 22, 'fresh' RETURNING label, qty;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("fresh".to_owned()),
+                SqliteValue::Integer(22)
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_select_without_from_explicit_rowid_is_preserved() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (payload TEXT);").unwrap();
+
+        let rows = conn
+            .query("INSERT INTO t(rowid, payload) SELECT 7, 'x' RETURNING rowid, payload;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(7), SqliteValue::Text("x".to_owned())]
+        );
+    }
+
+    #[test]
+    fn insert_values_rowid_family_uses_last_target_assignment() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+
+        let rows = conn
+            .query("INSERT INTO t(rowid, id, payload) VALUES (7, 8, 'x') RETURNING rowid, id;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(8), SqliteValue::Integer(8)]
+        );
+
+        let rows = conn
+            .query("INSERT INTO t(id, rowid, payload) VALUES (9, 10, 'y') RETURNING rowid, id;")
+            .unwrap();
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(10), SqliteValue::Integer(10)]
+        );
+    }
+
+    #[test]
+    fn ipk_insert_select_column_list_reorder() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t(name, id) SELECT 'Alice', 42 RETURNING id, name;")
+            .unwrap();
+        let vals = row_values(&rows[0]);
+        assert_eq!(vals[0], SqliteValue::Integer(42));
+        assert_eq!(vals[1], SqliteValue::Text("Alice".to_owned()));
+
+        let sel = conn.query("SELECT id, name FROM t;").unwrap();
+        let stored = row_values(&sel[0]);
+        assert_eq!(stored[0], SqliteValue::Integer(42));
+        assert_eq!(stored[1], SqliteValue::Text("Alice".to_owned()));
+    }
+
+    #[test]
+    fn ipk_insert_select_hidden_rowid_alias_honors_explicit_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t(rowid, name) SELECT 7, 'Bob' RETURNING id, rowid, name;")
+            .unwrap();
+        let vals = row_values(&rows[0]);
+        assert_eq!(vals[0], SqliteValue::Integer(7));
+        assert_eq!(vals[1], SqliteValue::Integer(7));
+        assert_eq!(vals[2], SqliteValue::Text("Bob".to_owned()));
+
+        let sel = conn.query("SELECT id, rowid, name FROM t;").unwrap();
+        let stored = row_values(&sel[0]);
+        assert_eq!(stored[0], SqliteValue::Integer(7));
+        assert_eq!(stored[1], SqliteValue::Integer(7));
+        assert_eq!(stored[2], SqliteValue::Text("Bob".to_owned()));
     }
 
     /// Explicit column list omitting IPK should auto-generate rowid.
@@ -8334,6 +8462,24 @@ mod tests {
         assert!(col_names.contains(&"id".to_owned()));
         assert!(col_names.contains(&"name".to_owned()));
         assert!(col_names.contains(&"score".to_owned()));
+    }
+
+    #[test]
+    fn pragma_table_info_preserves_declared_type_arguments() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE metrics(amount DECIMAL(10, 2), name VARCHAR(255))")
+            .unwrap();
+        let rows = conn.query("PRAGMA table_info(metrics)").unwrap();
+        let amount = rows
+            .iter()
+            .find(|row| row_values(row)[1].to_text() == "amount")
+            .expect("amount column metadata");
+        let name = rows
+            .iter()
+            .find(|row| row_values(row)[1].to_text() == "name")
+            .expect("name column metadata");
+        assert_eq!(row_values(amount)[2].to_text(), "DECIMAL(10, 2)");
+        assert_eq!(row_values(name)[2].to_text(), "VARCHAR(255)");
     }
 
     #[test]

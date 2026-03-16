@@ -5367,12 +5367,14 @@ pub fn codegen_insert(
             if rows.is_empty() {
                 return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
             }
-            if stmt.columns.is_empty() {
+            let target_mapping = build_insert_target_mapping(&stmt.columns, table)?;
+            if let Some(mapping) = target_mapping.as_ref() {
                 codegen_insert_values(
                     b,
                     rows,
-                    None,
-                    None,
+                    Some(mapping.expected_source_cols),
+                    mapping.explicit_rowid_source_pos,
+                    Some(&mapping.col_mapping),
                     table_cursor,
                     table,
                     &stmt.returning,
@@ -5381,27 +5383,12 @@ pub fn codegen_insert(
                     upsert_clause,
                 )?;
             } else {
-                // Build default expressions: use column DEFAULT if available, else NULL.
-                let mut explicit_rowid_source_pos = None;
-                let mut col_mapping = vec![None; table.columns.len()];
-                for (source_pos, col_name) in stmt.columns.iter().enumerate() {
-                    if table.resolves_to_hidden_rowid(col_name) {
-                        explicit_rowid_source_pos = Some(source_pos);
-                    } else {
-                        let tbl_pos = table.column_index(col_name).ok_or_else(|| {
-                            CodegenError::ColumnNotFound {
-                                table: table.name.clone(),
-                                column: col_name.clone(),
-                            }
-                        })?;
-                        col_mapping[tbl_pos] = Some(source_pos);
-                    }
-                }
                 codegen_insert_values(
                     b,
                     rows,
-                    explicit_rowid_source_pos,
-                    Some(&col_mapping),
+                    None,
+                    None,
+                    None,
                     table_cursor,
                     table,
                     &stmt.returning,
@@ -5412,56 +5399,12 @@ pub fn codegen_insert(
             }
         }
         InsertSource::Select(select_stmt) => {
-            // INSERT ... SELECT: columns arrive in SELECT output order.
-            // When an explicit column list is provided, build a mapping
-            // from table-schema position → SELECT output position so the
-            // inner function can reorder values before MakeRecord.
-            let col_mapping: Option<Vec<Option<usize>>> = if stmt.columns.is_empty() {
-                None
-            } else {
-                let mut mapping = vec![None; table.columns.len()];
-                for (select_pos, col_name) in stmt.columns.iter().enumerate() {
-                    if table.resolves_to_hidden_rowid(col_name) {
-                        // rowid aliases handled separately via IPK logic.
-                        continue;
-                    }
-                    let tbl_pos = table.column_index(col_name).ok_or_else(|| {
-                        CodegenError::ColumnNotFound {
-                            table: table.name.clone(),
-                            column: col_name.clone(),
-                        }
-                    })?;
-                    mapping[tbl_pos] = Some(select_pos);
-                }
-                Some(mapping)
-            };
+            let target_mapping = build_insert_target_mapping(&stmt.columns, table)?;
 
-            // When a column mapping is present, IPK index should reference
-            // the table-schema position (reordering puts it there).
-            // When no mapping, remap IPK from schema to SELECT output pos.
-            let select_ctx = if col_mapping.is_some() {
-                // After reordering, columns are in table-schema order;
-                // rowid_alias_col_idx already points to the right position.
-                ctx.clone()
-            } else if let Some(ipk_schema_idx) = ctx.rowid_alias_col_idx {
-                let ipk_col_name = &table.columns[ipk_schema_idx].name;
-                let select_pos = stmt
-                    .columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(ipk_col_name));
-                CodegenContext {
-                    concurrent_mode: ctx.concurrent_mode,
-                    rowid_alias_col_idx: select_pos,
-                    ..CodegenContext::default()
-                }
+            let expected_cols = if let Some(mapping) = target_mapping.as_ref() {
+                Some(mapping.expected_source_cols)
             } else {
-                ctx.clone()
-            };
-
-            let expected_cols = if stmt.columns.is_empty() {
                 Some(table.columns.len())
-            } else {
-                Some(stmt.columns.len())
             };
 
             codegen_insert_select(
@@ -5471,10 +5414,15 @@ pub fn codegen_insert(
                 table,
                 schema,
                 &stmt.returning,
-                &select_ctx,
+                ctx,
                 oe_flag,
                 expected_cols,
-                col_mapping.as_deref(),
+                target_mapping
+                    .as_ref()
+                    .and_then(|mapping| mapping.explicit_rowid_source_pos),
+                target_mapping
+                    .as_ref()
+                    .map(|mapping| mapping.col_mapping.as_slice()),
             )?;
         }
         InsertSource::DefaultValues => {
@@ -5585,6 +5533,59 @@ pub fn codegen_insert(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct InsertTargetMapping {
+    expected_source_cols: usize,
+    explicit_rowid_source_pos: Option<usize>,
+    col_mapping: Vec<Option<usize>>,
+}
+
+fn build_insert_target_mapping(
+    insert_columns: &[String],
+    table: &TableSchema,
+) -> Result<Option<InsertTargetMapping>, CodegenError> {
+    if insert_columns.is_empty() {
+        return Ok(None);
+    }
+
+    enum RowidTarget {
+        Hidden(usize),
+        Ipk,
+    }
+
+    let mut rowid_target = None;
+    let mut col_mapping = vec![None; table.columns.len()];
+
+    for (source_pos, col_name) in insert_columns.iter().enumerate() {
+        if table.resolves_to_hidden_rowid(col_name) {
+            rowid_target = Some(RowidTarget::Hidden(source_pos));
+            continue;
+        }
+
+        let tbl_pos = table
+            .column_index(col_name)
+            .ok_or_else(|| CodegenError::ColumnNotFound {
+                table: table.name.clone(),
+                column: col_name.clone(),
+            })?;
+        if table.columns[tbl_pos].is_ipk {
+            rowid_target = Some(RowidTarget::Ipk);
+            col_mapping[tbl_pos] = Some(source_pos);
+        } else {
+            col_mapping[tbl_pos].get_or_insert(source_pos);
+        }
+    }
+
+    Ok(Some(InsertTargetMapping {
+        expected_source_cols: insert_columns.len(),
+        explicit_rowid_source_pos: match rowid_target {
+            Some(RowidTarget::Hidden(source_pos)) => Some(source_pos),
+            Some(RowidTarget::Ipk) | None => None,
+        },
+        col_mapping,
+    }))
+}
+
 /// Emit the INSERT loop for `VALUES (row), (row), ...`.
 ///
 /// # Arguments
@@ -5597,6 +5598,7 @@ pub fn codegen_insert(
 fn codegen_insert_values(
     b: &mut ProgramBuilder,
     rows: &[Vec<Expr>],
+    expected_source_cols: Option<usize>,
     explicit_rowid_source_pos: Option<usize>,
     col_mapping: Option<&[Option<usize>]>,
     cursor: i32,
@@ -5611,15 +5613,21 @@ fn codegen_insert_values(
         .ok_or_else(|| CodegenError::Unsupported("empty VALUES".to_owned()))?
         .len();
 
-    // If no explicit column mapping was provided, the number of values must
-    // exactly match the number of columns in the table.
-    if col_mapping.is_none() && n_source_cols != table.columns.len() {
-        return Err(CodegenError::Unsupported(format!(
-            "table {} has {} columns but {} values were supplied",
-            table.name,
-            table.columns.len(),
-            n_source_cols
-        )));
+    let expected_source_cols = expected_source_cols.unwrap_or(table.columns.len());
+    if n_source_cols != expected_source_cols {
+        let message = if expected_source_cols == table.columns.len() && col_mapping.is_none() {
+            format!(
+                "table {} has {} columns but {} values were supplied",
+                table.name,
+                table.columns.len(),
+                n_source_cols
+            )
+        } else {
+            format!(
+                "INSERT target list has {expected_source_cols} columns but {n_source_cols} values were supplied"
+            )
+        };
+        return Err(CodegenError::Unsupported(message));
     }
 
     let rowid_reg = b.alloc_reg();
@@ -5671,11 +5679,18 @@ fn codegen_insert_values(
         if let Some(source_pos) = explicit_rowid_source_pos {
             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
             let rowid_value_reg = source_regs + source_pos as i32;
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+            let ipk_reg = ctx
+                .rowid_alias_col_idx
+                .map(|ipk_idx| val_regs + ipk_idx as i32);
             let auto_label = b.emit_label();
             let done_label = b.emit_label();
 
             b.emit_jump_to_label(Opcode::IsNull, rowid_value_reg, 0, auto_label, P4::None, 0);
             b.emit_op(Opcode::Copy, rowid_value_reg, rowid_reg, 0, P4::None, 0);
+            if let Some(ipk_reg) = ipk_reg {
+                b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+            }
             b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
             b.resolve_label(auto_label);
@@ -5687,9 +5702,7 @@ fn codegen_insert_values(
                 P4::None,
                 0,
             );
-            if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
-                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-                let ipk_reg = val_regs + ipk_idx as i32;
+            if let Some(ipk_reg) = ipk_reg {
                 b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
             }
 
@@ -6108,6 +6121,7 @@ fn codegen_insert_select(
     ctx: &CodegenContext,
     oe_flag: u16,
     expected_cols: Option<usize>,
+    explicit_rowid_source_pos: Option<usize>,
     col_mapping: Option<&[Option<usize>]>,
 ) -> Result<(), CodegenError> {
     // Extract columns, FROM, and WHERE from the inner SELECT.
@@ -6136,6 +6150,8 @@ fn codegen_insert_select(
             ctx,
             oe_flag,
             expected_cols,
+            explicit_rowid_source_pos,
+            col_mapping,
         );
     }
 
@@ -6241,8 +6257,39 @@ fn codegen_insert_select(
         (val_regs, n_cols)
     };
 
-    // Rowid determination: use IPK column value if present, else auto-generate.
-    if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
+    // Rowid determination: explicit hidden rowid takes precedence over IPK.
+    if let Some(source_pos) = explicit_rowid_source_pos {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let rowid_value_reg = val_regs + source_pos as i32;
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let ipk_reg = ctx
+            .rowid_alias_col_idx
+            .map(|ipk_idx| final_regs + ipk_idx as i32);
+        let auto_label = b.emit_label();
+        let done_rowid = b.emit_label();
+
+        b.emit_jump_to_label(Opcode::IsNull, rowid_value_reg, 0, auto_label, P4::None, 0);
+        b.emit_op(Opcode::Copy, rowid_value_reg, rowid_reg, 0, P4::None, 0);
+        if let Some(ipk_reg) = ipk_reg {
+            b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+        }
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_rowid, P4::None, 0);
+
+        b.resolve_label(auto_label);
+        b.emit_op(
+            Opcode::NewRowid,
+            write_cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
+        if let Some(ipk_reg) = ipk_reg {
+            b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+        }
+
+        b.resolve_label(done_rowid);
+    } else if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
         let ipk_reg = final_regs + ipk_idx as i32;
         let auto_label = b.emit_label();
@@ -6366,6 +6413,8 @@ fn codegen_insert_select_without_from(
     ctx: &CodegenContext,
     oe_flag: u16,
     expected_cols: Option<usize>,
+    explicit_rowid_source_pos: Option<usize>,
+    col_mapping: Option<&[Option<usize>]>,
 ) -> Result<(), CodegenError> {
     let n_cols = result_column_count_without_from(columns)?;
     let n_cols_usize = usize::try_from(n_cols).unwrap_or(0);
@@ -6395,9 +6444,61 @@ fn codegen_insert_select_without_from(
 
     emit_projection_without_from(b, columns, val_regs)?;
 
-    // Rowid determination: use IPK column value if present, else auto-generate.
-    if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
-        let ipk_reg = val_regs + ipk_idx as i32;
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let (final_regs, final_n_cols) = if let Some(mapping) = col_mapping {
+        let n_table_cols = target_table.columns.len() as i32;
+        let table_regs = b.alloc_regs(n_table_cols);
+        for (tbl_idx, src) in mapping.iter().enumerate() {
+            let dest = table_regs + tbl_idx as i32;
+            if let Some(sel_pos) = src {
+                b.emit_op(
+                    Opcode::Copy,
+                    val_regs + *sel_pos as i32,
+                    dest,
+                    0,
+                    P4::None,
+                    0,
+                );
+            } else {
+                emit_default_value(b, &target_table.columns[tbl_idx], dest);
+            }
+        }
+        (table_regs, n_table_cols)
+    } else {
+        (val_regs, n_cols)
+    };
+
+    // Rowid determination: explicit hidden rowid takes precedence over IPK.
+    if let Some(source_pos) = explicit_rowid_source_pos {
+        let rowid_value_reg = val_regs + source_pos as i32;
+        let ipk_reg = ctx
+            .rowid_alias_col_idx
+            .map(|ipk_idx| final_regs + ipk_idx as i32);
+        let auto_label = b.emit_label();
+        let done_rowid = b.emit_label();
+
+        b.emit_jump_to_label(Opcode::IsNull, rowid_value_reg, 0, auto_label, P4::None, 0);
+        b.emit_op(Opcode::Copy, rowid_value_reg, rowid_reg, 0, P4::None, 0);
+        if let Some(ipk_reg) = ipk_reg {
+            b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+        }
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_rowid, P4::None, 0);
+
+        b.resolve_label(auto_label);
+        b.emit_op(
+            Opcode::NewRowid,
+            write_cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
+        if let Some(ipk_reg) = ipk_reg {
+            b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+        }
+        b.resolve_label(done_rowid);
+    } else if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
+        let ipk_reg = final_regs + ipk_idx as i32;
         let auto_label = b.emit_label();
         let done_rowid = b.emit_label();
 
@@ -6431,7 +6532,7 @@ fn codegen_insert_select_without_from(
     }
 
     // Evaluate STORED generated columns before packing the record.
-    emit_stored_generated_columns(b, target_table, val_regs);
+    emit_stored_generated_columns(b, target_table, final_regs);
 
     let ignore_target = if oe_flag == OE_IGNORE {
         Some(done_label)
@@ -6440,16 +6541,16 @@ fn codegen_insert_select_without_from(
     };
 
     // STRICT type check before affinity.
-    emit_strict_type_check(b, target_table, val_regs);
-    emit_check_constraints(b, target_table, val_regs, ignore_target);
-    emit_not_null_constraints(b, target_table, val_regs, ignore_target);
+    emit_strict_type_check(b, target_table, final_regs);
+    emit_check_constraints(b, target_table, final_regs, ignore_target);
+    emit_not_null_constraints(b, target_table, final_regs, ignore_target);
 
     // Apply column type affinities before packing the record.
     let aff_str = target_table.affinity_string();
     b.emit_op(
         Opcode::Affinity,
-        val_regs,
-        n_cols,
+        final_regs,
+        final_n_cols,
         0,
         P4::Affinity(aff_str.clone()),
         0,
@@ -6457,8 +6558,8 @@ fn codegen_insert_select_without_from(
 
     b.emit_op(
         Opcode::MakeRecord,
-        val_regs,
-        n_cols,
+        final_regs,
+        final_n_cols,
         rec_reg,
         P4::Affinity(aff_str),
         0,
@@ -6473,7 +6574,14 @@ fn codegen_insert_select_without_from(
         oe_flag,
     );
 
-    emit_index_inserts(b, target_table, write_cursor, val_regs, rowid_reg, oe_flag);
+    emit_index_inserts(
+        b,
+        target_table,
+        write_cursor,
+        final_regs,
+        rowid_reg,
+        oe_flag,
+    );
 
     if !returning.is_empty() {
         emit_returning(b, write_cursor, target_table, returning, rowid_reg)?;
@@ -7415,19 +7523,6 @@ pub fn codegen_delete(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Convert a column's DEFAULT value text to an AST `Expr`.
-///
-/// Used by INSERT with explicit column lists to fill unmentioned columns
-/// with their declared DEFAULT rather than NULL.
-fn default_value_to_expr(col: &ColumnInfo) -> Expr {
-    let span = fsqlite_ast::Span::ZERO;
-    let Some(dv) = col.default_value.as_deref() else {
-        return Expr::Literal(Literal::Null, span);
-    };
-    parse_default_expr(dv)
-        .unwrap_or_else(|| Expr::Literal(Literal::String(dv.trim().to_owned()), span))
-}
 
 /// Emit a column's DEFAULT value into a register.
 ///
@@ -13055,7 +13150,7 @@ mod tests {
     // === Test: INSERT ... SELECT with specific columns ===
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn test_codegen_insert_select_with_columns() {
+    fn test_codegen_insert_select_with_explicit_columns_reorders_projection() {
         // Schema with source "s" having 3 columns, target "t" with 2.
         let schema = vec![
             TableSchema {
@@ -13133,7 +13228,7 @@ mod tests {
             },
         ];
 
-        // INSERT INTO t SELECT x, y FROM s
+        // INSERT INTO t(b, a) SELECT x, y FROM s
         let inner_select = SelectStatement {
             with: None,
             body: SelectBody {
@@ -13174,7 +13269,7 @@ mod tests {
             or_conflict: None,
             table: QualifiedName::bare("t"),
             alias: None,
-            columns: vec![],
+            columns: vec!["b".to_owned(), "a".to_owned()],
             source: InsertSource::Select(Box::new(inner_select)),
             upsert: vec![],
             returning: vec![],
@@ -13192,6 +13287,15 @@ mod tests {
             .filter(|op| op.opcode == Opcode::Column)
             .count();
         assert_eq!(column_count, 2);
+        let copy_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Copy)
+            .count();
+        assert!(
+            copy_count >= 2,
+            "explicit target-column mapping should reorder both projected values"
+        );
     }
 
     // === Test: SELECT DISTINCT full scan ===
@@ -16988,6 +17092,104 @@ mod tests {
         assert!(
             ops.contains(&Opcode::IsNull),
             "reordered column list with IPK should emit IsNull"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_allows_duplicate_target_columns() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["b".to_owned(), "b".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+    }
+
+    #[test]
+    fn test_codegen_insert_allows_hidden_rowid_and_ipk_targets() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["rowid".to_owned(), "a".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+    }
+
+    #[test]
+    fn test_codegen_insert_hidden_rowid_after_ipk_uses_rowid_source() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["a".to_owned(), "rowid".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+        assert!(
+            ops.contains(&Opcode::Copy),
+            "rowid/IPK mixed target list should still emit rowid routing"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_values_rejects_explicit_column_arity_mismatch() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["b".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_ipk_alias();
+        let ctx = CodegenContext {
+            concurrent_mode: false,
+            rowid_alias_col_idx: Some(0),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported(ref message) if message.contains("INSERT target list has 1 columns but 2 values were supplied")),
+            "unexpected error: {err:?}"
         );
     }
 
