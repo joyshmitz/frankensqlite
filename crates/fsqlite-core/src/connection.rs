@@ -22089,7 +22089,7 @@ impl Connection {
                             // the rowid at that position since it's not stored in the
                             // record payload.
                             if let Some(ipk_idx) = ipk_col_idx {
-                                let payload_includes_rowid_alias = if values.len() >= columns.len()
+                                let payload_includes_rowid_alias = if values.len() >= num_columns
                                 {
                                     true
                                 } else {
@@ -53413,14 +53413,9 @@ mod schema_loading_tests {
         let rows = conn
             .query("SELECT id, val, note FROM t ORDER BY id;")
             .unwrap();
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Text("alpha".to_owned()),
-                SqliteValue::Text("one".to_owned())
-            ]
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("one".to_owned()));
     }
 
     #[test]

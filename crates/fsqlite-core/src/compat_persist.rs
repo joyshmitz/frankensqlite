@@ -354,7 +354,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                         }
                     })?;
                     if !without_rowid && let Some(ipk_idx) = ipk_col_idx {
-                        let payload_includes_rowid_alias = if values.len() >= columns.len() {
+                        let payload_includes_rowid_alias = if values.len() >= num_columns {
                             true
                         } else {
                             match values.get(ipk_idx) {
