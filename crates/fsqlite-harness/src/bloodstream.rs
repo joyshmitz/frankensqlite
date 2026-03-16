@@ -238,6 +238,16 @@ pub enum DifferentialOperator {
     Project { columns: Vec<usize> },
     /// Consolidate algebraic weights by key and elide zero-weight results.
     ConsolidateByKey { key_columns: Vec<usize> },
+    /// Compute `ΔLeft ⋈ Right` with the current stream as the delta-left input.
+    DeltaJoinLeft {
+        stable_right: Vec<WeightedRow>,
+        key_spec: JoinKeySpec,
+    },
+    /// Compute `Left ⋈ ΔRight` with the current stream as the delta-right input.
+    DeltaJoinRight {
+        stable_left: Vec<WeightedRow>,
+        key_spec: JoinKeySpec,
+    },
 }
 
 impl DifferentialOperator {
@@ -272,6 +282,14 @@ impl DifferentialOperator {
                     })
                     .collect())
             }
+            Self::DeltaJoinLeft {
+                stable_right,
+                key_spec,
+            } => delta_join_left(rows, stable_right, key_spec),
+            Self::DeltaJoinRight {
+                stable_left,
+                key_spec,
+            } => delta_join_right(stable_left, rows, key_spec),
         }
     }
 }
@@ -1164,6 +1182,97 @@ mod tests {
         let rows = vec![WeightedRow::new(vec![SqliteValue::Integer(7)], 0)];
 
         assert_eq!(automaton.execute(&rows).unwrap(), Vec::<WeightedRow>::new());
+    }
+
+    #[test]
+    fn differential_automaton_delta_join_left_can_chain_into_projection() {
+        let automaton = DifferentialAutomaton::new(vec![
+            DifferentialOperator::DeltaJoinLeft {
+                stable_right: vec![WeightedRow::new(
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("admin".to_owned()),
+                    ],
+                    3,
+                )],
+                key_spec: JoinKeySpec::new(vec![0], vec![0]),
+            },
+            DifferentialOperator::Project {
+                columns: vec![1, 3],
+            },
+        ]);
+        let rows = vec![WeightedRow::new(
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("alice".to_owned()),
+            ],
+            1,
+        )];
+
+        assert_eq!(
+            automaton.execute(&rows).unwrap(),
+            vec![WeightedRow::new(
+                vec![
+                    SqliteValue::Text("alice".to_owned()),
+                    SqliteValue::Text("admin".to_owned()),
+                ],
+                3,
+            )]
+        );
+    }
+
+    #[test]
+    fn differential_automaton_delta_join_right_can_chain_into_projection() {
+        let automaton = DifferentialAutomaton::new(vec![
+            DifferentialOperator::DeltaJoinRight {
+                stable_left: vec![WeightedRow::new(
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("alice".to_owned()),
+                    ],
+                    2,
+                )],
+                key_spec: JoinKeySpec::new(vec![0], vec![0]),
+            },
+            DifferentialOperator::Project {
+                columns: vec![1, 3],
+            },
+        ]);
+        let rows = vec![WeightedRow::new(
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("guest".to_owned()),
+            ],
+            -1,
+        )];
+
+        assert_eq!(
+            automaton.execute(&rows).unwrap(),
+            vec![WeightedRow::new(
+                vec![
+                    SqliteValue::Text("alice".to_owned()),
+                    SqliteValue::Text("guest".to_owned()),
+                ],
+                -2,
+            )]
+        );
+    }
+
+    #[test]
+    fn differential_automaton_delta_join_operator_propagates_key_errors() {
+        let automaton = DifferentialAutomaton::new(vec![DifferentialOperator::DeltaJoinLeft {
+            stable_right: vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)],
+            key_spec: JoinKeySpec::new(vec![0], vec![1]),
+        }]);
+        let rows = vec![WeightedRow::new(vec![SqliteValue::Integer(1)], 1)];
+
+        assert_eq!(
+            automaton.execute(&rows),
+            Err(DifferentialPlanError::ColumnOutOfBounds {
+                column: 1,
+                width: 1,
+            })
+        );
     }
 
     #[test]
