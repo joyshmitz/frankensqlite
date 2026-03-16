@@ -117,6 +117,8 @@ use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
 use crate::region::{RegionKind, RegionTree, TaskHandle};
 use crate::wal_adapter::WalBackendAdapter;
 
+const WRITE_COORDINATOR_SERVICE_BEAD_ID: &str = "bd-2jpu6.4";
+
 const EPROCESS_DEFAULT_CONFIG: EProcessConfig = EProcessConfig {
     p0: 0.1,
     lambda: 3.0,
@@ -2446,6 +2448,10 @@ impl Connection {
         let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
+        if let Err(err) = shared_mvcc_state.ensure_write_coordinator_service_started() {
+            let _ = shared_mvcc_state.release_connection(runtime_region, true);
+            return Err(err);
+        }
         let eprocess_oracle = Arc::new(EProcessOracle::new(
             EPROCESS_DEFAULT_CONFIG,
             EPROCESS_PRIORITY_THRESHOLD,
@@ -25114,8 +25120,24 @@ struct SharedRuntimeState {
     regions: RegionTree,
     db_root_region: Region,
     write_coordinator_region: Region,
+    write_coordinator_service_starting: bool,
+    write_coordinator_service_running: bool,
+    write_coordinator_service_generation: u64,
+    write_coordinator_service_launch_count: u64,
+    write_coordinator_shutdown: Option<asupersync::channel::oneshot::Sender<()>>,
     open_connections: usize,
     poisoned: Option<String>,
+}
+
+struct WriteCoordinatorServiceStart {
+    generation: u64,
+    path_key: String,
+}
+
+enum WriteCoordinatorServiceReservation {
+    Running,
+    Starting,
+    Reserved(WriteCoordinatorServiceStart),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -25187,6 +25209,11 @@ impl SharedMvccState {
                 regions,
                 db_root_region,
                 write_coordinator_region,
+                write_coordinator_service_starting: false,
+                write_coordinator_service_running: false,
+                write_coordinator_service_generation: 0,
+                write_coordinator_service_launch_count: 0,
+                write_coordinator_shutdown: None,
                 open_connections: 0,
                 poisoned: None,
             }),
@@ -25233,6 +25260,163 @@ impl SharedMvccState {
         Ok((connection_region, connection_cx))
     }
 
+    fn reserve_write_coordinator_service_start(
+        &self,
+    ) -> Result<WriteCoordinatorServiceReservation> {
+        let mut state = lock_unpoisoned(&self.runtime_state);
+        if let Some(details) = &state.poisoned {
+            return Err(FrankenError::BackgroundWorkerFailed(details.clone()));
+        }
+
+        if state.write_coordinator_service_running
+            && state.regions.active_tasks(state.write_coordinator_region) == 0
+        {
+            state.write_coordinator_service_running = false;
+            state.write_coordinator_shutdown = None;
+        }
+
+        if state.write_coordinator_service_running {
+            return Ok(WriteCoordinatorServiceReservation::Running);
+        }
+
+        if state.write_coordinator_service_starting {
+            return Ok(WriteCoordinatorServiceReservation::Starting);
+        }
+
+        state.write_coordinator_service_starting = true;
+        state.write_coordinator_service_generation =
+            state.write_coordinator_service_generation.saturating_add(1);
+        Ok(WriteCoordinatorServiceReservation::Reserved(
+            WriteCoordinatorServiceStart {
+                generation: state.write_coordinator_service_generation,
+                path_key: state.key.path_key.clone(),
+            },
+        ))
+    }
+
+    fn revert_write_coordinator_service_start(&self, reservation: &WriteCoordinatorServiceStart) {
+        let mut state = lock_unpoisoned(&self.runtime_state);
+        if !state.write_coordinator_service_starting
+            || state.write_coordinator_service_generation != reservation.generation
+        {
+            return;
+        }
+
+        state.write_coordinator_service_starting = false;
+        state.write_coordinator_service_running = false;
+        state.write_coordinator_shutdown = None;
+    }
+
+    fn record_write_coordinator_service_launch(
+        &self,
+        reservation: &WriteCoordinatorServiceStart,
+        shutdown: asupersync::channel::oneshot::Sender<()>,
+    ) {
+        let mut state = lock_unpoisoned(&self.runtime_state);
+        if !state.write_coordinator_service_starting
+            || state.write_coordinator_service_generation != reservation.generation
+        {
+            return;
+        }
+
+        state.write_coordinator_service_starting = false;
+        state.write_coordinator_service_running = true;
+        state.write_coordinator_service_launch_count = state
+            .write_coordinator_service_launch_count
+            .saturating_add(1);
+        state.write_coordinator_shutdown = Some(shutdown);
+    }
+
+    fn ensure_write_coordinator_service_started(&self) -> Result<()> {
+        const MAX_WRITE_COORDINATOR_START_WAIT_ATTEMPTS: usize = 32;
+
+        let mut reservation = None;
+        for attempt in 0..MAX_WRITE_COORDINATOR_START_WAIT_ATTEMPTS {
+            match self.reserve_write_coordinator_service_start()? {
+                WriteCoordinatorServiceReservation::Running => return Ok(()),
+                WriteCoordinatorServiceReservation::Reserved(start) => {
+                    reservation = Some(start);
+                    break;
+                }
+                WriteCoordinatorServiceReservation::Starting => {
+                    if attempt + 1 == MAX_WRITE_COORDINATOR_START_WAIT_ATTEMPTS {
+                        return Ok(());
+                    }
+                    std::hint::spin_loop();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let reservation =
+            reservation.ok_or_else(|| FrankenError::internal("write coordinator start lost"))?;
+
+        let (shutdown_tx, mut shutdown_rx) = asupersync::channel::oneshot::channel::<()>();
+        let task_path_key = reservation.path_key.clone();
+        let launched = match self.try_spawn_write_coordinator_task(move |task_cx| async move {
+            let Some(native_task_cx) = task_cx.attached_native_cx() else {
+                tracing::error!(
+                    target: "fsqlite::runtime",
+                    bead_id = WRITE_COORDINATOR_SERVICE_BEAD_ID,
+                    event = "write_coordinator_service_missing_native_cx",
+                    db_path = %task_path_key
+                );
+                return;
+            };
+
+            tracing::info!(
+                target: "fsqlite::runtime",
+                bead_id = WRITE_COORDINATOR_SERVICE_BEAD_ID,
+                event = "write_coordinator_service_started",
+                db_path = %task_path_key
+            );
+
+            match shutdown_rx.recv(&native_task_cx).await {
+                Ok(())
+                | Err(
+                    asupersync::channel::oneshot::RecvError::Closed
+                    | asupersync::channel::oneshot::RecvError::Cancelled,
+                ) => {}
+                Err(asupersync::channel::oneshot::RecvError::PolledAfterCompletion) => {
+                    tracing::warn!(
+                        target: "fsqlite::runtime",
+                        bead_id = WRITE_COORDINATOR_SERVICE_BEAD_ID,
+                        event = "write_coordinator_service_invalid_recv_state",
+                        db_path = %task_path_key
+                    );
+                }
+            }
+
+            let _ = task_cx.checkpoint_with("write coordinator service shutdown");
+            tracing::info!(
+                target: "fsqlite::runtime",
+                bead_id = WRITE_COORDINATOR_SERVICE_BEAD_ID,
+                event = "write_coordinator_service_stopped",
+                db_path = %task_path_key
+            );
+        }) {
+            Ok(launched) => launched,
+            Err(err) => {
+                self.revert_write_coordinator_service_start(&reservation);
+                return Err(err);
+            }
+        };
+
+        if launched {
+            self.record_write_coordinator_service_launch(&reservation, shutdown_tx);
+        } else {
+            self.revert_write_coordinator_service_start(&reservation);
+            tracing::debug!(
+                target: "fsqlite::runtime",
+                bead_id = WRITE_COORDINATOR_SERVICE_BEAD_ID,
+                event = "write_coordinator_service_deferred",
+                db_path = %reservation.path_key
+            );
+        }
+
+        Ok(())
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn register_write_coordinator_task(&self) -> Result<(TaskHandle, Cx)> {
         let state = lock_unpoisoned(&self.runtime_state);
@@ -25250,8 +25434,7 @@ impl SharedMvccState {
         Ok((task, cx))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn spawn_write_coordinator_task<F, Fut>(&self, task: F) -> Result<()>
+    fn try_spawn_write_coordinator_task<F, Fut>(&self, task: F) -> Result<bool>
     where
         F: FnOnce(Cx) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
@@ -25259,19 +25442,14 @@ impl SharedMvccState {
         #[cfg(any(target_arch = "wasm32", not(feature = "native")))]
         {
             let _ = task;
-            return Err(FrankenError::internal(
-                "write coordinator tasks require native asupersync runtime support",
-            ));
+            return Ok(false);
         }
 
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         {
-            let runtime_handle =
-                asupersync::runtime::Runtime::current_handle().ok_or_else(|| {
-                    FrankenError::internal(
-                        "write coordinator tasks require an active asupersync runtime",
-                    )
-                })?;
+            let Some(runtime_handle) = asupersync::runtime::Runtime::current_handle() else {
+                return Ok(false);
+            };
             let (region_task, task_cx) = self.register_write_coordinator_task()?;
             runtime_handle
                 .try_spawn(async move {
@@ -25289,8 +25467,23 @@ impl SharedMvccState {
                         "failed to spawn write coordinator task on active asupersync runtime: {err}"
                     ))
                 })?;
-            Ok(())
+            Ok(true)
         }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn spawn_write_coordinator_task<F, Fut>(&self, task: F) -> Result<()>
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        if self.try_spawn_write_coordinator_task(task)? {
+            return Ok(());
+        }
+
+        Err(FrankenError::internal(
+            "write coordinator tasks require an active asupersync runtime",
+        ))
     }
 
     fn release_connection(&self, connection_region: Region, best_effort: bool) -> Result<()> {
@@ -25327,6 +25520,9 @@ impl SharedMvccState {
         );
 
         if state.open_connections == 0 {
+            state.write_coordinator_service_starting = false;
+            state.write_coordinator_service_running = false;
+            drop(state.write_coordinator_shutdown.take());
             let db_root_region = state.db_root_region;
             let root_close_started = Instant::now();
             tracing::info!(
@@ -34202,6 +34398,25 @@ mod tests {
         assert!(Arc::ptr_eq(&conn._shared_mvcc_state._runtime, &runtime));
     }
 
+    #[test]
+    fn test_open_with_env_without_active_runtime_leaves_write_coordinator_service_dormant() {
+        let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let conn = Connection::open_with_env(":memory:", ConnectionEnv::new(runtime))
+            .expect("connection should open");
+        let state = lock_unpoisoned(&conn._shared_mvcc_state.runtime_state);
+
+        assert!(!state.write_coordinator_service_starting);
+        assert!(!state.write_coordinator_service_running);
+        assert_eq!(state.write_coordinator_service_launch_count, 0);
+        assert_eq!(
+            state.regions.active_tasks(state.write_coordinator_region),
+            0
+        );
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     #[test]
     fn test_open_with_env_inherits_seeded_runtime_native_lineage() {
@@ -34385,6 +34600,206 @@ mod tests {
         assert!(started.load(Ordering::SeqCst));
         assert!(cancelled.load(Ordering::SeqCst));
         assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_open_with_env_starts_write_coordinator_service_once_per_shared_database() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let runtime = RuntimeBuilder::new()
+            .worker_threads(1)
+            .build()
+            .expect("runtime build");
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("write-coordinator-service.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+
+        let (conn1, conn2, shared) = runtime.block_on(async {
+            let runtime_context = Arc::new(RuntimeContext::new(RuntimeConfig {
+                worker_threads: 1,
+                io_poll_strategy: IoPollStrategy::Auto,
+            }));
+            let conn1 = Connection::open_with_env(
+                &db_path,
+                ConnectionEnv::new(Arc::clone(&runtime_context)),
+            )
+            .expect("first connection should open");
+            let conn2 = Connection::open_with_env(
+                &db_path,
+                ConnectionEnv::new(Arc::clone(&runtime_context)),
+            )
+            .expect("second connection should open");
+            let shared = Arc::clone(&conn1._shared_mvcc_state);
+
+            {
+                let state = lock_unpoisoned(&shared.runtime_state);
+                assert!(!state.write_coordinator_service_starting);
+                assert!(state.write_coordinator_service_running);
+                assert_eq!(state.write_coordinator_service_launch_count, 1);
+                assert_eq!(
+                    state.regions.active_tasks(state.write_coordinator_region),
+                    1
+                );
+            }
+
+            (conn1, conn2, shared)
+        });
+
+        drop(conn1);
+        {
+            let state = lock_unpoisoned(&shared.runtime_state);
+            assert!(!state.write_coordinator_service_starting);
+            assert!(state.write_coordinator_service_running);
+            assert_eq!(state.write_coordinator_service_launch_count, 1);
+            assert_eq!(
+                state.regions.active_tasks(state.write_coordinator_region),
+                1
+            );
+        }
+
+        drop(conn2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let (running, active_tasks) = {
+                let state = lock_unpoisoned(&shared.runtime_state);
+                (
+                    state.write_coordinator_service_running,
+                    state.regions.active_tasks(state.write_coordinator_region),
+                )
+            };
+            if !running && active_tasks == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "write coordinator service should stop after last connection close"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_existing_dormant_shared_state_can_start_write_coordinator_service_later() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("write-coordinator-dormant.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let runtime_context = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let conn1 =
+            Connection::open_with_env(&db_path, ConnectionEnv::new(Arc::clone(&runtime_context)))
+                .expect("first connection should open");
+        let shared = Arc::clone(&conn1._shared_mvcc_state);
+
+        {
+            let state = lock_unpoisoned(&shared.runtime_state);
+            assert!(!state.write_coordinator_service_starting);
+            assert!(!state.write_coordinator_service_running);
+            assert_eq!(state.write_coordinator_service_launch_count, 0);
+            assert_eq!(
+                state.regions.active_tasks(state.write_coordinator_region),
+                0
+            );
+        }
+
+        let runtime = RuntimeBuilder::new()
+            .worker_threads(1)
+            .build()
+            .expect("runtime build");
+        let conn2 = runtime.block_on(async {
+            Connection::open_with_env(&db_path, ConnectionEnv::new(Arc::clone(&runtime_context)))
+                .expect("second connection should open")
+        });
+
+        {
+            let state = lock_unpoisoned(&shared.runtime_state);
+            assert!(!state.write_coordinator_service_starting);
+            assert!(state.write_coordinator_service_running);
+            assert_eq!(state.write_coordinator_service_launch_count, 1);
+            assert_eq!(
+                state.regions.active_tasks(state.write_coordinator_region),
+                1
+            );
+        }
+
+        drop(conn2);
+        drop(conn1);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_concurrent_open_with_env_starts_write_coordinator_service_once() {
+        use asupersync::runtime::RuntimeBuilder;
+        use std::sync::mpsc::channel;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("write-coordinator-concurrent-open.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+        let runtime_context = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let start_barrier = Arc::new(std::sync::Barrier::new(3));
+        let release_barrier = Arc::new(std::sync::Barrier::new(3));
+        let (shared_tx, shared_rx) = channel();
+        let mut handles = Vec::new();
+
+        for _ in 0..2 {
+            let db_path = db_path.clone();
+            let runtime_context = Arc::clone(&runtime_context);
+            let start_barrier = Arc::clone(&start_barrier);
+            let release_barrier = Arc::clone(&release_barrier);
+            let shared_tx = shared_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                let runtime = RuntimeBuilder::new()
+                    .worker_threads(1)
+                    .build()
+                    .expect("runtime build");
+                let conn = runtime.block_on(async {
+                    start_barrier.wait();
+                    Connection::open_with_env(
+                        &db_path,
+                        ConnectionEnv::new(Arc::clone(&runtime_context)),
+                    )
+                    .expect("connection should open")
+                });
+                shared_tx
+                    .send(Arc::clone(&conn._shared_mvcc_state))
+                    .expect("shared state should send");
+                release_barrier.wait();
+                drop(conn);
+            }));
+        }
+
+        start_barrier.wait();
+        let shared = shared_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("first shared state should arrive");
+        let shared_again = shared_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("second shared state should arrive");
+
+        assert!(Arc::ptr_eq(&shared, &shared_again));
+        {
+            let state = lock_unpoisoned(&shared.runtime_state);
+            assert!(!state.write_coordinator_service_starting);
+            assert!(state.write_coordinator_service_running);
+            assert_eq!(state.write_coordinator_service_launch_count, 1);
+            assert_eq!(
+                state.regions.active_tasks(state.write_coordinator_region),
+                1
+            );
+        }
+
+        release_barrier.wait();
+        for handle in handles {
+            handle.join().expect("worker should not panic");
+        }
     }
 
     #[test]
