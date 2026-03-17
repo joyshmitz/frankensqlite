@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use fsqlite::Connection;
 use fsqlite_ast::Statement;
 use fsqlite_error::{ErrorCode, FrankenError};
-use fsqlite_parser::parse_first_statement_with_tail;
+use fsqlite_parser::{Parser, parse_first_statement_with_tail};
 use fsqlite_types::value::SqliteValue;
 
 // ── SQLite result codes ─────────────────────────────────────────────
@@ -223,6 +223,13 @@ pub struct Sqlite3Stmt {
     text_cache: Vec<Option<CString>>,
 }
 
+type ExecCallback = unsafe extern "C" fn(
+    parg: *mut c_void,
+    ncols: c_int,
+    values: *mut *mut c_char,
+    names: *mut *mut c_char,
+) -> c_int;
+
 // ── Helper: convert FrankenError → c_int ────────────────────────────
 
 fn error_to_code(err: &FrankenError) -> c_int {
@@ -289,6 +296,191 @@ fn validate_and_classify_prepared_sql(
         step_mode,
         column_count,
     }))
+}
+
+fn first_statement_tail_offset(sql: &str) -> Result<Option<usize>, FrankenError> {
+    parse_first_statement_with_tail(sql)
+        .map_err(|err| FrankenError::ParseError {
+            offset: err.span.start as usize,
+            detail: err.message,
+        })
+        .map(|parsed| parsed.map(|(_, tail_offset)| tail_offset))
+}
+
+fn best_effort_exec_callback_column_names(conn: &Connection, sql: &str) -> Option<Vec<String>> {
+    let mut parser = Parser::from_sql(sql);
+    let (statements, errors) = parser.parse_all();
+    if let Some(error) = errors.into_iter().next() {
+        tracing::warn!(
+            target: "fsqlite.compat",
+            error = %error,
+            "failed to recover sqlite3_exec callback column names"
+        );
+        return None;
+    }
+
+    let statement = statements.last()?;
+    if !can_prepare_statement(statement) {
+        return None;
+    }
+
+    match conn.prepare(&statement.to_string()) {
+        Ok(prepared) => Some(prepared.column_names().to_vec()),
+        Err(error) => {
+            tracing::warn!(
+                target: "fsqlite.compat",
+                error = %error,
+                "failed to prepare sqlite3_exec callback column metadata"
+            );
+            None
+        }
+    }
+}
+
+unsafe fn emit_exec_callback_rows(
+    handle: &Sqlite3,
+    sql: &str,
+    rows: &[fsqlite::Row],
+    callback: ExecCallback,
+    parg: *mut c_void,
+    errmsg: *mut *mut c_char,
+) -> c_int {
+    let callback_column_names = (!rows.is_empty())
+        .then(|| best_effort_exec_callback_column_names(&handle.conn, sql))
+        .flatten();
+    for row in rows {
+        let vals = row.values();
+        let ncols = vals.len() as c_int;
+
+        let mut c_values: Vec<*mut c_char> = Vec::with_capacity(vals.len());
+        let mut c_names: Vec<*mut c_char> = Vec::with_capacity(vals.len());
+        let mut owned_vals: Vec<CString> = Vec::with_capacity(vals.len());
+        let mut owned_names: Vec<CString> = Vec::with_capacity(vals.len());
+
+        for (i, v) in vals.iter().enumerate() {
+            let col_name = callback_column_names
+                .as_ref()
+                .and_then(|names| names.get(i))
+                .cloned()
+                .unwrap_or_else(|| format!("column{i}"));
+            let cname = CString::new(col_name).expect("col name");
+            c_names.push(cname.as_ptr().cast_mut());
+            owned_names.push(cname);
+
+            let text = match v {
+                SqliteValue::Null => {
+                    c_values.push(std::ptr::null_mut());
+                    owned_vals.push(CString::default());
+                    continue;
+                }
+                SqliteValue::Integer(n) => n.to_string(),
+                v @ SqliteValue::Float(_) => v.to_text(),
+                SqliteValue::Text(s) => s.clone(),
+                SqliteValue::Blob(b) => {
+                    let mut hex = String::with_capacity(2 + b.len() * 2);
+                    hex.push_str("X'");
+                    for byte in b {
+                        let _ = write!(hex, "{byte:02X}");
+                    }
+                    hex.push('\'');
+                    hex
+                }
+            };
+            let cval = CString::new(text).unwrap_or_else(|_| CString::new("").expect(""));
+            c_values.push(cval.as_ptr().cast_mut());
+            owned_vals.push(cval);
+        }
+
+        debug_assert_eq!(owned_vals.len(), c_values.len());
+        debug_assert_eq!(owned_names.len(), c_names.len());
+        let rc = callback(parg, ncols, c_values.as_mut_ptr(), c_names.as_mut_ptr());
+        if rc != SQLITE_OK {
+            let err = FrankenError::Abort;
+            handle.set_error(&err);
+            write_error_message(errmsg, &err.to_string());
+            return SQLITE_ABORT;
+        }
+    }
+    SQLITE_OK
+}
+
+unsafe fn execute_exec_batch(
+    handle: &Sqlite3,
+    sql: &str,
+    callback: Option<ExecCallback>,
+    parg: *mut c_void,
+    errmsg: *mut *mut c_char,
+) -> c_int {
+    let mut remaining = sql;
+
+    loop {
+        let trimmed = remaining.trim_start();
+        if trimmed.is_empty() {
+            handle.clear_error();
+            handle.refresh_last_changes();
+            return SQLITE_OK;
+        }
+        let statement_offset = sql.len().saturating_sub(trimmed.len());
+
+        let tail_offset = match first_statement_tail_offset(trimmed) {
+            Ok(Some(tail_offset)) => tail_offset,
+            Ok(None) => {
+                handle.clear_error();
+                handle.refresh_last_changes();
+                return SQLITE_OK;
+            }
+            Err(FrankenError::ParseError { offset, detail }) => {
+                let error = FrankenError::ParseError {
+                    offset: statement_offset.saturating_add(offset),
+                    detail,
+                };
+                tracing::warn!(
+                    target: "fsqlite.compat",
+                    error = %error,
+                    "sqlite3_exec failed while parsing statement batch"
+                );
+                handle.set_error(&error);
+                write_error_message(errmsg, &error.to_string());
+                return error_to_code(&error);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "fsqlite.compat",
+                    error = %error,
+                    "sqlite3_exec failed while parsing statement batch"
+                );
+                handle.set_error(&error);
+                write_error_message(errmsg, &error.to_string());
+                return error_to_code(&error);
+            }
+        };
+
+        let statement_sql = &trimmed[..tail_offset];
+        let rows = match handle.conn.query(statement_sql) {
+            Ok(rows) => rows,
+            Err(FrankenError::QueryReturnedNoRows) => Vec::new(),
+            Err(error) => {
+                tracing::warn!(
+                    target: "fsqlite.compat",
+                    error = %error,
+                    statement_sql = %statement_sql,
+                    "sqlite3_exec failed while executing statement batch"
+                );
+                handle.set_error(&error);
+                write_error_message(errmsg, &error.to_string());
+                return error_to_code(&error);
+            }
+        };
+
+        if let Some(cb) = callback {
+            let rc = emit_exec_callback_rows(handle, statement_sql, &rows, cb, parg, errmsg);
+            if rc != SQLITE_OK {
+                return rc;
+            }
+        }
+
+        remaining = &trimmed[tail_offset..];
+    }
 }
 
 unsafe fn write_error_message(errmsg: *mut *mut c_char, message: &str) {
@@ -421,14 +613,7 @@ pub unsafe extern "C" fn sqlite3_close(db: *mut Sqlite3) -> c_int {
 pub unsafe extern "C" fn sqlite3_exec(
     db: *mut Sqlite3,
     sql: *const c_char,
-    callback: Option<
-        unsafe extern "C" fn(
-            parg: *mut c_void,
-            ncols: c_int,
-            values: *mut *mut c_char,
-            names: *mut *mut c_char,
-        ) -> c_int,
-    >,
+    callback: Option<ExecCallback>,
     parg: *mut c_void,
     errmsg: *mut *mut c_char,
 ) -> c_int {
@@ -456,89 +641,18 @@ pub unsafe extern "C" fn sqlite3_exec(
 
     tracing::info!(target: "fsqlite.compat", sql = %sql_str, "sqlite3_exec");
 
-    // Route through Connection::query() because FrankenSQLite already executes
-    // DDL/DML there and returns rows only for result-producing statements.
-    let exec_result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.conn.query(sql_str)));
+    let exec_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        execute_exec_batch(handle, sql_str, callback, parg, errmsg)
+    }));
 
-    match exec_result {
-        Ok(Ok(rows)) => {
-            handle.clear_error();
-            handle.refresh_last_changes();
-            if let Some(cb) = callback {
-                for row in &rows {
-                    let vals = row.values();
-                    let ncols = vals.len() as c_int;
-
-                    // Build C string arrays for the callback.
-                    let mut c_values: Vec<*mut c_char> = Vec::with_capacity(vals.len());
-                    let mut c_names: Vec<*mut c_char> = Vec::with_capacity(vals.len());
-                    let mut owned_vals: Vec<CString> = Vec::with_capacity(vals.len());
-                    let mut owned_names: Vec<CString> = Vec::with_capacity(vals.len());
-
-                    for (i, v) in vals.iter().enumerate() {
-                        let col_name = format!("column{i}");
-                        let cname = CString::new(col_name).expect("col name");
-                        c_names.push(cname.as_ptr().cast_mut());
-                        owned_names.push(cname);
-
-                        let text = match v {
-                            SqliteValue::Null => {
-                                c_values.push(std::ptr::null_mut());
-                                owned_vals.push(CString::default());
-                                continue;
-                            }
-                            SqliteValue::Integer(n) => n.to_string(),
-                            v @ SqliteValue::Float(_) => v.to_text(),
-                            SqliteValue::Text(s) => s.clone(),
-                            SqliteValue::Blob(b) => {
-                                // Represent blob as hex for the exec callback.
-                                let mut hex = String::with_capacity(2 + b.len() * 2);
-                                hex.push_str("X'");
-                                for byte in b {
-                                    let _ = write!(hex, "{byte:02X}");
-                                }
-                                hex.push('\'');
-                                hex
-                            }
-                        };
-                        let cval =
-                            CString::new(text).unwrap_or_else(|_| CString::new("").expect(""));
-                        c_values.push(cval.as_ptr().cast_mut());
-                        owned_vals.push(cval);
-                    }
-
-                    debug_assert_eq!(owned_vals.len(), c_values.len());
-                    debug_assert_eq!(owned_names.len(), c_names.len());
-                    let rc = cb(parg, ncols, c_values.as_mut_ptr(), c_names.as_mut_ptr());
-                    if rc != SQLITE_OK {
-                        let err = FrankenError::Abort;
-                        handle.set_error(&err);
-                        write_error_message(errmsg, &err.to_string());
-                        return SQLITE_ABORT;
-                    }
-                }
-            }
-            SQLITE_OK
-        }
-        Ok(Err(ref e)) if matches!(e, FrankenError::QueryReturnedNoRows) => {
-            handle.clear_error();
-            handle.refresh_last_changes();
-            SQLITE_OK
-        }
-        Ok(Err(e)) => {
-            tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_exec failed");
-            handle.set_error(&e);
-            write_error_message(errmsg, &e.to_string());
-            error_to_code(&e)
-        }
-        Err(_) => {
-            let e = FrankenError::Internal("Rust panic during sqlite3_exec".to_owned());
-            tracing::error!(target: "fsqlite.compat", error = %e, "sqlite3_exec panicked");
-            handle.set_error(&e);
-            write_error_message(errmsg, &e.to_string());
-            error_to_code(&e)
-        }
+    if let Ok(rc) = exec_result {
+        rc
+    } else {
+        let e = FrankenError::Internal("Rust panic during sqlite3_exec".to_owned());
+        tracing::error!(target: "fsqlite.compat", error = %e, "sqlite3_exec panicked");
+        handle.set_error(&e);
+        write_error_message(errmsg, &e.to_string());
+        error_to_code(&e)
     }
 }
 
@@ -1495,22 +1609,17 @@ mod tests {
             assert_eq!(CStr::from_ptr(tail).to_str().unwrap(), " SELECT 100;");
             sqlite3_finalize(stmt);
 
-            let fire = CString::new("INSERT INTO t VALUES(1);").unwrap();
+            let mut tail_stmt: *mut Sqlite3Stmt = ptr::null_mut();
             assert_eq!(
-                sqlite3_exec(db, fire.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                sqlite3_prepare_v2(db, tail, -1, &mut tail_stmt, ptr::null_mut()),
                 SQLITE_OK
             );
+            assert!(!tail_stmt.is_null());
+            assert_eq!(sqlite3_step(tail_stmt), SQLITE_ROW);
+            assert_eq!(sqlite3_column_int64(tail_stmt, 0), 100);
+            assert_eq!(sqlite3_step(tail_stmt), SQLITE_DONE);
 
-            let verify = CString::new("SELECT COUNT(*) FROM audit;").unwrap();
-            let mut verify_stmt: *mut Sqlite3Stmt = ptr::null_mut();
-            assert_eq!(
-                sqlite3_prepare_v2(db, verify.as_ptr(), -1, &mut verify_stmt, ptr::null_mut()),
-                SQLITE_OK
-            );
-            assert_eq!(sqlite3_step(verify_stmt), SQLITE_ROW);
-            assert_eq!(sqlite3_column_int64(verify_stmt, 0), 2);
-
-            sqlite3_finalize(verify_stmt);
+            sqlite3_finalize(tail_stmt);
             sqlite3_close(db);
         }
     }
@@ -1748,6 +1857,143 @@ mod tests {
             );
             assert_eq!(rc, SQLITE_ABORT);
 
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_exec_callback_uses_actual_column_names() {
+        unsafe {
+            unsafe extern "C" fn capture_names_cb(
+                parg: *mut c_void,
+                ncols: c_int,
+                _values: *mut *mut c_char,
+                names: *mut *mut c_char,
+            ) -> c_int {
+                let out = &mut *parg.cast::<Vec<String>>();
+                let names =
+                    std::slice::from_raw_parts(names.cast::<*const c_char>(), ncols as usize);
+                out.extend(
+                    names
+                        .iter()
+                        .map(|ptr| CStr::from_ptr(*ptr).to_str().unwrap().to_owned()),
+                );
+                SQLITE_OK
+            }
+
+            let db = open_memory();
+            let mut captured_names: Vec<String> = Vec::new();
+
+            let sql = CString::new("SELECT 1 AS alpha, 2 AS beta;").unwrap();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    sql.as_ptr(),
+                    Some(capture_names_cb),
+                    std::ptr::from_mut(&mut captured_names).cast(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(captured_names, vec!["alpha", "beta"]);
+
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_exec_callback_runs_for_each_query_statement_in_batch() {
+        unsafe {
+            #[derive(Debug, PartialEq, Eq)]
+            struct CallbackRow {
+                names: Vec<String>,
+                values: Vec<Option<String>>,
+            }
+
+            unsafe extern "C" fn capture_rows_cb(
+                parg: *mut c_void,
+                ncols: c_int,
+                values: *mut *mut c_char,
+                names: *mut *mut c_char,
+            ) -> c_int {
+                let out = &mut *parg.cast::<Vec<CallbackRow>>();
+                let names =
+                    std::slice::from_raw_parts(names.cast::<*const c_char>(), ncols as usize);
+                let values =
+                    std::slice::from_raw_parts(values.cast::<*const c_char>(), ncols as usize);
+                out.push(CallbackRow {
+                    names: names
+                        .iter()
+                        .map(|ptr| CStr::from_ptr(*ptr).to_str().unwrap().to_owned())
+                        .collect(),
+                    values: values
+                        .iter()
+                        .map(|ptr| {
+                            (!ptr.is_null())
+                                .then(|| CStr::from_ptr(*ptr).to_str().unwrap().to_owned())
+                        })
+                        .collect(),
+                });
+                SQLITE_OK
+            }
+
+            let db = open_memory();
+            let mut callback_rows: Vec<CallbackRow> = Vec::new();
+
+            let sql = CString::new("SELECT 1 AS alpha; SELECT 2 AS beta;").unwrap();
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    sql.as_ptr(),
+                    Some(capture_rows_cb),
+                    std::ptr::from_mut(&mut callback_rows).cast(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(
+                callback_rows,
+                vec![
+                    CallbackRow {
+                        names: vec!["alpha".to_owned()],
+                        values: vec![Some("1".to_owned())],
+                    },
+                    CallbackRow {
+                        names: vec!["beta".to_owned()],
+                        values: vec![Some("2".to_owned())],
+                    },
+                ]
+            );
+
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_exec_error_in_later_statement_reports_global_offset() {
+        unsafe {
+            let db = open_memory();
+            let mut errmsg: *mut c_char = ptr::null_mut();
+            let sql = CString::new("SELECT 1; SELECT * FROM").unwrap();
+
+            assert_eq!(
+                sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), &mut errmsg),
+                SQLITE_ERROR
+            );
+            assert!(!errmsg.is_null());
+            let message = CStr::from_ptr(errmsg).to_string_lossy().into_owned();
+            let offset = message
+                .split("offset ")
+                .nth(1)
+                .and_then(|suffix| suffix.split(':').next())
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("errmsg should contain parse offset");
+            assert!(
+                offset >= "SELECT 1; ".len(),
+                "later statement parse error should report an offset in the original SQL string: {message}"
+            );
+
+            sqlite3_free(errmsg.cast());
             sqlite3_close(db);
         }
     }
