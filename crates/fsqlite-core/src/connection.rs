@@ -220,6 +220,7 @@ static FSQLITE_COMPILE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_BACKGROUND_STATUS_CHECKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_OP_CX_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_SCHEMA_REFRESHES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParserHotPathProfileSnapshot {
@@ -242,6 +243,7 @@ pub struct HotPathProfileSnapshot {
     pub background_status_checks: u64,
     pub op_cx_background_gates: u64,
     pub statement_dispatch_background_gates: u64,
+    pub prepared_schema_refreshes: u64,
     pub record_decode: RecordHotPathProfileSnapshot,
     pub vdbe: VdbeMetricsSnapshot,
 }
@@ -272,6 +274,7 @@ pub fn reset_hot_path_profile() {
     FSQLITE_BACKGROUND_STATUS_CHECKS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_OP_CX_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_SCHEMA_REFRESHES.store(0, AtomicOrdering::Relaxed);
     reset_record_profile();
     reset_vdbe_metrics();
 }
@@ -295,6 +298,8 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         background_status_checks: FSQLITE_BACKGROUND_STATUS_CHECKS.load(AtomicOrdering::Relaxed),
         op_cx_background_gates: FSQLITE_OP_CX_BACKGROUND_GATES.load(AtomicOrdering::Relaxed),
         statement_dispatch_background_gates: FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES
+            .load(AtomicOrdering::Relaxed),
+        prepared_schema_refreshes: FSQLITE_PREPARED_SCHEMA_REFRESHES
             .load(AtomicOrdering::Relaxed),
         record_decode: record_profile_snapshot(),
         vdbe: vdbe_metrics_snapshot(),
@@ -1349,6 +1354,10 @@ impl PreparedStatement<'_> {
         self.db.is_some() || self.dml_dispatch.is_some() || self.deferred_query_statement.is_some()
     }
 
+    fn requires_external_schema_refresh(&self) -> bool {
+        self.requires_schema_validation() && !self.conn.pager.is_memory()
+    }
+
     fn dispatch_precompiled_program(&self) -> Option<&VdbeProgram> {
         if self.deferred_dml_statement().is_some() && self.db.is_some() {
             Some(self.program.as_ref())
@@ -1372,7 +1381,7 @@ impl PreparedStatement<'_> {
     }
 
     fn ensure_schema_unchanged(&self, cx: &Cx) -> Result<()> {
-        if self.requires_schema_validation() {
+        if self.requires_external_schema_refresh() {
             self.conn.refresh_prepared_schema_state(cx)?;
         }
         if self.requires_schema_validation()
@@ -4173,6 +4182,9 @@ impl Connection {
     }
 
     fn refresh_prepared_schema_state(&self, cx: &Cx) -> Result<()> {
+        if hot_path_profile_enabled() {
+            FSQLITE_PREPARED_SCHEMA_REFRESHES.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         if !*self.in_transaction.borrow() {
             self.refresh_memdb_if_stale(cx)?;
         }
@@ -63589,6 +63601,47 @@ mod pager_routing_tests {
             .query("SELECT COUNT(*) FROM prep_schema_dml;")
             .unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn test_prepared_memory_statement_paths_skip_external_schema_refresh() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_mem_fast (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let insert_stmt = conn
+            .prepare("INSERT INTO prep_mem_fast (id, val) VALUES (?1, ?2)")
+            .unwrap();
+        let select_stmt = conn
+            .prepare("SELECT val FROM prep_mem_fast WHERE id = ?1")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = insert_stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("alpha".to_owned()),
+            ])
+            .unwrap();
+        assert_eq!(affected, 1);
+        let insert_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            insert_profile.prepared_schema_refreshes, 0,
+            "prepared INSERT on :memory: should not pay file-backed schema refresh cost: {insert_profile:?}"
+        );
+
+        reset_hot_path_profile();
+        let rows = select_stmt
+            .query_with_params(&[SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+        let select_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            select_profile.prepared_schema_refreshes, 0,
+            "prepared SELECT on :memory: should not pay file-backed schema refresh cost: {select_profile:?}"
+        );
     }
 
     #[cfg(test)]
