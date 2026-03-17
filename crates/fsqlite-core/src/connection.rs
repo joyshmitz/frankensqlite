@@ -1457,7 +1457,7 @@ impl PreparedStatement<'_> {
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
         let runtime_inputs = self
             .conn
-            .table_execution_runtime_inputs(self.program.has_insert_ops())?;
+            .table_execution_runtime_inputs(self.program.has_insert_ops());
         let txn = self
             .pager
             .as_ref()
@@ -10587,7 +10587,7 @@ impl Connection {
     fn table_execution_runtime_inputs(
         &self,
         needs_defaults: bool,
-    ) -> Result<TableExecutionRuntimeInputs> {
+    ) -> TableExecutionRuntimeInputs {
         let metadata = self.table_execution_metadata();
         let autoincrement_tables = self.autoincrement_tables.borrow();
         let sqlite_sequence_cache = self.sqlite_sequence_cache.borrow();
@@ -10634,13 +10634,13 @@ impl Connection {
                 )
             };
 
-        Ok(TableExecutionRuntimeInputs {
+        TableExecutionRuntimeInputs {
             autoincrement_seq_by_root_page,
             rowid_alias_col_by_root_page: Arc::clone(&metadata.rowid_alias_col_by_root_page),
             table_column_count_by_root_page: Arc::clone(&metadata.table_column_count_by_root_page),
             column_defaults_by_root_page,
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
-        })
+        }
     }
 
     fn table_execution_metadata(&self) -> Arc<TableExecutionMetadataCacheEntry> {
@@ -22134,7 +22134,7 @@ impl Connection {
         // Only evaluate column defaults when the program actually contains
         // Insert opcodes — avoids recursive execute_statement calls for
         // SELECT/DELETE/UPDATE programs that never use defaults.
-        let runtime_inputs = self.table_execution_runtime_inputs(program.has_insert_ops())?;
+        let runtime_inputs = self.table_execution_runtime_inputs(program.has_insert_ops());
 
         // Lend the active transaction to the VDBE engine so that storage
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
@@ -63971,8 +63971,8 @@ mod pager_routing_tests {
         conn.execute("CREATE INDEX runtime_inputs_fast_val ON runtime_inputs_fast(val);")
             .unwrap();
 
-        let first = conn.table_execution_runtime_inputs(true).unwrap();
-        let second = conn.table_execution_runtime_inputs(true).unwrap();
+        let first = conn.table_execution_runtime_inputs(true);
+        let second = conn.table_execution_runtime_inputs(true);
 
         assert!(
             Arc::ptr_eq(

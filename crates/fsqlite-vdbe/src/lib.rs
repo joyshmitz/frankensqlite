@@ -4,8 +4,11 @@
 // label resolution, register allocation, coroutine mechanism, and disassembly.
 // The foundational types (Opcode, VdbeOp, P4) live in fsqlite-types.
 
+use hashbrown::HashMap;
+
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+use std::sync::Arc;
 
 pub mod codegen;
 pub mod engine;
@@ -205,7 +208,7 @@ pub struct ProgramBuilder {
     /// Counter for anonymous placeholder numbering (1-based).
     next_anon_placeholder: u32,
     /// Table-to-index cursor metadata for REPLACE conflict resolution.
-    table_index_meta: Vec<(i32, Vec<fsqlite_types::opcode::IndexCursorMeta>)>,
+    table_index_meta: HashMap<i32, Vec<fsqlite_types::opcode::IndexCursorMeta>>,
 }
 
 impl ProgramBuilder {
@@ -216,7 +219,7 @@ impl ProgramBuilder {
             labels: Vec::new(),
             regs: RegisterAllocator::new(),
             next_anon_placeholder: 1,
-            table_index_meta: Vec::new(),
+            table_index_meta: HashMap::new(),
         }
     }
 
@@ -394,7 +397,10 @@ impl ProgramBuilder {
         indexes: Vec<fsqlite_types::opcode::IndexCursorMeta>,
     ) {
         if !indexes.is_empty() {
-            self.table_index_meta.push((table_cursor, indexes));
+            self.table_index_meta
+                .entry(table_cursor)
+                .or_default()
+                .extend(indexes);
         }
     }
 
@@ -414,12 +420,17 @@ impl ProgramBuilder {
             }
         }
         let bind_parameter_requirement = compute_bind_parameter_requirement(&self.ops);
+        let table_index_meta = self
+            .table_index_meta
+            .into_iter()
+            .map(|(table_cursor, indexes)| (table_cursor, indexes.into_boxed_slice()))
+            .collect();
 
         Ok(VdbeProgram {
             ops: self.ops,
             register_count: self.regs.count(),
             bind_parameter_requirement,
-            table_index_meta: self.table_index_meta,
+            table_index_meta: Arc::new(table_index_meta),
         })
     }
 }
@@ -431,6 +442,8 @@ impl Default for ProgramBuilder {
 }
 
 // ── VDBE Program ────────────────────────────────────────────────────────────
+
+pub(crate) type TableIndexMetaMap = HashMap<i32, Box<[fsqlite_types::opcode::IndexCursorMeta]>>;
 
 /// A finalized VDBE bytecode program ready for execution.
 #[derive(Debug, Clone, PartialEq)]
@@ -445,7 +458,7 @@ pub struct VdbeProgram {
     /// `Err(raw_index)` stores the first invalid raw index encountered.
     bind_parameter_requirement: std::result::Result<usize, i32>,
     /// Table-to-index cursor metadata for REPLACE conflict resolution.
-    table_index_meta: Vec<(i32, Vec<fsqlite_types::opcode::IndexCursorMeta>)>,
+    table_index_meta: Arc<TableIndexMetaMap>,
 }
 
 impl VdbeProgram {
@@ -484,7 +497,11 @@ impl VdbeProgram {
     }
 
     /// Table-to-index cursor metadata for REPLACE conflict resolution.
-    pub fn table_index_meta(&self) -> &[(i32, Vec<fsqlite_types::opcode::IndexCursorMeta>)] {
+    pub fn table_index_meta(&self) -> &TableIndexMetaMap {
+        self.table_index_meta.as_ref()
+    }
+
+    pub(crate) fn shared_table_index_meta(&self) -> &Arc<TableIndexMetaMap> {
         &self.table_index_meta
     }
 
@@ -1585,6 +1602,38 @@ mod tests {
         b.emit_op(Opcode::Variable, 0, 1, 0, P4::None, 0);
         let prog = b.finish().unwrap();
         assert_eq!(prog.max_bind_parameter_index(), Err(0));
+    }
+
+    #[test]
+    fn test_program_builder_accumulates_table_index_meta_by_table_cursor() {
+        use fsqlite_types::opcode::IndexCursorMeta;
+
+        let mut b = ProgramBuilder::new();
+        b.register_table_indexes(
+            3,
+            vec![IndexCursorMeta {
+                cursor_id: 4,
+                column_indices: vec![0, 2],
+            }],
+        );
+        b.register_table_indexes(
+            3,
+            vec![IndexCursorMeta {
+                cursor_id: 5,
+                column_indices: vec![1],
+            }],
+        );
+
+        let prog = b.finish().expect("program should build");
+        let metas = prog
+            .table_index_meta()
+            .get(&3)
+            .expect("table cursor metadata should be present");
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].cursor_id, 4);
+        assert_eq!(metas[0].column_indices, vec![0, 2]);
+        assert_eq!(metas[1].cursor_id, 5);
+        assert_eq!(metas[1].column_indices, vec![1]);
     }
 
     // ── test_disassemble ────────────────────────────────────────────────

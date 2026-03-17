@@ -42,12 +42,12 @@ use fsqlite_mvcc::{
 };
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
-use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4, VdbeOp};
+use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnType, WitnessKey};
 
-use crate::VdbeProgram;
+use crate::{TableIndexMetaMap, VdbeProgram};
 
 const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 256;
 /// FrankenSQLite-specific p5 flag for `Insert`/`Delete` opcodes emitted from
@@ -3510,7 +3510,7 @@ pub struct VdbeEngine {
     /// Metadata mapping table cursor IDs to their associated index cursors
     /// and column indices. Used by `native_replace_row` to clean up secondary
     /// index entries during REPLACE conflict resolution.
-    table_index_meta: HashMap<i32, Vec<IndexCursorMeta>>,
+    table_index_meta: Arc<TableIndexMetaMap>,
     /// Window function accumulators keyed by accumulator register.
     window_contexts: SwissIndex<i32, WindowContext>,
     /// Register subtype tags (register index → subtype value).
@@ -3887,7 +3887,7 @@ impl VdbeEngine {
             version_store: None,
             time_travel_commit_log: None,
             time_travel_gc_horizon: None,
-            table_index_meta: HashMap::new(),
+            table_index_meta: Arc::new(HashMap::new()),
             window_contexts: SwissIndex::new(),
             register_subtypes: HashMap::new(),
             bloom_filters: HashMap::new(),
@@ -3981,8 +3981,9 @@ impl VdbeEngine {
         // Delete secondary index entries for the old row using the metadata
         // registered by the codegen. For each index cursor, build the index
         // key from the old row's column values and delete it.
-        if let Some(index_metas) = self.table_index_meta.get(&tbl_cursor_id).cloned() {
-            for meta in &index_metas {
+        let table_index_meta = Arc::clone(&self.table_index_meta);
+        if let Some(index_metas) = table_index_meta.get(&tbl_cursor_id) {
+            for meta in index_metas.iter() {
                 // Build index key: (indexed_col_values..., rowid).
                 let mut key_values: Vec<SqliteValue> =
                     Vec::with_capacity(meta.column_indices.len() + 1);
@@ -4072,13 +4073,14 @@ impl VdbeEngine {
                 tsc.cursor.table_insert(&tsc.cx, rowid, &payload)?;
                 invalidate_storage_cursor_row_cache(tsc);
 
-                if let Some(index_metas) = self.table_index_meta.get(&cursor_id).cloned() {
+                let table_index_meta = Arc::clone(&self.table_index_meta);
+                if let Some(index_metas) = table_index_meta.get(&cursor_id) {
                     let old_row = parse_record(&payload).ok_or_else(|| {
                         FrankenError::internal(
                             "UPDATE conflict restore could not decode original row payload",
                         )
                     })?;
-                    for meta in &index_metas {
+                    for meta in index_metas.iter() {
                         let mut key_values =
                             Vec::with_capacity(meta.column_indices.len().saturating_add(1));
                         for &col_idx in &meta.column_indices {
@@ -4354,7 +4356,7 @@ impl VdbeEngine {
     pub fn execute(&mut self, program: &VdbeProgram) -> Result<ExecOutcome> {
         self.aggregates.clear();
         self.results.clear();
-        self.table_index_meta.clear();
+        self.table_index_meta = Arc::clone(program.shared_table_index_meta());
         self.last_compare_result = None;
         self.changes = 0;
         self.last_insert_rowid = 0;
@@ -4384,11 +4386,6 @@ impl VdbeEngine {
         let reg_count = usize::try_from(program.register_count()).unwrap_or(0);
         if self.registers.len() < reg_count {
             self.registers.resize(reg_count, SqliteValue::Null);
-        }
-
-        // Load table-to-index cursor metadata for REPLACE conflict resolution.
-        for (table_cursor, indexes) in program.table_index_meta() {
-            self.table_index_meta.insert(*table_cursor, indexes.clone());
         }
 
         let statement_debug_enabled =
@@ -4852,9 +4849,11 @@ impl VdbeEngine {
 
                 // ── Result Row ──────────────────────────────────────────
                 Opcode::ResultRow => {
-                    // Output p2 registers starting at p1.
+                    // Output p2 registers starting at p1.  Move values out of
+                    // the register file instead of cloning — the registers are
+                    // about to be overwritten on the next loop iteration.
                     let materialize_start = collect_vdbe_metrics.then(Instant::now);
-                    let row = self.collect_reg_range(op.p1, usize::try_from(op.p2).unwrap_or(0));
+                    let row = self.take_reg_range(op.p1, usize::try_from(op.p2).unwrap_or(0));
                     if collect_vdbe_metrics {
                         if let Some(materialize_start) = materialize_start {
                             FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
@@ -8400,6 +8399,24 @@ impl VdbeEngine {
         row
     }
 
+    /// Like `collect_reg_range` but *moves* values out of the register file,
+    /// leaving Null in the source registers. This avoids deep-cloning Text and
+    /// Blob values on the hot ResultRow path where the registers are about to
+    /// be overwritten by the next iteration anyway.
+    fn take_reg_range(
+        &mut self,
+        start: i32,
+        count: usize,
+    ) -> smallvec::SmallVec<[SqliteValue; 16]> {
+        let mut row = smallvec::SmallVec::with_capacity(count);
+        for offset in 0..count {
+            let val = Self::reg_with_offset(start, offset)
+                .map_or_else(|| SqliteValue::Null, |reg| self.take_reg(reg));
+            row.push(val);
+        }
+        row
+    }
+
     #[allow(dead_code)]
     fn collect_reg_range_refs(&self, start: i32, count: usize) -> Vec<&SqliteValue> {
         let mut row = Vec::with_capacity(count);
@@ -10366,7 +10383,7 @@ mod tests {
     use fsqlite_func::{FunctionRegistry, ScalarFunction, register_builtins};
     use fsqlite_mvcc::ConcurrentRegistry;
     use fsqlite_types::Snapshot;
-    use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+    use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4, VdbeOp};
 
     struct CancelExecutionFunc {
         cx: Cx,
@@ -10400,6 +10417,69 @@ mod tests {
             .into_iter()
             .map(|v| v.into_vec())
             .collect()
+    }
+
+    #[test]
+    fn test_execute_swaps_shared_table_index_meta_per_program() {
+        let first_program = {
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+            b.register_table_indexes(
+                7,
+                vec![IndexCursorMeta {
+                    cursor_id: 8,
+                    column_indices: vec![0, 2],
+                }],
+            );
+            b.finish().expect("first program should build")
+        };
+        let second_program = {
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+            b.finish().expect("second program should build")
+        };
+
+        let mut engine = VdbeEngine::new(
+            first_program
+                .register_count()
+                .max(second_program.register_count()),
+        );
+        assert!(engine.table_index_meta.is_empty());
+
+        let first_outcome = engine
+            .execute(&first_program)
+            .expect("first execution should succeed");
+        assert_eq!(first_outcome, ExecOutcome::Done);
+        assert!(Arc::ptr_eq(
+            &engine.table_index_meta,
+            first_program.shared_table_index_meta()
+        ));
+        let first_meta = engine
+            .table_index_meta
+            .get(&7)
+            .expect("first program metadata should be visible to the engine");
+        assert_eq!(first_meta.len(), 1);
+        assert_eq!(first_meta[0].cursor_id, 8);
+        assert_eq!(first_meta[0].column_indices, vec![0, 2]);
+
+        let second_outcome = engine
+            .execute(&second_program)
+            .expect("second execution should succeed");
+        assert_eq!(second_outcome, ExecOutcome::Done);
+        assert!(Arc::ptr_eq(
+            &engine.table_index_meta,
+            second_program.shared_table_index_meta()
+        ));
+        assert!(
+            engine.table_index_meta.is_empty(),
+            "executing a program without REPLACE metadata must clear prior program metadata"
+        );
     }
 
     /// Build and execute a program with bound SQL parameters.
