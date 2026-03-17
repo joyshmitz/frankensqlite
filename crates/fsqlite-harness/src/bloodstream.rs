@@ -14,6 +14,7 @@
 //!            gauge `bloodstream_active_bindings`.
 
 use fsqlite_types::SqliteValue;
+use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -170,6 +171,13 @@ pub enum DifferentialPlanError {
     ColumnOutOfBounds { column: usize, width: usize },
     /// Join keys must specify the same number of left/right columns.
     JoinKeyArityMismatch { left: usize, right: usize },
+    /// The compiled automaton no longer matches the input row shape.
+    SchemaChanged {
+        expected_width: usize,
+        actual_width: usize,
+    },
+    /// The VDBE program shape is not yet supported by the differential bootstrap.
+    UnsupportedProgram { detail: String },
 }
 
 impl fmt::Display for DifferentialPlanError {
@@ -180,6 +188,16 @@ impl fmt::Display for DifferentialPlanError {
             }
             Self::JoinKeyArityMismatch { left, right } => {
                 write!(f, "join key arity mismatch: left={left}, right={right}")
+            }
+            Self::SchemaChanged {
+                expected_width,
+                actual_width,
+            } => write!(
+                f,
+                "schema changed: expected row width {expected_width}, got {actual_width}"
+            ),
+            Self::UnsupportedProgram { detail } => {
+                write!(f, "unsupported differential VDBE program: {detail}")
             }
         }
     }
@@ -192,12 +210,33 @@ impl std::error::Error for DifferentialPlanError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DifferentialAutomaton {
     operators: Vec<DifferentialOperator>,
+    expected_input_width: Option<usize>,
 }
 
 impl DifferentialAutomaton {
     /// Create an automaton from an ordered operator list.
     pub fn new(operators: Vec<DifferentialOperator>) -> Self {
-        Self { operators }
+        Self {
+            operators,
+            expected_input_width: None,
+        }
+    }
+
+    /// Bootstrap an automaton from a narrow supported subset of VDBE bytecode.
+    ///
+    /// Current support is intentionally fail-closed:
+    /// - single `ResultRow`
+    /// - projection via plain `Column` opcodes
+    /// - optional `=` filter compiled as `Column`, literal load, `IsNull`, `Ne`
+    /// - full-scan loop shape (`Rewind` ... `ResultRow` ... `Next`)
+    pub fn from_vdbe_ops(
+        ops: &[VdbeOp],
+        expected_input_width: usize,
+    ) -> Result<Self, DifferentialPlanError> {
+        Ok(Self {
+            operators: translate_vdbe_ops(ops)?,
+            expected_input_width: Some(expected_input_width),
+        })
     }
 
     /// Execute the operator sequence over a weighted-row batch.
@@ -210,6 +249,16 @@ impl DifferentialAutomaton {
         );
 
         let mut current: Vec<_> = rows.iter().filter(|row| !row.is_zero()).cloned().collect();
+        if let Some(expected_width) = self.expected_input_width {
+            for row in &current {
+                if row.values.len() != expected_width {
+                    return Err(DifferentialPlanError::SchemaChanged {
+                        expected_width,
+                        actual_width: row.values.len(),
+                    });
+                }
+            }
+        }
         for operator in &self.operators {
             current = operator.apply(&current)?;
         }
@@ -336,6 +385,192 @@ fn index_weighted_rows(
         index.entry(key).or_default().push(row.clone());
     }
     Ok(index)
+}
+
+fn translate_vdbe_ops(ops: &[VdbeOp]) -> Result<Vec<DifferentialOperator>, DifferentialPlanError> {
+    let result_row_indices = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, op)| (op.opcode == Opcode::ResultRow).then_some(idx))
+        .collect::<Vec<_>>();
+    let [result_row_idx] = result_row_indices.as_slice() else {
+        return Err(DifferentialPlanError::UnsupportedProgram {
+            detail: format!(
+                "expected exactly one ResultRow opcode, found {}",
+                result_row_indices.len()
+            ),
+        });
+    };
+    let result_row = &ops[*result_row_idx];
+    let output_columns =
+        usize::try_from(result_row.p2).map_err(|_| DifferentialPlanError::UnsupportedProgram {
+            detail: format!(
+                "ResultRow column count is not representable as usize (p2={})",
+                result_row.p2
+            ),
+        })?;
+    let output_register = result_row.p1;
+    let projection_start = result_row_idx.checked_sub(output_columns).ok_or_else(|| {
+        DifferentialPlanError::UnsupportedProgram {
+            detail: "ResultRow appears before its projection loads".to_owned(),
+        }
+    })?;
+    let projection_columns = extract_vdbe_projection(
+        &ops[projection_start..*result_row_idx],
+        output_register,
+        output_columns,
+    )?;
+    let rewind_idx = ops[..projection_start]
+        .iter()
+        .rposition(|op| op.opcode == Opcode::Rewind)
+        .ok_or_else(|| DifferentialPlanError::UnsupportedProgram {
+            detail: "expected a Rewind opcode before ResultRow".to_owned(),
+        })?;
+    let next_exists = ops[result_row_idx + 1..]
+        .iter()
+        .any(|op| op.opcode == Opcode::Next);
+    if !next_exists {
+        return Err(DifferentialPlanError::UnsupportedProgram {
+            detail: "expected a Next opcode after ResultRow".to_owned(),
+        });
+    }
+
+    let mut operators = Vec::new();
+    let filter_slice = &ops[rewind_idx + 1..projection_start];
+    if !filter_slice.is_empty() {
+        operators.push(extract_vdbe_filter(filter_slice)?);
+    }
+    operators.push(DifferentialOperator::Project {
+        columns: projection_columns,
+    });
+    Ok(operators)
+}
+
+fn extract_vdbe_projection(
+    projection_ops: &[VdbeOp],
+    base_register: i32,
+    output_columns: usize,
+) -> Result<Vec<usize>, DifferentialPlanError> {
+    if projection_ops.len() != output_columns {
+        return Err(DifferentialPlanError::UnsupportedProgram {
+            detail: format!(
+                "expected {output_columns} projection opcodes before ResultRow, found {}",
+                projection_ops.len()
+            ),
+        });
+    }
+
+    projection_ops
+        .iter()
+        .enumerate()
+        .map(|(offset, op)| {
+            let expected_register = base_register
+                + i32::try_from(offset).map_err(|_| DifferentialPlanError::UnsupportedProgram {
+                    detail: "projection register offset overflowed i32".to_owned(),
+                })?;
+            match op.opcode {
+                Opcode::Column if op.p3 == expected_register => {
+                    usize::try_from(op.p2).map_err(|_| DifferentialPlanError::UnsupportedProgram {
+                        detail: format!("negative column index in projection opcode: {}", op.p2),
+                    })
+                }
+                Opcode::Rowid => Err(DifferentialPlanError::UnsupportedProgram {
+                    detail: "rowid projection is not yet supported by differential bootstrap"
+                        .to_owned(),
+                }),
+                _ => Err(DifferentialPlanError::UnsupportedProgram {
+                    detail: format!(
+                        "projection opcode {:?} is not supported by differential bootstrap",
+                        op.opcode
+                    ),
+                }),
+            }
+        })
+        .collect()
+}
+
+fn extract_vdbe_filter(
+    filter_ops: &[VdbeOp],
+) -> Result<DifferentialOperator, DifferentialPlanError> {
+    let [column_op, literal_op, is_null_op, compare_op] = filter_ops else {
+        return Err(DifferentialPlanError::UnsupportedProgram {
+            detail: format!(
+                "expected 4 opcodes for simple equality filter, found {}",
+                filter_ops.len()
+            ),
+        });
+    };
+
+    let column = match column_op.opcode {
+        Opcode::Column => usize::try_from(column_op.p2).map_err(|_| {
+            DifferentialPlanError::UnsupportedProgram {
+                detail: format!("negative filter column index: {}", column_op.p2),
+            }
+        })?,
+        Opcode::Rowid => {
+            return Err(DifferentialPlanError::UnsupportedProgram {
+                detail: "rowid filters are not yet supported by differential bootstrap".to_owned(),
+            });
+        }
+        _ => {
+            return Err(DifferentialPlanError::UnsupportedProgram {
+                detail: format!(
+                    "filter must start with Column/Rowid, found {:?}",
+                    column_op.opcode
+                ),
+            });
+        }
+    };
+
+    let (literal_register, value) = decode_vdbe_literal_load(literal_op)?;
+    if matches!(value, SqliteValue::Null) {
+        return Err(DifferentialPlanError::UnsupportedProgram {
+            detail: "NULL equality filters are not supported by differential bootstrap".to_owned(),
+        });
+    }
+    if is_null_op.opcode != Opcode::IsNull || is_null_op.p1 != literal_register {
+        return Err(DifferentialPlanError::UnsupportedProgram {
+            detail: "simple equality filter must null-check the literal register".to_owned(),
+        });
+    }
+    if compare_op.opcode != Opcode::Ne
+        || compare_op.p1 != literal_register
+        || compare_op.p3 != column_op.p3
+    {
+        return Err(DifferentialPlanError::UnsupportedProgram {
+            detail: "simple equality filter must compare literal register against the filter column using Ne".to_owned(),
+        });
+    }
+
+    Ok(DifferentialOperator::FilterEq { column, value })
+}
+
+fn decode_vdbe_literal_load(op: &VdbeOp) -> Result<(i32, SqliteValue), DifferentialPlanError> {
+    match op.opcode {
+        Opcode::Integer => Ok((op.p2, SqliteValue::Integer(i64::from(op.p1)))),
+        Opcode::Int64 => match op.p4 {
+            P4::Int64(value) => Ok((op.p2, SqliteValue::Integer(value))),
+            _ => Err(DifferentialPlanError::UnsupportedProgram {
+                detail: "Int64 opcode missing P4::Int64 payload".to_owned(),
+            }),
+        },
+        Opcode::Real => match op.p4 {
+            P4::Real(value) => Ok((op.p2, SqliteValue::Float(value))),
+            _ => Err(DifferentialPlanError::UnsupportedProgram {
+                detail: "Real opcode missing P4::Real payload".to_owned(),
+            }),
+        },
+        Opcode::String8 => match &op.p4 {
+            P4::Str(value) => Ok((op.p2, SqliteValue::Text(value.clone()))),
+            _ => Err(DifferentialPlanError::UnsupportedProgram {
+                detail: "String8 opcode missing P4::Str payload".to_owned(),
+            }),
+        },
+        Opcode::Null => Ok((op.p2, SqliteValue::Null)),
+        _ => Err(DifferentialPlanError::UnsupportedProgram {
+            detail: format!("literal opcode {:?} is not supported", op.opcode),
+        }),
+    }
 }
 
 /// Compute `ΔLeft ⋈ Right`, preserving algebraic weights.
@@ -1033,6 +1268,41 @@ impl fmt::Display for ContractViolation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_ast::Statement;
+    use fsqlite_parser::Parser;
+    use fsqlite_vdbe::ProgramBuilder;
+    use fsqlite_vdbe::codegen::{CodegenContext, ColumnInfo, TableSchema, codegen_select};
+
+    fn bloodstream_test_schema() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "users".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("id", 'd', false),
+                ColumnInfo::basic("name", 'B', false),
+            ],
+            indexes: vec![],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
+    fn compile_select(sql: &str, schema: &[TableSchema]) -> fsqlite_vdbe::VdbeProgram {
+        let mut parser = Parser::from_sql(sql);
+        let (stmts, errors) = parser.parse_all();
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let stmt = match &stmts[0] {
+            Statement::Select(stmt) => stmt,
+            other => panic!("expected SELECT statement, got {other:?}"),
+        };
+        let mut builder = ProgramBuilder::new();
+        codegen_select(&mut builder, stmt, schema, &CodegenContext::default())
+            .expect("codegen select");
+        builder.finish().expect("finish program")
+    }
 
     #[test]
     fn delta_kind_display_roundtrip() {
@@ -1273,6 +1543,110 @@ mod tests {
                 width: 1,
             })
         );
+    }
+
+    #[test]
+    fn differential_automaton_bootstraps_projection_from_vdbe_ops() {
+        let schema = bloodstream_test_schema();
+        let program = compile_select("SELECT name FROM users;", &schema);
+        let automaton =
+            DifferentialAutomaton::from_vdbe_ops(program.ops(), schema[0].columns.len()).unwrap();
+        let rows = vec![
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alice".to_owned()),
+                ],
+                1,
+            ),
+            WeightedRow::new(
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                -1,
+            ),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).unwrap(),
+            vec![
+                WeightedRow::new(vec![SqliteValue::Text("alice".to_owned())], 1),
+                WeightedRow::new(vec![SqliteValue::Text("bob".to_owned())], -1),
+            ]
+        );
+    }
+
+    #[test]
+    fn differential_automaton_bootstraps_filter_eq_from_vdbe_ops() {
+        let schema = bloodstream_test_schema();
+        let program = compile_select("SELECT name FROM users WHERE id = 2;", &schema);
+        let automaton =
+            DifferentialAutomaton::from_vdbe_ops(program.ops(), schema[0].columns.len()).unwrap();
+        let rows = vec![
+            WeightedRow::new(
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alice".to_owned()),
+                ],
+                1,
+            ),
+            WeightedRow::new(
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            automaton.execute(&rows).unwrap(),
+            vec![WeightedRow::new(
+                vec![SqliteValue::Text("bob".to_owned())],
+                1,
+            )]
+        );
+    }
+
+    #[test]
+    fn differential_automaton_bootstrap_rejects_unsupported_sorter_program() {
+        let schema = bloodstream_test_schema();
+        let program = compile_select("SELECT name FROM users ORDER BY name;", &schema);
+
+        assert!(matches!(
+            DifferentialAutomaton::from_vdbe_ops(program.ops(), schema[0].columns.len()),
+            Err(DifferentialPlanError::UnsupportedProgram { .. })
+        ));
+    }
+
+    #[test]
+    fn differential_automaton_bootstrap_detects_schema_width_drift() {
+        let schema = bloodstream_test_schema();
+        let program = compile_select("SELECT name FROM users;", &schema);
+        let automaton =
+            DifferentialAutomaton::from_vdbe_ops(program.ops(), schema[0].columns.len()).unwrap();
+        let rows = vec![WeightedRow::new(
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("alice".to_owned()),
+                SqliteValue::Text("unexpected".to_owned()),
+            ],
+            1,
+        )];
+
+        assert_eq!(
+            automaton.execute(&rows),
+            Err(DifferentialPlanError::SchemaChanged {
+                expected_width: 2,
+                actual_width: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn differential_automaton_bootstrap_rejects_null_equality_filter() {
+        let schema = bloodstream_test_schema();
+        let program = compile_select("SELECT name FROM users WHERE id = NULL;", &schema);
+
+        assert!(matches!(
+            DifferentialAutomaton::from_vdbe_ops(program.ops(), schema[0].columns.len()),
+            Err(DifferentialPlanError::UnsupportedProgram { .. })
+        ));
     }
 
     #[test]
