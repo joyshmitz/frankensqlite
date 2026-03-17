@@ -653,6 +653,19 @@ impl ConcurrentRegistry {
         self.active.remove(&session_id)
     }
 
+    fn can_use_uncontended_prepare_fast_path(&self, session_id: u64, begin_seq: CommitSeq) -> bool {
+        self.active.len() == 1
+            && self.active.contains_key(&session_id)
+            && self
+                .committed_readers
+                .last()
+                .is_none_or(|reader| reader.commit_seq <= begin_seq)
+            && self
+                .committed_writers
+                .last()
+                .is_none_or(|writer| writer.commit_seq <= begin_seq)
+    }
+
     /// Prune committed SSI history that cannot overlap any active transaction.
     fn prune_committed_conflict_history(&mut self) {
         let Some(min_active_begin) = self.history_retention_horizon() else {
@@ -1754,6 +1767,27 @@ pub fn prepare_concurrent_commit_with_ssi(
             handle.mark_aborted();
         }
         return Err((MvccError::BusySnapshot, FcwResult::Clean));
+    }
+
+    if registry.can_use_uncontended_prepare_fast_path(session_id, begin_seq) {
+        let read_key_summary = summarize_witness_keys(&sorted_read_keys);
+        let write_key_summary = summarize_witness_keys(&sorted_write_keys);
+        return Ok(PreparedConcurrentCommit {
+            session_id,
+            planned_commit_seq,
+            txn_token: txn,
+            begin_seq,
+            read_keys: sorted_read_keys,
+            read_key_summary,
+            write_keys: sorted_write_keys,
+            write_key_summary,
+            write_set_pages,
+            has_in_rw: false,
+            has_out_rw: false,
+            incoming_edges: Vec::new(),
+            outgoing_edges: Vec::new(),
+            dro_t3_decision: None,
+        });
     }
 
     // Step 2: Discover SSI edges without publishing side effects yet.
@@ -3064,6 +3098,119 @@ mod tests {
         assert!(
             registry.committed_readers.is_empty(),
             "history older than the surviving retention horizon should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_can_use_uncontended_prepare_fast_path_only_for_single_active_session_without_overlap() {
+        let mut registry = ConcurrentRegistry::new();
+        let session_id = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session");
+
+        assert!(
+            registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)),
+            "single active session with no newer committed history should use the fast path"
+        );
+
+        let other_session_id = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("other session");
+        assert!(
+            !registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)),
+            "multiple active sessions must force full SSI edge discovery"
+        );
+        registry
+            .remove(other_session_id)
+            .expect("remove other session");
+        let session_token = registry.get(session_id).expect("handle").txn_token();
+
+        registry
+            .committed_writers
+            .push(crate::ssi_validation::CommittedWriterInfo {
+                token: session_token,
+                commit_seq: CommitSeq::new(11),
+                had_out_rw: false,
+                keys: vec![WitnessKey::Page(test_page(7))],
+            });
+
+        assert!(
+            !registry.can_use_uncontended_prepare_fast_path(session_id, CommitSeq::new(10)),
+            "committed history newer than the begin sequence must disable the fast path"
+        );
+    }
+
+    #[test]
+    fn test_prepare_concurrent_commit_with_ssi_uses_uncontended_fast_path_after_stale_history_is_pruned()
+     {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let seed_session = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut seed = registry.get_mut(seed_session).unwrap();
+            seed.record_read(test_page(3));
+            concurrent_write_page(
+                &mut seed,
+                &lock_table,
+                seed_session,
+                test_page(5),
+                test_data(),
+            )
+            .unwrap();
+        }
+        concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            seed_session,
+            CommitSeq::new(11),
+        )
+        .unwrap();
+        registry
+            .remove(seed_session)
+            .expect("remove committed seed");
+        assert!(
+            registry.committed_writers.is_empty(),
+            "once no active sessions remain, stale committed history should already be pruned"
+        );
+
+        let session_id = registry.begin_concurrent(test_snapshot(11)).unwrap();
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            handle.record_read(test_page(7));
+            concurrent_write_page(
+                &mut handle,
+                &lock_table,
+                session_id,
+                test_page(9),
+                test_data(),
+            )
+            .unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            session_id,
+            CommitSeq::new(12),
+        )
+        .expect("prepare should succeed");
+
+        assert!(
+            prepared.conflicting_txns().is_empty(),
+            "the uncontended fast path should not manufacture SSI conflicts"
+        );
+        assert!(
+            prepared.conflict_pages().contains(&test_page(9)),
+            "the plan should still carry the write set pages forward to finalize"
+        );
+        assert_eq!(
+            prepared.dro_t3_decision(),
+            None,
+            "uncontended fast path should bypass DRO evaluation"
         );
     }
 

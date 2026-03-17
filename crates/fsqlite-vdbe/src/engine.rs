@@ -3466,18 +3466,18 @@ pub struct VdbeEngine {
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
     /// INTEGER PRIMARY KEY alias column positions keyed by root page number.
     /// Used to decode storage-cursor payload columns for rowid tables.
-    rowid_alias_col_by_root_page: HashMap<i32, usize>,
+    rowid_alias_col_by_root_page: Arc<HashMap<i32, usize>>,
     /// Declared table column counts keyed by root page number.
     /// Used to distinguish canonical SQLite payloads from legacy short records.
-    table_column_count_by_root_page: HashMap<i32, usize>,
+    table_column_count_by_root_page: Arc<HashMap<i32, usize>>,
     /// Per-cursor monotonic sequence counters for `Opcode::Sequence`.
     sequence_counters: HashMap<i32, i64>,
     /// Column default values by root page number (for ALTER TABLE ADD COLUMN).
     /// When a row has fewer columns than the schema expects, defaults from this
     /// map are applied instead of returning NULL.
-    column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
+    column_defaults_by_root_page: Arc<HashMap<i32, Vec<Option<SqliteValue>>>>,
     /// Per-index descending flags keyed by index root page number.
-    index_desc_flags_by_root_page: HashMap<i32, Vec<bool>>,
+    index_desc_flags_by_root_page: Arc<HashMap<i32, Vec<bool>>>,
     /// Mapping from cursor_id to root_page for default value lookup.
     cursor_root_pages: HashMap<i32, i32>,
     /// Open virtual table cursors keyed by cursor number.
@@ -3829,7 +3829,10 @@ impl VdbeEngine {
         Self {
             registers: smallvec::smallvec![SqliteValue::Null; count as usize],
             bindings: Vec::new(),
-            execution_cx: execution_cx.create_child(),
+            // The caller already supplies a per-execution context; cloning it
+            // keeps cancellation/tracing lineage while avoiding another child
+            // allocation on every statement execution.
+            execution_cx: execution_cx.clone(),
             page_size,
             trace_opcodes: opcode_trace_enabled(),
             results: Vec::with_capacity(64),
@@ -3858,11 +3861,11 @@ impl VdbeEngine {
             rowsets: SwissIndex::new(),
             fk_counter: 0,
             autoincrement_seq_by_root_page: HashMap::new(),
-            rowid_alias_col_by_root_page: HashMap::new(),
-            table_column_count_by_root_page: HashMap::new(),
+            rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
+            table_column_count_by_root_page: Arc::new(HashMap::new()),
             sequence_counters: HashMap::new(),
-            column_defaults_by_root_page: HashMap::new(),
-            index_desc_flags_by_root_page: HashMap::new(),
+            column_defaults_by_root_page: Arc::new(HashMap::new()),
+            index_desc_flags_by_root_page: Arc::new(HashMap::new()),
             cursor_root_pages: HashMap::new(),
             vtab_cursors: SwissIndex::new(),
             vtab_instances: SwissIndex::new(),
@@ -3924,7 +3927,7 @@ impl VdbeEngine {
     }
 
     fn derive_execution_cx(&self) -> Cx {
-        self.execution_cx.create_child()
+        self.execution_cx.clone()
     }
 
     fn index_desc_flags_for_root(&self, root_page: i32) -> Vec<bool> {
@@ -4267,11 +4270,21 @@ impl VdbeEngine {
 
     /// Provide INTEGER PRIMARY KEY alias column positions keyed by root page.
     pub fn set_rowid_alias_column_by_root_page(&mut self, map: HashMap<i32, usize>) {
+        self.rowid_alias_col_by_root_page = Arc::new(map);
+    }
+
+    /// Reuse shared INTEGER PRIMARY KEY alias column positions keyed by root page.
+    pub fn set_shared_rowid_alias_column_by_root_page(&mut self, map: Arc<HashMap<i32, usize>>) {
         self.rowid_alias_col_by_root_page = map;
     }
 
     /// Provide declared table column counts keyed by root page.
     pub fn set_table_column_count_by_root_page(&mut self, map: HashMap<i32, usize>) {
+        self.table_column_count_by_root_page = Arc::new(map);
+    }
+
+    /// Reuse shared declared table column counts keyed by root page.
+    pub fn set_shared_table_column_count_by_root_page(&mut self, map: Arc<HashMap<i32, usize>>) {
         self.table_column_count_by_root_page = map;
     }
 
@@ -4281,11 +4294,24 @@ impl VdbeEngine {
         &mut self,
         map: HashMap<i32, Vec<Option<SqliteValue>>>,
     ) {
+        self.column_defaults_by_root_page = Arc::new(map);
+    }
+
+    /// Reuse shared column default values by root page.
+    pub fn set_shared_column_defaults_by_root_page(
+        &mut self,
+        map: Arc<HashMap<i32, Vec<Option<SqliteValue>>>>,
+    ) {
         self.column_defaults_by_root_page = map;
     }
 
     /// Provide per-index descending flags keyed by index root page.
     pub fn set_index_desc_flags_by_root_page(&mut self, map: HashMap<i32, Vec<bool>>) {
+        self.index_desc_flags_by_root_page = Arc::new(map);
+    }
+
+    /// Reuse shared per-index descending flags keyed by index root page.
+    pub fn set_shared_index_desc_flags_by_root_page(&mut self, map: Arc<HashMap<i32, Vec<bool>>>) {
         self.index_desc_flags_by_root_page = map;
     }
 

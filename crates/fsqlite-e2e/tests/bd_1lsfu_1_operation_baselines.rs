@@ -490,3 +490,149 @@ fn capture_all_nine_baselines_frankensqlite() {
         );
     }
 }
+
+// ─── Manual perf probes ────────────────────────────────────────────────
+
+fn median_f64(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    values[values.len() / 2]
+}
+
+#[test]
+#[ignore = "manual perf probe; run via rch when investigating write throughput"]
+fn manual_perf_probe_write_10k_autocommit_prepared_and_ad_hoc() {
+    const ROW_COUNT: i64 = 10_000;
+    const MEASURED_RUNS: usize = 3;
+    const CREATE_TABLE: &str =
+        "CREATE TABLE bench (id INTEGER PRIMARY KEY, data TEXT, value REAL);";
+    const INSERT_SQL: &str = "INSERT INTO bench VALUES (?1, ('data_' || ?1), (?1 * 0.137));";
+
+    fn apply_pragmas_csqlite(conn: &rusqlite::Connection) {
+        conn.execute_batch(
+            "PRAGMA page_size = 4096;\
+             PRAGMA journal_mode = WAL;\
+             PRAGMA synchronous = NORMAL;\
+             PRAGMA cache_size = -64000;",
+        )
+        .ok();
+    }
+
+    fn apply_pragmas_fsqlite(conn: &fsqlite::Connection) {
+        for pragma in [
+            "PRAGMA page_size = 4096;",
+            "PRAGMA journal_mode = WAL;",
+            "PRAGMA synchronous = NORMAL;",
+            "PRAGMA cache_size = -64000;",
+        ] {
+            let _ = conn.execute(pragma);
+        }
+    }
+
+    fn run_csqlite_prepared_once() -> f64 {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_pragmas_csqlite(&conn);
+        conn.execute_batch(CREATE_TABLE).unwrap();
+        let start = std::time::Instant::now();
+        let mut stmt = conn.prepare(INSERT_SQL).unwrap();
+        for i in 0..ROW_COUNT {
+            stmt.execute(rusqlite::params![i]).unwrap();
+        }
+        let elapsed = start.elapsed();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bench", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, ROW_COUNT);
+        ROW_COUNT as f64 / elapsed.as_secs_f64()
+    }
+
+    fn run_csqlite_ad_hoc_once() -> f64 {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        apply_pragmas_csqlite(&conn);
+        conn.execute_batch(CREATE_TABLE).unwrap();
+        let start = std::time::Instant::now();
+        for i in 0..ROW_COUNT {
+            conn.execute(INSERT_SQL, rusqlite::params![i]).unwrap();
+        }
+        let elapsed = start.elapsed();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bench", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, ROW_COUNT);
+        ROW_COUNT as f64 / elapsed.as_secs_f64()
+    }
+
+    fn run_fsqlite_prepared_once() -> f64 {
+        let conn = fsqlite::Connection::open(":memory:").unwrap();
+        apply_pragmas_fsqlite(&conn);
+        conn.execute(CREATE_TABLE).unwrap();
+        let stmt = conn.prepare(INSERT_SQL).unwrap();
+        let start = std::time::Instant::now();
+        for i in 0..ROW_COUNT {
+            stmt.execute_with_params(&[fsqlite_types::value::SqliteValue::Integer(i)])
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            fsqlite_types::value::SqliteValue::Integer(ROW_COUNT)
+        );
+        ROW_COUNT as f64 / elapsed.as_secs_f64()
+    }
+
+    fn run_fsqlite_ad_hoc_once() -> f64 {
+        let conn = fsqlite::Connection::open(":memory:").unwrap();
+        apply_pragmas_fsqlite(&conn);
+        conn.execute(CREATE_TABLE).unwrap();
+        let start = std::time::Instant::now();
+        for i in 0..ROW_COUNT {
+            conn.execute_with_params(INSERT_SQL, &[fsqlite_types::value::SqliteValue::Integer(i)])
+                .unwrap();
+        }
+        let elapsed = start.elapsed();
+        let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            fsqlite_types::value::SqliteValue::Integer(ROW_COUNT)
+        );
+        ROW_COUNT as f64 / elapsed.as_secs_f64()
+    }
+
+    let csqlite_prepared: Vec<f64> = (0..MEASURED_RUNS)
+        .map(|_| run_csqlite_prepared_once())
+        .collect();
+    let csqlite_ad_hoc: Vec<f64> = (0..MEASURED_RUNS)
+        .map(|_| run_csqlite_ad_hoc_once())
+        .collect();
+    let fsqlite_prepared: Vec<f64> = (0..MEASURED_RUNS)
+        .map(|_| run_fsqlite_prepared_once())
+        .collect();
+    let fsqlite_ad_hoc: Vec<f64> = (0..MEASURED_RUNS)
+        .map(|_| run_fsqlite_ad_hoc_once())
+        .collect();
+
+    let csqlite_prepared_median = median_f64(csqlite_prepared.clone());
+    let csqlite_ad_hoc_median = median_f64(csqlite_ad_hoc.clone());
+    let fsqlite_prepared_median = median_f64(fsqlite_prepared.clone());
+    let fsqlite_ad_hoc_median = median_f64(fsqlite_ad_hoc.clone());
+
+    eprintln!(
+        "manual_perf_probe.write_10k_autocommit.csqlite_prepared.samples={csqlite_prepared:?} median_rows_per_sec={csqlite_prepared_median:.1}"
+    );
+    eprintln!(
+        "manual_perf_probe.write_10k_autocommit.csqlite_ad_hoc.samples={csqlite_ad_hoc:?} median_rows_per_sec={csqlite_ad_hoc_median:.1}"
+    );
+    eprintln!(
+        "manual_perf_probe.write_10k_autocommit.fsqlite_prepared.samples={fsqlite_prepared:?} median_rows_per_sec={fsqlite_prepared_median:.1} ratio_vs_csqlite={:.4}",
+        fsqlite_prepared_median / csqlite_prepared_median
+    );
+    eprintln!(
+        "manual_perf_probe.write_10k_autocommit.fsqlite_ad_hoc.samples={fsqlite_ad_hoc:?} median_rows_per_sec={fsqlite_ad_hoc_median:.1} ratio_vs_csqlite={:.4}",
+        fsqlite_ad_hoc_median / csqlite_prepared_median
+    );
+
+    assert!(csqlite_prepared_median > 0.0);
+    assert!(csqlite_ad_hoc_median > 0.0);
+    assert!(fsqlite_prepared_median > 0.0);
+    assert!(fsqlite_ad_hoc_median > 0.0);
+}

@@ -688,6 +688,7 @@ struct PublishedPagerState {
     freelist_count: AtomicUsize,
     checkpoint_active: AtomicBool,
     page_set_size: AtomicUsize,
+    publication_write_count: AtomicU64,
     read_retry_count: StripedCounter64,
     published_page_hits: StripedCounter64,
     pages: RwLock<HashMap<PageNumber, PageData, foldhash::fast::FixedState>>,
@@ -711,6 +712,7 @@ impl PublishedPagerState {
             freelist_count: AtomicUsize::new(freelist_count),
             checkpoint_active: AtomicBool::new(false),
             page_set_size: AtomicUsize::new(0),
+            publication_write_count: AtomicU64::new(0),
             read_retry_count: StripedCounter64::new(),
             published_page_hits: StripedCounter64::new(),
             pages: RwLock::new(HashMap::with_hasher(foldhash::fast::FixedState::default())),
@@ -818,6 +820,8 @@ impl PublishedPagerState {
             mutate_pages(&mut pages);
             pages.len()
         };
+        self.publication_write_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
         self.visible_commit_seq
             .store(update.visible_commit_seq.get(), AtomicOrdering::Release);
         self.db_size.store(update.db_size, AtomicOrdering::Release);
@@ -880,6 +884,10 @@ impl PublishedPagerState {
 
     fn published_page_hits(&self) -> u64 {
         self.published_page_hits.load()
+    }
+
+    fn publication_write_count(&self) -> u64 {
+        self.publication_write_count.load(AtomicOrdering::Relaxed)
     }
 }
 
@@ -1423,6 +1431,12 @@ where
     #[must_use]
     pub fn published_page_hits(&self) -> u64 {
         self.published.published_page_hits()
+    }
+
+    /// Number of publish-plane writes applied to this pager.
+    #[must_use]
+    pub fn publication_write_count(&self) -> u64 {
+        self.published.publication_write_count()
     }
 
     /// Number of frames currently in the WAL for this pager.
@@ -2120,21 +2134,14 @@ impl<V: Vfs> SimpleTransaction<V> {
         pages
     }
 
-    fn publish_committed_metadata(&self, cx: &Cx, update: PublishedPagerUpdate) {
+    fn publish_committed_state(&self, cx: &Cx, update: PublishedPagerUpdate) {
         self.published.publish(cx, update, |pages| {
             pages.retain(|page_no, _| page_no.get() <= update.db_size);
-            for page_no in self.write_set.keys() {
-                pages.remove(page_no);
+            pages.reserve(self.write_set.len());
+            for (&page_no, staged) in &self.write_set {
+                pages.insert(page_no, staged.published_page());
             }
         });
-    }
-
-    fn publish_committed_pages(&self, cx: &Cx, update: PublishedPagerUpdate) {
-        for (&page_no, staged) in &self.write_set {
-            let _ =
-                self.published
-                    .publish_observed_page(cx, update, page_no, staged.published_page());
-        }
     }
 
     fn drain_committed_cache_pages(&mut self) -> Vec<(PageNumber, PageBuf)> {
@@ -2144,6 +2151,11 @@ impl<V: Vfs> SimpleTransaction<V> {
         }
         self.write_pages_sorted.clear();
         committed_pages
+    }
+
+    fn discard_committed_pages(&mut self) {
+        self.write_set.clear();
+        self.write_pages_sorted.clear();
     }
 }
 
@@ -2737,10 +2749,9 @@ where
                 freelist_count: inner.freelist.len(),
                 checkpoint_active: inner.checkpoint_active,
             };
-            // Keep the mutex only for the authoritative metadata transition.
-            // Dirty-page fanout can race safely after commit because stale
-            // publication is ignored and the durable state is already fixed.
-            self.publish_committed_metadata(cx, publish_update);
+            // Publish metadata and committed pages in one pass so small
+            // autocommit writes do not pay multiple snapshot-plane updates.
+            self.publish_committed_state(cx, publish_update);
 
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
@@ -2748,24 +2759,28 @@ where
 
             drop(inner);
 
-            self.publish_committed_pages(cx, publish_update);
-
-            // Cache admission is a post-commit optimization, so re-enter the
-            // cache mutex only instead of holding the pager metadata lock across the
-            // entire success path.
-            let committed_cache_pages = self.drain_committed_cache_pages();
-            if !committed_cache_pages.is_empty() {
-                let inner = self
-                    .inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if inner.commit_seq == publish_update.visible_commit_seq {
-                    let mut cache = self
-                        .cache
+            // WAL readers prefer the published snapshot plane or WAL backend,
+            // so copying committed pages into the shared cache is wasted work.
+            if publish_update.journal_mode == JournalMode::Wal {
+                self.discard_committed_pages();
+            } else {
+                // Cache admission is a post-commit optimization, so re-enter
+                // only the cache mutex instead of holding the pager metadata
+                // lock across the entire success path.
+                let committed_cache_pages = self.drain_committed_cache_pages();
+                if !committed_cache_pages.is_empty() {
+                    let inner = self
+                        .inner
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    for (page_no, buf) in committed_cache_pages {
-                        cache.insert_buffer(page_no, buf);
+                    if inner.commit_seq == publish_update.visible_commit_seq {
+                        let mut cache = self
+                            .cache
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for (page_no, buf) in committed_cache_pages {
+                            cache.insert_buffer(page_no, buf);
+                        }
                     }
                 }
             }
@@ -10375,6 +10390,70 @@ mod tests {
         assert!(
             !after.checkpoint_active,
             "bead_id={BEAD_ID} case=publication_checkpoint_inactive_after_commit"
+        );
+    }
+
+    #[test]
+    fn test_commit_batches_publication_writes() {
+        init_publication_test_tracing();
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let publication_writes_before_commit = pager.publication_write_count();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0x5A; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        assert_eq!(
+            pager.publication_write_count(),
+            publication_writes_before_commit + 1,
+            "bead_id={BEAD_ID} case=commit_batches_publication_writes"
+        );
+    }
+
+    #[test]
+    fn test_wal_commit_skips_post_commit_cache_admission() {
+        init_publication_test_tracing();
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = PathBuf::from("/wal_commit_skips_post_commit_cache_admission.db");
+        let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT).unwrap();
+        let (backend, _frames, _begin_calls, _batch_calls) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let cached_pages_before_commit = pager.cache_metrics_snapshot().unwrap().cached_pages;
+        let ps = PageSize::DEFAULT.as_usize();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0xAB; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let cache_after_commit = pager.cache_metrics_snapshot().unwrap();
+        assert_eq!(
+            cache_after_commit.cached_pages,
+            cached_pages_before_commit + 1,
+            "bead_id={BEAD_ID} case=wal_commit_avoids_post_commit_cache_fanout"
+        );
+
+        let read_before = read_surface_snapshot(&pager);
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(
+            reader.get_page(&cx, p).unwrap().as_ref()[0],
+            0xAB,
+            "bead_id={BEAD_ID} case=wal_commit_publication_keeps_read_visibility"
+        );
+        let read_after = read_surface_snapshot(&pager);
+        assert_eq!(
+            read_after.cache, read_before.cache,
+            "bead_id={BEAD_ID} case=wal_post_commit_read_skips_cache"
+        );
+        assert_eq!(
+            read_after.published_hits,
+            read_before.published_hits + 1,
+            "bead_id={BEAD_ID} case=wal_post_commit_read_hits_publication"
         );
     }
 
