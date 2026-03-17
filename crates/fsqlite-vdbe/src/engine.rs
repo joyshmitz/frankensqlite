@@ -30,6 +30,7 @@ use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
+use fsqlite_mvcc::ConcurrentPageState;
 #[cfg(test)]
 use fsqlite_mvcc::concurrent_write_page;
 use fsqlite_mvcc::{
@@ -807,6 +808,13 @@ struct SharedTxnPageIo {
     concurrent: Option<ConcurrentContext>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcurrentWriteTier {
+    Tier0AlreadyOwned,
+    Tier1FirstTouch,
+    Tier2CommitSurfaceRare,
+}
+
 impl std::fmt::Debug for SharedTxnPageIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedTxnPageIo")
@@ -907,126 +915,272 @@ impl SharedTxnPageIo {
         Ok(())
     }
 
-    fn write_page_internal(
+    fn classify_concurrent_write_tier(&self, page_no: PageNumber) -> Result<ConcurrentWriteTier> {
+        let Some(ctx) = &self.concurrent else {
+            return Ok(ConcurrentWriteTier::Tier2CommitSurfaceRare);
+        };
+
+        if ctx.handle.lock().holds_page_lock(page_no) {
+            return Ok(ConcurrentWriteTier::Tier0AlreadyOwned);
+        }
+
+        let page_one_tracking_required = self
+            .txn
+            .borrow()
+            .write_page_requires_page_one_conflict_tracking(page_no)?;
+
+        if page_one_tracking_required {
+            Ok(ConcurrentWriteTier::Tier2CommitSurfaceRare)
+        } else {
+            Ok(ConcurrentWriteTier::Tier1FirstTouch)
+        }
+    }
+
+    fn restore_concurrent_page_state(
+        &self,
+        ctx: &ConcurrentContext,
+        page_state: &ConcurrentPageState,
+        restore_label: &str,
+    ) -> Result<()> {
+        let mut handle = ctx.handle.lock();
+        concurrent_restore_page_state(&mut handle, &ctx.lock_table, ctx.session_id, page_state)
+            .map_err(|restore_error| {
+                FrankenError::Internal(format!("{restore_label}: {restore_error}"))
+            })
+    }
+
+    fn write_page_tier0_already_owned(
         &self,
         cx: &Cx,
+        ctx: &ConcurrentContext,
         page_no: PageNumber,
         page_data_base: PageData,
     ) -> Result<()> {
-        // ═══════════════════════════════════════════════════════════════
-        // FAST PATH: Already-owned page — single lock, no retry loop.
-        //
-        // When this transaction already holds the page lock for `page_no`,
-        // there can be no commit-index conflict and no lock contention.
-        // Skip the full slow path (3 handle lock acquisitions, restore
-        // closure setup, commit-index check, retry loop, page-one state
-        // capture) and go directly to staging + pager write.
-        //
-        // This is the dominant path during balance/split operations where
-        // multiple writes go to the same page (read-modify-write cycle).
-        //
-        // Reduces handle lock acquisitions from 3 to 1 per write for
-        // already-owned pages.  Inspired by the profile evidence showing
-        // 95% of cycles in write_page with IPC 0.05 due to lock convoy.
-        // ═══════════════════════════════════════════════════════════════
-        if let Some(ref ctx) = self.concurrent {
-            let mut handle = ctx.handle.lock();
-            if handle.holds_page_lock(page_no) {
-                // Page-one conflict tracking: add if needed and not yet tracked.
-                if page_no != PageNumber::ONE {
-                    let needs_p1 = self
-                        .txn
-                        .borrow()
-                        .write_page_requires_page_one_conflict_tracking(page_no)?;
-                    if needs_p1 && !handle.tracks_write_conflict_page(PageNumber::ONE) {
-                        drop(handle);
-                        track_concurrent_conflict_only_page(
-                            cx,
-                            ctx,
-                            PageNumber::ONE,
-                            "write_page_fast",
-                        )?;
-                        handle = ctx.handle.lock();
-                    }
-                }
-                // Capture prior state so we can restore on pager write failure,
-                // matching the slow path's error-recovery contract.
-                let prior_state = concurrent_page_state(&handle, page_no);
-                // Stage page data in MVCC handle (single lock acquisition).
-                if let Err(stage_error) = concurrent_stage_prepared_write_page(
-                    &mut handle,
-                    page_no,
-                    page_data_base.clone(),
-                ) {
-                    return Err(FrankenError::Internal(format!(
-                        "MVCC fast-path staging failed: {stage_error}"
-                    )));
-                }
-                drop(handle);
-                // Write to pager.
-                if let Err(write_error) =
-                    self.txn
-                        .borrow_mut()
-                        .write_page_data(cx, page_no, page_data_base)
-                {
-                    // Restore prior MVCC state to keep handle consistent
-                    // with the pager's write set on failure.
-                    let mut restore_handle = ctx.handle.lock();
-                    if let Err(restore_error) = concurrent_restore_page_state(
-                        &mut restore_handle,
-                        &ctx.lock_table,
-                        ctx.session_id,
-                        &prior_state,
-                    ) {
-                        return Err(FrankenError::Internal(format!(
-                            "pager write_page failed: {write_error}; \
-                             MVCC fast-path restore failed: {restore_error}"
-                        )));
-                    }
-                    return Err(write_error);
-                }
-                self.clear_stale_synthetic_pending_commit_surface(cx, "write_page_fast")?;
-                return Ok(());
-            }
-            drop(handle);
+        let mut handle = ctx.handle.lock();
+        let prior_state = concurrent_page_state(&handle, page_no);
+        if let Err(stage_error) =
+            concurrent_stage_prepared_write_page(&mut handle, page_no, page_data_base.clone())
+        {
+            return Err(FrankenError::Internal(format!(
+                "MVCC fast-path staging failed: {stage_error}"
+            )));
+        }
+        drop(handle);
+
+        if let Err(write_error) = self
+            .txn
+            .borrow_mut()
+            .write_page_data(cx, page_no, page_data_base)
+        {
+            self.restore_concurrent_page_state(
+                ctx,
+                &prior_state,
+                &format!("pager write_page failed: {write_error}; MVCC fast-path restore failed"),
+            )?;
+            return Err(write_error);
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // SLOW PATH: New page acquisition (full concurrent machinery).
-        // ═══════════════════════════════════════════════════════════════
-        let page_one_tracking_required = self
-            .concurrent
-            .as_ref()
-            .map(|_| {
-                if page_no == PageNumber::ONE {
-                    return Ok(false);
-                }
-                self.txn
-                    .borrow()
-                    .write_page_requires_page_one_conflict_tracking(page_no)
-            })
-            .transpose()?
-            .unwrap_or(false);
-        let (prior_page_state, page_one_state) = if let Some(ctx) = &self.concurrent {
+        self.clear_stale_synthetic_pending_commit_surface(cx, "write_page_fast")?;
+        Ok(())
+    }
+
+    fn write_page_tier1_first_touch(
+        &self,
+        cx: &Cx,
+        ctx: &ConcurrentContext,
+        page_no: PageNumber,
+        page_data_base: PageData,
+    ) -> Result<()> {
+        let prior_page_state = {
             let handle = ctx.handle.lock();
-            let prior_page_state = Some(concurrent_page_state(&handle, page_no));
-            let page_one_state = if page_one_tracking_required {
-                if !handle.tracks_write_conflict_page(PageNumber::ONE) {
-                    Some(concurrent_page_state(&handle, PageNumber::ONE))
-                } else {
-                    None
+            concurrent_page_state(&handle, page_no)
+        };
+
+        let started = Instant::now();
+        let deadline = Duration::from_millis(ctx.busy_timeout_ms);
+        loop {
+            observe_execution_cancellation(cx)?;
+            let (write_result, conflicting_commit_seq) = {
+                let mut handle = ctx.handle.lock();
+                let conflicting_commit_seq = (!handle.holds_page_lock(page_no))
+                    .then(|| ctx.commit_index.latest(page_no))
+                    .flatten()
+                    .filter(|seq| *seq > ctx.snapshot_high);
+                let write_result = conflicting_commit_seq.is_none().then(|| {
+                    concurrent_prepare_write_page(
+                        &mut handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        page_no,
+                    )
+                });
+                (write_result, conflicting_commit_seq)
+            };
+            let txn_id = ctx.txn_id;
+            let snapshot_high = ctx.snapshot_high.get();
+
+            if let Some(conflicting_commit_seq) = conflicting_commit_seq {
+                let error = FrankenError::BusySnapshot {
+                    conflicting_pages: page_no.get().to_string(),
+                };
+                self.restore_concurrent_page_state(
+                    ctx,
+                    &prior_page_state,
+                    &format!("{error}; MVCC state restore failed"),
+                )?;
+                tracing::warn!(
+                    txn_id,
+                    commit_seq = conflicting_commit_seq.get(),
+                    snapshot_high,
+                    page_id = page_no.get(),
+                    visibility_decision = "write_snapshot_stale",
+                    conflict_reason = "fcw_base_drift",
+                    "mvcc write rejected due to stale snapshot"
+                );
+                return Err(error);
+            }
+
+            match write_result.expect("write result must exist when snapshot is valid") {
+                Ok(()) => {
+                    tracing::debug!(
+                        txn_id,
+                        commit_seq = snapshot_high,
+                        snapshot_high,
+                        page_id = page_no.get(),
+                        visibility_decision = "write_lock_acquired",
+                        conflict_reason = "none",
+                        write_tier = "tier1_first_touch",
+                        "mvcc write visibility decision"
+                    );
+                    break;
                 }
+                Err(MvccError::Busy) => {
+                    let remaining = deadline.saturating_sub(started.elapsed());
+                    match wait_for_page_lock_holder_change(cx, ctx, page_no, remaining) {
+                        Ok(true) => {
+                            tracing::warn!(
+                                txn_id,
+                                commit_seq = snapshot_high,
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "write_retry",
+                                conflict_reason = "page_lock_busy",
+                                retry_policy = "park_wake",
+                                retry_wait_ms = remaining.as_millis(),
+                                write_tier = "tier1_first_touch",
+                                "mvcc write conflict detected"
+                            );
+                        }
+                        Ok(false) => {
+                            let error = FrankenError::Busy;
+                            self.restore_concurrent_page_state(
+                                ctx,
+                                &prior_page_state,
+                                &format!("{error}; MVCC state restore failed"),
+                            )?;
+                            tracing::warn!(
+                                txn_id,
+                                commit_seq = snapshot_high,
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "write_busy_timeout",
+                                conflict_reason = "page_lock_busy",
+                                retry_policy = "park_wake",
+                                write_tier = "tier1_first_touch",
+                                "mvcc write conflict exceeded busy timeout"
+                            );
+                            return Err(error);
+                        }
+                        Err(wait_error) => {
+                            self.restore_concurrent_page_state(
+                                ctx,
+                                &prior_page_state,
+                                &format!("{wait_error}; MVCC state restore failed"),
+                            )?;
+                            return Err(wait_error);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error = FrankenError::Internal(format!("MVCC write_page failed: {e}"));
+                    self.restore_concurrent_page_state(
+                        ctx,
+                        &prior_page_state,
+                        &format!("{error}; MVCC state restore failed"),
+                    )?;
+                    tracing::warn!(
+                        txn_id,
+                        commit_seq = snapshot_high,
+                        snapshot_high,
+                        page_id = page_no.get(),
+                        visibility_decision = "write_abort",
+                        conflict_reason = %e,
+                        write_tier = "tier1_first_touch",
+                        "mvcc write failed"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+
+        {
+            let mut handle = ctx.handle.lock();
+            if let Err(stage_error) =
+                concurrent_stage_prepared_write_page(&mut handle, page_no, page_data_base.clone())
+            {
+                self.restore_concurrent_page_state(
+                    ctx,
+                    &prior_page_state,
+                    &format!("MVCC write staging failed: {stage_error}; MVCC state restore failed"),
+                )?;
+                return Err(FrankenError::Internal(format!(
+                    "MVCC write staging failed: {stage_error}"
+                )));
+            }
+        }
+
+        if let Err(write_error) = self
+            .txn
+            .borrow_mut()
+            .write_page_data(cx, page_no, page_data_base)
+        {
+            self.restore_concurrent_page_state(
+                ctx,
+                &prior_page_state,
+                &format!("pager write_page failed: {write_error}; MVCC state restore failed"),
+            )?;
+            return Err(write_error);
+        }
+
+        self.clear_stale_synthetic_pending_commit_surface(cx, "write_page_tier1")?;
+        Ok(())
+    }
+
+    fn write_page_tier2_commit_surface_rare(
+        &self,
+        cx: &Cx,
+        ctx: &ConcurrentContext,
+        page_no: PageNumber,
+        page_data_base: PageData,
+    ) -> Result<()> {
+        let page_one_tracking_required = if page_no == PageNumber::ONE {
+            false
+        } else {
+            self.txn
+                .borrow()
+                .write_page_requires_page_one_conflict_tracking(page_no)?
+        };
+        let handle = ctx.handle.lock();
+        let prior_page_state = Some(concurrent_page_state(&handle, page_no));
+        let page_one_state =
+            if page_one_tracking_required && !handle.tracks_write_conflict_page(PageNumber::ONE) {
+                Some(concurrent_page_state(&handle, PageNumber::ONE))
             } else {
                 None
             };
-            (prior_page_state, page_one_state)
-        } else {
-            (None, None)
-        };
+        drop(handle);
+
         let restore_concurrent_state = || -> std::result::Result<(), String> {
-            let Some(ctx) = &self.concurrent else {
-                return Ok(());
-            };
             let mut handle = ctx.handle.lock();
             if let Some(prior_page_state) = prior_page_state.as_ref()
                 && let Err(restore_error) = concurrent_restore_page_state(
@@ -1050,199 +1204,208 @@ impl SharedTxnPageIo {
             }
             Ok(())
         };
-        if let Some(ref ctx) = self.concurrent {
-            if page_one_state.is_some() {
-                track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "write_page")?;
-            }
-            let started = Instant::now();
-            let deadline = Duration::from_millis(ctx.busy_timeout_ms);
 
-            loop {
-                observe_execution_cancellation(cx)?;
-                let (write_result, conflicting_commit_seq) = {
-                    let mut handle = ctx.handle.lock();
-                    let conflicting_commit_seq = (!handle.holds_page_lock(page_no))
-                        .then(|| ctx.commit_index.latest(page_no))
-                        .flatten()
-                        .filter(|seq| *seq > ctx.snapshot_high);
-                    let write_result = conflicting_commit_seq.is_none().then(|| {
-                        concurrent_prepare_write_page(
-                            &mut handle,
-                            &ctx.lock_table,
-                            ctx.session_id,
-                            page_no,
-                        )
-                    });
-                    (write_result, conflicting_commit_seq)
+        if page_one_state.is_some() {
+            track_concurrent_conflict_only_page(cx, ctx, PageNumber::ONE, "write_page")?;
+        }
+        let started = Instant::now();
+        let deadline = Duration::from_millis(ctx.busy_timeout_ms);
+
+        loop {
+            observe_execution_cancellation(cx)?;
+            let (write_result, conflicting_commit_seq) = {
+                let mut handle = ctx.handle.lock();
+                let conflicting_commit_seq = (!handle.holds_page_lock(page_no))
+                    .then(|| ctx.commit_index.latest(page_no))
+                    .flatten()
+                    .filter(|seq| *seq > ctx.snapshot_high);
+                let write_result = conflicting_commit_seq.is_none().then(|| {
+                    concurrent_prepare_write_page(
+                        &mut handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        page_no,
+                    )
+                });
+                (write_result, conflicting_commit_seq)
+            };
+            let txn_id = ctx.txn_id;
+            let snapshot_high = ctx.snapshot_high.get();
+
+            if let Some(conflicting_commit_seq) = conflicting_commit_seq {
+                let error = FrankenError::BusySnapshot {
+                    conflicting_pages: page_no.get().to_string(),
                 };
-                let txn_id = ctx.txn_id;
-                let snapshot_high = ctx.snapshot_high.get();
+                if let Err(restore_error) = restore_concurrent_state() {
+                    return Err(FrankenError::Internal(format!("{error}; {restore_error}")));
+                }
+                tracing::warn!(
+                    txn_id,
+                    commit_seq = conflicting_commit_seq.get(),
+                    snapshot_high,
+                    page_id = page_no.get(),
+                    visibility_decision = "write_snapshot_stale",
+                    conflict_reason = "fcw_base_drift",
+                    write_tier = "tier2_commit_surface_rare",
+                    "mvcc write rejected due to stale snapshot"
+                );
+                return Err(error);
+            }
 
-                if let Some(conflicting_commit_seq) = conflicting_commit_seq {
-                    let error = FrankenError::BusySnapshot {
-                        conflicting_pages: page_no.get().to_string(),
-                    };
+            match write_result.expect("write result must exist when snapshot is valid") {
+                Ok(()) => {
+                    tracing::debug!(
+                        txn_id,
+                        commit_seq = snapshot_high,
+                        snapshot_high,
+                        page_id = page_no.get(),
+                        visibility_decision = "write_lock_acquired",
+                        conflict_reason = "none",
+                        write_tier = "tier2_commit_surface_rare",
+                        "mvcc write visibility decision"
+                    );
+                    break;
+                }
+                Err(MvccError::Busy) => {
+                    let remaining = deadline.saturating_sub(started.elapsed());
+                    match wait_for_page_lock_holder_change(cx, ctx, page_no, remaining) {
+                        Ok(true) => {
+                            tracing::warn!(
+                                txn_id,
+                                commit_seq = snapshot_high,
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "write_retry",
+                                conflict_reason = "page_lock_busy",
+                                retry_policy = "park_wake",
+                                retry_wait_ms = remaining.as_millis(),
+                                write_tier = "tier2_commit_surface_rare",
+                                "mvcc write conflict detected"
+                            );
+                        }
+                        Ok(false) => {
+                            let error = FrankenError::Busy;
+                            if let Err(restore_error) = restore_concurrent_state() {
+                                return Err(FrankenError::Internal(format!(
+                                    "{error}; {restore_error}"
+                                )));
+                            }
+                            tracing::warn!(
+                                txn_id,
+                                commit_seq = snapshot_high,
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "write_busy_timeout",
+                                conflict_reason = "page_lock_busy",
+                                retry_policy = "park_wake",
+                                write_tier = "tier2_commit_surface_rare",
+                                "mvcc write conflict exceeded busy timeout"
+                            );
+                            return Err(error);
+                        }
+                        Err(wait_error) => {
+                            if let Err(restore_error) = restore_concurrent_state() {
+                                return Err(FrankenError::Internal(format!(
+                                    "{wait_error}; {restore_error}"
+                                )));
+                            }
+                            return Err(wait_error);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error = FrankenError::Internal(format!("MVCC write_page failed: {e}"));
                     if let Err(restore_error) = restore_concurrent_state() {
                         return Err(FrankenError::Internal(format!("{error}; {restore_error}")));
                     }
                     tracing::warn!(
                         txn_id,
-                        commit_seq = conflicting_commit_seq.get(),
+                        commit_seq = snapshot_high,
                         snapshot_high,
                         page_id = page_no.get(),
-                        visibility_decision = "write_snapshot_stale",
-                        conflict_reason = "fcw_base_drift",
-                        "mvcc write rejected due to stale snapshot"
+                        visibility_decision = "write_abort",
+                        conflict_reason = %e,
+                        write_tier = "tier2_commit_surface_rare",
+                        "mvcc write failed"
                     );
                     return Err(error);
                 }
-
-                match write_result.expect("write result must exist when snapshot is valid") {
-                    Ok(()) => {
-                        tracing::debug!(
-                            txn_id,
-                            commit_seq = snapshot_high,
-                            snapshot_high,
-                            page_id = page_no.get(),
-                            visibility_decision = "write_lock_acquired",
-                            conflict_reason = "none",
-                            "mvcc write visibility decision"
-                        );
-                        break;
-                    }
-                    Err(MvccError::Busy) => {
-                        let remaining = deadline.saturating_sub(started.elapsed());
-                        match wait_for_page_lock_holder_change(cx, ctx, page_no, remaining) {
-                            Ok(true) => {
-                                tracing::warn!(
-                                    txn_id,
-                                    commit_seq = snapshot_high,
-                                    snapshot_high,
-                                    page_id = page_no.get(),
-                                    visibility_decision = "write_retry",
-                                    conflict_reason = "page_lock_busy",
-                                    retry_policy = "park_wake",
-                                    retry_wait_ms = remaining.as_millis(),
-                                    "mvcc write conflict detected"
-                                );
-                            }
-                            Ok(false) => {
-                                let error = FrankenError::Busy;
-                                if let Err(restore_error) = restore_concurrent_state() {
-                                    return Err(FrankenError::Internal(format!(
-                                        "{error}; {restore_error}"
-                                    )));
-                                }
-                                tracing::warn!(
-                                    txn_id,
-                                    commit_seq = snapshot_high,
-                                    snapshot_high,
-                                    page_id = page_no.get(),
-                                    visibility_decision = "write_busy_timeout",
-                                    conflict_reason = "page_lock_busy",
-                                    retry_policy = "park_wake",
-                                    "mvcc write conflict exceeded busy timeout"
-                                );
-                                return Err(error);
-                            }
-                            Err(wait_error) => {
-                                if let Err(restore_error) = restore_concurrent_state() {
-                                    return Err(FrankenError::Internal(format!(
-                                        "{wait_error}; {restore_error}"
-                                    )));
-                                }
-                                return Err(wait_error);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let error = FrankenError::Internal(format!("MVCC write_page failed: {e}"));
-                        if let Err(restore_error) = restore_concurrent_state() {
-                            return Err(FrankenError::Internal(format!(
-                                "{error}; {restore_error}"
-                            )));
-                        }
-                        tracing::warn!(
-                            txn_id,
-                            commit_seq = snapshot_high,
-                            snapshot_high,
-                            page_id = page_no.get(),
-                            visibility_decision = "write_abort",
-                            conflict_reason = %e,
-                            "mvcc write failed"
-                        );
-                        return Err(error);
-                    }
-                }
             }
         }
 
-        let mut staged_page_data = Some(page_data_base);
-        if let Some(ctx) = &self.concurrent {
-            let stage_result = {
-                let mut handle = ctx.handle.lock();
-                concurrent_stage_prepared_write_page(
-                    &mut handle,
-                    page_no,
-                    staged_page_data
-                        .clone()
-                        .expect("concurrent write staging requires preserved page payload"),
-                )
-            };
-            if let Err(stage_error) = stage_result {
-                let error =
-                    FrankenError::Internal(format!("MVCC write staging failed: {stage_error}"));
-                if let Err(restore_error) = restore_concurrent_state() {
-                    return Err(FrankenError::Internal(format!("{error}; {restore_error}")));
-                }
-                return Err(error);
-            }
-        }
-        let pager_write_data = if self.concurrent.is_some() {
-            staged_page_data
-                .clone()
-                .expect("staged page data must be present before pager write")
-        } else {
-            staged_page_data
-                .take()
-                .expect("non-concurrent pager writes consume the owned page data once")
+        let stage_result = {
+            let mut handle = ctx.handle.lock();
+            concurrent_stage_prepared_write_page(&mut handle, page_no, page_data_base.clone())
         };
-        let write_result = self
+        if let Err(stage_error) = stage_result {
+            let error = FrankenError::Internal(format!("MVCC write staging failed: {stage_error}"));
+            if let Err(restore_error) = restore_concurrent_state() {
+                return Err(FrankenError::Internal(format!("{error}; {restore_error}")));
+            }
+            return Err(error);
+        }
+
+        if let Err(write_error) = self
             .txn
             .borrow_mut()
-            .write_page_data(cx, page_no, pager_write_data);
-        if let Err(write_error) = write_result {
-            if let Some(ctx) = &self.concurrent {
-                let mut handle = ctx.handle.lock();
-                if let Some(prior_page_state) = prior_page_state.as_ref()
-                    && let Err(restore_error) = concurrent_restore_page_state(
-                        &mut handle,
-                        &ctx.lock_table,
-                        ctx.session_id,
-                        prior_page_state,
-                    )
-                {
-                    return Err(FrankenError::Internal(format!(
-                        "pager write_page failed: {write_error}; MVCC state restore failed: {restore_error}"
-                    )));
-                }
-                if let Some(page_one_state) = page_one_state.as_ref()
-                    && let Err(restore_error) = concurrent_restore_page_state(
-                        &mut handle,
-                        &ctx.lock_table,
-                        ctx.session_id,
-                        page_one_state,
-                    )
-                {
-                    return Err(FrankenError::Internal(format!(
-                        "pager write_page failed: {write_error}; MVCC page1 restore failed: {restore_error}"
-                    )));
-                }
+            .write_page_data(cx, page_no, page_data_base)
+        {
+            let mut handle = ctx.handle.lock();
+            if let Some(prior_page_state) = prior_page_state.as_ref()
+                && let Err(restore_error) = concurrent_restore_page_state(
+                    &mut handle,
+                    &ctx.lock_table,
+                    ctx.session_id,
+                    prior_page_state,
+                )
+            {
+                return Err(FrankenError::Internal(format!(
+                    "pager write_page failed: {write_error}; MVCC state restore failed: {restore_error}"
+                )));
+            }
+            if let Some(page_one_state) = page_one_state.as_ref()
+                && let Err(restore_error) = concurrent_restore_page_state(
+                    &mut handle,
+                    &ctx.lock_table,
+                    ctx.session_id,
+                    page_one_state,
+                )
+            {
+                return Err(FrankenError::Internal(format!(
+                    "pager write_page failed: {write_error}; MVCC page1 restore failed: {restore_error}"
+                )));
             }
             return Err(write_error);
         }
+
         self.clear_stale_synthetic_pending_commit_surface(cx, "write_page")?;
         Ok(())
+    }
+
+    fn write_page_internal(
+        &self,
+        cx: &Cx,
+        page_no: PageNumber,
+        page_data_base: PageData,
+    ) -> Result<()> {
+        let Some(ctx) = &self.concurrent else {
+            return self
+                .txn
+                .borrow_mut()
+                .write_page_data(cx, page_no, page_data_base);
+        };
+
+        match self.classify_concurrent_write_tier(page_no)? {
+            ConcurrentWriteTier::Tier0AlreadyOwned => {
+                self.write_page_tier0_already_owned(cx, ctx, page_no, page_data_base)
+            }
+            ConcurrentWriteTier::Tier1FirstTouch => {
+                self.write_page_tier1_first_touch(cx, ctx, page_no, page_data_base)
+            }
+            ConcurrentWriteTier::Tier2CommitSurfaceRare => {
+                self.write_page_tier2_commit_surface_rare(cx, ctx, page_no, page_data_base)
+            }
+        }
     }
 }
 
@@ -7787,11 +7950,14 @@ impl VdbeEngine {
 
                     // Use a direct slice into the register file instead of
                     // allocating a SmallVec via collect_reg_range.  Same pattern as
-                    // AggStep (line 7545).  Falls back to collect_reg_range only when
-                    // the register range is out of bounds.
-                    let start_idx = usize::try_from(first_arg_reg).unwrap_or(0);
-                    let end_idx = start_idx.saturating_add(arg_count);
-                    let result = if end_idx <= self.registers.len() {
+                    // AggStep.  Falls back to collect_reg_range only when the
+                    // register range is out of bounds or negative.
+                    let result = if first_arg_reg >= 0
+                        && (first_arg_reg as usize).saturating_add(arg_count)
+                            <= self.registers.len()
+                    {
+                        let start_idx = first_arg_reg as usize;
+                        let end_idx = start_idx + arg_count;
                         let args = &self.registers[start_idx..end_idx];
                         observe_execution_cancellation(&self.execution_cx)?;
                         func.invoke(args)?
@@ -18140,6 +18306,84 @@ mod tests {
         assert!(
             !guard.held_locks().contains(&PageNumber::ONE),
             "net-zero growth should release the synthetic page-one lock"
+        );
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_concurrent_growth_write_does_not_block_on_page_one_pretracking() {
+        use std::path::PathBuf;
+
+        use fsqlite_pager::{MvccPager as _, SimplePager, TransactionMode};
+        use fsqlite_types::Snapshot;
+        use fsqlite_vfs::MemoryVfs;
+
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/leased_growth_write_skips_page_one_pretracking.db");
+        let cx = Cx::new();
+        let pager = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::MIN).unwrap();
+
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+
+        let (session_id, handle, blocker_session) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = guard
+                .begin_concurrent(snapshot)
+                .expect("session should register");
+            let handle = guard
+                .handle(session_id)
+                .expect("session handle must be present");
+            let blocker_session = guard
+                .begin_concurrent(snapshot)
+                .expect("blocker session should register");
+            (session_id, handle, blocker_session)
+        };
+
+        {
+            let guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut blocker = guard
+                .get_mut(blocker_session)
+                .expect("blocker handle should be present");
+            concurrent_track_write_conflict_page(
+                &mut blocker,
+                &lock_table,
+                blocker_session,
+                PageNumber::ONE,
+            )
+            .expect("blocker must hold synthetic page-one tracking");
+        }
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            session_id,
+            Arc::clone(&handle),
+            Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
+            0,
+        );
+
+        let page_no = page_io
+            .allocate_page(&cx)
+            .expect("allocate_page should not need page one");
+        page_io
+            .write_page(&cx, page_no, &vec![0x5A; PageSize::MIN.as_usize()])
+            .expect("leased growth write should not block on unrelated page-one tracking");
+
+        let guard = handle.lock();
+        assert!(
+            guard.tracks_write_conflict_page(page_no),
+            "the actual high page must still enter the write-conflict surface"
+        );
+        assert!(
+            !guard.tracks_write_conflict_page(PageNumber::ONE),
+            "tier-1 leased growth should not synthesize page-one conflict tracking before commit planning"
         );
     }
 
