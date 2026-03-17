@@ -534,7 +534,8 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     ///
     /// Real pager-backed transactions override this with exact allocator
     /// semantics so upper layers can avoid false page-1 conflicts on net-zero
-    /// allocator churn. The default remains conservative.
+    /// allocator churn or commit-time-only metadata updates. The default
+    /// remains conservative.
     fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
         Ok(true)
     }
@@ -545,7 +546,8 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     ///
     /// Real pager-backed transactions override this with exact allocator
     /// semantics so upper layers can avoid false page-1 conflicts on net-zero
-    /// allocator churn. The default remains conservative.
+    /// allocator churn or commit-time-only metadata updates. The default
+    /// remains conservative.
     fn free_page_requires_page_one_conflict_tracking(&self, _page_no: PageNumber) -> Result<bool> {
         Ok(true)
     }

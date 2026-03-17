@@ -2110,13 +2110,20 @@ impl<V: Vfs> SimpleTransaction<V> {
         &self,
         inner: &PagerInner<V::File>,
     ) -> bool {
+        if self.mode == TransactionMode::Concurrent {
+            // Concurrent-mode allocator/header/page-count reconciliation is a
+            // commit-planning concern. Ordinary page growth stays on the local
+            // leased fast path and does not need to pull page 1 into the live
+            // MVCC conflict surface up front.
+            return false;
+        }
+
         if self.current_page_one_conflict_tracking_required_with_inner(inner) {
             return true;
         }
 
         let committed_db_size = self.committed_db_size_with_inner(inner);
-        let committed_freelist_is_snapshot_pinned =
-            self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
+        let committed_freelist_is_snapshot_pinned = inner.active_transactions > 1;
 
         if committed_freelist_is_snapshot_pinned {
             return false;
@@ -2134,6 +2141,13 @@ impl<V: Vfs> SimpleTransaction<V> {
         inner: &PagerInner<V::File>,
         page_no: PageNumber,
     ) -> bool {
+        if self.mode == TransactionMode::Concurrent {
+            // Free-list/page-one reconciliation for concurrent transactions is
+            // likewise deferred to the commit-time pending surface. Per-op free
+            // should not synthesize page 1 into the hot path.
+            return false;
+        }
+
         if self.current_page_one_conflict_tracking_required_with_inner(inner) {
             return true;
         }
@@ -2147,9 +2161,18 @@ impl<V: Vfs> SimpleTransaction<V> {
         inner: &PagerInner<V::File>,
         page_no: PageNumber,
     ) -> bool {
-        if page_no == PageNumber::ONE
-            || self.current_page_one_conflict_tracking_required_with_inner(inner)
-        {
+        if page_no == PageNumber::ONE {
+            return true;
+        }
+
+        if self.mode == TransactionMode::Concurrent {
+            // Concurrent growth rewrites page 1 only at commit publication
+            // time. Do not drag synthetic page-one conflict tracking through
+            // every ordinary high-page write.
+            return false;
+        }
+
+        if self.current_page_one_conflict_tracking_required_with_inner(inner) {
             return true;
         }
 
@@ -9249,7 +9272,8 @@ mod tests {
     }
 
     #[test]
-    fn test_free_page_requires_page_one_conflict_tracking_distinguishes_durable_vs_net_zero() {
+    fn test_free_page_requires_page_one_conflict_tracking_defers_concurrent_freelist_reconciliation()
+     {
         let (pager, _) = test_pager();
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
@@ -9262,13 +9286,20 @@ mod tests {
             page
         };
 
-        let durable_txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut durable_txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
         assert!(
-            durable_txn
+            !durable_txn
                 .free_page_requires_page_one_conflict_tracking(durable_page)
                 .unwrap(),
-            "bead_id={BEAD_ID} case=durable_free_requires_page_one_conflict_tracking"
+            "bead_id={BEAD_ID} case=concurrent_durable_free_defers_page_one_conflict_tracking"
         );
+        durable_txn.free_page(&cx, durable_page).unwrap();
+        let durable_predicted = durable_txn.pending_commit_pages().unwrap();
+        assert!(
+            durable_predicted.contains(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=concurrent_durable_free_still_puts_page_one_in_pending_commit_surface"
+        );
+        durable_txn.rollback(&cx).unwrap();
 
         let reusable_pages = {
             let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
@@ -9302,16 +9333,27 @@ mod tests {
     }
 
     #[test]
-    fn test_write_page_requires_page_one_conflict_tracking_for_concurrent_growth() {
+    fn test_write_page_requires_page_one_conflict_tracking_defers_concurrent_growth_to_commit_surface()
+     {
         let (pager, _) = test_pager();
         let cx = Cx::new();
         let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
         let page = txn.allocate_page(&cx).unwrap();
 
         assert!(
-            txn.write_page_requires_page_one_conflict_tracking(page)
+            !txn.write_page_requires_page_one_conflict_tracking(page)
                 .unwrap(),
-            "bead_id={BEAD_ID} case=first_high_page_write_requires_page_one_conflict_tracking"
+            "bead_id={BEAD_ID} case=concurrent_growth_write_defers_page_one_conflict_tracking"
+        );
+        txn.write_page(&cx, page, &[0x7B; 32]).unwrap();
+        let predicted = txn.pending_commit_pages().unwrap();
+        assert!(
+            predicted.contains(&page),
+            "bead_id={BEAD_ID} case=concurrent_growth_pending_commit_surface_keeps_high_page"
+        );
+        assert!(
+            predicted.contains(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=concurrent_growth_pending_commit_surface_still_contains_page_one"
         );
     }
 
