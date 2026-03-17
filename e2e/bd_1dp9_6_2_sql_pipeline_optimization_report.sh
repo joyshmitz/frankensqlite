@@ -107,6 +107,18 @@ run_phase \
     cargo test -p fsqlite-harness --lib sql_pipeline_optimization::tests::test_sql_pipeline_opt_report_emits_structured_artifact -- --nocapture \
     || failures=$((failures + 1))
 
+run_phase \
+    "SQL-PIPELINE-OPT-EXECUTOR-SHAPE" \
+    "executor_shape_reuse" \
+    cargo test -p fsqlite-e2e --lib prepared_op_executor_normalizes_varying_point_selects -- --nocapture \
+    || failures=$((failures + 1))
+
+run_phase \
+    "SQL-PIPELINE-OPT-EXECUTOR-CHURN" \
+    "executor_churn_gate" \
+    cargo test -p fsqlite-e2e --lib run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_varying_point_selects -- --nocapture \
+    || failures=$((failures + 1))
+
 ARTIFACT_LOG="${LOG_DIR}/artifact_emission.log"
 ARTIFACT_JSON_LINE="$(grep -F 'SQL_PIPELINE_OPT_ARTIFACT_JSON:' "${ARTIFACT_LOG}" | tail -n 1 || true)"
 ARTIFACT_PAYLOAD="${ARTIFACT_JSON_LINE#SQL_PIPELINE_OPT_ARTIFACT_JSON:}"
