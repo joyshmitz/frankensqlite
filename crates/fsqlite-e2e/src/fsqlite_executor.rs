@@ -1811,6 +1811,7 @@ fn normalize_update_by_id(
     }
 
     let mut assignments = Vec::new();
+    let mut has_where_separator = false;
     loop {
         let Some(column) = consume_simple_identifier(&mut rest) else {
             return false;
@@ -1824,7 +1825,7 @@ fn normalize_update_by_id(
             return false;
         };
         assignments.push((column, value));
-        consume_ascii_whitespace(&mut rest);
+        has_where_separator = consume_ascii_whitespace(&mut rest) > 0;
         if !consume_ascii_char(&mut rest, ',') {
             break;
         }
@@ -1832,7 +1833,7 @@ fn normalize_update_by_id(
     }
 
     if assignments.is_empty()
-        || !consume_required_ascii_whitespace(&mut rest)
+        || !has_where_separator
         || !consume_ascii_keyword(&mut rest, "WHERE")
         || !consume_required_ascii_whitespace(&mut rest)
     {
@@ -2488,6 +2489,42 @@ mod tests {
                 .prepared_sql
                 .contains_key("UPDATE users SET status = ?2, created_at = ?3 WHERE id = ?1")
         );
+    }
+
+    #[test]
+    fn normalize_update_by_id_extracts_one_prepared_shape_and_params() {
+        let mut normalized_sql = String::new();
+        let mut params = Vec::new();
+
+        assert!(normalize_update_by_id(
+            "UPDATE users SET status = 'active', created_at = 3600 WHERE id = 7;",
+            &mut normalized_sql,
+            &mut params,
+        ));
+        assert_eq!(
+            normalized_sql,
+            "UPDATE users SET status = ?2, created_at = ?3 WHERE id = ?1"
+        );
+        assert_eq!(
+            params,
+            vec![
+                SqliteValue::Integer(7),
+                SqliteValue::Text("active".to_owned()),
+                SqliteValue::Integer(3600),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_update_by_id_rejects_missing_where_separator() {
+        let mut normalized_sql = String::new();
+        let mut params = Vec::new();
+
+        assert!(!normalize_update_by_id(
+            "UPDATE users SET status = 'active', created_at = 3600WHERE id = 7;",
+            &mut normalized_sql,
+            &mut params,
+        ));
     }
 
     #[test]
