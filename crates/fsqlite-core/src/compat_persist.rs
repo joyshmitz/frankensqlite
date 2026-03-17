@@ -272,7 +272,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             SqliteValue::Text(s) => s,
             _ => continue,
         };
-        if entry_type != "table" {
+        if &**entry_type != "table" {
             continue; // Skip indexes, views, triggers for now.
         }
 

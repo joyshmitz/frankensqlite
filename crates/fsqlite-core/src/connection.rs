@@ -10418,7 +10418,7 @@ impl Connection {
                     });
                 };
                 let existing_index = match values.get(1) {
-                    Some(SqliteValue::Text(name)) => Some(name.as_str()),
+                    Some(SqliteValue::Text(name)) => Some(&**name),
                     Some(SqliteValue::Null) | None => None,
                     Some(_) => {
                         return Err(FrankenError::DatabaseCorrupt {
@@ -12337,7 +12337,7 @@ impl Connection {
         let target_value =
             self.eval_expr_with_subqueries(&bound_expr, &empty_row, &empty_col_map, None)?;
         let target_path = match target_value {
-            SqliteValue::Text(path) if !path.is_empty() => PathBuf::from(path.into()),
+            SqliteValue::Text(path) if !path.is_empty() => PathBuf::from(&*path),
             SqliteValue::Text(_) | SqliteValue::Null => {
                 return Err(FrankenError::CannotOpen {
                     path: PathBuf::new(),
@@ -16874,7 +16874,7 @@ impl Connection {
                 };
                 Ok(vec![Row {
                     values: vec![SqliteValue::Text(
-                        checkpoint_schedule_override_label(schedule_mode).to_owned(),
+                        checkpoint_schedule_override_label(schedule_mode).to_owned().into(),
                     )],
                 }])
             }
@@ -17288,10 +17288,10 @@ impl Connection {
                                             SqliteValue::Text(from_col.into()),
                                             SqliteValue::Text(to_col.into()),
                                             SqliteValue::Text(
-                                                fk_action_sql(fk.on_update).to_owned(),
+                                                fk_action_sql(fk.on_update).to_owned().into(),
                                             ),
                                             SqliteValue::Text(
-                                                fk_action_sql(fk.on_delete).to_owned(),
+                                                fk_action_sql(fk.on_delete).to_owned().into(),
                                             ),
                                             SqliteValue::Text("NONE".to_owned().into()),
                                         ],
@@ -22711,9 +22711,9 @@ impl Connection {
                     SqliteValue::Text(s) => s.clone(),
                     _ => continue,
                 };
-                new_original_ddl_sql.insert(trigger_name.to_ascii_lowercase(), create_sql.clone());
+                new_original_ddl_sql.insert(trigger_name.to_ascii_lowercase(), create_sql.to_string());
                 if let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql) {
-                    new_triggers.push(TriggerDef::from_create_statement(&stmt, create_sql));
+                    new_triggers.push(TriggerDef::from_create_statement(&stmt, create_sql.to_string()));
                 }
                 continue;
             }
@@ -22765,7 +22765,7 @@ impl Connection {
                 if index_definition.key_term_count() == 0 {
                     continue;
                 }
-                pending_indexes.push((index_name, table_name, root_page, index_definition));
+                pending_indexes.push((index_name.to_string(), table_name.to_string(), root_page, index_definition));
                 continue;
             }
 
@@ -22936,7 +22936,7 @@ impl Connection {
             let check_defs = crate::compat_persist::extract_check_constraints_from_sql(&create_sql);
 
             new_schema.push(TableSchema {
-                name: name.clone(),
+                name: name.to_string(),
                 root_page: real_root_page,
                 columns,
                 indexes: Vec::new(),
@@ -27414,8 +27414,8 @@ fn rewrite_in_expr(
                 match val {
                     SqliteValue::Integer(i) => Literal::Integer(i),
                     SqliteValue::Float(f) => Literal::Float(f),
-                    SqliteValue::Text(s) => Literal::String(s.into()),
-                    SqliteValue::Blob(b) => Literal::Blob(b.into()),
+                    SqliteValue::Text(s) => Literal::String(s.to_string()),
+                    SqliteValue::Blob(b) => Literal::Blob(b.to_vec()),
                     SqliteValue::Null => Literal::Null,
                 },
                 *span,
@@ -27485,8 +27485,8 @@ fn value_to_literal_expr(val: SqliteValue) -> Expr {
     match val {
         SqliteValue::Integer(i) => Expr::Literal(Literal::Integer(i), Span::ZERO),
         SqliteValue::Float(f) => Expr::Literal(Literal::Float(f), Span::ZERO),
-        SqliteValue::Text(s) => Expr::Literal(Literal::String(s.into()), Span::ZERO),
-        SqliteValue::Blob(b) => Expr::Literal(Literal::Blob(b.into()), Span::ZERO),
+        SqliteValue::Text(s) => Expr::Literal(Literal::String(s.to_string()), Span::ZERO),
+        SqliteValue::Blob(b) => Expr::Literal(Literal::Blob(b.to_vec()), Span::ZERO),
         SqliteValue::Null => Expr::Literal(Literal::Null, Span::ZERO),
     }
 }
@@ -32527,8 +32527,8 @@ fn sqlite_value_to_literal(value: &SqliteValue) -> Literal {
         SqliteValue::Null => Literal::Null,
         SqliteValue::Integer(v) => Literal::Integer(*v),
         SqliteValue::Float(v) => Literal::Float(*v),
-        SqliteValue::Text(v) => Literal::String(v.clone().into()),
-        SqliteValue::Blob(v) => Literal::Blob(v.clone().into()),
+        SqliteValue::Text(v) => Literal::String(v.to_string()),
+        SqliteValue::Blob(v) => Literal::Blob(v.to_vec()),
     }
 }
 

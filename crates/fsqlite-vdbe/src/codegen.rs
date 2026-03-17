@@ -3768,11 +3768,6 @@ fn emit_join_expr(
                         "datetime literal in JOIN codegen".to_owned(),
                     ));
                 }
-                _ => {
-                    return Err(CodegenError::Unsupported(format!(
-                        "literal {lit:?} in JOIN codegen"
-                    )));
-                }
             }
             Ok(())
         }
