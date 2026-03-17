@@ -217,6 +217,9 @@ static FSQLITE_REWRITE_TIME_NS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILED_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILED_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COMPILE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_BACKGROUND_STATUS_CHECKS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_OP_CX_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParserHotPathProfileSnapshot {
@@ -236,6 +239,9 @@ pub struct ParserHotPathProfileSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotPathProfileSnapshot {
     pub parser: ParserHotPathProfileSnapshot,
+    pub background_status_checks: u64,
+    pub op_cx_background_gates: u64,
+    pub statement_dispatch_background_gates: u64,
     pub record_decode: RecordHotPathProfileSnapshot,
     pub vdbe: VdbeMetricsSnapshot,
 }
@@ -263,6 +269,9 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COMPILED_CACHE_HITS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMPILED_CACHE_MISSES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COMPILE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_BACKGROUND_STATUS_CHECKS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_OP_CX_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     reset_record_profile();
     reset_vdbe_metrics();
 }
@@ -283,6 +292,10 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             compiled_cache_misses: FSQLITE_COMPILED_CACHE_MISSES.load(AtomicOrdering::Relaxed),
             compile_time_ns: FSQLITE_COMPILE_TIME_NS.load(AtomicOrdering::Relaxed),
         },
+        background_status_checks: FSQLITE_BACKGROUND_STATUS_CHECKS.load(AtomicOrdering::Relaxed),
+        op_cx_background_gates: FSQLITE_OP_CX_BACKGROUND_GATES.load(AtomicOrdering::Relaxed),
+        statement_dispatch_background_gates: FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES
+            .load(AtomicOrdering::Relaxed),
         record_decode: record_profile_snapshot(),
         vdbe: vdbe_metrics_snapshot(),
     }
@@ -332,11 +345,28 @@ impl Default for RuntimeConfig {
 }
 
 /// Process-global runtime handle shared by all database regions.
-#[derive(Debug)]
 pub struct RuntimeContext {
     runtime_id: u64,
     config: RuntimeConfig,
     root_cx: Cx,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    native_runtime_handle: Option<asupersync::runtime::RuntimeHandle>,
+}
+
+impl std::fmt::Debug for RuntimeContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("RuntimeContext");
+        debug
+            .field("runtime_id", &self.runtime_id)
+            .field("config", &self.config)
+            .field("root_cx", &self.root_cx);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        debug.field(
+            "has_native_runtime_handle",
+            &self.native_runtime_handle.is_some(),
+        );
+        debug.finish()
+    }
 }
 
 impl RuntimeContext {
@@ -355,6 +385,11 @@ impl RuntimeContext {
             .with_trace_context(next_trace_id(), 0, 0)
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn current_native_runtime_handle() -> Option<asupersync::runtime::RuntimeHandle> {
+        asupersync::runtime::Runtime::current_handle()
+    }
+
     /// Create a runtime context with the provided configuration.
     ///
     /// When invoked from within an active asupersync task, this best-effort
@@ -368,6 +403,8 @@ impl RuntimeContext {
             runtime_id: NEXT_RUNTIME_ID.fetch_add(1, AtomicOrdering::Relaxed),
             config,
             root_cx: Self::detached_root_cx(),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            native_runtime_handle: Self::current_native_runtime_handle(),
         }
     }
 
@@ -382,7 +419,14 @@ impl RuntimeContext {
             runtime_id: NEXT_RUNTIME_ID.fetch_add(1, AtomicOrdering::Relaxed),
             config,
             root_cx: Self::derived_root_cx(root_cx),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            native_runtime_handle: Self::current_native_runtime_handle(),
         }
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn native_runtime_handle(&self) -> Option<asupersync::runtime::RuntimeHandle> {
+        self.native_runtime_handle.clone()
     }
 
     /// Return the stable runtime identity used to isolate per-database state.
@@ -1274,17 +1318,21 @@ fn emit_compat_trace_event(trace: Option<&TraceRegistration>, event: TraceEvent)
     }
 
     let callback_type = event.callback_type();
-    let span = tracing::span!(
-        target: "fsqlite.compat_trace",
-        tracing::Level::DEBUG,
-        "compat_trace",
-        callback_type
-    );
-    record_trace_span_created();
     record_compat_trace_callback();
-    let _guard = span.enter();
-    (trace.callback)(event);
-    tracing::debug!(callback_type, "sqlite3_trace_v2 callback emitted");
+    if tracing::enabled!(target: "fsqlite.compat_trace", tracing::Level::DEBUG) {
+        let span = tracing::span!(
+            target: "fsqlite.compat_trace",
+            tracing::Level::DEBUG,
+            "compat_trace",
+            callback_type
+        );
+        record_trace_span_created();
+        let _guard = span.enter();
+        (trace.callback)(event);
+        tracing::debug!(callback_type, "sqlite3_trace_v2 callback emitted");
+    } else {
+        (trace.callback)(event);
+    }
 }
 
 impl std::fmt::Debug for PreparedStatement<'_> {
@@ -1437,10 +1485,12 @@ impl PreparedStatement<'_> {
         }
         self.conn.background_status()?;
         self.conn.sync_change_tracking_context();
-        let op_cx = self.conn.op_cx()?;
+        let op_cx = self.conn.op_cx_after_background_status();
         self.ensure_schema_unchanged(&op_cx)?;
         if let Some(statement) = &self.deferred_query_statement {
-            return self.conn.execute_statement(statement.as_ref(), None);
+            return self
+                .conn
+                .execute_statement_after_background_status(statement.as_ref(), None);
         }
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, None)?
@@ -1475,12 +1525,12 @@ impl PreparedStatement<'_> {
         }
         self.conn.background_status()?;
         self.conn.sync_change_tracking_context();
-        let op_cx = self.conn.op_cx()?;
+        let op_cx = self.conn.op_cx_after_background_status();
         self.ensure_schema_unchanged(&op_cx)?;
         if let Some(statement) = &self.deferred_query_statement {
             return self
                 .conn
-                .execute_statement(statement.as_ref(), Some(params));
+                .execute_statement_after_background_status(statement.as_ref(), Some(params));
         }
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, Some(params))?
@@ -3909,24 +3959,34 @@ impl Connection {
     /// Each call allocates a new `decision_id` so that per-operation tracing
     /// can distinguish individual SQL operations within a connection's trace.
     fn op_cx(&self) -> Result<Cx> {
+        if hot_path_profile_enabled() {
+            FSQLITE_OP_CX_BACKGROUND_GATES.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         self.background_status()?;
+        Ok(self.op_cx_after_background_status())
+    }
+
+    #[must_use]
+    fn op_cx_after_background_status(&self) -> Cx {
         self.refresh_eprocess_oracle();
         let op_cx = self
             .root_cx
             .create_child()
             .with_decision_id(next_decision_id());
-        tracing::debug!(
-            target: "fsqlite::cx",
-            event = "derived",
-            connection_region = self.runtime_region.get(),
-            trace_id = op_cx.trace_id(),
-            decision_id = op_cx.decision_id(),
-            budget_deadline_ms = op_cx
-                .budget()
-                .deadline
-                .map(|deadline| u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX))
-        );
-        Ok(op_cx)
+        if tracing::enabled!(target: "fsqlite::cx", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "fsqlite::cx",
+                event = "derived",
+                connection_region = self.runtime_region.get(),
+                trace_id = op_cx.trace_id(),
+                decision_id = op_cx.decision_id(),
+                budget_deadline_ms = op_cx
+                    .budget()
+                    .deadline
+                    .map(|deadline| u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX))
+            );
+        }
+        op_cx
     }
 
     /// Derive a best-effort context for teardown paths.
@@ -4376,26 +4436,34 @@ impl Connection {
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
         self.background_status()?;
         let statement = {
-            let parse_span = tracing::span!(
-                target: "fsqlite.parse",
-                tracing::Level::TRACE,
-                "parse",
-                parse_mode = "prepare_single",
-                sql_len = sql.len()
-            );
-            record_trace_span_created();
-            let _parse_guard = parse_span.enter();
+            let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
+                .then(|| {
+                    let span = tracing::span!(
+                        target: "fsqlite.parse",
+                        tracing::Level::TRACE,
+                        "parse",
+                        parse_mode = "prepare_single",
+                        sql_len = sql.len()
+                    );
+                    record_trace_span_created();
+                    span
+                });
+            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.cached_parse_single(sql)?
         };
         let statement = {
-            let parse_span = tracing::span!(
-                target: "fsqlite.parse",
-                tracing::Level::TRACE,
-                "parse",
-                parse_mode = "prepare_rewrite"
-            );
-            record_trace_span_created();
-            let _parse_guard = parse_span.enter();
+            let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
+                .then(|| {
+                    let span = tracing::span!(
+                        target: "fsqlite.parse",
+                        tracing::Level::TRACE,
+                        "parse",
+                        parse_mode = "prepare_rewrite"
+                    );
+                    record_trace_span_created();
+                    span
+                });
+            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             let profile_enabled = hot_path_profile_enabled();
             if profile_enabled {
                 FSQLITE_REWRITE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
@@ -4412,24 +4480,32 @@ impl Connection {
         };
         let canonical_sql = statement.to_string();
         if self.prepared_select_requires_dispatch(&statement) {
-            let plan_span = tracing::span!(
-                target: "fsqlite.plan",
-                tracing::Level::TRACE,
-                "plan",
-                stage = "compile_prepared_statement"
-            );
-            record_trace_span_created();
-            let _plan_guard = plan_span.enter();
+            let plan_span =
+                tracing::enabled!(target: "fsqlite.plan", tracing::Level::TRACE).then(|| {
+                    let span = tracing::span!(
+                        target: "fsqlite.plan",
+                        tracing::Level::TRACE,
+                        "plan",
+                        stage = "compile_prepared_statement"
+                    );
+                    record_trace_span_created();
+                    span
+                });
+            let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
             return self.compile_and_wrap(&canonical_sql, &statement);
         }
-        let plan_span = tracing::span!(
-            target: "fsqlite.plan",
-            tracing::Level::TRACE,
-            "plan",
-            stage = "compile_prepared_statement"
-        );
-        record_trace_span_created();
-        let _plan_guard = plan_span.enter();
+        let plan_span =
+            tracing::enabled!(target: "fsqlite.plan", tracing::Level::TRACE).then(|| {
+                let span = tracing::span!(
+                    target: "fsqlite.plan",
+                    tracing::Level::TRACE,
+                    "plan",
+                    stage = "compile_prepared_statement"
+                );
+                record_trace_span_created();
+                span
+            });
+        let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
         self.compile_and_wrap(&canonical_sql, &statement)
     }
 
@@ -4441,20 +4517,24 @@ impl Connection {
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
         self.background_status()?;
         let statements = {
-            let parse_span = tracing::span!(
-                target: "fsqlite.parse",
-                tracing::Level::TRACE,
-                "parse",
-                parse_mode = "query_multi",
-                sql_len = sql.len()
-            );
-            record_trace_span_created();
-            let _parse_guard = parse_span.enter();
+            let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
+                .then(|| {
+                    let span = tracing::span!(
+                        target: "fsqlite.parse",
+                        tracing::Level::TRACE,
+                        "parse",
+                        parse_mode = "query_multi",
+                        sql_len = sql.len()
+                    );
+                    record_trace_span_created();
+                    span
+                });
+            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.cached_parse_multi(sql)?
         };
         let mut rows = Vec::new();
         for statement in statements {
-            rows = self.execute_statement(statement.as_ref(), None)?;
+            rows = self.execute_statement_after_background_status(statement.as_ref(), None)?;
         }
         Ok(rows)
     }
@@ -4463,18 +4543,22 @@ impl Connection {
     pub fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
         self.background_status()?;
         let statement = {
-            let parse_span = tracing::span!(
-                target: "fsqlite.parse",
-                tracing::Level::TRACE,
-                "parse",
-                parse_mode = "query_single",
-                sql_len = sql.len()
-            );
-            record_trace_span_created();
-            let _parse_guard = parse_span.enter();
+            let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
+                .then(|| {
+                    let span = tracing::span!(
+                        target: "fsqlite.parse",
+                        tracing::Level::TRACE,
+                        "parse",
+                        parse_mode = "query_single",
+                        sql_len = sql.len()
+                    );
+                    record_trace_span_created();
+                    span
+                });
+            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.cached_parse_single(sql)?
         };
-        self.execute_statement(statement.as_ref(), Some(params))
+        self.execute_statement_after_background_status(statement.as_ref(), Some(params))
     }
 
     /// Prepare and execute SQL as a query, returning exactly one row.
@@ -4495,15 +4579,19 @@ impl Connection {
     pub fn execute(&self, sql: &str) -> Result<usize> {
         self.background_status()?;
         let statements = {
-            let parse_span = tracing::span!(
-                target: "fsqlite.parse",
-                tracing::Level::TRACE,
-                "parse",
-                parse_mode = "execute_multi",
-                sql_len = sql.len()
-            );
-            record_trace_span_created();
-            let _parse_guard = parse_span.enter();
+            let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
+                .then(|| {
+                    let span = tracing::span!(
+                        target: "fsqlite.parse",
+                        tracing::Level::TRACE,
+                        "parse",
+                        parse_mode = "execute_multi",
+                        sql_len = sql.len()
+                    );
+                    record_trace_span_created();
+                    span
+                });
+            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.cached_parse_multi(sql)?
         };
         let mut last_count = 0;
@@ -4512,7 +4600,7 @@ impl Connection {
                 statement.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
-            let rows = self.execute_statement(statement.as_ref(), None)?;
+            let rows = self.execute_statement_after_background_status(statement.as_ref(), None)?;
             last_count = if is_dml {
                 *self.last_changes.borrow()
             } else {
@@ -4526,22 +4614,27 @@ impl Connection {
     pub fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
         self.background_status()?;
         let statement = {
-            let parse_span = tracing::span!(
-                target: "fsqlite.parse",
-                tracing::Level::TRACE,
-                "parse",
-                parse_mode = "execute_single",
-                sql_len = sql.len()
-            );
-            record_trace_span_created();
-            let _parse_guard = parse_span.enter();
+            let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
+                .then(|| {
+                    let span = tracing::span!(
+                        target: "fsqlite.parse",
+                        tracing::Level::TRACE,
+                        "parse",
+                        parse_mode = "execute_single",
+                        sql_len = sql.len()
+                    );
+                    record_trace_span_created();
+                    span
+                });
+            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.cached_parse_single(sql)?
         };
         let is_dml = matches!(
             statement.as_ref(),
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
-        let rows = self.execute_statement(statement.as_ref(), Some(params))?;
+        let rows =
+            self.execute_statement_after_background_status(statement.as_ref(), Some(params))?;
         Ok(if is_dml {
             *self.last_changes.borrow()
         } else {
@@ -4567,7 +4660,7 @@ impl Connection {
             ));
         }
         if let Some(dispatch) = stmt.precompiled_dml() {
-            let op_cx = self.op_cx()?;
+            let op_cx = self.op_cx_after_background_status();
             stmt.ensure_schema_unchanged(&op_cx)?;
             let p = if params.is_empty() {
                 None
@@ -4585,14 +4678,18 @@ impl Connection {
             };
         }
         if let Some(dml) = stmt.deferred_dml_statement() {
-            let op_cx = self.op_cx()?;
+            let op_cx = self.op_cx_after_background_status();
             stmt.ensure_schema_unchanged(&op_cx)?;
             let p = if params.is_empty() {
                 None
             } else {
                 Some(params)
             };
-            let rows = self.execute_statement_impl(dml, p, stmt.dispatch_precompiled_program())?;
+            let rows = self.execute_statement_impl_after_background_status(
+                dml,
+                p,
+                stmt.dispatch_precompiled_program(),
+            )?;
             let is_dml = matches!(
                 dml,
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -4622,19 +4719,24 @@ impl Connection {
     ) -> Result<usize> {
         self.clear_table_program_error_state();
         self.sync_change_tracking_context();
-        let trace_id = next_trace_id();
-        let decision_id = next_decision_id();
+        let statement_trace_enabled =
+            tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG);
+        let trace_id = statement_trace_enabled.then(next_trace_id).unwrap_or(0);
+        let decision_id = statement_trace_enabled.then(next_decision_id).unwrap_or(0);
         let trace_registration = self.trace_registration.borrow().clone();
-        let statement_span = tracing::span!(
-            target: "fsqlite.statement",
-            tracing::Level::DEBUG,
-            "statement",
-            trace_id,
-            decision_id,
-            statement_kind = "insert"
-        );
-        record_trace_span_created();
-        let _statement_guard = statement_span.enter();
+        let statement_span = statement_trace_enabled.then(|| {
+            let span = tracing::span!(
+                target: "fsqlite.statement",
+                tracing::Level::DEBUG,
+                "statement",
+                trace_id,
+                decision_id,
+                statement_kind = "insert"
+            );
+            record_trace_span_created();
+            span
+        });
+        let _statement_guard = statement_span.as_ref().map(tracing::Span::enter);
         if trace_registration.is_some() {
             emit_compat_trace_event(
                 trace_registration.as_ref(),
@@ -5218,11 +5320,23 @@ impl Connection {
         statement: &Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        self.execute_statement_impl(statement, params, None)
+        if hot_path_profile_enabled() {
+            FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.background_status()?;
+        self.execute_statement_after_background_status(statement, params)
+    }
+
+    fn execute_statement_after_background_status(
+        &self,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        self.execute_statement_impl_after_background_status(statement, params, None)
     }
 
     #[allow(clippy::too_many_lines)]
-    fn execute_statement_impl(
+    fn execute_statement_impl_after_background_status(
         &self,
         statement: &Statement,
         params: Option<&[SqliteValue]>,
@@ -5251,8 +5365,13 @@ impl Connection {
             Statement::Explain { .. } => "explain",
             _ => "other",
         };
-        let trace_id = next_trace_id();
-        let decision_id = next_decision_id();
+        let statement_trace_enabled =
+            tracing::enabled!(target: "fsqlite.statement", tracing::Level::DEBUG);
+        let parse_trace_enabled = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE);
+        let trace_id = (statement_trace_enabled || parse_trace_enabled)
+            .then(next_trace_id)
+            .unwrap_or(0);
+        let decision_id = statement_trace_enabled.then(next_decision_id).unwrap_or(0);
         let trace_registration = self.trace_registration.borrow().clone();
         let statement_sql = trace_registration.is_some().then(|| statement.to_string());
         let statement_reuse_sql =
@@ -5261,16 +5380,19 @@ impl Connection {
                     .clone()
                     .unwrap_or_else(|| statement.to_string())
             });
-        let statement_span = tracing::span!(
-            target: "fsqlite.statement",
-            tracing::Level::DEBUG,
-            "statement",
-            trace_id,
-            decision_id,
-            statement_kind
-        );
-        record_trace_span_created();
-        let _statement_guard = statement_span.enter();
+        let statement_span = statement_trace_enabled.then(|| {
+            let span = tracing::span!(
+                target: "fsqlite.statement",
+                tracing::Level::DEBUG,
+                "statement",
+                trace_id,
+                decision_id,
+                statement_kind
+            );
+            record_trace_span_created();
+            span
+        });
+        let _statement_guard = statement_span.as_ref().map(tracing::Span::enter);
         if trace_registration.is_some() {
             emit_compat_trace_event(
                 trace_registration.as_ref(),
@@ -5281,16 +5403,19 @@ impl Connection {
         }
         let execution_started = fsqlite_types::sync_primitives::Instant::now();
         let statement = {
-            let parse_span = tracing::span!(
-                target: "fsqlite.parse",
-                tracing::Level::TRACE,
-                "parse",
-                trace_id,
-                statement_kind,
-                phase = "rewrite_subquery"
-            );
-            record_trace_span_created();
-            let _parse_guard = parse_span.enter();
+            let parse_span = parse_trace_enabled.then(|| {
+                let span = tracing::span!(
+                    target: "fsqlite.parse",
+                    tracing::Level::TRACE,
+                    "parse",
+                    trace_id,
+                    statement_kind,
+                    phase = "rewrite_subquery"
+                );
+                record_trace_span_created();
+                span
+            });
+            let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
             self.rewrite_subquery_statement(statement, params)?
         };
         // 5B.5 + 5B.2 (bd-1yi8): autocommit wrapping — ensure a pager
@@ -5357,7 +5482,7 @@ impl Connection {
             );
         let rollback_on_constraint_violation =
             statement_rolls_back_transaction_on_constraint(statement.as_ref());
-        let op_cx = self.op_cx()?;
+        let op_cx = self.op_cx_after_background_status();
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint(statement_kind, || {
                 self.execute_statement_dispatch_impl(
@@ -25678,6 +25803,9 @@ impl SharedMvccState {
     }
 
     fn background_status(&self) -> Result<()> {
+        if hot_path_profile_enabled() {
+            FSQLITE_BACKGROUND_STATUS_CHECKS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         let state = lock_unpoisoned(&self.runtime_state);
         match &state.poisoned {
             Some(details) => Err(FrankenError::BackgroundWorkerFailed(details.clone())),
@@ -25907,7 +26035,7 @@ impl SharedMvccState {
 
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         {
-            let Some(runtime_handle) = asupersync::runtime::Runtime::current_handle() else {
+            let Some(runtime_handle) = self._runtime.native_runtime_handle() else {
                 return Ok(false);
             };
             let (region_task, task_cx) = self.register_write_coordinator_task()?;
@@ -35336,6 +35464,63 @@ mod tests {
 
         drop(conn2);
         drop(conn1);
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_open_with_env_uses_supplied_runtime_for_write_coordinator_service() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let runtime_a = RuntimeBuilder::new()
+            .worker_threads(1)
+            .build()
+            .expect("runtime A build");
+        let runtime_b = RuntimeBuilder::new()
+            .worker_threads(1)
+            .build()
+            .expect("runtime B build");
+        let runtime_context_a = runtime_a.block_on(async {
+            Arc::new(RuntimeContext::new(RuntimeConfig {
+                worker_threads: 1,
+                io_poll_strategy: IoPollStrategy::Auto,
+            }))
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("write-coordinator-explicit-runtime.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+
+        let conn = runtime_b.block_on(async {
+            Connection::open_with_env(&db_path, ConnectionEnv::new(Arc::clone(&runtime_context_a)))
+                .expect("connection should open")
+        });
+        let shared = Arc::clone(&conn._shared_mvcc_state);
+
+        assert!(Arc::ptr_eq(&shared._runtime, &runtime_context_a));
+
+        drop(runtime_b);
+
+        let hold_deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < hold_deadline {
+            let (running, active_tasks) = {
+                let state = lock_unpoisoned(&shared.runtime_state);
+                (
+                    state.write_coordinator_service_running,
+                    state.regions.active_tasks(state.write_coordinator_region),
+                )
+            };
+            assert!(
+                running,
+                "write coordinator service should remain alive on the env-selected runtime after the ambient runtime drops"
+            );
+            assert_eq!(
+                active_tasks, 1,
+                "write coordinator service task should stay registered on the env-selected runtime"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        drop(conn);
+        drop(runtime_a);
     }
 
     #[test]
@@ -56158,6 +56343,42 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_compat_trace_callback_works_without_debug_span_bookkeeping() {
+        let sink = Arc::new(std::sync::Mutex::new(Vec::<TraceEvent>::new()));
+        let sink_clone = Arc::clone(&sink);
+        let trace = TraceRegistration {
+            mask: TraceMask::ALL,
+            callback: Arc::new(move |event| {
+                sink_clone
+                    .lock()
+                    .expect("trace sink mutex poisoned")
+                    .push(event);
+            }),
+        };
+
+        reset_trace_metrics();
+        let baseline = trace_metrics_snapshot();
+        emit_compat_trace_event(Some(&trace), TraceEvent::Close);
+
+        let snapshot = trace_metrics_snapshot();
+        let captured = sink.lock().expect("trace sink mutex poisoned");
+        assert_eq!(captured.len(), 1, "compat callback should still fire");
+        assert!(
+            matches!(captured[0], TraceEvent::Close),
+            "expected close event to reach callback"
+        );
+        assert_eq!(
+            snapshot.fsqlite_compat_trace_callbacks_total,
+            baseline.fsqlite_compat_trace_callbacks_total + 1,
+            "compat callback counter should still advance"
+        );
+        assert_eq!(
+            snapshot.fsqlite_trace_spans_total, baseline.fsqlite_trace_spans_total,
+            "without a compat-trace subscriber, no extra compat trace span should be counted"
+        );
+    }
+
+    #[test]
     fn test_trace_v2_mask_filters_callback_types() {
         let events = Arc::new(std::sync::Mutex::new(Vec::<TraceEvent>::new()));
         let sink = Arc::clone(&events);
@@ -63446,6 +63667,67 @@ mod pager_routing_tests {
         assert!(
             profile.parser.compiled_cache_hits >= 4,
             "expected repeated ad-hoc execution to hit compiled cache: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_statement_paths_take_one_background_status_check_per_operation() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE bg_status (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let insert_stmt = conn
+            .prepare("INSERT INTO bg_status (id, val) VALUES (?1, ?2)")
+            .unwrap();
+        let select_stmt = conn
+            .prepare("SELECT val FROM bg_status WHERE id = ?1")
+            .unwrap();
+
+        reset_hot_path_profile();
+        for id in 1_i64..=4 {
+            let affected = insert_stmt
+                .execute_with_params(&[
+                    SqliteValue::Integer(id),
+                    SqliteValue::Text(format!("v{id}")),
+                ])
+                .unwrap();
+            assert_eq!(affected, 1);
+        }
+        let prepared_insert_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            prepared_insert_profile.statement_dispatch_background_gates, 0,
+            "prepared INSERT should bypass the legacy execute_statement() background-status gate: {prepared_insert_profile:?}"
+        );
+
+        reset_hot_path_profile();
+        for id in 1_i64..=4 {
+            let rows = select_stmt
+                .query_with_params(&[SqliteValue::Integer(id)])
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Text(format!("v{id}")));
+        }
+        let prepared_select_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            prepared_select_profile.statement_dispatch_background_gates, 0,
+            "prepared SELECT should bypass the legacy execute_statement() background-status gate: {prepared_select_profile:?}"
+        );
+
+        reset_hot_path_profile();
+        for id in 1_i64..=4 {
+            let row = conn
+                .query_row_with_params(
+                    "SELECT val FROM bg_status WHERE id = ?1",
+                    &[SqliteValue::Integer(id)],
+                )
+                .unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Text(format!("v{id}")));
+        }
+        let ad_hoc_select_profile = hot_path_profile_snapshot();
+        assert_eq!(
+            ad_hoc_select_profile.statement_dispatch_background_gates, 0,
+            "ad-hoc SELECT should bypass the legacy execute_statement() background-status gate: {ad_hoc_select_profile:?}"
         );
     }
 
