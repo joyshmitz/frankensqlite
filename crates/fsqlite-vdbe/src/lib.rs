@@ -426,11 +426,13 @@ impl ProgramBuilder {
             .map(|(table_cursor, indexes)| (table_cursor, indexes.into_boxed_slice()))
             .collect();
 
+        let has_insert = self.ops.iter().any(|op| op.opcode == Opcode::Insert);
         Ok(VdbeProgram {
             ops: self.ops,
             register_count: self.regs.count(),
             bind_parameter_requirement,
             table_index_meta: Arc::new(table_index_meta),
+            has_insert,
         })
     }
 }
@@ -459,6 +461,9 @@ pub struct VdbeProgram {
     bind_parameter_requirement: std::result::Result<usize, i32>,
     /// Table-to-index cursor metadata for REPLACE conflict resolution.
     table_index_meta: Arc<TableIndexMetaMap>,
+    /// Precomputed flag: true when the program contains at least one Insert
+    /// opcode, meaning column defaults may be needed during execution.
+    has_insert: bool,
 }
 
 impl VdbeProgram {
@@ -507,8 +512,9 @@ impl VdbeProgram {
 
     /// Returns `true` if the program contains any `Insert` opcodes,
     /// meaning column defaults may be needed during execution.
+    /// Precomputed at build time — O(1) at call time.
     pub fn has_insert_ops(&self) -> bool {
-        self.ops.iter().any(|op| op.opcode == Opcode::Insert)
+        self.has_insert
     }
 
     /// Disassemble the program to a human-readable string.

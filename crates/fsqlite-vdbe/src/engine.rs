@@ -6934,7 +6934,7 @@ impl VdbeEngine {
                     } else {
                         0
                     };
-                    self.set_reg(op.p2, SqliteValue::Integer(count));
+                    self.set_reg_int(op.p2, count);
                     pc += 1;
                 }
 
@@ -6942,7 +6942,7 @@ impl VdbeEngine {
                     let counter = self.sequence_counters.entry(op.p1).or_insert(0);
                     let val = *counter;
                     *counter += 1;
-                    self.set_reg(op.p2, SqliteValue::Integer(val));
+                    self.set_reg_int(op.p2, val);
                     pc += 1;
                 }
 
@@ -7812,7 +7812,7 @@ impl VdbeEngine {
                     let mut val = self.get_reg(op.p1).to_integer();
                     if val > 0 {
                         val -= 1;
-                        self.set_reg(op.p1, SqliteValue::Integer(val));
+                        self.set_reg_int(op.p1, val);
                         if val == 0 {
                             #[allow(clippy::cast_sign_loss)]
                             {
@@ -7832,7 +7832,7 @@ impl VdbeEngine {
                     let val = self.get_reg(op.p1).to_integer();
                     if val > 0 {
                         let decremented = val - i64::from(op.p3);
-                        self.set_reg(op.p1, SqliteValue::Integer(decremented));
+                        self.set_reg_int(op.p1, decremented);
                         #[allow(clippy::cast_sign_loss)]
                         {
                             pc = op.p2 as usize;
@@ -7864,7 +7864,7 @@ impl VdbeEngine {
                         .and_then(|rs| rs.read_next());
                     match next_val {
                         Some(val) => {
-                            self.set_reg(op.p3, SqliteValue::Integer(val));
+                            self.set_reg_int(op.p3, val);
                             pc += 1;
                         }
                         None => {
@@ -7915,7 +7915,7 @@ impl VdbeEngine {
                     let val1 = self.get_reg(op.p1).to_integer();
                     let val2 = self.get_reg(op.p2).to_integer();
                     if val1 > val2 {
-                        self.set_reg(op.p2, SqliteValue::Integer(val1));
+                        self.set_reg_int(op.p2, val1);
                     }
                     pc += 1;
                 }
@@ -7934,7 +7934,7 @@ impl VdbeEngine {
                     } else {
                         limit.saturating_add(offset)
                     };
-                    self.set_reg(op.p3, SqliteValue::Integer(combined));
+                    self.set_reg_int(op.p3, combined);
                     pc += 1;
                 }
 
@@ -7942,7 +7942,7 @@ impl VdbeEngine {
                 Opcode::IfNotZero => {
                     let val = self.get_reg(op.p1).to_integer();
                     if val != 0 {
-                        self.set_reg(op.p1, SqliteValue::Integer(val.wrapping_sub(1)));
+                        self.set_reg_int(op.p1, val.wrapping_sub(1));
                         pc = op.p2 as usize;
                     } else {
                         pc += 1;
