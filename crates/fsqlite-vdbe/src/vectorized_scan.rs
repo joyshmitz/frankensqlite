@@ -421,7 +421,7 @@ fn column_value_at(column: &Column, row_idx: usize) -> ScanResult<SqliteValue> {
         ColumnData::Binary { offsets, data } => {
             let (start, end) =
                 checked_offset_span(offsets, data.len(), row_idx, &column.spec.name)?;
-            Ok(SqliteValue::Blob(data[start..end].to_vec()))
+            Ok(SqliteValue::Blob(data[start..end].to_vec().into()))
         }
         ColumnData::Text { offsets, data } => {
             let (start, end) =
@@ -432,7 +432,7 @@ fn column_value_at(column: &Column, row_idx: usize) -> ScanResult<SqliteValue> {
                     row_idx,
                 }
             })?;
-            Ok(SqliteValue::Text(text.to_owned()))
+            Ok(SqliteValue::Text(text.to_owned().into()))
         }
     }
 }

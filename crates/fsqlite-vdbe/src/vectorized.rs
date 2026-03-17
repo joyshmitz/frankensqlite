@@ -796,7 +796,7 @@ fn append_row(
                 validity.push(false);
             }
             (ColumnBuilder::Binary(_, offsets, data, validity), SqliteValue::Blob(bytes)) => {
-                data.extend(bytes);
+                data.extend_from_slice(bytes);
                 let next_offset = u32::try_from(data.len()).map_err(|_| {
                     BatchFormatError::new(format!(
                         "binary column {} exceeds 4 GiB payload",
