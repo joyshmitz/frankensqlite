@@ -14,8 +14,10 @@
 //!   cargo run --profile release-perf -p fsqlite-e2e --bin comprehensive-bench -- --filter insert
 
 use std::io::Write as _;
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant, SystemTime};
+
+use asupersync::runtime::{BlockingTaskHandle, Runtime, RuntimeBuilder};
 
 // ─── Configuration ─────────────────────────────────────────────────────
 
@@ -287,6 +289,48 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
         label: label.to_string(),
         durations,
         row_count,
+    }
+}
+
+struct BenchTask<T> {
+    handle: BlockingTaskHandle,
+    result_rx: mpsc::Receiver<Result<T, String>>,
+}
+
+impl<T> BenchTask<T> {
+    fn wait(self) -> T {
+        self.handle.wait();
+        match self.result_rx.recv() {
+            Ok(Ok(value)) => value,
+            Ok(Err(message)) => panic!("{message}"),
+            Err(err) => panic!("benchmark worker exited without reporting a result: {err}"),
+        }
+    }
+}
+
+fn spawn_bench_task<T, F>(runtime: &Runtime, task: F) -> BenchTask<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (result_tx, result_rx) = mpsc::channel();
+    let handle = runtime
+        .spawn_blocking(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task))
+                .map_err(panic_payload_to_string);
+            let _ = result_tx.send(outcome);
+        })
+        .expect("comprehensive benchmark runtime must configure a blocking pool");
+    BenchTask { handle, result_rx }
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_owned(),
+            Err(_) => "non-string panic payload".to_owned(),
+        },
     }
 }
 
@@ -1347,6 +1391,10 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
 
         // C SQLite: file-backed WAL with multiple connections.
         let cs = measure(&format!("cs_concurrent_{n_threads}t"), total_rows, || {
+            let runtime = RuntimeBuilder::new()
+                .blocking_threads(n_threads, n_threads)
+                .build()
+                .expect("comprehensive benchmark runtime should build");
             let tmp = tempfile::NamedTempFile::new().unwrap();
             let path = tmp.path().to_str().unwrap().to_owned();
             {
@@ -1366,12 +1414,14 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             let handles: Vec<_> = (0..n_threads)
                 .map(|tid| {
                     let p = path.clone();
-                    let bar = barrier.clone();
-                    std::thread::spawn(move || {
+                    let bar = Arc::clone(&barrier);
+                    spawn_bench_task(&runtime, move || {
+                        // Enter the start gate before any fallible setup so one
+                        // worker error cannot strand the rest at the barrier.
+                        bar.wait();
                         let conn = rusqlite::Connection::open(&p).unwrap();
                         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
                             .unwrap();
-                        bar.wait();
 
                         conn.execute_batch("BEGIN").unwrap();
                         #[allow(clippy::cast_possible_wrap)]
@@ -1389,7 +1439,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                 .collect();
 
             for h in handles {
-                h.join().unwrap();
+                h.wait();
             }
         });
 
@@ -1468,6 +1518,53 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             &format!("C SQLite 1 thread / {total_rows} rows (baseline)"),
             Some(cs_single),
             None,
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn spawn_bench_task_runs_on_runtime_blocking_pool() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("benchmark runtime should build for test");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_for_task = Arc::clone(&counter);
+
+        let handle = spawn_bench_task(&runtime, move || {
+            counter_for_task.fetch_add(1, Ordering::Relaxed);
+        });
+
+        handle.wait();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "benchmark task should run exactly once",
+        );
+    }
+
+    #[test]
+    fn spawn_bench_task_propagates_panics() {
+        let runtime = RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("benchmark runtime should build for test");
+        let handle = spawn_bench_task(&runtime, || -> () {
+            panic!("benchmark worker panic should surface");
+        });
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.wait()))
+            .expect_err("wait should propagate worker panic");
+        let message = panic_payload_to_string(panic);
+        assert!(
+            message.contains("benchmark worker panic should surface"),
+            "panic payload should mention original worker failure: {message}",
         );
     }
 }
