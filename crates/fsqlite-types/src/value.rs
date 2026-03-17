@@ -285,11 +285,13 @@ impl SqliteValue {
     }
 
     /// Returns true if this is a NULL value.
+    #[inline]
     pub const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
 
     /// Try to extract an integer value.
+    #[inline]
     pub const fn as_integer(&self) -> Option<i64> {
         match self {
             Self::Integer(i) => Some(*i),
@@ -298,6 +300,7 @@ impl SqliteValue {
     }
 
     /// Try to extract a float value.
+    #[inline]
     pub fn as_float(&self) -> Option<f64> {
         match self {
             Self::Float(f) => Some(*f),
@@ -328,6 +331,7 @@ impl SqliteValue {
     /// - Float -> truncated to i64
     /// - Text -> attempt to parse, 0 on failure
     /// - Blob -> 0
+    #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub fn to_integer(&self) -> i64 {
         match self {
@@ -346,6 +350,7 @@ impl SqliteValue {
     /// - Float -> itself
     /// - Text -> attempt to parse, 0.0 on failure
     /// - Blob -> 0.0
+    #[inline]
     #[allow(clippy::cast_precision_loss)]
     pub fn to_float(&self) -> f64 {
         match self {

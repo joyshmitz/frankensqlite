@@ -4959,60 +4959,57 @@ impl VdbeEngine {
                 Opcode::BitAnd => {
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
-                    let result = if a.is_null() || b.is_null() {
-                        SqliteValue::Null
+                    if a.is_null() || b.is_null() {
+                        self.set_reg_fast(op.p3, SqliteValue::Null);
                     } else {
-                        SqliteValue::Integer(a.to_integer() & b.to_integer())
-                    };
-                    self.set_reg(op.p3, result);
+                        self.set_reg_int(op.p3, a.to_integer() & b.to_integer());
+                    }
                     pc += 1;
                 }
 
                 Opcode::BitOr => {
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
-                    let result = if a.is_null() || b.is_null() {
-                        SqliteValue::Null
+                    if a.is_null() || b.is_null() {
+                        self.set_reg_fast(op.p3, SqliteValue::Null);
                     } else {
-                        SqliteValue::Integer(a.to_integer() | b.to_integer())
-                    };
-                    self.set_reg(op.p3, result);
+                        self.set_reg_int(op.p3, a.to_integer() | b.to_integer());
+                    }
                     pc += 1;
                 }
 
                 Opcode::ShiftLeft => {
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
-                    let result = if a.is_null() || b.is_null() {
-                        SqliteValue::Null
+                    if a.is_null() || b.is_null() {
+                        self.set_reg_fast(op.p3, SqliteValue::Null);
                     } else {
-                        sql_shift_left(b.to_integer(), a.to_integer())
-                    };
-                    self.set_reg(op.p3, result);
+                        let result = sql_shift_left(b.to_integer(), a.to_integer());
+                        self.set_reg_fast(op.p3, result);
+                    }
                     pc += 1;
                 }
 
                 Opcode::ShiftRight => {
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
-                    let result = if a.is_null() || b.is_null() {
-                        SqliteValue::Null
+                    if a.is_null() || b.is_null() {
+                        self.set_reg_fast(op.p3, SqliteValue::Null);
                     } else {
-                        sql_shift_right(b.to_integer(), a.to_integer())
-                    };
-                    self.set_reg(op.p3, result);
+                        let result = sql_shift_right(b.to_integer(), a.to_integer());
+                        self.set_reg_fast(op.p3, result);
+                    }
                     pc += 1;
                 }
 
                 Opcode::BitNot => {
                     // p2 = ~p1
                     let a = self.get_reg(op.p1);
-                    let result = if a.is_null() {
-                        SqliteValue::Null
+                    if a.is_null() {
+                        self.set_reg_fast(op.p2, SqliteValue::Null);
                     } else {
-                        SqliteValue::Integer(!a.to_integer())
-                    };
-                    self.set_reg(op.p2, result);
+                        self.set_reg_int(op.p2, !a.to_integer());
+                    }
                     pc += 1;
                 }
 
@@ -5023,18 +5020,21 @@ impl VdbeEngine {
                         .get_reg(op.p1)
                         .to_integer()
                         .wrapping_add(i64::from(op.p2));
-                    self.set_reg(op.p1, SqliteValue::Integer(val));
+                    self.set_reg_int(op.p1, val);
                     pc += 1;
                 }
 
                 Opcode::Cast => {
                     // Cast register p1 to type indicated by p2.
                     let val = self.take_reg(op.p1);
-                    let casted = sql_cast(val.clone(), op.p2);
                     if collect_vdbe_metrics {
+                        let casted = sql_cast(val.clone(), op.p2);
                         record_type_coercion(&val, &casted);
+                        self.set_reg_fast(op.p1, casted);
+                    } else {
+                        let casted = sql_cast(val, op.p2);
+                        self.set_reg_fast(op.p1, casted);
                     }
-                    self.set_reg(op.p1, casted);
                     pc += 1;
                 }
 
@@ -5060,13 +5060,15 @@ impl VdbeEngine {
                 #[allow(clippy::cast_precision_loss)]
                 Opcode::RealAffinity => {
                     if let SqliteValue::Integer(i) = self.get_reg(op.p1) {
-                        let before = SqliteValue::Integer(*i);
-                        let f = *i as f64;
-                        let after = SqliteValue::Float(f);
+                        let i_val = *i;
+                        let f = i_val as f64;
                         if collect_vdbe_metrics {
-                            record_type_coercion(&before, &after);
+                            record_type_coercion(
+                                &SqliteValue::Integer(i_val),
+                                &SqliteValue::Float(f),
+                            );
                         }
-                        self.set_reg(op.p1, after);
+                        self.set_reg_fast(op.p1, SqliteValue::Float(f));
                     }
                     pc += 1;
                 }
@@ -5088,7 +5090,7 @@ impl VdbeEngine {
                                 _ => false,
                             };
                             if store_p2 {
-                                self.set_reg(op.p2, SqliteValue::Integer(i64::from(should_jump)));
+                                self.set_reg_int(op.p2, i64::from(should_jump));
                                 pc += 1;
                             } else if should_jump {
                                 pc = op.p2 as usize;
@@ -5097,7 +5099,7 @@ impl VdbeEngine {
                             }
                         } else if store_p2 {
                             // STOREP2 with NULL: store NULL in P2.
-                            self.set_reg(op.p2, SqliteValue::Null);
+                            self.set_reg_fast(op.p2, SqliteValue::Null);
                             pc += 1;
                         } else {
                             // JUMPIFNULL (0x10): jump to P2 when either is NULL.
@@ -5150,7 +5152,7 @@ impl VdbeEngine {
                         );
 
                         if store_p2 {
-                            self.set_reg(op.p2, SqliteValue::Integer(i64::from(should_jump)));
+                            self.set_reg_int(op.p2, i64::from(should_jump));
                             pc += 1;
                         } else if should_jump {
                             pc = op.p2 as usize;
@@ -5166,7 +5168,7 @@ impl VdbeEngine {
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
                     let result = sql_and(a, b);
-                    self.set_reg(op.p3, result);
+                    self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
 
@@ -5175,19 +5177,18 @@ impl VdbeEngine {
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
                     let result = sql_or(a, b);
-                    self.set_reg(op.p3, result);
+                    self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
 
                 Opcode::Not => {
                     // p2 = NOT p1
                     let a = self.get_reg(op.p1);
-                    let result = if a.is_null() {
-                        SqliteValue::Null
+                    if a.is_null() {
+                        self.set_reg_fast(op.p2, SqliteValue::Null);
                     } else {
-                        SqliteValue::Integer(i64::from(!vdbe_real_is_truthy(a)))
-                    };
-                    self.set_reg(op.p2, result);
+                        self.set_reg_int(op.p2, i64::from(!vdbe_real_is_truthy(a)));
+                    }
                     pc += 1;
                 }
 
@@ -7750,9 +7751,21 @@ impl VdbeEngine {
                             ))
                         })?;
 
-                    let args = self.collect_reg_range(first_arg_reg, arg_count);
-                    observe_execution_cancellation(&self.execution_cx)?;
-                    let result = func.invoke(&args)?;
+                    // Use a direct slice into the register file instead of
+                    // allocating a SmallVec via collect_reg_range.  Same pattern as
+                    // AggStep (line 7545).  Falls back to collect_reg_range only when
+                    // the register range is out of bounds.
+                    let start_idx = usize::try_from(first_arg_reg).unwrap_or(0);
+                    let end_idx = start_idx.saturating_add(arg_count);
+                    let result = if end_idx <= self.registers.len() {
+                        let args = &self.registers[start_idx..end_idx];
+                        observe_execution_cancellation(&self.execution_cx)?;
+                        func.invoke(args)?
+                    } else {
+                        let args = self.collect_reg_range(first_arg_reg, arg_count);
+                        observe_execution_cancellation(&self.execution_cx)?;
+                        func.invoke(&args)?
+                    };
                     observe_execution_cancellation(&self.execution_cx)?;
 
                     if self.trace_opcodes {
@@ -8403,6 +8416,7 @@ impl VdbeEngine {
     /// leaving Null in the source registers. This avoids deep-cloning Text and
     /// Blob values on the hot ResultRow path where the registers are about to
     /// be overwritten by the next iteration anyway.
+    #[inline]
     fn take_reg_range(
         &mut self,
         start: i32,
@@ -8428,6 +8442,7 @@ impl VdbeEngine {
         row
     }
 
+    #[inline]
     fn take_reg(&mut self, r: i32) -> SqliteValue {
         if r >= 0 && (r as usize) < self.registers.len() {
             if !self.register_subtypes.is_empty() {
@@ -8439,6 +8454,7 @@ impl VdbeEngine {
         }
     }
 
+    #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn set_reg(&mut self, r: i32, val: SqliteValue) {
         if !(0..=65535).contains(&r) {
@@ -8466,7 +8482,8 @@ impl VdbeEngine {
     /// Fast-path register write with NaN -> Null normalization.
     /// Auto-resizes the register file when necessary (handles both
     /// builder-allocated programs and hand-crafted test programs).
-    #[inline]
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     #[allow(clippy::cast_sign_loss)]
     fn set_reg_fast(&mut self, r: i32, val: SqliteValue) {
         if !(0..=65535).contains(&r) {
