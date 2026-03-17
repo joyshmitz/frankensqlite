@@ -1369,7 +1369,7 @@ impl<'conn> PreparedOpExecutor<'conn> {
             return Ok(());
         }
 
-        let execution = if let Some(is_query) = normalize_simple_integer_point_sql(
+        let execution = if let Some(is_query) = normalize_simple_reusable_sql_shape(
             trimmed,
             &mut self.sql_scratch,
             &mut self.params_scratch,
@@ -1656,14 +1656,16 @@ fn should_skip_sql_statement(sql: &str) -> bool {
         || starts_with_ascii_prefix(sql, "DROP INDEX")
 }
 
-fn normalize_simple_integer_point_sql(
+fn normalize_simple_reusable_sql_shape(
     sql: &str,
     normalized_sql: &mut String,
     params: &mut Vec<SqliteValue>,
 ) -> Option<bool> {
     if normalize_single_integer_equality_select(sql, normalized_sql, params) {
         Some(true)
-    } else if normalize_delete_by_id(sql, normalized_sql, params) {
+    } else if normalize_delete_by_id(sql, normalized_sql, params)
+        || normalize_update_by_id(sql, normalized_sql, params)
+    {
         Some(false)
     } else {
         None
@@ -1782,7 +1784,97 @@ fn normalize_delete_by_id(
     true
 }
 
-fn consume_ascii_keyword<'a>(input: &mut &'a str, keyword: &str) -> bool {
+fn normalize_update_by_id(
+    sql: &str,
+    normalized_sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+) -> bool {
+    normalized_sql.clear();
+    params.clear();
+
+    let sql = sql.trim_end();
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
+    let mut rest = sql;
+
+    if !consume_ascii_keyword(&mut rest, "UPDATE") || !consume_required_ascii_whitespace(&mut rest)
+    {
+        return false;
+    }
+    let Some(table) = consume_simple_identifier(&mut rest) else {
+        return false;
+    };
+    if !consume_required_ascii_whitespace(&mut rest)
+        || !consume_ascii_keyword(&mut rest, "SET")
+        || !consume_required_ascii_whitespace(&mut rest)
+    {
+        return false;
+    }
+
+    let mut assignments = Vec::new();
+    loop {
+        let Some(column) = consume_simple_identifier(&mut rest) else {
+            return false;
+        };
+        consume_ascii_whitespace(&mut rest);
+        if !consume_ascii_char(&mut rest, '=') {
+            return false;
+        }
+        consume_ascii_whitespace(&mut rest);
+        let Some(value) = consume_simple_sql_literal(&mut rest) else {
+            return false;
+        };
+        assignments.push((column, value));
+        consume_ascii_whitespace(&mut rest);
+        if !consume_ascii_char(&mut rest, ',') {
+            break;
+        }
+        consume_ascii_whitespace(&mut rest);
+    }
+
+    if assignments.is_empty()
+        || !consume_required_ascii_whitespace(&mut rest)
+        || !consume_ascii_keyword(&mut rest, "WHERE")
+        || !consume_required_ascii_whitespace(&mut rest)
+    {
+        return false;
+    }
+    let Some(column) = consume_simple_identifier(&mut rest) else {
+        return false;
+    };
+    if !column.eq_ignore_ascii_case("id") {
+        return false;
+    }
+    consume_ascii_whitespace(&mut rest);
+    if !consume_ascii_char(&mut rest, '=') {
+        return false;
+    }
+    consume_ascii_whitespace(&mut rest);
+    let Some(id) = consume_i64_literal(&mut rest) else {
+        return false;
+    };
+    consume_ascii_whitespace(&mut rest);
+    if !rest.is_empty() {
+        return false;
+    }
+
+    write!(normalized_sql, "UPDATE {table} SET ").expect("writing into a String should not fail");
+    for (idx, (column, _)) in assignments.iter().enumerate() {
+        if idx > 0 {
+            normalized_sql.push_str(", ");
+        }
+        write!(normalized_sql, "{column} = ?{}", idx + 2)
+            .expect("writing into a String should not fail");
+    }
+    normalized_sql.push_str(" WHERE id = ?1");
+
+    params.push(SqliteValue::Integer(id));
+    for (_, value) in assignments {
+        params.push(value);
+    }
+    true
+}
+
+fn consume_ascii_keyword(input: &mut &str, keyword: &str) -> bool {
     if input
         .get(..keyword.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(keyword))
@@ -1860,6 +1952,108 @@ fn consume_i64_literal(input: &mut &str) -> Option<i64> {
     let value = literal.parse().ok()?;
     *input = &input[end..];
     Some(value)
+}
+
+fn consume_simple_sql_literal(input: &mut &str) -> Option<SqliteValue> {
+    if let Some(text) = consume_single_quoted_text_literal(input) {
+        return Some(SqliteValue::Text(text));
+    }
+    if consume_ascii_keyword(input, "NULL") {
+        return Some(SqliteValue::Null);
+    }
+    let literal = consume_numeric_literal(input)?;
+    Some(parse_value(literal))
+}
+
+fn consume_single_quoted_text_literal(input: &mut &str) -> Option<String> {
+    if !input.starts_with('\'') {
+        return None;
+    }
+
+    let mut literal = String::new();
+    let bytes = input.as_bytes();
+    let mut chunk_start = 1;
+    let mut idx = 1;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'\'' {
+            literal.push_str(&input[chunk_start..idx]);
+            idx += 1;
+            if bytes.get(idx) == Some(&b'\'') {
+                literal.push('\'');
+                idx += 1;
+                chunk_start = idx;
+                continue;
+            }
+            *input = &input[idx..];
+            return Some(literal);
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn consume_numeric_literal<'a>(input: &mut &'a str) -> Option<&'a str> {
+    let bytes = input.as_bytes();
+    let mut end = 0;
+
+    if bytes
+        .first()
+        .is_some_and(|byte| *byte == b'+' || *byte == b'-')
+    {
+        end += 1;
+    }
+
+    let integer_start = end;
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    let mut has_digits = end > integer_start;
+
+    if bytes.get(end) == Some(&b'.') {
+        let fractional_start = end + 1;
+        let mut fractional_end = fractional_start;
+        while bytes.get(fractional_end).is_some_and(u8::is_ascii_digit) {
+            fractional_end += 1;
+        }
+        if fractional_end == fractional_start && !has_digits {
+            return None;
+        }
+        if fractional_end > fractional_start {
+            end = fractional_end;
+            has_digits = true;
+        }
+    }
+
+    if !has_digits {
+        return None;
+    }
+
+    if bytes
+        .get(end)
+        .is_some_and(|byte| *byte == b'e' || *byte == b'E')
+    {
+        let exponent_start = end;
+        end += 1;
+        if bytes
+            .get(end)
+            .is_some_and(|byte| *byte == b'+' || *byte == b'-')
+        {
+            end += 1;
+        }
+        let digits_start = end;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if end == digits_start {
+            end = exponent_start;
+        }
+    }
+
+    let literal = &input[..end];
+    *input = &input[end..];
+    Some(literal)
 }
 
 fn prepared_sql_mode(sql: &str) -> Option<bool> {
@@ -2255,6 +2449,48 @@ mod tests {
     }
 
     #[test]
+    fn prepared_op_executor_normalizes_varying_point_updates_into_one_shape() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE users(id INTEGER PRIMARY KEY, status TEXT, created_at INTEGER);",
+        )
+        .unwrap();
+        for id in 1..=3 {
+            conn.execute(&format!(
+                "INSERT INTO users(id, status, created_at) VALUES ({id}, 'seed', 0);"
+            ))
+            .unwrap();
+        }
+
+        let mut executor = PreparedOpExecutor::new(&conn);
+        for (op_id, id, status, created_at) in [
+            (0_u64, 1_i64, "active", 3600_i64),
+            (1, 2, "inactive", 7200),
+            (2, 3, "active", 10_800),
+        ] {
+            executor
+                .execute_op(&OpRecord {
+                    op_id,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: format!(
+                            "UPDATE users SET status = '{status}', created_at = {created_at} WHERE id = {id};"
+                        ),
+                    },
+                    expected: Some(ExpectedResult::AffectedRows(1)),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(executor.prepared_sql.len(), 1);
+        assert!(
+            executor
+                .prepared_sql
+                .contains_key("UPDATE users SET status = ?2, created_at = ?3 WHERE id = ?1")
+        );
+    }
+
+    #[test]
     fn run_oplog_fsqlite_prepared_dml_reduces_parser_churn_for_repeated_inserts() {
         let _guard = hot_path_test_guard();
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 17, 1, 20);
@@ -2490,6 +2726,88 @@ mod tests {
         assert!(
             profile.parser.parsed_statements_total < report.ops_total,
             "expected normalized DELETE reuse to keep parsed statements below executed ops: parsed={} ops={}",
+            profile.parser.parsed_statements_total,
+            report.ops_total
+        );
+    }
+
+    #[test]
+    fn run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_varying_point_updates() {
+        let _guard = hot_path_test_guard();
+        let repeated_updates = (0_u64..20)
+            .map(|op_id| {
+                let id = i64::try_from(op_id % 10).unwrap() + 1;
+                let status = if op_id % 2 == 0 { "active" } else { "inactive" };
+                let created_at = i64::try_from(op_id).unwrap() * 3600;
+                OpRecord {
+                    op_id: op_id + 11,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: format!(
+                            "UPDATE users SET status = '{status}', created_at = {created_at} WHERE id = {id};"
+                        ),
+                    },
+                    expected: Some(ExpectedResult::AffectedRows(1)),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut records = vec![OpRecord {
+            op_id: 0,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement:
+                    "CREATE TABLE users(id INTEGER PRIMARY KEY, status TEXT, created_at INTEGER);"
+                        .to_owned(),
+            },
+            expected: None,
+        }];
+        records.extend((0_u64..10).map(|op_id| {
+            let id = i64::try_from(op_id).unwrap() + 1;
+            OpRecord {
+                op_id: op_id + 1,
+                worker: 0,
+                kind: OpKind::Insert {
+                    table: "users".to_owned(),
+                    key: id,
+                    values: vec![
+                        ("status".to_owned(), "seed".to_owned()),
+                        ("created_at".to_owned(), "0".to_owned()),
+                    ],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            }
+        }));
+        records.extend(repeated_updates);
+
+        let oplog = OpLog {
+            header: OpLogHeader {
+                fixture_id: "prepared-sql-varying-point-updates".to_owned(),
+                seed: 37,
+                rng: RngSpec::default(),
+                concurrency: ConcurrencyModel {
+                    worker_count: 1,
+                    transaction_size: 1,
+                    commit_order_policy: "deterministic".to_owned(),
+                },
+                preset: None,
+            },
+            records,
+        };
+        let config = FsqliteExecConfig {
+            collect_hot_path_profile: true,
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite(Path::new(":memory:"), &oplog, &config).unwrap();
+        let profile = report
+            .hot_path_profile
+            .expect("collect_hot_path_profile should populate report");
+
+        assert!(
+            profile.parser.parsed_statements_total < report.ops_total,
+            "expected normalized UPDATE reuse to keep parsed statements below executed ops: parsed={} ops={}",
             profile.parser.parsed_statements_total,
             report.ops_total
         );

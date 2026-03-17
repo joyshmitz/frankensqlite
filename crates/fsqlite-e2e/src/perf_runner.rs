@@ -2945,8 +2945,10 @@ mod tests {
             golden_dir: workspace_root.join("sample_sqlite_db_files/golden"),
             working_base: workspace_root.join("sample_sqlite_db_files/working"),
         };
-        let mut settings = HarnessSettings::default();
-        settings.concurrent_mode = concurrent_mode;
+        let settings = HarnessSettings {
+            concurrent_mode,
+            ..HarnessSettings::default()
+        };
         let benchmark_config = BenchmarkConfig {
             warmup_iterations: 0,
             min_iterations: 1,
