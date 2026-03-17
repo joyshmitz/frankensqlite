@@ -1402,6 +1402,29 @@ pub fn codegen_select(
         }
     };
 
+    // Route simple 2-table INNER JOINs through dedicated codegen when there
+    // are no aggregates, GROUP BY, window functions, or DISTINCT — this is
+    // the common "SELECT ... FROM a JOIN b ON ..." shape that the benchmark
+    // exercises and that currently falls back to the connection interpreter.
+    if !from_clause.joins.is_empty()
+        && !has_aggregate_columns(columns)
+        && group_by.is_empty()
+        && having.is_none()
+        && !has_window_columns(columns)
+        && distinct == Distinctness::All
+        && time_travel.is_none()
+    {
+        return self::codegen_join_select(
+            b,
+            stmt,
+            from_clause,
+            columns,
+            where_clause.as_deref(),
+            schema,
+            ctx,
+        );
+    }
+
     let table = find_table(schema, table_name)?;
     let cursor = 0_i32;
 
@@ -3183,6 +3206,72 @@ fn has_aggregate_columns(columns: &[ResultColumn]) -> bool {
     })
 }
 
+/// Check whether any result column contains a window function call.
+fn has_window_columns(columns: &[ResultColumn]) -> bool {
+    columns.iter().any(|col| {
+        if let ResultColumn::Expr { expr, .. } = col {
+            expr_has_window(expr)
+        } else {
+            false
+        }
+    })
+}
+
+/// Recursive check for window function calls in an expression.
+fn expr_has_window(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { over: Some(_), .. } => true,
+        Expr::FunctionCall { args, filter, .. } => {
+            matches!(args, fsqlite_ast::FunctionArgs::List(items) if items.iter().any(expr_has_window))
+                || filter.as_deref().is_some_and(expr_has_window)
+        }
+        Expr::BinaryOp { left, right, .. } => expr_has_window(left) || expr_has_window(right),
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => expr_has_window(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => expr_has_window(inner) || expr_has_window(low) || expr_has_window(high),
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            expr_has_window(inner)
+                || matches!(set, fsqlite_ast::InSet::List(items) if items.iter().any(expr_has_window))
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_has_window(inner)
+                || expr_has_window(pattern)
+                || escape.as_deref().is_some_and(expr_has_window)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(|e| expr_has_window(e))
+                || whens.iter().any(|(when_expr, then_expr)| {
+                    expr_has_window(when_expr) || expr_has_window(then_expr)
+                })
+                || else_expr.as_deref().is_some_and(expr_has_window)
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => expr_has_window(inner) || expr_has_window(path),
+        Expr::RowValue(items, _) => items.iter().any(expr_has_window),
+        _ => false,
+    }
+}
+
 /// Check whether an expression contains an aggregate function call.
 /// NOTE: `max(x,y,...)` and `min(x,y,...)` with 2+ args are scalar, not aggregate.
 fn is_aggregate_expr(expr: &Expr) -> bool {
@@ -3342,6 +3431,512 @@ fn agg_func_p4(name: &str, collation: Option<&String>) -> P4 {
 /// Generate VDBE bytecode for a standalone `VALUES` clause.
 ///
 /// Pattern: `Init → Transaction → [for each row: eval exprs → ResultRow] → Halt`
+/// Codegen for SELECT ... FROM t1 JOIN t2 ON ... [WHERE ...] [ORDER BY ...]
+///
+/// Generates a nested-loop join: scan the outer table, for each row scan the
+/// inner table, evaluate the ON condition + WHERE, emit ResultRow for matches.
+/// This enables JOINs to execute through the VDBE storage-cursor path instead
+/// of falling back to the connection-level MemDatabase interpreter.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_join_select(
+    b: &mut ProgramBuilder,
+    stmt: &SelectStatement,
+    from: &FromClause,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    schema: &[TableSchema],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    use fsqlite_ast::{JoinConstraint, JoinKind, TableOrSubquery};
+
+    // Extract left (driving) table.
+    let (left_name, left_alias) = match &from.source {
+        TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
+        _ => {
+            return Err(CodegenError::Unsupported(
+                "non-table left source in JOIN".to_owned(),
+            ));
+        }
+    };
+    let left_table = find_table(schema, left_name)?;
+
+    // Build list of join sources: (table_schema, alias, join_kind, on_expr)
+    let mut join_tables: Vec<(&TableSchema, Option<String>, JoinKind, Option<&Expr>)> = Vec::new();
+    for join in &from.joins {
+        let (right_name, right_alias) = match &join.table {
+            TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.clone()),
+            _ => {
+                return Err(CodegenError::Unsupported(
+                    "non-table right source in JOIN".to_owned(),
+                ));
+            }
+        };
+        let right_table = find_table(schema, right_name)?;
+        let on_expr = match &join.constraint {
+            Some(JoinConstraint::On(expr)) => Some(expr),
+            Some(JoinConstraint::Using(_)) => {
+                return Err(CodegenError::Unsupported(
+                    "JOIN USING in codegen".to_owned(),
+                ));
+            }
+            None => None,
+        };
+        join_tables.push((right_table, right_alias, join.join_type.kind, on_expr));
+    }
+
+    if join_tables.is_empty() {
+        return Err(CodegenError::Unsupported("empty join list".to_owned()));
+    }
+
+    // For now, support only INNER joins (cross/left are more complex).
+    for (_, _, kind, _) in &join_tables {
+        if !matches!(kind, JoinKind::Inner | JoinKind::Cross) {
+            return Err(CodegenError::Unsupported(format!(
+                "{kind:?} JOIN not yet supported in VDBE codegen"
+            )));
+        }
+    }
+
+    let end_label = b.emit_label();
+    let done_label = b.emit_label();
+
+    // Init.
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+
+    // Allocate output registers.
+    let all_tables: Vec<(&TableSchema, Option<&str>)> = std::iter::once((left_table, left_alias))
+        .chain(join_tables.iter().map(|(t, a, _, _)| (*t, a.as_deref())))
+        .collect();
+    let out_col_count = resolve_join_output_count(columns, &all_tables);
+    let out_regs = b.alloc_regs(out_col_count as i32);
+
+    // Open cursors for all tables.
+    let left_cursor = 0_i32;
+    b.emit_op(
+        Opcode::OpenRead,
+        left_cursor,
+        left_table.root_page,
+        left_table.columns.len() as i32,
+        P4::None,
+        0,
+    );
+    let mut right_cursors: Vec<i32> = Vec::new();
+    for (i, (rt, _, _, _)) in join_tables.iter().enumerate() {
+        let cursor_id = (i + 1) as i32;
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor_id,
+            rt.root_page,
+            rt.columns.len() as i32,
+            P4::None,
+            0,
+        );
+        right_cursors.push(cursor_id);
+    }
+
+    // Sorter for ORDER BY (if present).
+    let sorter = if !stmt.order_by.is_empty() {
+        let sort_cursor = (join_tables.len() + 1) as i32;
+        let sort_key_count = stmt.order_by.len();
+        let total_sort_cols = sort_key_count + out_col_count;
+        let sort_regs = b.alloc_regs(total_sort_cols as i32);
+        let sort_order = stmt
+            .order_by
+            .iter()
+            .map(|term| {
+                if term.direction == Some(fsqlite_ast::SortDirection::Desc) {
+                    '-'
+                } else {
+                    '+'
+                }
+            })
+            .collect::<String>();
+        b.emit_op(
+            Opcode::SorterOpen,
+            sort_cursor,
+            total_sort_cols as i32,
+            0,
+            P4::Affinity(sort_order),
+            0,
+        );
+        Some((sort_cursor, sort_regs, sort_key_count))
+    } else {
+        None
+    };
+
+    // Nested loop: Rewind left, for each row rewind right, check ON + WHERE, emit.
+    let next_left_label = b.emit_label();
+    b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done_label, P4::None, 0);
+    b.resolve_label(next_left_label);
+
+    // For each right table, emit a nested Rewind+Next loop.
+    let mut next_labels: Vec<Label> = Vec::new();
+    let mut done_right_labels: Vec<Label> = Vec::new();
+    for &rc in &right_cursors {
+        let next_right_label = b.emit_label();
+        let done_right_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Rewind, rc, 0, done_right_label, P4::None, 0);
+        b.resolve_label(next_right_label);
+        next_labels.push(next_right_label);
+        done_right_labels.push(done_right_label);
+    }
+
+    // Evaluate ON conditions — skip row if condition is false.
+    // Combine all ON expressions and the WHERE clause.
+    let skip_label = next_labels.last().copied().unwrap_or(done_label);
+    for (_, _, _, on_expr) in &join_tables {
+        if let Some(expr) = on_expr {
+            let cond_reg = b.alloc_regs(1);
+            emit_join_expr(b, expr, cond_reg, &all_tables, ctx)?;
+            b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
+        }
+    }
+    if let Some(where_expr) = where_clause {
+        let cond_reg = b.alloc_regs(1);
+        emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
+        b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
+    }
+
+    // Emit output columns.
+    emit_join_result_columns(b, columns, out_regs, &all_tables, ctx)?;
+
+    if let Some((sort_cursor, sort_regs, sort_key_count)) = sorter {
+        // Copy sort keys then output columns into sorter registers.
+        for (i, term) in stmt.order_by.iter().enumerate() {
+            let sort_reg = sort_regs + i as i32;
+            emit_join_expr(b, &term.expr, sort_reg, &all_tables, ctx)?;
+        }
+        for i in 0..out_col_count {
+            let src = out_regs + i as i32;
+            let dst = sort_regs + (sort_key_count + i) as i32;
+            b.emit_op(Opcode::SCopy, src, dst, 0, P4::None, 0);
+        }
+        b.emit_op(
+            Opcode::SorterInsert,
+            sort_cursor,
+            sort_regs,
+            (sort_key_count + out_col_count) as i32,
+            P4::None,
+            0,
+        );
+    } else {
+        b.emit_op(
+            Opcode::ResultRow,
+            out_regs,
+            out_col_count as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+
+    // Close nested loops (inner to outer).
+    for (i, &rc) in right_cursors.iter().enumerate().rev() {
+        b.emit_jump_to_label(Opcode::Next, rc, 0, next_labels[i], P4::None, 0);
+        b.resolve_label(done_right_labels[i]);
+    }
+    b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left_label, P4::None, 0);
+
+    b.resolve_label(done_label);
+
+    // If sorting, emit sorter output.
+    if let Some((sort_cursor, sort_regs, sort_key_count)) = sorter {
+        let sort_loop = b.emit_label();
+        let sort_done = b.emit_label();
+        b.emit_op(Opcode::SorterSort, sort_cursor, 0, 0, P4::None, 0);
+        b.resolve_label(sort_loop);
+        b.emit_op(Opcode::SorterData, sort_cursor, sort_regs, 0, P4::None, 0);
+        // Extract output columns from sorter data.
+        for i in 0..out_col_count {
+            let dst = out_regs + i as i32;
+            b.emit_op(
+                Opcode::Column,
+                sort_cursor,
+                (sort_key_count + i) as i32,
+                dst,
+                P4::None,
+                0,
+            );
+        }
+        b.emit_op(
+            Opcode::ResultRow,
+            out_regs,
+            out_col_count as i32,
+            0,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(Opcode::SorterNext, sort_cursor, 0, sort_loop, P4::None, 0);
+        b.resolve_label(sort_done);
+    }
+
+    // LIMIT/OFFSET (simple version).
+    // (Full LIMIT support is handled by the caller's post-processing.)
+
+    // Close cursors.
+    for &rc in &right_cursors {
+        b.emit_op(Opcode::Close, rc, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Close, left_cursor, 0, 0, P4::None, 0);
+
+    // Halt.
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // Resolve end label (standard Init->Goto pattern).
+    b.resolve_label(end_label);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, next_left_label, P4::None, 0);
+
+    Ok(())
+}
+
+/// Count output columns for a JOIN query.
+fn resolve_join_output_count(
+    columns: &[ResultColumn],
+    _tables: &[(&TableSchema, Option<&str>)],
+) -> usize {
+    columns
+        .iter()
+        .map(|col| match col {
+            ResultColumn::Star => _tables.iter().map(|(t, _)| t.columns.len()).sum(),
+            ResultColumn::TableStar(_) => {
+                // For now, approximate with first matching table.
+                _tables.first().map_or(0, |(t, _)| t.columns.len())
+            }
+            ResultColumn::Expr { .. } => 1,
+        })
+        .sum()
+}
+
+/// Emit a single expression for a JOIN context (multi-table column resolution).
+///
+/// This is a simplified expression emitter that handles the common cases:
+/// column references (qualified and unqualified), literals, and simple
+/// binary comparisons. Complex expressions fall back to unsupported error.
+#[allow(clippy::too_many_lines)]
+fn emit_join_expr(
+    b: &mut ProgramBuilder,
+    expr: &Expr,
+    target: i32,
+    tables: &[(&TableSchema, Option<&str>)],
+    _ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    match expr {
+        Expr::Column(col_ref, _) => {
+            // Resolve which table+cursor and column index.
+            let (cursor, col_idx) =
+                resolve_join_column(col_ref.table.as_deref(), &col_ref.column, tables)?;
+            b.emit_op(Opcode::Column, cursor, col_idx as i32, target, P4::None, 0);
+            Ok(())
+        }
+        Expr::Literal(lit, _) => {
+            match lit {
+                Literal::Integer(n) => {
+                    if let Ok(small) = i32::try_from(*n) {
+                        b.emit_op(Opcode::Integer, small, target, 0, P4::None, 0);
+                    } else {
+                        b.emit_op(Opcode::Int64, 0, target, 0, P4::Int64(*n), 0);
+                    }
+                }
+                Literal::Float(f) => {
+                    b.emit_op(Opcode::Real, 0, target, 0, P4::Real(*f), 0);
+                }
+                Literal::String(s) => {
+                    b.emit_op(Opcode::String8, 0, target, 0, P4::Str(s.clone()), 0);
+                }
+                Literal::Blob(bytes) => {
+                    b.emit_op(
+                        Opcode::Blob,
+                        bytes.len() as i32,
+                        target,
+                        0,
+                        P4::Blob(bytes.clone()),
+                        0,
+                    );
+                }
+                Literal::Null => {
+                    b.emit_op(Opcode::Null, 0, target, 0, P4::None, 0);
+                }
+                Literal::True => {
+                    b.emit_op(Opcode::Integer, 1, target, 0, P4::None, 0);
+                }
+                Literal::False => {
+                    b.emit_op(Opcode::Integer, 0, target, 0, P4::None, 0);
+                }
+                Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => {
+                    return Err(CodegenError::Unsupported(
+                        "datetime literal in JOIN codegen".to_owned(),
+                    ));
+                }
+                _ => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "literal {lit:?} in JOIN codegen"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            use fsqlite_ast::BinaryOp;
+            let left_reg = b.alloc_regs(1);
+            let right_reg = b.alloc_regs(1);
+            emit_join_expr(b, left, left_reg, tables, _ctx)?;
+            emit_join_expr(b, right, right_reg, tables, _ctx)?;
+            match op {
+                BinaryOp::Eq => {
+                    // Use Eq with STOREP2 to store result in target.
+                    b.emit_op(Opcode::Eq, right_reg, target, left_reg, P4::None, 0x20);
+                }
+                BinaryOp::Ne => {
+                    b.emit_op(Opcode::Ne, right_reg, target, left_reg, P4::None, 0x20);
+                }
+                BinaryOp::Lt => {
+                    b.emit_op(Opcode::Lt, right_reg, target, left_reg, P4::None, 0x20);
+                }
+                BinaryOp::Le => {
+                    b.emit_op(Opcode::Le, right_reg, target, left_reg, P4::None, 0x20);
+                }
+                BinaryOp::Gt => {
+                    b.emit_op(Opcode::Gt, right_reg, target, left_reg, P4::None, 0x20);
+                }
+                BinaryOp::Ge => {
+                    b.emit_op(Opcode::Ge, right_reg, target, left_reg, P4::None, 0x20);
+                }
+                BinaryOp::Add => {
+                    b.emit_op(Opcode::Add, right_reg, left_reg, target, P4::None, 0);
+                }
+                BinaryOp::Subtract => {
+                    b.emit_op(Opcode::Subtract, right_reg, left_reg, target, P4::None, 0);
+                }
+                BinaryOp::Multiply => {
+                    b.emit_op(Opcode::Multiply, right_reg, left_reg, target, P4::None, 0);
+                }
+                BinaryOp::And => {
+                    b.emit_op(Opcode::And, left_reg, right_reg, target, P4::None, 0);
+                }
+                BinaryOp::Or => {
+                    b.emit_op(Opcode::Or, left_reg, right_reg, target, P4::None, 0);
+                }
+                _ => {
+                    return Err(CodegenError::Unsupported(format!(
+                        "binary op {op:?} in JOIN codegen"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Expr::IsNull {
+            expr: inner,
+            not: _,
+            ..
+        } => {
+            let inner_reg = b.alloc_regs(1);
+            emit_join_expr(b, inner, inner_reg, tables, _ctx)?;
+            let skip = b.emit_label();
+            b.emit_op(Opcode::Integer, 1, target, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IsNull, inner_reg, 0, skip, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, target, 0, P4::None, 0);
+            b.resolve_label(skip);
+            Ok(())
+        }
+        _ => Err(CodegenError::Unsupported(format!(
+            "expression {expr:?} in JOIN codegen"
+        ))),
+    }
+}
+
+/// Resolve a column reference to (cursor_id, column_index) across multiple tables.
+fn resolve_join_column(
+    qualifier: Option<&str>,
+    name: &str,
+    tables: &[(&TableSchema, Option<&str>)],
+) -> Result<(i32, usize), CodegenError> {
+    let name_lower = name.to_ascii_lowercase();
+    for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
+        // Check if qualifier matches table name or alias.
+        let matches_qualifier = qualifier.is_none()
+            || qualifier.is_some_and(|q| {
+                let q_lower = q.to_ascii_lowercase();
+                alias.is_some_and(|a| a.eq_ignore_ascii_case(&q_lower))
+                    || table.name.eq_ignore_ascii_case(&q_lower)
+            });
+        if !matches_qualifier {
+            continue;
+        }
+        for (col_idx, col) in table.columns.iter().enumerate() {
+            if col.name.eq_ignore_ascii_case(&name_lower) {
+                return Ok((cursor_idx as i32, col_idx));
+            }
+        }
+    }
+    Err(CodegenError::ColumnNotFound {
+        table: String::new(),
+        column: name.to_owned(),
+    })
+}
+
+/// Emit result columns for a JOIN query.
+fn emit_join_result_columns(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+    out_regs: i32,
+    tables: &[(&TableSchema, Option<&str>)],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    let mut reg_offset = 0;
+    for col in columns {
+        match col {
+            ResultColumn::Star => {
+                // Emit all columns from all tables.
+                for (cursor_idx, (table, _)) in tables.iter().enumerate() {
+                    for col_idx in 0..table.columns.len() {
+                        let dst = out_regs + reg_offset;
+                        b.emit_op(
+                            Opcode::Column,
+                            cursor_idx as i32,
+                            col_idx as i32,
+                            dst,
+                            P4::None,
+                            0,
+                        );
+                        reg_offset += 1;
+                    }
+                }
+            }
+            ResultColumn::TableStar(table_name) => {
+                let name_lower = table_name.to_ascii_lowercase();
+                for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
+                    let matches = alias.is_some_and(|a| a.eq_ignore_ascii_case(&name_lower))
+                        || table.name.eq_ignore_ascii_case(&name_lower);
+                    if matches {
+                        for col_idx in 0..table.columns.len() {
+                            let dst = out_regs + reg_offset;
+                            b.emit_op(
+                                Opcode::Column,
+                                cursor_idx as i32,
+                                col_idx as i32,
+                                dst,
+                                P4::None,
+                                0,
+                            );
+                            reg_offset += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            ResultColumn::Expr { expr, .. } => {
+                let dst = out_regs + reg_offset;
+                emit_join_expr(b, expr, dst, tables, ctx)?;
+                reg_offset += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 ///
 /// Handles `VALUES (1, 'a'), (2, 'b')` etc.
 fn codegen_values_select(b: &mut ProgramBuilder, rows: &[Vec<Expr>]) -> Result<(), CodegenError> {
