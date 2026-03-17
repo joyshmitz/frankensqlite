@@ -7,6 +7,7 @@
 //!
 //! See: <https://www.sqlite.org/fileformat.html#record_format>
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
@@ -659,8 +660,8 @@ pub fn decode_value(serial_type: u64, bytes: &[u8], profile_enabled: bool) -> Op
         }
         SerialTypeClass::Text => std::str::from_utf8(bytes)
             .ok()
-            .map(|text| SqliteValue::Text(text.to_owned())),
-        SerialTypeClass::Blob => Some(SqliteValue::Blob(bytes.to_vec())),
+            .map(|text| SqliteValue::Text(Arc::from(text))),
+        SerialTypeClass::Blob => Some(SqliteValue::Blob(Arc::from(bytes))),
         SerialTypeClass::Reserved => None,
     };
 
@@ -703,25 +704,13 @@ fn decode_value_into(
         }
         SerialTypeClass::Text => {
             let text = std::str::from_utf8(bytes).ok()?;
-            match slot {
-                SqliteValue::Text(existing) => {
-                    existing.clear();
-                    existing.push_str(text);
-                }
-                _ => {
-                    *slot = SqliteValue::Text(text.to_owned());
-                }
-            }
+            // Arc<str> is immutable — replace rather than mutate in place.
+            // The O(1) clone benefit of Arc outweighs the lack of buffer reuse.
+            *slot = SqliteValue::Text(Arc::from(text));
         }
-        SerialTypeClass::Blob => match slot {
-            SqliteValue::Blob(existing) => {
-                existing.clear();
-                existing.extend_from_slice(bytes);
-            }
-            _ => {
-                *slot = SqliteValue::Blob(bytes.to_vec());
-            }
-        },
+        SerialTypeClass::Blob => {
+            *slot = SqliteValue::Blob(Arc::from(bytes));
+        }
         SerialTypeClass::Reserved => return None,
     }
 

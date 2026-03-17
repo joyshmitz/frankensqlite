@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::{StorageClass, StrictColumnType, StrictTypeError, TypeAffinity};
 
@@ -155,9 +156,14 @@ pub enum SqliteValue {
     /// A 64-bit IEEE floating point number.
     Float(f64),
     /// A UTF-8 text string.
-    Text(String),
+    ///
+    /// Uses `Arc<str>` so that register copies (SCopy, Copy, ResultRow) are
+    /// O(1) atomic refcount increments instead of O(n) heap copies.
+    Text(Arc<str>),
     /// A binary large object.
-    Blob(Vec<u8>),
+    ///
+    /// Uses `Arc<[u8]>` for the same O(1)-clone benefit as `Text`.
+    Blob(Arc<[u8]>),
 }
 
 impl SqliteValue {
@@ -206,7 +212,7 @@ impl SqliteValue {
                 Self::Null | Self::Text(_) | Self::Blob(_) => self,
                 Self::Integer(_) | Self::Float(_) => {
                     let t = self.to_text();
-                    Self::Text(t)
+                    Self::Text(Arc::from(t.as_str()))
                 }
             },
             TypeAffinity::Numeric => match &self {
@@ -310,17 +316,19 @@ impl SqliteValue {
     }
 
     /// Try to extract a text reference.
+    #[inline]
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            Self::Text(s) => Some(s.as_str()),
+            Self::Text(s) => Some(s),
             _ => None,
         }
     }
 
     /// Try to extract a blob reference.
+    #[inline]
     pub fn as_blob(&self) -> Option<&[u8]> {
         match self {
-            Self::Blob(b) => Some(b.as_slice()),
+            Self::Blob(b) => Some(b),
             _ => None,
         }
     }
@@ -399,7 +407,7 @@ impl SqliteValue {
             Self::Null => String::new(),
             Self::Integer(i) => i.to_string(),
             Self::Float(f) => format_sqlite_float(*f),
-            Self::Text(s) => s.clone(),
+            Self::Text(s) => s.to_string(),
             Self::Blob(b) => String::from_utf8_lossy(b).into_owned(),
         }
     }
@@ -845,7 +853,7 @@ impl fmt::Display for SqliteValue {
             Self::Text(s) => write!(f, "'{s}'"),
             Self::Blob(b) => {
                 f.write_str("X'")?;
-                for byte in b {
+                for byte in b.iter() {
                     write!(f, "{byte:02X}")?;
                 }
                 f.write_str("'")
@@ -913,25 +921,37 @@ impl From<f64> for SqliteValue {
 
 impl From<String> for SqliteValue {
     fn from(s: String) -> Self {
-        Self::Text(s)
+        Self::Text(Arc::from(s.as_str()))
     }
 }
 
 impl From<&str> for SqliteValue {
     fn from(s: &str) -> Self {
-        Self::Text(s.to_owned())
+        Self::Text(Arc::from(s))
+    }
+}
+
+impl From<Arc<str>> for SqliteValue {
+    fn from(s: Arc<str>) -> Self {
+        Self::Text(s)
     }
 }
 
 impl From<Vec<u8>> for SqliteValue {
     fn from(b: Vec<u8>) -> Self {
-        Self::Blob(b)
+        Self::Blob(Arc::from(b.as_slice()))
     }
 }
 
 impl From<&[u8]> for SqliteValue {
     fn from(b: &[u8]) -> Self {
-        Self::Blob(b.to_vec())
+        Self::Blob(Arc::from(b))
+    }
+}
+
+impl From<Arc<[u8]>> for SqliteValue {
+    fn from(b: Arc<[u8]>) -> Self {
+        Self::Blob(b)
     }
 }
 
