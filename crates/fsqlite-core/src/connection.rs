@@ -1455,7 +1455,9 @@ impl PreparedStatement<'_> {
         // defaults for short records, and the MVCC version store for
         // historical snapshot upgrades.
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
-        let runtime_inputs = self.conn.table_execution_runtime_inputs()?;
+        let runtime_inputs = self
+            .conn
+            .table_execution_runtime_inputs(self.program.has_insert_ops())?;
         let txn = self
             .pager
             .as_ref()
@@ -10582,7 +10584,10 @@ impl Connection {
             .collect()
     }
 
-    fn table_execution_runtime_inputs(&self) -> Result<TableExecutionRuntimeInputs> {
+    fn table_execution_runtime_inputs(
+        &self,
+        needs_defaults: bool,
+    ) -> Result<TableExecutionRuntimeInputs> {
         let metadata = self.table_execution_metadata();
         let autoincrement_tables = self.autoincrement_tables.borrow();
         let sqlite_sequence_cache = self.sqlite_sequence_cache.borrow();
@@ -10598,33 +10603,36 @@ impl Connection {
         drop(sqlite_sequence_cache);
         drop(autoincrement_tables);
 
-        let column_defaults_by_root_page = if metadata.column_default_sql_by_root_page.is_empty() {
-            Arc::new(HbHashMap::new())
-        } else {
-            if hot_path_profile_enabled() {
-                FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            Arc::new(
-                metadata
-                    .column_default_sql_by_root_page
-                    .iter()
-                    .filter_map(|(root_page, default_sqls)| {
-                        let defaults: Vec<Option<SqliteValue>> = default_sqls
-                            .iter()
-                            .map(|default_sql| {
-                                default_sql.as_deref().and_then(|sql| {
-                                    self.evaluate_column_default_value(Some(sql)).ok()
+        // Skip expensive column default evaluation (which calls
+        // execute_statement recursively) for programs that never insert rows.
+        let column_defaults_by_root_page =
+            if !needs_defaults || metadata.column_default_sql_by_root_page.is_empty() {
+                Arc::new(HbHashMap::new())
+            } else {
+                if hot_path_profile_enabled() {
+                    FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                Arc::new(
+                    metadata
+                        .column_default_sql_by_root_page
+                        .iter()
+                        .filter_map(|(root_page, default_sqls)| {
+                            let defaults: Vec<Option<SqliteValue>> = default_sqls
+                                .iter()
+                                .map(|default_sql| {
+                                    default_sql.as_deref().and_then(|sql| {
+                                        self.evaluate_column_default_value(Some(sql)).ok()
+                                    })
                                 })
-                            })
-                            .collect();
-                        defaults
-                            .iter()
-                            .any(Option::is_some)
-                            .then_some((*root_page, defaults))
-                    })
-                    .collect::<HbHashMap<_, _>>(),
-            )
-        };
+                                .collect();
+                            defaults
+                                .iter()
+                                .any(Option::is_some)
+                                .then_some((*root_page, defaults))
+                        })
+                        .collect::<HbHashMap<_, _>>(),
+                )
+            };
 
         Ok(TableExecutionRuntimeInputs {
             autoincrement_seq_by_root_page,
@@ -22123,7 +22131,10 @@ impl Connection {
         // causing the outer concurrent commit to skip page-lock release.
         let func_reg = self.func_registry.borrow().clone();
         let reject_mem = *self.reject_mem_fallback.borrow();
-        let runtime_inputs = self.table_execution_runtime_inputs()?;
+        // Only evaluate column defaults when the program actually contains
+        // Insert opcodes — avoids recursive execute_statement calls for
+        // SELECT/DELETE/UPDATE programs that never use defaults.
+        let runtime_inputs = self.table_execution_runtime_inputs(program.has_insert_ops())?;
 
         // Lend the active transaction to the VDBE engine so that storage
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
@@ -63960,8 +63971,8 @@ mod pager_routing_tests {
         conn.execute("CREATE INDEX runtime_inputs_fast_val ON runtime_inputs_fast(val);")
             .unwrap();
 
-        let first = conn.table_execution_runtime_inputs().unwrap();
-        let second = conn.table_execution_runtime_inputs().unwrap();
+        let first = conn.table_execution_runtime_inputs(true).unwrap();
+        let second = conn.table_execution_runtime_inputs(true).unwrap();
 
         assert!(
             Arc::ptr_eq(

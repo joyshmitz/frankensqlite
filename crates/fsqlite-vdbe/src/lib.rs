@@ -488,6 +488,12 @@ impl VdbeProgram {
         &self.table_index_meta
     }
 
+    /// Returns `true` if the program contains any `Insert` opcodes,
+    /// meaning column defaults may be needed during execution.
+    pub fn has_insert_ops(&self) -> bool {
+        self.ops.iter().any(|op| op.opcode == Opcode::Insert)
+    }
+
     /// Disassemble the program to a human-readable string.
     ///
     /// Output format matches SQLite's `EXPLAIN` output:

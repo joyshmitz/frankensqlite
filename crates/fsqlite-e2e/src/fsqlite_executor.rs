@@ -1369,11 +1369,20 @@ impl<'conn> PreparedOpExecutor<'conn> {
             return Ok(());
         }
 
-        let Some(is_query) = prepared_sql_mode(trimmed) else {
-            return execute_unprepared_sql(self.conn, trimmed, expected);
+        let execution = if normalize_single_integer_equality_select(
+            trimmed,
+            &mut self.sql_scratch,
+            &mut self.params_scratch,
+        ) {
+            self.execute_prepared_sql_with_scratch(true)
+        } else {
+            let Some(is_query) = prepared_sql_mode(trimmed) else {
+                return execute_unprepared_sql(self.conn, trimmed, expected);
+            };
+            self.execute_prepared_sql(trimmed, is_query)
         };
 
-        match self.execute_prepared_sql(trimmed, is_query) {
+        match execution {
             Ok(RawSqlExecution::Rows(rows)) => {
                 if matches!(expected, Some(ExpectedResult::Error)) {
                     return Err(OpError::Fatal(format!(
@@ -1535,6 +1544,47 @@ impl<'conn> PreparedOpExecutor<'conn> {
         Ok(())
     }
 
+    fn execute_prepared_sql_with_scratch(
+        &mut self,
+        is_query: bool,
+    ) -> Result<RawSqlExecution, FrankenError> {
+        self.ensure_prepared_sql_for_scratch()?;
+        for attempt in 0..=1 {
+            let sql = self.sql_scratch.as_str();
+            let params = self.params_scratch.as_slice();
+            let execute_result = {
+                let stmt = self
+                    .prepared_sql
+                    .get(sql)
+                    .expect("prepared SQL cache must contain the current scratch SQL");
+                if is_query {
+                    stmt.query_with_params(params).map(RawSqlExecution::Rows)
+                } else {
+                    stmt.execute_with_params(params)
+                        .map(RawSqlExecution::Affected)
+                }
+            };
+            match execute_result {
+                Ok(result) => return Ok(result),
+                Err(FrankenError::SchemaChanged) if attempt == 0 => {
+                    self.prepared_sql.remove(sql);
+                    self.ensure_prepared_sql_for_scratch()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("schema change retry loop must return or error")
+    }
+
+    fn ensure_prepared_sql_for_scratch(&mut self) -> Result<(), FrankenError> {
+        if !self.prepared_sql.contains_key(self.sql_scratch.as_str()) {
+            let sql = self.sql_scratch.clone();
+            let stmt = self.conn.prepare(&sql)?;
+            self.prepared_sql.insert(sql, stmt);
+        }
+        Ok(())
+    }
+
     fn execute_prepared_sql(
         &mut self,
         sql: &str,
@@ -1604,6 +1654,145 @@ fn should_skip_sql_statement(sql: &str) -> bool {
     starts_with_ascii_prefix(sql, "CREATE INDEX")
         || starts_with_ascii_prefix(sql, "CREATE UNIQUE INDEX")
         || starts_with_ascii_prefix(sql, "DROP INDEX")
+}
+
+fn normalize_single_integer_equality_select(
+    sql: &str,
+    normalized_sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+) -> bool {
+    normalized_sql.clear();
+    params.clear();
+
+    let sql = sql.trim_end();
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
+    let mut rest = sql;
+
+    if !consume_ascii_keyword(&mut rest, "SELECT") || !consume_required_ascii_whitespace(&mut rest)
+    {
+        return false;
+    }
+    let Some(projection) = consume_simple_identifier(&mut rest) else {
+        return false;
+    };
+    if !consume_required_ascii_whitespace(&mut rest)
+        || !consume_ascii_keyword(&mut rest, "FROM")
+        || !consume_required_ascii_whitespace(&mut rest)
+    {
+        return false;
+    }
+    let Some(table) = consume_simple_identifier(&mut rest) else {
+        return false;
+    };
+    if !consume_required_ascii_whitespace(&mut rest)
+        || !consume_ascii_keyword(&mut rest, "WHERE")
+        || !consume_required_ascii_whitespace(&mut rest)
+    {
+        return false;
+    }
+    let Some(column) = consume_simple_identifier(&mut rest) else {
+        return false;
+    };
+    consume_ascii_whitespace(&mut rest);
+    if !consume_ascii_char(&mut rest, '=') {
+        return false;
+    }
+    consume_ascii_whitespace(&mut rest);
+    let Some(value) = consume_i64_literal(&mut rest) else {
+        return false;
+    };
+    consume_ascii_whitespace(&mut rest);
+    if !rest.is_empty() {
+        return false;
+    }
+
+    write!(
+        normalized_sql,
+        "SELECT {projection} FROM {table} WHERE {column} = ?1"
+    )
+    .expect("writing into a String should not fail");
+    params.push(SqliteValue::Integer(value));
+    true
+}
+
+fn consume_ascii_keyword<'a>(input: &mut &'a str, keyword: &str) -> bool {
+    if input
+        .get(..keyword.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(keyword))
+    {
+        *input = &input[keyword.len()..];
+        true
+    } else {
+        false
+    }
+}
+
+fn consume_ascii_whitespace(input: &mut &str) -> usize {
+    let idx = input
+        .find(|ch: char| !ch.is_ascii_whitespace())
+        .unwrap_or(input.len());
+    *input = &input[idx..];
+    idx
+}
+
+fn consume_required_ascii_whitespace(input: &mut &str) -> bool {
+    consume_ascii_whitespace(input) > 0
+}
+
+fn consume_simple_identifier<'a>(input: &mut &'a str) -> Option<&'a str> {
+    let bytes = input.as_bytes();
+    let first = *bytes.first()?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+
+    let mut end = 1;
+    while end < bytes.len() {
+        let byte = bytes[end];
+        if byte.is_ascii_alphanumeric() || byte == b'_' {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+
+    let ident = &input[..end];
+    *input = &input[end..];
+    Some(ident)
+}
+
+fn consume_ascii_char(input: &mut &str, expected: char) -> bool {
+    if input.starts_with(expected) {
+        *input = &input[expected.len_utf8()..];
+        true
+    } else {
+        false
+    }
+}
+
+fn consume_i64_literal(input: &mut &str) -> Option<i64> {
+    let bytes = input.as_bytes();
+    let mut end = 0;
+
+    if bytes
+        .first()
+        .is_some_and(|byte| *byte == b'+' || *byte == b'-')
+    {
+        end += 1;
+    }
+
+    if bytes.get(end).is_none_or(|byte| !byte.is_ascii_digit()) {
+        return None;
+    }
+
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+
+    let literal = &input[..end];
+    let value = literal.parse().ok()?;
+    *input = &input[end..];
+    Some(value)
 }
 
 fn prepared_sql_mode(sql: &str) -> Option<bool> {
@@ -1933,6 +2122,38 @@ mod tests {
     }
 
     #[test]
+    fn prepared_op_executor_normalizes_varying_point_selects_into_one_shape() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO t0(id, val) VALUES (2, 'beta');")
+            .unwrap();
+
+        let mut executor = PreparedOpExecutor::new(&conn);
+        for (op_id, id) in [(0_u64, 1_i64), (1, 2), (2, 1)] {
+            executor
+                .execute_op(&OpRecord {
+                    op_id,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: format!("SELECT val FROM t0 WHERE id = {id};"),
+                    },
+                    expected: Some(ExpectedResult::RowCount(1)),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(executor.prepared_sql.len(), 1);
+        assert!(
+            executor
+                .prepared_sql
+                .contains_key("SELECT val FROM t0 WHERE id = ?1")
+        );
+    }
+
+    #[test]
     fn run_oplog_fsqlite_prepared_dml_reduces_parser_churn_for_repeated_inserts() {
         let _guard = hot_path_test_guard();
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 17, 1, 20);
@@ -2019,6 +2240,84 @@ mod tests {
         assert!(
             profile.parser.parsed_statements_total < report.ops_total,
             "expected prepared SQL reuse to keep parsed statements below executed ops: parsed={} ops={}",
+            profile.parser.parsed_statements_total,
+            report.ops_total
+        );
+    }
+
+    #[test]
+    fn run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_varying_point_selects() {
+        let _guard = hot_path_test_guard();
+        let repeated_reads = (0_u64..20)
+            .map(|op_id| {
+                let id = 1 + i64::try_from(op_id % 2).unwrap();
+                OpRecord {
+                    op_id: op_id + 3,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: format!("SELECT val FROM t0 WHERE id = {id};"),
+                    },
+                    expected: Some(ExpectedResult::RowCount(1)),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut records = vec![
+            OpRecord {
+                op_id: 0,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: "CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);".to_owned(),
+                },
+                expected: None,
+            },
+            OpRecord {
+                op_id: 1,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: "INSERT INTO t0(id, val) VALUES (1, 'alpha');".to_owned(),
+                },
+                expected: None,
+            },
+            OpRecord {
+                op_id: 2,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: "INSERT INTO t0(id, val) VALUES (2, 'beta');".to_owned(),
+                },
+                expected: None,
+            },
+        ];
+        records.extend(repeated_reads);
+
+        let oplog = OpLog {
+            header: OpLogHeader {
+                fixture_id: "prepared-sql-varying-point-selects".to_owned(),
+                seed: 29,
+                rng: RngSpec::default(),
+                concurrency: ConcurrencyModel {
+                    worker_count: 1,
+                    transaction_size: 1,
+                    commit_order_policy: "deterministic".to_owned(),
+                },
+                preset: None,
+            },
+            records,
+        };
+        let config = FsqliteExecConfig {
+            collect_hot_path_profile: true,
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite(Path::new(":memory:"), &oplog, &config).unwrap();
+        let profile = report
+            .hot_path_profile
+            .expect("collect_hot_path_profile should populate report");
+
+        assert!(
+            profile.parser.parsed_statements_total < report.ops_total,
+            "expected normalized prepared SQL reuse to keep parsed statements below executed ops: parsed={} ops={}",
             profile.parser.parsed_statements_total,
             report.ops_total
         );

@@ -446,11 +446,14 @@ impl SorterCursor {
             return Ok(());
         }
 
-        // Sort current batch
+        // Sort current batch — lock collation registry once for entire sort.
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
-        let registry = Arc::clone(&self.collation_registry);
+        let coll_guard = self
+            .collation_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.rows.sort_by(|lhs, rhs| {
             compare_sorter_rows(
                 &lhs.values,
@@ -458,9 +461,10 @@ impl SorterCursor {
                 key_columns,
                 &orders,
                 &colls,
-                registry.as_ref(),
+                &coll_guard,
             )
         });
+        drop(coll_guard);
 
         // Write to temp file.  We use `keep()` to detach the auto-delete
         // guard so the file persists until we explicitly remove it in
@@ -536,12 +540,17 @@ impl SorterCursor {
     /// `self.spill_runs` is drained.
     #[allow(clippy::too_many_lines)]
     fn sort(&mut self) -> Result<()> {
+        // Lock collation registry once for entire sort operation.
+        let coll_guard = self
+            .collation_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         if self.spill_runs.is_empty() {
             // Pure in-memory sort — fast path.
             let key_columns = self.key_columns;
             let orders = self.sort_key_orders.clone();
             let colls = self.collations.clone();
-            let registry = Arc::clone(&self.collation_registry);
             self.rows.sort_by(|lhs, rhs| {
                 compare_sorter_rows(
                     &lhs.values,
@@ -549,7 +558,7 @@ impl SorterCursor {
                     key_columns,
                     &orders,
                     &colls,
-                    registry.as_ref(),
+                    &coll_guard,
                 )
             });
             self.rows_sorted_total += self.rows.len() as u64;
@@ -560,7 +569,6 @@ impl SorterCursor {
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
-        let registry = Arc::clone(&self.collation_registry);
         self.rows.sort_by(|lhs, rhs| {
             compare_sorter_rows(
                 &lhs.values,
@@ -568,7 +576,7 @@ impl SorterCursor {
                 key_columns,
                 &orders,
                 &colls,
-                registry.as_ref(),
+                &coll_guard,
             )
         });
 
@@ -606,7 +614,7 @@ impl SorterCursor {
                             key_columns,
                             &orders,
                             &colls,
-                            self.collation_registry.as_ref(),
+                            &coll_guard,
                         ) == Ordering::Less
                         {
                             best_idx = Some(i);
@@ -866,29 +874,27 @@ impl SharedTxnPageIo {
         let Some(ctx) = &self.concurrent else {
             return Ok(());
         };
-        let pending_commit_pages = self.txn.borrow().pending_commit_pages()?;
-        let pending_commit_surface = pending_commit_pages.iter().copied().collect::<HashSet<_>>();
-
-        let pages_to_clear = {
+        // The live engine only synthesizes conflict-only tracking for page 1.
+        // Avoid rebuilding the full pending-commit surface after every write
+        // just to learn that page 1 is still (or is no longer) required.
+        let page_one_is_synthetic = {
             let handle = ctx.handle.lock();
-            handle
-                .write_set_pages()
-                .into_iter()
-                .filter(|page| !pending_commit_surface.contains(page))
-                .filter(|page| {
-                    let state = concurrent_page_state(&handle, *page);
-                    state.is_synthetic_conflict_only()
-                })
-                .collect::<Vec<_>>()
+            concurrent_page_state(&handle, PageNumber::ONE).is_synthetic_conflict_only()
         };
+        if !page_one_is_synthetic {
+            return Ok(());
+        }
+        if self.txn.borrow().page_one_in_pending_commit_surface()? {
+            return Ok(());
+        }
 
-        for page in pages_to_clear {
-            let mut handle = ctx.handle.lock();
-            concurrent_clear_page_state(&mut handle, &ctx.lock_table, ctx.session_id, page)
+        let mut handle = ctx.handle.lock();
+        if concurrent_page_state(&handle, PageNumber::ONE).is_synthetic_conflict_only() {
+            concurrent_clear_page_state(&mut handle, &ctx.lock_table, ctx.session_id, PageNumber::ONE)
                 .map_err(|restore_error| {
                     FrankenError::Internal(format!(
                         "MVCC pending commit surface clear failed for page {} during {operation}: {restore_error}",
-                        page.get()
+                        PageNumber::ONE.get()
                     ))
                 })?;
         }
@@ -3397,7 +3403,7 @@ pub struct VdbeEngine {
     /// Whether opcode-level tracing is enabled.
     trace_opcodes: bool,
     /// Result rows accumulated during execution.
-    results: Vec<smallvec::SmallVec<[SqliteValue; 8]>>,
+    results: Vec<smallvec::SmallVec<[SqliteValue; 16]>>,
     /// Open cursors (keyed by cursor number, i.e. p1 of OpenRead/OpenWrite).
     cursors: SwissIndex<i32, MemCursor>,
     /// Open sorter cursors keyed by cursor number.
@@ -3510,6 +3516,9 @@ pub struct VdbeEngine {
     /// Each entry is a fixed-size bit array used for early rejection
     /// during index lookups.
     bloom_filters: HashMap<i32, Vec<u64>>,
+    /// Reusable buffer for `MakeRecord` serialization.
+    /// Avoids allocating a new `Vec<u8>` for every row during INSERT/UPDATE.
+    make_record_buf: Vec<u8>,
 }
 
 /// Time-travel target marker stored on cursors opened with
@@ -3877,6 +3886,7 @@ impl VdbeEngine {
             window_contexts: SwissIndex::new(),
             register_subtypes: HashMap::new(),
             bloom_filters: HashMap::new(),
+            make_record_buf: Vec::new(),
         }
     }
 
@@ -4243,6 +4253,16 @@ impl VdbeEngine {
         self.collation_registry = registry;
     }
 
+    /// Acquire a read-lock on the collation registry.  Callers should hold
+    /// the guard for the duration of a comparison batch (e.g. an entire
+    /// opcode or sort run) rather than re-acquiring per comparison.
+    #[inline]
+    fn lock_collation(&self) -> std::sync::MutexGuard<'_, CollationRegistry> {
+        self.collation_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Replace the current set of bound SQL parameters.
     ///
     /// Values are 1-indexed at execution time (`?1` maps to `bindings[0]`).
@@ -4351,6 +4371,14 @@ impl VdbeEngine {
         let ops = program.ops();
         if ops.is_empty() {
             return Ok(ExecOutcome::Done);
+        }
+
+        // Pre-size the register file to the program's declared register count
+        // so that per-opcode register writes never need bounds-check + resize.
+        // This eliminates a branch from every set_reg/set_reg_fast in the hot loop.
+        let reg_count = usize::try_from(program.register_count()).unwrap_or(0);
+        if self.registers.len() < reg_count {
+            self.registers.resize(reg_count, SqliteValue::Null);
         }
 
         // Load table-to-index cursor metadata for REPLACE conflict resolution.
@@ -4706,7 +4734,7 @@ impl VdbeEngine {
                 // ── Constants ───────────────────────────────────────────
                 Opcode::Integer => {
                     // Set register p2 to integer value p1.
-                    self.set_reg_fast(op.p2, SqliteValue::Integer(i64::from(op.p1)));
+                    self.set_reg_int(op.p2, i64::from(op.p1));
                     pc += 1;
                 }
 
@@ -4715,7 +4743,7 @@ impl VdbeEngine {
                         P4::Int64(v) => *v,
                         _ => 0,
                     };
-                    self.set_reg_fast(op.p2, SqliteValue::Integer(val));
+                    self.set_reg_int(op.p2, val);
                     pc += 1;
                 }
 
@@ -4779,9 +4807,9 @@ impl VdbeEngine {
                     // Move p3 registers from p1 to p2.
                     // To handle potential overlap correctly, we collect all source
                     // values into a temporary buffer before writing them to the destination.
-                    // SmallVec avoids heap allocation for typical 1-8 register moves.
+                    // SmallVec avoids heap allocation for typical 1-16 register moves.
                     let count = usize::try_from(op.p3).unwrap_or(0);
-                    let mut temp: smallvec::SmallVec<[SqliteValue; 8]> =
+                    let mut temp: smallvec::SmallVec<[SqliteValue; 16]> =
                         smallvec::SmallVec::with_capacity(count);
 
                     for offset in 0..count {
@@ -4813,7 +4841,7 @@ impl VdbeEngine {
 
                 Opcode::IntCopy => {
                     let val = self.get_reg(op.p1).to_integer();
-                    self.set_reg(op.p2, SqliteValue::Integer(val));
+                    self.set_reg_int(op.p2, val);
                     pc += 1;
                 }
 
@@ -5077,18 +5105,27 @@ impl VdbeEngine {
                             }
                         }
                     } else {
-                        // Apply SQLite comparison affinity rules (§3.2):
-                        // coercion only happens when p5 carries numeric affinity.
-                        let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, op.p5);
-                        let cmp = if let P4::Collation(ref coll_name) = op.p4 {
-                            collate_compare(
-                                &cmp_lhs,
-                                &cmp_rhs,
-                                coll_name,
-                                self.collation_registry.as_ref(),
-                            )
+                        // Fast path: Integer vs Integer with no collation.
+                        // This is the dominant comparison case (rowid checks,
+                        // WHERE filters on int columns, index probes). Avoids
+                        // coerce_for_comparison Cow allocation and collation lookup.
+                        let cmp = if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) =
+                            (lhs, rhs)
+                        {
+                            if !matches!(op.p4, P4::Collation(_)) {
+                                Some(a.cmp(b))
+                            } else {
+                                lhs.partial_cmp(rhs)
+                            }
                         } else {
-                            cmp_lhs.partial_cmp(&cmp_rhs)
+                            // General path: affinity coercion + collation.
+                            let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, op.p5);
+                            if let P4::Collation(ref coll_name) = op.p4 {
+                                let coll = self.lock_collation();
+                                collate_compare(&cmp_lhs, &cmp_rhs, coll_name, &coll)
+                            } else {
+                                cmp_lhs.partial_cmp(&cmp_rhs)
+                            }
                         };
                         let should_jump = matches!(
                             (op.opcode, cmp),
@@ -5807,245 +5844,254 @@ impl VdbeEngine {
                     // index cursor receiving an integer key would wrongly call
                     // table_move_to, triggering "table leaf cell has no rowid"
                     // on index pages. (Fixes br#138-140, #144, #145.)
-                    let found =
-                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                            if cursor.cursor.is_table_btree() {
-                                // Table seek: key is a rowid (integer).
-                                let key = key_val.to_integer();
-                                let seek_result = cursor.cursor.table_move_to(&cursor.cx, key)?;
+                    let coll_arc = Arc::clone(&self.collation_registry);
+                    let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        if cursor.cursor.is_table_btree() {
+                            // Table seek: key is a rowid (integer).
+                            let key = key_val.to_integer();
+                            let seek_result = cursor.cursor.table_move_to(&cursor.cx, key)?;
 
-                                match op.opcode {
-                                    Opcode::SeekGE => {
-                                        // Need first row >= key.
-                                        // table_move_to already positions at key (Found) or
-                                        // at next larger (NotFound). Check for EOF.
+                            match op.opcode {
+                                Opcode::SeekGE => {
+                                    // Need first row >= key.
+                                    // table_move_to already positions at key (Found) or
+                                    // at next larger (NotFound). Check for EOF.
+                                    !cursor.cursor.eof()
+                                }
+                                Opcode::SeekGT => {
+                                    // Need first row > key.
+                                    // If Found (at exact key), advance past it.
+                                    // If NotFound, already past key.
+                                    if seek_result.is_found() {
+                                        cursor.cursor.next(&cursor.cx)?
+                                    } else {
                                         !cursor.cursor.eof()
                                     }
-                                    Opcode::SeekGT => {
-                                        // Need first row > key.
-                                        // If Found (at exact key), advance past it.
-                                        // If NotFound, already past key.
-                                        if seek_result.is_found() {
-                                            cursor.cursor.next(&cursor.cx)?
-                                        } else {
-                                            !cursor.cursor.eof()
-                                        }
-                                    }
-                                    Opcode::SeekLE => {
-                                        // Need last row <= key.
-                                        // If Found, we're at the exact key - done.
-                                        // If NotFound, cursor is at entry > key, so prev().
-                                        if seek_result.is_found() {
-                                            true
-                                        } else if cursor.cursor.eof() {
-                                            // All entries < key, position at last.
-                                            cursor.cursor.last(&cursor.cx)?
-                                        } else {
-                                            // Cursor at entry > key, move to previous.
-                                            cursor.cursor.prev(&cursor.cx)?
-                                        }
-                                    }
-                                    Opcode::SeekLT => {
-                                        // Need last row < key.
-                                        // Cursor is either at key (Found) or past key (NotFound).
-                                        // Either way, we need to go to the previous entry.
-                                        if cursor.cursor.eof() {
-                                            // All entries < key, position at last.
-                                            cursor.cursor.last(&cursor.cx)?
-                                        } else {
-                                            // Go to previous entry (which will be < key).
-                                            cursor.cursor.prev(&cursor.cx)?
-                                        }
-                                    }
-                                    _ => unreachable!(),
                                 }
-                            } else {
-                                // Index seek: key is a packed record blob.
-                                let key_bytes = record_blob_bytes(&key_val);
-                                let seek_result =
-                                    cursor.cursor.index_move_to(&cursor.cx, key_bytes)?;
+                                Opcode::SeekLE => {
+                                    // Need last row <= key.
+                                    // If Found, we're at the exact key - done.
+                                    // If NotFound, cursor is at entry > key, so prev().
+                                    if seek_result.is_found() {
+                                        true
+                                    } else if cursor.cursor.eof() {
+                                        // All entries < key, position at last.
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        // Cursor at entry > key, move to previous.
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                Opcode::SeekLT => {
+                                    // Need last row < key.
+                                    // Cursor is either at key (Found) or past key (NotFound).
+                                    // Either way, we need to go to the previous entry.
+                                    if cursor.cursor.eof() {
+                                        // All entries < key, position at last.
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        // Go to previous entry (which will be < key).
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                        } else {
+                            // Index seek: key is a packed record blob.
+                            let key_bytes = record_blob_bytes(&key_val);
+                            let seek_result = cursor.cursor.index_move_to(&cursor.cx, key_bytes)?;
 
-                                match op.opcode {
-                                    Opcode::SeekGE => !cursor.cursor.eof(),
-                                    Opcode::SeekGT => {
-                                        if seek_result.is_found() {
-                                            cursor.cursor.next(&cursor.cx)?;
-                                        }
-                                        if !cursor.cursor.eof() {
-                                            cursor.target_vals_buf.clear();
-                                            fsqlite_types::record::parse_record_into(
-                                                key_bytes,
-                                                &mut cursor.target_vals_buf,
-                                            )
-                                            .ok_or_else(|| {
+                            match op.opcode {
+                                Opcode::SeekGE => !cursor.cursor.eof(),
+                                Opcode::SeekGT => {
+                                    if seek_result.is_found() {
+                                        cursor.cursor.next(&cursor.cx)?;
+                                    }
+                                    if !cursor.cursor.eof() {
+                                        cursor.target_vals_buf.clear();
+                                        fsqlite_types::record::parse_record_into(
+                                            key_bytes,
+                                            &mut cursor.target_vals_buf,
+                                        )
+                                        .ok_or_else(
+                                            || {
                                                 FrankenError::internal(
                                                     "SeekGT: malformed seek key record",
                                                 )
-                                            })?;
-                                            loop {
-                                                if cursor.cursor.eof() {
-                                                    break;
-                                                }
-                                                let payload = cursor.cursor.payload(&cursor.cx)?;
-                                                cursor.cur_vals_buf.clear();
-                                                fsqlite_types::record::parse_record_into(
-                                                    &payload,
-                                                    &mut cursor.cur_vals_buf,
-                                                )
-                                                .ok_or_else(|| {
-                                                    FrankenError::internal(
-                                                        "SeekGT: malformed cursor record",
-                                                    )
-                                                })?;
-                                                let cmp = compare_sorter_keys(
-                                                    &cursor.cur_vals_buf,
-                                                    &cursor.target_vals_buf,
-                                                    cursor.target_vals_buf.len(),
-                                                    &[],
-                                                    self.collation_registry.as_ref(),
-                                                );
-                                                if cmp == std::cmp::Ordering::Equal {
-                                                    cursor.cursor.next(&cursor.cx)?;
-                                                } else {
-                                                    break;
-                                                }
+                                            },
+                                        )?;
+                                        loop {
+                                            if cursor.cursor.eof() {
+                                                break;
                                             }
-                                        }
-                                        !cursor.cursor.eof()
-                                    }
-                                    Opcode::SeekLE => {
-                                        if !cursor.cursor.eof() {
-                                            cursor.target_vals_buf.clear();
+                                            let payload = cursor.cursor.payload(&cursor.cx)?;
+                                            cursor.cur_vals_buf.clear();
                                             fsqlite_types::record::parse_record_into(
-                                                key_bytes,
-                                                &mut cursor.target_vals_buf,
+                                                &payload,
+                                                &mut cursor.cur_vals_buf,
                                             )
                                             .ok_or_else(|| {
                                                 FrankenError::internal(
-                                                    "SeekLE: malformed seek key record",
+                                                    "SeekGT: malformed cursor record",
                                                 )
                                             })?;
-                                            loop {
-                                                if cursor.cursor.eof() {
-                                                    break;
-                                                }
-                                                let payload = cursor.cursor.payload(&cursor.cx)?;
-                                                cursor.cur_vals_buf.clear();
-                                                fsqlite_types::record::parse_record_into(
-                                                    &payload,
-                                                    &mut cursor.cur_vals_buf,
-                                                )
-                                                .ok_or_else(|| {
-                                                    FrankenError::internal(
-                                                        "SeekLE: malformed cursor record",
-                                                    )
-                                                })?;
-                                                let cmp = compare_sorter_keys(
-                                                    &cursor.cur_vals_buf,
-                                                    &cursor.target_vals_buf,
-                                                    cursor.target_vals_buf.len(),
-                                                    &[],
-                                                    self.collation_registry.as_ref(),
-                                                );
-                                                if cmp == std::cmp::Ordering::Equal {
-                                                    cursor.cursor.next(&cursor.cx)?;
-                                                } else {
-                                                    break;
-                                                }
+                                            let coll =
+                                                coll_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                            let cmp = compare_sorter_keys(
+                                                &cursor.cur_vals_buf,
+                                                &cursor.target_vals_buf,
+                                                cursor.target_vals_buf.len(),
+                                                &[],
+                                                &coll,
+                                            );
+                                            drop(coll);
+                                            if cmp == std::cmp::Ordering::Equal {
+                                                cursor.cursor.next(&cursor.cx)?;
+                                            } else {
+                                                break;
                                             }
                                         }
-                                        if cursor.cursor.eof() {
-                                            cursor.cursor.last(&cursor.cx)?
-                                        } else {
-                                            cursor.cursor.prev(&cursor.cx)?
-                                        }
                                     }
-                                    Opcode::SeekLT => {
-                                        if cursor.cursor.eof() {
-                                            cursor.cursor.last(&cursor.cx)?
-                                        } else {
-                                            cursor.cursor.prev(&cursor.cx)?
-                                        }
-                                    }
-                                    _ => unreachable!(),
+                                    !cursor.cursor.eof()
                                 }
-                            }
-                        } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
-                            // MemCursor fallback (Phase 4 path).
-                            let key = key_val.to_integer();
-                            if let Some(db) = self.db.as_ref() {
-                                if let Some(table) = db.get_table(cursor.root_page) {
-                                    if table.rows.is_empty() {
-                                        false
-                                    } else {
-                                        match op.opcode {
-                                            Opcode::SeekGE => {
-                                                let pos = table
-                                                    .rows
-                                                    .binary_search_by_key(&key, |r| r.rowid)
-                                                    .unwrap_or_else(|e| e);
-                                                if pos < table.rows.len() {
-                                                    cursor.position = Some(pos);
-                                                    true
-                                                } else {
-                                                    false
-                                                }
+                                Opcode::SeekLE => {
+                                    if !cursor.cursor.eof() {
+                                        cursor.target_vals_buf.clear();
+                                        fsqlite_types::record::parse_record_into(
+                                            key_bytes,
+                                            &mut cursor.target_vals_buf,
+                                        )
+                                        .ok_or_else(
+                                            || {
+                                                FrankenError::internal(
+                                                    "SeekLE: malformed seek key record",
+                                                )
+                                            },
+                                        )?;
+                                        loop {
+                                            if cursor.cursor.eof() {
+                                                break;
                                             }
-                                            Opcode::SeekGT => {
-                                                let pos = match table
-                                                    .rows
-                                                    .binary_search_by_key(&key, |r| r.rowid)
-                                                {
-                                                    Ok(idx) => idx + 1,
-                                                    Err(idx) => idx,
-                                                };
-                                                if pos < table.rows.len() {
-                                                    cursor.position = Some(pos);
-                                                    true
-                                                } else {
-                                                    false
-                                                }
+                                            let payload = cursor.cursor.payload(&cursor.cx)?;
+                                            cursor.cur_vals_buf.clear();
+                                            fsqlite_types::record::parse_record_into(
+                                                &payload,
+                                                &mut cursor.cur_vals_buf,
+                                            )
+                                            .ok_or_else(|| {
+                                                FrankenError::internal(
+                                                    "SeekLE: malformed cursor record",
+                                                )
+                                            })?;
+                                            let coll =
+                                                coll_arc.lock().unwrap_or_else(|e| e.into_inner());
+                                            let cmp = compare_sorter_keys(
+                                                &cursor.cur_vals_buf,
+                                                &cursor.target_vals_buf,
+                                                cursor.target_vals_buf.len(),
+                                                &[],
+                                                &coll,
+                                            );
+                                            drop(coll);
+                                            if cmp == std::cmp::Ordering::Equal {
+                                                cursor.cursor.next(&cursor.cx)?;
+                                            } else {
+                                                break;
                                             }
-                                            Opcode::SeekLE => {
-                                                let pos = match table
-                                                    .rows
-                                                    .binary_search_by_key(&key, |r| r.rowid)
-                                                {
-                                                    Ok(idx) => Some(idx),
-                                                    Err(idx) => idx.checked_sub(1),
-                                                };
-                                                if let Some(idx) = pos {
-                                                    cursor.position = Some(idx);
-                                                    true
-                                                } else {
-                                                    false
-                                                }
-                                            }
-                                            Opcode::SeekLT => {
-                                                let pos = table
-                                                    .rows
-                                                    .binary_search_by_key(&key, |r| r.rowid)
-                                                    .unwrap_or_else(|e| e)
-                                                    .checked_sub(1);
-                                                if let Some(idx) = pos {
-                                                    cursor.position = Some(idx);
-                                                    true
-                                                } else {
-                                                    false
-                                                }
-                                            }
-                                            _ => unreachable!(),
                                         }
                                     }
-                                } else {
+                                    if cursor.cursor.eof() {
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                Opcode::SeekLT => {
+                                    if cursor.cursor.eof() {
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        // MemCursor fallback (Phase 4 path).
+                        let key = key_val.to_integer();
+                        if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                if table.rows.is_empty() {
                                     false
+                                } else {
+                                    match op.opcode {
+                                        Opcode::SeekGE => {
+                                            let pos = table
+                                                .rows
+                                                .binary_search_by_key(&key, |r| r.rowid)
+                                                .unwrap_or_else(|e| e);
+                                            if pos < table.rows.len() {
+                                                cursor.position = Some(pos);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        Opcode::SeekGT => {
+                                            let pos = match table
+                                                .rows
+                                                .binary_search_by_key(&key, |r| r.rowid)
+                                            {
+                                                Ok(idx) => idx + 1,
+                                                Err(idx) => idx,
+                                            };
+                                            if pos < table.rows.len() {
+                                                cursor.position = Some(pos);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        Opcode::SeekLE => {
+                                            let pos = match table
+                                                .rows
+                                                .binary_search_by_key(&key, |r| r.rowid)
+                                            {
+                                                Ok(idx) => Some(idx),
+                                                Err(idx) => idx.checked_sub(1),
+                                            };
+                                            if let Some(idx) = pos {
+                                                cursor.position = Some(idx);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        Opcode::SeekLT => {
+                                            let pos = table
+                                                .rows
+                                                .binary_search_by_key(&key, |r| r.rowid)
+                                                .unwrap_or_else(|e| e)
+                                                .checked_sub(1);
+                                            if let Some(idx) = pos {
+                                                cursor.position = Some(idx);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        _ => unreachable!(),
+                                    }
                                 }
                             } else {
                                 false
                             }
                         } else {
                             false
-                        };
+                        }
+                    } else {
+                        false
+                    };
                     if found {
                         pc += 1;
                     } else {
@@ -6301,7 +6347,10 @@ impl VdbeEngine {
                     let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
                     let is_update = (op.p5 & OPFLAG_ISUPDATE) != 0;
                     let rowid = self.get_reg(rowid_reg).to_integer();
-                    let record_val = self.get_reg(record_reg).clone();
+                    // take_reg moves the value out (replacing with Null) instead
+                    // of cloning — avoids a heap allocation for Blob/Text records.
+                    // Safe because MakeRecord overwrites the register each iteration.
+                    let record_val = self.take_reg(record_reg);
                     let previous_last_insert_rowid = self.last_insert_rowid;
                     let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
                     let pending_update_restore = if is_update {
@@ -6309,10 +6358,6 @@ impl VdbeEngine {
                     } else {
                         self.pending_update_restore = None;
                         None
-                    };
-                    let pk_conflict = ExecOutcome::Error {
-                        code: ErrorCode::Constraint as i32,
-                        message: "PRIMARY KEY constraint failed".to_owned(),
                     };
 
                     // Phase 5B.2 (bd-1yi8): write-through — route ONLY through
@@ -6352,7 +6397,10 @@ impl VdbeEngine {
                                     if let Some(update_restore) = pending_update_restore.clone() {
                                         self.restore_pending_update_after_conflict(update_restore)?;
                                     }
-                                    break pk_conflict;
+                                    break ExecOutcome::Error {
+                                        code: ErrorCode::Constraint as i32,
+                                        message: "PRIMARY KEY constraint failed".to_owned(),
+                                    };
                                 }
                             } else {
                                 // No conflict — insert normally
@@ -6416,7 +6464,10 @@ impl VdbeEngine {
                                                 update_restore,
                                             )?;
                                         }
-                                        break pk_conflict;
+                                        break ExecOutcome::Error {
+                                            code: ErrorCode::Constraint as i32,
+                                            message: "PRIMARY KEY constraint failed".to_owned(),
+                                        };
                                     }
                                 }
                             } else {
@@ -6708,6 +6759,7 @@ impl VdbeEngine {
                     // Compare current sorter key with packed record in register p3.
                     // Jump to p2 when keys differ.
                     let cursor_id = op.p1;
+                    let coll = self.lock_collation();
                     let differs = if let Some(sorter) = self.sorters.get(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             if let Some(current) = sorter.rows.get(pos) {
@@ -6717,7 +6769,7 @@ impl VdbeEngine {
                                     &probe,
                                     sorter.key_columns,
                                     &sorter.collations,
-                                    sorter.collation_registry.as_ref(),
+                                    &coll,
                                 )
                             } else {
                                 true
@@ -6769,39 +6821,41 @@ impl VdbeEngine {
                     // Build a record from registers p1..p1+p2-1 into register p3.
                     let target = op.p3;
                     let n_cols = usize::try_from(op.p2).unwrap_or(0);
-                    let this = &*self;
-                    let blob = if let P4::Affinity(aff) = &op.p4 {
-                        // SQLite stores INTEGER PRIMARY KEY aliases as a NULL
-                        // placeholder in the record payload and materializes
-                        // the real key from the rowid. Omitting the column
-                        // entirely shifts later fields and produces
-                        // SQLite-incompatible on-disk records.
-                        let null_placeholder = SqliteValue::Null;
-                        let iter = aff.chars().enumerate().map(|(i, ch)| {
-                            if ch == 'X' {
-                                &null_placeholder
-                            } else {
+                    // Reuse make_record_buf to avoid per-row Vec<u8> allocation.
+                    let mut rec_buf = std::mem::take(&mut self.make_record_buf);
+                    {
+                        let this = &*self;
+                        if let P4::Affinity(aff) = &op.p4 {
+                            let null_placeholder = SqliteValue::Null;
+                            let iter = aff.chars().enumerate().map(|(i, ch)| {
+                                if ch == 'X' {
+                                    &null_placeholder
+                                } else {
+                                    #[allow(clippy::cast_possible_wrap)]
+                                    let reg = op.p1 + i as i32;
+                                    this.get_reg(reg)
+                                }
+                            });
+                            fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                        } else {
+                            let iter = (0..n_cols).map(move |i| {
                                 #[allow(clippy::cast_possible_wrap)]
                                 let reg = op.p1 + i as i32;
                                 this.get_reg(reg)
-                            }
-                        });
-                        fsqlite_types::record::serialize_record_iter(iter)
-                    } else {
-                        let iter = (0..n_cols).map(move |i| {
-                            #[allow(clippy::cast_possible_wrap)]
-                            let reg = op.p1 + i as i32;
-                            this.get_reg(reg)
-                        });
-                        fsqlite_types::record::serialize_record_iter(iter)
-                    };
+                            });
+                            fsqlite_types::record::serialize_record_iter_into(iter, &mut rec_buf);
+                        }
+                    }
                     if collect_vdbe_metrics {
                         FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                         FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL.fetch_add(
-                            u64::try_from(blob.len()).unwrap_or(u64::MAX),
+                            u64::try_from(rec_buf.len()).unwrap_or(u64::MAX),
                             AtomicOrdering::Relaxed,
                         );
                     }
+                    // Take serialized bytes, return empty buffer for reuse.
+                    let blob = std::mem::take(&mut rec_buf);
+                    self.make_record_buf = rec_buf;
                     self.set_reg(target, SqliteValue::Blob(blob));
                     pc += 1;
                 }
@@ -6972,43 +7026,46 @@ impl VdbeEngine {
                     let start_b = op.p2;
                     let count = op.p3;
                     let compare_collations = parse_compare_collations(&op.p4);
-                    let mut result = Ordering::Equal;
-                    for i in 0..count {
-                        let val_a = self.get_reg(start_a + i);
-                        let val_b = self.get_reg(start_b + i);
-                        let coll_name = usize::try_from(i).ok().and_then(|field_idx| {
-                            compare_collation_for_field(compare_collations.as_deref(), field_idx)
-                        });
-                        // SQLite NULL sort order: NULLs sort before all other
-                        // values.  When partial_cmp returns None (NULL vs
-                        // non-NULL or NaN), apply NULL-first ordering.
-                        let ord = if let Some(coll_name) = coll_name {
-                            collate_compare(
-                                val_a,
-                                val_b,
-                                coll_name,
-                                self.collation_registry.as_ref(),
-                            )
-                        } else {
-                            val_a.partial_cmp(val_b)
-                        };
-                        let o = match ord {
-                            Some(o) => o,
-                            None => {
-                                // NULL < non-NULL; NULL == NULL for sort purposes.
-                                match (val_a.is_null(), val_b.is_null()) {
-                                    (true, true) => Ordering::Equal,
-                                    (true, false) => Ordering::Less,
-                                    (false, true) => Ordering::Greater,
-                                    (false, false) => Ordering::Equal, // NaN edge case fallback
+                    let coll_arc = Arc::clone(&self.collation_registry);
+                    let result = {
+                        let coll = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut result = Ordering::Equal;
+                        for i in 0..count {
+                            let val_a = self.get_reg(start_a + i);
+                            let val_b = self.get_reg(start_b + i);
+                            let coll_name = usize::try_from(i).ok().and_then(|field_idx| {
+                                compare_collation_for_field(
+                                    compare_collations.as_deref(),
+                                    field_idx,
+                                )
+                            });
+                            // SQLite NULL sort order: NULLs sort before all other
+                            // values.  When partial_cmp returns None (NULL vs
+                            // non-NULL or NaN), apply NULL-first ordering.
+                            let ord = if let Some(coll_name) = coll_name {
+                                collate_compare(val_a, val_b, coll_name, &coll)
+                            } else {
+                                val_a.partial_cmp(val_b)
+                            };
+                            let o = match ord {
+                                Some(o) => o,
+                                None => {
+                                    // NULL < non-NULL; NULL == NULL for sort purposes.
+                                    match (val_a.is_null(), val_b.is_null()) {
+                                        (true, true) => Ordering::Equal,
+                                        (true, false) => Ordering::Less,
+                                        (false, true) => Ordering::Greater,
+                                        (false, false) => Ordering::Equal,
+                                    }
                                 }
+                            };
+                            if o != Ordering::Equal {
+                                result = o;
+                                break;
                             }
-                        };
-                        if o != Ordering::Equal {
-                            result = o;
-                            break;
                         }
-                    }
+                        result
+                    };
                     self.last_compare_result = Some(result);
                     pc += 1;
                 }
@@ -7239,7 +7296,8 @@ impl VdbeEngine {
                         .copied()
                         .unwrap_or_default();
                     let desc_flags = self.index_desc_flags_for_root(root_page);
-                    let collation_registry = Arc::clone(&self.collation_registry);
+                    let coll_arc = Arc::clone(&self.collation_registry);
+                    let coll_guard = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
 
                     // Extract current cursor key as parsed fields.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
@@ -7290,7 +7348,7 @@ impl VdbeEngine {
                             n_compare,
                             &desc_flags,
                             &[], // TODO: Per-index collations are not yet threaded here.
-                            collation_registry.as_ref(),
+                            &coll_guard,
                         );
 
                         let condition_met = match op.opcode {
@@ -7326,7 +7384,7 @@ impl VdbeEngine {
                                 n_compare,
                                 &desc_flags,
                                 &[],
-                                self.collation_registry.as_ref(),
+                                &coll_guard,
                             );
                             let condition_met = match op.opcode {
                                 Opcode::IdxLE => cmp != Ordering::Greater,
@@ -8301,12 +8359,12 @@ impl VdbeEngine {
     }
 
     /// Get the collected result rows.
-    pub fn results(&self) -> &[smallvec::SmallVec<[SqliteValue; 8]>] {
+    pub fn results(&self) -> &[smallvec::SmallVec<[SqliteValue; 16]>] {
         &self.results
     }
 
     /// Take the result rows, consuming them.
-    pub fn take_results(&mut self) -> Vec<smallvec::SmallVec<[SqliteValue; 8]>> {
+    pub fn take_results(&mut self) -> Vec<smallvec::SmallVec<[SqliteValue; 16]>> {
         std::mem::take(&mut self.results)
     }
 
@@ -8326,7 +8384,7 @@ impl VdbeEngine {
             .and_then(|delta| start.checked_add(delta))
     }
 
-    fn collect_reg_range(&self, start: i32, count: usize) -> smallvec::SmallVec<[SqliteValue; 8]> {
+    fn collect_reg_range(&self, start: i32, count: usize) -> smallvec::SmallVec<[SqliteValue; 16]> {
         let mut row = smallvec::SmallVec::with_capacity(count);
         for offset in 0..count {
             let val = Self::reg_with_offset(start, offset)
@@ -8349,6 +8407,9 @@ impl VdbeEngine {
 
     fn take_reg(&mut self, r: i32) -> SqliteValue {
         if r >= 0 && (r as usize) < self.registers.len() {
+            if !self.register_subtypes.is_empty() {
+                self.register_subtypes.remove(&r);
+            }
             std::mem::replace(&mut self.registers[r as usize], SqliteValue::Null)
         } else {
             SqliteValue::Null
@@ -8399,6 +8460,28 @@ impl VdbeEngine {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
         };
+    }
+
+    /// Fastest possible register write for Integer values.
+    /// Skips: bounds check (registers pre-sized in execute()),
+    /// NaN normalization (integers can't be NaN).
+    /// Only safe when the register file has been pre-sized.
+    #[inline(always)]
+    #[allow(clippy::cast_sign_loss)]
+    fn set_reg_int(&mut self, r: i32, val: i64) {
+        let idx = r as usize;
+        // The register file is pre-sized in execute() to program.register_count(),
+        // so this should never need to resize. Guard with debug_assert only.
+        debug_assert!(
+            idx < self.registers.len(),
+            "register {r} out of pre-sized bounds"
+        );
+        if idx < self.registers.len() {
+            if !self.register_subtypes.is_empty() {
+                self.register_subtypes.remove(&r);
+            }
+            self.registers[idx] = SqliteValue::Integer(val);
+        }
     }
 
     /// Write a text string to a register, reusing the existing `String`
@@ -9414,7 +9497,7 @@ fn collate_compare(
     lhs: &SqliteValue,
     rhs: &SqliteValue,
     coll_name: &str,
-    collation_registry: &Mutex<CollationRegistry>,
+    collation_registry: &CollationRegistry,
 ) -> Option<std::cmp::Ordering> {
     match (lhs, rhs) {
         (SqliteValue::Text(l), SqliteValue::Text(r)) => Some(compare_text_with_collation(
@@ -9431,20 +9514,12 @@ fn compare_text_with_collation(
     left: &[u8],
     right: &[u8],
     coll_name: &str,
-    collation_registry: &Mutex<CollationRegistry>,
+    collation_registry: &CollationRegistry,
 ) -> Ordering {
-    let compare_with = |registry: &CollationRegistry| {
-        registry
-            .find(coll_name)
-            .map(|collation| collation.compare(left, right))
-    };
-
-    match collation_registry.lock() {
-        Ok(registry) => compare_with(&registry),
-        Err(_) => None,
-    }
-    .or_else(|| compare_with(&CollationRegistry::new()))
-    .unwrap_or_else(|| left.cmp(right))
+    collation_registry
+        .find(coll_name)
+        .map(|collation| collation.compare(left, right))
+        .unwrap_or_else(|| left.cmp(right))
 }
 
 fn parse_compare_collations(p4: &P4) -> Option<Vec<String>> {
@@ -9690,7 +9765,7 @@ fn sorter_keys_equal(
     rhs: &[SqliteValue],
     key_columns: usize,
     collations: &[Option<String>],
-    collation_registry: &Mutex<CollationRegistry>,
+    collation_registry: &CollationRegistry,
 ) -> bool {
     compare_sorter_keys(lhs, rhs, key_columns, collations, collation_registry) == Ordering::Equal
 }
@@ -9700,7 +9775,7 @@ fn compare_sorter_keys(
     rhs: &[SqliteValue],
     key_columns: usize,
     collations: &[Option<String>],
-    collation_registry: &Mutex<CollationRegistry>,
+    collation_registry: &CollationRegistry,
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
@@ -9730,7 +9805,7 @@ fn compare_index_prefix_keys(
     key_columns: usize,
     desc_flags: &[bool],
     collations: &[Option<String>],
-    collation_registry: &Mutex<CollationRegistry>,
+    collation_registry: &CollationRegistry,
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
@@ -9759,13 +9834,13 @@ fn compare_index_prefix_keys(
 
 /// Compare two `SqliteValue`s with an optional collation sequence.
 ///
-/// Text values consult the shared collation registry so dynamically loaded
+/// Text values consult the collation registry so dynamically loaded
 /// collations participate in ORDER BY, DISTINCT, and index probes.
 fn cmp_values_collated(
     lhs: &SqliteValue,
     rhs: &SqliteValue,
     collation: Option<&str>,
-    collation_registry: &Mutex<CollationRegistry>,
+    collation_registry: &CollationRegistry,
 ) -> Ordering {
     if let (Some(coll), SqliteValue::Text(lt), SqliteValue::Text(rt)) = (collation, lhs, rhs) {
         return compare_text_with_collation(lt.as_bytes(), rt.as_bytes(), coll, collation_registry);
@@ -9779,7 +9854,7 @@ fn compare_sorter_rows(
     key_columns: usize,
     sort_key_orders: &[SortKeyOrder],
     collations: &[Option<String>],
-    collation_registry: &Mutex<CollationRegistry>,
+    collation_registry: &CollationRegistry,
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
@@ -14725,19 +14800,20 @@ mod tests {
         let registry = Mutex::new(CollationRegistry::new());
         let lhs = vec![SqliteValue::Integer(20), SqliteValue::Integer(2)];
         let rhs = vec![SqliteValue::Integer(10), SqliteValue::Integer(1)];
+        let coll_guard = registry.lock().unwrap();
 
         assert_eq!(
-            compare_index_prefix_keys(&lhs, &rhs, 1, &[true], &[], &registry),
+            compare_index_prefix_keys(&lhs, &rhs, 1, &[true], &[], &coll_guard),
             Ordering::Less,
             "descending index comparison should treat the larger key as earlier"
         );
         assert_eq!(
-            compare_index_prefix_keys(&lhs, &rhs, 1, &[false], &[], &registry),
+            compare_index_prefix_keys(&lhs, &rhs, 1, &[false], &[], &coll_guard),
             Ordering::Greater,
             "ascending index comparison should keep natural integer ordering"
         );
         assert_eq!(
-            compare_index_prefix_keys(&lhs, &rhs, 0, &[true], &[], &registry),
+            compare_index_prefix_keys(&lhs, &rhs, 0, &[true], &[], &coll_guard),
             Ordering::Less,
             "zero key_columns should still compare the leading term"
         );
@@ -18256,6 +18332,20 @@ mod tests {
         });
 
         assert_eq!(rows, vec![vec![SqliteValue::Integer(0)]]);
+    }
+
+    #[test]
+    fn test_take_reg_clears_subtype_metadata() {
+        let mut engine = VdbeEngine::new(4);
+        engine.set_reg(1, SqliteValue::Text("payload".to_owned()));
+        engine.register_subtypes.insert(1, 74);
+
+        assert_eq!(engine.take_reg(1), SqliteValue::Text("payload".to_owned()));
+        assert_eq!(engine.get_reg(1), &SqliteValue::Null);
+        assert!(
+            !engine.register_subtypes.contains_key(&1),
+            "moving a register value out must clear any stale subtype metadata"
+        );
     }
 
     #[test]

@@ -542,6 +542,62 @@ where
     buf
 }
 
+/// Serialize a record into a reusable buffer, avoiding allocation.
+///
+/// Same logic as `serialize_record_iter` but writes into `buf` (clearing it
+/// first and reusing its capacity). This eliminates the per-row `Vec<u8>`
+/// allocation in the `MakeRecord` opcode hot path.
+pub fn serialize_record_iter_into<'a, I>(values: I, buf: &mut Vec<u8>)
+where
+    I: Iterator<Item = &'a SqliteValue> + Clone,
+{
+    // ── Phase 1: compute serial types + sizes (one call per column) ──
+    let mut serial_types_buf: [u64; 32] = [0; 32];
+    let mut serial_types_heap: Vec<u64> = Vec::new();
+    let mut n_cols: usize = 0;
+    let mut header_content_size: usize = 0;
+    let mut body_size: usize = 0;
+
+    for v in values.clone() {
+        let st = serial_type_for_value(v);
+        if n_cols < 32 {
+            serial_types_buf[n_cols] = st;
+        } else {
+            if serial_types_heap.is_empty() {
+                serial_types_heap.extend_from_slice(&serial_types_buf);
+            }
+            serial_types_heap.push(st);
+        }
+        header_content_size += varint_len(st);
+        body_size += serial_type_len(st).unwrap_or(0) as usize;
+        n_cols += 1;
+    }
+
+    let serial_types: &[u64] = if n_cols <= 32 {
+        &serial_types_buf[..n_cols]
+    } else {
+        &serial_types_heap
+    };
+
+    // ── Phase 2: single-pass write header + body ─────────────────────
+    let header_size = compute_header_size(header_content_size);
+    let total_size = header_size + body_size;
+    buf.clear();
+    buf.resize(total_size, 0);
+
+    let mut offset = write_varint(buf, header_size as u64);
+    for &st in serial_types {
+        offset += write_varint(&mut buf[offset..], st);
+    }
+    debug_assert_eq!(offset, header_size);
+
+    for (v, &st) in values.zip(serial_types.iter()) {
+        let value_len = serial_type_len(st).unwrap_or(0) as usize;
+        encode_value(v, st, &mut buf[offset..offset + value_len]);
+        offset += value_len;
+    }
+}
+
 /// Compute the total header size (including the header-size varint itself).
 #[allow(clippy::cast_possible_truncation)]
 fn compute_header_size(content_size: usize) -> usize {
