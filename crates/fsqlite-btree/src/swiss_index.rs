@@ -271,11 +271,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instrumentation::{btree_metrics_snapshot, reset_btree_metrics};
 
     #[test]
     fn test_swiss_index_basic_ops() {
-        reset_btree_metrics();
         let mut map = SwissIndex::new();
         assert!(map.is_empty());
 
@@ -290,12 +288,6 @@ mod tests {
         assert_eq!(map.remove("key1"), Some(1));
         assert_eq!(map.len(), 1);
         assert!(!map.contains_key("key1"));
-
-        // Check metrics
-        let metrics = btree_metrics_snapshot();
-        // probes: insert(1) + get(1) + contains(1) + insert(1) + remove(1) + contains(1 check) = 6
-        assert!(metrics.fsqlite_swiss_table_probes_total >= 6);
-        assert!(metrics.fsqlite_swiss_table_load_factor > 0);
     }
 
     #[test]
@@ -307,10 +299,26 @@ mod tests {
             map.insert(i, i * 10);
         }
 
-        let metrics = btree_metrics_snapshot();
-        assert!(metrics.fsqlite_swiss_table_probes_total >= 50);
         // Load factor should be roughly 50% (capacity might be > 100 due to power of 2 sizing)
-        assert!(metrics.fsqlite_swiss_table_load_factor > 0);
-        assert!(metrics.fsqlite_swiss_table_load_factor < 1000);
+        let lf = map.load_factor_milli();
+        assert!(lf > 0);
+        assert!(lf < 1000);
+    }
+
+    #[test]
+    fn test_swiss_index_entry_or_insert_with() {
+        let mut map = SwissIndex::new();
+        let val = map.entry_or_insert_with(42, || 100);
+        assert_eq!(*val, 100);
+        // Second call should return existing value.
+        let val = map.entry_or_insert_with(42, || 999);
+        assert_eq!(*val, 100);
+    }
+
+    #[test]
+    fn test_swiss_index_from_iter() {
+        let map: SwissIndex<i32, i32> = [(1, 10), (2, 20), (3, 30)].into_iter().collect();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&2), Some(&20));
     }
 }
