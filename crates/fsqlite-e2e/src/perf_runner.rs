@@ -2741,7 +2741,10 @@ mod tests {
             statement_dispatch_background_gates: 1,
             prepared_schema_refreshes: 1,
             pager_publication_refreshes: 1,
+            memory_autocommit_fast_path_begins: 1,
             column_default_evaluation_passes: 2,
+            prepared_table_engine_fresh_allocs: 1,
+            prepared_table_engine_reuses: 1,
             record_decode: RecordHotPathProfileSnapshot {
                 parse_record_calls: 4,
                 parse_record_into_calls: 2,

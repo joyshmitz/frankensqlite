@@ -227,6 +227,8 @@ static FSQLITE_PREPARED_SCHEMA_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PAGER_PUBLICATION_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PREPARED_TABLE_ENGINE_REUSES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParserHotPathProfileSnapshot {
@@ -253,6 +255,8 @@ pub struct HotPathProfileSnapshot {
     pub pager_publication_refreshes: u64,
     pub memory_autocommit_fast_path_begins: u64,
     pub column_default_evaluation_passes: u64,
+    pub prepared_table_engine_fresh_allocs: u64,
+    pub prepared_table_engine_reuses: u64,
     pub record_decode: RecordHotPathProfileSnapshot,
     pub vdbe: VdbeMetricsSnapshot,
 }
@@ -287,6 +291,8 @@ pub fn reset_hot_path_profile() {
     FSQLITE_PAGER_PUBLICATION_REFRESHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PREPARED_TABLE_ENGINE_REUSES.store(0, AtomicOrdering::Relaxed);
     reset_record_profile();
     reset_vdbe_metrics();
 }
@@ -317,6 +323,10 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         memory_autocommit_fast_path_begins: FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS
             .load(AtomicOrdering::Relaxed),
         column_default_evaluation_passes: FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES
+            .load(AtomicOrdering::Relaxed),
+        prepared_table_engine_fresh_allocs: FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS
+            .load(AtomicOrdering::Relaxed),
+        prepared_table_engine_reuses: FSQLITE_PREPARED_TABLE_ENGINE_REUSES
             .load(AtomicOrdering::Relaxed),
         record_decode: record_profile_snapshot(),
         vdbe: vdbe_metrics_snapshot(),
@@ -1435,70 +1445,162 @@ impl PreparedStatement<'_> {
         self.dml_dispatch.is_some()
     }
 
-    fn execute_table_query(&self, op_cx: &Cx, params: Option<&[SqliteValue]>) -> Result<Vec<Row>> {
+    fn execute_table_program_with_reuse(
+        &self,
+        op_cx: &Cx,
+        params: Option<&[SqliteValue]>,
+        track_last_insert_rowid: bool,
+    ) -> Result<(Vec<Row>, usize, Option<i64>)> {
         let Some(db) = self.db.as_ref() else {
             return Err(FrankenError::Internal(
-                "prepared table query missing database handle".to_owned(),
+                "prepared table program missing database handle".to_owned(),
             ));
         };
-        let Some(registry) = self.func_registry.as_ref() else {
+        let Some(func_registry) = self.func_registry.as_ref() else {
             return Err(FrankenError::Internal(
-                "prepared statement missing function registry".to_owned(),
+                "prepared table program missing function registry".to_owned(),
             ));
         };
+        let page_size = PageSize::new(self.conn.pragma_state.borrow().page_size).unwrap();
 
-        // When the parent connection already owns an active transaction, reuse
-        // that exact execution path so prepared reads observe the connection's
-        // uncommitted writes, concurrent session state, and MVCC snapshot.
-        if self.conn.active_txn.borrow().is_some() {
-            let (rows, _, _) = self.conn.execute_table_program_with_cx(
-                self.program.as_ref(),
-                params,
-                false,
-                op_cx,
-            )?;
-            return Ok(rows);
-        }
+        let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
+            .then(|| {
+                let span = tracing::span!(
+                    target: "fsqlite.execution",
+                    tracing::Level::DEBUG,
+                    "execution",
+                    mode = "table"
+                );
+                record_trace_span_created();
+                span
+            });
+        let _execution_guard = execution_span.as_ref().map(tracing::Span::enter);
 
-        // Standalone prepared reads still need the same execution metadata as
-        // the normal connection path: parity-cert fallback policy, synthetic
-        // defaults for short records, and the MVCC version store for
-        // historical snapshot upgrades.
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
         let runtime_inputs = self
             .conn
             .table_execution_runtime_inputs(self.program.has_insert_ops());
-        let txn = self
-            .pager
-            .as_ref()
-            .map(|p| {
-                self.conn
-                    .begin_pager_txn_with_busy_timeout(p, op_cx, TransactionMode::ReadOnly)
-            })
-            .transpose()?;
-        let (result, mut txn_back) = execute_table_program_with_db(
-            self.program.as_ref(),
-            params,
-            registry,
-            &self.conn.collation_registry,
-            op_cx,
-            db,
-            txn,
-            self.schema_cookie,
-            None,
-            runtime_inputs.autoincrement_seq_by_root_page,
-            runtime_inputs.rowid_alias_col_by_root_page,
-            runtime_inputs.table_column_count_by_root_page,
-            runtime_inputs.column_defaults_by_root_page,
-            runtime_inputs.index_desc_flags_by_root_page,
-            reject_mem,
-            Some(Arc::clone(&self.conn.version_store)),
-            PageSize::new(self.conn.pragma_state.borrow().page_size).unwrap(),
-        );
-        if let Some(ref mut txn) = txn_back {
+        let cookie = *self.conn.schema_cookie.borrow();
+        let had_active_txn = self.conn.active_txn.borrow().is_some();
+
+        let (result, txn_back) = if had_active_txn {
+            let txn = self.conn.active_txn.borrow_mut().take();
+            let concurrent_ctx = if *self.conn.concurrent_txn.borrow() {
+                let session_id = (*self.conn.concurrent_session_id.borrow()).ok_or_else(|| {
+                    FrankenError::Internal(
+                        "concurrent transaction missing session during prepared VDBE setup"
+                            .to_owned(),
+                    )
+                })?;
+                let handle = lock_unpoisoned(&self.conn.concurrent_registry)
+                    .handle(session_id)
+                    .ok_or_else(|| {
+                        FrankenError::Internal(
+                            "concurrent transaction missing handle during prepared VDBE setup"
+                                .to_owned(),
+                        )
+                    })?;
+                Some(ConcurrentExecContext {
+                    session_id,
+                    handle,
+                    lock_table: Arc::clone(&self.conn.concurrent_lock_table),
+                    commit_index: Arc::clone(&self.conn.concurrent_commit_index),
+                    #[allow(clippy::cast_sign_loss)]
+                    busy_timeout_ms: self.conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64,
+                })
+            } else {
+                None
+            };
+
+            execute_table_program_with_db(
+                self.program.as_ref(),
+                params,
+                func_registry,
+                &self.conn.collation_registry,
+                op_cx,
+                db,
+                txn,
+                cookie,
+                concurrent_ctx,
+                runtime_inputs.autoincrement_seq_by_root_page,
+                runtime_inputs.rowid_alias_col_by_root_page,
+                runtime_inputs.table_column_count_by_root_page,
+                runtime_inputs.column_defaults_by_root_page,
+                runtime_inputs.index_desc_flags_by_root_page,
+                reject_mem,
+                Some(Arc::clone(&self.conn.version_store)),
+                page_size,
+            )
+        } else {
+            let txn = self
+                .pager
+                .as_ref()
+                .map(|p| {
+                    self.conn
+                        .begin_pager_txn_with_busy_timeout(p, op_cx, TransactionMode::ReadOnly)
+                })
+                .transpose()?;
+            execute_table_program_with_db(
+                self.program.as_ref(),
+                params,
+                func_registry,
+                &self.conn.collation_registry,
+                op_cx,
+                db,
+                txn,
+                cookie,
+                None,
+                runtime_inputs.autoincrement_seq_by_root_page,
+                runtime_inputs.rowid_alias_col_by_root_page,
+                runtime_inputs.table_column_count_by_root_page,
+                runtime_inputs.column_defaults_by_root_page,
+                runtime_inputs.index_desc_flags_by_root_page,
+                reject_mem,
+                Some(Arc::clone(&self.conn.version_store)),
+                page_size,
+            )
+        };
+
+        if had_active_txn {
+            *self.conn.active_txn.borrow_mut() = txn_back;
+        } else if let Some(mut txn) = txn_back {
             txn.commit(op_cx)?;
         }
-        result.map(|(rows, ..)| rows).map_err(|error| error.error)
+
+        match result {
+            Ok((rows, changes, last_insert_rowid)) => {
+                self.conn.clear_table_program_error_state();
+                if track_last_insert_rowid && let Some(last_insert_rowid) = last_insert_rowid {
+                    self.conn
+                        .set_last_insert_rowid_without_sync(last_insert_rowid);
+                }
+                Ok((
+                    rows,
+                    changes,
+                    if track_last_insert_rowid {
+                        last_insert_rowid
+                    } else {
+                        None
+                    },
+                ))
+            }
+            Err(exec_error) => {
+                self.conn.record_table_program_error_state(
+                    exec_error.changes,
+                    if track_last_insert_rowid {
+                        exec_error.last_insert_rowid
+                    } else {
+                        None
+                    },
+                );
+                Err(exec_error.error)
+            }
+        }
+    }
+
+    fn execute_table_query(&self, op_cx: &Cx, params: Option<&[SqliteValue]>) -> Result<Vec<Row>> {
+        self.execute_table_program_with_reuse(op_cx, params, false)
+            .map(|(rows, ..)| rows)
     }
 
     /// Execute as a query and return all result rows.
@@ -4868,7 +4970,7 @@ impl Connection {
             self.with_internal_statement_savepoint("insert", || {
                 self.execute_precompiled_prepared_insert_dispatch(
                     execution_cx,
-                    stmt.program.as_ref(),
+                    stmt,
                     table_name,
                     params,
                 )
@@ -4876,7 +4978,7 @@ impl Connection {
         } else {
             self.execute_precompiled_prepared_insert_dispatch(
                 execution_cx,
-                stmt.program.as_ref(),
+                stmt,
                 table_name,
                 params,
             )
@@ -4958,12 +5060,12 @@ impl Connection {
     fn execute_precompiled_prepared_insert_dispatch(
         &self,
         execution_cx: &Cx,
-        program: &VdbeProgram,
+        stmt: &PreparedStatement<'_>,
         table_name: &str,
         params: Option<&[SqliteValue]>,
     ) -> Result<(Vec<Row>, usize)> {
         let (rows, affected, _) =
-            self.execute_table_program_with_cx(program, params, true, execution_cx)?;
+            stmt.execute_table_program_with_reuse(execution_cx, params, true)?;
         if table_name.eq_ignore_ascii_case("sqlite_sequence") {
             self.refresh_sqlite_sequence_cache()?;
         } else {
@@ -16874,7 +16976,9 @@ impl Connection {
                 };
                 Ok(vec![Row {
                     values: vec![SqliteValue::Text(
-                        checkpoint_schedule_override_label(schedule_mode).to_owned().into(),
+                        checkpoint_schedule_override_label(schedule_mode)
+                            .to_owned()
+                            .into(),
                     )],
                 }])
             }
@@ -21498,56 +21602,68 @@ impl Connection {
                         continue;
                     }
                 }
-                // For :memory: databases, read directly from MemDatabase
-                // instead of going through self.query() which pays the
-                // full parse→compile→VDBE→autocommit cost per table scan.
-                // Uses the same IPK-splice logic as the time-travel path.
+                // For :memory: databases, try reading directly from
+                // MemDatabase instead of going through self.query() which
+                // pays the full parse→compile→VDBE→autocommit cost per
+                // table scan.  Same IPK-splice logic as the time-travel
+                // path.  Falls back to self.query() when the table isn't
+                // in MemDatabase (e.g. virtual tables).
                 let row_data = if !self.pager.is_file_backed() {
-                    // Extract schema info and drop the borrow before
-                    // borrowing db, to keep borrow scopes minimal.
-                    let (root_page, num_schema_cols) = {
-                        let schema = self.schema.borrow();
-                        schema
-                            .iter()
-                            .find(|t| t.name.eq_ignore_ascii_case(&src.table_name))
-                            .map(|t| (t.root_page, t.columns.len()))
-                            .unwrap_or((0, 0))
-                    };
-                    let ipk_idx = self
-                        .rowid_alias_columns
-                        .borrow()
-                        .get(&src.table_name.to_ascii_lowercase())
-                        .copied();
-                    let db = self.db.borrow();
-                    if let Some(mem_table) = db.get_table(root_page) {
-                        mem_table
-                            .iter_rows()
-                            .map(|(rowid, vals)| {
-                                let mut row = if let Some(ipk_col) = ipk_idx {
-                                    let mut full = Vec::with_capacity(num_schema_cols);
-                                    let mut val_idx = 0;
-                                    for col_idx in 0..num_schema_cols {
-                                        if col_idx == ipk_col {
-                                            full.push(SqliteValue::Integer(rowid));
-                                        } else if val_idx < vals.len() {
-                                            full.push(vals[val_idx].clone());
-                                            val_idx += 1;
-                                        } else {
-                                            full.push(SqliteValue::Null);
+                    let mem_rows = {
+                        let (root_page, num_schema_cols) = {
+                            let schema = self.schema.borrow();
+                            schema
+                                .iter()
+                                .find(|t| t.name.eq_ignore_ascii_case(&src.table_name))
+                                .map(|t| (t.root_page, t.columns.len()))
+                                .unwrap_or((0, 0))
+                        };
+                        let ipk_idx = self
+                            .rowid_alias_columns
+                            .borrow()
+                            .get(&src.table_name.to_ascii_lowercase())
+                            .copied();
+                        let db = self.db.borrow();
+                        db.get_table(root_page).map(|mem_table| {
+                            mem_table
+                                .iter_rows()
+                                .map(|(rowid, vals)| {
+                                    let mut row = if let Some(ipk_col) = ipk_idx {
+                                        let mut full =
+                                            Vec::with_capacity(num_schema_cols);
+                                        let mut val_idx = 0;
+                                        for col_idx in 0..num_schema_cols {
+                                            if col_idx == ipk_col {
+                                                full.push(SqliteValue::Integer(
+                                                    rowid,
+                                                ));
+                                            } else if val_idx < vals.len() {
+                                                full.push(vals[val_idx].clone());
+                                                val_idx += 1;
+                                            } else {
+                                                full.push(SqliteValue::Null);
+                                            }
                                         }
+                                        full
+                                    } else {
+                                        vals.to_vec()
+                                    };
+                                    if src.hidden_rowid_projection.is_some() {
+                                        row.push(SqliteValue::Integer(rowid));
                                     }
-                                    full
-                                } else {
-                                    vals.to_vec()
-                                };
-                                if src.hidden_rowid_projection.is_some() {
-                                    row.push(SqliteValue::Integer(rowid));
-                                }
-                                row
-                            })
-                            .collect::<Vec<Vec<SqliteValue>>>()
+                                    row
+                                })
+                                .collect::<Vec<Vec<SqliteValue>>>()
+                        })
+                    };
+                    if let Some(rows) = mem_rows {
+                        rows
                     } else {
-                        Vec::new()
+                        // Table not in MemDatabase (virtual table, etc.) —
+                        // fall back to the query path.
+                        let scan_sql = build_join_scan_sql(src);
+                        let rows = self.query(&scan_sql)?;
+                        rows.iter().map(|row| row.values().to_vec()).collect()
                     }
                 } else {
                     // File-backed: scan through the normal query path so
@@ -22711,9 +22827,13 @@ impl Connection {
                     SqliteValue::Text(s) => s.clone(),
                     _ => continue,
                 };
-                new_original_ddl_sql.insert(trigger_name.to_ascii_lowercase(), create_sql.to_string());
+                new_original_ddl_sql
+                    .insert(trigger_name.to_ascii_lowercase(), create_sql.to_string());
                 if let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql) {
-                    new_triggers.push(TriggerDef::from_create_statement(&stmt, create_sql.to_string()));
+                    new_triggers.push(TriggerDef::from_create_statement(
+                        &stmt,
+                        create_sql.to_string(),
+                    ));
                 }
                 continue;
             }
@@ -22738,7 +22858,7 @@ impl Connection {
                 let maybe_index_definition = match &entry[4] {
                     SqliteValue::Text(create_sql) => {
                         new_original_ddl_sql
-                            .insert(index_name.to_ascii_lowercase(), create_sql.clone());
+                            .insert(index_name.to_ascii_lowercase(), create_sql.to_string());
                         parse_index_definition_from_create_sql(create_sql)
                     }
                     SqliteValue::Null => infer_implicit_index_definition_from_master_entries(
@@ -22765,7 +22885,12 @@ impl Connection {
                 if index_definition.key_term_count() == 0 {
                     continue;
                 }
-                pending_indexes.push((index_name.to_string(), table_name.to_string(), root_page, index_definition));
+                pending_indexes.push((
+                    index_name.to_string(),
+                    table_name.to_string(),
+                    root_page,
+                    index_definition,
+                ));
                 continue;
             }
 
@@ -22779,7 +22904,7 @@ impl Connection {
                     SqliteValue::Text(s) => s.clone(),
                     _ => continue,
                 };
-                new_original_ddl_sql.insert(view_name.to_ascii_lowercase(), create_sql.clone());
+                new_original_ddl_sql.insert(view_name.to_ascii_lowercase(), create_sql.to_string());
                 if let Ok(Statement::CreateView(stmt)) = parse_single_statement(&create_sql) {
                     new_views.push(ViewDef {
                         name: stmt.name.name.clone(),
@@ -22806,7 +22931,7 @@ impl Connection {
                 SqliteValue::Text(s) => s.clone(),
                 _ => continue,
             };
-            new_original_ddl_sql.insert(name.to_ascii_lowercase(), create_sql.clone());
+            new_original_ddl_sql.insert(name.to_ascii_lowercase(), create_sql.to_string());
 
             // Stock SQLite virtual tables (FTS5, rtree, etc.) have
             // rootpage=0 in sqlite_master and CREATE SQL beginning with
@@ -29534,7 +29659,7 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
             if parts.is_empty() {
                 SqliteValue::Null
             } else {
-                SqliteValue::Text(parts.join(",".into()))
+                SqliteValue::Text(parts.join(",").into())
             }
         }
         _ => SqliteValue::Null,
@@ -29559,7 +29684,7 @@ fn compute_aggregate_ext(
         if parts.is_empty() {
             SqliteValue::Null
         } else {
-            SqliteValue::Text(parts.join(sep.into()))
+            SqliteValue::Text(parts.join(sep).into())
         }
     } else {
         compute_aggregate(name, values)
@@ -30678,14 +30803,14 @@ fn ssi_decision_cards_to_rows(cards: &[SsiDecisionCard]) -> Vec<Row> {
                 SqliteValue::Integer(to_i64_clamped(card.snapshot_seq.get())),
                 SqliteValue::Integer(to_i64_clamped(card.commit_seq.map_or(0, CommitSeq::get))),
                 SqliteValue::Text(card.decision_type.as_str().to_owned().into()),
-                SqliteValue::Text(join_txn_tokens(&card.conflicting_txns.into())),
-                SqliteValue::Text(join_page_numbers(&card.conflict_pages.into())),
+                SqliteValue::Text(join_txn_tokens(&card.conflicting_txns).into()),
+                SqliteValue::Text(join_page_numbers(&card.conflict_pages).into()),
                 SqliteValue::Integer(
                     i64::try_from(card.read_set_summary.page_count).unwrap_or(i64::MAX),
                 ),
-                SqliteValue::Text(read_set_top_k_string(&card.read_set_summary.into())),
+                SqliteValue::Text(read_set_top_k_string(&card.read_set_summary).into()),
                 SqliteValue::Integer(to_i64_clamped(card.read_set_summary.bloom_fingerprint)),
-                SqliteValue::Text(join_page_numbers(&card.write_set.into())),
+                SqliteValue::Text(join_page_numbers(&card.write_set).into()),
                 SqliteValue::Text(card.rationale.clone().into()),
                 SqliteValue::Integer(to_i64_clamped(card.timestamp_unix_ns)),
                 SqliteValue::Integer(to_i64_clamped(card.decision_epoch)),
@@ -30731,9 +30856,15 @@ fn raptorq_repair_evidence_cards_to_rows(cards: &[WalFecRepairEvidenceCard]) -> 
                 SqliteValue::Integer(i64::from(card.validated_repair_symbols)),
                 SqliteValue::Integer(i64::from(card.required_symbols)),
                 SqliteValue::Integer(i64::from(card.available_symbols)),
-                SqliteValue::Text(hex_encode_blake3(card.witness.corrupted_hash_blake3.into())),
-                SqliteValue::Text(hex_encode_blake3(card.witness.repaired_hash_blake3.into())),
-                SqliteValue::Text(hex_encode_blake3(card.witness.expected_hash_blake3.into())),
+                SqliteValue::Text(
+                    hex_encode_blake3(card.witness.corrupted_hash_blake3.into()).into(),
+                ),
+                SqliteValue::Text(
+                    hex_encode_blake3(card.witness.repaired_hash_blake3.into()).into(),
+                ),
+                SqliteValue::Text(
+                    hex_encode_blake3(card.witness.expected_hash_blake3.into()).into(),
+                ),
                 SqliteValue::Integer(to_i64_clamped(card.repair_latency_ns)),
                 SqliteValue::Integer(i64::from(card.confidence_per_mille)),
                 SqliteValue::Text(card.severity_bucket.as_str().to_owned().into()),
@@ -31283,7 +31414,12 @@ fn sqlite_master_signature(row: &[SqliteValue]) -> Result<(String, String, Strin
             });
         }
     };
-    Ok((entry_type, name, tbl_name, root_page))
+    Ok((
+        entry_type,
+        name.to_string(),
+        tbl_name.to_string(),
+        root_page,
+    ))
 }
 
 fn format_master_signature(signature: &(String, String, String, i64)) -> String {
@@ -31295,7 +31431,7 @@ fn format_master_signature(signature: &(String, String, String, i64)) -> String 
 
 fn sqlite_master_sql_text(row: &[SqliteValue]) -> Result<Option<&str>> {
     match row.get(4) {
-        Some(SqliteValue::Text(sql)) => Ok(Some(sql.as_str())),
+        Some(SqliteValue::Text(sql)) => Ok(Some(sql.as_ref())),
         Some(SqliteValue::Null) | None => Ok(None),
         Some(other) => Err(FrankenError::DatabaseCorrupt {
             detail: format!("sqlite_master sql column has unexpected value {other:?}"),
@@ -34947,7 +35083,7 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
     } else if upper.contains("BLOB") || upper.is_empty() {
         match val {
             SqliteValue::Blob(_) => val,
-            SqliteValue::Text(s) => SqliteValue::Blob(s.into_bytes().into()),
+            SqliteValue::Text(s) => SqliteValue::Blob(s.as_bytes().to_vec().into()),
             SqliteValue::Integer(_) | SqliteValue::Float(_) => {
                 SqliteValue::Blob(val.to_text().into_bytes().into())
             }
@@ -35194,7 +35330,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 if from.is_empty() {
                     SqliteValue::Text(s.into())
                 } else {
-                    SqliteValue::Text(s.replace(&from, &to.into()))
+                    SqliteValue::Text(s.replace(&from, &to).into())
                 }
             } else {
                 SqliteValue::Null
@@ -35261,8 +35397,9 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 if let Some(chars_arg) = args.get(1) {
                     let chars: Vec<char> = sqlite_value_to_text(chars_arg).chars().collect();
                     SqliteValue::Text(
-                        s.trim_matches(|c: char| chars.contains(&c.into()))
-                            .to_owned(),
+                        s.trim_matches(|c: char| chars.contains(&c))
+                            .to_owned()
+                            .into(),
                     )
                 } else {
                     // C SQLite default: trim spaces only (not all Unicode whitespace).
@@ -35279,7 +35416,8 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                     let chars: Vec<char> = sqlite_value_to_text(chars_arg).chars().collect();
                     SqliteValue::Text(
                         s.trim_start_matches(|c: char| chars.contains(&c))
-                            .to_owned(),
+                            .to_owned()
+                            .into(),
                     )
                 } else {
                     SqliteValue::Text(s.trim_start_matches(' ').to_owned().into())
@@ -35294,8 +35432,9 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 if let Some(chars_arg) = args.get(1) {
                     let chars: Vec<char> = sqlite_value_to_text(chars_arg).chars().collect();
                     SqliteValue::Text(
-                        s.trim_end_matches(|c: char| chars.contains(&c.into()))
-                            .to_owned(),
+                        s.trim_end_matches(|c: char| chars.contains(&c))
+                            .to_owned()
+                            .into(),
                     )
                 } else {
                     SqliteValue::Text(s.trim_end_matches(' ').to_owned().into())
@@ -35308,7 +35447,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             Some(SqliteValue::Blob(b)) => {
                 use std::fmt::Write;
                 let mut hex = String::with_capacity(b.len() * 2);
-                for byte in b {
+                for &byte in b.iter() {
                     let _ = write!(hex, "{byte:02X}");
                 }
                 SqliteValue::Text(hex.into())
@@ -35328,11 +35467,13 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             Some(SqliteValue::Null) => SqliteValue::Text("NULL".to_owned().into()),
             Some(SqliteValue::Integer(n)) => SqliteValue::Text(n.to_string().into()),
             Some(v @ SqliteValue::Float(_)) => SqliteValue::Text(v.to_text().into()),
-            Some(SqliteValue::Text(s)) => SqliteValue::Text(format!("'{}'", s.replace('\'', "''"))),
+            Some(SqliteValue::Text(s)) => {
+                SqliteValue::Text(format!("'{}'", s.replace('\'', "''")).into())
+            }
             Some(SqliteValue::Blob(b)) => {
                 use std::fmt::Write;
                 let mut hex = String::with_capacity(b.len() * 2);
-                for byte in b {
+                for &byte in b.iter() {
                     let _ = write!(hex, "{byte:02X}");
                 }
                 SqliteValue::Text(format!("X'{hex}'").into())
@@ -35471,7 +35612,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                     .filter(|v| !matches!(v, SqliteValue::Null))
                     .map(sqlite_value_to_text)
                     .collect();
-                SqliteValue::Text(parts.join(&sep_str.into()))
+                SqliteValue::Text(parts.join(&sep_str).into())
             } else {
                 SqliteValue::Null
             }
@@ -64491,6 +64632,39 @@ mod pager_routing_tests {
         assert_eq!(
             profile.memory_autocommit_fast_path_begins, 1,
             "default concurrent :memory: autocommit writes should use the isolated memory fast path: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_prepared_insert_reuses_table_engine_after_first_execution() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_engine_reuse (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let insert_stmt = conn
+            .prepare("INSERT INTO prep_engine_reuse (id, val) VALUES (?1, ?2)")
+            .unwrap();
+
+        reset_hot_path_profile();
+        for id in 1_i64..=2 {
+            let affected = insert_stmt
+                .execute_with_params(&[
+                    SqliteValue::Integer(id),
+                    SqliteValue::Text(format!("v{id}")),
+                ])
+                .unwrap();
+            assert_eq!(affected, 1);
+        }
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.prepared_table_engine_fresh_allocs, 1,
+            "prepared table engine should allocate once on first execution: {profile:?}"
+        );
+        assert_eq!(
+            profile.prepared_table_engine_reuses, 1,
+            "prepared table engine should be reused on the second execution: {profile:?}"
         );
     }
 
