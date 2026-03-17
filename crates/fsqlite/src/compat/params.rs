@@ -104,7 +104,7 @@ impl From<u64> for ParamValue {
         // unsigned values exactly as TEXT rather than silently clamping.
         match i64::try_from(v) {
             Ok(i) => Self(SqliteValue::Integer(i)),
-            Err(_) => Self(SqliteValue::Text(v.to_string())),
+            Err(_) => Self(SqliteValue::Text(v.to_string().into())),
         }
     }
 }
@@ -114,7 +114,7 @@ impl From<usize> for ParamValue {
         // Keep parity with u64 handling to avoid lossy saturation.
         match i64::try_from(v) {
             Ok(i) => Self(SqliteValue::Integer(i)),
-            Err(_) => Self(SqliteValue::Text(v.to_string())),
+            Err(_) => Self(SqliteValue::Text(v.to_string().into())),
         }
     }
 }

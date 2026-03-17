@@ -184,12 +184,12 @@ fn bd_rjc_deterministic_hot_row_sum_and_integrity_probe() {
     let mut saw_table_t = false;
     for row in &schema_rows {
         let obj_type = match row.get(0) {
-            Some(SqliteValue::Text(value)) => value.clone(),
+            Some(SqliteValue::Text(value)) => value.to_string(),
             Some(other) => panic!("expected text sqlite_master.type, got {other:?}"),
             None => panic!("sqlite_master row missing type"),
         };
         let name = match row.get(1) {
-            Some(SqliteValue::Text(value)) => value.clone(),
+            Some(SqliteValue::Text(value)) => value.to_string(),
             Some(other) => panic!("expected text sqlite_master.name, got {other:?}"),
             None => panic!("sqlite_master row missing name"),
         };
@@ -221,7 +221,7 @@ fn query_single_integer(conn: &fsqlite::Connection, sql: &str) -> i64 {
 fn query_single_text(conn: &fsqlite::Connection, sql: &str) -> String {
     let row = conn.query_row(sql).expect("query text row");
     match row.get(0) {
-        Some(SqliteValue::Text(value)) => value.clone(),
+        Some(SqliteValue::Text(value)) => value.to_string(),
         Some(other) => panic!("expected text row value, got {other:?} for `{sql}`"),
         None => panic!("missing text row value for `{sql}`"),
     }

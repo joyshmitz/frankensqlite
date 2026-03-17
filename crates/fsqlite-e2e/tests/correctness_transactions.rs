@@ -109,8 +109,8 @@ fn fsqlite_query_values(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<SqlVal
                     fsqlite_types::SqliteValue::Null => SqlValue::Null,
                     fsqlite_types::SqliteValue::Integer(v) => SqlValue::Integer(*v),
                     fsqlite_types::SqliteValue::Float(v) => SqlValue::Real(*v),
-                    fsqlite_types::SqliteValue::Text(v) => SqlValue::Text(v.clone()),
-                    fsqlite_types::SqliteValue::Blob(v) => SqlValue::Blob(v.clone()),
+                    fsqlite_types::SqliteValue::Text(v) => SqlValue::Text(v.to_string()),
+                    fsqlite_types::SqliteValue::Blob(v) => SqlValue::Blob(v.to_vec()),
                 })
                 .collect()
         })

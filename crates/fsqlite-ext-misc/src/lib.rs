@@ -540,7 +540,7 @@ impl ScalarFunction for DecimalAddFunc {
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_add invoked");
         Ok(match decimal_add_impl(&a, &b) {
-            Some(result) => SqliteValue::Text(Arc::from(result.as_str())),
+            Some(result) => SqliteValue::Text(Arc::from(result)),
             None => SqliteValue::Null,
         })
     }
@@ -571,7 +571,7 @@ impl ScalarFunction for DecimalSubFunc {
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_sub invoked");
         Ok(match decimal_sub_impl(&a, &b) {
-            Some(result) => SqliteValue::Text(Arc::from(result.as_str())),
+            Some(result) => SqliteValue::Text(Arc::from(result)),
             None => SqliteValue::Null,
         })
     }
@@ -602,7 +602,7 @@ impl ScalarFunction for DecimalMulFunc {
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_mul invoked");
         Ok(match decimal_mul_impl(&a, &b) {
-            Some(result) => SqliteValue::Text(Arc::from(result.as_str())),
+            Some(result) => SqliteValue::Text(Arc::from(result)),
             None => SqliteValue::Null,
         })
     }
@@ -776,7 +776,7 @@ impl ScalarFunction for UuidFunc {
         }
         let uuid = generate_uuid_v4();
         debug!(uuid = %uuid, "uuid() generated");
-        Ok(SqliteValue::Text(Arc::from(uuid.as_str())))
+        Ok(SqliteValue::Text(Arc::from(uuid)))
     }
 
     fn is_deterministic(&self) -> bool {
@@ -808,13 +808,13 @@ impl ScalarFunction for UuidStrFunc {
         match &args[0] {
             SqliteValue::Blob(b) => {
                 let s = blob_to_uuid_str(b)?;
-                Ok(SqliteValue::Text(Arc::from(s.as_str())))
+                Ok(SqliteValue::Text(Arc::from(s)))
             }
             SqliteValue::Text(s) => {
                 // If already a string, normalize it
                 let blob = uuid_str_to_blob(s)?;
                 let normalized = blob_to_uuid_str(&blob)?;
-                Ok(SqliteValue::Text(Arc::from(normalized.as_str())))
+                Ok(SqliteValue::Text(Arc::from(normalized)))
             }
             _ => Err(FrankenError::internal(
                 "uuid_str: argument must be a blob or text",

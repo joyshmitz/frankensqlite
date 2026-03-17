@@ -1810,7 +1810,7 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
         let fs_stmt = fs_conn
             .prepare("SELECT * FROM bench WHERE name = ?1")
             .unwrap();
-        let target_name_param = [fsqlite::SqliteValue::Text(target_name)];
+        let target_name_param = [fsqlite::SqliteValue::Text(target_name.into())];
         let fs = measure(&format!("fs_idx_{count}"), 1, || {
             let _rows = fs_stmt.query_with_params(&target_name_param).unwrap();
         });

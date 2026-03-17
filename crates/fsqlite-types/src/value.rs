@@ -212,7 +212,7 @@ impl SqliteValue {
                 Self::Null | Self::Text(_) | Self::Blob(_) => self,
                 Self::Integer(_) | Self::Float(_) => {
                     let t = self.to_text();
-                    Self::Text(Arc::from(t.as_str()))
+                    Self::Text(Arc::from(t))
                 }
             },
             TypeAffinity::Numeric => match &self {
@@ -921,7 +921,9 @@ impl From<f64> for SqliteValue {
 
 impl From<String> for SqliteValue {
     fn from(s: String) -> Self {
-        Self::Text(Arc::from(s.as_str()))
+        // Arc::from(String) reuses the String's heap buffer via
+        // String → Box<str> → Arc<str>, avoiding a redundant copy.
+        Self::Text(Arc::from(s))
     }
 }
 
@@ -939,7 +941,9 @@ impl From<Arc<str>> for SqliteValue {
 
 impl From<Vec<u8>> for SqliteValue {
     fn from(b: Vec<u8>) -> Self {
-        Self::Blob(Arc::from(b.as_slice()))
+        // Arc::from(Vec<u8>) reuses the Vec's heap buffer via
+        // Vec → Box<[u8]> → Arc<[u8]>, avoiding a redundant copy.
+        Self::Blob(Arc::from(b))
     }
 }
 
@@ -1153,7 +1157,7 @@ mod tests {
 
     #[test]
     fn text_properties() {
-        let v = SqliteValue::Text("hello".to_owned());
+        let v = SqliteValue::Text(Arc::from("hello"));
         assert_eq!(v.as_text(), Some("hello"));
         assert_eq!(v.to_integer(), 0);
         assert_eq!(v.to_float(), 0.0);
@@ -1161,32 +1165,32 @@ mod tests {
 
     #[test]
     fn text_numeric_coercion() {
-        let v = SqliteValue::Text("123".to_owned());
+        let v = SqliteValue::Text(Arc::from("123"));
         assert_eq!(v.to_integer(), 123);
         assert_eq!(v.to_float(), 123.0);
 
-        let v = SqliteValue::Text("3.14".to_owned());
+        let v = SqliteValue::Text(Arc::from("3.14"));
         assert_eq!(v.to_integer(), 3);
         assert_eq!(v.to_float(), 3.14);
     }
 
     #[test]
     fn text_numeric_coercion_ignores_hex_text_prefixes() {
-        let v = SqliteValue::Text("0x10".to_owned());
+        let v = SqliteValue::Text(Arc::from("0x10"));
         assert_eq!(v.to_integer(), 0);
         assert_eq!(v.to_float(), 0.0);
 
-        let v = SqliteValue::Blob(b"0x10".to_vec());
+        let v = SqliteValue::Blob(Arc::from(b"0x10".as_slice()));
         assert_eq!(v.to_integer(), 0);
         assert_eq!(v.to_float(), 0.0);
     }
 
     #[test]
     fn test_integer_numeric_type_uses_sqlite_prefix_rules() {
-        assert!(SqliteValue::Text("123abc".to_owned()).is_integer_numeric_type());
-        assert!(SqliteValue::Blob(b"123a".to_vec()).is_integer_numeric_type());
-        assert!(!SqliteValue::Text("1.5e2abc".to_owned()).is_integer_numeric_type());
-        assert!(!SqliteValue::Text("abc".to_owned()).is_integer_numeric_type());
+        assert!(SqliteValue::Text(Arc::from("123abc")).is_integer_numeric_type());
+        assert!(SqliteValue::Blob(Arc::from(b"123a".as_slice())).is_integer_numeric_type());
+        assert!(!SqliteValue::Text(Arc::from("1.5e2abc")).is_integer_numeric_type());
+        assert!(!SqliteValue::Text(Arc::from("abc")).is_integer_numeric_type());
     }
 
     #[test]
@@ -1199,14 +1203,14 @@ mod tests {
 
     #[test]
     fn test_sqlite_value_text_to_integer_coercion() {
-        let text_value = SqliteValue::Text("123".to_owned());
+        let text_value = SqliteValue::Text(Arc::from("123"));
         let coerced = text_value.apply_affinity(TypeAffinity::Integer);
         assert_eq!(coerced, SqliteValue::Integer(123));
     }
 
     #[test]
     fn blob_properties() {
-        let v = SqliteValue::Blob(vec![0xDE, 0xAD]);
+        let v = SqliteValue::Blob(Arc::from([0xDE, 0xAD].as_slice()));
         assert_eq!(v.as_blob(), Some(&[0xDE, 0xAD][..]));
         assert_eq!(v.to_integer(), 0);
         assert_eq!(v.to_float(), 0.0);
@@ -1221,16 +1225,16 @@ mod tests {
         assert_eq!(SqliteValue::Integer(42).to_string(), "42");
         assert_eq!(SqliteValue::Integer(-1).to_string(), "-1");
         assert_eq!(SqliteValue::Float(1.5).to_string(), "1.5");
-        assert_eq!(SqliteValue::Text("hi".to_owned()).to_string(), "'hi'");
-        assert_eq!(SqliteValue::Blob(vec![0xCA, 0xFE]).to_string(), "X'CAFE'");
+        assert_eq!(SqliteValue::Text(Arc::from("hi")).to_string(), "'hi'");
+        assert_eq!(SqliteValue::Blob(Arc::from([0xCA, 0xFE].as_slice())).to_string(), "X'CAFE'");
     }
 
     #[test]
     fn sort_order_null_first() {
         let null = SqliteValue::Null;
         let int = SqliteValue::Integer(0);
-        let text = SqliteValue::Text(String::new());
-        let blob = SqliteValue::Blob(vec![]);
+        let text = SqliteValue::Text(Arc::from(""));
+        let blob = SqliteValue::Blob(Arc::from(&[] as &[u8]));
 
         assert!(null < int);
         assert!(int < text);
@@ -1323,10 +1327,10 @@ mod tests {
         assert_eq!(SqliteValue::Integer(0).affinity(), TypeAffinity::Integer);
         assert_eq!(SqliteValue::Float(0.0).affinity(), TypeAffinity::Real);
         assert_eq!(
-            SqliteValue::Text(String::new()).affinity(),
+            SqliteValue::Text(Arc::from("")).affinity(),
             TypeAffinity::Text
         );
-        assert_eq!(SqliteValue::Blob(vec![]).affinity(), TypeAffinity::Blob);
+        assert_eq!(SqliteValue::Blob(Arc::from(&[] as &[u8])).affinity(), TypeAffinity::Blob);
     }
 
     #[test]
@@ -1352,7 +1356,7 @@ mod tests {
             StorageClass::Text
         );
         assert_eq!(
-            SqliteValue::Blob(vec![1]).storage_class(),
+            SqliteValue::Blob(Arc::from([1u8].as_slice())).storage_class(),
             StorageClass::Blob
         );
     }
@@ -1426,23 +1430,23 @@ mod tests {
     #[test]
     fn test_cast_to_numeric_uses_sqlite_cast_rules() {
         assert_eq!(
-            SqliteValue::Text("123abc".into()).cast_to_numeric(),
+            SqliteValue::Text(Arc::from("123abc")).cast_to_numeric(),
             SqliteValue::Integer(123)
         );
         assert_eq!(
-            SqliteValue::Text("1.5e2abc".into()).cast_to_numeric(),
+            SqliteValue::Text(Arc::from("1.5e2abc")).cast_to_numeric(),
             SqliteValue::Integer(150)
         );
         assert_eq!(
-            SqliteValue::Text("abc".into()).cast_to_numeric(),
+            SqliteValue::Text(Arc::from("abc")).cast_to_numeric(),
             SqliteValue::Integer(0)
         );
         assert_eq!(
-            SqliteValue::Blob(b"123a".to_vec()).cast_to_numeric(),
+            SqliteValue::Blob(Arc::from(b"123a".as_slice())).cast_to_numeric(),
             SqliteValue::Integer(123)
         );
 
-        match SqliteValue::Text("1e999".into()).cast_to_numeric() {
+        match SqliteValue::Text(Arc::from("1e999")).cast_to_numeric() {
             SqliteValue::Float(value) => assert!(value.is_infinite() && value.is_sign_positive()),
             other => panic!("expected +inf REAL from NUMERIC cast, got {other:?}"),
         }
@@ -1473,7 +1477,7 @@ mod tests {
         assert!(val.validate_strict(StrictColumnType::Text).is_ok());
 
         // BLOB into BLOB column: ok.
-        let val = SqliteValue::Blob(vec![1, 2, 3]);
+        let val = SqliteValue::Blob(Arc::from([1u8, 2, 3].as_slice()));
         assert!(val.validate_strict(StrictColumnType::Blob).is_ok());
 
         // NULL into any STRICT column: ok (nullability enforced separately).
@@ -1514,7 +1518,7 @@ mod tests {
 
         // BLOB into TEXT column: rejected.
         assert!(
-            SqliteValue::Blob(vec![1])
+            SqliteValue::Blob(Arc::from([1u8].as_slice()))
                 .validate_strict(StrictColumnType::Text)
                 .is_err()
         );
@@ -1573,7 +1577,7 @@ mod tests {
             SqliteValue::Integer(42),
             SqliteValue::Float(3.14),
             SqliteValue::Text("hello".into()),
-            SqliteValue::Blob(vec![0xDE, 0xAD]),
+            SqliteValue::Blob(Arc::from([0xDE, 0xAD].as_slice())),
         ];
         let affinities = [
             TypeAffinity::Integer,
@@ -1808,7 +1812,7 @@ mod tests {
 
     #[test]
     fn test_empty_string_is_not_null() {
-        let empty = SqliteValue::Text(String::new());
+        let empty = SqliteValue::Text(Arc::from(""));
         // '' IS NULL → false.
         assert!(!empty.is_null());
         // '' IS NOT NULL → true (expressed as !is_null).
@@ -1819,13 +1823,13 @@ mod tests {
 
     #[test]
     fn test_length_empty_string_zero() {
-        let empty = SqliteValue::Text(String::new());
+        let empty = SqliteValue::Text(Arc::from(""));
         assert_eq!(empty.sql_length(), Some(0));
     }
 
     #[test]
     fn test_typeof_empty_string_text() {
-        let empty = SqliteValue::Text(String::new());
+        let empty = SqliteValue::Text(Arc::from(""));
         assert_eq!(empty.typeof_str(), "text");
         // NULL has typeof "null".
         assert_eq!(SqliteValue::Null.typeof_str(), "null");
@@ -1833,8 +1837,8 @@ mod tests {
 
     #[test]
     fn test_empty_string_comparisons() {
-        let empty1 = SqliteValue::Text(String::new());
-        let empty2 = SqliteValue::Text(String::new());
+        let empty1 = SqliteValue::Text(Arc::from(""));
+        let empty2 = SqliteValue::Text(Arc::from(""));
         // '' = '' → true.
         assert_eq!(empty1.partial_cmp(&empty2), Some(std::cmp::Ordering::Equal));
 
@@ -1851,7 +1855,7 @@ mod tests {
         assert_eq!(SqliteValue::Integer(0).typeof_str(), "integer");
         assert_eq!(SqliteValue::Float(0.0).typeof_str(), "real");
         assert_eq!(SqliteValue::Text("x".into()).typeof_str(), "text");
-        assert_eq!(SqliteValue::Blob(vec![]).typeof_str(), "blob");
+        assert_eq!(SqliteValue::Blob(Arc::from(&[] as &[u8])).typeof_str(), "blob");
     }
 
     #[test]
@@ -1860,9 +1864,9 @@ mod tests {
         assert_eq!(SqliteValue::Null.sql_length(), None);
         // TEXT → character count.
         assert_eq!(SqliteValue::Text("hello".into()).sql_length(), Some(5));
-        assert_eq!(SqliteValue::Text(String::new()).sql_length(), Some(0));
+        assert_eq!(SqliteValue::Text(Arc::from("")).sql_length(), Some(0));
         // BLOB → byte count.
-        assert_eq!(SqliteValue::Blob(vec![1, 2, 3]).sql_length(), Some(3));
+        assert_eq!(SqliteValue::Blob(Arc::from([1u8, 2, 3].as_slice())).sql_length(), Some(3));
         // INTEGER → length of text representation.
         assert_eq!(SqliteValue::Integer(42).sql_length(), Some(2));
         // REAL → length of text representation.

@@ -67,8 +67,8 @@ fn runtime_mode_allows_same_query_path() {
         )
         .expect("runtime mode should allow fallback query");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
-    assert_eq!(rows[0].values()[1], SqliteValue::Text("fruit".to_owned()));
+    assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+    assert_eq!(rows[0].values()[1], SqliteValue::Text("fruit".into()));
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn mode_pragmas_report_expected_state() {
         .expect("query backend_kind");
     assert_eq!(
         backend_kind_rows[0].values()[0],
-        SqliteValue::Text("memory".to_owned()),
+        SqliteValue::Text("memory".into()),
         "in-memory connection must report memory backend_kind"
     );
 
@@ -106,7 +106,7 @@ fn mode_pragmas_report_expected_state() {
         .expect("query backend_mode");
     assert_eq!(
         backend_mode_rows[0].values()[0],
-        SqliteValue::Text("parity_cert".to_owned()),
+        SqliteValue::Text("parity_cert".into()),
         "backend_mode must reflect default parity_cert mode"
     );
 }

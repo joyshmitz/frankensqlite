@@ -656,7 +656,7 @@ fn query_pragma_text(conn: &Connection, pragma: &str) -> E2eResult<String> {
         )));
     };
     match value {
-        SqliteValue::Text(value) => Ok(value.clone()),
+        SqliteValue::Text(value) => Ok(value.to_string()),
         SqliteValue::Integer(value) => Ok(value.to_string()),
         other => Err(E2eError::Fsqlite(format!(
             "query `{pragma}` returned non-text pragma value: {other:?}"
@@ -1957,7 +1957,7 @@ fn consume_i64_literal(input: &mut &str) -> Option<i64> {
 
 fn consume_simple_sql_literal(input: &mut &str) -> Option<SqliteValue> {
     if let Some(text) = consume_single_quoted_text_literal(input) {
-        return Some(SqliteValue::Text(text));
+        return Some(SqliteValue::Text(text.into()));
     }
     if consume_ascii_keyword(input, "NULL") {
         return Some(SqliteValue::Null);
@@ -2160,7 +2160,7 @@ fn parse_value(s: &str) -> SqliteValue {
             return SqliteValue::Float(f);
         }
     }
-    SqliteValue::Text(s.to_owned())
+    SqliteValue::Text(s.to_owned().into())
 }
 
 fn classify_fsqlite_error_as_batch(err: FrankenError) -> BatchError {
@@ -2509,7 +2509,7 @@ mod tests {
             params,
             vec![
                 SqliteValue::Integer(7),
-                SqliteValue::Text("active".to_owned()),
+                SqliteValue::Text("active".into()),
                 SqliteValue::Integer(3600),
             ]
         );
@@ -3052,7 +3052,7 @@ mod tests {
         assert_eq!(parse_value("42"), SqliteValue::Integer(42));
         assert_eq!(parse_value("-7"), SqliteValue::Integer(-7));
         assert_eq!(parse_value("3.14"), SqliteValue::Float(3.14));
-        assert_eq!(parse_value("hello"), SqliteValue::Text("hello".to_owned()));
+        assert_eq!(parse_value("hello"), SqliteValue::Text("hello".into()));
     }
 
     #[test]

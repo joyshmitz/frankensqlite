@@ -203,7 +203,7 @@ fn test_csqlite_writes_fsqlite_reads() {
         };
 
         assert_eq!(id, 50);
-        assert_eq!(name, "name_50");
+        assert_eq!(name.as_ref(), "name_50");
         assert!((val - 100.0).abs() < f64::EPSILON);
         compat_log_kv!(
             "csqlite→fsqlite",

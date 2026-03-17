@@ -101,7 +101,7 @@ impl FromSqliteValue for f64 {
 impl FromSqliteValue for String {
     fn from_sqlite_value(val: &SqliteValue) -> Result<Self, FrankenError> {
         match val {
-            SqliteValue::Text(s) => Ok(s.clone()),
+            SqliteValue::Text(s) => Ok(s.to_string()),
             other => Err(FrankenError::TypeMismatch {
                 expected: "text".into(),
                 actual: other.typeof_str().into(),
@@ -113,7 +113,7 @@ impl FromSqliteValue for String {
 impl FromSqliteValue for Vec<u8> {
     fn from_sqlite_value(val: &SqliteValue) -> Result<Self, FrankenError> {
         match val {
-            SqliteValue::Blob(b) => Ok(b.clone()),
+            SqliteValue::Blob(b) => Ok(b.to_vec()),
             other => Err(FrankenError::TypeMismatch {
                 expected: "blob".into(),
                 actual: other.typeof_str().into(),

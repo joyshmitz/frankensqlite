@@ -149,7 +149,7 @@ fn changeset_value_json(value: &ChangesetValue) -> serde_json::Value {
         ChangesetValue::Real(value) => json!({ "type": "real", "value": value }),
         ChangesetValue::Text(value) => json!({ "type": "text", "value": value }),
         ChangesetValue::Blob(value) => {
-            json!({ "type": "blob", "hex": format_hex(value.as_slice()) })
+            json!({ "type": "blob", "hex": format_hex(value.as_ref()) })
         }
     }
 }
@@ -161,7 +161,7 @@ fn sqlite_value_json(value: &SqliteValue) -> serde_json::Value {
         SqliteValue::Float(value) => json!({ "type": "real", "value": value }),
         SqliteValue::Text(value) => json!({ "type": "text", "value": value }),
         SqliteValue::Blob(value) => {
-            json!({ "type": "blob", "hex": format_hex(value.as_slice()) })
+            json!({ "type": "blob", "hex": format_hex(value.as_ref()) })
         }
     }
 }
@@ -317,12 +317,12 @@ fn build_manual_conflict_target() -> SimpleTarget {
         vec![
             vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("eve".to_owned()),
+                SqliteValue::Text("eve".into()),
                 SqliteValue::Integer(5),
             ],
             vec![
                 SqliteValue::Integer(2),
-                SqliteValue::Text("robert".to_owned()),
+                SqliteValue::Text("robert".into()),
                 SqliteValue::Integer(60),
             ],
         ],

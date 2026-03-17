@@ -432,7 +432,7 @@ fn js_value_to_sqlite_value(value: &JsValue) -> Result<SqliteValue, JsValue> {
         return Ok(SqliteValue::Null);
     }
     if let Some(text) = value.as_string() {
-        return Ok(SqliteValue::Text(text));
+        return Ok(SqliteValue::Text(std::sync::Arc::from(text.as_str())));
     }
     if let Some(boolean) = value.as_bool() {
         return Ok(SqliteValue::Integer(i64::from(boolean)));
@@ -442,7 +442,7 @@ fn js_value_to_sqlite_value(value: &JsValue) -> Result<SqliteValue, JsValue> {
         return parse_bigint_sqlite_value(&bigint_text).map_err(franken_error_to_js);
     }
     if let Some(bytes) = value.dyn_ref::<Uint8Array>() {
-        return Ok(SqliteValue::Blob(bytes.to_vec()));
+        return Ok(SqliteValue::Blob(std::sync::Arc::from(bytes.to_vec().as_slice())));
     }
     if let Some(date) = value.dyn_ref::<Date>() {
         return date_to_sqlite_value(date).map_err(franken_error_to_js);
@@ -470,7 +470,7 @@ fn sqlite_value_to_js(value: &SqliteValue) -> Result<JsValue, FrankenError> {
         }
         SqliteValue::Float(number) => sqlite_float_to_js(*number),
         SqliteValue::Text(text) => Ok(JsValue::from_str(text)),
-        SqliteValue::Blob(bytes) => Ok(Uint8Array::from(bytes.as_slice()).into()),
+        SqliteValue::Blob(bytes) => Ok(Uint8Array::from(&**bytes).into()),
     }
 }
 
@@ -626,7 +626,7 @@ fn date_to_sqlite_value(date: &Date) -> Result<SqliteValue, FrankenError> {
             actual: "invalid Date".to_owned(),
         });
     }
-    Ok(SqliteValue::Text(String::from(date.to_iso_string())))
+    Ok(SqliteValue::Text(std::sync::Arc::from(String::from(date.to_iso_string()).as_str())))
 }
 
 fn describe_js_value(value: &JsValue) -> String {

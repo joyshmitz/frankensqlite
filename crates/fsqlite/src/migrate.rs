@@ -194,7 +194,7 @@ impl MigrationRunner {
             "INSERT INTO _schema_migrations (version, name) VALUES (?1, ?2);",
             &[
                 SqliteValue::Integer(migration.version),
-                SqliteValue::Text(migration.name.to_owned()),
+                SqliteValue::Text(migration.name.to_owned().into()),
             ],
         )?;
         Ok(())

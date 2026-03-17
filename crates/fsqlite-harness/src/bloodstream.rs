@@ -561,7 +561,7 @@ fn decode_vdbe_literal_load(op: &VdbeOp) -> Result<(i32, SqliteValue), Different
             }),
         },
         Opcode::String8 => match &op.p4 {
-            P4::Str(value) => Ok((op.p2, SqliteValue::Text(value.clone()))),
+            P4::Str(value) => Ok((op.p2, SqliteValue::Text(value.clone().into()))),
             _ => Err(DifferentialPlanError::UnsupportedProgram {
                 detail: "String8 opcode missing P4::Str payload".to_owned(),
             }),

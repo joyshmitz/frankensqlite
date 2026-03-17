@@ -1595,7 +1595,7 @@ mod tests {
     }
 
     fn json_value(vertices: &[Point]) -> SqliteValue {
-        SqliteValue::Text(Arc::from(geopoly_json(vertices).as_str()))
+        SqliteValue::Text(Arc::from(geopoly_json(vertices)))
     }
 
     fn blob_value(vertices: &[Point]) -> SqliteValue {
@@ -2105,7 +2105,7 @@ mod tests {
             .expect("json wrapper should succeed");
         assert_eq!(
             value,
-            SqliteValue::Text(Arc::from(geopoly_json(&polygon).as_str()))
+            SqliteValue::Text(Arc::from(geopoly_json(&polygon)))
         );
     }
 

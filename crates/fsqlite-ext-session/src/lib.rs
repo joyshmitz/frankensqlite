@@ -215,7 +215,7 @@ impl ChangesetValue {
                     return None;
                 }
                 let s = std::str::from_utf8(&data[offset..end]).ok()?;
-                Some((Self::Text(s.to_owned()), end - pos))
+                Some((Self::Text(s.into()), end - pos))
             }
             VAL_BLOB => {
                 let (len, vlen) = read_varint(&data[offset..])?;
@@ -1481,13 +1481,13 @@ mod tests {
     #[test]
     fn test_changeset_value_text() {
         let mut buf = Vec::new();
-        ChangesetValue::Text("hello".to_owned()).encode(&mut buf);
+        ChangesetValue::Text("hello".into()).encode(&mut buf);
         assert_eq!(buf[0], VAL_TEXT);
         // varint(5) = 0x05, then b"hello"
         assert_eq!(buf[1], 5);
         assert_eq!(&buf[2..], b"hello");
         let (val, consumed) = ChangesetValue::decode(&buf, 0).unwrap();
-        assert_eq!(val, ChangesetValue::Text("hello".to_owned()));
+        assert_eq!(val, ChangesetValue::Text("hello".into()));
         assert_eq!(consumed, 7); // 1 type + 1 varint + 5 data
     }
 
@@ -1596,7 +1596,7 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".to_owned()),
+                ChangesetValue::Text("a".into()),
             ],
         );
         let cs = session.changeset();
@@ -1613,7 +1613,7 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".to_owned()),
+                ChangesetValue::Text("a".into()),
             ],
         );
         let cs = session.changeset();
@@ -1628,19 +1628,19 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".to_owned()),
+                ChangesetValue::Text("a".into()),
             ],
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("b".to_owned()),
+                ChangesetValue::Text("b".into()),
             ],
         );
         let cs = session.changeset();
         let row = &cs.tables[0].rows[0];
         assert_eq!(row.op, ChangeOp::Update);
-        assert_eq!(row.old_values[1], ChangesetValue::Text("a".to_owned()));
+        assert_eq!(row.old_values[1], ChangesetValue::Text("a".into()));
         assert_eq!(row.new_values[0], ChangesetValue::Undefined);
-        assert_eq!(row.new_values[1], ChangesetValue::Text("b".to_owned()));
+        assert_eq!(row.new_values[1], ChangesetValue::Text("b".into()));
     }
 
     #[test]
@@ -1668,7 +1668,7 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("x".to_owned()),
+                ChangesetValue::Text("x".into()),
                 ChangesetValue::Integer(2),
             ],
         );
@@ -1688,7 +1688,7 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("hi".to_owned()),
+                ChangesetValue::Text("hi".into()),
             ],
         );
         let encoded = session.changeset().encode();
@@ -1709,7 +1709,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
         );
@@ -1717,7 +1717,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Text("bob".into()),
                 ChangesetValue::Integer(50),
             ],
         );
@@ -1725,7 +1725,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Text("bob".into()),
                 ChangesetValue::Integer(50),
             ],
             vec![
@@ -1738,7 +1738,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
         );
@@ -1751,7 +1751,7 @@ mod tests {
             changeset.tables[0].rows[0].new_values,
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Text("bob".into()),
                 ChangesetValue::Integer(75),
             ]
         );
@@ -1765,7 +1765,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
         );
@@ -1773,7 +1773,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
             vec![
@@ -1786,12 +1786,12 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Text("ally".into()),
                 ChangesetValue::Undefined,
             ],
         );
@@ -1804,7 +1804,7 @@ mod tests {
             changeset.tables[0].rows[0].new_values,
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Text("ally".into()),
                 ChangesetValue::Integer(100),
             ]
         );
@@ -1818,12 +1818,12 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Text("ally".into()),
                 ChangesetValue::Undefined,
             ],
         );
@@ -1836,7 +1836,7 @@ mod tests {
             changeset.tables[0].rows[0].old_values,
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ]
         );
@@ -1845,7 +1845,7 @@ mod tests {
             changeset.tables[0].rows[1].new_values,
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Text("ally".into()),
                 ChangesetValue::Integer(100),
             ]
         );
@@ -1859,12 +1859,12 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Text("ally".into()),
                 ChangesetValue::Undefined,
             ],
         );
@@ -1872,7 +1872,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Text("ally".into()),
                 ChangesetValue::Integer(100),
             ],
         );
@@ -1885,7 +1885,7 @@ mod tests {
             changeset.tables[0].rows[0].old_values,
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ]
         );
@@ -1900,12 +1900,12 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Text("ally".into()),
             ],
         );
     }
@@ -1919,7 +1919,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
             ],
         );
     }
@@ -1932,11 +1932,11 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
             ],
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("alicia".to_owned()),
+                ChangesetValue::Text("alicia".into()),
             ],
         );
 
@@ -1948,7 +1948,7 @@ mod tests {
             changeset.tables[0].rows[0].old_values,
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
             ]
         );
         assert_eq!(changeset.tables[0].rows[1].op, ChangeOp::Insert);
@@ -1956,7 +1956,7 @@ mod tests {
             changeset.tables[0].rows[1].new_values,
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("alicia".to_owned()),
+                ChangesetValue::Text("alicia".into()),
             ]
         );
     }
@@ -1969,25 +1969,25 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
             ],
         );
         session.record_update(
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
             ],
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("alicia".to_owned()),
+                ChangesetValue::Text("alicia".into()),
             ],
         );
         session.record_delete(
             "accounts",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("alicia".to_owned()),
+                ChangesetValue::Text("alicia".into()),
             ],
         );
 
@@ -2013,7 +2013,7 @@ mod tests {
             "users",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("Alice".to_owned()),
+                ChangesetValue::Text("Alice".into()),
                 ChangesetValue::Integer(30),
             ],
         );
@@ -2021,7 +2021,7 @@ mod tests {
             "users",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("Bob".to_owned()),
+                ChangesetValue::Text("Bob".into()),
                 ChangesetValue::Integer(25),
             ],
         );
@@ -2029,7 +2029,7 @@ mod tests {
             "users",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("Alice".to_owned()),
+                ChangesetValue::Text("Alice".into()),
                 ChangesetValue::Integer(30),
             ],
         );
@@ -2037,12 +2037,12 @@ mod tests {
             "users",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("Bob".to_owned()),
+                ChangesetValue::Text("Bob".into()),
                 ChangesetValue::Integer(25),
             ],
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("Robert".to_owned()),
+                ChangesetValue::Text("Robert".into()),
                 ChangesetValue::Undefined,
             ],
         );
@@ -2089,19 +2089,19 @@ mod tests {
             op: ChangeOp::Update,
             old_values: vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("old".to_owned()),
+                ChangesetValue::Text("old".into()),
             ],
             new_values: vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("new".to_owned()),
+                ChangesetValue::Text("new".into()),
             ],
         };
         let inv = row.invert();
         assert_eq!(inv.op, ChangeOp::Update);
         assert_eq!(inv.old_values[0], ChangesetValue::Undefined);
-        assert_eq!(inv.old_values[1], ChangesetValue::Text("new".to_owned()));
+        assert_eq!(inv.old_values[1], ChangesetValue::Text("new".into()));
         assert_eq!(inv.new_values[0], ChangesetValue::Integer(1));
-        assert_eq!(inv.new_values[1], ChangesetValue::Text("old".to_owned()));
+        assert_eq!(inv.new_values[1], ChangesetValue::Text("old".into()));
     }
 
     // -----------------------------------------------------------------------
@@ -2153,12 +2153,12 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("old_name".to_owned()),
+                ChangesetValue::Text("old_name".into()),
                 ChangesetValue::Integer(100),
             ],
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Text("new_name".into()),
                 ChangesetValue::Undefined,
             ],
         );
@@ -2180,12 +2180,12 @@ mod tests {
             op: ChangeOp::Update,
             old_values: vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("old_name".to_owned()),
+                ChangesetValue::Text("old_name".into()),
                 ChangesetValue::Integer(100),
             ],
             new_values: vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Text("new_name".into()),
                 ChangesetValue::Undefined,
             ],
         };
@@ -2195,7 +2195,7 @@ mod tests {
 
         let mut expected = vec![OP_UPDATE, 0x00];
         ChangesetValue::Integer(1).encode(&mut expected);
-        ChangesetValue::Text("new_name".to_owned()).encode(&mut expected);
+        ChangesetValue::Text("new_name".into()).encode(&mut expected);
         ChangesetValue::Undefined.encode(&mut expected);
         assert_eq!(patchset, expected);
     }
@@ -2208,7 +2208,7 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".to_owned()),
+                ChangesetValue::Text("a".into()),
             ],
         );
         let changeset_bytes = session.changeset().encode();
@@ -2226,12 +2226,12 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("old_name".to_owned()),
+                ChangesetValue::Text("old_name".into()),
                 ChangesetValue::Integer(100),
             ],
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Text("new_name".into()),
                 ChangesetValue::Undefined,
             ],
         );
@@ -2253,7 +2253,7 @@ mod tests {
             row.new_values,
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Text("new_name".into()),
                 ChangesetValue::Undefined,
             ]
         );
@@ -2267,12 +2267,12 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("old_name".to_owned()),
+                ChangesetValue::Text("old_name".into()),
                 ChangesetValue::Integer(100),
             ],
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Text("new_name".into()),
                 ChangesetValue::Undefined,
             ],
         );
@@ -2290,7 +2290,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
         );
@@ -2298,7 +2298,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Text("bob".into()),
                 ChangesetValue::Integer(50),
             ],
         );
@@ -2306,7 +2306,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Text("bob".into()),
                 ChangesetValue::Integer(50),
             ],
             vec![
@@ -2319,7 +2319,7 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
                 ChangesetValue::Integer(100),
             ],
         );
@@ -2346,7 +2346,7 @@ mod tests {
             changeset_target.tables["accounts"],
             vec![vec![
                 SqliteValue::Integer(2),
-                SqliteValue::Text("bob".to_owned()),
+                SqliteValue::Text("bob".into()),
                 SqliteValue::Integer(75),
             ]]
         );
@@ -2370,7 +2370,7 @@ mod tests {
                     old_values: Vec::new(),
                     new_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("hello".to_owned()),
+                        ChangesetValue::Text("hello".into()),
                     ],
                 }],
             }],
@@ -2389,7 +2389,7 @@ mod tests {
             target.tables["t"],
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("hello".to_owned())
+                SqliteValue::Text("hello".into())
             ]]
         );
     }
@@ -2401,7 +2401,7 @@ mod tests {
             "t".to_owned(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("hello".to_owned()),
+                SqliteValue::Text("hello".into()),
             ]],
         );
 
@@ -2416,7 +2416,7 @@ mod tests {
                     op: ChangeOp::Delete,
                     old_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("hello".to_owned()),
+                        ChangesetValue::Text("hello".into()),
                     ],
                     new_values: Vec::new(),
                 }],
@@ -2441,7 +2441,7 @@ mod tests {
             "t".to_owned(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("old".to_owned()),
+                SqliteValue::Text("old".into()),
             ]],
         );
 
@@ -2456,11 +2456,11 @@ mod tests {
                     op: ChangeOp::Update,
                     old_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("old".to_owned()),
+                        ChangesetValue::Text("old".into()),
                     ],
                     new_values: vec![
                         ChangesetValue::Undefined,
-                        ChangesetValue::Text("new".to_owned()),
+                        ChangesetValue::Text("new".into()),
                     ],
                 }],
             }],
@@ -2476,7 +2476,7 @@ mod tests {
         );
         assert_eq!(
             target.tables["t"][0],
-            vec![SqliteValue::Integer(1), SqliteValue::Text("new".to_owned())]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("new".into())]
         );
     }
 
@@ -2523,7 +2523,7 @@ mod tests {
             "t".to_owned(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("actual".to_owned()),
+                SqliteValue::Text("actual".into()),
             ]],
         );
 
@@ -2538,7 +2538,7 @@ mod tests {
                     op: ChangeOp::Delete,
                     old_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("expected".to_owned()),
+                        ChangesetValue::Text("expected".into()),
                     ],
                     new_values: Vec::new(),
                 }],
@@ -2631,7 +2631,7 @@ mod tests {
             "t".to_owned(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("old".to_owned()),
+                SqliteValue::Text("old".into()),
             ]],
         );
 
@@ -2647,7 +2647,7 @@ mod tests {
                     old_values: Vec::new(),
                     new_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("replaced".to_owned()),
+                        ChangesetValue::Text("replaced".into()),
                     ],
                 }],
             }],
@@ -2665,7 +2665,7 @@ mod tests {
             target.tables["t"][0],
             vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("replaced".to_owned())
+                SqliteValue::Text("replaced".into())
             ]
         );
     }
@@ -2713,7 +2713,7 @@ mod tests {
             "users",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("Alice".to_owned()),
+                ChangesetValue::Text("Alice".into()),
                 ChangesetValue::Integer(30),
             ],
         );
@@ -2721,7 +2721,7 @@ mod tests {
             "users",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("Bob".to_owned()),
+                ChangesetValue::Text("Bob".into()),
                 ChangesetValue::Integer(25),
             ],
         );
@@ -2741,11 +2741,11 @@ mod tests {
         assert_eq!(target.tables["users"].len(), 2);
         assert_eq!(
             target.tables["users"][0][1],
-            SqliteValue::Text("Alice".to_owned())
+            SqliteValue::Text("Alice".into())
         );
         assert_eq!(
             target.tables["users"][1][1],
-            SqliteValue::Text("Bob".to_owned())
+            SqliteValue::Text("Bob".into())
         );
     }
 
@@ -2757,7 +2757,7 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".to_owned()),
+                ChangesetValue::Text("a".into()),
             ],
         );
 
@@ -2793,11 +2793,11 @@ mod tests {
             ChangesetValue::Real(1.5)
         );
         assert_eq!(
-            ChangesetValue::from_sqlite(&SqliteValue::Text("x".to_owned())),
-            ChangesetValue::Text("x".to_owned())
+            ChangesetValue::from_sqlite(&SqliteValue::Text("x".into())),
+            ChangesetValue::Text("x".into())
         );
         assert_eq!(
-            ChangesetValue::from_sqlite(&SqliteValue::Blob(vec![1, 2])),
+            ChangesetValue::from_sqlite(&SqliteValue::Blob(vec![1, 2].into())),
             ChangesetValue::Blob(vec![1, 2])
         );
     }
@@ -2815,12 +2815,12 @@ mod tests {
             SqliteValue::Float(2.5)
         );
         assert_eq!(
-            ChangesetValue::Text("hi".to_owned()).to_sqlite(),
-            SqliteValue::Text("hi".to_owned())
+            ChangesetValue::Text("hi".into()).to_sqlite(),
+            SqliteValue::Text("hi".into())
         );
         assert_eq!(
             ChangesetValue::Blob(vec![0xAB]).to_sqlite(),
-            SqliteValue::Blob(vec![0xAB])
+            SqliteValue::Blob(vec![0xAB].into())
         );
     }
 
@@ -2913,9 +2913,9 @@ mod tests {
     fn test_changeset_value_text_unicode() {
         let text = "\u{1F600}\u{1F4A9}\u{2603}"; // emoji + snowman
         let mut buf = Vec::new();
-        ChangesetValue::Text(text.to_owned()).encode(&mut buf);
+        ChangesetValue::Text(text.into()).encode(&mut buf);
         let (decoded, _) = ChangesetValue::decode(&buf, 0).unwrap();
-        assert_eq!(decoded, ChangesetValue::Text(text.to_owned()));
+        assert_eq!(decoded, ChangesetValue::Text(text.into()));
     }
 
     #[test]
@@ -2973,10 +2973,10 @@ mod tests {
             SqliteValue::Integer(0),
             SqliteValue::Integer(i64::MAX),
             SqliteValue::Float(3.14),
-            SqliteValue::Text(String::new()),
-            SqliteValue::Text("test".to_owned()),
-            SqliteValue::Blob(vec![]),
-            SqliteValue::Blob(vec![1, 2, 3]),
+            SqliteValue::Text("".into()),
+            SqliteValue::Text("test".into()),
+            SqliteValue::Blob(vec![].into()),
+            SqliteValue::Blob(vec![1, 2, 3].into()),
         ];
         for sv in &values {
             let cv = ChangesetValue::from_sqlite(sv);
@@ -3063,11 +3063,11 @@ mod tests {
             op: ChangeOp::Update,
             old_values: vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("old".to_owned()),
+                ChangesetValue::Text("old".into()),
             ],
             new_values: vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("new".to_owned()),
+                ChangesetValue::Text("new".into()),
             ],
         };
         let double_inverted = row.invert().invert();
@@ -3093,11 +3093,11 @@ mod tests {
                     op,
                     old_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("a".to_owned()),
+                        ChangesetValue::Text("a".into()),
                     ],
                     new_values: vec![
                         ChangesetValue::Undefined,
-                        ChangesetValue::Text("b".to_owned()),
+                        ChangesetValue::Text("b".into()),
                     ],
                 },
             };
@@ -3125,12 +3125,12 @@ mod tests {
             op: ChangeOp::Update,
             old_values: vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("old_name".to_owned()),
+                ChangesetValue::Text("old_name".into()),
                 ChangesetValue::Integer(100),
             ],
             new_values: vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Text("new_name".into()),
                 ChangesetValue::Undefined,
             ],
         };
@@ -3148,7 +3148,7 @@ mod tests {
             op: ChangeOp::Delete,
             old_values: vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".to_owned()),
+                ChangesetValue::Text("a".into()),
             ],
             new_values: Vec::new(),
         };
@@ -3179,7 +3179,7 @@ mod tests {
             "auto",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".to_owned()),
+                ChangesetValue::Text("a".into()),
             ],
         );
         let cs = session.changeset();
@@ -3194,25 +3194,25 @@ mod tests {
             "accounts",
             vec![
                 ChangesetValue::Null,
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
             ],
         );
         session.record_update(
             "accounts",
             vec![
                 ChangesetValue::Null,
-                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Text("alice".into()),
             ],
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("alice_2".to_owned()),
+                ChangesetValue::Text("alice_2".into()),
             ],
         );
         session.record_delete(
             "accounts",
             vec![
                 ChangesetValue::Null,
-                ChangesetValue::Text("alice_2".to_owned()),
+                ChangesetValue::Text("alice_2".into()),
             ],
         );
 
@@ -3267,25 +3267,25 @@ mod tests {
             "t",
             vec![
                 ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".to_owned()),
+                ChangesetValue::Text("a".into()),
             ],
         );
         session.record_delete(
             "t",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("b".to_owned()),
+                ChangesetValue::Text("b".into()),
             ],
         );
         session.record_update(
             "t",
             vec![
                 ChangesetValue::Integer(3),
-                ChangesetValue::Text("c".to_owned()),
+                ChangesetValue::Text("c".into()),
             ],
             vec![
                 ChangesetValue::Undefined,
-                ChangesetValue::Text("d".to_owned()),
+                ChangesetValue::Text("d".into()),
             ],
         );
 
@@ -3304,7 +3304,7 @@ mod tests {
             "b",
             vec![
                 ChangesetValue::Integer(2),
-                ChangesetValue::Text("x".to_owned()),
+                ChangesetValue::Text("x".into()),
             ],
         );
         session.record_delete("a", vec![ChangesetValue::Integer(3)]);
@@ -3326,7 +3326,7 @@ mod tests {
             "t".to_owned(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("actual".to_owned()),
+                SqliteValue::Text("actual".into()),
             ]],
         );
 
@@ -3341,11 +3341,11 @@ mod tests {
                     op: ChangeOp::Update,
                     old_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("expected".to_owned()),
+                        ChangesetValue::Text("expected".into()),
                     ],
                     new_values: vec![
                         ChangesetValue::Undefined,
-                        ChangesetValue::Text("new".to_owned()),
+                        ChangesetValue::Text("new".into()),
                     ],
                 }],
             }],
@@ -3361,7 +3361,7 @@ mod tests {
         );
         assert_eq!(
             target.tables["t"][0][1],
-            SqliteValue::Text("new".to_owned())
+            SqliteValue::Text("new".into())
         );
     }
 
@@ -3373,9 +3373,9 @@ mod tests {
             vec![
                 vec![
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".to_owned()),
+                    SqliteValue::Text("alice".into()),
                 ],
-                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())],
             ],
         );
 
@@ -3390,11 +3390,11 @@ mod tests {
                     op: ChangeOp::Update,
                     old_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("alice".to_owned()),
+                        ChangesetValue::Text("alice".into()),
                     ],
                     new_values: vec![
                         ChangesetValue::Integer(2),
-                        ChangesetValue::Text("ally".to_owned()),
+                        ChangesetValue::Text("ally".into()),
                     ],
                 }],
             }],
@@ -3418,9 +3418,9 @@ mod tests {
             vec![
                 vec![
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".to_owned()),
+                    SqliteValue::Text("alice".into()),
                 ],
-                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned()),],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into()),],
             ]
         );
     }
@@ -3433,9 +3433,9 @@ mod tests {
             vec![
                 vec![
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".to_owned()),
+                    SqliteValue::Text("alice".into()),
                 ],
-                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())],
             ],
         );
 
@@ -3450,11 +3450,11 @@ mod tests {
                     op: ChangeOp::Update,
                     old_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("alice".to_owned()),
+                        ChangesetValue::Text("alice".into()),
                     ],
                     new_values: vec![
                         ChangesetValue::Integer(2),
-                        ChangesetValue::Text("ally".to_owned()),
+                        ChangesetValue::Text("ally".into()),
                     ],
                 }],
             }],
@@ -3472,7 +3472,7 @@ mod tests {
             target.tables["t"],
             vec![vec![
                 SqliteValue::Integer(2),
-                SqliteValue::Text("ally".to_owned()),
+                SqliteValue::Text("ally".into()),
             ]]
         );
     }
@@ -3484,7 +3484,7 @@ mod tests {
             "t".to_owned(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("actual".to_owned()),
+                SqliteValue::Text("actual".into()),
             ]],
         );
 
@@ -3499,7 +3499,7 @@ mod tests {
                     op: ChangeOp::Delete,
                     old_values: vec![
                         ChangesetValue::Integer(1),
-                        ChangesetValue::Text("expected".to_owned()),
+                        ChangesetValue::Text("expected".into()),
                     ],
                     new_values: Vec::new(),
                 }],
@@ -3627,7 +3627,7 @@ mod tests {
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(1),
-                            ChangesetValue::Text("a".to_owned()),
+                            ChangesetValue::Text("a".into()),
                         ],
                     },
                     ChangesetRow {
@@ -3635,7 +3635,7 @@ mod tests {
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(2),
-                            ChangesetValue::Text("b".to_owned()),
+                            ChangesetValue::Text("b".into()),
                         ],
                     },
                 ],
@@ -3668,7 +3668,7 @@ mod tests {
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(1),
-                            ChangesetValue::Text("a".to_owned()),
+                            ChangesetValue::Text("a".into()),
                         ],
                     },
                     ChangesetRow {
@@ -3676,7 +3676,7 @@ mod tests {
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(2),
-                            ChangesetValue::Text("b".to_owned()),
+                            ChangesetValue::Text("b".into()),
                         ],
                     },
                     ChangesetRow {
@@ -3684,7 +3684,7 @@ mod tests {
                         old_values: Vec::new(),
                         new_values: vec![
                             ChangesetValue::Integer(1),
-                            ChangesetValue::Text("a".to_owned()),
+                            ChangesetValue::Text("a".into()),
                         ],
                     },
                 ],
@@ -3703,8 +3703,8 @@ mod tests {
         assert_eq!(
             target.tables["t"],
             vec![
-                vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())],
-                vec![SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("a".into())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("b".into())],
             ]
         );
     }

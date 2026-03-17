@@ -892,10 +892,10 @@ impl SqlExecutor for FsqliteExecutor {
                         }
                         fsqlite_types::value::SqliteValue::Float(f) => NormalizedValue::Real(*f),
                         fsqlite_types::value::SqliteValue::Text(s) => {
-                            NormalizedValue::Text(s.clone())
+                            NormalizedValue::Text(s.to_string())
                         }
                         fsqlite_types::value::SqliteValue::Blob(b) => {
-                            NormalizedValue::Blob(b.clone())
+                            NormalizedValue::Blob(b.to_vec())
                         }
                     })
                     .collect()

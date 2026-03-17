@@ -55,7 +55,7 @@ fn frank_query_sorted(conn: &fsqlite::Connection) -> Vec<(i64, String, i64)> {
                 }
             };
             let name = match &vals[1] {
-                fsqlite_types::value::SqliteValue::Text(s) => s.clone(),
+                fsqlite_types::value::SqliteValue::Text(s) => s.to_string(),
                 other => {
                     assert!(
                         matches!(other, fsqlite_types::value::SqliteValue::Text(_)),

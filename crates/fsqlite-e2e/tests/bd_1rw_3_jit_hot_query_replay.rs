@@ -33,7 +33,7 @@ fn jit_stats(conn: &fsqlite::Connection) -> HashMap<String, i64> {
 
     for row in rows {
         let key = match row.get(0) {
-            Some(SqliteValue::Text(value)) => value.clone(),
+            Some(SqliteValue::Text(value)) => value.to_string(),
             other => panic!("expected TEXT key in jit_stats, got {other:?}"),
         };
         let value = match row.get(1) {

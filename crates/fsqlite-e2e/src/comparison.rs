@@ -239,8 +239,8 @@ fn fsqlite_value_to_sql_value(v: &SqliteValue) -> SqlValue {
         SqliteValue::Null => SqlValue::Null,
         SqliteValue::Integer(i) => SqlValue::Integer(*i),
         SqliteValue::Float(f) => SqlValue::Real(*f),
-        SqliteValue::Text(s) => SqlValue::Text(s.clone()),
-        SqliteValue::Blob(b) => SqlValue::Blob(b.clone()),
+        SqliteValue::Text(s) => SqlValue::Text(s.to_string()),
+        SqliteValue::Blob(b) => SqlValue::Blob(b.to_vec()),
     }
 }
 

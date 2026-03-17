@@ -172,7 +172,7 @@ fn json_extract_value(root: &Value, paths: &[&str]) -> Result<SqliteValue> {
     }
 
     let encoded = encode_json_text("json_extract array encode failed", &Value::Array(out))?;
-    Ok(SqliteValue::Text(Arc::from(encoded.as_str())))
+    Ok(SqliteValue::Text(Arc::from(encoded)))
 }
 
 fn jsonb_extract_value(root: &Value, paths: &[&str]) -> Result<Vec<u8>> {
@@ -207,7 +207,7 @@ fn json_arrow_value(root: &Value, path: &str) -> Result<SqliteValue> {
         return Ok(SqliteValue::Null);
     };
     let encoded = encode_json_text("json_arrow encode failed", value)?;
-    Ok(SqliteValue::Text(Arc::from(encoded.as_str())))
+    Ok(SqliteValue::Text(Arc::from(encoded)))
 }
 
 fn json_array_length_value(root: &Value, path: Option<&str>) -> Result<Option<usize>> {
@@ -1277,7 +1277,7 @@ fn append_array_path(base: &str, index: usize) -> String {
 fn json_value_column(value: &Value) -> Result<SqliteValue> {
     match value {
         Value::Array(_) | Value::Object(_) => serde_json::to_string(value)
-            .map(|s| SqliteValue::Text(Arc::from(s.as_str())))
+            .map(|s| SqliteValue::Text(Arc::from(s)))
             .map_err(|error| {
                 FrankenError::function_error(format!("json table value encode failed: {error}"))
             }),
@@ -1441,7 +1441,7 @@ fn json_to_sqlite_scalar(value: &Value) -> SqliteValue {
         Value::String(text) => SqliteValue::Text(Arc::from(text.as_str())),
         Value::Array(_) | Value::Object(_) => {
             let encoded = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-            SqliteValue::Text(Arc::from(encoded.as_str()))
+            SqliteValue::Text(Arc::from(encoded))
         }
     }
 }
@@ -1972,7 +1972,7 @@ impl ScalarFunction for JsonFunc {
         }
         let input = json_arg_value(self.name(), args, 0)?;
         let encoded = encode_json_text("json serialize failed", &input)?;
-        Ok(SqliteValue::Text(Arc::from(encoded.as_str())))
+        Ok(SqliteValue::Text(Arc::from(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2175,7 +2175,7 @@ pub struct JsonArrayFunc;
 impl ScalarFunction for JsonArrayFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         let s = json_array(args)?;
-        Ok(SqliteValue::Text(Arc::from(s.as_str())))
+        Ok(SqliteValue::Text(Arc::from(s)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2209,7 +2209,7 @@ pub struct JsonObjectFunc;
 impl ScalarFunction for JsonObjectFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         let s = json_object(args)?;
-        Ok(SqliteValue::Text(Arc::from(s.as_str())))
+        Ok(SqliteValue::Text(Arc::from(s)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2246,7 +2246,7 @@ impl ScalarFunction for JsonQuoteFunc {
             return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
         }
         let s = json_quote(&args[0])?;
-        Ok(SqliteValue::Text(Arc::from(s.as_str())))
+        Ok(SqliteValue::Text(Arc::from(s)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2288,7 +2288,7 @@ impl ScalarFunction for JsonSetFunc {
             .collect::<Vec<_>>();
         let edited = edit_json_paths_value(&input, &pairs, EditMode::Set)?;
         let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(Arc::from(encoded.as_str())))
+        Ok(SqliteValue::Text(Arc::from(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2371,7 +2371,7 @@ impl ScalarFunction for JsonInsertFunc {
             .collect::<Vec<_>>();
         let edited = edit_json_paths_value(&input, &pairs, EditMode::Insert)?;
         let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(Arc::from(encoded.as_str())))
+        Ok(SqliteValue::Text(Arc::from(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2454,7 +2454,7 @@ impl ScalarFunction for JsonReplaceFunc {
             .collect::<Vec<_>>();
         let edited = edit_json_paths_value(&input, &pairs, EditMode::Replace)?;
         let encoded = encode_json_text("json edit encode failed", &edited)?;
-        Ok(SqliteValue::Text(Arc::from(encoded.as_str())))
+        Ok(SqliteValue::Text(Arc::from(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2525,7 +2525,7 @@ impl ScalarFunction for JsonRemoveFunc {
         if args.len() == 1 {
             // With just the JSON argument, validate and return minified.
             let encoded = encode_json_text("json serialize failed", &input)?;
-            return Ok(SqliteValue::Text(Arc::from(encoded.as_str())));
+            return Ok(SqliteValue::Text(Arc::from(encoded)));
         }
         // SQLite returns NULL when any path argument is NULL.
         if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
@@ -2534,7 +2534,7 @@ impl ScalarFunction for JsonRemoveFunc {
         let paths = collect_path_args(self.name(), args, 1)?;
         let edited = json_remove_value(&input, &paths)?;
         let encoded = encode_json_text("json_remove encode failed", &edited)?;
-        Ok(SqliteValue::Text(Arc::from(encoded.as_str())))
+        Ok(SqliteValue::Text(Arc::from(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2601,7 +2601,7 @@ impl ScalarFunction for JsonPatchFunc {
         let patch = json_arg_value(self.name(), args, 1)?;
         let merged = json_patch_value(&input, &patch);
         let encoded = encode_json_text("json_patch encode failed", &merged)?;
-        Ok(SqliteValue::Text(Arc::from(encoded.as_str())))
+        Ok(SqliteValue::Text(Arc::from(encoded)))
     }
 
     fn num_args(&self) -> i32 {
@@ -2731,7 +2731,7 @@ impl ScalarFunction for JsonPrettyFunc {
             None
         };
         let s = json_pretty_value(&input, indent)?;
-        Ok(SqliteValue::Text(Arc::from(s.as_str())))
+        Ok(SqliteValue::Text(Arc::from(s)))
     }
 
     fn num_args(&self) -> i32 {

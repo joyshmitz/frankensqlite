@@ -847,7 +847,7 @@ where
 
     let rows = match filter {
         Some(filter) => {
-            connection.query_with_params(filtered_sql, &[SqliteValue::Text(filter.to_owned())])
+            connection.query_with_params(filtered_sql, &[SqliteValue::from(filter.to_owned())])
         }
         None => connection.query(sql),
     }
@@ -910,7 +910,7 @@ where
 
     let table_rows = match filter {
         Some(filter) => connection
-            .query_with_params(filtered_table_sql, &[SqliteValue::Text(filter.to_owned())]),
+            .query_with_params(filtered_table_sql, &[SqliteValue::from(filter.to_owned())]),
         None => connection.query(table_sql),
     }
     .map_err(|error| error.to_string())?;
@@ -948,7 +948,7 @@ where
 
     let object_rows = match filter {
         Some(filter) => connection
-            .query_with_params(filtered_object_sql, &[SqliteValue::Text(filter.to_owned())]),
+            .query_with_params(filtered_object_sql, &[SqliteValue::from(filter.to_owned())]),
         None => connection.query(object_sql),
     }
     .map_err(|error| error.to_string())?;
@@ -988,7 +988,7 @@ fn sql_literal(value: &SqliteValue) -> String {
         SqliteValue::Text(text) => format!("'{}'", text.replace('\'', "''")),
         SqliteValue::Blob(bytes) => {
             let mut rendered = String::from("X'");
-            for byte in bytes {
+            for byte in bytes.iter() {
                 let _ = write!(rendered, "{byte:02X}");
             }
             rendered.push('\'');

@@ -162,7 +162,7 @@ impl ScalarFunction for CharFunc {
                 result.push(c);
             }
         }
-        Ok(SqliteValue::Text(Arc::from(result.as_str())))
+        Ok(SqliteValue::Text(Arc::from(result)))
     }
 
     fn is_deterministic(&self) -> bool {
@@ -217,7 +217,7 @@ impl ScalarFunction for ConcatFunc {
                 result.push_str(&arg.to_text());
             }
         }
-        Ok(SqliteValue::Text(Arc::from(result.as_str())))
+        Ok(SqliteValue::Text(Arc::from(result)))
     }
 
     fn num_args(&self) -> i32 {
@@ -250,7 +250,7 @@ impl ScalarFunction for ConcatWsFunc {
                 parts.push(arg.to_text());
             }
         }
-        Ok(SqliteValue::Text(Arc::from(parts.join(&sep).as_str())))
+        Ok(SqliteValue::Text(Arc::from(parts.join(&sep))))
     }
 
     fn num_args(&self) -> i32 {
@@ -283,7 +283,7 @@ impl ScalarFunction for HexFunc {
         for b in &bytes {
             let _ = write!(hex, "{b:02X}");
         }
-        Ok(SqliteValue::Text(Arc::from(hex.as_str())))
+        Ok(SqliteValue::Text(Arc::from(hex)))
     }
 
     fn num_args(&self) -> i32 {
@@ -684,7 +684,7 @@ impl ScalarFunction for ReplaceFunc {
         let y = args[1].to_text();
         let z = args[2].to_text();
         if y.is_empty() {
-            return Ok(SqliteValue::Text(Arc::from(x.as_str())));
+            return Ok(SqliteValue::Text(Arc::from(x)));
         }
 
         // Prevent OOM from massive string expansion
@@ -696,7 +696,7 @@ impl ScalarFunction for ReplaceFunc {
             }
         }
 
-        Ok(SqliteValue::Text(Arc::from(x.replace(&y, &z).as_str())))
+        Ok(SqliteValue::Text(Arc::from(x.replace(&y, &z))))
     }
 
     fn num_args(&self) -> i32 {
@@ -1013,7 +1013,7 @@ impl ScalarFunction for QuoteFunc {
                 hex
             }
         };
-        Ok(SqliteValue::Text(Arc::from(result.as_str())))
+        Ok(SqliteValue::Text(Arc::from(result)))
     }
 
     fn num_args(&self) -> i32 {
@@ -1178,7 +1178,7 @@ impl ScalarFunction for SubstrFunc {
         }
 
         let result: String = chars[p1 as usize..(p1 + p2) as usize].iter().collect();
-        Ok(SqliteValue::Text(Arc::from(result.as_str())))
+        Ok(SqliteValue::Text(Arc::from(result)))
     }
 
     fn num_args(&self) -> i32 {
@@ -1260,7 +1260,7 @@ impl ScalarFunction for SoundexFunc {
             return Ok(SqliteValue::Text(Arc::from("?000")));
         }
         let s = args[0].to_text();
-        Ok(SqliteValue::Text(Arc::from(soundex(&s).as_str())))
+        Ok(SqliteValue::Text(Arc::from(soundex(&s))))
     }
 
     fn num_args(&self) -> i32 {
@@ -1771,7 +1771,7 @@ impl ScalarFunction for UnistrFunc {
             result.push(chars[i]);
             i += 1;
         }
-        Ok(SqliteValue::Text(Arc::from(result.as_str())))
+        Ok(SqliteValue::Text(Arc::from(result)))
     }
 
     fn num_args(&self) -> i32 {
@@ -1991,7 +1991,7 @@ impl ScalarFunction for FormatFunc {
         let fmt_str = args[0].to_text();
         let params = &args[1..];
         let result = sqlite_format(&fmt_str, params)?;
-        Ok(SqliteValue::Text(Arc::from(result.as_str())))
+        Ok(SqliteValue::Text(Arc::from(result)))
     }
 
     fn num_args(&self) -> i32 {
