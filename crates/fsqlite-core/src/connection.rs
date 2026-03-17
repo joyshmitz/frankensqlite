@@ -1155,7 +1155,7 @@ fn flat_combining_stats_rows() -> Vec<Row> {
         .into_iter()
         .map(|(name, value)| Row {
             values: vec![
-                SqliteValue::Text(name.to_owned()),
+                SqliteValue::Text(name.to_owned().into()),
                 SqliteValue::Integer(to_i64_clamped(value)),
             ],
         })
@@ -3644,7 +3644,7 @@ impl Connection {
                 let mut row = columns
                     .into_iter()
                     .take(src.col_names.len())
-                    .map(SqliteValue::Text)
+                    .map(|s| SqliteValue::Text(s.into()))
                     .collect::<Vec<_>>();
                 while row.len() < src.col_names.len() {
                     row.push(SqliteValue::Null);
@@ -5913,6 +5913,32 @@ impl Connection {
                     }
                     Ok(rows)
                 } else if has_joins(select) || has_subquery_source(select) {
+                    // Try VDBE codegen for simple JOINs first — if it succeeds,
+                    // execute through the storage-cursor path (100-1000x faster
+                    // than the interpreted fallback for in-memory databases).
+                    if has_joins(select) && !has_subquery_source(select) {
+                        let rewritten_for_vdbe =
+                            self.rewrite_in_subqueries_select(select, params)?;
+                        let sql_text = rewritten_for_vdbe.to_string();
+                        let sql_key = Self::sql_hash(&sql_text);
+                        let vdbe_result = self.compile_with_cache(sql_key, &sql_text, |conn| {
+                            conn.compile_table_select(rewritten_for_vdbe.as_ref())
+                        });
+                        if let Ok(program) = vdbe_result {
+                            let (mut rows, _, _) =
+                                self.execute_table_program_with_cx(&program, params, false, cx)?;
+                            if distinct {
+                                dedup_rows(&mut rows);
+                            }
+                            if let Some(ref limit) = select.limit {
+                                apply_limit_clause(&mut rows, limit);
+                            }
+                            return Ok(rows);
+                        }
+                        // If VDBE codegen fails (Unsupported), fall through to
+                        // the interpreted join path.
+                    }
+
                     // Fallback path: eagerly rewrite IN subqueries.
                     // Also handles derived tables even without explicit JOINs.
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
@@ -6587,7 +6613,7 @@ impl Connection {
                     .first()
                     .and_then(|r| r.values().first())
                     .map(|v| match v {
-                        SqliteValue::Text(s) => s.clone(),
+                        SqliteValue::Text(s) => s.to_string(),
                         other => format!("{other}"),
                     })
                     .unwrap_or_default();
@@ -7281,17 +7307,55 @@ impl Connection {
             Statement::Select(select) => {
                 let distinct = is_distinct_select(select);
                 let limit_clause = select.limit.clone();
-                let program = if distinct && limit_clause.is_some() {
+                let compile_result = if distinct && limit_clause.is_some() {
                     let mut unbounded = select.clone();
                     unbounded.limit = None;
                     let compiled_sql = unbounded.to_string();
                     let compiled_sql_key = Self::sql_hash(&compiled_sql);
                     self.compile_with_cache(compiled_sql_key, &compiled_sql, |conn| {
                         conn.compile_table_select(&unbounded)
-                    })?
+                    })
                 } else {
                     let sql_key = Self::sql_hash(sql);
-                    self.compile_with_cache(sql_key, sql, |conn| conn.compile_table_select(select))?
+                    self.compile_with_cache(sql_key, sql, |conn| conn.compile_table_select(select))
+                };
+                // If VDBE compilation fails for a JOIN query (codegen_join_select
+                // returned Unsupported), fall back to the deferred dispatch path
+                // which uses the connection-level interpreted join instead of
+                // propagating the error.
+                let program = match compile_result {
+                    Ok(p) => p,
+                    // Only fall back to the interpreted JOIN for codegen
+                    // Unsupported errors (mapped to NotImplemented). Real
+                    // errors (TableNotFound, etc.) must propagate.
+                    Err(FrankenError::NotImplemented(_)) if has_joins(select) => {
+                        let placeholder_program =
+                            Arc::new(ProgramBuilder::new().finish().map_err(|e| {
+                                FrankenError::Internal(format!(
+                                    "failed to build placeholder program: {e}"
+                                ))
+                            })?);
+                        return Ok(PreparedStatement {
+                            sql: sql.to_owned(),
+                            program: placeholder_program,
+                            func_registry: registry,
+                            expression_postprocess: None,
+                            distinct: false,
+                            db: None,
+                            pager: None,
+                            post_distinct_limit: None,
+                            schema_cookie: self.schema_cookie(),
+                            schema_generation: self.schema_generation(),
+                            dml_dispatch: None,
+                            deferred_query_statement: Some(Arc::new(statement.clone())),
+                            deferred_query_column_count: Some(
+                                self.prepared_statement_column_count(statement),
+                            ),
+                            column_names: prepared_column_names,
+                            conn: self,
+                        });
+                    }
+                    Err(e) => return Err(e),
                 };
                 Ok(PreparedStatement {
                     sql: sql.to_owned(),
@@ -7612,7 +7676,12 @@ impl Connection {
             || has_ordered_aggregate
             || has_window_functions(select)
             || select_contains_match_operator(select)
-            || has_join_like_source
+            // JOINs require dispatch UNLESS the VDBE codegen can handle them.
+            // Note: has_grouping/has_window_functions are already checked above,
+            // so this guard only needs to test fallback-source and eligibility.
+            || (has_join_like_source
+                && (has_fallback_from_source(select)
+                    || !select_join_is_vdbe_eligible(select)))
             || select_has_correlated_join_subquery(select)
     }
 
@@ -8657,7 +8726,7 @@ impl Connection {
             .into_iter()
             .map(|(name, value)| Row {
                 values: vec![
-                    SqliteValue::Text(name.to_owned()),
+                    SqliteValue::Text(name.to_owned().into()),
                     SqliteValue::Integer(to_i64(value)),
                 ],
             })
@@ -8764,9 +8833,9 @@ impl Connection {
             |code: &str, severity: &str, message: String, actual: u64, threshold: u64| {
                 rows.push(Row {
                     values: vec![
-                        SqliteValue::Text(code.to_owned()),
-                        SqliteValue::Text(severity.to_owned()),
-                        SqliteValue::Text(message),
+                        SqliteValue::Text(code.to_owned().into()),
+                        SqliteValue::Text(severity.to_owned().into()),
+                        SqliteValue::Text(message.into()),
                         SqliteValue::Integer(to_i64(actual)),
                         SqliteValue::Integer(to_i64(threshold)),
                     ],
@@ -8945,7 +9014,7 @@ impl Connection {
         .to_string();
 
         vec![Row {
-            values: vec![SqliteValue::Text(snapshot)],
+            values: vec![SqliteValue::Text(snapshot.into())],
         }]
     }
 
@@ -9244,9 +9313,9 @@ impl Connection {
             |code: &str, severity: &str, message: String, actual: u64, threshold: u64| {
                 rows.push(Row {
                     values: vec![
-                        SqliteValue::Text(code.to_owned()),
-                        SqliteValue::Text(severity.to_owned()),
-                        SqliteValue::Text(message),
+                        SqliteValue::Text(code.to_owned().into()),
+                        SqliteValue::Text(severity.to_owned().into()),
+                        SqliteValue::Text(message.into()),
                         SqliteValue::Integer(to_i64(actual)),
                         SqliteValue::Integer(to_i64(threshold)),
                     ],
@@ -9941,11 +10010,13 @@ impl Connection {
             };
 
             let record = serialize_record(&[
-                SqliteValue::Text(type_.to_owned()),
-                SqliteValue::Text(name.to_owned()),
-                SqliteValue::Text(tbl_name.to_owned()),
+                SqliteValue::Text(type_.to_owned().into()),
+                SqliteValue::Text(name.to_owned().into()),
+                SqliteValue::Text(tbl_name.to_owned().into()),
                 SqliteValue::Integer(i64::from(rootpage)),
-                sql.map_or(SqliteValue::Null, |s| SqliteValue::Text(s.to_owned())),
+                sql.map_or(SqliteValue::Null, |s| {
+                    SqliteValue::Text(s.to_owned().into())
+                }),
             ]);
             cursor.table_insert(cx, rowid, &record)
         })?;
@@ -10042,7 +10113,7 @@ impl Connection {
                     if updated.len() < 5 {
                         updated.resize(5, SqliteValue::Null);
                     }
-                    updated[4] = SqliteValue::Text(new_sql.to_owned());
+                    updated[4] = SqliteValue::Text(new_sql.to_owned().into());
                     let record = serialize_record(&updated);
 
                     // Delete old row then re-insert at the same rowid.
@@ -10387,11 +10458,11 @@ impl Connection {
         for row in replacement_rows {
             max_rowid = max_rowid.saturating_add(1).max(1);
             let record = serialize_record(&[
-                SqliteValue::Text(row.table_name.clone()),
-                row.index_name
-                    .as_ref()
-                    .map_or(SqliteValue::Null, |name| SqliteValue::Text(name.clone())),
-                SqliteValue::Text(row.stat.clone()),
+                SqliteValue::Text(row.table_name.clone().into()),
+                row.index_name.as_ref().map_or(SqliteValue::Null, |name| {
+                    SqliteValue::Text(name.clone().into())
+                }),
+                SqliteValue::Text(row.stat.clone().into()),
             ]);
             cursor.table_insert(cx, max_rowid, &record)?;
         }
@@ -10529,7 +10600,7 @@ impl Connection {
         };
 
         let record = serialize_record(&[
-            SqliteValue::Text(table_name.to_owned()),
+            SqliteValue::Text(table_name.to_owned().into()),
             SqliteValue::Integer(seq),
         ]);
         cursor.table_insert(cx, rowid, &record)?;
@@ -12266,7 +12337,7 @@ impl Connection {
         let target_value =
             self.eval_expr_with_subqueries(&bound_expr, &empty_row, &empty_col_map, None)?;
         let target_path = match target_value {
-            SqliteValue::Text(path) if !path.is_empty() => PathBuf::from(path),
+            SqliteValue::Text(path) if !path.is_empty() => PathBuf::from(path.into()),
             SqliteValue::Text(_) | SqliteValue::Null => {
                 return Err(FrankenError::CannotOpen {
                     path: PathBuf::new(),
@@ -13670,11 +13741,11 @@ impl Connection {
                 .unwrap_or_else(|| render_create_table_sql(table, is_autoincrement));
 
             rows.push(vec![
-                SqliteValue::Text("table".to_owned()),
-                SqliteValue::Text(table.name.clone()),
-                SqliteValue::Text(table.name.clone()),
+                SqliteValue::Text("table".to_owned().into()),
+                SqliteValue::Text(table.name.clone().into()),
+                SqliteValue::Text(table.name.clone().into()),
                 SqliteValue::Integer(i64::from(table.root_page)),
-                SqliteValue::Text(table_sql),
+                SqliteValue::Text(table_sql.into()),
             ]);
 
             for index in &table.indexes {
@@ -13684,11 +13755,11 @@ impl Connection {
                     .cloned()
                     .unwrap_or_else(|| render_create_index_sql(index, &table.name));
                 rows.push(vec![
-                    SqliteValue::Text("index".to_owned()),
-                    SqliteValue::Text(index.name.clone()),
-                    SqliteValue::Text(table.name.clone()),
+                    SqliteValue::Text("index".to_owned().into()),
+                    SqliteValue::Text(index.name.clone().into()),
+                    SqliteValue::Text(table.name.clone().into()),
                     SqliteValue::Integer(i64::from(index.root_page)),
-                    SqliteValue::Text(index_sql),
+                    SqliteValue::Text(index_sql.into()),
                 ]);
             }
         }
@@ -13699,21 +13770,21 @@ impl Connection {
                 .cloned()
                 .unwrap_or_else(|| format!("CREATE VIEW {}", view.name));
             rows.push(vec![
-                SqliteValue::Text("view".to_owned()),
-                SqliteValue::Text(view.name.clone()),
-                SqliteValue::Text(view.name.clone()),
+                SqliteValue::Text("view".to_owned().into()),
+                SqliteValue::Text(view.name.clone().into()),
+                SqliteValue::Text(view.name.clone().into()),
                 SqliteValue::Integer(0),
-                SqliteValue::Text(view_sql),
+                SqliteValue::Text(view_sql.into()),
             ]);
         }
 
         for trigger in triggers.iter().filter(|t| !t.temporary) {
             rows.push(vec![
-                SqliteValue::Text("trigger".to_owned()),
-                SqliteValue::Text(trigger.name.clone()),
-                SqliteValue::Text(trigger.table_name.clone()),
+                SqliteValue::Text("trigger".to_owned().into()),
+                SqliteValue::Text(trigger.name.clone().into()),
+                SqliteValue::Text(trigger.table_name.clone().into()),
                 SqliteValue::Integer(0),
-                SqliteValue::Text(trigger.create_sql.clone()),
+                SqliteValue::Text(trigger.create_sql.clone().into()),
             ]);
         }
 
@@ -14955,7 +15026,7 @@ impl Connection {
             Err(err) => err.to_string(),
         };
         vec![Row {
-            values: vec![SqliteValue::Text(outcome)],
+            values: vec![SqliteValue::Text(outcome.into())],
         }]
     }
 
@@ -16178,7 +16249,7 @@ impl Connection {
         match pragma_out {
             fsqlite_vdbe::pragma::PragmaOutput::Text(s) => {
                 return Ok(vec![Row {
-                    values: vec![SqliteValue::Text(s)],
+                    values: vec![SqliteValue::Text(s.into())],
                 }]);
             }
             fsqlite_vdbe::pragma::PragmaOutput::Int(n) => {
@@ -16223,7 +16294,7 @@ impl Connection {
                         TextEncoding::Utf16le => "UTF-16le",
                         TextEncoding::Utf16be => "UTF-16be",
                     };
-                    SqliteValue::Text(encoding.to_owned())
+                    SqliteValue::Text(encoding.to_owned().into())
                 }
                 _ => unreachable!("guarded by matches!"),
             };
@@ -16240,10 +16311,14 @@ impl Connection {
 
         match full_name.as_str() {
             "fsqlite.backend_kind" | "backend_kind" => Ok(vec![Row {
-                values: vec![SqliteValue::Text(self.pager_backend_kind().to_owned())],
+                values: vec![SqliteValue::Text(
+                    self.pager_backend_kind().to_owned().into(),
+                )],
             }]),
             "fsqlite.backend_mode" | "backend_mode" => Ok(vec![Row {
-                values: vec![SqliteValue::Text(self.backend_mode_label().to_owned())],
+                values: vec![SqliteValue::Text(
+                    self.backend_mode_label().to_owned().into(),
+                )],
             }]),
             "fsqlite.concurrent_mode" | "concurrent_mode" => {
                 if let Some(ref val) = pragma.value {
@@ -16461,7 +16536,7 @@ impl Connection {
                                 SqliteValue::Integer(
                                     i64::try_from(e.timestamp_ns()).unwrap_or(i64::MAX),
                                 ),
-                                SqliteValue::Text(desc),
+                                SqliteValue::Text(desc.into()),
                             ],
                         }
                     })
@@ -16958,7 +17033,7 @@ impl Connection {
                                 i64::try_from(event.latency_ns).unwrap_or(i64::MAX),
                             ),
                             SqliteValue::Integer(i64::from(event.budget_utilization_pct)),
-                            SqliteValue::Text(event.severity_bucket.as_str().to_owned()),
+                            SqliteValue::Text(event.severity_bucket.as_str().to_owned().into()),
                         ],
                     })
                     .collect::<Vec<_>>();
@@ -17072,16 +17147,16 @@ impl Connection {
                                         _ => "",
                                     });
                                 let notnull = i64::from(col.notnull);
-                                let dflt = col
-                                    .default_value
-                                    .as_ref()
-                                    .map_or(SqliteValue::Null, |s| SqliteValue::Text(s.clone()));
+                                let dflt =
+                                    col.default_value.as_ref().map_or(SqliteValue::Null, |s| {
+                                        SqliteValue::Text(s.clone().into())
+                                    });
                                 let pk = pk_positions.get(i).copied().unwrap_or(0);
                                 Row {
                                     values: vec![
                                         SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
-                                        SqliteValue::Text(col.name.clone()),
-                                        SqliteValue::Text(type_str.to_owned()),
+                                        SqliteValue::Text(col.name.clone().into()),
+                                        SqliteValue::Text(type_str.to_owned().into()),
                                         SqliteValue::Integer(notnull),
                                         dflt,
                                         SqliteValue::Integer(pk),
@@ -17120,9 +17195,9 @@ impl Connection {
                             .map(|(seq, idx)| Row {
                                 values: vec![
                                     SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
-                                    SqliteValue::Text(idx.name.clone()),
+                                    SqliteValue::Text(idx.name.clone().into()),
                                     SqliteValue::Integer(i64::from(idx.is_unique)),
-                                    SqliteValue::Text("c".to_owned()),
+                                    SqliteValue::Text("c".to_owned().into()),
                                     SqliteValue::Integer(0),
                                 ],
                             })
@@ -17163,7 +17238,7 @@ impl Connection {
                                         values: vec![
                                             SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
                                             SqliteValue::Integer(cid),
-                                            SqliteValue::Text(col_name.clone()),
+                                            SqliteValue::Text(col_name.clone().into()),
                                         ],
                                     }
                                 })
@@ -17209,16 +17284,16 @@ impl Connection {
                                         values: vec![
                                             SqliteValue::Integer(i64::try_from(fk_id).unwrap_or(0)),
                                             SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
-                                            SqliteValue::Text(fk.parent_table.clone()),
-                                            SqliteValue::Text(from_col),
-                                            SqliteValue::Text(to_col),
+                                            SqliteValue::Text(fk.parent_table.clone().into()),
+                                            SqliteValue::Text(from_col.into()),
+                                            SqliteValue::Text(to_col.into()),
                                             SqliteValue::Text(
                                                 fk_action_sql(fk.on_update).to_owned(),
                                             ),
                                             SqliteValue::Text(
                                                 fk_action_sql(fk.on_delete).to_owned(),
                                             ),
-                                            SqliteValue::Text("NONE".to_owned()),
+                                            SqliteValue::Text("NONE".to_owned().into()),
                                         ],
                                     }
                                 })
@@ -17242,7 +17317,7 @@ impl Connection {
                 let rows = options
                     .iter()
                     .map(|opt| Row {
-                        values: vec![SqliteValue::Text((*opt).to_owned())],
+                        values: vec![SqliteValue::Text((*opt).to_owned().into())],
                     })
                     .collect();
                 Ok(rows)
@@ -17254,15 +17329,15 @@ impl Connection {
                     Row {
                         values: vec![
                             SqliteValue::Integer(0),
-                            SqliteValue::Text("main".to_owned()),
-                            SqliteValue::Text(self.path.clone()),
+                            SqliteValue::Text("main".to_owned().into()),
+                            SqliteValue::Text(self.path.clone().into()),
                         ],
                     },
                     Row {
                         values: vec![
                             SqliteValue::Integer(1),
-                            SqliteValue::Text("temp".to_owned()),
-                            SqliteValue::Text(String::new()),
+                            SqliteValue::Text("temp".to_owned().into()),
+                            SqliteValue::Text(String::new().into()),
                         ],
                     },
                 ];
@@ -17277,8 +17352,8 @@ impl Connection {
                     rows.push(Row {
                         values: vec![
                             SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
-                            SqliteValue::Text(schema_name.to_owned()),
-                            SqliteValue::Text(path),
+                            SqliteValue::Text(schema_name.to_owned().into()),
+                            SqliteValue::Text(path.into()),
                         ],
                     });
                 }
@@ -17294,9 +17369,9 @@ impl Connection {
                         let ncol = i64::try_from(t.columns.len()).unwrap_or(0);
                         Row {
                             values: vec![
-                                SqliteValue::Text("main".to_owned()),
-                                SqliteValue::Text(t.name.clone()),
-                                SqliteValue::Text("table".to_owned()),
+                                SqliteValue::Text("main".to_owned().into()),
+                                SqliteValue::Text(t.name.clone().into()),
+                                SqliteValue::Text("table".to_owned().into()),
                                 SqliteValue::Integer(ncol),
                                 SqliteValue::Integer(0),
                                 SqliteValue::Integer(i64::from(t.strict)),
@@ -17311,9 +17386,9 @@ impl Connection {
                     let ncol = i64::try_from(v.columns.len()).unwrap_or(0);
                     rows.push(Row {
                         values: vec![
-                            SqliteValue::Text("main".to_owned()),
-                            SqliteValue::Text(v.name.clone()),
-                            SqliteValue::Text("view".to_owned()),
+                            SqliteValue::Text("main".to_owned().into()),
+                            SqliteValue::Text(v.name.clone().into()),
+                            SqliteValue::Text("view".to_owned().into()),
                             SqliteValue::Integer(ncol),
                             SqliteValue::Integer(0),
                             SqliteValue::Integer(0),
@@ -17334,7 +17409,7 @@ impl Connection {
                 .map(|(idx, name)| Row {
                     values: vec![
                         SqliteValue::Integer(i64::try_from(idx).unwrap_or(0)),
-                        SqliteValue::Text(name),
+                        SqliteValue::Text(name.into()),
                     ],
                 })
                 .collect()),
@@ -17349,7 +17424,7 @@ impl Connection {
             }
             // PRAGMA encoding — return the database text encoding.
             "encoding" if pragma.value.is_none() => Ok(vec![Row {
-                values: vec![SqliteValue::Text("UTF-8".to_owned())],
+                values: vec![SqliteValue::Text("UTF-8".to_owned().into())],
             }]),
             // Unrecognised pragmas are silently ignored (SQLite compatibility).
             _ => Ok(Vec::new()),
@@ -17777,7 +17852,7 @@ impl Connection {
             Row {
                 values: vec![
                     SqliteValue::Text("active_views".into()),
-                    SqliteValue::Text(active_views),
+                    SqliteValue::Text(active_views.into()),
                 ],
             },
         ]
@@ -18292,7 +18367,7 @@ impl Connection {
                             values.push(if entries.is_empty() {
                                 SqliteValue::Null
                             } else {
-                                SqliteValue::Text(result)
+                                SqliteValue::Text(result.into())
                             });
                         } else {
                             let mut owned_values: Vec<SqliteValue> = if let Some(idx) = *arg_col {
@@ -19570,7 +19645,7 @@ impl Connection {
                             values.push(if entries.is_empty() {
                                 SqliteValue::Null
                             } else {
-                                SqliteValue::Text(result)
+                                SqliteValue::Text(result.into())
                             });
                         } else {
                             let mut owned_values: Vec<SqliteValue> = if let Some(idx) = *arg_col {
@@ -21423,14 +21498,64 @@ impl Connection {
                         continue;
                     }
                 }
-                // Named table: scan through the normal query path so file-backed
-                // parity-cert connections read from pager-backed state instead
-                // of the schema-only MemDatabase mirror.  When the join layer
-                // needs the hidden rowid, append it explicitly to the scan.
-                let scan_sql = build_join_scan_sql(src);
-                let rows = self.query(&scan_sql)?;
-                let row_data: Vec<Vec<SqliteValue>> =
-                    rows.iter().map(|row| row.values().to_vec()).collect();
+                // For :memory: databases, read directly from MemDatabase
+                // instead of going through self.query() which pays the
+                // full parse→compile→VDBE→autocommit cost per table scan.
+                // Uses the same IPK-splice logic as the time-travel path.
+                let row_data = if !self.pager.is_file_backed() {
+                    // Extract schema info and drop the borrow before
+                    // borrowing db, to keep borrow scopes minimal.
+                    let (root_page, num_schema_cols) = {
+                        let schema = self.schema.borrow();
+                        schema
+                            .iter()
+                            .find(|t| t.name.eq_ignore_ascii_case(&src.table_name))
+                            .map(|t| (t.root_page, t.columns.len()))
+                            .unwrap_or((0, 0))
+                    };
+                    let ipk_idx = self
+                        .rowid_alias_columns
+                        .borrow()
+                        .get(&src.table_name.to_ascii_lowercase())
+                        .copied();
+                    let db = self.db.borrow();
+                    if let Some(mem_table) = db.get_table(root_page) {
+                        mem_table
+                            .iter_rows()
+                            .map(|(rowid, vals)| {
+                                let mut row = if let Some(ipk_col) = ipk_idx {
+                                    let mut full = Vec::with_capacity(num_schema_cols);
+                                    let mut val_idx = 0;
+                                    for col_idx in 0..num_schema_cols {
+                                        if col_idx == ipk_col {
+                                            full.push(SqliteValue::Integer(rowid));
+                                        } else if val_idx < vals.len() {
+                                            full.push(vals[val_idx].clone());
+                                            val_idx += 1;
+                                        } else {
+                                            full.push(SqliteValue::Null);
+                                        }
+                                    }
+                                    full
+                                } else {
+                                    vals.to_vec()
+                                };
+                                if src.hidden_rowid_projection.is_some() {
+                                    row.push(SqliteValue::Integer(rowid));
+                                }
+                                row
+                            })
+                            .collect::<Vec<Vec<SqliteValue>>>()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    // File-backed: scan through the normal query path so
+                    // parity-cert connections read from pager-backed state.
+                    let scan_sql = build_join_scan_sql(src);
+                    let rows = self.query(&scan_sql)?;
+                    rows.iter().map(|row| row.values().to_vec()).collect()
+                };
                 // Only clone into the cache when the same table might appear
                 // again (self-join, CTE).  Check remaining sources for a match.
                 let might_reuse = table_sources[i + 1..]
@@ -22197,13 +22322,13 @@ impl Connection {
                 Row {
                     values: vec![
                         SqliteValue::Integer(i64::try_from(addr).unwrap_or(i64::MAX)),
-                        SqliteValue::Text(op.opcode.name().to_owned()),
+                        SqliteValue::Text(op.opcode.name().to_owned().into()),
                         SqliteValue::Integer(i64::from(op.p1)),
                         SqliteValue::Integer(i64::from(op.p2)),
                         SqliteValue::Integer(i64::from(op.p3)),
-                        SqliteValue::Text(p4_str),
+                        SqliteValue::Text(p4_str.into()),
                         SqliteValue::Integer(i64::from(op.p5)),
-                        SqliteValue::Text(String::new()), // comment column
+                        SqliteValue::Text(String::new().into()), // comment column
                     ],
                 }
             })
@@ -22243,7 +22368,7 @@ impl Connection {
                 SqliteValue::Integer(2),
                 SqliteValue::Integer(0),
                 SqliteValue::Integer(0),
-                SqliteValue::Text(detail),
+                SqliteValue::Text(detail.into()),
             ],
         }]
     }
@@ -22573,7 +22698,7 @@ impl Connection {
                 continue;
             }
             let entry_type = match &entry[0] {
-                SqliteValue::Text(s) => s.as_str(),
+                SqliteValue::Text(s) => s,
                 _ => continue,
             };
 
@@ -23624,6 +23749,54 @@ fn has_joins(select: &SelectStatement) -> bool {
         &select.body.select,
         SelectCore::Select { from: Some(from), .. } if !from.joins.is_empty()
     )
+}
+
+/// Returns true if a JOIN query is eligible for VDBE codegen (simple INNER/CROSS
+/// JOINs on named tables with ON constraints — no LEFT/RIGHT/FULL/NATURAL,
+/// no USING, no subquery sources).
+fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
+    let SelectCore::Select {
+        from: Some(from), ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    if from.joins.is_empty() {
+        return false;
+    }
+    // Primary source must be a named table.
+    if !matches!(&from.source, TableOrSubquery::Table { .. }) {
+        return false;
+    }
+    for join in &from.joins {
+        // Only INNER and CROSS joins.
+        if !matches!(
+            join.join_type.kind,
+            fsqlite_ast::JoinKind::Inner | fsqlite_ast::JoinKind::Cross
+        ) {
+            return false;
+        }
+        // No NATURAL joins.
+        if join.join_type.natural {
+            return false;
+        }
+        // Right source must be a named table.
+        if !matches!(&join.table, TableOrSubquery::Table { .. }) {
+            return false;
+        }
+        // Only ON constraints (no USING).
+        if matches!(
+            &join.constraint,
+            Some(fsqlite_ast::JoinConstraint::Using(_))
+        ) {
+            return false;
+        }
+    }
+    // No compound queries.
+    if !select.body.compounds.is_empty() {
+        return false;
+    }
+    true
 }
 
 /// Check if the FROM source contains a subquery (derived table) that
@@ -27241,8 +27414,8 @@ fn rewrite_in_expr(
                 match val {
                     SqliteValue::Integer(i) => Literal::Integer(i),
                     SqliteValue::Float(f) => Literal::Float(f),
-                    SqliteValue::Text(s) => Literal::String(s),
-                    SqliteValue::Blob(b) => Literal::Blob(b),
+                    SqliteValue::Text(s) => Literal::String(s.into()),
+                    SqliteValue::Blob(b) => Literal::Blob(b.into()),
                     SqliteValue::Null => Literal::Null,
                 },
                 *span,
@@ -27312,8 +27485,8 @@ fn value_to_literal_expr(val: SqliteValue) -> Expr {
     match val {
         SqliteValue::Integer(i) => Expr::Literal(Literal::Integer(i), Span::ZERO),
         SqliteValue::Float(f) => Expr::Literal(Literal::Float(f), Span::ZERO),
-        SqliteValue::Text(s) => Expr::Literal(Literal::String(s), Span::ZERO),
-        SqliteValue::Blob(b) => Expr::Literal(Literal::Blob(b), Span::ZERO),
+        SqliteValue::Text(s) => Expr::Literal(Literal::String(s.into()), Span::ZERO),
+        SqliteValue::Blob(b) => Expr::Literal(Literal::Blob(b.into()), Span::ZERO),
         SqliteValue::Null => Expr::Literal(Literal::Null, Span::ZERO),
     }
 }
@@ -27751,21 +27924,21 @@ fn infer_implicit_index_definition_from_master_entries(
             return None;
         }
         let entry_type = match &entry[0] {
-            SqliteValue::Text(s) => s.as_str(),
+            SqliteValue::Text(s) => s,
             _ => return None,
         };
         if !entry_type.eq_ignore_ascii_case("table") {
             return None;
         }
         let entry_table_name = match &entry[1] {
-            SqliteValue::Text(s) => s.as_str(),
+            SqliteValue::Text(s) => s,
             _ => return None,
         };
         if !entry_table_name.eq_ignore_ascii_case(table_name) {
             return None;
         }
         match &entry[4] {
-            SqliteValue::Text(sql) => Some(sql.as_str()),
+            SqliteValue::Text(sql) => Some(&*sql),
             _ => None,
         }
     })?;
@@ -28486,7 +28659,7 @@ fn evaluate_having_value(
         Expr::Literal(lit, _) => match lit {
             fsqlite_ast::Literal::Integer(n) => SqliteValue::Integer(*n),
             fsqlite_ast::Literal::Float(f) => SqliteValue::Float(*f),
-            fsqlite_ast::Literal::String(s) => SqliteValue::Text(s.clone()),
+            fsqlite_ast::Literal::String(s) => SqliteValue::Text(s.clone().into()),
             fsqlite_ast::Literal::True => SqliteValue::Integer(1),
             fsqlite_ast::Literal::False => SqliteValue::Integer(0),
             _ => SqliteValue::Null,
@@ -28592,7 +28765,7 @@ fn evaluate_having_value(
                     if is_null_op {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Text(format!("{}{}", lv.to_text(), rv.to_text()))
+                        SqliteValue::Text(format!("{}{}", lv.to_text(), rv.to_text()).into())
                     }
                 }
                 _ => SqliteValue::Null,
@@ -28758,11 +28931,11 @@ fn evaluate_having_value(
             if upper.contains("INT") {
                 SqliteValue::Integer(v.to_integer())
             } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
-                SqliteValue::Text(v.to_text())
+                SqliteValue::Text(v.to_text().into())
             } else if upper.contains("BLOB") || upper.is_empty() {
                 match v {
                     SqliteValue::Blob(_) => v,
-                    _ => SqliteValue::Blob(v.to_text().into_bytes()),
+                    _ => SqliteValue::Blob(v.to_text().into_bytes().into()),
                 }
             } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
                 SqliteValue::Float(v.to_float())
@@ -28776,10 +28949,10 @@ fn evaluate_having_value(
                     if f.is_finite() {
                         SqliteValue::Float(f)
                     } else {
-                        SqliteValue::Text(txt)
+                        SqliteValue::Text(txt.into())
                     }
                 } else {
-                    SqliteValue::Text(txt)
+                    SqliteValue::Text(txt.into())
                 }
             }
         }
@@ -29361,7 +29534,7 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
             if parts.is_empty() {
                 SqliteValue::Null
             } else {
-                SqliteValue::Text(parts.join(","))
+                SqliteValue::Text(parts.join(",".into()))
             }
         }
         _ => SqliteValue::Null,
@@ -29386,7 +29559,7 @@ fn compute_aggregate_ext(
         if parts.is_empty() {
             SqliteValue::Null
         } else {
-            SqliteValue::Text(parts.join(sep))
+            SqliteValue::Text(parts.join(sep.into()))
         }
     } else {
         compute_aggregate(name, values)
@@ -30504,19 +30677,19 @@ fn ssi_decision_cards_to_rows(cards: &[SsiDecisionCard]) -> Vec<Row> {
                 SqliteValue::Integer(i64::from(card.txn.epoch.get())),
                 SqliteValue::Integer(to_i64_clamped(card.snapshot_seq.get())),
                 SqliteValue::Integer(to_i64_clamped(card.commit_seq.map_or(0, CommitSeq::get))),
-                SqliteValue::Text(card.decision_type.as_str().to_owned()),
-                SqliteValue::Text(join_txn_tokens(&card.conflicting_txns)),
-                SqliteValue::Text(join_page_numbers(&card.conflict_pages)),
+                SqliteValue::Text(card.decision_type.as_str().to_owned().into()),
+                SqliteValue::Text(join_txn_tokens(&card.conflicting_txns.into())),
+                SqliteValue::Text(join_page_numbers(&card.conflict_pages.into())),
                 SqliteValue::Integer(
                     i64::try_from(card.read_set_summary.page_count).unwrap_or(i64::MAX),
                 ),
-                SqliteValue::Text(read_set_top_k_string(&card.read_set_summary)),
+                SqliteValue::Text(read_set_top_k_string(&card.read_set_summary.into())),
                 SqliteValue::Integer(to_i64_clamped(card.read_set_summary.bloom_fingerprint)),
-                SqliteValue::Text(join_page_numbers(&card.write_set)),
-                SqliteValue::Text(card.rationale.clone()),
+                SqliteValue::Text(join_page_numbers(&card.write_set.into())),
+                SqliteValue::Text(card.rationale.clone().into()),
                 SqliteValue::Integer(to_i64_clamped(card.timestamp_unix_ns)),
                 SqliteValue::Integer(to_i64_clamped(card.decision_epoch)),
-                SqliteValue::Text(card.chain_hash_hex()),
+                SqliteValue::Text(card.chain_hash_hex().into()),
             ],
         })
         .collect()
@@ -30546,26 +30719,26 @@ fn raptorq_repair_evidence_cards_to_rows(cards: &[WalFecRepairEvidenceCard]) -> 
                     }),
                 SqliteValue::Integer(to_i64_clamped(card.monotonic_timestamp_ns)),
                 SqliteValue::Integer(to_i64_clamped(card.wall_clock_unix_ns)),
-                SqliteValue::Text(card.corruption_signature_hex()),
+                SqliteValue::Text(card.corruption_signature_hex().into()),
                 card.bit_error_pattern
                     .as_ref()
                     .map_or(SqliteValue::Null, |pattern| {
-                        SqliteValue::Text(pattern.clone())
+                        SqliteValue::Text(pattern.clone().into())
                     }),
-                SqliteValue::Text(card.repair_source.as_str().to_owned()),
+                SqliteValue::Text(card.repair_source.as_str().to_owned().into()),
                 SqliteValue::Integer(i64::from(card.symbols_used)),
                 SqliteValue::Integer(i64::from(card.validated_source_symbols)),
                 SqliteValue::Integer(i64::from(card.validated_repair_symbols)),
                 SqliteValue::Integer(i64::from(card.required_symbols)),
                 SqliteValue::Integer(i64::from(card.available_symbols)),
-                SqliteValue::Text(hex_encode_blake3(card.witness.corrupted_hash_blake3)),
-                SqliteValue::Text(hex_encode_blake3(card.witness.repaired_hash_blake3)),
-                SqliteValue::Text(hex_encode_blake3(card.witness.expected_hash_blake3)),
+                SqliteValue::Text(hex_encode_blake3(card.witness.corrupted_hash_blake3.into())),
+                SqliteValue::Text(hex_encode_blake3(card.witness.repaired_hash_blake3.into())),
+                SqliteValue::Text(hex_encode_blake3(card.witness.expected_hash_blake3.into())),
                 SqliteValue::Integer(to_i64_clamped(card.repair_latency_ns)),
                 SqliteValue::Integer(i64::from(card.confidence_per_mille)),
-                SqliteValue::Text(card.severity_bucket.as_str().to_owned()),
+                SqliteValue::Text(card.severity_bucket.as_str().to_owned().into()),
                 SqliteValue::Integer(to_i64_clamped(card.ledger_epoch)),
-                SqliteValue::Text(card.chain_hash_hex()),
+                SqliteValue::Text(card.chain_hash_hex().into()),
             ],
         })
         .collect()
@@ -32354,8 +32527,8 @@ fn sqlite_value_to_literal(value: &SqliteValue) -> Literal {
         SqliteValue::Null => Literal::Null,
         SqliteValue::Integer(v) => Literal::Integer(*v),
         SqliteValue::Float(v) => Literal::Float(*v),
-        SqliteValue::Text(v) => Literal::String(v.clone()),
-        SqliteValue::Blob(v) => Literal::Blob(v.clone()),
+        SqliteValue::Text(v) => Literal::String(v.clone().into()),
+        SqliteValue::Blob(v) => Literal::Blob(v.clone().into()),
     }
 }
 
@@ -33195,6 +33368,161 @@ struct InsertTargetLayout {
 
 /// Perform a single join step: combine left-side rows with right-side rows.
 #[allow(clippy::too_many_lines)]
+/// Hashable wrapper for SqliteValue join keys. Floats are hashed by their
+/// bit representation (correct for equi-join: bit-equal floats hash equally,
+/// and NaN keys are excluded by the NULL check in the caller).
+#[derive(Clone, PartialEq, Eq)]
+struct HashableJoinKey(smallvec::SmallVec<[SqliteValue; 2]>);
+
+impl std::hash::Hash for HashableJoinKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for val in &self.0 {
+            std::mem::discriminant(val).hash(state);
+            match val {
+                SqliteValue::Null => {}
+                SqliteValue::Integer(i) => i.hash(state),
+                SqliteValue::Float(f) => {
+                    // Normalize -0.0 to +0.0 so they hash equally
+                    // (SQL: -0.0 = 0.0 is TRUE).
+                    let normalized = if *f == 0.0 { 0.0_f64 } else { *f };
+                    normalized.to_bits().hash(state);
+                }
+                SqliteValue::Text(s) => s.hash(state),
+                SqliteValue::Blob(b) => b.hash(state),
+            }
+        }
+    }
+}
+
+/// Try to extract equi-join column index pairs from an ON expression.
+/// Returns `Some(pairs)` when the expr is `a.col = b.col` (or AND chain
+/// of such equalities), where one side references a left column and the
+/// other a right column.
+fn try_extract_equi_join_indices(
+    expr: &Expr,
+    col_map: &[(String, String, bool)],
+    left_width: usize,
+) -> Option<Vec<(usize, usize)>> {
+    let mut terms = Vec::new();
+    flatten_and_terms(expr, &mut terms);
+    if terms.is_empty() {
+        return None;
+    }
+    let mut pairs = Vec::with_capacity(terms.len());
+    for term in &terms {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } = term
+        else {
+            return None;
+        };
+        let resolve_col = |e: &Expr| -> Option<usize> {
+            if let Expr::Column(col_ref, _) = e {
+                if let Some(table) = &col_ref.table {
+                    col_map.iter().position(|(t, c, _)| {
+                        t.eq_ignore_ascii_case(table) && c.eq_ignore_ascii_case(&col_ref.column)
+                    })
+                } else {
+                    col_map
+                        .iter()
+                        .position(|(_, c, _)| c.eq_ignore_ascii_case(&col_ref.column))
+                }
+            } else {
+                None
+            }
+        };
+        let l_idx = resolve_col(left)?;
+        let r_idx = resolve_col(right)?;
+        if l_idx < left_width && r_idx >= left_width {
+            pairs.push((l_idx, r_idx - left_width));
+        } else if r_idx < left_width && l_idx >= left_width {
+            pairs.push((r_idx, l_idx - left_width));
+        } else {
+            return None;
+        }
+    }
+    Some(pairs)
+}
+
+/// Hash-join: build a multi-map on the right table, probe for each left row.
+/// O(n+m) instead of O(n*m).
+#[allow(clippy::too_many_arguments)]
+fn execute_hash_join(
+    left: &[Vec<SqliteValue>],
+    right: &[Vec<SqliteValue>],
+    right_width: usize,
+    left_width: usize,
+    kind: JoinKind,
+    equi_pairs: &[(usize, usize)],
+    track_right: bool,
+) -> Vec<Vec<SqliteValue>> {
+    let combined_width = left_width + right_width;
+    let mut right_index: HashMap<HashableJoinKey, Vec<usize>> = HashMap::with_capacity(right.len());
+    for (ri, right_row) in right.iter().enumerate() {
+        let key: smallvec::SmallVec<[SqliteValue; 2]> = equi_pairs
+            .iter()
+            .map(|&(_, r_idx)| right_row.get(r_idx).cloned().unwrap_or(SqliteValue::Null))
+            .collect();
+        if key.iter().any(|v| matches!(v, SqliteValue::Null)) {
+            continue;
+        }
+        right_index
+            .entry(HashableJoinKey(key))
+            .or_default()
+            .push(ri);
+    }
+    let mut right_matched = if track_right {
+        vec![false; right.len()]
+    } else {
+        Vec::new()
+    };
+    let mut result = Vec::with_capacity(left.len());
+    for left_row in left {
+        let probe_key: smallvec::SmallVec<[SqliteValue; 2]> = equi_pairs
+            .iter()
+            .map(|&(l_idx, _)| left_row.get(l_idx).cloned().unwrap_or(SqliteValue::Null))
+            .collect();
+        let mut matched = false;
+        if !probe_key.iter().any(|v| matches!(v, SqliteValue::Null)) {
+            if let Some(matching_indices) = right_index.get(&HashableJoinKey(probe_key)) {
+                for &ri in matching_indices {
+                    let right_row = &right[ri];
+                    let mut combined = Vec::with_capacity(combined_width);
+                    combined.extend_from_slice(left_row);
+                    combined.extend_from_slice(&right_row[..right_width]);
+                    result.push(combined);
+                    matched = true;
+                    if track_right {
+                        right_matched[ri] = true;
+                    }
+                }
+            }
+        }
+        if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
+            let mut combined = Vec::with_capacity(combined_width);
+            combined.extend_from_slice(left_row);
+            combined.extend(std::iter::repeat_n(SqliteValue::Null, right_width));
+            result.push(combined);
+        }
+    }
+    if track_right {
+        for (ri, right_row) in right.iter().enumerate() {
+            if !right_matched[ri] {
+                let mut combined = Vec::with_capacity(combined_width);
+                combined.extend(std::iter::repeat_n(SqliteValue::Null, left_width));
+                combined.extend_from_slice(&right_row[..right_width]);
+                result.push(combined);
+            }
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_single_join(
     left: &[Vec<SqliteValue>],
     right: &[Vec<SqliteValue>],
@@ -33204,10 +33532,56 @@ fn execute_single_join(
     constraint: Option<&JoinConstraint>,
     col_map: &[(String, String, bool)],
 ) -> Result<Vec<Vec<SqliteValue>>> {
-    let mut result = Vec::new();
     let combined_width = left_width + right_width;
 
-    // For RIGHT/FULL joins, track which right rows were matched.
+    // ── Hash-join fast path for equi-joins (O(n+m) vs O(n*m)) ──
+    if let Some(JoinConstraint::On(expr)) = constraint {
+        if let Some(equi_pairs) = try_extract_equi_join_indices(expr, col_map, left_width) {
+            let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+            return Ok(execute_hash_join(
+                left,
+                right,
+                right_width,
+                left_width,
+                kind,
+                &equi_pairs,
+                track_right,
+            ));
+        }
+    }
+    if let Some(JoinConstraint::Using(cols)) = constraint {
+        let mut equi_pairs = Vec::with_capacity(cols.len());
+        let mut all_found = true;
+        for col_name in cols {
+            let l_idx = col_map[..left_width]
+                .iter()
+                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name));
+            let r_idx = col_map[left_width..]
+                .iter()
+                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name));
+            if let (Some(l), Some(r)) = (l_idx, r_idx) {
+                equi_pairs.push((l, r));
+            } else {
+                all_found = false;
+                break;
+            }
+        }
+        if all_found && !equi_pairs.is_empty() {
+            let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
+            return Ok(execute_hash_join(
+                left,
+                right,
+                right_width,
+                left_width,
+                kind,
+                &equi_pairs,
+                track_right,
+            ));
+        }
+    }
+
+    // ── Fallback: nested-loop join ──
+    let mut result = Vec::new();
     let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
     let mut right_matched = if track_right {
         vec![false; right.len()]
@@ -33217,7 +33591,6 @@ fn execute_single_join(
 
     let mut scratch = Vec::with_capacity(combined_width);
 
-    // Pre-resolve USING constraint column indices to avoid linear searches per row
     let using_indices = if let Some(JoinConstraint::Using(cols)) = constraint {
         let mut indices = Vec::with_capacity(cols.len());
         let mut complete = true;
@@ -33247,7 +33620,6 @@ fn execute_single_join(
         let mut matched = false;
 
         for (ri, right_row) in right.iter().enumerate() {
-            // Build combined row in scratch buffer to avoid allocation if it fails constraint.
             scratch.clear();
             scratch.extend_from_slice(left_row);
             scratch.extend_from_slice(&right_row[..right_width]);
@@ -33719,7 +34091,7 @@ fn eval_join_expr(
                     .map(sqlite_value_to_text)
                     .collect::<Vec<_>>()
                     .join(" ");
-                return Ok(SqliteValue::Text(text));
+                return Ok(SqliteValue::Text(text.into()));
             }
 
             Err(FrankenError::Internal(format!(
@@ -34170,7 +34542,7 @@ fn literal_to_join_value(lit: &Literal) -> SqliteValue {
     match lit {
         Literal::Integer(n) => SqliteValue::Integer(*n),
         Literal::Float(f) => SqliteValue::Float(*f),
-        Literal::String(s) => SqliteValue::Text(s.clone()),
+        Literal::String(s) => SqliteValue::Text(s.clone().into()),
         Literal::True => SqliteValue::Integer(1),
         Literal::False => SqliteValue::Integer(0),
         _ => SqliteValue::Null,
@@ -34238,7 +34610,7 @@ fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) ->
             } else {
                 let l = sqlite_value_to_text(left);
                 let r = sqlite_value_to_text(right);
-                SqliteValue::Text(format!("{l}{r}"))
+                SqliteValue::Text(format!("{l}{r}").into())
             }
         }
         // IS / IS NOT: NULLEQ semantics (NULL IS NULL = TRUE).
@@ -34571,13 +34943,13 @@ fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
             SqliteValue::Null => SqliteValue::Null,
         }
     } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
-        SqliteValue::Text(val.to_text())
+        SqliteValue::Text(val.to_text().into())
     } else if upper.contains("BLOB") || upper.is_empty() {
         match val {
             SqliteValue::Blob(_) => val,
-            SqliteValue::Text(s) => SqliteValue::Blob(s.into_bytes()),
+            SqliteValue::Text(s) => SqliteValue::Blob(s.into_bytes().into()),
             SqliteValue::Integer(_) | SqliteValue::Float(_) => {
-                SqliteValue::Blob(val.to_text().into_bytes())
+                SqliteValue::Blob(val.to_text().into_bytes().into())
             }
             SqliteValue::Null => SqliteValue::Null,
         }
@@ -34669,14 +35041,14 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         },
         "upper" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
-                SqliteValue::Text(s.to_ascii_uppercase())
+                SqliteValue::Text(s.to_ascii_uppercase().into())
             } else {
                 SqliteValue::Null
             }
         }
         "lower" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
-                SqliteValue::Text(s.to_ascii_lowercase())
+                SqliteValue::Text(s.to_ascii_lowercase().into())
             } else {
                 SqliteValue::Null
             }
@@ -34730,7 +35102,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 Some(SqliteValue::Blob(_)) => "blob",
                 _ => "null",
             };
-            SqliteValue::Text(type_name.to_owned())
+            SqliteValue::Text(type_name.to_owned().into())
         }
         "strftime" => {
             use fsqlite_func::ScalarFunction;
@@ -34820,9 +35192,9 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 let from = sqlite_value_to_text(&args[1]);
                 let to = sqlite_value_to_text(&args[2]);
                 if from.is_empty() {
-                    SqliteValue::Text(s)
+                    SqliteValue::Text(s.into())
                 } else {
-                    SqliteValue::Text(s.replace(&from, &to))
+                    SqliteValue::Text(s.replace(&from, &to.into()))
                 }
             } else {
                 SqliteValue::Null
@@ -34857,13 +35229,13 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                     let end = ((z - 1).max(0) as usize).min(chars.len());
                     let start = start.min(chars.len());
                     if start < end {
-                        SqliteValue::Text(chars[start..end].iter().collect())
+                        SqliteValue::Text(chars[start..end].iter().collect::<String>().into())
                     } else {
-                        SqliteValue::Text(String::new())
+                        SqliteValue::Text(String::new().into())
                     }
                 } else {
                     let idx = ((p2.max(1) - 1) as usize).min(chars.len());
-                    SqliteValue::Text(chars[idx..].iter().collect())
+                    SqliteValue::Text(chars[idx..].iter().collect::<String>().into())
                 }
             } else {
                 SqliteValue::Null
@@ -34888,10 +35260,13 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 let s = sqlite_value_to_text(v);
                 if let Some(chars_arg) = args.get(1) {
                     let chars: Vec<char> = sqlite_value_to_text(chars_arg).chars().collect();
-                    SqliteValue::Text(s.trim_matches(|c: char| chars.contains(&c)).to_owned())
+                    SqliteValue::Text(
+                        s.trim_matches(|c: char| chars.contains(&c.into()))
+                            .to_owned(),
+                    )
                 } else {
                     // C SQLite default: trim spaces only (not all Unicode whitespace).
-                    SqliteValue::Text(s.trim_matches(' ').to_owned())
+                    SqliteValue::Text(s.trim_matches(' ').to_owned().into())
                 }
             } else {
                 SqliteValue::Null
@@ -34907,7 +35282,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                             .to_owned(),
                     )
                 } else {
-                    SqliteValue::Text(s.trim_start_matches(' ').to_owned())
+                    SqliteValue::Text(s.trim_start_matches(' ').to_owned().into())
                 }
             } else {
                 SqliteValue::Null
@@ -34918,9 +35293,12 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 let s = sqlite_value_to_text(v);
                 if let Some(chars_arg) = args.get(1) {
                     let chars: Vec<char> = sqlite_value_to_text(chars_arg).chars().collect();
-                    SqliteValue::Text(s.trim_end_matches(|c: char| chars.contains(&c)).to_owned())
+                    SqliteValue::Text(
+                        s.trim_end_matches(|c: char| chars.contains(&c.into()))
+                            .to_owned(),
+                    )
                 } else {
-                    SqliteValue::Text(s.trim_end_matches(' ').to_owned())
+                    SqliteValue::Text(s.trim_end_matches(' ').to_owned().into())
                 }
             } else {
                 SqliteValue::Null
@@ -34933,7 +35311,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 for byte in b {
                     let _ = write!(hex, "{byte:02X}");
                 }
-                SqliteValue::Text(hex)
+                SqliteValue::Text(hex.into())
             }
             Some(v) => {
                 use std::fmt::Write;
@@ -34942,14 +35320,14 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 for b in s.bytes() {
                     let _ = write!(hex, "{b:02X}");
                 }
-                SqliteValue::Text(hex)
+                SqliteValue::Text(hex.into())
             }
             None => SqliteValue::Null,
         },
         "quote" => match args.first() {
-            Some(SqliteValue::Null) => SqliteValue::Text("NULL".to_owned()),
-            Some(SqliteValue::Integer(n)) => SqliteValue::Text(n.to_string()),
-            Some(v @ SqliteValue::Float(_)) => SqliteValue::Text(v.to_text()),
+            Some(SqliteValue::Null) => SqliteValue::Text("NULL".to_owned().into()),
+            Some(SqliteValue::Integer(n)) => SqliteValue::Text(n.to_string().into()),
+            Some(v @ SqliteValue::Float(_)) => SqliteValue::Text(v.to_text().into()),
             Some(SqliteValue::Text(s)) => SqliteValue::Text(format!("'{}'", s.replace('\'', "''"))),
             Some(SqliteValue::Blob(b)) => {
                 use std::fmt::Write;
@@ -34957,7 +35335,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 for byte in b {
                     let _ = write!(hex, "{byte:02X}");
                 }
-                SqliteValue::Text(format!("X'{hex}'"))
+                SqliteValue::Text(format!("X'{hex}'").into())
             }
             None => SqliteValue::Null,
         },
@@ -34982,7 +35360,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                     }
                 })
                 .collect();
-            SqliteValue::Text(s)
+            SqliteValue::Text(s.into())
         }
         "random" => {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -34998,7 +35376,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         }
         "zeroblob" => {
             let n = args.first().map_or(0, |v| v.to_integer().max(0)) as usize;
-            SqliteValue::Blob(vec![0u8; n])
+            SqliteValue::Blob(vec![0u8; n].into())
         }
         "round" => match args.first() {
             Some(SqliteValue::Float(f)) => {
@@ -35080,7 +35458,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 .filter(|v| !matches!(v, SqliteValue::Null))
                 .map(sqlite_value_to_text)
                 .collect();
-            SqliteValue::Text(parts.concat())
+            SqliteValue::Text(parts.concat().into())
         }
         "concat_ws" => {
             if let Some(sep) = args.first() {
@@ -35093,12 +35471,12 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                     .filter(|v| !matches!(v, SqliteValue::Null))
                     .map(sqlite_value_to_text)
                     .collect();
-                SqliteValue::Text(parts.join(&sep_str))
+                SqliteValue::Text(parts.join(&sep_str.into()))
             } else {
                 SqliteValue::Null
             }
         }
-        "sqlite_version" => SqliteValue::Text("3.52.0".to_owned()),
+        "sqlite_version" => SqliteValue::Text("3.52.0".to_owned().into()),
         "last_insert_rowid" => SqliteValue::Integer(get_last_insert_rowid()),
         "changes" => SqliteValue::Integer(get_last_changes()),
         "total_changes" => SqliteValue::Integer(get_total_changes()),
@@ -67237,11 +67615,11 @@ mod pager_routing_tests {
         let mut found_view = false;
         for row in &rows {
             let name = match &row.values()[1] {
-                SqliteValue::Text(s) => s.as_str(),
+                SqliteValue::Text(s) => s,
                 _ => continue,
             };
             let obj_type = match &row.values()[2] {
-                SqliteValue::Text(s) => s.as_str(),
+                SqliteValue::Text(s) => s,
                 _ => continue,
             };
             if name == "t1" {

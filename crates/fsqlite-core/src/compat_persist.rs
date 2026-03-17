@@ -162,11 +162,11 @@ pub fn persist_to_sqlite(
 
         for (rowid, (name, root_page_num, create_sql)) in master_entries.iter().enumerate() {
             let record = serialize_record(&[
-                SqliteValue::Text("table".to_owned()),
-                SqliteValue::Text(name.clone()),
-                SqliteValue::Text(name.clone()),
+                SqliteValue::Text("table".to_owned().into()),
+                SqliteValue::Text(name.clone().into()),
+                SqliteValue::Text(name.clone().into()),
                 SqliteValue::Integer(i64::from(*root_page_num)),
-                SqliteValue::Text(create_sql.clone()),
+                SqliteValue::Text(create_sql.clone().into()),
             ]);
             #[allow(clippy::cast_possible_wrap)]
             let rid = (rowid as i64) + 1;
@@ -269,7 +269,7 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             continue;
         }
         let entry_type = match &entry[0] {
-            SqliteValue::Text(s) => s.as_str(),
+            SqliteValue::Text(s) => s,
             _ => continue,
         };
         if entry_type != "table" {
@@ -318,9 +318,9 @@ pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
             i32::try_from(root_page_u32).expect("validated root page must fit MemDatabase");
         db.create_table_at(real_root_page, num_columns);
 
-        let table_name_for_err = name.clone();
+        let table_name_for_err = name.to_string();
         schema.push(TableSchema {
-            name,
+            name: name.to_string(),
             root_page: real_root_page,
             columns,
             indexes: indexes.clone(),
