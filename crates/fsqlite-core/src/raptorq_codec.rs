@@ -289,6 +289,65 @@ fn derive_native_request_cx(cx: &Cx) -> (Cx, AsCx) {
     (codec_cx, native_cx)
 }
 
+fn decode_object_params(
+    object_id: AsObjectId,
+    k_source: u32,
+    symbol_size: u32,
+    max_block_size: usize,
+) -> Result<ObjectParams> {
+    let object_size = u64::from(k_source)
+        .checked_mul(u64::from(symbol_size))
+        .ok_or_else(|| FrankenError::OutOfRange {
+            what: "object_size for decode params".to_owned(),
+            value: format!("{k_source}*{symbol_size}"),
+        })?;
+    let symbol_size_u16 = u16::try_from(symbol_size).map_err(|_| FrankenError::OutOfRange {
+        what: "symbol_size as u16".to_owned(),
+        value: symbol_size.to_string(),
+    })?;
+    if object_size == 0 {
+        return Ok(ObjectParams::new(object_id, 0, symbol_size_u16, 0, 0));
+    }
+    if max_block_size == 0 {
+        return Err(FrankenError::OutOfRange {
+            what: "max_block_size (must be > 0)".to_owned(),
+            value: "0".to_owned(),
+        });
+    }
+
+    let max_block_size_u64 =
+        u64::try_from(max_block_size).map_err(|_| FrankenError::OutOfRange {
+            what: "max_block_size as u64".to_owned(),
+            value: max_block_size.to_string(),
+        })?;
+    let source_blocks = u16::try_from(object_size.div_ceil(max_block_size_u64)).map_err(|_| {
+        FrankenError::OutOfRange {
+            what: "source_blocks as u16".to_owned(),
+            value: object_size.div_ceil(max_block_size_u64).to_string(),
+        }
+    })?;
+    let symbols_per_block = u16::try_from(
+        object_size
+            .min(max_block_size_u64)
+            .div_ceil(u64::from(symbol_size_u16)),
+    )
+    .map_err(|_| FrankenError::OutOfRange {
+        what: "symbols_per_block as u16".to_owned(),
+        value: object_size
+            .min(max_block_size_u64)
+            .div_ceil(u64::from(symbol_size_u16))
+            .to_string(),
+    })?;
+
+    Ok(ObjectParams::new(
+        object_id,
+        object_size,
+        symbol_size_u16,
+        source_blocks,
+        symbols_per_block,
+    ))
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_lossless,
@@ -380,36 +439,7 @@ impl SymbolCodec for AsupersyncCodec {
         let mut config = RaptorQConfig::default();
         config.encoding.symbol_size = symbol_size as u16;
         config.encoding.max_block_size = self.max_block_size;
-
-        // `SymbolCodec::decode` only carries `k_source` + `symbol_size`, not the
-        // encoder's block partitioning. Reconstruct the same single-block object
-        // geometry that the current encoder metadata can faithfully describe.
-        let source_blocks = 1_u16;
-        let symbols_per_block = k_source.max(1);
-        let object_size = u64::from(k_source)
-            .checked_mul(u64::from(symbol_size))
-            .ok_or_else(|| FrankenError::OutOfRange {
-                what: "object_size for decode params".to_owned(),
-                value: format!("{k_source}*{symbol_size}"),
-            })?;
-        let params = ObjectParams::new(
-            object_id,
-            object_size,
-            u16::try_from(symbol_size).map_err(|_| FrankenError::OutOfRange {
-                what: "symbol_size as u16".to_owned(),
-                value: symbol_size.to_string(),
-            })?,
-            source_blocks
-                .try_into()
-                .map_err(|_| FrankenError::OutOfRange {
-                    what: "source_blocks".to_owned(),
-                    value: source_blocks.to_string(),
-                })?,
-            u16::try_from(symbols_per_block).map_err(|_| FrankenError::OutOfRange {
-                what: "symbols_per_block as u16".to_owned(),
-                value: symbols_per_block.to_string(),
-            })?,
-        );
+        let params = decode_object_params(object_id, k_source, symbol_size, self.max_block_size)?;
 
         let mut rebuilt = Vec::with_capacity(symbols.len());
         for (packed, data) in symbols {
@@ -677,6 +707,37 @@ mod tests {
             high.repair_symbols.len(),
             low.repair_symbols.len()
         );
+    }
+
+    #[test]
+    fn test_codec_decode_multiple_source_blocks_roundtrip() {
+        let codec = AsupersyncCodec::new(1024);
+        let cx = test_cx();
+        let data = vec![0x5A_u8; 3 * 1024];
+        let symbol_size = 512_u32;
+
+        let encoded = codec.encode(&cx, &data, symbol_size, 1.25).unwrap();
+        assert!(
+            encoded.source_symbols.iter().any(|(packed, _)| {
+                let (_, sbn, _) = unpack_symbol_key(*packed);
+                sbn > 0
+            }),
+            "test data should span multiple source blocks"
+        );
+
+        let decoded = codec
+            .decode(&cx, &encoded.source_symbols, encoded.k_source, symbol_size)
+            .unwrap();
+        match decoded {
+            CodecDecodeResult::Success {
+                data: recovered, ..
+            } => {
+                assert_eq!(recovered, data);
+            }
+            CodecDecodeResult::Failure { reason, .. } => {
+                panic!("multi-block decode failed: {reason:?}");
+            }
+        }
     }
 
     #[test]

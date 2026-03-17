@@ -238,6 +238,9 @@ impl FecCommitHook {
 
     /// Enable or disable FEC encoding.
     pub fn set_enabled(&mut self, enabled: bool) {
+        if !enabled {
+            self.discard_buffered();
+        }
         self.enabled = enabled;
     }
 
@@ -576,6 +579,20 @@ mod tests {
         assert!(result.is_some(), "re-enabled hook should produce symbols");
     }
 
+    #[test]
+    fn test_hook_disable_discards_buffered_pages() {
+        let cx = test_cx();
+        let mut hook = FecCommitHook::new(default_config()).unwrap();
+
+        hook.on_frame(&cx, 1, &sample_page(0x10, 512), 0).unwrap();
+        hook.set_enabled(false);
+        hook.set_enabled(true);
+
+        let result = hook.on_frame(&cx, 2, &sample_page(0x20, 512), 2).unwrap();
+        let commit = result.expect("re-enabled hook should encode only new frames");
+        assert_eq!(commit.page_numbers, vec![2]);
+    }
+
     // -- FEC recovery round-trip test --
 
     #[test]
@@ -604,6 +621,51 @@ mod tests {
             }
             DecodeOutcome::Failure(fail) => {
                 panic!("FEC recovery failed: {:?}", fail.reason);
+            }
+        }
+    }
+
+    #[test]
+    fn test_fec_encode_then_recover_multiple_source_blocks() {
+        let cx = test_cx();
+        let config = PipelineConfig {
+            max_block_size: 1024,
+            ..default_config()
+        };
+        let mut hook = FecCommitHook::new(config.clone()).unwrap();
+
+        let page1 = sample_page(0xA1, 512);
+        let page2 = sample_page(0xB2, 512);
+        let page3 = sample_page(0xC3, 512);
+        let page4 = sample_page(0xD4, 512);
+        hook.on_frame(&cx, 1, &page1, 0).unwrap();
+        hook.on_frame(&cx, 2, &page2, 0).unwrap();
+        hook.on_frame(&cx, 3, &page3, 0).unwrap();
+        let result = hook.on_frame(&cx, 4, &page4, 4).unwrap();
+        let commit = result.expect("commit");
+
+        assert!(
+            commit.symbols.iter().any(|(packed, _)| {
+                let (_, sbn, _) = crate::raptorq_codec::unpack_symbol_key(*packed);
+                sbn > 0
+            }),
+            "encoded commit should span multiple source blocks"
+        );
+
+        let symbol_map: BTreeMap<u32, Vec<u8>> = commit.symbols.into_iter().collect();
+        let outcome = attempt_fec_recovery(&cx, &config, symbol_map, commit.k_source).unwrap();
+
+        match outcome {
+            DecodeOutcome::Success(success) => {
+                let mut expected = Vec::new();
+                expected.extend_from_slice(&page1);
+                expected.extend_from_slice(&page2);
+                expected.extend_from_slice(&page3);
+                expected.extend_from_slice(&page4);
+                assert_eq!(success.data, expected);
+            }
+            DecodeOutcome::Failure(fail) => {
+                panic!("multi-block FEC recovery failed: {:?}", fail.reason);
             }
         }
     }
