@@ -890,13 +890,18 @@ impl SharedTxnPageIo {
 
         let mut handle = ctx.handle.lock();
         if concurrent_page_state(&handle, PageNumber::ONE).is_synthetic_conflict_only() {
-            concurrent_clear_page_state(&mut handle, &ctx.lock_table, ctx.session_id, PageNumber::ONE)
-                .map_err(|restore_error| {
-                    FrankenError::Internal(format!(
-                        "MVCC pending commit surface clear failed for page {} during {operation}: {restore_error}",
-                        PageNumber::ONE.get()
-                    ))
-                })?;
+            concurrent_clear_page_state(
+                &mut handle,
+                &ctx.lock_table,
+                ctx.session_id,
+                PageNumber::ONE,
+            )
+            .map_err(|restore_error| {
+                FrankenError::Internal(format!(
+                    "MVCC pending commit surface clear failed for page {} during {operation}: {restore_error}",
+                    PageNumber::ONE.get()
+                ))
+            })?;
         }
 
         Ok(())
@@ -8370,6 +8375,8 @@ impl VdbeEngine {
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     fn get_reg(&self, r: i32) -> &SqliteValue {
         if r >= 0 && (r as usize) < self.registers.len() {
             &self.registers[r as usize]

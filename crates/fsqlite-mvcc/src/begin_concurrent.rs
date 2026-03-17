@@ -666,6 +666,22 @@ impl ConcurrentRegistry {
                 .is_none_or(|writer| writer.commit_seq <= begin_seq)
     }
 
+    fn can_use_uncontended_finalize_fast_path(
+        &self,
+        session_id: u64,
+        begin_seq: CommitSeq,
+    ) -> bool {
+        (self.active.is_empty() || (self.active.len() == 1 && self.active.contains_key(&session_id)))
+            && self
+                .committed_readers
+                .last()
+                .is_none_or(|reader| reader.commit_seq <= begin_seq)
+            && self
+                .committed_writers
+                .last()
+                .is_none_or(|writer| writer.commit_seq <= begin_seq)
+    }
+
     /// Prune committed SSI history that cannot overlap any active transaction.
     fn prune_committed_conflict_history(&mut self) {
         let Some(min_active_begin) = self.history_retention_horizon() else {
@@ -1282,6 +1298,7 @@ pub struct PreparedConcurrentCommit {
     incoming_edges: Vec<DiscoveredEdge>,
     outgoing_edges: Vec<DiscoveredEdge>,
     dro_t3_decision: Option<crate::ssi_abort_policy::DroHotPathDecision>,
+    used_uncontended_prepare_fast_path: bool,
 }
 
 impl PreparedConcurrentCommit {
@@ -1313,6 +1330,11 @@ impl PreparedConcurrentCommit {
     #[must_use]
     pub const fn has_out_rw(&self) -> bool {
         self.has_out_rw
+    }
+
+    #[must_use]
+    pub const fn used_uncontended_prepare_fast_path(&self) -> bool {
+        self.used_uncontended_prepare_fast_path
     }
 
     #[must_use]
@@ -1787,6 +1809,7 @@ pub fn prepare_concurrent_commit_with_ssi(
             incoming_edges: Vec::new(),
             outgoing_edges: Vec::new(),
             dro_t3_decision: None,
+            used_uncontended_prepare_fast_path: true,
         });
     }
 
@@ -1879,6 +1902,7 @@ pub fn prepare_concurrent_commit_with_ssi(
         incoming_edges,
         outgoing_edges,
         dro_t3_decision,
+        used_uncontended_prepare_fast_path: false,
     })
 }
 
@@ -1902,6 +1926,43 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
     let Some(txn_id) = TxnId::new(prepared.session_id) else {
         return;
     };
+
+    if prepared.used_uncontended_prepare_fast_path()
+        && registry.can_use_uncontended_finalize_fast_path(prepared.session_id, prepared.begin_seq)
+    {
+        let mut mark_committed = false;
+        if let Some(handle) = registry.get_mut(prepared.session_id) {
+            if handle.is_active() {
+                handle.has_in_rw.set(false);
+                handle.has_out_rw.set(false);
+                mark_committed = true;
+            } else {
+                tracing::warn!(
+                    session_id = prepared.session_id,
+                    "finalize_prepared_concurrent_commit_with_ssi: uncontended fast-path session inactive during finalize; applying commit-index/lock-table side effects"
+                );
+            }
+        } else {
+            tracing::warn!(
+                session_id = prepared.session_id,
+                "finalize_prepared_concurrent_commit_with_ssi: uncontended fast-path session missing during finalize; applying commit-index/lock-table side effects"
+            );
+        }
+
+        for &page in &prepared.write_set_pages {
+            commit_index.update(page, committed_seq);
+        }
+        lock_table.release_all(txn_id);
+        if mark_committed {
+            if let Some(mut handle) = registry.get_mut(prepared.session_id) {
+                if handle.is_active() {
+                    handle.mark_committed();
+                }
+            }
+        }
+        registry.prune_committed_conflict_history();
+        return;
+    }
 
     // Re-scan against current active state to capture overlap edges that may
     // appear after prepare but before finalize. This keeps committed pivot
@@ -3212,6 +3273,85 @@ mod tests {
             None,
             "uncontended fast path should bypass DRO evaluation"
         );
+        assert!(
+            prepared.used_uncontended_prepare_fast_path(),
+            "prepare should tag uncontended plans so finalize can re-check for the matching fast path"
+        );
+    }
+
+    #[test]
+    fn test_finalize_uncontended_fast_path_skips_ssi_history_when_still_uncontended() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let session_id = registry.begin_concurrent(test_snapshot(11)).unwrap();
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            handle.record_read(test_page(7));
+            concurrent_write_page(
+                &mut handle,
+                &lock_table,
+                session_id,
+                test_page(9),
+                test_data(),
+            )
+            .unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            session_id,
+            CommitSeq::new(12),
+        )
+        .expect("prepare should succeed");
+
+        assert!(
+            prepared.used_uncontended_prepare_fast_path(),
+            "setup should hit the uncontended prepare fast path"
+        );
+
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &prepared,
+            CommitSeq::new(12),
+        );
+
+        let committed = registry.get(session_id).expect("committed handle");
+        assert!(
+            !committed.has_in_rw() && !committed.has_out_rw(),
+            "uncontended finalize should not manufacture SSI edges"
+        );
+        drop(committed);
+
+        assert_eq!(
+            commit_index.latest(test_page(9)),
+            Some(CommitSeq::new(12)),
+            "finalize must still publish the committed page version"
+        );
+        assert!(
+            registry.committed_readers.is_empty(),
+            "uncontended finalize should skip committed reader history publication"
+        );
+        assert!(
+            registry.committed_writers.is_empty(),
+            "uncontended finalize should skip committed writer history publication"
+        );
+
+        let next_session = registry.begin_concurrent(test_snapshot(12)).unwrap();
+        let mut next_handle = registry.get_mut(next_session).unwrap();
+        concurrent_write_page(
+            &mut next_handle,
+            &lock_table,
+            next_session,
+            test_page(9),
+            test_data(),
+        )
+        .expect("uncontended finalize must still release the page lock");
     }
 
     #[test]
