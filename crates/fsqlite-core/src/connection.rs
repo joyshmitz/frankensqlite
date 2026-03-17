@@ -221,6 +221,7 @@ static FSQLITE_BACKGROUND_STATUS_CHECKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_OP_CX_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_SCHEMA_REFRESHES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PAGER_PUBLICATION_REFRESHES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParserHotPathProfileSnapshot {
@@ -244,6 +245,7 @@ pub struct HotPathProfileSnapshot {
     pub op_cx_background_gates: u64,
     pub statement_dispatch_background_gates: u64,
     pub prepared_schema_refreshes: u64,
+    pub pager_publication_refreshes: u64,
     pub record_decode: RecordHotPathProfileSnapshot,
     pub vdbe: VdbeMetricsSnapshot,
 }
@@ -275,6 +277,7 @@ pub fn reset_hot_path_profile() {
     FSQLITE_OP_CX_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_SCHEMA_REFRESHES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PAGER_PUBLICATION_REFRESHES.store(0, AtomicOrdering::Relaxed);
     reset_record_profile();
     reset_vdbe_metrics();
 }
@@ -299,7 +302,8 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         op_cx_background_gates: FSQLITE_OP_CX_BACKGROUND_GATES.load(AtomicOrdering::Relaxed),
         statement_dispatch_background_gates: FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES
             .load(AtomicOrdering::Relaxed),
-        prepared_schema_refreshes: FSQLITE_PREPARED_SCHEMA_REFRESHES
+        prepared_schema_refreshes: FSQLITE_PREPARED_SCHEMA_REFRESHES.load(AtomicOrdering::Relaxed),
+        pager_publication_refreshes: FSQLITE_PAGER_PUBLICATION_REFRESHES
             .load(AtomicOrdering::Relaxed),
         record_decode: record_profile_snapshot(),
         vdbe: vdbe_metrics_snapshot(),
@@ -4066,9 +4070,10 @@ impl Connection {
 
     /// Capture a time-travel snapshot of the current database state.
     ///
-    /// Called after a successful COMMIT (explicit or autocommit) to record the
-    /// database state at the given commit sequence number. The snapshot is stored
-    /// in a bounded ring buffer; oldest entries are evicted when full.
+    /// Called after successful commit paths that retain `:memory:` history to
+    /// record the database state at the given commit sequence number. The
+    /// snapshot is stored in a bounded ring buffer; oldest entries are evicted
+    /// when full.
     ///
     /// These snapshots are only retained for `:memory:` connections. File-backed
     /// databases should source historical reads from MVCC/WAL state rather than
@@ -4113,8 +4118,19 @@ impl Connection {
         scenario_id: &'static str,
     ) -> Result<BoundPagerPublication> {
         let started = Instant::now();
+        let snapshot = if self.pager.is_memory() {
+            // In-memory connections are process-local and cannot be invalidated
+            // by an external pager instance, so the published plane is already
+            // authoritative for stale checks and MVCC snapshot binding.
+            self.pager.published_snapshot()
+        } else {
+            if hot_path_profile_enabled() {
+                FSQLITE_PAGER_PUBLICATION_REFRESHES.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            self.pager.refresh_published_snapshot(cx)?
+        };
         let publication = BoundPagerPublication {
-            snapshot: self.pager.refresh_published_snapshot(cx)?,
+            snapshot,
             read_retry_count: self.pager.published_read_retry_count(),
         };
         tracing::trace!(
@@ -4686,6 +4702,7 @@ impl Connection {
                     dispatch.rollback_on_constraint_violation,
                     dispatch.preserve_prior_changes_on_constraint_violation,
                     p,
+                    false,
                 ),
             };
         }
@@ -4728,6 +4745,7 @@ impl Connection {
         rollback_on_constraint_violation: bool,
         preserve_prior_changes_on_constraint_violation: bool,
         params: Option<&[SqliteValue]>,
+        capture_time_travel_snapshot: bool,
     ) -> Result<usize> {
         self.clear_table_program_error_state();
         self.sync_change_tracking_context();
@@ -4807,7 +4825,7 @@ impl Connection {
                 Err(error) if error_is_constraint_violation(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
-        self.resolve_autocommit_txn(was_auto, ok)?;
+        self.resolve_autocommit_txn_with_capture(was_auto, ok, capture_time_travel_snapshot)?;
         let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let failure_diag = match result.as_ref() {
             Ok(_) => Cow::Borrowed("none"),
@@ -5464,6 +5482,10 @@ impl Connection {
                 // `PRAGMA wal_checkpoint`) manage their own pager operations.
                 | Statement::Pragma(_)
         );
+        let capture_time_travel_snapshot = !matches!(
+            statement.as_ref(),
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        );
         let was_auto = if is_txn_control {
             false // transaction-control manages its own transactions
         } else if is_write {
@@ -5538,7 +5560,7 @@ impl Connection {
                 Err(error) if error_is_constraint_violation(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
-        self.resolve_autocommit_txn(was_auto, ok)?;
+        self.resolve_autocommit_txn_with_capture(was_auto, ok, capture_time_travel_snapshot)?;
         let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if let Some(statement_reuse_sql) = statement_reuse_sql.as_deref() {
             let failure_diag = match result.as_ref() {
@@ -6576,7 +6598,7 @@ impl Connection {
                 Err(error) if error_is_constraint_violation(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
-        self.resolve_autocommit_txn(was_auto, ok)?;
+        self.resolve_autocommit_txn_with_capture(was_auto, ok, false)?;
         result
     }
 
@@ -9389,7 +9411,21 @@ impl Connection {
 
     /// Finalize an implicit (autocommit) transaction: commit on success,
     /// rollback on error.  No-op when `was_auto` is `false`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn resolve_autocommit_txn(&self, was_auto: bool, ok: bool) -> Result<()> {
+        self.resolve_autocommit_txn_with_capture(was_auto, ok, true)
+    }
+
+    /// Finalize an implicit (autocommit) transaction: commit on success,
+    /// rollback on error. `capture_time_travel_snapshot` controls whether
+    /// successful writes retain a `:memory:` historical snapshot for
+    /// `FOR SYSTEM_TIME AS OF`.
+    fn resolve_autocommit_txn_with_capture(
+        &self,
+        was_auto: bool,
+        ok: bool,
+        capture_time_travel_snapshot: bool,
+    ) -> Result<()> {
         if !was_auto {
             return Ok(());
         }
@@ -9556,7 +9592,9 @@ impl Connection {
         if committed_write {
             if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
                 self.emit_differential_commit_invalidations(committed_seq);
-                self.capture_time_travel_snapshot(committed_seq.get());
+                if capture_time_travel_snapshot {
+                    self.capture_time_travel_snapshot(committed_seq.get());
+                }
             }
             self.maybe_run_adaptive_autocheckpoint();
         }
@@ -63644,6 +63682,32 @@ mod pager_routing_tests {
         );
     }
 
+    #[test]
+    fn test_memory_autocommit_insert_skips_pager_publication_refresh() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE mem_pub_fast (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        reset_hot_path_profile();
+        let affected = conn
+            .execute_with_params(
+                "INSERT INTO mem_pub_fast (id, val) VALUES (?1, ?2)",
+                &[
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alpha".to_owned()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(affected, 1);
+
+        let profile = hot_path_profile_snapshot();
+        assert_eq!(
+            profile.pager_publication_refreshes, 0,
+            "autocommit :memory: writes should not force file-backed publication refreshes: {profile:?}"
+        );
+    }
+
     #[cfg(test)]
     use proptest::{prop_assert, prop_assert_eq};
 
@@ -65090,6 +65154,35 @@ mod pager_routing_tests {
         assert!(
             snaps.is_empty(),
             "file-backed connections should not retain MemDatabase time-travel snapshots"
+        );
+    }
+
+    #[test]
+    fn autocommit_dml_skips_memdb_time_travel_snapshot_capture() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let snapshot_count_after_ddl = conn.time_travel_snapshots.borrow().len();
+        assert_eq!(
+            snapshot_count_after_ddl, 1,
+            "autocommit DDL should still retain the schema snapshot for time-travel"
+        );
+
+        conn.execute("INSERT INTO t VALUES (1, 'hello');").unwrap();
+        conn.execute("UPDATE t SET val = 'world' WHERE id = 1;")
+            .unwrap();
+        conn.execute("DELETE FROM t WHERE id = 1;").unwrap();
+
+        let snapshots = conn.time_travel_snapshots.borrow();
+        assert_eq!(
+            snapshots.len(),
+            snapshot_count_after_ddl,
+            "ordinary autocommit DML should not clone MemDatabase history on every statement"
+        );
+        assert_eq!(
+            snapshots[0].commit_seq, 1,
+            "the retained snapshot should still be the post-DDL schema state"
         );
     }
 
