@@ -47,6 +47,7 @@ struct VerifyProofInput {
 struct ShellOptions {
     show_prompts: bool,
     colorize_prompts: bool,
+    fail_on_error: bool,
 }
 
 impl ShellOptions {
@@ -55,6 +56,7 @@ impl ShellOptions {
         Self {
             show_prompts: true,
             colorize_prompts: false,
+            fail_on_error: false,
         }
     }
 
@@ -62,6 +64,7 @@ impl ShellOptions {
         Self {
             show_prompts: false,
             colorize_prompts: false,
+            fail_on_error: true,
         }
     }
 }
@@ -70,6 +73,12 @@ impl ShellOptions {
 enum ShellFlow {
     Continue,
     Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellOutcome {
+    flow: ShellFlow,
+    had_error: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +98,7 @@ fn main() {
     let shell_options = ShellOptions {
         show_prompts: interactive_input && interactive_output,
         colorize_prompts: interactive_output,
+        fail_on_error: !interactive_input,
     };
 
     let exit_code = run_with_shell_options(
@@ -428,8 +438,8 @@ where
         err,
         ShellOptions::batch(),
     ) {
-        Some(_) => 0,
-        None => 1,
+        Some(outcome) if !outcome.had_error => 0,
+        Some(_) | None => 1,
     }
 }
 
@@ -447,8 +457,8 @@ where
     E: Write,
 {
     match run_shell(connection, current_db_path, input, out, err, shell_options) {
-        Some(_) => 0,
-        None => 1,
+        Some(outcome) if !(shell_options.fail_on_error && outcome.had_error) => 0,
+        Some(_) | None => 1,
     }
 }
 
@@ -459,7 +469,7 @@ fn run_shell<R, W, E>(
     out: &mut W,
     err: &mut E,
     shell_options: ShellOptions,
-) -> Option<ShellFlow>
+) -> Option<ShellOutcome>
 where
     R: BufRead,
     W: Write,
@@ -467,6 +477,7 @@ where
 {
     let mut pending_sql = String::new();
     let mut line_buffer = String::new();
+    let mut had_error = false;
 
     loop {
         if shell_options.show_prompts {
@@ -497,9 +508,12 @@ where
 
         if bytes_read == 0 {
             if !pending_sql.trim().is_empty() {
-                let _ = execute_sql(connection, pending_sql.trim(), out, err);
+                had_error |= !execute_sql(connection, pending_sql.trim(), out, err);
             }
-            return Some(ShellFlow::Continue);
+            return Some(ShellOutcome {
+                flow: ShellFlow::Continue,
+                had_error,
+            });
         }
 
         let line = line_buffer.trim_end_matches(['\n', '\r']);
@@ -507,7 +521,10 @@ where
 
         if pending_sql.trim().is_empty() {
             if matches!(trimmed, ".exit" | ".quit") {
-                return Some(ShellFlow::Exit);
+                return Some(ShellOutcome {
+                    flow: ShellFlow::Exit,
+                    had_error,
+                });
             }
 
             if trimmed == ".help" {
@@ -524,10 +541,16 @@ where
                 out,
                 err,
                 shell_options,
+                &mut had_error,
             ) {
                 DotCommandResult::NotHandled => {}
                 DotCommandResult::Continue => continue,
-                DotCommandResult::Exit => return Some(ShellFlow::Exit),
+                DotCommandResult::Exit => {
+                    return Some(ShellOutcome {
+                        flow: ShellFlow::Exit,
+                        had_error,
+                    });
+                }
             }
 
             if trimmed.is_empty() {
@@ -541,7 +564,7 @@ where
         pending_sql.push_str(line);
 
         if statement_complete(&pending_sql) {
-            let _ = execute_sql(connection, pending_sql.trim(), out, err);
+            had_error |= !execute_sql(connection, pending_sql.trim(), out, err);
             pending_sql.clear();
         }
     }
@@ -676,6 +699,7 @@ fn try_execute_dot_command<W, E>(
     out: &mut W,
     err: &mut E,
     shell_options: ShellOptions,
+    had_error: &mut bool,
 ) -> DotCommandResult
 where
     W: Write,
@@ -684,6 +708,7 @@ where
     if let Some(arg) = dot_command_arg(trimmed, ".read") {
         let Some(path) = parse_optional_quoted_arg(arg) else {
             let _ = writeln!(err, "error: .read requires a file path");
+            *had_error = true;
             return DotCommandResult::Continue;
         };
 
@@ -699,14 +724,23 @@ where
                     ShellOptions {
                         show_prompts: false,
                         colorize_prompts: shell_options.colorize_prompts,
+                        fail_on_error: shell_options.fail_on_error,
                     },
                 ) {
-                    Some(ShellFlow::Continue) | None => {}
-                    Some(ShellFlow::Exit) => return DotCommandResult::Exit,
+                    Some(outcome) => {
+                        *had_error |= outcome.had_error;
+                        if outcome.flow == ShellFlow::Exit {
+                            return DotCommandResult::Exit;
+                        }
+                    }
+                    None => {
+                        *had_error = true;
+                    }
                 }
             }
             Err(error) => {
                 let _ = writeln!(err, "error: {error}");
+                *had_error = true;
             }
         }
         return DotCommandResult::Continue;
@@ -715,6 +749,7 @@ where
     if let Some(arg) = dot_command_arg(trimmed, ".open") {
         let Some(path) = parse_optional_quoted_arg(arg) else {
             let _ = writeln!(err, "error: .open requires a database path");
+            *had_error = true;
             return DotCommandResult::Continue;
         };
 
@@ -725,6 +760,7 @@ where
             }
             Err(error) => {
                 let _ = writeln!(err, "error: {error}");
+                *had_error = true;
             }
         }
         return DotCommandResult::Continue;
@@ -734,6 +770,7 @@ where
         let filter = parse_optional_quoted_arg(arg);
         if let Err(error) = write_schema(connection, filter.as_deref(), out) {
             let _ = writeln!(err, "error: {error}");
+            *had_error = true;
         }
         return DotCommandResult::Continue;
     }
@@ -742,6 +779,7 @@ where
         let filter = parse_optional_quoted_arg(arg);
         if let Err(error) = write_dump(connection, filter.as_deref(), out) {
             let _ = writeln!(err, "error: {error}");
+            *had_error = true;
         }
         return DotCommandResult::Continue;
     }
@@ -1361,6 +1399,43 @@ mod tests {
         assert!(
             !stdout.contains("fsqlite> ") && !stdout.contains("   ...> "),
             "batch mode should not render prompts, got: {stdout}",
+        );
+    }
+
+    #[test]
+    fn test_command_mode_sql_error_returns_failure_exit_code() {
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![
+            OsString::from("fsqlite"),
+            OsString::from("-c"),
+            OsString::from("SELECT * FROM missing_table;"),
+        ];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+        assert_eq!(exit_code, 1);
+        let stderr = String::from_utf8(err).expect("stderr should be utf-8");
+        assert!(
+            stderr.contains("missing_table") || stderr.contains("no such table"),
+            "expected SQL failure in stderr, got: {stderr}",
+        );
+    }
+
+    #[test]
+    fn test_batch_mode_read_error_returns_failure_exit_code() {
+        let mut input = Cursor::new(b".read /definitely/missing/path.sql\n".to_vec());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code =
+            run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch());
+        assert_eq!(exit_code, 1);
+        let stderr = String::from_utf8(err).expect("stderr should be utf-8");
+        assert!(
+            stderr.contains("error:"),
+            "expected .read failure in stderr, got: {stderr}",
         );
     }
 
