@@ -671,7 +671,8 @@ impl ConcurrentRegistry {
         session_id: u64,
         begin_seq: CommitSeq,
     ) -> bool {
-        (self.active.is_empty() || (self.active.len() == 1 && self.active.contains_key(&session_id)))
+        (self.active.is_empty()
+            || (self.active.len() == 1 && self.active.contains_key(&session_id)))
             && self
                 .committed_readers
                 .last()

@@ -519,6 +519,7 @@ impl SqliteValue {
     /// - NULL propagates (NULL + x = NULL).
     /// - Text/Blob coerced via `numericType()`: if both parse as integer,
     ///   integer math is used (SQLite VDBE:1932-1934).
+    #[inline]
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn sql_add(&self, other: &Self) -> Self {
@@ -546,6 +547,7 @@ impl SqliteValue {
     /// Subtract two values following SQLite's overflow semantics.
     ///
     /// Integer - Integer with overflow promotes to REAL.
+    #[inline]
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn sql_sub(&self, other: &Self) -> Self {
@@ -570,6 +572,7 @@ impl SqliteValue {
     /// Multiply two values following SQLite's overflow semantics.
     ///
     /// Integer * Integer with overflow promotes to REAL.
+    #[inline]
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn sql_mul(&self, other: &Self) -> Self {
