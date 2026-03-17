@@ -410,7 +410,7 @@ mod tests {
             for a in args {
                 out.push_str(&a.to_text());
             }
-            Ok(SqliteValue::Text(out))
+            Ok(SqliteValue::Text(out.into()))
         }
 
         fn num_args(&self) -> i32 {
@@ -570,12 +570,12 @@ mod tests {
             .expect("variadic fallback");
         assert_eq!(
             f.invoke(&[
-                SqliteValue::Text("a".to_owned()),
-                SqliteValue::Text("b".to_owned()),
-                SqliteValue::Text("c".to_owned()),
+                SqliteValue::Text("a".into()),
+                SqliteValue::Text("b".into()),
+                SqliteValue::Text("c".into()),
             ])
             .unwrap(),
-            SqliteValue::Text("abc".to_owned())
+            SqliteValue::Text("abc".into())
         );
     }
 

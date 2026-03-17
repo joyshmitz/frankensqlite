@@ -1086,7 +1086,7 @@ mod tests {
 
     #[test]
     fn test_blob_input_returns_null() {
-        let blob = SqliteValue::Blob(vec![b'1', b'2']);
+        let blob = SqliteValue::Blob(vec![b'1', b'2'].into());
         assert_null(&SqrtFunc.invoke(std::slice::from_ref(&blob)).unwrap());
         assert_null(&CeilFunc.invoke(std::slice::from_ref(&blob)).unwrap());
         assert_null(&Atan2Func.invoke(&[blob.clone(), float(1.0)]).unwrap());

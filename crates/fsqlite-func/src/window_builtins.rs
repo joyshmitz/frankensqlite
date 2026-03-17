@@ -1103,7 +1103,7 @@ fn window_group_concat_step(state: &mut WindowGroupConcatState, args: &[SqliteVa
 
 fn window_group_concat_value(state: &WindowGroupConcatState) -> SqliteValue {
     if state.has_value {
-        SqliteValue::Text(state.result.clone())
+        SqliteValue::Text(state.result.clone().into())
     } else {
         SqliteValue::Null
     }
@@ -1241,7 +1241,7 @@ mod tests {
     }
 
     fn text(s: &str) -> SqliteValue {
-        SqliteValue::Text(s.to_owned())
+        SqliteValue::Text(s.into())
     }
 
     fn null() -> SqliteValue {

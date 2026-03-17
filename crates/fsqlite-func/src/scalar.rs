@@ -123,7 +123,7 @@ mod tests {
             for arg in args {
                 result.push_str(&arg.to_text());
             }
-            Ok(SqliteValue::Text(result))
+            Ok(SqliteValue::Text(result.into()))
         }
 
         fn num_args(&self) -> i32 {
@@ -198,7 +198,7 @@ mod tests {
         assert!(f.invoke(&[SqliteValue::Null]).unwrap().is_null());
         // Text (numeric coercion)
         assert_eq!(
-            f.invoke(&[SqliteValue::Text("99".to_owned())]).unwrap(),
+            f.invoke(&[SqliteValue::Text("99".into())]).unwrap(),
             SqliteValue::Integer(100)
         );
     }
@@ -218,23 +218,23 @@ mod tests {
         assert_eq!(f.num_args(), -1);
 
         // 0 args
-        assert_eq!(f.invoke(&[]).unwrap(), SqliteValue::Text(String::new()));
+        assert_eq!(f.invoke(&[]).unwrap(), SqliteValue::Text("".into()));
 
         // 1 arg
         assert_eq!(
-            f.invoke(&[SqliteValue::Text("hello".to_owned())]).unwrap(),
-            SqliteValue::Text("hello".to_owned())
+            f.invoke(&[SqliteValue::Text("hello".into())]).unwrap(),
+            SqliteValue::Text("hello".into())
         );
 
         // many args
         assert_eq!(
             f.invoke(&[
-                SqliteValue::Text("a".to_owned()),
-                SqliteValue::Text("b".to_owned()),
-                SqliteValue::Text("c".to_owned()),
+                SqliteValue::Text("a".into()),
+                SqliteValue::Text("b".into()),
+                SqliteValue::Text("c".into()),
             ])
             .unwrap(),
-            SqliteValue::Text("abc".to_owned())
+            SqliteValue::Text("abc".into())
         );
     }
 

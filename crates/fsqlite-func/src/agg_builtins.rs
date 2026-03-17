@@ -203,7 +203,7 @@ impl AggregateFunction for GroupConcatFunc {
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
         if state.has_value {
-            Ok(SqliteValue::Text(state.result))
+            Ok(SqliteValue::Text(state.result.into()))
         } else {
             Ok(SqliteValue::Null)
         }
@@ -713,7 +713,7 @@ mod tests {
     }
 
     fn text(s: &str) -> SqliteValue {
-        SqliteValue::Text(s.to_owned())
+        SqliteValue::Text(s.into())
     }
 
     fn assert_float_eq(result: &SqliteValue, expected: f64) {
@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn test_group_concat_basic() {
         let r = run_agg(&GroupConcatFunc, &[text("a"), text("b"), text("c")]);
-        assert_eq!(r, SqliteValue::Text("a,b,c".to_owned()));
+        assert_eq!(r, SqliteValue::Text("a,b,c".into()));
     }
 
     #[test]
@@ -818,13 +818,13 @@ mod tests {
             (text("c"), text("; ")),
         ];
         let r = run_agg2(&GroupConcatFunc, &rows);
-        assert_eq!(r, SqliteValue::Text("a; b; c".to_owned()));
+        assert_eq!(r, SqliteValue::Text("a; b; c".into()));
     }
 
     #[test]
     fn test_group_concat_null_skipped() {
         let r = run_agg(&GroupConcatFunc, &[text("a"), null(), text("c")]);
-        assert_eq!(r, SqliteValue::Text("a,c".to_owned()));
+        assert_eq!(r, SqliteValue::Text("a,c".into()));
     }
 
     #[test]
@@ -844,13 +844,13 @@ mod tests {
             (text("c"), text("*")),
         ];
         let r = run_agg2(&GroupConcatFunc, &rows);
-        assert_eq!(r, SqliteValue::Text("a+b*c".to_owned()));
+        assert_eq!(r, SqliteValue::Text("a+b*c".into()));
     }
 
     #[test]
     fn test_group_concat_single_value() {
         let r = run_agg(&GroupConcatFunc, &[text("only")]);
-        assert_eq!(r, SqliteValue::Text("only".to_owned()));
+        assert_eq!(r, SqliteValue::Text("only".into()));
     }
 
     // ── max (aggregate) ───────────────────────────────────────────────
@@ -1098,7 +1098,7 @@ mod tests {
         sa.step(&mut state, &[text("a"), text(",")]).unwrap();
         sa.step(&mut state, &[text("b"), text(",")]).unwrap();
         let r = sa.finalize(state).unwrap();
-        assert_eq!(r, SqliteValue::Text("a,b".to_owned()));
+        assert_eq!(r, SqliteValue::Text("a,b".into()));
     }
 
     // ── registration ──────────────────────────────────────────────────

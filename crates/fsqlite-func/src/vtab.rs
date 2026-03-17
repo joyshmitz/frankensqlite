@@ -942,7 +942,7 @@ mod tests {
             &[
                 SqliteValue::Null,
                 SqliteValue::Null,
-                SqliteValue::Text("hello".to_owned()),
+                SqliteValue::Text("hello".into()),
             ],
         )
         .unwrap();

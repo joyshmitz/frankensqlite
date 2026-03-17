@@ -791,7 +791,7 @@ pub struct DateFunc;
 impl ScalarFunction for DateFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, _)) => Ok(SqliteValue::Text(format_date(jdn))),
+            Some((jdn, _)) => Ok(SqliteValue::Text(format_date(jdn).into())),
             None => Ok(SqliteValue::Null),
         }
     }
@@ -812,7 +812,7 @@ pub struct TimeFunc;
 impl ScalarFunction for TimeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_time(jdn, subsec))),
+            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_time(jdn, subsec).into())),
             None => Ok(SqliteValue::Null),
         }
     }
@@ -833,7 +833,7 @@ pub struct DateTimeFunc;
 impl ScalarFunction for DateTimeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         match parse_args(args) {
-            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_datetime(jdn, subsec))),
+            Some((jdn, subsec)) => Ok(SqliteValue::Text(format_datetime(jdn, subsec).into())),
             None => Ok(SqliteValue::Null),
         }
     }
@@ -901,7 +901,7 @@ impl ScalarFunction for StrftimeFunc {
         let fmt = args[0].to_text();
         let rest = &args[1..];
         match parse_args(rest) {
-            Some((jdn, _)) => Ok(SqliteValue::Text(format_strftime(&fmt, jdn))),
+            Some((jdn, _)) => Ok(SqliteValue::Text(format_strftime(&fmt, jdn).into())),
             None => Ok(SqliteValue::Null),
         }
     }
@@ -939,7 +939,7 @@ impl ScalarFunction for TimediffFunc {
         };
 
         match (jdn1, jdn2) {
-            (Some(j1), Some(j2)) => Ok(SqliteValue::Text(timediff_impl(j1, j2))),
+            (Some(j1), Some(j2)) => Ok(SqliteValue::Text(timediff_impl(j1, j2).into())),
             _ => Ok(SqliteValue::Null),
         }
     }
@@ -973,7 +973,7 @@ mod tests {
     use super::*;
 
     fn text(s: &str) -> SqliteValue {
-        SqliteValue::Text(s.to_owned())
+        SqliteValue::Text(s.into())
     }
 
     fn int(v: i64) -> SqliteValue {
@@ -990,7 +990,7 @@ mod tests {
 
     fn assert_text(result: &SqliteValue, expected: &str) {
         match result {
-            SqliteValue::Text(s) => assert_eq!(s, expected, "text mismatch"),
+            SqliteValue::Text(s) => assert_eq!(s.as_ref(), expected, "text mismatch"),
             other => panic!("expected Text(\"{expected}\"), got {other:?}"),
         }
     }
@@ -1162,7 +1162,7 @@ mod tests {
                 SqliteValue::Text(s) => s.clone(),
                 _ => panic!("expected text"),
             };
-            assert_ne!(shifted, "2024-03-15 12:00:00");
+            assert_ne!(&*shifted, "2024-03-15 12:00:00");
         }
     }
 
