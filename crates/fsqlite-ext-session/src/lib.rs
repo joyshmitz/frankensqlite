@@ -128,20 +128,21 @@ impl ChangesetValue {
             SqliteValue::Null => Self::Null,
             SqliteValue::Integer(i) => Self::Integer(*i),
             SqliteValue::Float(f) => Self::Real(*f),
-            SqliteValue::Text(s) => Self::Text(s.clone()),
-            SqliteValue::Blob(b) => Self::Blob(b.clone()),
+            SqliteValue::Text(s) => Self::Text(s.to_string()),
+            SqliteValue::Blob(b) => Self::Blob(b.to_vec()),
         }
     }
 
     /// Convert to a [`SqliteValue`], mapping `Undefined` to `Null`.
     #[must_use]
     pub fn to_sqlite(&self) -> SqliteValue {
+        use std::sync::Arc;
         match self {
             Self::Undefined | Self::Null => SqliteValue::Null,
             Self::Integer(i) => SqliteValue::Integer(*i),
             Self::Real(f) => SqliteValue::Float(*f),
-            Self::Text(s) => SqliteValue::Text(s.clone()),
-            Self::Blob(b) => SqliteValue::Blob(b.clone()),
+            Self::Text(s) => SqliteValue::Text(Arc::from(s.as_str())),
+            Self::Blob(b) => SqliteValue::Blob(Arc::from(b.as_slice())),
         }
     }
 

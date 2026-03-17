@@ -6,6 +6,7 @@
 //! modes, and secure-delete / contentless-delete configuration.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::ScalarFunction;
@@ -1996,7 +1997,7 @@ impl VirtualTableCursor for Fts5Cursor {
             if col < 0 || col_idx >= self.columns.len() {
                 ctx.set_value(SqliteValue::Float(*score));
             } else if let Some(val) = cols.get(col_idx) {
-                ctx.set_value(SqliteValue::Text(val.clone()));
+                ctx.set_value(SqliteValue::Text(Arc::from(val.as_str())));
             } else {
                 ctx.set_value(SqliteValue::Null);
             }
@@ -2141,8 +2142,8 @@ impl ScalarFunction for Fts5HighlightFunc {
         let close_tag = args[3].to_text();
         let terms = query_terms_from_query_text(&query);
 
-        Ok(SqliteValue::Text(highlight(
-            &text, &terms, &open_tag, &close_tag,
+        Ok(SqliteValue::Text(Arc::from(
+            highlight(&text, &terms, &open_tag, &close_tag).as_str(),
         )))
     }
 
@@ -2173,8 +2174,8 @@ impl ScalarFunction for Fts5SnippetFunc {
         let max_tokens = usize::try_from(args[5].to_integer()).unwrap_or(0);
         let terms = query_terms_from_query_text(&query);
 
-        Ok(SqliteValue::Text(snippet(
-            &text, &terms, &open_tag, &close_tag, &ellipsis, max_tokens,
+        Ok(SqliteValue::Text(Arc::from(
+            snippet(&text, &terms, &open_tag, &close_tag, &ellipsis, max_tokens).as_str(),
         )))
     }
 
@@ -2192,9 +2193,9 @@ pub struct Fts5SourceIdFunc;
 
 impl ScalarFunction for Fts5SourceIdFunc {
     fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
-        Ok(SqliteValue::Text(
-            "fts5: FrankenSQLite FTS5 extension".to_owned(),
-        ))
+        Ok(SqliteValue::Text(Arc::from(
+            "fts5: FrankenSQLite FTS5 extension",
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -2848,7 +2849,7 @@ mod tests {
                 &[
                     SqliteValue::Null,
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("hello world".to_owned()),
+                    SqliteValue::Text(Arc::from("hello world")),
                 ],
             )
             .unwrap();
@@ -2866,7 +2867,7 @@ mod tests {
             &[
                 SqliteValue::Null,
                 SqliteValue::Integer(1),
-                SqliteValue::Text("hello".to_owned()),
+                SqliteValue::Text(Arc::from("hello")),
             ],
         )
         .unwrap();
@@ -2923,16 +2924,16 @@ mod tests {
         let func = Fts5HighlightFunc;
         let result = func
             .invoke(&[
-                SqliteValue::Text("the quick brown fox".to_owned()),
-                SqliteValue::Text("quick OR fox".to_owned()),
-                SqliteValue::Text("<b>".to_owned()),
-                SqliteValue::Text("</b>".to_owned()),
+                SqliteValue::Text(Arc::from("the quick brown fox")),
+                SqliteValue::Text(Arc::from("quick OR fox")),
+                SqliteValue::Text(Arc::from("<b>")),
+                SqliteValue::Text(Arc::from("</b>")),
             ])
             .unwrap();
 
         assert_eq!(
             result,
-            SqliteValue::Text("the <b>quick</b> brown <b>fox</b>".to_owned())
+            SqliteValue::Text(Arc::from("the <b>quick</b> brown <b>fox</b>"))
         );
     }
 
@@ -2941,14 +2942,14 @@ mod tests {
         let func = Fts5HighlightFunc;
         let result = func
             .invoke(&[
-                SqliteValue::Text("hello world".to_owned()),
-                SqliteValue::Text("(hello".to_owned()),
-                SqliteValue::Text("<b>".to_owned()),
-                SqliteValue::Text("</b>".to_owned()),
+                SqliteValue::Text(Arc::from("hello world")),
+                SqliteValue::Text(Arc::from("(hello")),
+                SqliteValue::Text(Arc::from("<b>")),
+                SqliteValue::Text(Arc::from("</b>")),
             ])
             .unwrap();
 
-        assert_eq!(result, SqliteValue::Text("<b>hello</b> world".to_owned()));
+        assert_eq!(result, SqliteValue::Text(Arc::from("<b>hello</b> world")));
     }
 
     #[test]
@@ -2956,11 +2957,11 @@ mod tests {
         let func = Fts5SnippetFunc;
         let result = func
             .invoke(&[
-                SqliteValue::Text("alpha beta gamma delta epsilon".to_owned()),
-                SqliteValue::Text("delta".to_owned()),
-                SqliteValue::Text("[".to_owned()),
-                SqliteValue::Text("]".to_owned()),
-                SqliteValue::Text("...".to_owned()),
+                SqliteValue::Text(Arc::from("alpha beta gamma delta epsilon")),
+                SqliteValue::Text(Arc::from("delta")),
+                SqliteValue::Text(Arc::from("[")),
+                SqliteValue::Text(Arc::from("]")),
+                SqliteValue::Text(Arc::from("...")),
                 SqliteValue::Integer(3),
             ])
             .unwrap();
@@ -3572,7 +3573,7 @@ mod tests {
                 &[
                     SqliteValue::Null,
                     SqliteValue::Null,
-                    SqliteValue::Text("first".to_owned()),
+                    SqliteValue::Text(Arc::from("first")),
                 ],
             )
             .unwrap();
@@ -3582,7 +3583,7 @@ mod tests {
                 &[
                     SqliteValue::Null,
                     SqliteValue::Null,
-                    SqliteValue::Text("second".to_owned()),
+                    SqliteValue::Text(Arc::from("second")),
                 ],
             )
             .unwrap();
@@ -3600,7 +3601,7 @@ mod tests {
             &[
                 SqliteValue::Null,
                 SqliteValue::Integer(1),
-                SqliteValue::Text("original".to_owned()),
+                SqliteValue::Text(Arc::from("original")),
             ],
         )
         .unwrap();
@@ -3611,7 +3612,7 @@ mod tests {
             &[
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(1),
-                SqliteValue::Text("modified".to_owned()),
+                SqliteValue::Text(Arc::from("modified")),
             ],
         )
         .unwrap();
@@ -3685,7 +3686,7 @@ mod tests {
         cursor.column(&mut ctx, 0).unwrap();
         assert_eq!(
             ctx.take_value(),
-            Some(SqliteValue::Text("hello world".to_owned()))
+            Some(SqliteValue::Text(Arc::from("hello world")))
         );
 
         // Rank column (beyond column count).

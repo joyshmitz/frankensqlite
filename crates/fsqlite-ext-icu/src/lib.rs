@@ -197,7 +197,7 @@ impl ScalarFunction for IcuUpperFunc {
             "icu_upper invoked"
         );
         let upper = icu_to_upper(&text, &locale);
-        Ok(SqliteValue::Text(upper))
+        Ok(SqliteValue::Text(Arc::from(upper.as_str())))
     }
 
     fn num_args(&self) -> i32 {
@@ -241,7 +241,7 @@ impl ScalarFunction for IcuLowerFunc {
             "icu_lower invoked"
         );
         let lower = icu_to_lower(&text, &locale);
-        Ok(SqliteValue::Text(lower))
+        Ok(SqliteValue::Text(Arc::from(lower.as_str())))
     }
 
     fn num_args(&self) -> i32 {

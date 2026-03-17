@@ -1363,7 +1363,9 @@ impl ScalarFunction for GeopolyBlobFunc {
         let Some(vertices) = unary_polygon(self.name(), args)? else {
             return Ok(SqliteValue::Null);
         };
-        Ok(SqliteValue::Blob(geopoly_blob(&vertices)))
+        Ok(SqliteValue::Blob(Arc::from(
+            geopoly_blob(&vertices).as_slice(),
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -1383,7 +1385,9 @@ impl ScalarFunction for GeopolyJsonFunc {
         let Some(vertices) = unary_polygon(self.name(), args)? else {
             return Ok(SqliteValue::Null);
         };
-        Ok(SqliteValue::Text(geopoly_json(&vertices)))
+        Ok(SqliteValue::Text(Arc::from(
+            geopoly_json(&vertices).as_str(),
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -1403,7 +1407,9 @@ impl ScalarFunction for GeopolySvgFunc {
         let Some(vertices) = unary_polygon(self.name(), args)? else {
             return Ok(SqliteValue::Null);
         };
-        Ok(SqliteValue::Text(geopoly_svg(&vertices)))
+        Ok(SqliteValue::Text(Arc::from(
+            geopoly_svg(&vertices).as_str(),
+        )))
     }
 
     fn num_args(&self) -> i32 {
@@ -1589,11 +1595,11 @@ mod tests {
     }
 
     fn json_value(vertices: &[Point]) -> SqliteValue {
-        SqliteValue::Text(geopoly_json(vertices))
+        SqliteValue::Text(Arc::from(geopoly_json(vertices).as_str()))
     }
 
     fn blob_value(vertices: &[Point]) -> SqliteValue {
-        SqliteValue::Blob(geopoly_blob(vertices))
+        SqliteValue::Blob(Arc::from(geopoly_blob(vertices).as_slice()))
     }
 
     fn collect_rtree_rows(
@@ -2097,7 +2103,10 @@ mod tests {
         let value = GeopolyJsonFunc
             .invoke(&[blob_value(&polygon)])
             .expect("json wrapper should succeed");
-        assert_eq!(value, SqliteValue::Text(geopoly_json(&polygon)));
+        assert_eq!(
+            value,
+            SqliteValue::Text(Arc::from(geopoly_json(&polygon).as_str()))
+        );
     }
 
     #[test]
@@ -2168,7 +2177,7 @@ mod tests {
     #[test]
     fn test_geopoly_scalar_wrappers_reject_malformed_text() {
         let error = GeopolyJsonFunc
-            .invoke(&[SqliteValue::Text("not json".to_owned())])
+            .invoke(&[SqliteValue::Text(Arc::from("not json"))])
             .expect_err("malformed polygon text should fail");
         assert!(matches!(error, FrankenError::FunctionError(_)));
     }
@@ -2724,7 +2733,7 @@ mod tests {
                 &cx,
                 RTREE_SCAN_GEOMETRY,
                 None,
-                &[SqliteValue::Text("upper_right".to_owned())],
+                &[SqliteValue::Text(Arc::from("upper_right"))],
             )
             .unwrap();
         let rows = collect_rtree_rows(&mut cursor, &cx, 5);
