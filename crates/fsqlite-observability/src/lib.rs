@@ -57,6 +57,9 @@ pub fn record_trace_span_created() {
 
 /// Record an export batch for tracing spans.
 pub fn record_trace_export(spans_exported: u64, export_latency_us: u64) {
+    if !tracing::enabled!(target: "fsqlite.trace_export", tracing::Level::DEBUG) {
+        return;
+    }
     let span = tracing::span!(
         target: "fsqlite.trace_export",
         tracing::Level::DEBUG,

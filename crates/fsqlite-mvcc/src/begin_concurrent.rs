@@ -219,6 +219,23 @@ impl ConcurrentHandle {
         }
     }
 
+    /// Reset this handle for a new concurrent transaction while preserving
+    /// allocation capacity across hot autocommit begin/commit cycles.
+    pub fn reset_for_new_transaction(&mut self, snapshot: Snapshot, txn_token: TxnToken) {
+        self.snapshot = snapshot;
+        self.page_states.clear();
+        self.state = TransactionState::Active;
+        self.read_set.clear();
+        self.read_index.clear();
+        self.global_read_witnesses.clear();
+        self.write_index.clear();
+        self.global_write_witnesses.clear();
+        self.txn_token = txn_token;
+        self.has_in_rw.set(false);
+        self.has_out_rw.set(false);
+        self.marked_for_abort.set(false);
+    }
+
     /// Returns the read snapshot for this concurrent transaction.
     #[must_use]
     pub const fn snapshot(&self) -> &Snapshot {
@@ -573,6 +590,9 @@ pub struct ConcurrentRegistry {
     committed_writers_by_page: HashMap<PageNumber, Vec<usize>>,
     /// Committed writer entries that include at least one global witness.
     committed_writers_with_global_keys: Vec<usize>,
+    /// Detached handles kept for reuse so hot autocommit loops do not hit the
+    /// general allocator for a fresh handle every statement.
+    recycled_handles: Vec<SharedConcurrentHandle>,
     /// Next session id to assign.
     next_session_id: u64,
     /// Epoch counter for TxnToken generation (increments on each session).
@@ -591,6 +611,7 @@ impl ConcurrentRegistry {
             committed_writers: Vec::new(),
             committed_writers_by_page: HashMap::new(),
             committed_writers_with_global_keys: Vec::new(),
+            recycled_handles: Vec::new(),
             next_session_id: 1,
             epoch_counter: 0,
         }
@@ -619,7 +640,12 @@ impl ConcurrentRegistry {
         let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
         let txn_token = TxnToken::new(txn_id, TxnEpoch::new(self.epoch_counter));
 
-        let handle = Arc::new(Mutex::new(ConcurrentHandle::new(snapshot, txn_token)));
+        let handle = if let Some(handle) = self.recycled_handles.pop() {
+            handle.lock().reset_for_new_transaction(snapshot, txn_token);
+            handle
+        } else {
+            Arc::new(Mutex::new(ConcurrentHandle::new(snapshot, txn_token)))
+        };
         self.active.insert(session_id, handle);
         Ok(session_id)
     }
@@ -651,6 +677,24 @@ impl ConcurrentRegistry {
     /// Remove a session (after commit or abort).
     pub fn remove(&mut self, session_id: u64) -> Option<SharedConcurrentHandle> {
         self.active.remove(&session_id)
+    }
+
+    /// Remove a session and recycle its handle when the caller no longer
+    /// needs to inspect it.
+    pub fn remove_and_recycle(&mut self, session_id: u64) -> bool {
+        self.remove(session_id)
+            .map(|handle| self.recycle_handle(handle))
+            .is_some()
+    }
+
+    /// Return an idle handle to the local recycle pool when no other strong
+    /// references remain.
+    pub fn recycle_handle(&mut self, handle: SharedConcurrentHandle) {
+        const MAX_RECYCLED_HANDLES: usize = 8;
+        if self.recycled_handles.len() >= MAX_RECYCLED_HANDLES || Arc::strong_count(&handle) != 1 {
+            return;
+        }
+        self.recycled_handles.push(handle);
     }
 
     fn can_use_uncontended_prepare_fast_path(&self, session_id: u64, begin_seq: CommitSeq) -> bool {
@@ -1455,6 +1499,31 @@ fn summarize_witness_keys(keys: &[WitnessKey]) -> WitnessKeySummary {
     }
 }
 
+fn hydrate_finalize_witness_state(
+    registry: &ConcurrentRegistry,
+    session_id: u64,
+) -> Option<(
+    Vec<WitnessKey>,
+    WitnessKeySummary,
+    Vec<WitnessKey>,
+    WitnessKeySummary,
+)> {
+    let handle = registry.get(session_id)?;
+    if !handle.is_active() {
+        return None;
+    }
+
+    let mut read_keys = handle.read_witness_keys();
+    read_keys.sort_unstable();
+    let read_key_summary = summarize_witness_keys(&read_keys);
+
+    let mut write_keys = handle.write_witness_keys();
+    write_keys.sort_unstable();
+    let write_key_summary = summarize_witness_keys(&write_keys);
+
+    Some((read_keys, read_key_summary, write_keys, write_key_summary))
+}
+
 fn collect_indexed_candidates(
     global_indexes: &[usize],
     indexes_by_page: &HashMap<PageNumber, Vec<usize>>,
@@ -1754,31 +1823,24 @@ pub fn prepare_concurrent_commit_with_ssi(
         if !matches!(fcw_result, FcwResult::Clean) {
             Err(fcw_result)
         } else {
-            let mut read_keys = handle.read_witness_keys();
-            read_keys.sort_unstable();
-            let mut write_keys = handle.write_witness_keys();
-            write_keys.sort_unstable();
             Ok((
                 handle.token(),
                 handle.begin_seq(),
-                read_keys,
-                write_keys,
                 handle.write_set_pages(),
                 handle.is_marked_for_abort(),
             ))
         }
     };
-    let (txn, begin_seq, sorted_read_keys, sorted_write_keys, write_set_pages, marked_for_abort) =
-        match commit_view {
-            Ok(view) => view,
-            Err(fcw_result) => {
-                lock_table.release_all(txn_id);
-                if let Some(mut handle) = registry.get_mut(session_id) {
-                    handle.mark_aborted();
-                }
-                return Err((MvccError::BusySnapshot, fcw_result));
+    let (txn, begin_seq, write_set_pages, marked_for_abort) = match commit_view {
+        Ok(view) => view,
+        Err(fcw_result) => {
+            lock_table.release_all(txn_id);
+            if let Some(mut handle) = registry.get_mut(session_id) {
+                handle.mark_aborted();
             }
-        };
+            return Err((MvccError::BusySnapshot, fcw_result));
+        }
+    };
 
     if marked_for_abort {
         tracing::warn!(
@@ -1793,17 +1855,43 @@ pub fn prepare_concurrent_commit_with_ssi(
     }
 
     if registry.can_use_uncontended_prepare_fast_path(session_id, begin_seq) {
-        let read_key_summary = summarize_witness_keys(&sorted_read_keys);
-        let write_key_summary = summarize_witness_keys(&sorted_write_keys);
+        if write_set_pages.is_empty() {
+            let Some((sorted_read_keys, read_key_summary, sorted_write_keys, write_key_summary)) =
+                hydrate_finalize_witness_state(registry, session_id)
+            else {
+                lock_table.release_all(txn_id);
+                if let Some(mut handle) = registry.get_mut(session_id) {
+                    handle.mark_aborted();
+                }
+                return Err((MvccError::InvalidState, FcwResult::Clean));
+            };
+            return Ok(PreparedConcurrentCommit {
+                session_id,
+                planned_commit_seq,
+                txn_token: txn,
+                begin_seq,
+                read_keys: sorted_read_keys,
+                read_key_summary,
+                write_keys: sorted_write_keys,
+                write_key_summary,
+                write_set_pages,
+                has_in_rw: false,
+                has_out_rw: false,
+                incoming_edges: Vec::new(),
+                outgoing_edges: Vec::new(),
+                dro_t3_decision: None,
+                used_uncontended_prepare_fast_path: true,
+            });
+        }
         return Ok(PreparedConcurrentCommit {
             session_id,
             planned_commit_seq,
             txn_token: txn,
             begin_seq,
-            read_keys: sorted_read_keys,
-            read_key_summary,
-            write_keys: sorted_write_keys,
-            write_key_summary,
+            read_keys: Vec::new(),
+            read_key_summary: WitnessKeySummary::default(),
+            write_keys: Vec::new(),
+            write_key_summary: WitnessKeySummary::default(),
             write_set_pages,
             has_in_rw: false,
             has_out_rw: false,
@@ -1813,6 +1901,16 @@ pub fn prepare_concurrent_commit_with_ssi(
             used_uncontended_prepare_fast_path: true,
         });
     }
+
+    let Some((sorted_read_keys, _read_key_summary, sorted_write_keys, _write_key_summary)) =
+        hydrate_finalize_witness_state(registry, session_id)
+    else {
+        lock_table.release_all(txn_id);
+        if let Some(mut handle) = registry.get_mut(session_id) {
+            handle.mark_aborted();
+        }
+        return Err((MvccError::InvalidState, FcwResult::Clean));
+    };
 
     // Step 2: Discover SSI edges without publishing side effects yet.
     let views = registry
@@ -1965,6 +2063,25 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         return;
     }
 
+    let (read_keys, read_key_summary, write_keys, write_key_summary) =
+        if prepared.used_uncontended_prepare_fast_path() {
+            hydrate_finalize_witness_state(registry, prepared.session_id).unwrap_or_else(|| {
+                (
+                    prepared.read_keys.clone(),
+                    prepared.read_key_summary.clone(),
+                    prepared.write_keys.clone(),
+                    prepared.write_key_summary.clone(),
+                )
+            })
+        } else {
+            (
+                prepared.read_keys.clone(),
+                prepared.read_key_summary.clone(),
+                prepared.write_keys.clone(),
+                prepared.write_key_summary.clone(),
+            )
+        };
+
     // Re-scan against current active state to capture overlap edges that may
     // appear after prepare but before finalize. This keeps committed pivot
     // decisions deterministic.
@@ -1982,26 +2099,26 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &prepared.write_key_summary,
+        &write_key_summary,
     );
     let committed_reader_candidates = registry.committed_reader_candidates(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &prepared.write_key_summary,
+        &write_key_summary,
     );
     let active_writer_candidates = active_index.outgoing_candidate_refs(
         &active_views,
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &prepared.read_key_summary,
+        &read_key_summary,
     );
     let committed_writer_candidates = registry.committed_writer_candidates(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &prepared.read_key_summary,
+        &read_key_summary,
     );
 
     let mut incoming_edges = prepared.incoming_edges.clone();
@@ -2009,7 +2126,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &prepared.write_keys,
+        &write_keys,
         &active_reader_candidates,
         &[],
     ) {
@@ -2024,7 +2141,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &prepared.write_keys,
+        &write_keys,
         &[],
         &committed_reader_candidates,
     ) {
@@ -2041,7 +2158,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &prepared.read_keys,
+        &read_keys,
         &active_writer_candidates,
         &[],
     ) {
@@ -2053,7 +2170,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &prepared.read_keys,
+        &read_keys,
         &[],
         &committed_writer_candidates,
     ) {
@@ -2171,22 +2288,22 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         }
     }
 
-    if !prepared.read_keys.is_empty() {
+    if !read_keys.is_empty() {
         registry.committed_readers.push(CommittedReaderInfo {
             token: prepared.txn_token,
             begin_seq: prepared.begin_seq,
             commit_seq: committed_seq,
             had_in_rw: has_in_rw,
-            keys: prepared.read_keys.clone(),
+            keys: read_keys,
         });
         registry.index_committed_reader(registry.committed_readers.len() - 1);
     }
-    if !prepared.write_keys.is_empty() {
+    if !write_keys.is_empty() {
         registry.committed_writers.push(CommittedWriterInfo {
             token: prepared.txn_token,
             commit_seq: committed_seq,
             had_out_rw: has_out_rw,
-            keys: prepared.write_keys.clone(),
+            keys: write_keys,
         });
         registry.index_committed_writer(registry.committed_writers.len() - 1);
     }
@@ -2210,9 +2327,12 @@ pub fn concurrent_commit_with_ssi(
     ) {
         Ok(p) => p,
         Err(e) => {
-            if let Some(handle) = registry.remove(session_id) {
-                let mut handle = handle.lock();
-                concurrent_abort(&mut handle, lock_table, session_id);
+            if let Some(shared_handle) = registry.remove(session_id) {
+                {
+                    let mut handle = shared_handle.lock();
+                    concurrent_abort(&mut handle, lock_table, session_id);
+                }
+                registry.recycle_handle(shared_handle);
             }
             return Err(e);
         }
@@ -3203,6 +3323,39 @@ mod tests {
     }
 
     #[test]
+    fn test_begin_concurrent_reuses_recycled_handle_and_clears_state() {
+        let mut registry = ConcurrentRegistry::new();
+        let session1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let mut handle = registry.get_mut(session1).unwrap();
+            handle.record_read(test_page(5));
+            handle.record_write_witness(WitnessKey::Page(test_page(7)));
+            handle.has_in_rw.set(true);
+            handle.has_out_rw.set(true);
+            handle.set_marked_for_abort(true);
+            handle.mark_aborted();
+        }
+
+        let removed = registry.remove(session1).unwrap();
+        let recycled_ptr = Arc::as_ptr(&removed);
+        registry.recycle_handle(removed);
+
+        let session2 = registry.begin_concurrent(test_snapshot(20)).unwrap();
+        let handle = registry.handle(session2).unwrap();
+        assert_eq!(Arc::as_ptr(&handle), recycled_ptr);
+
+        let handle = handle.lock();
+        assert_eq!(handle.snapshot().high, CommitSeq::new(20));
+        assert!(handle.is_active());
+        assert!(handle.read_set().is_empty());
+        assert!(handle.write_set_pages().is_empty());
+        assert!(!handle.has_in_rw());
+        assert!(!handle.has_out_rw());
+        assert!(!handle.is_marked_for_abort());
+        assert_eq!(handle.txn_token().id.get(), session2);
+    }
+
+    #[test]
     fn test_prepare_concurrent_commit_with_ssi_uses_uncontended_fast_path_after_stale_history_is_pruned()
      {
         let lock_table = InProcessPageLockTable::new();
@@ -3277,6 +3430,10 @@ mod tests {
         assert!(
             prepared.used_uncontended_prepare_fast_path(),
             "prepare should tag uncontended plans so finalize can re-check for the matching fast path"
+        );
+        assert!(
+            prepared.read_keys().is_empty() && prepared.write_keys().is_empty(),
+            "uncontended prepare should defer witness materialization until slow finalize actually needs it"
         );
     }
 
@@ -3353,6 +3510,70 @@ mod tests {
             test_data(),
         )
         .expect("uncontended finalize must still release the page lock");
+    }
+
+    #[test]
+    fn test_finalize_rehydrates_deferred_witnesses_when_fast_path_plan_loses_eligibility() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let session_id = registry.begin_concurrent(test_snapshot(11)).unwrap();
+        {
+            let mut handle = registry.get_mut(session_id).unwrap();
+            handle.record_read(test_page(7));
+            concurrent_write_page(
+                &mut handle,
+                &lock_table,
+                session_id,
+                test_page(9),
+                test_data(),
+            )
+            .unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            session_id,
+            CommitSeq::new(12),
+        )
+        .expect("prepare should succeed");
+
+        assert!(
+            prepared.used_uncontended_prepare_fast_path(),
+            "setup should hit the uncontended prepare fast path"
+        );
+        assert!(
+            prepared.read_keys().is_empty() && prepared.write_keys().is_empty(),
+            "prepare should not materialize witness vectors on the uncontended path"
+        );
+
+        let blocker = registry.begin_concurrent(test_snapshot(11)).unwrap();
+        {
+            let blocker_handle = registry.get(blocker).unwrap();
+            assert!(blocker_handle.is_active(), "blocker txn should stay active");
+        }
+
+        finalize_prepared_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            &prepared,
+            CommitSeq::new(12),
+        );
+
+        assert_eq!(
+            registry.committed_readers.len(),
+            1,
+            "slow finalize fallback should rehydrate deferred read witnesses before publishing history"
+        );
+        assert_eq!(
+            registry.committed_writers.len(),
+            1,
+            "slow finalize fallback should rehydrate deferred write witnesses before publishing history"
+        );
     }
 
     #[test]

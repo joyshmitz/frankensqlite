@@ -2336,6 +2336,72 @@ impl<P: PageWriter> BtCursor<P> {
 
         Ok((leaf_page_no, new_count))
     }
+
+    fn table_insert_from_current_position(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<()> {
+        let insert_idx = {
+            let top = self
+                .stack
+                .last()
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+            if self.at_eof {
+                top.header.cell_count
+            } else {
+                top.cell_idx
+            }
+        };
+
+        // Take cell_buf for reuse so repeated inserts preserve allocation capacity.
+        let mut cell_data = std::mem::take(&mut self.cell_buf);
+        let overflow_head = self.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
+
+        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+            Ok(true) => {
+                self.cell_buf = cell_data;
+                self.last_insert_rowid = Some(rowid);
+                Ok(())
+            }
+            Ok(false) => {
+                // Page full — balance and redistribute.
+                let balance_result = self.balance_for_insert(cx, &cell_data, insert_idx);
+                self.cell_buf = cell_data;
+                if balance_result.is_ok() {
+                    self.last_insert_rowid = Some(rowid);
+                } else if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
+                }
+                balance_result
+            }
+            Err(error) => {
+                self.cell_buf = cell_data;
+                if let Some(first) = overflow_head {
+                    let _ = self.free_overflow_chain(cx, first);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Fast insert path for callers that already positioned the cursor with
+    /// `table_move_to(rowid)` and observed `SeekResult::NotFound`.
+    ///
+    /// This reuses the current successor/EOF position instead of performing a
+    /// second full B-tree seek before the insert.
+    #[doc(hidden)]
+    pub fn table_insert_prechecked_absent(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<()> {
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            cursor.table_insert_from_current_position(cx, rowid, data)
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2531,50 +2597,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             if seek.is_found() {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
-
-            let insert_idx = {
-                let top = cursor
-                    .stack
-                    .last()
-                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-                if cursor.at_eof {
-                    top.header.cell_count
-                } else {
-                    top.cell_idx
-                }
-            };
-
-            // Take cell_buf for reuse in the normal path too.
-            let mut cell_data = std::mem::take(&mut cursor.cell_buf);
-            let overflow_head =
-                cursor.encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)?;
-
-            match cursor.try_insert_on_leaf(cx, insert_idx, &cell_data) {
-                Ok(true) => {
-                    cursor.cell_buf = cell_data;
-                    cursor.last_insert_rowid = Some(rowid);
-
-                    Ok(())
-                }
-                Ok(false) => {
-                    // Page full — balance and redistribute.
-                    let balance_result = cursor.balance_for_insert(cx, &cell_data, insert_idx);
-                    cursor.cell_buf = cell_data;
-                    if balance_result.is_ok() {
-                        cursor.last_insert_rowid = Some(rowid);
-                    } else if let Some(first) = overflow_head {
-                        let _ = cursor.free_overflow_chain(cx, first);
-                    }
-                    balance_result
-                }
-                Err(error) => {
-                    cursor.cell_buf = cell_data;
-                    if let Some(first) = overflow_head {
-                        let _ = cursor.free_overflow_chain(cx, first);
-                    }
-                    Err(error)
-                }
-            }
+            cursor.table_insert_from_current_position(cx, rowid, data)
         })
     }
 
@@ -3044,6 +3067,37 @@ mod tests {
                     .saturating_add(inserts_done as u64),
             "insert counter should reflect at least {inserts_done} inserts"
         );
+    }
+
+    #[test]
+    fn test_table_insert_prechecked_absent_reuses_successor_position() {
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        cursor.table_insert(&cx, 10, b"ten").unwrap();
+        cursor.table_insert(&cx, 30, b"thirty").unwrap();
+
+        let seek = cursor.table_move_to(&cx, 20).unwrap();
+        assert_eq!(seek, SeekResult::NotFound);
+        assert!(!cursor.eof(), "seek should land on successor rowid 30");
+
+        cursor
+            .table_insert_prechecked_absent(&cx, 20, b"twenty")
+            .unwrap();
+
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
+        assert_eq!(cursor.payload(&cx).unwrap(), b"ten");
+
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 20);
+        assert_eq!(cursor.payload(&cx).unwrap(), b"twenty");
+
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 30);
+        assert_eq!(cursor.payload(&cx).unwrap(), b"thirty");
     }
 
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.

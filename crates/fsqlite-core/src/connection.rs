@@ -40,7 +40,9 @@ use fsqlite_ext_fts5::{Fts5Expr, Fts5Table, build_expr, parse_fts5_query};
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
 use fsqlite_ext_misc::GenerateSeriesTable;
 use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
-use fsqlite_func::builtins::{ChangeTrackingState, set_change_tracking_state};
+use fsqlite_func::builtins::{
+    ChangeTrackingState, get_change_tracking_state, set_change_tracking_state,
+};
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::{
     ColumnContext, ConstraintOp, ErasedVtabInstance, IndexConstraint, IndexInfo, VirtualTable,
@@ -223,6 +225,7 @@ static FSQLITE_OP_CX_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_SCHEMA_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PAGER_PUBLICATION_REFRESHES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -248,6 +251,7 @@ pub struct HotPathProfileSnapshot {
     pub statement_dispatch_background_gates: u64,
     pub prepared_schema_refreshes: u64,
     pub pager_publication_refreshes: u64,
+    pub memory_autocommit_fast_path_begins: u64,
     pub column_default_evaluation_passes: u64,
     pub record_decode: RecordHotPathProfileSnapshot,
     pub vdbe: VdbeMetricsSnapshot,
@@ -281,6 +285,7 @@ pub fn reset_hot_path_profile() {
     FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PREPARED_SCHEMA_REFRESHES.store(0, AtomicOrdering::Relaxed);
     FSQLITE_PAGER_PUBLICATION_REFRESHES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.store(0, AtomicOrdering::Relaxed);
     reset_record_profile();
     reset_vdbe_metrics();
@@ -308,6 +313,8 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
             .load(AtomicOrdering::Relaxed),
         prepared_schema_refreshes: FSQLITE_PREPARED_SCHEMA_REFRESHES.load(AtomicOrdering::Relaxed),
         pager_publication_refreshes: FSQLITE_PAGER_PUBLICATION_REFRESHES
+            .load(AtomicOrdering::Relaxed),
+        memory_autocommit_fast_path_begins: FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS
             .load(AtomicOrdering::Relaxed),
         column_default_evaluation_passes: FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES
             .load(AtomicOrdering::Relaxed),
@@ -1444,9 +1451,12 @@ impl PreparedStatement<'_> {
         // that exact execution path so prepared reads observe the connection's
         // uncommitted writes, concurrent session state, and MVCC snapshot.
         if self.conn.active_txn.borrow().is_some() {
-            let (rows, _, _) =
-                self.conn
-                    .execute_table_program(self.program.as_ref(), params, false)?;
+            let (rows, _, _) = self.conn.execute_table_program_with_cx(
+                self.program.as_ref(),
+                params,
+                false,
+                op_cx,
+            )?;
             return Ok(rows);
         }
 
@@ -2673,7 +2683,9 @@ impl Connection {
             last_changes: i64::try_from(*self.last_changes.borrow()).unwrap_or(i64::MAX),
             total_changes: i64::try_from(*self.total_changes.borrow()).unwrap_or(i64::MAX),
         };
-        set_change_tracking_state(state);
+        if get_change_tracking_state() != state {
+            set_change_tracking_state(state);
+        }
     }
 
     fn current_last_insert_rowid(&self) -> i64 {
@@ -3706,8 +3718,12 @@ impl Connection {
     }
 
     fn record_last_insert_rowid(&self, rowid: i64) {
-        *self.last_insert_rowid.borrow_mut() = rowid;
+        self.set_last_insert_rowid_without_sync(rowid);
         self.sync_change_tracking_context();
+    }
+
+    fn set_last_insert_rowid_without_sync(&self, rowid: i64) {
+        *self.last_insert_rowid.borrow_mut() = rowid;
     }
 
     fn record_statement_changes(&self, changes: usize) {
@@ -4215,23 +4231,28 @@ impl Connection {
         cx: &Cx,
         mode: TransactionMode,
     ) -> Result<Box<dyn TransactionHandle>> {
+        match pager.begin(cx, mode) {
+            Ok(txn) => return Ok(txn),
+            Err(FrankenError::Busy) => {}
+            Err(err) => return Err(err),
+        }
+
         let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
         let deadline = Duration::from_millis(busy_timeout_ms);
         let started = Instant::now();
         let mut handoff = BeginBusyRetryHandoff::default();
 
         loop {
+            let Some(wait) = handoff.next_wait(started, deadline) else {
+                return Err(FrankenError::Busy);
+            };
+            perform_begin_busy_retry_handoff(wait);
+            self.refresh_memdb_if_stale(cx)?;
             match pager.begin(cx, mode) {
                 Ok(txn) => return Ok(txn),
-                Err(FrankenError::Busy) => {
-                    let Some(wait) = handoff.next_wait(started, deadline) else {
-                        return Err(FrankenError::Busy);
-                    };
-                    perform_begin_busy_retry_handoff(wait);
-                    self.refresh_memdb_if_stale(cx)?;
-                }
+                Err(FrankenError::Busy) => {}
                 Err(err) => return Err(err),
-            }
+            };
         }
     }
 
@@ -4239,7 +4260,11 @@ impl Connection {
         if hot_path_profile_enabled() {
             FSQLITE_PREPARED_SCHEMA_REFRESHES.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        if !*self.in_transaction.borrow() {
+        // In-memory databases cannot become stale from external connections,
+        // so skip the staleness check entirely. Schema changes within the
+        // same connection are caught by the schema_generation comparison
+        // in ensure_schema_unchanged, not by memdb staleness.
+        if !*self.in_transaction.borrow() && !self.pager.is_memory() {
             self.refresh_memdb_if_stale(cx)?;
         }
         Ok(())
@@ -4340,7 +4365,7 @@ impl Connection {
                     if let Some(mut handle) = registry.get_mut(session_id) {
                         concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
                     }
-                    registry.remove(session_id);
+                    registry.remove_and_recycle(session_id);
                 }
             }
             *self.concurrent_session_id.get_mut() = None;
@@ -4795,6 +4820,19 @@ impl Connection {
         let trace_id = statement_trace_enabled.then(next_trace_id).unwrap_or(0);
         let decision_id = statement_trace_enabled.then(next_decision_id).unwrap_or(0);
         let trace_registration = self.trace_registration.borrow().clone();
+        let compat_trace_stmt_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::STMT));
+        let compat_trace_profile_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::PROFILE));
+        let compat_trace_row_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::ROW));
+        let statement_reuse_enabled =
+            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO);
+        let compat_trace_sql =
+            (compat_trace_stmt_enabled || compat_trace_profile_enabled).then(|| stmt.sql.clone());
         let statement_span = statement_trace_enabled.then(|| {
             let span = tracing::span!(
                 target: "fsqlite.statement",
@@ -4808,15 +4846,16 @@ impl Connection {
             span
         });
         let _statement_guard = statement_span.as_ref().map(tracing::Span::enter);
-        if trace_registration.is_some() {
+        if compat_trace_stmt_enabled {
             emit_compat_trace_event(
                 trace_registration.as_ref(),
                 TraceEvent::Statement {
-                    sql: stmt.sql.clone(),
+                    sql: compat_trace_sql.clone().unwrap_or_else(|| stmt.sql.clone()),
                 },
             );
         }
-        let execution_started = fsqlite_types::sync_primitives::Instant::now();
+        let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
+            .then(fsqlite_types::sync_primitives::Instant::now);
         let was_auto = self.ensure_autocommit_txn_with_cx(execution_cx)?;
         let previous_total_changes = *self.total_changes.borrow();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
@@ -4874,28 +4913,36 @@ impl Connection {
             capture_time_travel_snapshot,
             execution_cx,
         )?;
-        let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let failure_diag = match result.as_ref() {
-            Ok(_) => Cow::Borrowed("none"),
-            Err(error) => Cow::Owned(error.to_string()),
-        };
-        self.log_statement_reuse_event(
-            "execution",
-            &stmt.sql,
-            true,
-            if ok { "none" } else { "execution_error" },
-            0,
-            elapsed_ns,
-            failure_diag.as_ref(),
-        );
-        emit_compat_trace_event(
-            trace_registration.as_ref(),
-            TraceEvent::Profile {
-                sql: stmt.sql.clone(),
-                elapsed_ns,
-            },
-        );
-        if let Ok((rows, _)) = result.as_ref() {
+        if statement_reuse_enabled || compat_trace_profile_enabled {
+            let elapsed_ns = execution_started
+                .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            if statement_reuse_enabled {
+                let failure_diag = match result.as_ref() {
+                    Ok(_) => Cow::Borrowed("none"),
+                    Err(error) => Cow::Owned(error.to_string()),
+                };
+                self.log_statement_reuse_event(
+                    "execution",
+                    &stmt.sql,
+                    true,
+                    if ok { "none" } else { "execution_error" },
+                    0,
+                    elapsed_ns,
+                    failure_diag.as_ref(),
+                );
+            }
+            if compat_trace_profile_enabled {
+                emit_compat_trace_event(
+                    trace_registration.as_ref(),
+                    TraceEvent::Profile {
+                        sql: compat_trace_sql.unwrap_or_else(|| stmt.sql.clone()),
+                        elapsed_ns,
+                    },
+                );
+            }
+        }
+        if compat_trace_row_enabled && let Ok((rows, _)) = result.as_ref() {
             for row in rows {
                 emit_compat_trace_event(
                     trace_registration.as_ref(),
@@ -5453,13 +5500,24 @@ impl Connection {
             .unwrap_or(0);
         let decision_id = statement_trace_enabled.then(next_decision_id).unwrap_or(0);
         let trace_registration = self.trace_registration.borrow().clone();
-        let statement_sql = trace_registration.is_some().then(|| statement.to_string());
-        let statement_reuse_sql =
-            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO).then(|| {
-                statement_sql
-                    .clone()
-                    .unwrap_or_else(|| statement.to_string())
-            });
+        let compat_trace_stmt_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::STMT));
+        let compat_trace_profile_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::PROFILE));
+        let compat_trace_row_enabled = trace_registration
+            .as_ref()
+            .is_some_and(|trace| trace.mask.contains(TraceMask::ROW));
+        let statement_sql = (compat_trace_stmt_enabled || compat_trace_profile_enabled)
+            .then(|| statement.to_string());
+        let statement_reuse_enabled =
+            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO);
+        let statement_reuse_sql = statement_reuse_enabled.then(|| {
+            statement_sql
+                .clone()
+                .unwrap_or_else(|| statement.to_string())
+        });
         let statement_span = statement_trace_enabled.then(|| {
             let span = tracing::span!(
                 target: "fsqlite.statement",
@@ -5473,7 +5531,7 @@ impl Connection {
             span
         });
         let _statement_guard = statement_span.as_ref().map(tracing::Span::enter);
-        if trace_registration.is_some() {
+        if compat_trace_stmt_enabled {
             emit_compat_trace_event(
                 trace_registration.as_ref(),
                 TraceEvent::Statement {
@@ -5481,7 +5539,8 @@ impl Connection {
                 },
             );
         }
-        let execution_started = fsqlite_types::sync_primitives::Instant::now();
+        let execution_started = (statement_reuse_enabled || compat_trace_profile_enabled)
+            .then(fsqlite_types::sync_primitives::Instant::now);
         let statement = {
             let parse_span = parse_trace_enabled.then(|| {
                 let span = tracing::span!(
@@ -5616,30 +5675,36 @@ impl Connection {
             capture_time_travel_snapshot,
             &op_cx,
         )?;
-        let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        if let Some(statement_reuse_sql) = statement_reuse_sql.as_deref() {
-            let failure_diag = match result.as_ref() {
-                Ok(_) => Cow::Borrowed("none"),
-                Err(error) => Cow::Owned(error.to_string()),
-            };
-            self.log_statement_reuse_event(
-                "execution",
-                statement_reuse_sql,
-                precompiled.is_some(),
-                if ok { "none" } else { "execution_error" },
-                0,
-                elapsed_ns,
-                failure_diag.as_ref(),
-            );
+        if statement_reuse_enabled || compat_trace_profile_enabled {
+            let elapsed_ns = execution_started
+                .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            if let Some(statement_reuse_sql) = statement_reuse_sql.as_deref() {
+                let failure_diag = match result.as_ref() {
+                    Ok(_) => Cow::Borrowed("none"),
+                    Err(error) => Cow::Owned(error.to_string()),
+                };
+                self.log_statement_reuse_event(
+                    "execution",
+                    statement_reuse_sql,
+                    precompiled.is_some(),
+                    if ok { "none" } else { "execution_error" },
+                    0,
+                    elapsed_ns,
+                    failure_diag.as_ref(),
+                );
+            }
+            if compat_trace_profile_enabled {
+                emit_compat_trace_event(
+                    trace_registration.as_ref(),
+                    TraceEvent::Profile {
+                        sql: statement_sql.unwrap_or_default(),
+                        elapsed_ns,
+                    },
+                );
+            }
         }
-        emit_compat_trace_event(
-            trace_registration.as_ref(),
-            TraceEvent::Profile {
-                sql: statement_sql.unwrap_or_default(),
-                elapsed_ns,
-            },
-        );
-        if let Ok(rows) = result.as_ref() {
+        if compat_trace_row_enabled && let Ok(rows) = result.as_ref() {
             for row in rows {
                 emit_compat_trace_event(
                     trace_registration.as_ref(),
@@ -5932,8 +5997,9 @@ impl Connection {
                         // Cache the actual compiled SELECT shape, not the original
                         // SQL text, because eager subquery rewriting can inline
                         // parameter-sensitive literal lists before codegen.
-                        let sql_text =
-                            Statement::Select(compiled_select.as_ref().clone()).to_string();
+                        // Use SelectStatement::to_string() directly to avoid
+                        // cloning the entire AST into a Statement wrapper.
+                        let sql_text = compiled_select.to_string();
                         let sql_key = Self::sql_hash(&sql_text);
                         arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
                             conn.compile_table_select(compiled_select.as_ref())
@@ -7218,7 +7284,7 @@ impl Connection {
                 let program = if distinct && limit_clause.is_some() {
                     let mut unbounded = select.clone();
                     unbounded.limit = None;
-                    let compiled_sql = Statement::Select(unbounded.clone()).to_string();
+                    let compiled_sql = unbounded.to_string();
                     let compiled_sql_key = Self::sql_hash(&compiled_sql);
                     self.compile_with_cache(compiled_sql_key, &compiled_sql, |conn| {
                         conn.compile_table_select(&unbounded)
@@ -9441,6 +9507,42 @@ impl Connection {
             return Ok(false);
         }
         let is_concurrent = mode == TransactionMode::Concurrent;
+
+        // Fast path for isolated :memory: autocommit transactions: these
+        // connections cannot observe external commits, so they do not need the
+        // staleness/publication binding path that file-backed databases use.
+        if self.pager.is_memory() {
+            if hot_path_profile_enabled() {
+                FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, cx, mode)?;
+            let concurrent_session = if is_concurrent {
+                let snapshot = Snapshot::new(
+                    self.pager.published_snapshot().visible_commit_seq,
+                    SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+                );
+                let begin_result =
+                    lock_unpoisoned(&self.concurrent_registry).begin_concurrent(snapshot);
+                match begin_result {
+                    Ok(session_id) => Some(session_id),
+                    Err(error) => {
+                        let _ = txn.rollback(cx);
+                        return Err(match error {
+                            MvccError::Busy => FrankenError::Busy,
+                            _ => FrankenError::Internal(format!("MVCC begin failed: {error}")),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+            *self.active_txn.borrow_mut() = Some(txn);
+            *self.concurrent_session_id.borrow_mut() = concurrent_session;
+            *self.concurrent_txn.borrow_mut() = is_concurrent;
+            self.txn_metrics_mark_started();
+            return Ok(true);
+        }
+
         let publication = self.refresh_memdb_if_stale_with_publication(
             cx,
             if is_concurrent {
@@ -9492,7 +9594,7 @@ impl Connection {
         if let Some(mut handle) = registry.get_mut(session_id) {
             concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
         }
-        registry.remove(session_id);
+        registry.remove_and_recycle(session_id);
     }
 
     /// Finalize an implicit (autocommit) transaction: commit on success,
@@ -9617,13 +9719,10 @@ impl Connection {
                             self.finalize_concurrent_commit(plan, committed_seq);
                         }
                     } else if is_concurrent_txn {
-                        let _ =
-                            self.concurrent_session_id
-                                .borrow_mut()
-                                .take()
-                                .and_then(|session_id| {
-                                    lock_unpoisoned(&self.concurrent_registry).remove(session_id)
-                                });
+                        if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
+                            lock_unpoisoned(&self.concurrent_registry)
+                                .remove_and_recycle(session_id);
+                        }
                     }
                     (Ok(()), txn_has_pending_writes, false)
                 }
@@ -10602,25 +10701,36 @@ impl Connection {
 
     fn table_execution_runtime_inputs(&self, needs_defaults: bool) -> TableExecutionRuntimeInputs {
         let metadata = self.table_execution_metadata();
-        let autoincrement_tables = self.autoincrement_tables.borrow();
-        let sqlite_sequence_cache = self.sqlite_sequence_cache.borrow();
-        let autoincrement_seq_by_root_page = metadata
-            .autoincrement_table_names_by_root_page
-            .iter()
-            .filter(|(_, table_name)| autoincrement_tables.contains(table_name))
-            .map(|(root_page, table_name)| {
-                let seq = sqlite_sequence_cache.get(table_name).copied().unwrap_or(0);
-                (*root_page, seq)
-            })
-            .collect::<HbHashMap<_, _>>();
-        drop(sqlite_sequence_cache);
-        drop(autoincrement_tables);
+
+        // Autoincrement metadata is only needed for INSERT programs. Skip the
+        // borrow+iterate+collect cycle entirely for read/update/delete paths,
+        // and also for schemas with no autoincrement tables at all.
+        let autoincrement_seq_by_root_page =
+            if !needs_defaults || metadata.autoincrement_table_names_by_root_page.is_empty() {
+                HbHashMap::new()
+            } else {
+                let autoincrement_tables = self.autoincrement_tables.borrow();
+                let sqlite_sequence_cache = self.sqlite_sequence_cache.borrow();
+                let map = metadata
+                    .autoincrement_table_names_by_root_page
+                    .iter()
+                    .filter(|(_, table_name)| autoincrement_tables.contains(table_name))
+                    .map(|(root_page, table_name)| {
+                        let seq = sqlite_sequence_cache.get(table_name).copied().unwrap_or(0);
+                        (*root_page, seq)
+                    })
+                    .collect::<HbHashMap<_, _>>();
+                drop(sqlite_sequence_cache);
+                drop(autoincrement_tables);
+                map
+            };
 
         // Skip expensive column default evaluation (which calls
         // execute_statement recursively) for programs that never insert rows.
+        // Use a shared empty Arc to avoid per-statement heap allocation.
         let column_defaults_by_root_page =
             if !needs_defaults || metadata.column_default_sql_by_root_page.is_empty() {
-                Arc::new(HbHashMap::new())
+                empty_column_defaults_arc()
             } else {
                 if hot_path_profile_enabled() {
                     FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
@@ -14127,9 +14237,12 @@ impl Connection {
                 Ok(Some(plan))
             }
             Err((err, fcw_result)) => {
-                if let Some(handle) = registry.remove(session_id) {
-                    let mut handle = handle.lock();
-                    concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                if let Some(shared_handle) = registry.remove(session_id) {
+                    {
+                        let mut handle = shared_handle.lock();
+                        concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                    }
+                    registry.recycle_handle(shared_handle);
                 }
                 *self.concurrent_session_id.borrow_mut() = None;
                 Err(Self::map_mvcc_commit_error(err, fcw_result))
@@ -14169,7 +14282,7 @@ impl Connection {
             &plan,
             committed_seq,
         );
-        let _ = registry.remove(session_id);
+        registry.remove_and_recycle(session_id);
         *self.concurrent_session_id.borrow_mut() = None;
         should_record_commit_evidence
             .then(|| Self::build_ssi_commit_decision_draft(&plan, committed_seq))
@@ -14484,7 +14597,7 @@ impl Connection {
                     if let Some(mut handle) = registry.get_mut(session_id) {
                         concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
                     }
-                    registry.remove(session_id);
+                    registry.remove_and_recycle(session_id);
                 }
             }
 
@@ -21243,10 +21356,13 @@ impl Connection {
                     let tbl_schema = schema
                         .iter()
                         .find(|t| t.name.eq_ignore_ascii_case(&src.table_name));
-                    let (root_page, _num_schema_cols) = tbl_schema
+                    let (root_page, num_schema_cols) = tbl_schema
                         .map(|t| (t.root_page, t.columns.len()))
                         .unwrap_or((0, 0));
-                    let _ipk_idx = self
+                    // IPK (INTEGER PRIMARY KEY) columns are stored as the rowid,
+                    // not in the record payload. We need to splice the rowid back
+                    // at the IPK column position to match what SELECT would return.
+                    let ipk_idx = self
                         .rowid_alias_columns
                         .borrow()
                         .get(&src.table_name.to_ascii_lowercase())
@@ -21256,7 +21372,26 @@ impl Connection {
                         mem_table
                             .iter_rows()
                             .map(|(rowid, vals)| {
-                                let mut row = vals.to_vec();
+                                let mut row = if let Some(ipk_col) = ipk_idx {
+                                    // The record payload has num_schema_cols - 1 values
+                                    // (IPK is not stored). Reconstruct the full row
+                                    // by inserting the rowid at the IPK position.
+                                    let mut full = Vec::with_capacity(num_schema_cols);
+                                    let mut val_idx = 0;
+                                    for col_idx in 0..num_schema_cols {
+                                        if col_idx == ipk_col {
+                                            full.push(SqliteValue::Integer(rowid));
+                                        } else if val_idx < vals.len() {
+                                            full.push(vals[val_idx].clone());
+                                            val_idx += 1;
+                                        } else {
+                                            full.push(SqliteValue::Null);
+                                        }
+                                    }
+                                    full
+                                } else {
+                                    vals.to_vec()
+                                };
                                 if src.hidden_rowid_projection.is_some() {
                                     row.push(SqliteValue::Integer(rowid));
                                 }
@@ -21293,11 +21428,17 @@ impl Connection {
                 // of the schema-only MemDatabase mirror.  When the join layer
                 // needs the hidden rowid, append it explicitly to the scan.
                 let scan_sql = build_join_scan_sql(src);
-                self.invalidate_compiled_cache(&scan_sql);
                 let rows = self.query(&scan_sql)?;
                 let row_data: Vec<Vec<SqliteValue>> =
                     rows.iter().map(|row| row.values().to_vec()).collect();
-                scanned_cache.insert(src.table_name.clone(), row_data.clone());
+                // Only clone into the cache when the same table might appear
+                // again (self-join, CTE).  Check remaining sources for a match.
+                let might_reuse = table_sources[i + 1..]
+                    .iter()
+                    .any(|later| later.table_name.eq_ignore_ascii_case(&src.table_name));
+                if might_reuse {
+                    scanned_cache.insert(src.table_name.clone(), row_data.clone());
+                }
                 table_rows.push(maybe_filter_primary_join_rows(
                     row_data,
                     i,
@@ -22115,6 +22256,7 @@ impl Connection {
         track_last_insert_rowid: bool,
     ) -> Result<(Vec<Row>, usize, Option<i64>)> {
         let execution_cx = self.op_cx()?;
+        self.sync_change_tracking_context();
         self.execute_table_program_with_cx(program, params, track_last_insert_rowid, &execution_cx)
     }
 
@@ -22140,7 +22282,6 @@ impl Connection {
                 span
             });
         let _execution_guard = execution_span.as_ref().map(tracing::Span::enter);
-        self.sync_change_tracking_context();
         // Collect column defaults BEFORE taking the active transaction.
         // `column_defaults_by_root_page()` calls `evaluate_column_default_value()`
         // which uses `execute_statement` internally.  If `active_txn` were already
@@ -22213,7 +22354,10 @@ impl Connection {
                 self.clear_table_program_error_state();
                 if track_last_insert_rowid {
                     if let Some(last_insert_rowid) = last_insert_rowid {
-                        self.record_last_insert_rowid(last_insert_rowid);
+                        // Defer the thread-local sync until the caller records
+                        // statement changes so successful INSERTs only pay one
+                        // change-tracking update on the hot path.
+                        self.set_last_insert_rowid_without_sync(last_insert_rowid);
                     }
                 }
                 Ok((
@@ -25985,6 +26129,11 @@ struct SharedMvccState {
     next_commit_seq: Arc<AtomicU64>,
     _runtime: Arc<RuntimeContext>,
     runtime_state: Mutex<SharedRuntimeState>,
+    /// Fast-path poison check: single atomic load instead of mutex lock.
+    /// Set to `true` when a background worker reports a fatal error.
+    /// `background_status()` checks this first and only acquires the
+    /// mutex when the flag is set (to read the error details).
+    is_poisoned: AtomicBool,
 }
 
 impl SharedMvccState {
@@ -26040,12 +26189,19 @@ impl SharedMvccState {
                 open_connections: 0,
                 poisoned: None,
             }),
+            is_poisoned: AtomicBool::new(false),
         })
     }
 
     fn background_status(&self) -> Result<()> {
         if hot_path_profile_enabled() {
             FSQLITE_BACKGROUND_STATUS_CHECKS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        // Fast path: single atomic load avoids mutex lock on every statement.
+        // is_poisoned is only set when a background worker reports a fatal
+        // error — on the normal hot path this is a single cache-line read.
+        if !self.is_poisoned.load(AtomicOrdering::Relaxed) {
+            return Ok(());
         }
         let state = lock_unpoisoned(&self.runtime_state);
         match &state.poisoned {
@@ -26401,6 +26557,7 @@ impl SharedMvccState {
         }
 
         state.poisoned = Some(details.clone());
+        self.is_poisoned.store(true, AtomicOrdering::Release);
         if let Some(db_root_cx) = state.regions.cx(state.db_root_region) {
             db_root_cx.cancel_with_reason(CancelReason::Abort);
         }
@@ -29730,6 +29887,14 @@ fn default_expr_is_self_contained(expr: &Expr) -> bool {
 }
 
 /// Convert a `CodegenError` to a `FrankenError`.
+/// Shared empty Arc for column defaults — avoids per-statement heap allocation
+/// when no tables have column defaults (the common case for read-only queries).
+fn empty_column_defaults_arc() -> Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>> {
+    use std::sync::OnceLock;
+    static EMPTY: OnceLock<Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>> = OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(HbHashMap::new())))
+}
+
 fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
     match e {
         CodegenError::TableNotFound(name) => {
@@ -29806,7 +29971,7 @@ fn execute_program(
         VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size);
     if let Some(params) = params {
         validate_bound_parameters(program, params)?;
-        engine.set_bindings(params.to_vec());
+        engine.set_bindings_slice(params);
     }
     if let Some(registry) = func_registry {
         engine.set_function_registry(Arc::clone(registry));
@@ -29924,7 +30089,7 @@ fn execute_table_program_with_db(
                 txn,
             );
         }
-        engine.set_bindings(params.to_vec());
+        engine.set_bindings_slice(params);
     }
 
     engine.set_function_registry(Arc::clone(func_registry));
@@ -29969,10 +30134,15 @@ fn execute_table_program_with_db(
     engine.set_database(db_value);
 
     // Always take the DB and txn back, even if execution returns Err.
-    let export_started = fsqlite_types::sync_primitives::Instant::now();
+    let trace_export_enabled =
+        tracing::enabled!(target: "fsqlite.trace_export", tracing::Level::DEBUG);
+    let export_started = trace_export_enabled.then(fsqlite_types::sync_primitives::Instant::now);
     let exec_res = engine.execute(program);
-    let export_latency_us = u64::try_from(export_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    record_trace_export(1, export_latency_us);
+    if let Some(export_started) = export_started {
+        let export_latency_us =
+            u64::try_from(export_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        record_trace_export(1, export_latency_us);
+    }
     if exec_res.is_err() || matches!(exec_res, Ok(ExecOutcome::Error { .. })) {
         record_trace_export_error();
     }
@@ -36141,6 +36311,32 @@ mod tests {
             conn.in_transaction(),
             "connection transaction state must remain consistent after op_cx failure"
         );
+    }
+
+    #[test]
+    fn test_execute_table_program_direct_wrapper_resyncs_change_tracking_context() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alpha');").unwrap();
+
+        fsqlite_func::set_change_tracking_state(fsqlite_func::builtins::ChangeTrackingState {
+            last_insert_rowid: -7,
+            last_changes: -8,
+            total_changes: -9,
+        });
+
+        let stmt = conn
+            .prepare("SELECT last_insert_rowid(), changes(), total_changes();")
+            .unwrap();
+        let (rows, _, _) = conn
+            .execute_table_program(&stmt.program, None, false)
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[2], SqliteValue::Integer(1));
     }
 
     #[test]
@@ -63914,6 +64110,10 @@ mod pager_routing_tests {
             profile.pager_publication_refreshes, 0,
             "autocommit :memory: writes should not force file-backed publication refreshes: {profile:?}"
         );
+        assert_eq!(
+            profile.memory_autocommit_fast_path_begins, 1,
+            "default concurrent :memory: autocommit writes should use the isolated memory fast path: {profile:?}"
+        );
     }
 
     #[test]
@@ -64020,6 +64220,61 @@ mod pager_routing_tests {
                 &second.index_desc_flags_by_root_page
             ),
             "index-sort-direction metadata should be reused across executions"
+        );
+    }
+
+    #[test]
+    fn test_table_execution_runtime_inputs_skip_insert_only_metadata_for_non_insert_paths() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE runtime_inputs_insert_only (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                val TEXT DEFAULT 'fallback'
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO runtime_inputs_insert_only(val) VALUES ('seed');")
+            .unwrap();
+
+        let root_page = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| {
+                table
+                    .name
+                    .eq_ignore_ascii_case("runtime_inputs_insert_only")
+            })
+            .map(|table| table.root_page)
+            .expect("table root page should exist");
+
+        let non_insert = conn.table_execution_runtime_inputs(false);
+        assert!(
+            non_insert.autoincrement_seq_by_root_page.is_empty(),
+            "non-insert executions should not rebuild autoincrement sequence metadata"
+        );
+        assert!(
+            non_insert.column_defaults_by_root_page.is_empty(),
+            "non-insert executions should not evaluate column defaults"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &non_insert.column_defaults_by_root_page,
+                &empty_column_defaults_arc()
+            ),
+            "non-insert executions should reuse the shared empty defaults map"
+        );
+
+        let insert = conn.table_execution_runtime_inputs(true);
+        assert_eq!(
+            insert.autoincrement_seq_by_root_page.get(&root_page),
+            Some(&1),
+            "insert executions should still receive AUTOINCREMENT sequence state"
+        );
+        assert_eq!(
+            insert.column_defaults_by_root_page.get(&root_page),
+            Some(&vec![None, Some(SqliteValue::Text("fallback".to_owned())),]),
+            "insert executions should still evaluate column defaults"
         );
     }
 

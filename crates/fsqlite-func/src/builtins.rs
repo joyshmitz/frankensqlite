@@ -58,6 +58,16 @@ pub fn set_change_tracking_state(state: ChangeTrackingState) {
     TOTAL_CHANGES.set(state.total_changes);
 }
 
+/// Read the current builtin change-tracking context for this thread.
+#[must_use]
+pub fn get_change_tracking_state() -> ChangeTrackingState {
+    ChangeTrackingState {
+        last_insert_rowid: LAST_INSERT_ROWID.get(),
+        last_changes: LAST_CHANGES.get(),
+        total_changes: TOTAL_CHANGES.get(),
+    }
+}
+
 /// Set the last insert rowid (called by Connection after INSERT).
 pub fn set_last_insert_rowid(rowid: i64) {
     LAST_INSERT_ROWID.set(rowid);
@@ -2348,6 +2358,21 @@ mod tests {
 
     fn invoke2(f: &dyn ScalarFunction, a: SqliteValue, b: SqliteValue) -> Result<SqliteValue> {
         f.invoke(&[a, b])
+    }
+
+    #[test]
+    fn test_get_change_tracking_state_returns_thread_local_snapshot() {
+        let original = get_change_tracking_state();
+        let expected = ChangeTrackingState {
+            last_insert_rowid: 17,
+            last_changes: 23,
+            total_changes: 42,
+        };
+
+        set_change_tracking_state(expected);
+        assert_eq!(get_change_tracking_state(), expected);
+
+        set_change_tracking_state(original);
     }
 
     // ── abs ──────────────────────────────────────────────────────────────
