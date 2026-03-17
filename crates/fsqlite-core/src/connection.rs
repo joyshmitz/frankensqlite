@@ -4763,6 +4763,7 @@ impl Connection {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_precompiled_prepared_insert(
         &self,
         execution_cx: &Cx,
@@ -9443,14 +9444,14 @@ impl Connection {
         } else {
             None
         };
-        let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, mode)?;
+        let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, cx, mode)?;
         let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
             let begin_result =
                 lock_unpoisoned(&self.concurrent_registry).begin_concurrent(snapshot);
             match begin_result {
                 Ok(session_id) => Some(session_id),
                 Err(error) => {
-                    let _ = txn.rollback(&cx);
+                    let _ = txn.rollback(cx);
                     return Err(match error {
                         MvccError::Busy => FrankenError::Busy,
                         _ => FrankenError::Internal(format!("MVCC begin failed: {error}")),
@@ -9521,9 +9522,9 @@ impl Connection {
             let Some(txn) = guard.take() else {
                 self.live_vtab_transactions.borrow_mut().clear();
                 if ok {
-                    self.finalize_live_vtab_registry_commit(&cx);
+                    self.finalize_live_vtab_registry_commit(cx);
                 } else {
-                    self.restore_live_vtab_registry_to(&cx, 0)?;
+                    self.restore_live_vtab_registry_to(cx, 0)?;
                 }
                 *self.concurrent_txn.borrow_mut() = false;
                 *self.concurrent_session_id.borrow_mut() = None;
@@ -9535,20 +9536,20 @@ impl Connection {
 
         let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
         if ok && !self.live_vtab_transactions.borrow().is_empty() {
-            if let Err(sync_error) = self.live_vtab_sync_all(&cx) {
+            if let Err(sync_error) = self.live_vtab_sync_all(cx) {
                 if *self.concurrent_txn.borrow() {
                     self.abort_current_concurrent_session();
                 }
                 self.txn_metrics_note_rollback();
-                let rollback_result = txn.rollback(&cx);
+                let rollback_result = txn.rollback(cx);
                 let rollback_succeeded = rollback_result.is_ok();
-                let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
-                let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+                let vtab_rollback_result = self.live_vtab_rollback_all(cx);
+                let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
                 *self.concurrent_txn.borrow_mut() = false;
                 *self.concurrent_session_id.borrow_mut() = None;
                 self.txn_metrics_mark_finished();
                 if txn_has_pending_writes && rollback_succeeded {
-                    self.reload_memdb_from_pager(&cx)?;
+                    self.reload_memdb_from_pager(cx)?;
                 }
                 vtab_rollback_result?;
                 registry_rollback_result?;
@@ -9573,15 +9574,15 @@ impl Connection {
                     Err(e) => {
                         self.abort_current_concurrent_session();
                         self.txn_metrics_note_rollback();
-                        let rollback_result = txn.rollback(&cx);
+                        let rollback_result = txn.rollback(cx);
                         let rollback_succeeded = rollback_result.is_ok();
-                        let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
-                        let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+                        let vtab_rollback_result = self.live_vtab_rollback_all(cx);
+                        let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
                         *self.concurrent_txn.borrow_mut() = false;
                         *self.concurrent_session_id.borrow_mut() = None;
                         self.txn_metrics_mark_finished();
                         if txn_has_pending_writes && rollback_succeeded {
-                            self.reload_memdb_from_pager(&cx)?;
+                            self.reload_memdb_from_pager(cx)?;
                         }
                         vtab_rollback_result?;
                         registry_rollback_result?;
@@ -9594,7 +9595,7 @@ impl Connection {
             } else {
                 None
             };
-            match txn.commit(&cx) {
+            match txn.commit(cx) {
                 Ok(()) => {
                     if txn_has_pending_writes {
                         if let Some(plan) = concurrent_plan {
@@ -9616,10 +9617,10 @@ impl Connection {
                     // Commit failed (e.g. I/O error or BUSY in standard mode).
                     // We must rollback to ensure cleanup and propagate the error.
                     self.txn_metrics_note_rollback();
-                    let rollback_result = txn.rollback(&cx);
+                    let rollback_result = txn.rollback(cx);
                     let rollback_succeeded = rollback_result.is_ok();
-                    let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
-                    let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+                    let vtab_rollback_result = self.live_vtab_rollback_all(cx);
+                    let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
                     if *self.concurrent_txn.borrow() {
                         self.abort_current_concurrent_session();
                     }
@@ -9645,10 +9646,10 @@ impl Connection {
                 self.abort_current_concurrent_session();
             }
             self.txn_metrics_note_rollback();
-            let rollback_result = txn.rollback(&cx);
+            let rollback_result = txn.rollback(cx);
             let rollback_succeeded = rollback_result.is_ok();
-            let vtab_rollback_result = self.live_vtab_rollback_all(&cx);
-            let registry_rollback_result = self.restore_live_vtab_registry_to(&cx, 0);
+            let vtab_rollback_result = self.live_vtab_rollback_all(cx);
+            let registry_rollback_result = self.restore_live_vtab_registry_to(cx, 0);
             (
                 match rollback_result {
                     Ok(()) => match vtab_rollback_result {
@@ -9668,12 +9669,12 @@ impl Connection {
         self.txn_metrics_mark_finished();
 
         if rolled_back_dirty_state {
-            self.reload_memdb_from_pager(&cx)?;
+            self.reload_memdb_from_pager(cx)?;
         }
 
         txn_result?;
-        self.live_vtab_commit_all_best_effort(&cx);
-        self.finalize_live_vtab_registry_commit(&cx);
+        self.live_vtab_commit_all_best_effort(cx);
+        self.finalize_live_vtab_registry_commit(cx);
 
         if committed_write {
             if let Some(committed_seq) = *self.last_local_commit_seq.borrow() {
@@ -49650,13 +49651,12 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE ssi_cards(id INTEGER PRIMARY KEY, v INTEGER);")
             .unwrap();
+        conn.execute("INSERT INTO ssi_cards VALUES (1, 10);")
+            .unwrap();
 
         conn.execute("BEGIN CONCURRENT;").unwrap();
         let rows = conn.query("SELECT id FROM ssi_cards;").unwrap();
-        assert!(
-            rows.is_empty(),
-            "table starts empty for read-only evidence setup"
-        );
+        assert_eq!(rows.len(), 1, "seed row should be visible to read-only tx");
         conn.execute("COMMIT;").unwrap();
 
         conn.execute("BEGIN CONCURRENT;").unwrap();
@@ -49746,13 +49746,12 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE ssi_filter(id INTEGER PRIMARY KEY, v INTEGER);")
             .unwrap();
+        conn.execute("INSERT INTO ssi_filter VALUES (1, 1);")
+            .unwrap();
 
         conn.execute("BEGIN CONCURRENT;").unwrap();
         let rows = conn.query("SELECT id FROM ssi_filter;").unwrap();
-        assert!(
-            rows.is_empty(),
-            "table starts empty for read-only evidence setup"
-        );
+        assert_eq!(rows.len(), 1, "seed row should be visible to read-only tx");
         conn.execute("COMMIT;").unwrap();
 
         conn.execute("BEGIN CONCURRENT;").unwrap();
