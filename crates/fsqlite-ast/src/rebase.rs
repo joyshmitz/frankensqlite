@@ -4,6 +4,8 @@
 //! subset. Only proven-deterministic, side-effect-free expressions pass
 //! validation; everything else returns `None`.
 
+use std::sync::Arc;
+
 use fsqlite_types::SqliteValue;
 use fsqlite_types::glossary::{ColumnIdx, RebaseBinaryOp, RebaseExpr, RebaseUnaryOp};
 
@@ -217,8 +219,8 @@ fn literal_to_rebase(lit: &Literal) -> Option<RebaseExpr> {
     let val = match lit {
         Literal::Integer(i) => SqliteValue::Integer(*i),
         Literal::Float(f) => SqliteValue::Float(*f),
-        Literal::String(s) => SqliteValue::Text(s.clone()),
-        Literal::Blob(b) => SqliteValue::Blob(b.clone()),
+        Literal::String(s) => SqliteValue::Text(Arc::from(s.as_str())),
+        Literal::Blob(b) => SqliteValue::Blob(Arc::from(b.as_slice())),
         Literal::Null => SqliteValue::Null,
         Literal::True => SqliteValue::Integer(1),
         Literal::False => SqliteValue::Integer(0),

@@ -14,6 +14,8 @@
 //! 6. UNIQUE enforcement against committed base snapshot
 //! 7. Overflow page chain management (delegated to B-tree layer)
 
+use std::sync::Arc;
+
 use fsqlite_types::TypeAffinity;
 use fsqlite_types::glossary::{ColumnIdx, IndexId, IntentOpKind, RebaseExpr, RowId, TableId};
 use fsqlite_types::record::{parse_record, serialize_record};
@@ -275,11 +277,11 @@ fn sqlite_concat(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
         let mut res = Vec::with_capacity(ba.len() + bb.len());
         res.extend_from_slice(ba);
         res.extend_from_slice(bb);
-        return SqliteValue::Blob(res);
+        return SqliteValue::Blob(res.into());
     }
     let sa = a.to_text();
     let sb = b.to_text();
-    SqliteValue::Text(format!("{sa}{sb}"))
+    SqliteValue::Text(format!("{sa}{sb}").into())
 }
 
 use fsqlite_types::glossary::{RebaseBinaryOp, RebaseUnaryOp};
@@ -429,14 +431,14 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
         }
         "lower" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
-                Ok(SqliteValue::Text(s.to_ascii_lowercase()))
+                Ok(SqliteValue::Text(s.to_ascii_lowercase().into()))
             } else {
                 Ok(args.first().cloned().unwrap_or(SqliteValue::Null))
             }
         }
         "upper" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
-                Ok(SqliteValue::Text(s.to_ascii_uppercase()))
+                Ok(SqliteValue::Text(s.to_ascii_uppercase().into()))
             } else {
                 Ok(args.first().cloned().unwrap_or(SqliteValue::Null))
             }
@@ -458,16 +460,13 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
         }
         "typeof" => {
             if let Some(v) = args.first() {
-                Ok(SqliteValue::Text(
-                    match v {
-                        SqliteValue::Null => "null",
-                        SqliteValue::Integer(_) => "integer",
-                        SqliteValue::Float(_) => "real",
-                        SqliteValue::Text(_) => "text",
-                        SqliteValue::Blob(_) => "blob",
-                    }
-                    .to_owned(),
-                ))
+                Ok(SqliteValue::Text(Arc::from(match v {
+                    SqliteValue::Null => "null",
+                    SqliteValue::Integer(_) => "integer",
+                    SqliteValue::Float(_) => "real",
+                    SqliteValue::Text(_) => "text",
+                    SqliteValue::Blob(_) => "blob",
+                })))
             } else {
                 Ok(SqliteValue::Null)
             }
@@ -609,7 +608,7 @@ fn apply_collation(val: SqliteValue, collation: Collation) -> SqliteValue {
             if let SqliteValue::Text(s) = val {
                 // SQLite NOCASE only folds ASCII a-z → A-Z. We must uppercase
                 // for index key encoding so binary comparison matches SQLite.
-                SqliteValue::Text(s.to_ascii_uppercase())
+                SqliteValue::Text(s.to_ascii_uppercase().into())
             } else {
                 val
             }
@@ -617,7 +616,7 @@ fn apply_collation(val: SqliteValue, collation: Collation) -> SqliteValue {
         Collation::Rtrim => {
             if let SqliteValue::Text(s) = val {
                 // SQLite RTRIM only ignores trailing spaces (ASCII 0x20), not all whitespace.
-                SqliteValue::Text(s.trim_end_matches(' ').to_owned())
+                SqliteValue::Text(Arc::from(s.trim_end_matches(' ')))
             } else {
                 val
             }
