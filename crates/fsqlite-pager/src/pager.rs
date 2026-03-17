@@ -985,6 +985,7 @@ where
                 journal_mode,
                 pool,
                 cleanup_cx,
+                page_lease: Vec::new(),
             });
         }
 
@@ -1166,6 +1167,7 @@ where
             journal_mode,
             pool,
             cleanup_cx,
+            page_lease: Vec::new(),
         })
     }
 
@@ -1944,6 +1946,11 @@ impl StagedPage {
 }
 
 /// Transaction handle produced by [`SimplePager`].
+/// Number of EOF pages to pre-allocate in a single lock acquisition.
+/// Reduces `inner` mutex contention when concurrent writers cause
+/// frequent B-tree splits that each need a new page.
+const PAGE_LEASE_BATCH_SIZE: u32 = 8;
+
 pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
     journal_path: PathBuf,
@@ -1969,6 +1976,12 @@ pub struct SimpleTransaction<V: Vfs> {
     pool: PageBufPool,
     /// Caller-rooted cleanup context used for drop-time finalization.
     cleanup_cx: Cx,
+    /// Local page lease: pre-allocated EOF pages that can be handed out
+    /// without re-acquiring the global `inner` mutex. Reduces lock
+    /// convoy pressure during concurrent insert workloads with B-tree
+    /// splits. Unused pages are returned to the global next_page on
+    /// commit/rollback.
+    page_lease: Vec<PageNumber>,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
@@ -2591,6 +2604,14 @@ where
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
         self.ensure_writer(cx)?;
 
+        // ── Local lease fast path ──────────────────────────────────────
+        // If we have pre-allocated pages from a previous batch, hand one
+        // out without touching the global `inner` mutex at all.
+        if let Some(page) = self.page_lease.pop() {
+            self.allocated_from_eof.push(page);
+            return Ok(page);
+        }
+
         // Pages freed earlier in the same transaction stay quarantined until
         // commit. Reusing them immediately lets one B-tree operation hand a
         // page to another tree before the old ownership is durably retired,
@@ -2629,16 +2650,42 @@ where
             return Ok(page);
         }
 
-        let mut raw = inner.next_page;
+        // ── EOF allocation ──────────────────────────────────────────────
+        // For concurrent transactions that have already allocated at least
+        // one page, batch-allocate PAGE_LEASE_BATCH_SIZE pages in one lock
+        // acquisition to reduce mutex contention during B-tree splits.
+        // The first allocation is always single-page to avoid over-reserving
+        // for short transactions. Non-concurrent writers always allocate
+        // one page at a time since there's no lock convoy to avoid.
         let pending_byte_page = (0x4000_0000 / inner.page_size.get()) + 1;
-        if raw == pending_byte_page {
-            raw = raw.saturating_add(1);
+        let already_allocated =
+            !self.allocated_from_eof.is_empty() || !self.allocated_from_freelist.is_empty();
+        let batch = if self.mode == TransactionMode::Concurrent && already_allocated {
+            PAGE_LEASE_BATCH_SIZE
+        } else {
+            1
+        };
+        let mut first_page: Option<PageNumber> = None;
+
+        for _ in 0..batch {
+            let mut raw = inner.next_page;
+            if raw == pending_byte_page {
+                raw = raw.saturating_add(1);
+            }
+            inner.next_page = raw.saturating_add(1);
+            if let Some(page) = PageNumber::new(raw) {
+                if first_page.is_none() {
+                    first_page = Some(page);
+                } else {
+                    self.page_lease.push(page);
+                }
+            }
         }
-        inner.next_page = raw.saturating_add(1);
         drop(inner);
-        let page = PageNumber::new(raw).ok_or_else(|| FrankenError::OutOfRange {
+
+        let page = first_page.ok_or_else(|| FrankenError::OutOfRange {
             what: "allocated page number".to_owned(),
-            value: raw.to_string(),
+            value: "0".to_owned(),
         })?;
         self.allocated_from_eof.push(page);
         Ok(page)
@@ -2671,6 +2718,9 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            // Return any unused lease pages to the freelist so they can
+            // be reused by other transactions.
+            inner.freelist.append(&mut self.page_lease);
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
@@ -2685,6 +2735,8 @@ where
                 .inner
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            // Return any unused lease pages.
+            inner.freelist.append(&mut self.page_lease);
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             if self.mode != TransactionMode::Concurrent {
                 inner.writer_active = false;
@@ -2702,6 +2754,8 @@ where
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        // Return any unused lease pages before computing committed db_size.
+        inner.freelist.append(&mut self.page_lease);
 
         let committed_db_size = self.committed_db_size_with_inner(&inner);
         let commit_result = {
@@ -2949,6 +3003,8 @@ where
                 inner.writer_active = false;
             }
         } else {
+            // Return unused lease pages to the freelist.
+            inner.freelist.append(&mut self.page_lease);
             // Restore pages allocated from the freelist.
             return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
 
@@ -3090,7 +3146,8 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             return;
         }
         if let Ok(mut inner) = self.inner.lock() {
-            // Restore pages allocated from the freelist.
+            // Return unused lease pages and restore freelist allocations.
+            inner.freelist.append(&mut self.page_lease);
             return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
 
             if self.is_writer && self.mode != TransactionMode::Concurrent {
