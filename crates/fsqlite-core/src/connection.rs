@@ -9286,6 +9286,12 @@ impl Connection {
         if self.pager.journal_mode() != JournalMode::Wal {
             return;
         }
+        // Private `:memory:` databases do not need post-commit WAL backfill; the
+        // WAL exists only inside the process and auto-checkpointing adds pure
+        // write-path tax to hot autocommit loops.
+        if self.path == ":memory:" {
+            return;
+        }
         if self.wal_checkpoint_blocked_by_active_concurrent_txns() {
             tracing::debug!(
                 trace_id = next_trace_id(),
@@ -50381,7 +50387,10 @@ mod tests {
 
     #[test]
     fn test_pragma_checkpoint_autocheckpoint_triggers_and_disable_semantics() {
-        let conn = Connection::open(":memory:").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ckpt_auto.db");
+        let path_str = path.to_string_lossy().into_owned();
+        let conn = Connection::open(&path_str).unwrap();
         let metrics_map = |rows: &[Row]| {
             rows.iter()
                 .filter_map(|row| {
@@ -50463,7 +50472,12 @@ mod tests {
                 .collect::<std::collections::HashMap<String, i64>>()
         };
         let run_case = |write_pressure_fps: u64| {
-            let conn = Connection::open(":memory:").unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join(format!("ckpt_burst_{write_pressure_fps}.db"));
+            let path_str = path.to_string_lossy().into_owned();
+            let conn = Connection::open(&path_str).unwrap();
             conn.execute("PRAGMA wal_autocheckpoint=1;").unwrap();
             conn.query("PRAGMA checkpoint_urgent_wal_frames=4000;")
                 .unwrap();
