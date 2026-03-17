@@ -3583,8 +3583,9 @@ fn codegen_join_select(
     }
 
     // Evaluate ON conditions — skip row if condition is false.
-    // Combine all ON expressions and the WHERE clause.
-    let skip_label = next_labels.last().copied().unwrap_or(done_label);
+    // When the condition fails, jump forward to the innermost Next opcode
+    // (not the loop start — that would re-check the same row forever).
+    let skip_label = b.emit_label();
     for (_, _, _, on_expr) in &join_tables {
         if let Some(expr) = on_expr {
             let cond_reg = b.alloc_regs(1);
@@ -3632,6 +3633,9 @@ fn codegen_join_select(
     }
 
     // Close nested loops (inner to outer).
+    // Resolve skip_label here so failed ON/WHERE conditions jump to the
+    // innermost Next (advancing the cursor) rather than the loop body start.
+    b.resolve_label(skip_label);
     for (i, &rc) in right_cursors.iter().enumerate().rev() {
         b.emit_jump_to_label(Opcode::Next, rc, 0, next_labels[i], P4::None, 0);
         b.resolve_label(done_right_labels[i]);
@@ -3683,9 +3687,10 @@ fn codegen_join_select(
     // Halt.
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
-    // Resolve end label (standard Init->Goto pattern).
+    // End target for Init jump — Init will see this points past the
+    // program end and fall through to Transaction (the standard pattern
+    // used by all other codegen paths).
     b.resolve_label(end_label);
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, next_left_label, P4::None, 0);
 
     Ok(())
 }
@@ -3693,16 +3698,21 @@ fn codegen_join_select(
 /// Count output columns for a JOIN query.
 fn resolve_join_output_count(
     columns: &[ResultColumn],
-    _tables: &[(&TableSchema, Option<&str>)],
+    tables: &[(&TableSchema, Option<&str>)],
 ) -> usize {
     columns
         .iter()
         .map(|col| match col {
-            ResultColumn::Star => _tables.iter().map(|(t, _)| t.columns.len()).sum(),
-            ResultColumn::TableStar(_) => {
-                // For now, approximate with first matching table.
-                _tables.first().map_or(0, |(t, _)| t.columns.len())
-            }
+            ResultColumn::Star => tables.iter().map(|(t, _)| t.columns.len()).sum(),
+            ResultColumn::TableStar(name) => tables
+                .iter()
+                .find(|(t, alias)| {
+                    alias.map_or_else(
+                        || t.name.eq_ignore_ascii_case(name),
+                        |a| a.eq_ignore_ascii_case(name),
+                    )
+                })
+                .map_or(0, |(t, _)| t.columns.len()),
             ResultColumn::Expr { .. } => 1,
         })
         .sum()
