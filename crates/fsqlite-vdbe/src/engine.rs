@@ -7302,7 +7302,6 @@ impl VdbeEngine {
                         .unwrap_or_default();
                     let desc_flags = self.index_desc_flags_for_root(root_page);
                     let coll_arc = Arc::clone(&self.collation_registry);
-                    let coll_guard = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
 
                     // Extract current cursor key as parsed fields.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
@@ -7353,7 +7352,7 @@ impl VdbeEngine {
                             n_compare,
                             &desc_flags,
                             &[], // TODO: Per-index collations are not yet threaded here.
-                            &coll_guard,
+                            &coll_arc.lock().unwrap_or_else(|e| e.into_inner()),
                         );
 
                         let condition_met = match op.opcode {
@@ -7389,7 +7388,7 @@ impl VdbeEngine {
                                 n_compare,
                                 &desc_flags,
                                 &[],
-                                &coll_guard,
+                                &coll_arc.lock().unwrap_or_else(|e| e.into_inner()),
                             );
                             let condition_met = match op.opcode {
                                 Opcode::IdxLE => cmp != Ordering::Greater,
@@ -8473,6 +8472,7 @@ impl VdbeEngine {
     /// Skips: bounds check (registers pre-sized in execute()),
     /// NaN normalization (integers can't be NaN).
     /// Only safe when the register file has been pre-sized.
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     #[allow(clippy::cast_sign_loss)]
     fn set_reg_int(&mut self, r: i32, val: i64) {
