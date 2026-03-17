@@ -49,7 +49,7 @@ use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnTy
 
 use crate::{TableIndexMetaMap, VdbeProgram};
 
-const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 256;
+const VDBE_EXECUTION_CHECKPOINT_INTERVAL: u64 = 4096;
 /// FrankenSQLite-specific p5 flag for `Insert`/`Delete` opcodes emitted from
 /// UPDATE rewrites.
 ///
@@ -4390,10 +4390,13 @@ impl VdbeEngine {
 
         let statement_debug_enabled =
             tracing::enabled!(target: "fsqlite_vdbe::statement", tracing::Level::DEBUG);
+        let jit_enabled = vdbe_jit_enabled();
         let jit_debug_enabled =
-            tracing::enabled!(target: "fsqlite_vdbe::jit", tracing::Level::DEBUG);
-        let jit_info_enabled = tracing::enabled!(target: "fsqlite_vdbe::jit", tracing::Level::INFO);
-        let jit_warn_enabled = tracing::enabled!(target: "fsqlite_vdbe::jit", tracing::Level::WARN);
+            jit_enabled && tracing::enabled!(target: "fsqlite_vdbe::jit", tracing::Level::DEBUG);
+        let jit_info_enabled =
+            jit_enabled && tracing::enabled!(target: "fsqlite_vdbe::jit", tracing::Level::INFO);
+        let jit_warn_enabled =
+            jit_enabled && tracing::enabled!(target: "fsqlite_vdbe::jit", tracing::Level::WARN);
         let exec_info_enabled = tracing::enabled!(target: "fsqlite_vdbe", tracing::Level::INFO);
         let slow_query_info_enabled =
             tracing::enabled!(target: "fsqlite_vdbe::slow_query", tracing::Level::INFO);
@@ -4423,97 +4426,99 @@ impl VdbeEngine {
             );
         }
 
-        match maybe_trigger_jit(program) {
-            JitDecision::Disabled => {}
-            JitDecision::Warming {
-                plan_hash,
-                execution_count,
-            } => {
-                if jit_debug_enabled {
-                    tracing::debug!(
-                        target: "fsqlite_vdbe::jit",
-                        program_id,
-                        plan_hash = format_args!("{plan_hash:016x}"),
-                        execution_count,
-                        hot_threshold = vdbe_jit_hot_threshold(),
-                        "jit warmup (interpreter tier)"
-                    );
+        if jit_enabled {
+            match maybe_trigger_jit(program) {
+                JitDecision::Disabled => {}
+                JitDecision::Warming {
+                    plan_hash,
+                    execution_count,
+                } => {
+                    if jit_debug_enabled {
+                        tracing::debug!(
+                            target: "fsqlite_vdbe::jit",
+                            program_id,
+                            plan_hash = format_args!("{plan_hash:016x}"),
+                            execution_count,
+                            hot_threshold = vdbe_jit_hot_threshold(),
+                            "jit warmup (interpreter tier)"
+                        );
+                    }
                 }
-            }
-            JitDecision::CacheHit {
-                plan_hash,
-                code_size_bytes,
-            } => {
-                if jit_info_enabled {
-                    tracing::info!(
-                        target: "fsqlite_vdbe::jit",
-                        program_id,
-                        plan_hash = format_args!("{plan_hash:016x}"),
-                        code_size_bytes,
-                        "jit trigger cache hit (interpreter fallback path)"
-                    );
+                JitDecision::CacheHit {
+                    plan_hash,
+                    code_size_bytes,
+                } => {
+                    if jit_info_enabled {
+                        tracing::info!(
+                            target: "fsqlite_vdbe::jit",
+                            program_id,
+                            plan_hash = format_args!("{plan_hash:016x}"),
+                            code_size_bytes,
+                            "jit trigger cache hit (interpreter fallback path)"
+                        );
+                    }
                 }
-            }
-            JitDecision::UnsupportedCached { plan_hash } => {
-                if jit_debug_enabled {
-                    tracing::debug!(
-                        target: "fsqlite_vdbe::jit",
-                        program_id,
-                        plan_hash = format_args!("{plan_hash:016x}"),
-                        "jit unsupported-plan cache hit (skipping recompilation)"
-                    );
+                JitDecision::UnsupportedCached { plan_hash } => {
+                    if jit_debug_enabled {
+                        tracing::debug!(
+                            target: "fsqlite_vdbe::jit",
+                            program_id,
+                            plan_hash = format_args!("{plan_hash:016x}"),
+                            "jit unsupported-plan cache hit (skipping recompilation)"
+                        );
+                    }
                 }
-            }
-            JitDecision::Compiled {
-                plan_hash,
-                compile_time_us,
-                code_size_bytes,
-                evicted_plan_hash,
-            } => {
-                let plan_hash_hex = format!("{plan_hash:016x}");
-                let span = tracing::info_span!(
-                    target: "fsqlite_vdbe::jit",
-                    "jit_compile",
-                    plan_hash = %plan_hash_hex,
+                JitDecision::Compiled {
+                    plan_hash,
                     compile_time_us,
                     code_size_bytes,
-                );
-                let _compile_guard = span.enter();
-                if jit_info_enabled {
-                    tracing::info!(
-                        target: "fsqlite_vdbe::jit",
-                        program_id,
-                        plan_hash = %plan_hash_hex,
-                        compile_time_us,
-                        code_size_bytes,
-                        evicted_plan_hash = evicted_plan_hash.map(|value| format!("{value:016x}")),
-                        "jit trigger compile completed (interpreter fallback path)"
-                    );
+                    evicted_plan_hash,
+                } => {
+                    if jit_info_enabled {
+                        let plan_hash_hex = format!("{plan_hash:016x}");
+                        let span = tracing::info_span!(
+                            target: "fsqlite_vdbe::jit",
+                            "jit_compile",
+                            plan_hash = %plan_hash_hex,
+                            compile_time_us,
+                            code_size_bytes,
+                        );
+                        let _compile_guard = span.enter();
+                        tracing::info!(
+                            target: "fsqlite_vdbe::jit",
+                            program_id,
+                            plan_hash = %plan_hash_hex,
+                            compile_time_us,
+                            code_size_bytes,
+                            evicted_plan_hash = evicted_plan_hash.map(|value| format!("{value:016x}")),
+                            "jit trigger compile completed (interpreter fallback path)"
+                        );
+                    }
                 }
-            }
-            JitDecision::CompileFailed {
-                plan_hash,
-                compile_time_us,
-                reason,
-            } => {
-                let plan_hash_hex = format!("{plan_hash:016x}");
-                let span = tracing::info_span!(
-                    target: "fsqlite_vdbe::jit",
-                    "jit_compile",
-                    plan_hash = %plan_hash_hex,
+                JitDecision::CompileFailed {
+                    plan_hash,
                     compile_time_us,
-                    code_size_bytes = 0_u64,
-                );
-                let _compile_guard = span.enter();
-                if jit_warn_enabled {
-                    tracing::warn!(
-                        target: "fsqlite_vdbe::jit",
-                        program_id,
-                        plan_hash = %plan_hash_hex,
-                        compile_time_us,
-                        reason,
-                        "jit compilation failed; falling back to interpreter"
-                    );
+                    reason,
+                } => {
+                    if jit_warn_enabled {
+                        let plan_hash_hex = format!("{plan_hash:016x}");
+                        let span = tracing::info_span!(
+                            target: "fsqlite_vdbe::jit",
+                            "jit_compile",
+                            plan_hash = %plan_hash_hex,
+                            compile_time_us,
+                            code_size_bytes = 0_u64,
+                        );
+                        let _compile_guard = span.enter();
+                        tracing::warn!(
+                            target: "fsqlite_vdbe::jit",
+                            program_id,
+                            plan_hash = %plan_hash_hex,
+                            compile_time_us,
+                            reason,
+                            "jit compilation failed; falling back to interpreter"
+                        );
+                    }
                 }
             }
         }
@@ -4754,7 +4759,7 @@ impl VdbeEngine {
                         P4::Real(v) => *v,
                         _ => 0.0,
                     };
-                    self.set_reg(op.p2, SqliteValue::Float(val));
+                    self.set_reg_fast(op.p2, SqliteValue::Float(val));
                     pc += 1;
                 }
 
@@ -4763,7 +4768,7 @@ impl VdbeEngine {
                     // register's existing String buffer when possible.
                     match &op.p4 {
                         P4::Str(s) => self.write_text_to_reg(op.p2, s),
-                        _ => self.set_reg(op.p2, SqliteValue::Text(String::new())),
+                        _ => self.set_reg_fast(op.p2, SqliteValue::Text(String::new())),
                     }
                     pc += 1;
                 }
@@ -4772,7 +4777,7 @@ impl VdbeEngine {
                     // p1 = length, p4 = string data. Same as String8 for us.
                     match &op.p4 {
                         P4::Str(s) => self.write_text_to_reg(op.p2, s),
-                        _ => self.set_reg(op.p2, SqliteValue::Text(String::new())),
+                        _ => self.set_reg_fast(op.p2, SqliteValue::Text(String::new())),
                     }
                     pc += 1;
                 }
@@ -4784,13 +4789,13 @@ impl VdbeEngine {
                     let start = op.p2;
                     let end = if op.p3 > 0 { op.p3 } else { start };
                     for r in start..=end {
-                        self.set_reg(r, SqliteValue::Null);
+                        self.set_reg_fast(r, SqliteValue::Null);
                     }
                     pc += 1;
                 }
 
                 Opcode::SoftNull => {
-                    self.set_reg(op.p1, SqliteValue::Null);
+                    self.set_reg_fast(op.p1, SqliteValue::Null);
                     pc += 1;
                 }
 
@@ -4822,7 +4827,7 @@ impl VdbeEngine {
                     }
 
                     for (i, val) in temp.into_iter().enumerate() {
-                        self.set_reg(op.p2 + (i as i32), val);
+                        self.set_reg_fast(op.p2 + (i as i32), val);
                     }
                     pc += 1;
                 }
@@ -4830,14 +4835,14 @@ impl VdbeEngine {
                 Opcode::Copy => {
                     // Copy register p1 to p2 (deep copy).
                     let val = self.get_reg(op.p1).clone();
-                    self.set_reg(op.p2, val);
+                    self.set_reg_fast(op.p2, val);
                     pc += 1;
                 }
 
                 Opcode::SCopy => {
                     // Shallow copy register p1 to p2.
                     let val = self.get_reg(op.p1).clone();
-                    self.set_reg(op.p2, val);
+                    self.set_reg_fast(op.p2, val);
                     pc += 1;
                 }
 
@@ -4951,7 +4956,7 @@ impl VdbeEngine {
                             }
                         }
                     };
-                    self.set_reg(op.p3, result);
+                    self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
 
@@ -5042,7 +5047,7 @@ impl VdbeEngine {
                     let val = self.take_reg(op.p1);
                     let coerced = val.apply_affinity(fsqlite_types::TypeAffinity::Integer);
                     let is_int = coerced.as_integer().is_some();
-                    self.set_reg(op.p1, coerced);
+                    self.set_reg_fast(op.p1, coerced);
                     if is_int {
                         pc += 1;
                     } else {
@@ -5720,7 +5725,7 @@ impl VdbeEngine {
                     let target = op.p3;
                     if !self.column_to_reg_direct(cursor_id, col_idx, target)? {
                         let val = self.cursor_column(cursor_id, col_idx)?;
-                        self.set_reg(target, val);
+                        self.set_reg_fast(target, val);
                     }
                     pc += 1;
                 }
@@ -5730,7 +5735,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let target = op.p2;
                     let val = self.cursor_rowid(cursor_id)?;
-                    self.set_reg(target, val);
+                    self.set_reg_fast(target, val);
                     pc += 1;
                 }
 
@@ -5740,24 +5745,24 @@ impl VdbeEngine {
                     let target = op.p2;
                     if let Some(cursor) = self.storage_cursors.get(&cursor_id) {
                         if cursor.cursor.eof() {
-                            self.set_reg(target, SqliteValue::Null);
+                            self.set_reg_fast(target, SqliteValue::Null);
                         } else {
                             let payload = cursor.cursor.payload(&cursor.cx)?;
-                            self.set_reg(target, SqliteValue::Blob(payload));
+                            self.set_reg_fast(target, SqliteValue::Blob(payload));
                         }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if cursor.is_pseudo {
                             if let Some(reg) = cursor.pseudo_reg {
                                 let blob = self.get_reg(reg).clone();
-                                self.set_reg(target, blob);
+                                self.set_reg_fast(target, blob);
                             } else {
-                                self.set_reg(target, SqliteValue::Null);
+                                self.set_reg_fast(target, SqliteValue::Null);
                             }
                         } else {
-                            self.set_reg(target, SqliteValue::Null);
+                            self.set_reg_fast(target, SqliteValue::Null);
                         }
                     } else {
-                        self.set_reg(target, SqliteValue::Null);
+                        self.set_reg_fast(target, SqliteValue::Null);
                     }
                     pc += 1;
                 }
@@ -5778,7 +5783,7 @@ impl VdbeEngine {
                 }
 
                 Opcode::Offset => {
-                    self.set_reg(op.p3, SqliteValue::Null);
+                    self.set_reg_fast(op.p3, SqliteValue::Null);
                     pc += 1;
                 }
 
@@ -7269,7 +7274,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let target = op.p2;
                     let val = self.cursor_rowid(cursor_id)?;
-                    self.set_reg(target, val);
+                    self.set_reg_fast(target, val);
                     pc += 1;
                 }
 
@@ -7301,7 +7306,6 @@ impl VdbeEngine {
                         .copied()
                         .unwrap_or_default();
                     let desc_flags = self.index_desc_flags_for_root(root_page);
-                    let coll_arc = Arc::clone(&self.collation_registry);
 
                     // Extract current cursor key as parsed fields.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
@@ -7346,14 +7350,20 @@ impl VdbeEngine {
                         } else {
                             sc.target_vals_buf.len()
                         };
+                        // Lock collation via a separately-owned Arc clone
+                        // so the mutable borrow on `sc` is not conflicted.
+                        // Avoids cloning cur/tgt vals into SmallVecs per cmp.
+                        let coll_arc = Arc::clone(&self.collation_registry);
+                        let coll_guard = coll_arc.lock().unwrap_or_else(|e| e.into_inner());
                         let cmp = compare_index_prefix_keys(
                             &sc.cur_vals_buf,
                             &sc.target_vals_buf,
                             n_compare,
                             &desc_flags,
                             &[], // TODO: Per-index collations are not yet threaded here.
-                            &coll_arc.lock().unwrap_or_else(|e| e.into_inner()),
+                            &coll_guard,
                         );
+                        drop(coll_guard);
 
                         let condition_met = match op.opcode {
                             Opcode::IdxLE => cmp != Ordering::Greater,
@@ -7382,14 +7392,16 @@ impl VdbeEngine {
                                 probe_fields.len()
                             };
                             let desc_flags = self.index_desc_flags_for_root(cursor.root_page);
+                            let coll_guard = self.lock_collation();
                             let cmp = compare_index_prefix_keys(
                                 &row.values,
                                 &probe_fields,
                                 n_compare,
                                 &desc_flags,
                                 &[],
-                                &coll_arc.lock().unwrap_or_else(|e| e.into_inner()),
+                                &coll_guard,
                             );
+                            drop(coll_guard);
                             let condition_met = match op.opcode {
                                 Opcode::IdxLE => cmp != Ordering::Greater,
                                 Opcode::IdxGT => cmp == Ordering::Greater,
@@ -8442,7 +8454,8 @@ impl VdbeEngine {
         row
     }
 
-    #[inline]
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     fn take_reg(&mut self, r: i32) -> SqliteValue {
         if r >= 0 && (r as usize) < self.registers.len() {
             if !self.register_subtypes.is_empty() {
@@ -8751,7 +8764,7 @@ impl VdbeEngine {
             }
 
             // Write freshly decoded value to register (owned, no clone needed).
-            self.set_reg(target, val);
+            self.set_reg_fast(target, val);
             return Ok(true);
         }
 
@@ -15578,6 +15591,49 @@ mod tests {
             after.cache_entries >= 1,
             "expected non-empty JIT cache after hot runs"
         );
+
+        set_vdbe_jit_enabled(prev_enabled);
+        let _ = set_vdbe_jit_hot_threshold(prev_threshold);
+        let _ = set_vdbe_jit_cache_capacity(prev_capacity);
+    }
+
+    #[test]
+    fn test_jit_disabled_leaves_runtime_state_cold() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_enabled = vdbe_jit_enabled();
+        let prev_threshold = vdbe_jit_hot_threshold();
+        let prev_capacity = vdbe_jit_cache_capacity();
+
+        set_vdbe_jit_enabled(false);
+        let _ = set_vdbe_jit_hot_threshold(1);
+        let _ = set_vdbe_jit_cache_capacity(8);
+        reset_vdbe_jit_metrics();
+        let before = vdbe_jit_metrics_snapshot();
+
+        for _ in 0..3 {
+            let rows = run_program(|b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                b.emit_op(Opcode::Integer, 42, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            });
+            assert_eq!(rows, vec![vec![SqliteValue::Integer(42)]]);
+        }
+
+        let after = vdbe_jit_metrics_snapshot();
+        assert_eq!(after.jit_compilations_total, before.jit_compilations_total);
+        assert_eq!(
+            after.jit_compile_failures_total,
+            before.jit_compile_failures_total
+        );
+        assert_eq!(after.jit_triggers_total, before.jit_triggers_total);
+        assert_eq!(after.jit_cache_hits_total, before.jit_cache_hits_total);
+        assert_eq!(after.jit_cache_misses_total, before.jit_cache_misses_total);
+        assert_eq!(after.cache_entries, before.cache_entries);
 
         set_vdbe_jit_enabled(prev_enabled);
         let _ = set_vdbe_jit_hot_threshold(prev_threshold);

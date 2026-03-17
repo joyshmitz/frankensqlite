@@ -119,6 +119,12 @@ run_phase \
     cargo test -p fsqlite-e2e --lib run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_varying_point_selects -- --nocapture \
     || failures=$((failures + 1))
 
+run_phase \
+    "SQL-PIPELINE-OPT-EXECUTOR-DELETE-CHURN" \
+    "executor_delete_churn_gate" \
+    cargo test -p fsqlite-e2e --lib run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_varying_point_deletes -- --nocapture \
+    || failures=$((failures + 1))
+
 ARTIFACT_LOG="${LOG_DIR}/artifact_emission.log"
 ARTIFACT_JSON_LINE="$(grep -F 'SQL_PIPELINE_OPT_ARTIFACT_JSON:' "${ARTIFACT_LOG}" | tail -n 1 || true)"
 ARTIFACT_PAYLOAD="${ARTIFACT_JSON_LINE#SQL_PIPELINE_OPT_ARTIFACT_JSON:}"

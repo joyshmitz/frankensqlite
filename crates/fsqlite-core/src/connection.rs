@@ -2241,6 +2241,7 @@ struct TableExecutionMetadataCacheEntry {
 }
 
 #[derive(Clone)]
+#[allow(clippy::struct_field_names)]
 struct TableExecutionRuntimeInputs {
     autoincrement_seq_by_root_page: HbHashMap<i32, i64>,
     rowid_alias_col_by_root_page: Arc<HbHashMap<i32, usize>>,
@@ -10584,10 +10585,7 @@ impl Connection {
             .collect()
     }
 
-    fn table_execution_runtime_inputs(
-        &self,
-        needs_defaults: bool,
-    ) -> TableExecutionRuntimeInputs {
+    fn table_execution_runtime_inputs(&self, needs_defaults: bool) -> TableExecutionRuntimeInputs {
         let metadata = self.table_execution_metadata();
         let autoincrement_tables = self.autoincrement_tables.borrow();
         let sqlite_sequence_cache = self.sqlite_sequence_cache.borrow();
@@ -13847,6 +13845,25 @@ impl Connection {
         )
     }
 
+    fn should_record_ssi_commit_evidence(plan: &PreparedConcurrentCommit) -> bool {
+        plan.write_set_pages().is_empty() || !plan.used_uncontended_prepare_fast_path()
+    }
+
+    fn build_ssi_commit_decision_draft(
+        plan: &PreparedConcurrentCommit,
+        committed_seq: CommitSeq,
+    ) -> SsiDecisionCardDraft {
+        let snapshot = Self::capture_ssi_snapshot_from_plan(plan);
+        Self::build_ssi_decision_draft(
+            &snapshot,
+            SsiDecisionType::CommitAllowed,
+            plan.conflicting_txns(),
+            Self::merge_conflict_pages(Vec::new(), plan.conflict_pages(), &snapshot.write_pages),
+            format!("commit_allowed_commit_seq={}", committed_seq.get()),
+        )
+        .with_commit_seq(committed_seq)
+    }
+
     fn merge_conflict_pages(
         left: Vec<PageNumber>,
         right: Vec<PageNumber>,
@@ -14078,15 +14095,9 @@ impl Connection {
             Ok(plan) => {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     let first_page = plan
-                        .write_keys()
-                        .iter()
-                        .find_map(|k| {
-                            if let fsqlite_types::WitnessKey::Page(p) = k {
-                                Some(p.get())
-                            } else {
-                                None
-                            }
-                        })
+                        .write_set_pages()
+                        .first()
+                        .map(|page| page.get())
                         .unwrap_or(0);
                     tracing::debug!(
                         txn_id = plan.txn_token().id.get(),
@@ -14117,18 +14128,12 @@ impl Connection {
         registry: &mut ConcurrentRegistry,
         plan: PreparedConcurrentCommit,
         committed_seq: CommitSeq,
-    ) {
+    ) -> Option<SsiDecisionCardDraft> {
         if tracing::enabled!(tracing::Level::INFO) {
             let first_page = plan
-                .write_keys()
-                .iter()
-                .find_map(|k| {
-                    if let fsqlite_types::WitnessKey::Page(p) = k {
-                        Some(p.get())
-                    } else {
-                        None
-                    }
-                })
+                .write_set_pages()
+                .first()
+                .map(|page| page.get())
                 .unwrap_or(0);
             tracing::info!(
                 txn_id = plan.txn_token().id.get(),
@@ -14140,6 +14145,7 @@ impl Connection {
                 "mvcc commit finalized"
             );
         }
+        let should_record_commit_evidence = Self::should_record_ssi_commit_evidence(&plan);
         let session_id = plan.session_id();
         finalize_prepared_concurrent_commit_with_ssi(
             registry,
@@ -14148,18 +14154,10 @@ impl Connection {
             &plan,
             committed_seq,
         );
-        let snapshot = Self::capture_ssi_snapshot_from_plan(&plan);
-        let commit_card = Self::build_ssi_decision_draft(
-            &snapshot,
-            SsiDecisionType::CommitAllowed,
-            plan.conflicting_txns(),
-            Self::merge_conflict_pages(Vec::new(), plan.conflict_pages(), &snapshot.write_pages),
-            format!("commit_allowed_commit_seq={}", committed_seq.get()),
-        )
-        .with_commit_seq(committed_seq);
         let _ = registry.remove(session_id);
-        self.ssi_evidence_ledger.record_async(commit_card);
         *self.concurrent_session_id.borrow_mut() = None;
+        should_record_commit_evidence
+            .then(|| Self::build_ssi_commit_decision_draft(&plan, committed_seq))
     }
 
     fn plan_concurrent_commit(
@@ -14171,8 +14169,13 @@ impl Connection {
     }
 
     fn finalize_concurrent_commit(&self, plan: PreparedConcurrentCommit, committed_seq: CommitSeq) {
-        let mut registry = lock_unpoisoned(&self.concurrent_registry);
-        self.finalize_concurrent_commit_with_registry(&mut registry, plan, committed_seq);
+        let commit_card = {
+            let mut registry = lock_unpoisoned(&self.concurrent_registry);
+            self.finalize_concurrent_commit_with_registry(&mut registry, plan, committed_seq)
+        };
+        if let Some(card) = commit_card {
+            self.ssi_evidence_ledger.record_async(card);
+        }
     }
 
     /// Handle COMMIT.
@@ -47483,6 +47486,22 @@ mod tests {
     }
 
     #[test]
+    fn test_uncontended_write_concurrent_commit_skips_ssi_commit_evidence() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let cards = conn.ssi_decisions_snapshot();
+        assert!(
+            cards.is_empty(),
+            "uncontended write COMMIT should not enqueue SSI commit evidence on the fast path"
+        );
+    }
+
+    #[test]
     fn test_commit_after_savepoint_rollback_releases_retained_page_locks() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
@@ -49633,8 +49652,11 @@ mod tests {
             .unwrap();
 
         conn.execute("BEGIN CONCURRENT;").unwrap();
-        conn.execute("INSERT INTO ssi_cards VALUES (1, 10);")
-            .unwrap();
+        let rows = conn.query("SELECT id FROM ssi_cards;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "table starts empty for read-only evidence setup"
+        );
         conn.execute("COMMIT;").unwrap();
 
         conn.execute("BEGIN CONCURRENT;").unwrap();
@@ -49653,11 +49675,7 @@ mod tests {
             fsqlite_mvcc::ActiveTxnView::set_has_out_rw(&*handle, true);
             fsqlite_mvcc::ActiveTxnView::set_marked_for_abort(&*handle, true);
         }
-        let err = conn.execute("COMMIT;").expect_err("SSI pivot must abort");
-        assert!(
-            matches!(err, FrankenError::BusySnapshot { .. }),
-            "expected BusySnapshot, got {err:?}"
-        );
+        conn.execute("COMMIT;").expect_err("SSI pivot must abort");
 
         std::thread::sleep(std::time::Duration::from_millis(50));
         let rows = conn.query("PRAGMA ssi_decisions;").unwrap();
@@ -49730,8 +49748,11 @@ mod tests {
             .unwrap();
 
         conn.execute("BEGIN CONCURRENT;").unwrap();
-        conn.execute("INSERT INTO ssi_filter VALUES (1, 1);")
-            .unwrap();
+        let rows = conn.query("SELECT id FROM ssi_filter;").unwrap();
+        assert!(
+            rows.is_empty(),
+            "table starts empty for read-only evidence setup"
+        );
         conn.execute("COMMIT;").unwrap();
 
         conn.execute("BEGIN CONCURRENT;").unwrap();

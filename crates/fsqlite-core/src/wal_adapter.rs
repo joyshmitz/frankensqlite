@@ -238,35 +238,37 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             return Ok(());
         }
 
-        let previous = self.published_snapshot.clone();
-        let mut page_index = if previous.generation == generation {
-            previous.page_index.as_ref().clone()
+        let previous_generation = self.published_snapshot.generation;
+        let previous_last_commit = self.published_snapshot.last_commit_frame;
+        let mut page_index = if previous_generation == generation {
+            std::mem::replace(
+                &mut self.published_snapshot.page_index,
+                Arc::new(HashMap::new()),
+            )
         } else {
-            HashMap::new()
+            Arc::new(HashMap::new())
         };
-        let mut index_is_partial = if previous.generation == generation {
-            previous.index_is_partial
+        let mut index_is_partial = if previous_generation == generation {
+            self.published_snapshot.index_is_partial
         } else {
             false
         };
 
-        let frame_delta_count = match (previous.last_commit_frame, last_commit_frame) {
+        let frame_delta_count = match (previous_last_commit, last_commit_frame) {
             (Some(prev), Some(curr)) if curr >= prev => curr.saturating_sub(prev),
             (Some(_) | None, Some(curr)) => curr.saturating_add(1),
             (Some(prev), None) => prev.saturating_add(1),
             (None, None) => 0,
         };
 
-        match last_commit_frame {
+        let update_result = match last_commit_frame {
             None => {
-                page_index.clear();
+                Arc::make_mut(&mut page_index).clear();
                 index_is_partial = false;
+                Ok(())
             }
             Some(current_last_commit) => {
-                let start = match (
-                    previous.generation == generation,
-                    previous.last_commit_frame,
-                ) {
+                let start = match (previous_generation == generation, previous_last_commit) {
                     (true, Some(previous_last_commit))
                         if previous_last_commit < current_last_commit =>
                     {
@@ -278,7 +280,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                         current_last_commit.saturating_add(1)
                     }
                     _ => {
-                        page_index.clear();
+                        Arc::make_mut(&mut page_index).clear();
                         index_is_partial = false;
                         0
                     }
@@ -286,13 +288,21 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 if start <= current_last_commit {
                     self.build_index_range(
                         cx,
-                        &mut page_index,
+                        Arc::make_mut(&mut page_index),
                         &mut index_is_partial,
                         start,
                         current_last_commit,
-                    )?;
+                    )
+                } else {
+                    Ok(())
                 }
             }
+        };
+        if let Err(error) = update_result {
+            if previous_generation == generation {
+                self.published_snapshot.page_index = page_index;
+            }
+            return Err(error);
         }
 
         let publication_seq = self.next_publication_seq;
@@ -302,7 +312,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             publication_seq,
             generation,
             last_commit_frame,
-            page_index: Arc::new(page_index),
+            page_index,
             index_is_partial,
         };
 
@@ -573,23 +583,27 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         scenario_id: &'static str,
     ) -> Result<()> {
         let generation = self.wal.generation_identity();
-        let previous = self.published_snapshot.clone();
-        let can_extend_previous = previous.generation == generation
-            && previous
+        let previous_last_commit = self.published_snapshot.last_commit_frame;
+        let can_extend_previous = self.published_snapshot.generation == generation
+            && self
+                .published_snapshot
                 .last_commit_frame
                 .is_none_or(|previous_last_commit| previous_last_commit < last_commit_frame);
         let mut page_index = if can_extend_previous {
-            previous.page_index.as_ref().clone()
+            std::mem::replace(
+                &mut self.published_snapshot.page_index,
+                Arc::new(HashMap::new()),
+            )
         } else {
-            HashMap::new()
+            Arc::new(HashMap::new())
         };
         let mut index_is_partial = if can_extend_previous {
-            previous.index_is_partial
+            self.published_snapshot.index_is_partial
         } else {
             false
         };
         let previous_last_commit = if can_extend_previous {
-            previous.last_commit_frame
+            previous_last_commit
         } else {
             None
         };
@@ -604,9 +618,11 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             }
 
             frame_delta_count = frame_delta_count.saturating_add(1);
-            if page_index.len() < self.page_index_cap || page_index.contains_key(&frame.page_number)
+            let page_index_map = Arc::make_mut(&mut page_index);
+            if page_index_map.len() < self.page_index_cap
+                || page_index_map.contains_key(&frame.page_number)
             {
-                page_index.insert(frame.page_number, frame.frame_index);
+                page_index_map.insert(frame.page_number, frame.frame_index);
             } else {
                 index_is_partial = true;
             }
@@ -624,7 +640,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             publication_seq,
             generation,
             last_commit_frame: Some(last_commit_frame),
-            page_index: Arc::new(page_index),
+            page_index,
             index_is_partial,
         };
         self.pending_publication_frames.clear();

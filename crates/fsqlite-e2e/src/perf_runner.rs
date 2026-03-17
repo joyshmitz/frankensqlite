@@ -2736,6 +2736,12 @@ mod tests {
                 compiled_cache_misses: 2,
                 compile_time_ns: 900,
             },
+            background_status_checks: 2,
+            op_cx_background_gates: 1,
+            statement_dispatch_background_gates: 1,
+            prepared_schema_refreshes: 1,
+            pager_publication_refreshes: 1,
+            column_default_evaluation_passes: 2,
             record_decode: RecordHotPathProfileSnapshot {
                 parse_record_calls: 4,
                 parse_record_into_calls: 2,
@@ -2910,6 +2916,123 @@ mod tests {
             cells.iter().any(|c| c.engine == Engine::Fsqlite
                 && c.fixture_id == "fix2"
                 && c.concurrency == 4)
+        );
+    }
+
+    fn focused_perf_workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    fn run_focused_disjoint_c8_case(
+        mode_id: &str,
+        engine: Engine,
+        concurrent_mode: bool,
+    ) -> BenchmarkSummary {
+        let oplog = generate_oplog(
+            "commutative_inserts_disjoint_keys",
+            "frankensqlite",
+            42,
+            8,
+            50,
+        )
+        .expect("known preset");
+        let workspace_root = focused_perf_workspace_root();
+        let workspace_config = WorkspaceConfig {
+            golden_dir: workspace_root.join("sample_sqlite_db_files/golden"),
+            working_base: workspace_root.join("sample_sqlite_db_files/working"),
+        };
+        let mut settings = HarnessSettings::default();
+        settings.concurrent_mode = concurrent_mode;
+        let benchmark_config = BenchmarkConfig {
+            warmup_iterations: 0,
+            min_iterations: 1,
+            measurement_time_secs: 0,
+        };
+        let meta = BenchmarkMeta {
+            engine: mode_id.to_owned(),
+            workload: "commutative_inserts_disjoint_keys".to_owned(),
+            fixture_id: "frankensqlite".to_owned(),
+            concurrency: 8,
+            cargo_profile: "release-perf".to_owned(),
+        };
+        let summary = run_benchmark(&benchmark_config, &meta, |iteration_idx| {
+            run_single_iteration(
+                engine,
+                "frankensqlite",
+                &oplog,
+                &workspace_config,
+                &settings,
+                iteration_idx,
+            )
+        });
+        let error = benchmark_summary_error(&summary);
+        assert!(
+            error.is_none(),
+            "focused disjoint c8 run failed for {mode_id}: {error:?}"
+        );
+        summary
+    }
+
+    #[test]
+    #[ignore = "manual remote perf evidence for the flagship c8 row"]
+    fn focused_disjoint_c8_release_perf_triplet_emits_results() {
+        let cases = [
+            ("sqlite3", Engine::Sqlite3, true),
+            ("fsqlite_mvcc", Engine::Fsqlite, true),
+            ("fsqlite_single_writer", Engine::Fsqlite, false),
+        ];
+
+        let summaries = cases
+            .into_iter()
+            .map(|(mode_id, engine, concurrent_mode)| {
+                eprintln!("[focused_disjoint_c8] starting {mode_id}");
+                let summary = run_focused_disjoint_c8_case(mode_id, engine, concurrent_mode);
+                eprintln!(
+                    "[focused_disjoint_c8] finished {mode_id} median_ops_per_sec={:.2} mean_ops_per_sec={:.2}",
+                    summary.throughput.median_ops_per_sec,
+                    summary.throughput.mean_ops_per_sec
+                );
+                (
+                    mode_id,
+                    summary,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let artifact_dir =
+            focused_perf_workspace_root().join("artifacts/perf/20260317_targeted_disjoint_c8");
+        std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+
+        let payload = serde_json::json!({
+            "schema_version": "focused_disjoint_c8_release_perf_test.v1",
+            "fixture_id": "frankensqlite",
+            "workload": "commutative_inserts_disjoint_keys",
+            "concurrency": 8,
+            "seed": 42,
+            "scale": 50,
+            "cases": summaries.iter().map(|(mode_id, summary)| {
+                serde_json::json!({
+                    "mode_id": mode_id,
+                    "benchmark_id": summary.benchmark_id,
+                    "mean_ops_per_sec": summary.throughput.mean_ops_per_sec,
+                    "median_ops_per_sec": summary.throughput.median_ops_per_sec,
+                    "peak_ops_per_sec": summary.throughput.peak_ops_per_sec,
+                    "iterations": summary.iterations,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        std::fs::write(
+            artifact_dir.join("focused_disjoint_c8_release_perf_test.json"),
+            serde_json::to_string_pretty(&payload).expect("serialize focused result"),
+        )
+        .expect("write focused artifact");
+        eprintln!(
+            "FOCUSED_DISJOINT_C8_RELEASE_PERF_TEST_JSON:{}",
+            serde_json::to_string(&payload).expect("serialize focused stdout payload")
         );
     }
 

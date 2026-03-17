@@ -203,6 +203,10 @@ impl Vfs for MemoryVfs {
             Ok(env::current_dir()?.join(path))
         }
     }
+
+    fn is_memory(&self) -> bool {
+        true
+    }
 }
 
 /// A file handle in the memory VFS.

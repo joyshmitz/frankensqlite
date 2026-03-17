@@ -83,6 +83,13 @@ pub trait Vfs: Send + Sync {
         // Default: derive from `Cx` time capability (no ambient authority).
         cx.current_time_julian_day()
     }
+
+    /// Returns true if this VFS operates entirely in-process memory.
+    /// In-memory VFS backends can skip file locking, journal recovery,
+    /// and other I/O-oriented work in the pager hot path.
+    fn is_memory(&self) -> bool {
+        false
+    }
 }
 
 /// A file handle opened by a VFS.

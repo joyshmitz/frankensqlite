@@ -4,19 +4,25 @@
 //! with integrated observability (tracing spans and metrics) as required by §7.7.
 //!
 //! Uses SSE2/AVX2 control byte probing for cache-line parallel lookup (via hashbrown).
+//!
+//! **Performance note:** Observability (atomic probe counters and tracing spans) is
+//! deferred to a cold path gated on `tracing::enabled!(Level::TRACE)`. On the hot
+//! path — cursor lookups inside the VDBE opcode dispatch — only the underlying
+//! hashbrown operation runs, with zero overhead from instrumentation.
 
 use crate::instrumentation::{record_swiss_probe, set_swiss_load_factor};
 use foldhash::fast::FixedState;
 use hashbrown::HashMap;
 use std::borrow::Borrow;
 use std::hash::Hash;
-use tracing::{Level, span};
+use tracing::Level;
 
 /// A SIMD-accelerated hash map with integrated observability.
 ///
 /// This structure is a thin wrapper around `hashbrown::HashMap` that automatically
 /// emits `hash_probe` spans and updates `fsqlite_swiss_table_probes_total` and
-/// `fsqlite_swiss_table_load_factor` metrics on operations.
+/// `fsqlite_swiss_table_load_factor` metrics on operations — but only when
+/// TRACE-level tracing is enabled, keeping the hot path zero-cost.
 #[derive(Debug, Clone, Default)]
 pub struct SwissIndex<K, V> {
     inner: HashMap<K, V, FixedState>,
@@ -27,6 +33,7 @@ where
     K: Eq + Hash,
 {
     /// Creates an empty `SwissIndex`.
+    #[inline]
     pub fn new() -> Self {
         Self {
             inner: HashMap::with_hasher(FixedState::default()),
@@ -34,6 +41,7 @@ where
     }
 
     /// Creates an empty `SwissIndex` with the specified capacity.
+    #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             inner: HashMap::with_capacity_and_hasher(capacity, FixedState::default()),
@@ -41,125 +49,145 @@ where
     }
 
     /// Returns the number of elements in the map.
+    #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Returns true if the map contains no elements.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
     /// Inserts a key-value pair into the map.
-    ///
-    /// Triggers observability events.
+    #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.record_probe();
         let result = self.inner.insert(key, value);
-        self.update_load_factor();
+        self.maybe_record_probe_and_load_factor();
         result
     }
 
     /// Returns a reference to the value corresponding to the key.
-    ///
-    /// Triggers observability events.
+    #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.record_probe();
-        self.inner.get(key)
+        let result = self.inner.get(key);
+        self.maybe_record_probe();
+        result
     }
 
     /// Returns a mutable reference to the value corresponding to the key.
-    ///
-    /// Triggers observability events.
+    #[inline]
     pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.record_probe();
+        self.maybe_record_probe();
         self.inner.get_mut(key)
     }
 
     /// Gets the given key's corresponding entry for in-place manipulation,
     /// inserting a default value if the key is absent.
-    ///
-    /// Triggers observability events (probe count; load factor updated on
-    /// next insert/remove since entry borrows prevent self-access).
+    #[inline]
     pub fn entry_or_insert_with(&mut self, key: K, default: impl FnOnce() -> V) -> &mut V {
-        record_swiss_probe();
+        self.maybe_record_probe();
         self.inner.entry(key).or_insert_with(default)
     }
 
     /// Returns an iterator visiting all values in arbitrary order.
+    #[inline]
     pub fn values(&self) -> hashbrown::hash_map::Values<'_, K, V> {
         self.inner.values()
     }
 
     /// Returns true if the map contains a value for the specified key.
-    ///
-    /// Triggers observability events.
+    #[inline]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.record_probe();
-        self.inner.contains_key(key)
+        let result = self.inner.contains_key(key);
+        self.maybe_record_probe();
+        result
     }
 
     /// Removes a key from the map, returning the value at the key if the key
     /// was previously in the map.
-    ///
-    /// Triggers observability events.
+    #[inline]
     pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.record_probe();
         let result = self.inner.remove(key);
-        self.update_load_factor();
+        self.maybe_record_probe_and_load_factor();
         result
     }
 
     /// Clears the map, removing all key-value pairs.
+    #[inline]
     pub fn clear(&mut self) {
         self.inner.clear();
-        self.update_load_factor();
+        if tracing::enabled!(Level::TRACE) {
+            self.update_load_factor();
+        }
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
+    #[inline]
     pub fn iter(&self) -> hashbrown::hash_map::Iter<'_, K, V> {
         self.inner.iter()
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order, with mutable references to the values.
+    #[inline]
     pub fn iter_mut(&mut self) -> hashbrown::hash_map::IterMut<'_, K, V> {
         self.inner.iter_mut()
     }
 
-    // --- Observability Helpers ---
+    // --- Observability Helpers (cold path only) ---
 
+    /// Record a probe event only when TRACE-level tracing is active.
+    /// On the hot path this compiles to a single branch on the tracing
+    /// subscriber's interest flag — no atomic increment, no span creation.
     #[inline]
-    fn record_probe(&self) {
+    fn maybe_record_probe(&self) {
+        if tracing::enabled!(Level::TRACE) {
+            self.record_probe_cold();
+        }
+    }
+
+    /// Combined probe + load-factor update, gated on TRACE.
+    #[inline]
+    fn maybe_record_probe_and_load_factor(&self) {
+        if tracing::enabled!(Level::TRACE) {
+            self.record_probe_cold();
+            self.update_load_factor();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record_probe_cold(&self) {
         record_swiss_probe();
-        let span = span!(
+        let span = tracing::span!(
             Level::TRACE,
             "hash_probe",
-            probes = 1, // Simplified: hashbrown handles collision resolution internally
+            probes = 1,
             items = self.len(),
             load_factor = self.load_factor_milli() as f64 / 1000.0
         );
-        span.in_scope(|| {
-            // Trace log is handled by the span entry/exit if configured
-        });
+        span.in_scope(|| {});
     }
 
-    #[inline]
+    #[cold]
+    #[inline(never)]
     fn update_load_factor(&self) {
         set_swiss_load_factor(self.load_factor_milli());
     }

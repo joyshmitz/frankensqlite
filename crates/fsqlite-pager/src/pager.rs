@@ -941,6 +941,54 @@ where
         }
 
         let active_transactions_before_begin = inner.active_transactions;
+
+        // ── In-memory fast path ─────────────────────────────────────
+        // For in-memory VFS, skip journal recovery, file locking, WAL
+        // snapshot refresh, and publication updates. There are no
+        // on-disk artifacts to recover, no cross-process locks to
+        // acquire, and the committed state is already authoritative.
+        if self.vfs.is_memory() {
+            let eager_writer = matches!(
+                mode,
+                TransactionMode::Immediate | TransactionMode::Exclusive
+            );
+            if eager_writer && inner.writer_active {
+                return Err(FrankenError::Busy);
+            }
+            if eager_writer {
+                inner.writer_active = true;
+            }
+            inner.active_transactions += 1;
+            let original_db_size = inner.db_size;
+            let journal_mode = inner.journal_mode;
+            let published_visible_commit_seq = inner.commit_seq;
+            let pool = self.pool.clone();
+            let cleanup_cx = cx.clone();
+            return Ok(SimpleTransaction {
+                vfs: Arc::clone(&self.vfs),
+                journal_path: Self::journal_path(&self.db_path),
+                inner: Arc::clone(&self.inner),
+                cache: Arc::clone(&self.cache),
+                published: Arc::clone(&self.published),
+                published_visible_commit_seq,
+                write_set: HashMap::new(),
+                write_pages_sorted: Vec::new(),
+                freed_pages: Vec::new(),
+                allocated_from_freelist: Vec::new(),
+                allocated_from_eof: Vec::new(),
+                mode,
+                is_writer: eager_writer,
+                committed: false,
+                finished: false,
+                original_db_size,
+                savepoint_stack: Vec::new(),
+                journal_mode,
+                pool,
+                cleanup_cx,
+            });
+        }
+
+        // ── File-backed path (full locking + recovery) ──────────────
         let had_recovery_pending = inner.rollback_journal_recovery_pending;
         let commit_seq_before_refresh = inner.commit_seq;
 

@@ -1535,6 +1535,7 @@ impl CommitIndex {
     /// Get the latest `CommitSeq` for `page`.
     ///
     /// For page numbers <= 65536 this is a single `AtomicU64::load(Acquire)`.
+    #[inline]
     #[must_use]
     pub fn latest(&self, page: PageNumber) -> Option<CommitSeq> {
         let pgno = page.get() as usize;

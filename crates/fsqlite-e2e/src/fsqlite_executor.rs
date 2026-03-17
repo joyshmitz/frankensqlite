@@ -1369,12 +1369,12 @@ impl<'conn> PreparedOpExecutor<'conn> {
             return Ok(());
         }
 
-        let execution = if normalize_single_integer_equality_select(
+        let execution = if let Some(is_query) = normalize_simple_integer_point_sql(
             trimmed,
             &mut self.sql_scratch,
             &mut self.params_scratch,
         ) {
-            self.execute_prepared_sql_with_scratch(true)
+            self.execute_prepared_sql_with_scratch(is_query)
         } else {
             let Some(is_query) = prepared_sql_mode(trimmed) else {
                 return execute_unprepared_sql(self.conn, trimmed, expected);
@@ -1656,6 +1656,20 @@ fn should_skip_sql_statement(sql: &str) -> bool {
         || starts_with_ascii_prefix(sql, "DROP INDEX")
 }
 
+fn normalize_simple_integer_point_sql(
+    sql: &str,
+    normalized_sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+) -> Option<bool> {
+    if normalize_single_integer_equality_select(sql, normalized_sql, params) {
+        Some(true)
+    } else if normalize_delete_by_id(sql, normalized_sql, params) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn normalize_single_integer_equality_select(
     sql: &str,
     normalized_sql: &mut String,
@@ -1711,6 +1725,59 @@ fn normalize_single_integer_equality_select(
         "SELECT {projection} FROM {table} WHERE {column} = ?1"
     )
     .expect("writing into a String should not fail");
+    params.push(SqliteValue::Integer(value));
+    true
+}
+
+fn normalize_delete_by_id(
+    sql: &str,
+    normalized_sql: &mut String,
+    params: &mut Vec<SqliteValue>,
+) -> bool {
+    normalized_sql.clear();
+    params.clear();
+
+    let sql = sql.trim_end();
+    let sql = sql.strip_suffix(';').unwrap_or(sql).trim_end();
+    let mut rest = sql;
+
+    if !consume_ascii_keyword(&mut rest, "DELETE")
+        || !consume_required_ascii_whitespace(&mut rest)
+        || !consume_ascii_keyword(&mut rest, "FROM")
+        || !consume_required_ascii_whitespace(&mut rest)
+    {
+        return false;
+    }
+    let Some(table) = consume_simple_identifier(&mut rest) else {
+        return false;
+    };
+    if !consume_required_ascii_whitespace(&mut rest)
+        || !consume_ascii_keyword(&mut rest, "WHERE")
+        || !consume_required_ascii_whitespace(&mut rest)
+    {
+        return false;
+    }
+    let Some(column) = consume_simple_identifier(&mut rest) else {
+        return false;
+    };
+    if !column.eq_ignore_ascii_case("id") {
+        return false;
+    }
+    consume_ascii_whitespace(&mut rest);
+    if !consume_ascii_char(&mut rest, '=') {
+        return false;
+    }
+    consume_ascii_whitespace(&mut rest);
+    let Some(value) = consume_i64_literal(&mut rest) else {
+        return false;
+    };
+    consume_ascii_whitespace(&mut rest);
+    if !rest.is_empty() {
+        return false;
+    }
+
+    write!(normalized_sql, "DELETE FROM {table} WHERE id = ?1")
+        .expect("writing into a String should not fail");
     params.push(SqliteValue::Integer(value));
     true
 }
@@ -2154,6 +2221,40 @@ mod tests {
     }
 
     #[test]
+    fn prepared_op_executor_normalizes_varying_point_deletes_into_one_shape() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        for (id, value) in [(1, "alpha"), (2, "beta"), (3, "gamma")] {
+            conn.execute(&format!(
+                "INSERT INTO t0(id, val) VALUES ({id}, '{value}');"
+            ))
+            .unwrap();
+        }
+
+        let mut executor = PreparedOpExecutor::new(&conn);
+        for (op_id, id) in [(0_u64, 1_i64), (1, 2), (2, 3)] {
+            executor
+                .execute_op(&OpRecord {
+                    op_id,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: format!("DELETE FROM t0 WHERE id = {id};"),
+                    },
+                    expected: Some(ExpectedResult::AffectedRows(1)),
+                })
+                .unwrap();
+        }
+
+        assert_eq!(executor.prepared_sql.len(), 1);
+        assert!(
+            executor
+                .prepared_sql
+                .contains_key("DELETE FROM t0 WHERE id = ?1")
+        );
+    }
+
+    #[test]
     fn run_oplog_fsqlite_prepared_dml_reduces_parser_churn_for_repeated_inserts() {
         let _guard = hot_path_test_guard();
         let oplog = preset_commutative_inserts_disjoint_keys("test-fixture", 17, 1, 20);
@@ -2318,6 +2419,77 @@ mod tests {
         assert!(
             profile.parser.parsed_statements_total < report.ops_total,
             "expected normalized prepared SQL reuse to keep parsed statements below executed ops: parsed={} ops={}",
+            profile.parser.parsed_statements_total,
+            report.ops_total
+        );
+    }
+
+    #[test]
+    fn run_oplog_fsqlite_prepared_sql_reduces_parser_churn_for_varying_point_deletes() {
+        let _guard = hot_path_test_guard();
+        let repeated_deletes = (0_u64..20)
+            .map(|op_id| {
+                let id = i64::try_from(op_id).unwrap() + 1;
+                OpRecord {
+                    op_id: op_id + 21,
+                    worker: 0,
+                    kind: OpKind::Sql {
+                        statement: format!("DELETE FROM t0 WHERE id = {id};"),
+                    },
+                    expected: Some(ExpectedResult::AffectedRows(1)),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut records = vec![OpRecord {
+            op_id: 0,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: "CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);".to_owned(),
+            },
+            expected: None,
+        }];
+        records.extend((0_u64..20).map(|op_id| {
+            let id = op_id + 1;
+            OpRecord {
+                op_id: id,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: format!("INSERT INTO t0(id, val) VALUES ({id}, 'v{id}');"),
+                },
+                expected: None,
+            }
+        }));
+        records.extend(repeated_deletes);
+
+        let oplog = OpLog {
+            header: OpLogHeader {
+                fixture_id: "prepared-sql-varying-point-deletes".to_owned(),
+                seed: 31,
+                rng: RngSpec::default(),
+                concurrency: ConcurrencyModel {
+                    worker_count: 1,
+                    transaction_size: 1,
+                    commit_order_policy: "deterministic".to_owned(),
+                },
+                preset: None,
+            },
+            records,
+        };
+        let config = FsqliteExecConfig {
+            collect_hot_path_profile: true,
+            run_integrity_check: false,
+            ..FsqliteExecConfig::default()
+        };
+
+        let report = run_oplog_fsqlite(Path::new(":memory:"), &oplog, &config).unwrap();
+        let profile = report
+            .hot_path_profile
+            .expect("collect_hot_path_profile should populate report");
+
+        assert!(
+            profile.parser.parsed_statements_total < report.ops_total,
+            "expected normalized DELETE reuse to keep parsed statements below executed ops: parsed={} ops={}",
             profile.parser.parsed_statements_total,
             report.ops_total
         );

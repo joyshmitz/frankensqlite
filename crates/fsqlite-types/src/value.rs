@@ -285,7 +285,8 @@ impl SqliteValue {
     }
 
     /// Returns true if this is a NULL value.
-    #[inline]
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     pub const fn is_null(&self) -> bool {
         matches!(self, Self::Null)
     }
@@ -331,7 +332,8 @@ impl SqliteValue {
     /// - Float -> truncated to i64
     /// - Text -> attempt to parse, 0 on failure
     /// - Blob -> 0
-    #[inline]
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     #[allow(clippy::cast_possible_truncation)]
     pub fn to_integer(&self) -> i64 {
         match self {
@@ -350,7 +352,8 @@ impl SqliteValue {
     /// - Float -> itself
     /// - Text -> attempt to parse, 0.0 on failure
     /// - Blob -> 0.0
-    #[inline]
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     #[allow(clippy::cast_precision_loss)]
     pub fn to_float(&self) -> f64 {
         match self {
@@ -524,7 +527,8 @@ impl SqliteValue {
     /// - NULL propagates (NULL + x = NULL).
     /// - Text/Blob coerced via `numericType()`: if both parse as integer,
     ///   integer math is used (SQLite VDBE:1932-1934).
-    #[inline]
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn sql_add(&self, other: &Self) -> Self {
@@ -552,7 +556,8 @@ impl SqliteValue {
     /// Subtract two values following SQLite's overflow semantics.
     ///
     /// Integer - Integer with overflow promotes to REAL.
-    #[inline]
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn sql_sub(&self, other: &Self) -> Self {
@@ -577,7 +582,8 @@ impl SqliteValue {
     /// Multiply two values following SQLite's overflow semantics.
     ///
     /// Integer * Integer with overflow promotes to REAL.
-    #[inline]
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn sql_mul(&self, other: &Self) -> Self {
