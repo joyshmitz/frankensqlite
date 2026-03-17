@@ -1594,10 +1594,7 @@ mod tests {
         session.attach_table("t", 2, vec![true, false]);
         session.record_insert(
             "t",
-            vec![
-                ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".into()),
-            ],
+            vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
         );
         let cs = session.changeset();
         assert_eq!(cs.tables.len(), 1);
@@ -1611,10 +1608,7 @@ mod tests {
         session.attach_table("t", 2, vec![true, false]);
         session.record_delete(
             "t",
-            vec![
-                ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".into()),
-            ],
+            vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
         );
         let cs = session.changeset();
         assert_eq!(cs.tables[0].rows[0].op, ChangeOp::Delete);
@@ -1626,14 +1620,8 @@ mod tests {
         session.attach_table("t", 2, vec![true, false]);
         session.record_update(
             "t",
-            vec![
-                ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".into()),
-            ],
-            vec![
-                ChangesetValue::Undefined,
-                ChangesetValue::Text("b".into()),
-            ],
+            vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
+            vec![ChangesetValue::Undefined, ChangesetValue::Text("b".into())],
         );
         let cs = session.changeset();
         let row = &cs.tables[0].rows[0];
@@ -2206,10 +2194,7 @@ mod tests {
         session.attach_table("t", 2, vec![true, false]);
         session.record_insert(
             "t",
-            vec![
-                ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".into()),
-            ],
+            vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
         );
         let changeset_bytes = session.changeset().encode();
         let patchset_bytes = session.patchset();
@@ -2755,10 +2740,7 @@ mod tests {
         session.attach_table("t", 2, vec![true, false]);
         session.record_insert(
             "t",
-            vec![
-                ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".into()),
-            ],
+            vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
         );
 
         let cs = session.changeset();
@@ -3091,14 +3073,8 @@ mod tests {
                 },
                 ChangeOp::Update => ChangesetRow {
                     op,
-                    old_values: vec![
-                        ChangesetValue::Integer(1),
-                        ChangesetValue::Text("a".into()),
-                    ],
-                    new_values: vec![
-                        ChangesetValue::Undefined,
-                        ChangesetValue::Text("b".into()),
-                    ],
+                    old_values: vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
+                    new_values: vec![ChangesetValue::Undefined, ChangesetValue::Text("b".into())],
                 },
             };
             let mut buf = Vec::new();
@@ -3146,10 +3122,7 @@ mod tests {
         let pk_flags = vec![true, false];
         let row = ChangesetRow {
             op: ChangeOp::Delete,
-            old_values: vec![
-                ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".into()),
-            ],
+            old_values: vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
             new_values: Vec::new(),
         };
         let mut cs_buf = Vec::new();
@@ -3177,10 +3150,7 @@ mod tests {
         session.attach_table("auto", 2, vec![false, false]);
         session.record_insert(
             "auto",
-            vec![
-                ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".into()),
-            ],
+            vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
         );
         let cs = session.changeset();
         assert!(cs.tables.is_empty());
@@ -3192,17 +3162,11 @@ mod tests {
         session.attach_table("accounts", 2, vec![true, false]);
         session.record_insert(
             "accounts",
-            vec![
-                ChangesetValue::Null,
-                ChangesetValue::Text("alice".into()),
-            ],
+            vec![ChangesetValue::Null, ChangesetValue::Text("alice".into())],
         );
         session.record_update(
             "accounts",
-            vec![
-                ChangesetValue::Null,
-                ChangesetValue::Text("alice".into()),
-            ],
+            vec![ChangesetValue::Null, ChangesetValue::Text("alice".into())],
             vec![
                 ChangesetValue::Undefined,
                 ChangesetValue::Text("alice_2".into()),
@@ -3210,10 +3174,7 @@ mod tests {
         );
         session.record_delete(
             "accounts",
-            vec![
-                ChangesetValue::Null,
-                ChangesetValue::Text("alice_2".into()),
-            ],
+            vec![ChangesetValue::Null, ChangesetValue::Text("alice_2".into())],
         );
 
         let changeset = session.changeset();
@@ -3265,28 +3226,16 @@ mod tests {
         session.attach_table("t", 2, vec![true, false]);
         session.record_insert(
             "t",
-            vec![
-                ChangesetValue::Integer(1),
-                ChangesetValue::Text("a".into()),
-            ],
+            vec![ChangesetValue::Integer(1), ChangesetValue::Text("a".into())],
         );
         session.record_delete(
             "t",
-            vec![
-                ChangesetValue::Integer(2),
-                ChangesetValue::Text("b".into()),
-            ],
+            vec![ChangesetValue::Integer(2), ChangesetValue::Text("b".into())],
         );
         session.record_update(
             "t",
-            vec![
-                ChangesetValue::Integer(3),
-                ChangesetValue::Text("c".into()),
-            ],
-            vec![
-                ChangesetValue::Undefined,
-                ChangesetValue::Text("d".into()),
-            ],
+            vec![ChangesetValue::Integer(3), ChangesetValue::Text("c".into())],
+            vec![ChangesetValue::Undefined, ChangesetValue::Text("d".into())],
         );
 
         let cs = session.changeset();
@@ -3302,10 +3251,7 @@ mod tests {
         session.record_insert("a", vec![ChangesetValue::Integer(1)]);
         session.record_insert(
             "b",
-            vec![
-                ChangesetValue::Integer(2),
-                ChangesetValue::Text("x".into()),
-            ],
+            vec![ChangesetValue::Integer(2), ChangesetValue::Text("x".into())],
         );
         session.record_delete("a", vec![ChangesetValue::Integer(3)]);
 
@@ -3359,10 +3305,7 @@ mod tests {
                 skipped: 0
             }
         );
-        assert_eq!(
-            target.tables["t"][0][1],
-            SqliteValue::Text("new".into())
-        );
+        assert_eq!(target.tables["t"][0][1], SqliteValue::Text("new".into()));
     }
 
     #[test]
@@ -3371,10 +3314,7 @@ mod tests {
         target.tables.insert(
             "t".to_owned(),
             vec![
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".into()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into())],
                 vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())],
             ],
         );
@@ -3416,10 +3356,7 @@ mod tests {
         assert_eq!(
             target.tables["t"],
             vec![
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".into()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into()),],
                 vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into()),],
             ]
         );
@@ -3431,10 +3368,7 @@ mod tests {
         target.tables.insert(
             "t".to_owned(),
             vec![
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".into()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into())],
                 vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())],
             ],
         );

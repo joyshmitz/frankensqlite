@@ -1226,7 +1226,10 @@ mod tests {
         assert_eq!(SqliteValue::Integer(-1).to_string(), "-1");
         assert_eq!(SqliteValue::Float(1.5).to_string(), "1.5");
         assert_eq!(SqliteValue::Text(Arc::from("hi")).to_string(), "'hi'");
-        assert_eq!(SqliteValue::Blob(Arc::from([0xCA, 0xFE].as_slice())).to_string(), "X'CAFE'");
+        assert_eq!(
+            SqliteValue::Blob(Arc::from([0xCA, 0xFE].as_slice())).to_string(),
+            "X'CAFE'"
+        );
     }
 
     #[test]
@@ -1330,7 +1333,10 @@ mod tests {
             SqliteValue::Text(Arc::from("")).affinity(),
             TypeAffinity::Text
         );
-        assert_eq!(SqliteValue::Blob(Arc::from(&[] as &[u8])).affinity(), TypeAffinity::Blob);
+        assert_eq!(
+            SqliteValue::Blob(Arc::from(&[] as &[u8])).affinity(),
+            TypeAffinity::Blob
+        );
     }
 
     #[test]
@@ -1855,7 +1861,10 @@ mod tests {
         assert_eq!(SqliteValue::Integer(0).typeof_str(), "integer");
         assert_eq!(SqliteValue::Float(0.0).typeof_str(), "real");
         assert_eq!(SqliteValue::Text("x".into()).typeof_str(), "text");
-        assert_eq!(SqliteValue::Blob(Arc::from(&[] as &[u8])).typeof_str(), "blob");
+        assert_eq!(
+            SqliteValue::Blob(Arc::from(&[] as &[u8])).typeof_str(),
+            "blob"
+        );
     }
 
     #[test]
@@ -1866,7 +1875,10 @@ mod tests {
         assert_eq!(SqliteValue::Text("hello".into()).sql_length(), Some(5));
         assert_eq!(SqliteValue::Text(Arc::from("")).sql_length(), Some(0));
         // BLOB → byte count.
-        assert_eq!(SqliteValue::Blob(Arc::from([1u8, 2, 3].as_slice())).sql_length(), Some(3));
+        assert_eq!(
+            SqliteValue::Blob(Arc::from([1u8, 2, 3].as_slice())).sql_length(),
+            Some(3)
+        );
         // INTEGER → length of text representation.
         assert_eq!(SqliteValue::Integer(42).sql_length(), Some(2));
         // REAL → length of text representation.

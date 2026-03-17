@@ -7,6 +7,11 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["native"]
+native = ["fsqlite-types/native", "fsqlite-vfs/native"]
+wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm"]
+
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }

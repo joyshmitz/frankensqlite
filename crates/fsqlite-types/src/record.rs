@@ -820,49 +820,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_record_into_reuses_text_buffer_for_same_slot() {
-        let first = serialize_record(&[SqliteValue::Text("hello reusable buffer".to_owned())]);
-        let second = serialize_record(&[SqliteValue::Text("shorter".to_owned())]);
+    fn parse_record_into_decodes_text_correctly() {
+        let first = serialize_record(&[SqliteValue::Text(Arc::from("hello reusable buffer"))]);
+        let second = serialize_record(&[SqliteValue::Text(Arc::from("shorter"))]);
         let mut values = Vec::new();
 
         parse_record_into(&first, &mut values).expect("first decode");
-        let (first_ptr, first_cap) = match &values[0] {
-            SqliteValue::Text(text) => (text.as_ptr(), text.capacity()),
-            other => panic!("expected text slot, got {other:?}"),
-        };
+        assert_eq!(values[0].as_text(), Some("hello reusable buffer"));
 
         parse_record_into(&second, &mut values).expect("second decode");
-        match &values[0] {
-            SqliteValue::Text(text) => {
-                assert_eq!(text, "shorter");
-                assert_eq!(text.capacity(), first_cap);
-                assert_eq!(text.as_ptr(), first_ptr);
-            }
-            other => panic!("expected text slot, got {other:?}"),
-        }
+        assert_eq!(values[0].as_text(), Some("shorter"));
     }
 
     #[test]
-    fn parse_record_into_reuses_blob_buffer_for_same_slot() {
-        let first = serialize_record(&[SqliteValue::Blob(vec![1, 2, 3, 4, 5, 6, 7, 8])]);
-        let second = serialize_record(&[SqliteValue::Blob(vec![9, 10, 11])]);
+    fn parse_record_into_decodes_blob_correctly() {
+        let first = serialize_record(&[SqliteValue::Blob(Arc::from(
+            [1u8, 2, 3, 4, 5, 6, 7, 8].as_slice(),
+        ))]);
+        let second = serialize_record(&[SqliteValue::Blob(Arc::from([9u8, 10, 11].as_slice()))]);
         let mut values = Vec::new();
 
         parse_record_into(&first, &mut values).expect("first decode");
-        let (first_ptr, first_cap) = match &values[0] {
-            SqliteValue::Blob(blob) => (blob.as_ptr(), blob.capacity()),
-            other => panic!("expected blob slot, got {other:?}"),
-        };
+        assert_eq!(values[0].as_blob(), Some(&[1u8, 2, 3, 4, 5, 6, 7, 8][..]));
 
         parse_record_into(&second, &mut values).expect("second decode");
-        match &values[0] {
-            SqliteValue::Blob(blob) => {
-                assert_eq!(blob.as_slice(), &[9, 10, 11]);
-                assert_eq!(blob.capacity(), first_cap);
-                assert_eq!(blob.as_ptr(), first_ptr);
-            }
-            other => panic!("expected blob slot, got {other:?}"),
-        }
+        assert_eq!(values[0].as_blob(), Some(&[9u8, 10, 11][..]));
     }
 
     #[test]
@@ -927,7 +909,7 @@ mod tests {
 
     #[test]
     fn text_value() {
-        let values = vec![SqliteValue::Text("hello world".to_owned())];
+        let values = vec![SqliteValue::Text(Arc::from("hello world"))];
         let data = serialize_record(&values);
         let parsed = parse_record(&data).unwrap();
         assert_eq!(parsed.len(), 1);
@@ -936,7 +918,7 @@ mod tests {
 
     #[test]
     fn text_empty() {
-        let values = vec![SqliteValue::Text(String::new())];
+        let values = vec![SqliteValue::Text(Arc::from(""))];
         let data = serialize_record(&values);
         let parsed = parse_record(&data).unwrap();
         assert_eq!(parsed.len(), 1);
@@ -945,7 +927,9 @@ mod tests {
 
     #[test]
     fn blob_value() {
-        let values = vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])];
+        let values = vec![SqliteValue::Blob(Arc::from(
+            [0xDEu8, 0xAD, 0xBE, 0xEF].as_slice(),
+        ))];
         let data = serialize_record(&values);
         let parsed = parse_record(&data).unwrap();
         assert_eq!(parsed.len(), 1);
@@ -954,7 +938,7 @@ mod tests {
 
     #[test]
     fn blob_empty() {
-        let values = vec![SqliteValue::Blob(vec![])];
+        let values = vec![SqliteValue::Blob(Arc::from(&[] as &[u8]))];
         let data = serialize_record(&values);
         let parsed = parse_record(&data).unwrap();
         assert_eq!(parsed.len(), 1);
@@ -965,10 +949,10 @@ mod tests {
     fn mixed_record() {
         let values = vec![
             SqliteValue::Integer(42),
-            SqliteValue::Text("hello".to_owned()),
+            SqliteValue::Text(Arc::from("hello")),
             SqliteValue::Null,
             SqliteValue::Float(2.718),
-            SqliteValue::Blob(vec![1, 2, 3]),
+            SqliteValue::Blob(Arc::from([1u8, 2, 3].as_slice())),
             SqliteValue::Integer(0),
             SqliteValue::Integer(1),
         ];
@@ -998,8 +982,8 @@ mod tests {
             SqliteValue::Float(-1234.5),
             SqliteValue::Integer(0),
             SqliteValue::Integer(1),
-            SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
-            SqliteValue::Text("serial-type-text".to_owned()),
+            SqliteValue::Blob(Arc::from([0xDEu8, 0xAD, 0xBE, 0xEF].as_slice())),
+            SqliteValue::Text(Arc::from("serial-type-text")),
         ];
 
         let encoded = serialize_record(&values);
@@ -1088,7 +1072,7 @@ mod tests {
     #[test]
     fn large_text_roundtrip() {
         let big_text = "x".repeat(10_000);
-        let values = vec![SqliteValue::Text(big_text.clone())];
+        let values = vec![SqliteValue::Text(Arc::from(big_text.as_str()))];
         let data = serialize_record(&values);
         let parsed = parse_record(&data).unwrap();
         assert_eq!(parsed[0].as_text(), Some(big_text.as_str()));
@@ -1126,8 +1110,8 @@ mod tests {
         let values = vec![
             SqliteValue::Null,
             SqliteValue::Integer(42),
-            SqliteValue::Text("hello".to_owned()),
-            SqliteValue::Blob(vec![1, 2, 3]),
+            SqliteValue::Text(Arc::from("hello")),
+            SqliteValue::Blob(Arc::from([1u8, 2, 3].as_slice())),
         ];
         let data = serialize_record(&values);
         assert_eq!(record_column_count(&data), Some(values.len()));
@@ -1181,10 +1165,10 @@ mod tests {
 
     #[test]
     fn test_record_format_text_blob_vectors() {
-        let text = serialize_record(&[SqliteValue::Text("hello".to_owned())]);
+        let text = serialize_record(&[SqliteValue::Text(Arc::from("hello"))]);
         assert_eq!(text, vec![0x02, 0x17, 0x68, 0x65, 0x6C, 0x6C, 0x6F]);
 
-        let blob = serialize_record(&[SqliteValue::Blob(vec![0xCA, 0xFE])]);
+        let blob = serialize_record(&[SqliteValue::Blob(Arc::from([0xCAu8, 0xFE].as_slice()))]);
         assert_eq!(blob, vec![0x02, 0x10, 0xCA, 0xFE]);
     }
 
@@ -1192,10 +1176,10 @@ mod tests {
     fn test_record_format_worked_example_exact_bytes() {
         let values = vec![
             SqliteValue::Integer(42),
-            SqliteValue::Text("hello".to_owned()),
+            SqliteValue::Text(Arc::from("hello")),
             SqliteValue::Float(3.14),
             SqliteValue::Null,
-            SqliteValue::Blob(vec![0xCA, 0xFE]),
+            SqliteValue::Blob(Arc::from([0xCAu8, 0xFE].as_slice())),
         ];
         let data = serialize_record(&values);
         let expected = vec![
@@ -1260,9 +1244,9 @@ mod tests {
                 Just(f64::MIN),
                 Just(f64::MIN_POSITIVE),
             ].prop_map(SqliteValue::Float),
-            10 => "[a-zA-Z0-9 _]{0,200}".prop_map(SqliteValue::Text),
+            10 => "[a-zA-Z0-9 _]{0,200}".prop_map(|s: String| SqliteValue::Text(Arc::from(s.as_str()))),
             5 => proptest::collection::vec(any::<u8>(), 0..200)
-                .prop_map(SqliteValue::Blob),
+                .prop_map(|v: Vec<u8>| SqliteValue::Blob(Arc::from(v.as_slice()))),
         ]
         .boxed()
     }

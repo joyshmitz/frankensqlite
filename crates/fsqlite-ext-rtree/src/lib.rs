@@ -2103,10 +2103,7 @@ mod tests {
         let value = GeopolyJsonFunc
             .invoke(&[blob_value(&polygon)])
             .expect("json wrapper should succeed");
-        assert_eq!(
-            value,
-            SqliteValue::Text(Arc::from(geopoly_json(&polygon)))
-        );
+        assert_eq!(value, SqliteValue::Text(Arc::from(geopoly_json(&polygon))));
     }
 
     #[test]

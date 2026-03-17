@@ -442,7 +442,9 @@ fn js_value_to_sqlite_value(value: &JsValue) -> Result<SqliteValue, JsValue> {
         return parse_bigint_sqlite_value(&bigint_text).map_err(franken_error_to_js);
     }
     if let Some(bytes) = value.dyn_ref::<Uint8Array>() {
-        return Ok(SqliteValue::Blob(std::sync::Arc::from(bytes.to_vec().as_slice())));
+        return Ok(SqliteValue::Blob(std::sync::Arc::from(
+            bytes.to_vec().as_slice(),
+        )));
     }
     if let Some(date) = value.dyn_ref::<Date>() {
         return date_to_sqlite_value(date).map_err(franken_error_to_js);
@@ -553,9 +555,13 @@ fn parse_js_number_value(number: f64, is_safe_integer: bool) -> Result<SqliteVal
         #[allow(clippy::cast_possible_truncation)]
         return Ok(SqliteValue::Integer(number as i64));
     }
-    // If it's outside the safe integer range but has no fractional part,
-    // it's a large float (e.g. 1e20). We treat it as a REAL rather than
-    // failing, per the `REAL <-> number` spec.
+    if number.fract() == 0.0 {
+        return Err(FrankenError::TypeMismatch {
+            expected: "JavaScript BigInt for INTEGER values outside Number.MAX_SAFE_INTEGER"
+                .to_owned(),
+            actual: number.to_string(),
+        });
+    }
     Ok(SqliteValue::Float(number))
 }
 
@@ -626,7 +632,9 @@ fn date_to_sqlite_value(date: &Date) -> Result<SqliteValue, FrankenError> {
             actual: "invalid Date".to_owned(),
         });
     }
-    Ok(SqliteValue::Text(std::sync::Arc::from(String::from(date.to_iso_string()).as_str())))
+    Ok(SqliteValue::Text(std::sync::Arc::from(
+        String::from(date.to_iso_string()).as_str(),
+    )))
 }
 
 fn describe_js_value(value: &JsValue) -> String {
@@ -759,6 +767,13 @@ mod tests {
             .expect_err("unsafe integers should be rejected");
         assert!(matches!(error, FrankenError::TypeMismatch { .. }));
         assert!(error.to_string().contains("BigInt"));
+    }
+
+    #[test]
+    fn fractional_number_outside_safe_integer_range_remains_real() {
+        let value = parse_js_number_value((MAX_SAFE_INTEGER as f64) + 0.5, false)
+            .expect("fractional numbers should remain REAL");
+        assert_eq!(value, SqliteValue::Float((MAX_SAFE_INTEGER as f64) + 0.5));
     }
 
     #[test]

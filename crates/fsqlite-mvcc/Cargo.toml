@@ -7,6 +7,11 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["native"]
+native = ["fsqlite-pager/native", "fsqlite-wal/native"]
+wasm = ["fsqlite-pager/wasm", "fsqlite-wal/wasm"]
+
 [dependencies]
 blake3 = { workspace = true }
 crossbeam-epoch = { workspace = true }

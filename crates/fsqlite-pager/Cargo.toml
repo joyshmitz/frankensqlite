@@ -7,6 +7,11 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["native"]
+native = ["fsqlite-types/native", "fsqlite-vfs/native"]
+wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm"]
+
 [dependencies]
 foldhash = "0.1"
 smallvec = { version = "1.13.2", features = ["const_generics", "union", "const_new"] }

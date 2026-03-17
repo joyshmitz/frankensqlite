@@ -7,15 +7,30 @@ license-file.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["native"]
+native = [
+    "fsqlite-pager/native",
+    "fsqlite-btree/native",
+    "fsqlite-mvcc/native",
+    "fsqlite-wal/native",
+]
+wasm = [
+    "fsqlite-pager/wasm",
+    "fsqlite-btree/wasm",
+    "fsqlite-mvcc/wasm",
+    "fsqlite-wal/wasm",
+]
+
 [dependencies]
 asupersync = { workspace = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
-fsqlite-pager = { workspace = true }
-fsqlite-btree = { workspace = true }
+fsqlite-pager = { version = "0.1.1", path = "../fsqlite-pager", default-features = false }
+fsqlite-btree = { version = "0.1.1", path = "../fsqlite-btree", default-features = false }
 fsqlite-ast = { workspace = true }
-fsqlite-mvcc = { workspace = true }
-fsqlite-wal = { workspace = true }
+fsqlite-mvcc = { version = "0.1.1", path = "../fsqlite-mvcc", default-features = false }
+fsqlite-wal = { version = "0.1.1", path = "../fsqlite-wal", default-features = false }
 fsqlite-func = { workspace = true }
 fsqlite-parser = { workspace = true }
 tracing = { workspace = true }

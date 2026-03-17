@@ -1454,6 +1454,7 @@ impl BTreePageType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn page_number_zero_is_invalid() {
@@ -2359,7 +2360,7 @@ mod tests {
     #[test]
     fn test_affinity_applied_to_needing_operand_only() {
         let left = SqliteValue::Integer(42);
-        let right = SqliteValue::Text("123".to_string());
+        let right = SqliteValue::Text(Arc::from("123"));
         let affinity = TypeAffinity::comparison_affinity(left.affinity(), right.affinity())
             .expect("numeric-vs-text comparison must request numeric coercion");
 

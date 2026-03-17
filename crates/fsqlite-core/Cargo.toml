@@ -9,23 +9,41 @@ rust-version.workspace = true
 
 [features]
 default = ["native", "linux-asupersync-uring"]
-native = ["fsqlite-types/native", "fsqlite-vfs/native"]
-wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm"]
+native = [
+    "fsqlite-types/native",
+    "fsqlite-vfs/native",
+    "fsqlite-pager/native",
+    "fsqlite-wal/native",
+    "fsqlite-mvcc/native",
+    "fsqlite-btree/native",
+    "fsqlite-planner/native",
+    "fsqlite-vdbe/native",
+]
+wasm = [
+    "fsqlite-types/wasm",
+    "fsqlite-vfs/wasm",
+    "fsqlite-pager/wasm",
+    "fsqlite-wal/wasm",
+    "fsqlite-mvcc/wasm",
+    "fsqlite-btree/wasm",
+    "fsqlite-planner/wasm",
+    "fsqlite-vdbe/wasm",
+]
 linux-asupersync-uring = ["native", "fsqlite-vfs/linux-asupersync-uring"]
 
 [dependencies]
 fsqlite-types = { path = "../fsqlite-types", version = "0.1", default-features = false }
 fsqlite-error = { workspace = true }
 fsqlite-vfs = { version = "0.1.2", path = "../fsqlite-vfs", default-features = false }
-fsqlite-pager = { workspace = true }
-fsqlite-wal = { workspace = true }
-fsqlite-mvcc = { workspace = true }
+fsqlite-pager = { version = "0.1.1", path = "../fsqlite-pager", default-features = false }
+fsqlite-wal = { version = "0.1.1", path = "../fsqlite-wal", default-features = false }
+fsqlite-mvcc = { version = "0.1.1", path = "../fsqlite-mvcc", default-features = false }
 fsqlite-observability = { workspace = true }
-fsqlite-btree = { workspace = true }
+fsqlite-btree = { version = "0.1.1", path = "../fsqlite-btree", default-features = false }
 fsqlite-ast = { workspace = true }
 fsqlite-parser = { workspace = true }
-fsqlite-planner = { workspace = true }
-fsqlite-vdbe = { workspace = true }
+fsqlite-planner = { version = "0.1.1", path = "../fsqlite-planner", default-features = false }
+fsqlite-vdbe = { version = "0.1.1", path = "../fsqlite-vdbe", default-features = false }
 fsqlite-func = { workspace = true }
 fsqlite-ext-json = { workspace = true }
 fsqlite-ext-fts5 = { workspace = true }

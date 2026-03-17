@@ -21629,14 +21629,11 @@ impl Connection {
                                 .iter_rows()
                                 .map(|(rowid, vals)| {
                                     let mut row = if let Some(ipk_col) = ipk_idx {
-                                        let mut full =
-                                            Vec::with_capacity(num_schema_cols);
+                                        let mut full = Vec::with_capacity(num_schema_cols);
                                         let mut val_idx = 0;
                                         for col_idx in 0..num_schema_cols {
                                             if col_idx == ipk_col {
-                                                full.push(SqliteValue::Integer(
-                                                    rowid,
-                                                ));
+                                                full.push(SqliteValue::Integer(rowid));
                                             } else if val_idx < vals.len() {
                                                 full.push(vals[val_idx].clone());
                                                 val_idx += 1;
