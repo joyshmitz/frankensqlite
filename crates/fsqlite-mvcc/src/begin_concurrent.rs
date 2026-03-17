@@ -1961,6 +1961,25 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
                 }
             }
         }
+        if !prepared.read_keys.is_empty() {
+            registry.committed_readers.push(CommittedReaderInfo {
+                token: prepared.txn_token,
+                begin_seq: prepared.begin_seq,
+                commit_seq: committed_seq,
+                had_in_rw: false,
+                keys: prepared.read_keys.clone(),
+            });
+            registry.index_committed_reader(registry.committed_readers.len() - 1);
+        }
+        if !prepared.write_keys.is_empty() {
+            registry.committed_writers.push(CommittedWriterInfo {
+                token: prepared.txn_token,
+                commit_seq: committed_seq,
+                had_out_rw: false,
+                keys: prepared.write_keys.clone(),
+            });
+            registry.index_committed_writer(registry.committed_writers.len() - 1);
+        }
         registry.prune_committed_conflict_history();
         return;
     }
@@ -3334,13 +3353,23 @@ mod tests {
             Some(CommitSeq::new(12)),
             "finalize must still publish the committed page version"
         );
+        let committed_reader = registry
+            .committed_readers
+            .iter()
+            .find(|entry| entry.token.id.get() == session_id)
+            .expect("reader history should still be published");
         assert!(
-            registry.committed_readers.is_empty(),
-            "uncontended finalize should skip committed reader history publication"
+            !committed_reader.had_in_rw,
+            "uncontended finalize should publish reader history without phantom incoming edges"
         );
+        let committed_writer = registry
+            .committed_writers
+            .iter()
+            .find(|entry| entry.token.id.get() == session_id)
+            .expect("writer history should still be published");
         assert!(
-            registry.committed_writers.is_empty(),
-            "uncontended finalize should skip committed writer history publication"
+            !committed_writer.had_out_rw,
+            "uncontended finalize should publish writer history without phantom outgoing edges"
         );
 
         let next_session = registry.begin_concurrent(test_snapshot(12)).unwrap();
