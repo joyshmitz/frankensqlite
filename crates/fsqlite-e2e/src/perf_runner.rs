@@ -915,8 +915,14 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
             .integrity_check_ok
             .map_or_else(|| "skipped".to_owned(), |ok| ok.to_string())
     );
+    if let Some(notes) = &report.engine_report.correctness.notes {
+        let _ = writeln!(out, "- Notes: `{notes}`");
+    }
     if let Some(error) = &report.engine_report.error {
         let _ = writeln!(out, "- Error: `{error}`");
+    }
+    if let Some(diagnostic) = &report.engine_report.first_failure_diagnostic {
+        let _ = writeln!(out, "- First failure diagnostic: `{diagnostic}`");
     }
     let _ = writeln!(out);
 

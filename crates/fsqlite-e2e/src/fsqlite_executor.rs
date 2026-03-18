@@ -99,6 +99,17 @@ struct WorkerStats {
     ops_err: u64,
     retries: u64,
     aborts: u64,
+    busy_retries: u64,
+    busy_snapshot_retries: u64,
+    busy_recovery_retries: u64,
+    busy_other_retries: u64,
+    begin_busy_retries: u64,
+    body_busy_retries: u64,
+    commit_busy_retries: u64,
+    rollback_busy_retries: u64,
+    max_batch_attempts: u32,
+    snapshot_conflict_pages: HashMap<u32, u64>,
+    last_busy_message: Option<String>,
     retry_backoff_time_ns: u64,
     busy_attempt_time_ns: u64,
     begin_boundary_time_ns: u64,
@@ -108,12 +119,112 @@ struct WorkerStats {
     error: Option<String>,
 }
 
+impl WorkerStats {
+    fn merge_from(&mut self, other: Self) {
+        self.ops_ok += other.ops_ok;
+        self.ops_err += other.ops_err;
+        self.retries += other.retries;
+        self.aborts += other.aborts;
+        self.busy_retries += other.busy_retries;
+        self.busy_snapshot_retries += other.busy_snapshot_retries;
+        self.busy_recovery_retries += other.busy_recovery_retries;
+        self.busy_other_retries += other.busy_other_retries;
+        self.begin_busy_retries += other.begin_busy_retries;
+        self.body_busy_retries += other.body_busy_retries;
+        self.commit_busy_retries += other.commit_busy_retries;
+        self.rollback_busy_retries += other.rollback_busy_retries;
+        self.max_batch_attempts = self.max_batch_attempts.max(other.max_batch_attempts);
+        for (page, count) in other.snapshot_conflict_pages {
+            *self.snapshot_conflict_pages.entry(page).or_default() += count;
+        }
+        if other.last_busy_message.is_some() {
+            self.last_busy_message = other.last_busy_message;
+        }
+        self.retry_backoff_time_ns = self
+            .retry_backoff_time_ns
+            .saturating_add(other.retry_backoff_time_ns);
+        self.busy_attempt_time_ns = self
+            .busy_attempt_time_ns
+            .saturating_add(other.busy_attempt_time_ns);
+        self.begin_boundary_time_ns = self
+            .begin_boundary_time_ns
+            .saturating_add(other.begin_boundary_time_ns);
+        self.body_execution_time_ns = self
+            .body_execution_time_ns
+            .saturating_add(other.body_execution_time_ns);
+        self.commit_finalize_time_ns = self
+            .commit_finalize_time_ns
+            .saturating_add(other.commit_finalize_time_ns);
+        self.rollback_time_ns = self.rollback_time_ns.saturating_add(other.rollback_time_ns);
+        if self.error.is_none() {
+            self.error = other.error;
+        }
+    }
+
+    fn record_busy(&mut self, busy: &BusyDiagnostic, phase: BatchPhase, attempt: u32) {
+        match busy.class {
+            BusyClass::Busy => {
+                self.busy_retries = self.busy_retries.saturating_add(1);
+            }
+            BusyClass::BusySnapshot => {
+                self.busy_snapshot_retries = self.busy_snapshot_retries.saturating_add(1);
+                for &page in &busy.conflicting_pages {
+                    *self.snapshot_conflict_pages.entry(page).or_default() += 1;
+                }
+            }
+            BusyClass::BusyRecovery => {
+                self.busy_recovery_retries = self.busy_recovery_retries.saturating_add(1);
+            }
+        }
+
+        match phase {
+            BatchPhase::Begin => {
+                self.begin_busy_retries = self.begin_busy_retries.saturating_add(1);
+            }
+            BatchPhase::Body => {
+                self.body_busy_retries = self.body_busy_retries.saturating_add(1);
+            }
+            BatchPhase::Commit => {
+                self.commit_busy_retries = self.commit_busy_retries.saturating_add(1);
+            }
+            BatchPhase::Rollback => {
+                self.rollback_busy_retries = self.rollback_busy_retries.saturating_add(1);
+            }
+        }
+
+        self.max_batch_attempts = self.max_batch_attempts.max(attempt);
+        self.last_busy_message = Some(busy.message.clone());
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct BatchTiming {
     begin_boundary: u64,
     body_execution: u64,
     commit_finalize: u64,
     rollback: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BusyClass {
+    Busy,
+    BusySnapshot,
+    BusyRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchPhase {
+    Begin,
+    Body,
+    Commit,
+    Rollback,
+}
+
+#[derive(Debug, Clone)]
+struct BusyDiagnostic {
+    class: BusyClass,
+    conflicting_pages: Vec<u32>,
+    message: String,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -590,13 +701,16 @@ pub fn run_oplog_fsqlite(
         None
     };
 
+    let retry_diagnostics = retry_diagnostics_note(&stats);
+
     Ok(build_report(EngineRunReportArgs {
         wall,
         ops_ok: stats.ops_ok,
         ops_err: stats.ops_err,
         retries: stats.retries,
         aborts: stats.aborts,
-        first_error: stats.error,
+        first_error: stats.error.clone(),
+        retry_diagnostics,
         concurrent_mode: config.concurrent_mode,
         integrity_check_ok,
         parallel_workers: run_parallel_workers,
@@ -816,31 +930,7 @@ fn replay_parallel(
 
     let mut total = WorkerStats::default();
     for stats in worker_stats {
-        total.ops_ok += stats.ops_ok;
-        total.ops_err += stats.ops_err;
-        total.retries += stats.retries;
-        total.aborts += stats.aborts;
-        total.retry_backoff_time_ns = total
-            .retry_backoff_time_ns
-            .saturating_add(stats.retry_backoff_time_ns);
-        total.busy_attempt_time_ns = total
-            .busy_attempt_time_ns
-            .saturating_add(stats.busy_attempt_time_ns);
-        total.begin_boundary_time_ns = total
-            .begin_boundary_time_ns
-            .saturating_add(stats.begin_boundary_time_ns);
-        total.body_execution_time_ns = total
-            .body_execution_time_ns
-            .saturating_add(stats.body_execution_time_ns);
-        total.commit_finalize_time_ns = total
-            .commit_finalize_time_ns
-            .saturating_add(stats.commit_finalize_time_ns);
-        total.rollback_time_ns = total
-            .rollback_time_ns
-            .saturating_add(stats.rollback_time_ns);
-        if total.error.is_none() {
-            total.error = stats.error;
-        }
+        total.merge_from(stats);
     }
 
     Ok(total)
@@ -878,31 +968,7 @@ fn replay_sequential(
             &owned,
             config,
         );
-        total.ops_ok += stats.ops_ok;
-        total.ops_err += stats.ops_err;
-        total.retries += stats.retries;
-        total.aborts += stats.aborts;
-        total.retry_backoff_time_ns = total
-            .retry_backoff_time_ns
-            .saturating_add(stats.retry_backoff_time_ns);
-        total.busy_attempt_time_ns = total
-            .busy_attempt_time_ns
-            .saturating_add(stats.busy_attempt_time_ns);
-        total.begin_boundary_time_ns = total
-            .begin_boundary_time_ns
-            .saturating_add(stats.begin_boundary_time_ns);
-        total.body_execution_time_ns = total
-            .body_execution_time_ns
-            .saturating_add(stats.body_execution_time_ns);
-        total.commit_finalize_time_ns = total
-            .commit_finalize_time_ns
-            .saturating_add(stats.commit_finalize_time_ns);
-        total.rollback_time_ns = total
-            .rollback_time_ns
-            .saturating_add(stats.rollback_time_ns);
-        if total.error.is_none() {
-            total.error = stats.error;
-        }
+        total.merge_from(stats);
     }
 
     total
@@ -951,6 +1017,7 @@ struct EngineRunReportArgs {
     retries: u64,
     aborts: u64,
     first_error: Option<String>,
+    retry_diagnostics: Option<String>,
     concurrent_mode: bool,
     integrity_check_ok: Option<bool>,
     parallel_workers: bool,
@@ -968,6 +1035,7 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
         retries,
         aborts,
         first_error,
+        retry_diagnostics,
         concurrent_mode,
         integrity_check_ok,
         parallel_workers,
@@ -1010,6 +1078,17 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
             )
         },
     );
+    let notes = if let Some(diagnostics) = retry_diagnostics.as_deref() {
+        format!("{notes}; {diagnostics}")
+    } else {
+        notes
+    };
+    let first_failure_diagnostic = error.as_ref().map(|message| {
+        retry_diagnostics.as_ref().map_or_else(
+            || message.clone(),
+            |diagnostics| format!("{message}; {diagnostics}"),
+        )
+    });
 
     EngineRunReport {
         wall_time_ms: wall_ms,
@@ -1028,7 +1107,7 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
             notes: Some(notes),
         },
         latency_ms: None,
-        first_failure_diagnostic: error.clone(),
+        first_failure_diagnostic,
         error,
         storage_wiring,
         runtime_phase_timing: Some(runtime_phase_timing),
@@ -1112,25 +1191,28 @@ fn split_into_batches(records: &[OpRecord]) -> Vec<BatchRange> {
 #[derive(Debug)]
 enum BatchError {
     Busy {
-        message: String,
+        busy: BusyDiagnostic,
+        phase: BatchPhase,
         timing: BatchTiming,
     },
     Fatal {
         message: String,
+        phase: BatchPhase,
         timing: BatchTiming,
     },
 }
 
 #[derive(Debug)]
 enum OpError {
-    Busy(String),
+    Busy(BusyDiagnostic),
     Fatal(String),
 }
 
 impl OpError {
     fn message(&self) -> &str {
         match self {
-            Self::Busy(msg) | Self::Fatal(msg) => msg,
+            Self::Busy(diag) => diag.message.as_str(),
+            Self::Fatal(msg) => msg,
         }
     }
 }
@@ -1146,7 +1228,7 @@ fn execute_batch_with_executor(
     executor
         .conn
         .execute("BEGIN;")
-        .map_err(classify_fsqlite_error_as_batch)?;
+        .map_err(|err| classify_fsqlite_error_as_batch_in_phase(err, BatchPhase::Begin))?;
     timing.begin_boundary = duration_to_u64_ns(begin_started.elapsed());
 
     let mut ok: u64 = 0;
@@ -1166,18 +1248,21 @@ fn execute_batch_with_executor(
                 let rollback_started = Instant::now();
                 rollback_active_batch(executor.conn).map_err(|rollback| BatchError::Fatal {
                     message: format!("{}; rollback failed: {rollback}", err.message()),
+                    phase: BatchPhase::Rollback,
                     timing,
                 })?;
                 timing.rollback = timing
                     .rollback
                     .saturating_add(duration_to_u64_ns(rollback_started.elapsed()));
                 return Err(match err {
-                    OpError::Busy(msg) => BatchError::Busy {
-                        message: msg,
+                    OpError::Busy(busy) => BatchError::Busy {
+                        busy,
+                        phase: BatchPhase::Body,
                         timing,
                     },
                     OpError::Fatal(msg) => BatchError::Fatal {
                         message: msg,
+                        phase: BatchPhase::Body,
                         timing,
                     },
                 });
@@ -1206,15 +1291,31 @@ fn execute_batch_with_executor(
             let rollback_started = Instant::now();
             rollback_active_batch(executor.conn).map_err(|rollback| BatchError::Fatal {
                 message: format!("{err}; rollback failed: {rollback}"),
+                phase: BatchPhase::Rollback,
                 timing,
             })?;
             timing.rollback = timing
                 .rollback
                 .saturating_add(duration_to_u64_ns(rollback_started.elapsed()));
-            Err(match classify_fsqlite_error_as_batch(err) {
-                BatchError::Busy { message, .. } => BatchError::Busy { message, timing },
-                BatchError::Fatal { message, .. } => BatchError::Fatal { message, timing },
-            })
+            let finalize_phase = if batch.commit {
+                BatchPhase::Commit
+            } else {
+                BatchPhase::Rollback
+            };
+            Err(
+                match classify_fsqlite_error_as_batch_in_phase(err, finalize_phase) {
+                    BatchError::Busy { busy, phase, .. } => BatchError::Busy {
+                        busy,
+                        phase,
+                        timing,
+                    },
+                    BatchError::Fatal { message, phase, .. } => BatchError::Fatal {
+                        message,
+                        phase,
+                        timing,
+                    },
+                },
+            )
         }
     }
 }
@@ -1254,9 +1355,14 @@ fn run_records_with_retry(
                         .saturating_add(outcome.timing.rollback);
                     break;
                 }
-                Err(BatchError::Busy { message, timing }) => {
+                Err(BatchError::Busy {
+                    busy,
+                    phase,
+                    timing,
+                }) => {
                     stats.retries += 1;
                     stats.aborts += 1;
+                    stats.record_busy(&busy, phase, attempt.saturating_add(1));
                     stats.busy_attempt_time_ns = stats.busy_attempt_time_ns.saturating_add(
                         timing
                             .begin_boundary
@@ -1271,8 +1377,8 @@ fn run_records_with_retry(
                     attempt = attempt.saturating_add(1);
                     if attempt > config.max_busy_retries {
                         stats.error = Some(format!(
-                            "worker {worker_id}: exceeded max_busy_retries={} (last={message})",
-                            config.max_busy_retries
+                            "worker {worker_id}: exceeded max_busy_retries={} (last={})",
+                            config.max_busy_retries, busy.message
                         ));
                         break;
                     }
@@ -1282,7 +1388,11 @@ fn run_records_with_retry(
                         .saturating_add(duration_to_u64_ns(backoff));
                     std::thread::sleep(backoff);
                 }
-                Err(BatchError::Fatal { message, timing }) => {
+                Err(BatchError::Fatal {
+                    message,
+                    phase: _,
+                    timing,
+                }) => {
                     stats.begin_boundary_time_ns = stats
                         .begin_boundary_time_ns
                         .saturating_add(timing.begin_boundary);
@@ -2163,25 +2273,15 @@ fn parse_value(s: &str) -> SqliteValue {
     SqliteValue::Text(s.into())
 }
 
+#[cfg(test)]
 fn classify_fsqlite_error_as_batch(err: FrankenError) -> BatchError {
-    if is_retryable_busy(&err) {
-        BatchError::Busy {
-            message: err.to_string(),
-            timing: BatchTiming::default(),
-        }
-    } else {
-        BatchError::Fatal {
-            message: err.to_string(),
-            timing: BatchTiming::default(),
-        }
-    }
+    classify_fsqlite_error_as_batch_in_phase(err, BatchPhase::Body)
 }
 
 fn classify_fsqlite_error_as_op(err: FrankenError) -> OpError {
-    if is_retryable_busy(&err) {
-        OpError::Busy(err.to_string())
-    } else {
-        OpError::Fatal(err.to_string())
+    match classify_retryable_busy(err) {
+        Ok(busy) => OpError::Busy(busy),
+        Err(message) => OpError::Fatal(message),
     }
 }
 
@@ -2190,6 +2290,105 @@ fn is_retryable_busy(err: &FrankenError) -> bool {
         err,
         FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::BusySnapshot { .. }
     )
+}
+
+fn classify_fsqlite_error_as_batch_in_phase(err: FrankenError, phase: BatchPhase) -> BatchError {
+    match classify_retryable_busy(err) {
+        Ok(busy) => BatchError::Busy {
+            busy,
+            phase,
+            timing: BatchTiming::default(),
+        },
+        Err(message) => BatchError::Fatal {
+            message,
+            phase,
+            timing: BatchTiming::default(),
+        },
+    }
+}
+
+fn classify_retryable_busy(err: FrankenError) -> Result<BusyDiagnostic, String> {
+    let message = err.to_string();
+    match err {
+        FrankenError::Busy => Ok(BusyDiagnostic {
+            class: BusyClass::Busy,
+            conflicting_pages: Vec::new(),
+            message,
+        }),
+        FrankenError::BusyRecovery => Ok(BusyDiagnostic {
+            class: BusyClass::BusyRecovery,
+            conflicting_pages: Vec::new(),
+            message,
+        }),
+        FrankenError::BusySnapshot { conflicting_pages } => Ok(BusyDiagnostic {
+            class: BusyClass::BusySnapshot,
+            conflicting_pages: parse_conflicting_pages(&conflicting_pages),
+            message,
+        }),
+        _ => Err(message),
+    }
+}
+
+fn parse_conflicting_pages(conflicting_pages: &str) -> Vec<u32> {
+    conflicting_pages
+        .split(',')
+        .filter_map(|raw| raw.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn retry_diagnostics_note(stats: &WorkerStats) -> Option<String> {
+    if stats.retries == 0 {
+        return None;
+    }
+
+    let mut note = format!(
+        "retry_diag=kind[busy={},busy_snapshot={},busy_recovery={},other={}] phase[begin={},body={},commit={},rollback={}] max_batch_attempts={}",
+        stats.busy_retries,
+        stats.busy_snapshot_retries,
+        stats.busy_recovery_retries,
+        stats.busy_other_retries,
+        stats.begin_busy_retries,
+        stats.body_busy_retries,
+        stats.commit_busy_retries,
+        stats.rollback_busy_retries,
+        stats.max_batch_attempts,
+    );
+
+    let top_pages = format_top_conflict_pages(&stats.snapshot_conflict_pages);
+    if !top_pages.is_empty() {
+        let _ = write!(note, " top_conflict_pages[{top_pages}]");
+    }
+
+    if let Some(message) = &stats.last_busy_message {
+        let _ = write!(note, " last_busy=\"{}\"", sanitize_retry_message(message));
+    }
+
+    Some(note)
+}
+
+fn format_top_conflict_pages(conflicts: &HashMap<u32, u64>) -> String {
+    let mut ranked: Vec<(u32, u64)> = conflicts
+        .iter()
+        .map(|(&page, &count)| (page, count))
+        .collect();
+    ranked.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(&rhs.0)));
+    ranked.truncate(5);
+    ranked
+        .into_iter()
+        .map(|(page, count)| format!("p{page}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn sanitize_retry_message(message: &str) -> String {
+    const MAX_MESSAGE_LEN: usize = 160;
+
+    let trimmed = message.replace(['\n', '\r', ';'], " ");
+    if trimmed.len() <= MAX_MESSAGE_LEN {
+        trimmed
+    } else {
+        format!("{}...", &trimmed[..MAX_MESSAGE_LEN.saturating_sub(3)])
+    }
 }
 
 fn backoff_duration(config: &FsqliteExecConfig, attempt: u32) -> Duration {
