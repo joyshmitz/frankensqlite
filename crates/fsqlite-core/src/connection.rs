@@ -33445,8 +33445,6 @@ struct InsertTargetLayout {
     explicit_rowid_source: Option<usize>,
 }
 
-/// Perform a single join step: combine left-side rows with right-side rows.
-#[allow(clippy::too_many_lines)]
 /// Hashable wrapper for SqliteValue join keys. Floats are hashed by their
 /// bit representation (correct for equi-join: bit-equal floats hash equally,
 /// and NaN keys are excluded by the NULL check in the caller).
@@ -33601,7 +33599,9 @@ fn execute_hash_join(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Perform a single join step: combine left-side rows with right-side rows.
+/// Uses hash-join O(n+m) for equi-joins, falls back to nested-loop O(n*m).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn execute_single_join(
     left: &[Vec<SqliteValue>],
     right: &[Vec<SqliteValue>],
@@ -48419,6 +48419,108 @@ mod tests {
         }
 
         conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_commit_planning_page_one_surface_serializes_disjoint_concurrent_growth_writers() {
+        use fsqlite_pager::TransactionMode;
+        use fsqlite_types::{Snapshot, TxnId};
+
+        let conn = Connection::open(":memory:").unwrap();
+        let cx = conn.op_cx().unwrap();
+        let ps = PageSize::MIN.as_usize();
+
+        let (predicted_one, predicted_two, page_one_data, page_two_data) = {
+            let mut txn_one = conn.pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+            let mut txn_two = conn.pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+
+            let page_one_data = txn_one.allocate_page(&cx).unwrap();
+            txn_one
+                .write_page(&cx, page_one_data, &vec![0xA1; ps])
+                .unwrap();
+
+            let page_two_data = txn_two.allocate_page(&cx).unwrap();
+            txn_two
+                .write_page(&cx, page_two_data, &vec![0xB2; ps])
+                .unwrap();
+
+            assert_ne!(
+                page_one_data, page_two_data,
+                "concurrent growth writers must allocate distinct data pages for this proof"
+            );
+
+            let predicted_one = txn_one.pending_commit_pages().unwrap();
+            let predicted_two = txn_two.pending_commit_pages().unwrap();
+
+            assert!(
+                predicted_one.contains(&PageNumber::ONE),
+                "concurrent growth still pulls page 1 into the pending commit surface"
+            );
+            assert!(
+                predicted_two.contains(&PageNumber::ONE),
+                "a second disjoint growth writer still pulls page 1 into the pending commit surface"
+            );
+            assert!(
+                predicted_one.contains(&page_one_data) && !predicted_one.contains(&page_two_data),
+                "first writer should only contribute its own data page plus structural pages"
+            );
+            assert!(
+                predicted_two.contains(&page_two_data) && !predicted_two.contains(&page_one_data),
+                "second writer should only contribute its own data page plus structural pages"
+            );
+
+            (predicted_one, predicted_two, page_one_data, page_two_data)
+        };
+
+        let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        let (session_one, session_two, session_three) = {
+            let mut registry = lock_unpoisoned(&conn.concurrent_registry);
+            (
+                registry.begin_concurrent(snapshot).unwrap(),
+                registry.begin_concurrent(snapshot).unwrap(),
+                registry.begin_concurrent(snapshot).unwrap(),
+            )
+        };
+
+        {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            conn.track_pending_commit_pages_with_registry(&registry, session_one, &predicted_one)
+                .expect("first disjoint growth writer should track its pending surface");
+        }
+
+        {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            let err = conn
+                .track_pending_commit_pages_with_registry(&registry, session_two, &predicted_two)
+                .expect_err("page 1 alone should serialize disjoint growth writers");
+            assert!(
+                matches!(err, FrankenError::Busy),
+                "expected page-one lock contention during concurrent planning, got {err:?}"
+            );
+        }
+
+        conn.concurrent_lock_table
+            .release_all(TxnId::new(session_one).unwrap());
+        conn.concurrent_commit_index
+            .update(PageNumber::ONE, CommitSeq::new(1));
+
+        {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            let err = conn
+                .track_pending_commit_pages_with_registry(&registry, session_three, &predicted_two)
+                .expect_err("after page-one publish, the stale disjoint writer should fail FCW");
+            match err {
+                FrankenError::BusySnapshot { conflicting_pages } => {
+                    assert_eq!(
+                        conflicting_pages, "1",
+                        "the stale commit should conflict on page 1 even though its data page was {}/{}",
+                        page_one_data.get(),
+                        page_two_data.get()
+                    );
+                }
+                other => panic!("expected BusySnapshot on page 1, got {other:?}"),
+            }
+        }
     }
 
     #[test]
