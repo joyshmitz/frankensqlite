@@ -402,6 +402,47 @@ source of truth for dimensions and naming:
 rch exec -- cargo run -p fsqlite-e2e --profile release-perf --bin realdb-e2e -- bench
 ```
 
+### Track H Matched Mode Packs
+
+`bd-db300.8.1.1` needs one reproducible entrypoint that assembles a matched
+three-mode pack for the same canonical row instead of leaving operators to
+manually stitch together SQLite, MVCC, and forced single-writer outputs.
+
+The checked-in collector is:
+
+```bash
+bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
+```
+
+By default it targets the current Track H steering cell
+`mixed_read_write_c4`, uses `baseline_unpinned`, and routes every benchmark
+through `rch exec`. Narrow the scope explicitly when you want a smaller or more
+focused pack:
+
+```bash
+ROW_IDS=mixed_read_write_c4 \
+FIXTURE_IDS=frankensqlite \
+PLACEMENT_PROFILE_IDS=baseline_unpinned \
+WARMUP=0 \
+REPEAT=1 \
+bash scripts/verify_bd_db300_8_1_1_matched_artifact_packs.sh
+```
+
+The output goes under `artifacts/perf/bd-db300.8.1.1/<run_id>/` and includes:
+
+- one pack directory per `row_id` × `fixture_id` × `placement_profile_id`
+- mode-specific `results.jsonl` and `summary.md` artifacts for
+  `sqlite_reference`, `fsqlite_mvcc`, and `fsqlite_single_writer`
+- a per-pack `manifest.json` plus `summary.md` with shared provenance fields and
+  direct deltas between MVCC and forced single-writer behavior
+- a run-level `report.json` and `summary.md`
+
+`baseline_unpinned` packs are directly comparable under scheduler-default
+placement. If you request `recommended_pinned` or `adversarial_cross_node`, the
+collector records the declared placement profile but does not enforce remote CPU
+or memory placement on your behalf; those packs are marked as declared-only
+until the operator supplies external placement enforcement.
+
 ### Run Library Benchmarks (Unit Tests)
 
 ```bash

@@ -264,7 +264,11 @@ impl HotPathMetricsCapture {
 
     fn reset(&mut self) {
         if self.enabled {
-            reset();
+            reset_tokenize_metrics();
+            reset_parse_metrics();
+            reset_semantic_metrics();
+            reset_vdbe_metrics();
+            reset_btree_metrics();
             self.vfs_before = GLOBAL_VFS_METRICS.snapshot();
             self.wal_before = wal_telemetry_snapshot();
         }
@@ -294,14 +298,6 @@ impl Drop for HotPathMetricsCapture {
         set_parse_metrics_enabled(self.prev_parse_metrics_enabled);
         set_vdbe_metrics_enabled(self.prev_vdbe_metrics_enabled);
     }
-}
-
-fn reset() {
-    reset_tokenize_metrics();
-    reset_parse_metrics();
-    reset_semantic_metrics();
-    reset_vdbe_metrics();
-    reset_btree_metrics();
 }
 
 fn hot_path_histogram(snapshot: &ValueTypeMetricsSnapshot) -> HotPathValueHistogram {
@@ -669,11 +665,12 @@ pub fn run_oplog_fsqlite(
 
     let (setup_len, per_worker) = partition_records(oplog, worker_count)?;
     let mut storage_wiring = None;
+    let conflict_diagnostics;
+    let wall;
 
-    let started = Instant::now();
     let run_parallel_workers = worker_count > 1 && db_path != Path::new(":memory:");
     let stats = if run_parallel_workers {
-        replay_parallel(
+        let (stats, conflict_stats_note, run_wall) = replay_parallel(
             db_path,
             oplog,
             setup_len,
@@ -681,15 +678,22 @@ pub fn run_oplog_fsqlite(
             config,
             &mut metrics_capture,
             &mut storage_wiring,
-        )?
+        )?;
+        conflict_diagnostics = conflict_stats_note;
+        wall = run_wall;
+        stats
     } else {
         let conn = open_connection(db_path)?;
         storage_wiring = Some(configure_connection(&conn, db_path, config)?);
         execute_setup(&conn, &oplog.records[..setup_len])?;
+        reset_conflict_stats(&conn)?;
         metrics_capture.reset();
-        replay_sequential(&conn, &per_worker, config)
+        let started = Instant::now();
+        let stats = replay_sequential(&conn, &per_worker, config);
+        wall = started.elapsed();
+        conflict_diagnostics = query_conflict_stats_note(&conn)?;
+        stats
     };
-    let wall = started.elapsed();
     let hot_path_profile = metrics_capture.snapshot(oplog);
 
     let integrity_check_ok = if config.run_integrity_check && db_path != Path::new(":memory:") {
@@ -711,6 +715,7 @@ pub fn run_oplog_fsqlite(
         aborts: stats.aborts,
         first_error: stats.error.clone(),
         retry_diagnostics,
+        conflict_diagnostics,
         concurrent_mode: config.concurrent_mode,
         integrity_check_ok,
         parallel_workers: run_parallel_workers,
@@ -775,6 +780,73 @@ fn query_pragma_text(conn: &Connection, pragma: &str) -> E2eResult<String> {
         other => Err(E2eError::Fsqlite(format!(
             "query `{pragma}` returned non-text pragma value: {other:?}"
         ))),
+    }
+}
+
+fn reset_conflict_stats(conn: &Connection) -> E2eResult<()> {
+    conn.query("PRAGMA fsqlite.conflict_reset;")
+        .map(|_| ())
+        .map_err(|e| E2eError::Fsqlite(format!("query `PRAGMA fsqlite.conflict_reset;`: {e}")))
+}
+
+fn query_conflict_stats_note(conn: &Connection) -> E2eResult<Option<String>> {
+    let rows = conn
+        .query("PRAGMA fsqlite.conflict_stats;")
+        .map_err(|e| E2eError::Fsqlite(format!("query `PRAGMA fsqlite.conflict_stats;`: {e}")))?;
+
+    let mut page_contentions = 0_u64;
+    let mut fcw_drifts = 0_u64;
+    let mut ssi_aborts = 0_u64;
+    let mut fcw_merge_attempts = 0_u64;
+    let mut fcw_merge_successes = 0_u64;
+    let mut top_hotspots = String::new();
+
+    for row in rows {
+        let values = row.values();
+        let Some(name) = values.first().and_then(sqlite_value_as_str) else {
+            continue;
+        };
+        let Some(value) = values.get(1) else {
+            continue;
+        };
+        match name {
+            "page_contentions" => page_contentions = sqlite_value_as_u64(value).unwrap_or(0),
+            "fcw_drifts" => fcw_drifts = sqlite_value_as_u64(value).unwrap_or(0),
+            "ssi_aborts" => ssi_aborts = sqlite_value_as_u64(value).unwrap_or(0),
+            "fcw_merge_attempts" => fcw_merge_attempts = sqlite_value_as_u64(value).unwrap_or(0),
+            "fcw_merge_successes" => {
+                fcw_merge_successes = sqlite_value_as_u64(value).unwrap_or(0);
+            }
+            "top_hotspots" => {
+                sqlite_value_as_str(value)
+                    .unwrap_or_default()
+                    .clone_into(&mut top_hotspots);
+            }
+            _ => {}
+        }
+    }
+
+    let mut note = format!(
+        "conflict_stats[page_contentions={page_contentions},fcw_drifts={fcw_drifts},ssi_aborts={ssi_aborts},fcw_merge_attempts={fcw_merge_attempts},fcw_merge_successes={fcw_merge_successes}]"
+    );
+    if !top_hotspots.is_empty() {
+        let _ = write!(note, " top_hotspots[{top_hotspots}]");
+    }
+    Ok(Some(note))
+}
+
+fn sqlite_value_as_str(value: &SqliteValue) -> Option<&str> {
+    match value {
+        SqliteValue::Text(value) => Some(value.as_ref()),
+        _ => None,
+    }
+}
+
+fn sqlite_value_as_u64(value: &SqliteValue) -> Option<u64> {
+    match value {
+        SqliteValue::Integer(value) => u64::try_from(*value).ok(),
+        SqliteValue::Text(value) => value.parse::<u64>().ok(),
+        _ => None,
     }
 }
 
@@ -872,7 +944,7 @@ fn replay_parallel(
     config: &FsqliteExecConfig,
     metrics_capture: &mut HotPathMetricsCapture,
     storage_wiring: &mut Option<StorageWiringReport>,
-) -> E2eResult<WorkerStats> {
+) -> E2eResult<(WorkerStats, Option<String>, Duration)> {
     let worker_count = u16::try_from(per_worker.len()).map_err(|_| {
         E2eError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -880,14 +952,14 @@ fn replay_parallel(
         ))
     })?;
     if worker_count == 0 {
-        return Ok(WorkerStats::default());
+        return Ok((WorkerStats::default(), None, Duration::ZERO));
     }
 
     // Setup SQL must run once before worker replay so schema/seed data exists.
     let setup_conn = open_connection(db_path)?;
     *storage_wiring = Some(configure_connection(&setup_conn, db_path, config)?);
     execute_setup(&setup_conn, &oplog.records[..setup_len])?;
-    drop(setup_conn);
+    reset_conflict_stats(&setup_conn)?;
 
     let per_worker_owned: Vec<Vec<OpRecord>> = per_worker
         .iter()
@@ -896,6 +968,7 @@ fn replay_parallel(
     let config_barrier = Barrier::new(usize::from(worker_count) + 1);
     let start_barrier = Barrier::new(usize::from(worker_count) + 1);
 
+    let started = Instant::now();
     let worker_stats: Vec<WorkerStats> = std::thread::scope(|s| {
         let mut joins = Vec::with_capacity(usize::from(worker_count));
         for worker_id in 0..worker_count {
@@ -927,13 +1000,15 @@ fn replay_parallel(
             })
             .collect()
     });
+    let wall = started.elapsed();
 
     let mut total = WorkerStats::default();
     for stats in worker_stats {
         total.merge_from(stats);
     }
 
-    Ok(total)
+    let conflict_diagnostics = query_conflict_stats_note(&setup_conn)?;
+    Ok((total, conflict_diagnostics, wall))
 }
 
 fn execute_setup(conn: &Connection, setup_records: &[OpRecord]) -> E2eResult<()> {
@@ -1018,6 +1093,7 @@ struct EngineRunReportArgs {
     aborts: u64,
     first_error: Option<String>,
     retry_diagnostics: Option<String>,
+    conflict_diagnostics: Option<String>,
     concurrent_mode: bool,
     integrity_check_ok: Option<bool>,
     parallel_workers: bool,
@@ -1036,6 +1112,7 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
         aborts,
         first_error,
         retry_diagnostics,
+        conflict_diagnostics,
         concurrent_mode,
         integrity_check_ok,
         parallel_workers,
@@ -1083,11 +1160,21 @@ fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
     } else {
         notes
     };
+    let notes = if let Some(diagnostics) = conflict_diagnostics.as_deref() {
+        format!("{notes}; {diagnostics}")
+    } else {
+        notes
+    };
     let first_failure_diagnostic = error.as_ref().map(|message| {
-        retry_diagnostics.as_ref().map_or_else(
-            || message.clone(),
-            |diagnostics| format!("{message}; {diagnostics}"),
-        )
+        [
+            Some(message.as_str()),
+            retry_diagnostics.as_deref(),
+            conflict_diagnostics.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ")
     });
 
     EngineRunReport {
@@ -2278,9 +2365,15 @@ fn classify_fsqlite_error_as_batch(err: FrankenError) -> BatchError {
 }
 
 fn classify_fsqlite_error_as_op(err: FrankenError) -> OpError {
-    match classify_retryable_busy(err) {
-        Ok(busy) => OpError::Busy(busy),
-        Err(message) => OpError::Fatal(message),
+    match err {
+        FrankenError::Busy | FrankenError::BusyRecovery | FrankenError::BusySnapshot { .. } => {
+            OpError::Busy(BusyDiagnostic {
+                class: BusyClass::Busy,
+                conflicting_pages: Vec::new(),
+                message: err.to_string(),
+            })
+        }
+        _ => OpError::Fatal(err.to_string()),
     }
 }
 
@@ -3394,6 +3487,44 @@ mod tests {
 
         assert_ne!(storage_wiring.backend_kind, "memory");
         assert_eq!(storage_wiring.backend_mode, "fallback_allowed");
+    }
+
+    #[test]
+    fn build_report_surfaces_conflict_diagnostics_in_notes() {
+        let report = build_report(EngineRunReportArgs {
+            wall: Duration::from_millis(10),
+            ops_ok: 1,
+            ops_err: 0,
+            retries: 0,
+            aborts: 0,
+            first_error: None,
+            retry_diagnostics: None,
+            conflict_diagnostics: Some(
+                "conflict_stats[page_contentions=7,fcw_drifts=0,ssi_aborts=0,fcw_merge_attempts=0,fcw_merge_successes=0] top_hotspots[p2653:7]".to_owned(),
+            ),
+            concurrent_mode: true,
+            integrity_check_ok: None,
+            parallel_workers: true,
+            storage_wiring: None,
+            runtime_phase_timing: RuntimePhaseTimingEvidence {
+                retry_backoff_time_ns: 0,
+                busy_attempt_time_ns: 0,
+                begin_boundary_time_ns: 0,
+                body_execution_time_ns: 0,
+                commit_finalize_time_ns: 0,
+                rollback_time_ns: 0,
+            },
+            hot_path_profile: None,
+        });
+
+        assert!(
+            report
+                .correctness
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.contains("conflict_stats[")),
+            "expected conflict diagnostics in report notes"
+        );
     }
 
     #[test]

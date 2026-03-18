@@ -15,6 +15,7 @@ workspace = true
 [features]
 default = []
 tui = ["dep:ftui"]
+linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring", "fsqlite-core/linux-asupersync-uring", "fsqlite/linux-asupersync-uring"]
 
 [dependencies]
 asupersync = { workspace = true }

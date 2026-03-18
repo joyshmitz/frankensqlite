@@ -196,8 +196,13 @@ impl OpLog {
 /// Generate the **commutative inserts (disjoint keys)** preset.
 ///
 /// Each of `worker_count` workers inserts into its own non-overlapping key
-/// range, ensuring zero write conflicts.  Final row count and content are
-/// independent of execution order.
+/// range. Final row count and content are independent of execution order.
+///
+/// Setup pre-seeds each worker's range with even-numbered keys so the measured
+/// odd-key inserts land in already-fanned-out, worker-local ranges instead of
+/// all converging on the empty-table right edge. Use single-row transactions so
+/// workers do not hold a shared leaf across multi-insert batches while the
+/// measured phase is running.
 #[must_use]
 pub fn preset_commutative_inserts_disjoint_keys(
     fixture_id: &str,
@@ -205,9 +210,8 @@ pub fn preset_commutative_inserts_disjoint_keys(
     worker_count: u16,
     rows_per_worker: u32,
 ) -> OpLog {
-    // Keep transactions short so heavily-contended executors (like stock SQLite)
-    // don't spend a long time holding the single-writer lock.
-    let transaction_size = rows_per_worker.clamp(1, 5);
+    let transaction_size = 1;
+    let range_width = i64::from(rows_per_worker) * 2;
 
     let header = OpLogHeader {
         fixture_id: fixture_id.to_owned(),
@@ -236,9 +240,30 @@ pub fn preset_commutative_inserts_disjoint_keys(
     });
     op_id += 1;
 
-    // Each worker inserts into a disjoint key range.
+    // Pre-shape the tree so the measured inserts land into worker-local ranges
+    // instead of all queueing behind the empty-table right edge.
     for w in 0..worker_count {
-        let base_key = i64::from(w) * i64::from(rows_per_worker);
+        let base_key = i64::from(w) * range_width;
+        for r in 0..rows_per_worker {
+            let seed_key = base_key + (i64::from(r) * 2);
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: format!(
+                        "INSERT INTO t0 (id, val, num) VALUES ({seed_key}, 'seed_w{w}_r{r}', {})",
+                        f64::from(r) * 1.1
+                    ),
+                },
+                expected: None,
+            });
+            op_id += 1;
+        }
+    }
+
+    // Each worker inserts odd keys into its own pre-shaped disjoint range.
+    for w in 0..worker_count {
+        let base_key = i64::from(w) * range_width;
         for chunk_start in (0..rows_per_worker).step_by(transaction_size as usize) {
             let chunk_end = (chunk_start + transaction_size).min(rows_per_worker);
 
@@ -251,7 +276,7 @@ pub fn preset_commutative_inserts_disjoint_keys(
             op_id += 1;
 
             for r in chunk_start..chunk_end {
-                let key = base_key + i64::from(r);
+                let key = base_key + (i64::from(r) * 2) + 1;
                 records.push(OpRecord {
                     op_id,
                     worker: w,
@@ -2077,8 +2102,9 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
     vec![
         PresetMeta {
             name: "commutative_inserts_disjoint_keys".to_owned(),
-            description: "Disjoint-key inserts across workers; zero write conflicts expected. \
-                Tests MVCC scaling with embarrassingly parallel writes."
+            description: "Setup pre-shapes worker-local key ranges with even keys, then workers \
+                insert disjoint odd keys using single-row transactions. Tests MVCC scaling with \
+                physically separated commutative writes instead of an empty-table right-edge convoy."
                 .to_owned(),
             expected_tier: EquivalenceTier::Tier2Canonical,
             serial_only: false,
@@ -2286,12 +2312,22 @@ mod tests {
         assert_eq!(log.header.concurrency.worker_count, 4);
         assert_eq!(log.header.concurrency.commit_order_policy, "free");
 
-        assert_eq!(log.header.concurrency.transaction_size, 5);
+        assert_eq!(log.header.concurrency.transaction_size, 1);
 
-        // 1 CREATE + 4 workers × (2 × (1 BEGIN + 5 INSERTs + 1 COMMIT)) + 1 SELECT = 58
-        assert_eq!(log.records.len(), 58);
+        // 1 CREATE + 40 setup INSERT SQL statements
+        // + 4 workers × (10 × (1 BEGIN + 1 INSERT + 1 COMMIT))
+        // + 1 SELECT = 162
+        assert_eq!(log.records.len(), 162);
 
-        // Verify disjoint key ranges: worker 0 = [0..10), worker 1 = [10..20), etc.
+        let setup_sql_count = log
+            .records
+            .iter()
+            .take_while(|record| matches!(record.kind, OpKind::Sql { .. }))
+            .count();
+        assert_eq!(setup_sql_count, 41);
+
+        // Verify measured inserts target disjoint odd-key ranges:
+        // worker 0 = {1,3,...,19}, worker 1 = {21,23,...,39}, etc.
         let insert_keys: Vec<(u16, i64)> = log
             .records
             .iter()
@@ -2307,6 +2343,11 @@ mod tests {
         all_keys.sort_unstable();
         all_keys.dedup();
         assert_eq!(all_keys.len(), 40, "all keys must be unique");
+
+        assert!(
+            insert_keys.iter().all(|(_, key)| key % 2 == 1),
+            "measured inserts should target odd keys only"
+        );
     }
 
     #[test]

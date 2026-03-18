@@ -10,7 +10,8 @@
 //! ## Workloads
 //!
 //! 1. **Disjoint writes (best case):** each worker inserts into a
-//!    non-overlapping key range — zero page conflicts, pure MVCC scaling.
+//!    non-overlapping key range using single-row transactions to minimize
+//!    early shared-leaf contention as the table fans out.
 //! 2. **Hot-page contention (stress case):** all workers write to the same
 //!    leaf page — maximum contention to show conflict handling.
 //!
@@ -270,7 +271,7 @@ fn render_executive_summary(out: &mut String, perf: &PerfResult) {
              (median) vs sqlite3's **{:.0} ms** — a **{:.1}x** speedup. \
              sqlite3 spent its time serializing writers via busy-wait retries ({} total), \
              while FrankenSQLite's MVCC allowed all workers to commit in parallel \
-             with zero page conflicts.",
+             after minimizing early shared-leaf contention with single-row transactions.",
             sp.concurrency,
             sp.fsqlite_median_ms,
             sp.sqlite3_median_ms,
@@ -386,8 +387,10 @@ fn render_workload_section(
 
     let description = match workload {
         "commutative_inserts_disjoint_keys" => {
-            "Each worker inserts into a non-overlapping key range. \
-             Zero page conflicts expected — this is where MVCC shines."
+            "Setup pre-shapes each worker's range with even keys, then each \
+             worker inserts disjoint odd keys using single-row transactions. \
+             This removes the empty-table right-edge convoy and measures how \
+             well MVCC exploits physically separated writes."
         }
         "hot_page_contention" => {
             "All workers write to the same leaf page. Maximum contention — \
