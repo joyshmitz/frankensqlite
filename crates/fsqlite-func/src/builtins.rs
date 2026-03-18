@@ -3232,7 +3232,7 @@ mod tests {
     #[test]
     fn test_substr_negative_length() {
         let f = SubstrFunc;
-        let t = |s: &str| SqliteValue::Text(Arc::from(&*s));
+        let t = |s: &str| SqliteValue::Text(Arc::from(s));
         let i = SqliteValue::Integer;
         // SUBSTR('hello', 3, -2) => 'he' (2 chars before position 3)
         assert_eq!(f.invoke(&[t("hello"), i(3), i(-2)]).unwrap(), t("he"));
@@ -3245,7 +3245,7 @@ mod tests {
     #[test]
     fn test_substr_negative_start_negative_length() {
         let f = SubstrFunc;
-        let t = |s: &str| SqliteValue::Text(Arc::from(&*s));
+        let t = |s: &str| SqliteValue::Text(Arc::from(s));
         let i = SqliteValue::Integer;
         // SUBSTR('hello', -2, -2) => 'el' (C SQLite confirmed)
         assert_eq!(f.invoke(&[t("hello"), i(-2), i(-2)]).unwrap(), t("el"));
@@ -3254,7 +3254,7 @@ mod tests {
     #[test]
     fn test_substr_edge_cases() {
         let f = SubstrFunc;
-        let t = |s: &str| SqliteValue::Text(Arc::from(&*s));
+        let t = |s: &str| SqliteValue::Text(Arc::from(s));
         let i = SqliteValue::Integer;
         // Past end
         assert_eq!(f.invoke(&[t("hello"), i(6), i(2)]).unwrap(), t(""));

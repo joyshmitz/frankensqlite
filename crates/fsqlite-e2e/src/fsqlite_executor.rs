@@ -1921,8 +1921,7 @@ fn normalize_update_by_id(
     }
 
     let mut assignments = Vec::new();
-    let mut has_where_separator = false;
-    loop {
+    let has_where_separator = loop {
         let Some(column) = consume_simple_identifier(&mut rest) else {
             return false;
         };
@@ -1935,12 +1934,12 @@ fn normalize_update_by_id(
             return false;
         };
         assignments.push((column, value));
-        has_where_separator = consume_ascii_whitespace(&mut rest) > 0;
+        let has_where_separator = consume_ascii_whitespace(&mut rest) > 0;
         if !consume_ascii_char(&mut rest, ',') {
-            break;
+            break has_where_separator;
         }
         consume_ascii_whitespace(&mut rest);
-    }
+    };
 
     if assignments.is_empty()
         || !has_where_separator

@@ -1183,7 +1183,9 @@ impl TransactionManager {
                     self.abort(txn);
                     return Err(MvccError::BusySnapshot);
                 }
-                MergeDecision::IntentReplay | MergeDecision::StructuredPatch | MergeDecision::RawXorLab => {
+                MergeDecision::IntentReplay
+                | MergeDecision::StructuredPatch
+                | MergeDecision::RawXorLab => {
                     // Attempt structured page patch merge (Level 3) or raw XOR patch.
                     if self.try_structured_rebase_page(txn, pgno, page_kind) {
                         tracing::info!(
@@ -1194,7 +1196,8 @@ impl TransactionManager {
                             "FCW conflict resolved via structured rebase"
                         );
                         rebased = true;
-                    } else if page_kind == MergePageKind::Opaque && self.try_rebase_page(txn, pgno) {
+                    } else if page_kind == MergePageKind::Opaque && self.try_rebase_page(txn, pgno)
+                    {
                         tracing::info!(
                             txn_id = %txn.txn_id,
                             pgno = pgno.get(),
