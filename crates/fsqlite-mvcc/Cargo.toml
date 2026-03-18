@@ -11,6 +11,7 @@ rust-version.workspace = true
 default = ["native"]
 native = ["fsqlite-pager/native", "fsqlite-wal/native"]
 wasm = ["fsqlite-pager/wasm", "fsqlite-wal/wasm"]
+linux-asupersync-uring = ["fsqlite-pager/linux-asupersync-uring"]
 
 [dependencies]
 blake3 = { workspace = true }

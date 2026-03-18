@@ -1373,6 +1373,14 @@ impl TransactionManager {
                 }
                 true
             }
+            Ok(crate::physical_merge::MergeLadderResult::NoConflict) => {
+                // Base is unchanged physically, so our changes are strictly over the "latest".
+                txn.record_page_read(pgno, latest_seq);
+                if let Some(entry) = txn.write_set_versions.get_mut(&pgno) {
+                    entry.old_version = Some(latest_seq);
+                }
+                true
+            }
             _ => false,
         }
     }

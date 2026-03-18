@@ -1483,9 +1483,11 @@ impl PreparedStatement<'_> {
         let _execution_guard = execution_span.as_ref().map(tracing::Span::enter);
 
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
-        let runtime_inputs = self
-            .conn
-            .table_execution_runtime_inputs(self.program.has_insert_ops());
+        // Always populate column defaults — they are needed both for
+        // INSERT (to provide default values for omitted columns) and for
+        // SELECT (to fill in missing columns in rows written before an
+        // ALTER TABLE ADD COLUMN).
+        let runtime_inputs = self.conn.table_execution_runtime_inputs(true);
         let cookie = *self.conn.schema_cookie.borrow();
         let had_active_txn = self.conn.active_txn.borrow().is_some();
 
@@ -2500,10 +2502,11 @@ pub struct Connection {
     /// FK checking).
     fk_cascade_depth: Cell<usize>,
     // ── MVCC conflict observability (bd-t6sv2.1) ──────────────────────────
-    /// Observer for MVCC conflict analytics.  Records metrics (contention,
-    /// FCW drift, SSI aborts) and a ring-buffer of recent conflict events.
+    /// Shared observer for MVCC conflict analytics. Records metrics
+    /// (contention, FCW drift, SSI aborts) and a ring-buffer of recent
+    /// conflict events for every connection sharing this database path.
     /// Exposed via PRAGMA fsqlite.conflict_stats / conflict_log / conflict_reset.
-    conflict_observer: Rc<MetricsObserver>,
+    conflict_observer: Arc<MetricsObserver>,
     /// sqlite3_trace_v2 compatibility callback registration.
     trace_registration: RefCell<Option<TraceRegistration>>,
     /// Bounded append-only SSI decision cards with tamper-evident chain hashes.
@@ -2712,7 +2715,7 @@ impl Connection {
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
             // MVCC conflict observability (bd-t6sv2.1)
-            conflict_observer: Rc::new(MetricsObserver::new(1024)),
+            conflict_observer: Arc::clone(&shared_mvcc_state.conflict_observer),
             trace_registration: RefCell::new(None),
             // SSI evidence ledger (bd-1lsfu.3)
             ssi_evidence_ledger: SsiEvidenceLedger::new(4096),
@@ -10848,37 +10851,38 @@ impl Connection {
                 map
             };
 
-        // Skip expensive column default evaluation (which calls
-        // execute_statement recursively) for programs that never insert rows.
-        // Use a shared empty Arc to avoid per-statement heap allocation.
-        let column_defaults_by_root_page =
-            if !needs_defaults || metadata.column_default_sql_by_root_page.is_empty() {
-                empty_column_defaults_arc()
-            } else {
-                if hot_path_profile_enabled() {
-                    FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
-                }
-                Arc::new(
-                    metadata
-                        .column_default_sql_by_root_page
-                        .iter()
-                        .filter_map(|(root_page, default_sqls)| {
-                            let defaults: Vec<Option<SqliteValue>> = default_sqls
-                                .iter()
-                                .map(|default_sql| {
-                                    default_sql.as_deref().and_then(|sql| {
-                                        self.evaluate_column_default_value(Some(sql)).ok()
-                                    })
+        // Column defaults are needed for BOTH writes (INSERT with omitted
+        // columns) AND reads (SELECT on rows predating ALTER TABLE ADD COLUMN
+        // — those rows have fewer columns than the current schema, and the
+        // VDBE engine fills missing columns from this map).  Only skip when
+        // the schema has no defaults at all (fast short-circuit).
+        let column_defaults_by_root_page = if metadata.column_default_sql_by_root_page.is_empty() {
+            empty_column_defaults_arc()
+        } else {
+            if hot_path_profile_enabled() {
+                FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Arc::new(
+                metadata
+                    .column_default_sql_by_root_page
+                    .iter()
+                    .filter_map(|(root_page, default_sqls)| {
+                        let defaults: Vec<Option<SqliteValue>> = default_sqls
+                            .iter()
+                            .map(|default_sql| {
+                                default_sql.as_deref().and_then(|sql| {
+                                    self.evaluate_column_default_value(Some(sql)).ok()
                                 })
-                                .collect();
-                            defaults
-                                .iter()
-                                .any(Option::is_some)
-                                .then_some((*root_page, defaults))
-                        })
-                        .collect::<HbHashMap<_, _>>(),
-                )
-            };
+                            })
+                            .collect();
+                        defaults
+                            .iter()
+                            .any(Option::is_some)
+                            .then_some((*root_page, defaults))
+                    })
+                    .collect::<HbHashMap<_, _>>(),
+            )
+        };
 
         TableExecutionRuntimeInputs {
             autoincrement_seq_by_root_page,
@@ -16577,6 +16581,31 @@ impl Connection {
                             SqliteValue::Integer(to_i64(snap.conflicts_resolved)),
                         ],
                     },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fcw_merge_attempts".into()),
+                            SqliteValue::Integer(to_i64(snap.fcw_merge_attempts)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fcw_merge_successes".into()),
+                            SqliteValue::Integer(to_i64(snap.fcw_merge_successes)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("top_hotspots".into()),
+                            SqliteValue::Text(
+                                snap.top_hotspots
+                                    .iter()
+                                    .map(|(page, count)| format!("p{}:{count}", page.get()))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                                    .into(),
+                            ),
+                        ],
+                    },
                 ])
             }
             "fsqlite.conflict_log" | "conflict_log" => {
@@ -21537,72 +21566,15 @@ impl Connection {
                         continue;
                     }
                 }
-                // For :memory: databases, try reading directly from
-                // MemDatabase instead of going through self.query() which
-                // pays the full parse→compile→VDBE→autocommit cost per
-                // table scan.  Same IPK-splice logic as the time-travel
-                // path.  Falls back to self.query() when the table isn't
-                // in MemDatabase (e.g. virtual tables).
-                let row_data = if !self.pager.is_file_backed() {
-                    let mem_rows = {
-                        let (root_page, num_schema_cols) = {
-                            let schema = self.schema.borrow();
-                            schema
-                                .iter()
-                                .find(|t| t.name.eq_ignore_ascii_case(&src.table_name))
-                                .map(|t| (t.root_page, t.columns.len()))
-                                .unwrap_or((0, 0))
-                        };
-                        let ipk_idx = self
-                            .rowid_alias_columns
-                            .borrow()
-                            .get(&src.table_name.to_ascii_lowercase())
-                            .copied();
-                        let db = self.db.borrow();
-                        db.get_table(root_page).map(|mem_table| {
-                            mem_table
-                                .iter_rows()
-                                .map(|(rowid, vals)| {
-                                    let mut row = if let Some(ipk_col) = ipk_idx {
-                                        let mut full = Vec::with_capacity(num_schema_cols);
-                                        let mut val_idx = 0;
-                                        for col_idx in 0..num_schema_cols {
-                                            if col_idx == ipk_col {
-                                                full.push(SqliteValue::Integer(rowid));
-                                            } else if val_idx < vals.len() {
-                                                full.push(vals[val_idx].clone());
-                                                val_idx += 1;
-                                            } else {
-                                                full.push(SqliteValue::Null);
-                                            }
-                                        }
-                                        full
-                                    } else {
-                                        vals.to_vec()
-                                    };
-                                    if src.hidden_rowid_projection.is_some() {
-                                        row.push(SqliteValue::Integer(rowid));
-                                    }
-                                    row
-                                })
-                                .collect::<Vec<Vec<SqliteValue>>>()
-                        })
-                    };
-                    if let Some(rows) = mem_rows {
-                        rows
-                    } else {
-                        // Table not in MemDatabase (virtual table, etc.) —
-                        // fall back to the query path.
-                        let scan_sql = build_join_scan_sql(src);
-                        let rows = self.query(&scan_sql)?;
-                        rows.iter().map(|row| row.values().to_vec()).collect()
-                    }
-                } else {
-                    // File-backed: scan through the normal query path so
-                    // parity-cert connections read from pager-backed state.
+                // Scan rows through the normal query path which reads
+                // from the pager-backed store. This works for both
+                // file-backed and :memory: databases because all writes
+                // now go through the VDBE/pager path (MemDatabase is no
+                // longer populated by the write path).
+                let row_data: Vec<Vec<SqliteValue>> = {
                     let scan_sql = build_join_scan_sql(src);
                     let rows = self.query(&scan_sql)?;
-                    rows.iter().map(|row| row.values().to_vec()).collect()
+                    rows.iter().map(|r| r.values().to_vec()).collect()
                 };
                 // Only clone into the cache when the same table might appear
                 // again (self-join, CTE).  Check remaining sources for a match.
@@ -22463,10 +22435,11 @@ impl Connection {
         // causing the outer concurrent commit to skip page-lock release.
         let func_reg = self.func_registry.borrow().clone();
         let reject_mem = *self.reject_mem_fallback.borrow();
-        // Only evaluate column defaults when the program actually contains
-        // Insert opcodes — avoids recursive execute_statement calls for
-        // SELECT/DELETE/UPDATE programs that never use defaults.
-        let runtime_inputs = self.table_execution_runtime_inputs(program.has_insert_ops());
+        // Always populate column defaults — needed for INSERT (default
+        // values for omitted columns) and SELECT/DELETE/UPDATE (to fill
+        // in missing columns from rows written before ALTER TABLE ADD
+        // COLUMN).
+        let runtime_inputs = self.table_execution_runtime_inputs(true);
 
         // Lend the active transaction to the VDBE engine so that storage
         // cursors route through the real pager/WAL stack (Phase 5, bd-2a3y).
@@ -26360,6 +26333,7 @@ impl SharedMvccKey {
 
 struct SharedMvccState {
     registry: Arc<Mutex<ConcurrentRegistry>>,
+    conflict_observer: Arc<MetricsObserver>,
     lock_table: Arc<InProcessPageLockTable>,
     commit_index: Arc<CommitIndex>,
     next_commit_seq: Arc<AtomicU64>,
@@ -26406,9 +26380,13 @@ impl SharedMvccState {
             region_kind = "write_coordinator"
         );
 
+        let conflict_observer = Arc::new(MetricsObserver::new(1024));
         Ok(Self {
             registry: Arc::new(Mutex::new(ConcurrentRegistry::new())),
-            lock_table: Arc::new(InProcessPageLockTable::new()),
+            conflict_observer: Arc::clone(&conflict_observer),
+            lock_table: Arc::new(InProcessPageLockTable::with_observer(
+                conflict_observer as Arc<dyn fsqlite_observability::ConflictObserver>,
+            )),
             commit_index: Arc::new(CommitIndex::new()),
             next_commit_seq: Arc::new(AtomicU64::new(1)),
             _runtime: runtime,
@@ -33443,29 +33421,101 @@ struct InsertTargetLayout {
     explicit_rowid_source: Option<usize>,
 }
 
-/// Hashable wrapper for SqliteValue join keys. Floats are hashed by their
-/// bit representation (correct for equi-join: bit-equal floats hash equally,
-/// and NaN keys are excluded by the NULL check in the caller).
-#[derive(Clone, PartialEq, Eq)]
+/// Hashable wrapper for SqliteValue join keys with SQLite type-affinity
+/// coercion.  TEXT values that represent valid numbers are normalized to
+/// their numeric form so that `Integer(10)` and `Text("10")` hash and
+/// compare equally — matching SQLite's comparison semantics in JOIN ON.
+#[derive(Clone)]
 struct HashableJoinKey(smallvec::SmallVec<[SqliteValue; 2]>);
+
+/// Normalize a `SqliteValue` for hash-join comparison: coerce TEXT that
+/// is a valid number to its numeric form (matching `cmp_values` behavior).
+fn normalize_join_key_value(val: &SqliteValue) -> std::borrow::Cow<'_, SqliteValue> {
+    if let SqliteValue::Text(s) = val {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            // Try integer first (no decimal point / exponent).
+            let has_decimal = trimmed.bytes().any(|b| matches!(b, b'.' | b'e' | b'E'));
+            if !has_decimal {
+                if let Ok(v) = trimmed.parse::<i64>() {
+                    return std::borrow::Cow::Owned(SqliteValue::Integer(v));
+                }
+            }
+            if let Ok(v) = trimmed.parse::<f64>() {
+                if v.is_finite() {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+                    if !has_decimal {
+                        let truncated = v as i64;
+                        #[allow(clippy::float_cmp)]
+                        if truncated as f64 == v {
+                            return std::borrow::Cow::Owned(SqliteValue::Integer(truncated));
+                        }
+                    }
+                    return std::borrow::Cow::Owned(SqliteValue::Float(v));
+                }
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(val)
+}
+
+/// Hash a single normalized value (shared by Hash impl).
+fn hash_normalized_value<H: std::hash::Hasher>(val: &SqliteValue, state: &mut H) {
+    // Use a fixed discriminant scheme: numeric=1, text=2, blob=3, null=0.
+    match val {
+        SqliteValue::Null => 0u8.hash(state),
+        SqliteValue::Integer(i) => {
+            1u8.hash(state);
+            i.hash(state);
+        }
+        SqliteValue::Float(f) => {
+            let normalized = if *f == 0.0 { 0.0_f64 } else { *f };
+            // If the float is an exact integer, hash as integer for
+            // consistency with Integer values.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            if normalized.is_finite()
+                && normalized.fract() == 0.0
+                && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
+                    .contains(&normalized)
+            {
+                1u8.hash(state);
+                (normalized as i64).hash(state);
+            } else {
+                1u8.hash(state);
+                normalized.to_bits().hash(state);
+            }
+        }
+        SqliteValue::Text(s) => {
+            2u8.hash(state);
+            s.hash(state);
+        }
+        SqliteValue::Blob(b) => {
+            3u8.hash(state);
+            b.hash(state);
+        }
+    }
+}
+
+impl PartialEq for HashableJoinKey {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .all(|(a, b)| cmp_values(&normalize_join_key_value(a), &normalize_join_key_value(b)) == std::cmp::Ordering::Equal)
+    }
+}
+
+impl Eq for HashableJoinKey {}
 
 impl std::hash::Hash for HashableJoinKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.len().hash(state);
         for val in &self.0 {
-            std::mem::discriminant(val).hash(state);
-            match val {
-                SqliteValue::Null => {}
-                SqliteValue::Integer(i) => i.hash(state),
-                SqliteValue::Float(f) => {
-                    // Normalize -0.0 to +0.0 so they hash equally
-                    // (SQL: -0.0 = 0.0 is TRUE).
-                    let normalized = if *f == 0.0 { 0.0_f64 } else { *f };
-                    normalized.to_bits().hash(state);
-                }
-                SqliteValue::Text(s) => s.hash(state),
-                SqliteValue::Blob(b) => b.hash(state),
-            }
+            let normalized = normalize_join_key_value(val);
+            hash_normalized_value(&normalized, state);
         }
     }
 }
@@ -55915,6 +55965,66 @@ mod schema_loading_tests {
         assert!(
             matches!(result, Err(MvccError::Busy)),
             "expected MvccError::Busy, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_conflict_stats_capture_shared_page_lock_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared-conflict-stats.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+
+        let setup = Connection::open(&db_path).unwrap();
+        setup
+            .execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        setup.query("PRAGMA fsqlite.conflict_reset;").unwrap();
+
+        let conn1 = Connection::open(&db_path).unwrap();
+        let conn2 = Connection::open(&db_path).unwrap();
+
+        conn1.execute("BEGIN CONCURRENT;").unwrap();
+        conn2.execute("BEGIN CONCURRENT;").unwrap();
+
+        conn1
+            .execute("INSERT INTO t0(id, val) VALUES (1, 'alpha');")
+            .unwrap();
+        let err = conn2
+            .execute("INSERT INTO t0(id, val) VALUES (2, 'beta');")
+            .expect_err("same hot leaf should force page-lock contention");
+        assert!(
+            matches!(err, FrankenError::Busy),
+            "expected BUSY, got {err:?}"
+        );
+
+        let stats = setup.query("PRAGMA fsqlite.conflict_stats;").unwrap();
+        let page_contentions = stats.iter().find_map(|row| match row.values() {
+            [SqliteValue::Text(name), SqliteValue::Integer(value)]
+                if name.as_ref() == "page_contentions" =>
+            {
+                Some(*value)
+            }
+            _ => None,
+        });
+        let top_hotspots = stats.iter().find_map(|row| match row.values() {
+            [SqliteValue::Text(name), SqliteValue::Text(value)]
+                if name.as_ref() == "top_hotspots" =>
+            {
+                Some(value.to_string())
+            }
+            _ => None,
+        });
+
+        assert_eq!(
+            page_contentions,
+            Some(1),
+            "expected one shared-page contention"
+        );
+        assert!(
+            top_hotspots
+                .as_deref()
+                .is_some_and(|value| !value.is_empty()),
+            "expected top_hotspots row to identify the hot page, got {top_hotspots:?}"
         );
     }
 

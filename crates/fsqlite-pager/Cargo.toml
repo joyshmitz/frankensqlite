@@ -11,6 +11,7 @@ rust-version.workspace = true
 default = ["native"]
 native = ["fsqlite-types/native", "fsqlite-vfs/native"]
 wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm"]
+linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring"]
 
 [dependencies]
 foldhash = "0.1"

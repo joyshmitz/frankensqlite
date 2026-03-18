@@ -988,7 +988,7 @@ pub fn evaluate_merge_ladder(
                     "merge_ladder: patch merge succeeded, applying"
                 );
                 let merged_cells = apply_patch(&base_parsed, &merged_patch)?;
-                let merged_page = repack_btree_page(
+                let mut merged_page = repack_btree_page(
                     &merged_cells,
                     base_parsed.page_type,
                     page_size,
@@ -996,6 +996,11 @@ pub fn evaluate_merge_ladder(
                     is_page1,
                     base_parsed.header.right_most_child,
                 )?;
+
+                if is_page1 {
+                    merged_page[0..100].copy_from_slice(&committed_page[0..100]);
+                }
+
                 info!(
                     ladder_step = "level3",
                     result = "merge",
@@ -1417,7 +1422,7 @@ mod tests {
         let base = build_leaf_table_page(&[(1, b"orig"), (2, b"orig2")], ps);
         // T1: modified row 1
         let committed = build_leaf_table_page(&[(1, b"from_t1"), (2, b"orig2")], ps);
-        // T2: modified row 2
+        // T2: also modified row 2
         let txn = build_leaf_table_page(&[(1, b"orig"), (2, b"from_t2")], ps);
 
         let result = evaluate_merge_ladder(
