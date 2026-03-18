@@ -4360,7 +4360,7 @@ impl Connection {
                 Ok(txn) => return Ok(txn),
                 Err(FrankenError::Busy) => {}
                 Err(err) => return Err(err),
-            };
+            }
         }
     }
 
@@ -9800,15 +9800,15 @@ impl Connection {
         }
 
         let is_concurrent_txn = *self.concurrent_txn.borrow();
-        let pending_commit_pages = if is_concurrent_txn && txn_has_pending_writes {
-            txn.pending_commit_pages()?
+        let pending_conflict_pages = if is_concurrent_txn && txn_has_pending_writes {
+            txn.pending_conflict_pages()?
         } else {
             Vec::new()
         };
 
         let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
             let concurrent_plan = if is_concurrent_txn && txn_has_pending_writes {
-                match self.plan_concurrent_commit(&pending_commit_pages) {
+                match self.plan_concurrent_commit(&pending_conflict_pages) {
                     Ok(plan) => plan,
                     Err(e) => {
                         self.abort_current_concurrent_session();
@@ -14127,17 +14127,17 @@ impl Connection {
         pages
     }
 
-    fn track_pending_commit_pages_with_registry(
+    fn track_pending_conflict_pages_with_registry(
         &self,
         registry: &ConcurrentRegistry,
         session_id: u64,
-        pending_commit_pages: &[PageNumber],
+        pending_conflict_pages: &[PageNumber],
     ) -> Result<()> {
-        if pending_commit_pages.is_empty() {
+        if pending_conflict_pages.is_empty() {
             return Ok(());
         }
 
-        for &page in pending_commit_pages {
+        for &page in pending_conflict_pages {
             let (already_tracked, snapshot_high) = {
                 let handle = registry.get(session_id).ok_or_else(|| {
                     FrankenError::Internal(
@@ -14199,7 +14199,7 @@ impl Connection {
     fn plan_concurrent_commit_with_registry(
         &self,
         registry: &mut ConcurrentRegistry,
-        pending_commit_pages: &[PageNumber],
+        pending_conflict_pages: &[PageNumber],
     ) -> Result<Option<PreparedConcurrentCommit>> {
         // MVCC concurrent-writer commit path (bd-14zc / 5E.1):
         // Validate FCW/SSI preconditions first, but delay commit-side
@@ -14213,7 +14213,11 @@ impl Connection {
 
         let mut abort_card: Option<SsiDecisionCardDraft> = None;
         let planned_commit_seq = CommitSeq::new(self.next_commit_seq.load(AtomicOrdering::Acquire));
-        self.track_pending_commit_pages_with_registry(registry, session_id, pending_commit_pages)?;
+        self.track_pending_conflict_pages_with_registry(
+            registry,
+            session_id,
+            pending_conflict_pages,
+        )?;
 
         let validate_result: std::result::Result<PreparedConcurrentCommit, (MvccError, FcwResult)> =
             match prepare_concurrent_commit_with_ssi(
@@ -14484,28 +14488,28 @@ impl Connection {
         }
 
         let is_concurrent_txn = *self.concurrent_txn.borrow();
-        let (txn_has_pending_writes, pending_commit_pages) = {
+        let (txn_has_pending_writes, pending_conflict_pages) = {
             let txn_guard = self.active_txn.borrow();
             let txn_has_pending_writes = txn_guard
                 .as_ref()
                 .is_some_and(|txn| TransactionHandle::has_pending_writes(&**txn));
-            let pending_commit_pages = if is_concurrent_txn && txn_has_pending_writes {
+            let pending_conflict_pages = if is_concurrent_txn && txn_has_pending_writes {
                 txn_guard
                     .as_ref()
-                    .map(|txn| txn.pending_commit_pages())
+                    .map(|txn| txn.pending_conflict_pages())
                     .transpose()?
                     .unwrap_or_default()
             } else {
                 Vec::new()
             };
-            (txn_has_pending_writes, pending_commit_pages)
+            (txn_has_pending_writes, pending_conflict_pages)
         };
 
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
         let (commit_result, committed_write) = {
             let concurrent_commit_plan = if is_concurrent_txn {
-                self.plan_concurrent_commit(&pending_commit_pages)?
+                self.plan_concurrent_commit(&pending_conflict_pages)?
             } else {
                 None
             };
@@ -28006,7 +28010,7 @@ fn infer_implicit_index_definition_from_master_entries(
             return None;
         }
         match &entry[4] {
-            SqliteValue::Text(sql) => Some(&*sql),
+            SqliteValue::Text(sql) => Some(sql),
             _ => None,
         }
     })?;
@@ -30799,15 +30803,9 @@ fn raptorq_repair_evidence_cards_to_rows(cards: &[WalFecRepairEvidenceCard]) -> 
                 SqliteValue::Integer(i64::from(card.validated_repair_symbols)),
                 SqliteValue::Integer(i64::from(card.required_symbols)),
                 SqliteValue::Integer(i64::from(card.available_symbols)),
-                SqliteValue::Text(
-                    hex_encode_blake3(card.witness.corrupted_hash_blake3.into()).into(),
-                ),
-                SqliteValue::Text(
-                    hex_encode_blake3(card.witness.repaired_hash_blake3.into()).into(),
-                ),
-                SqliteValue::Text(
-                    hex_encode_blake3(card.witness.expected_hash_blake3.into()).into(),
-                ),
+                SqliteValue::Text(hex_encode_blake3(card.witness.corrupted_hash_blake3).into()),
+                SqliteValue::Text(hex_encode_blake3(card.witness.repaired_hash_blake3).into()),
+                SqliteValue::Text(hex_encode_blake3(card.witness.expected_hash_blake3).into()),
                 SqliteValue::Integer(to_i64_clamped(card.repair_latency_ns)),
                 SqliteValue::Integer(i64::from(card.confidence_per_mille)),
                 SqliteValue::Text(card.severity_bucket.as_str().to_owned().into()),
@@ -48372,16 +48370,16 @@ mod tests {
             .borrow()
             .expect("BEGIN CONCURRENT should register a session");
 
-        let predicted = {
+        let conflict_surface = {
             let mut txn_guard = conn.active_txn.borrow_mut();
             let txn = txn_guard
                 .as_mut()
                 .expect("concurrent transaction should keep an active pager handle");
             txn.free_page(&cx, p3).unwrap();
-            let predicted = txn.pending_commit_pages().unwrap();
+            let predicted = txn.pending_conflict_pages().unwrap();
             assert!(
                 predicted.contains(&p2),
-                "commit planning must see the committed freelist trunk page in the pending surface"
+                "commit planning must still see the committed freelist trunk page in the conflict surface"
             );
             predicted
         };
@@ -48399,8 +48397,12 @@ mod tests {
 
         {
             let registry = lock_unpoisoned(&conn.concurrent_registry);
-            conn.track_pending_commit_pages_with_registry(&registry, session_id, &predicted)
-                .expect("commit planning should track pending commit pages before SSI validation");
+            conn.track_pending_conflict_pages_with_registry(
+                &registry,
+                session_id,
+                &conflict_surface,
+            )
+            .expect("commit planning should track pending conflict pages before SSI validation");
         }
 
         {
@@ -48422,15 +48424,15 @@ mod tests {
     }
 
     #[test]
-    fn test_commit_planning_page_one_surface_serializes_disjoint_concurrent_growth_writers() {
+    fn test_commit_planning_ignores_synthetic_page_one_for_disjoint_concurrent_growth_writers() {
         use fsqlite_pager::TransactionMode;
-        use fsqlite_types::{Snapshot, TxnId};
+        use fsqlite_types::Snapshot;
 
         let conn = Connection::open(":memory:").unwrap();
         let cx = conn.op_cx().unwrap();
         let ps = PageSize::MIN.as_usize();
 
-        let (predicted_one, predicted_two, page_one_data, page_two_data) = {
+        let (conflict_one, conflict_two, page_one_data, page_two_data) = {
             let mut txn_one = conn.pager.begin(&cx, TransactionMode::Concurrent).unwrap();
             let mut txn_two = conn.pager.begin(&cx, TransactionMode::Concurrent).unwrap();
 
@@ -48451,6 +48453,8 @@ mod tests {
 
             let predicted_one = txn_one.pending_commit_pages().unwrap();
             let predicted_two = txn_two.pending_commit_pages().unwrap();
+            let conflict_one = txn_one.pending_conflict_pages().unwrap();
+            let conflict_two = txn_two.pending_conflict_pages().unwrap();
 
             assert!(
                 predicted_one.contains(&PageNumber::ONE),
@@ -48468,15 +48472,30 @@ mod tests {
                 predicted_two.contains(&page_two_data) && !predicted_two.contains(&page_one_data),
                 "second writer should only contribute its own data page plus structural pages"
             );
+            assert!(
+                !conflict_one.contains(&PageNumber::ONE),
+                "synthetic WAL page-1 growth metadata must not participate in FCW for the first writer"
+            );
+            assert!(
+                !conflict_two.contains(&PageNumber::ONE),
+                "synthetic WAL page-1 growth metadata must not participate in FCW for the second writer"
+            );
+            assert!(
+                conflict_one.contains(&page_one_data) && !conflict_one.contains(&page_two_data),
+                "the first writer's conflict surface should retain only its real data page"
+            );
+            assert!(
+                conflict_two.contains(&page_two_data) && !conflict_two.contains(&page_one_data),
+                "the second writer's conflict surface should retain only its real data page"
+            );
 
-            (predicted_one, predicted_two, page_one_data, page_two_data)
+            (conflict_one, conflict_two, page_one_data, page_two_data)
         };
 
         let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
-        let (session_one, session_two, session_three) = {
+        let (session_one, session_two) = {
             let mut registry = lock_unpoisoned(&conn.concurrent_registry);
             (
-                registry.begin_concurrent(snapshot).unwrap(),
                 registry.begin_concurrent(snapshot).unwrap(),
                 registry.begin_concurrent(snapshot).unwrap(),
             )
@@ -48484,42 +48503,47 @@ mod tests {
 
         {
             let registry = lock_unpoisoned(&conn.concurrent_registry);
-            conn.track_pending_commit_pages_with_registry(&registry, session_one, &predicted_one)
-                .expect("first disjoint growth writer should track its pending surface");
+            conn.track_pending_conflict_pages_with_registry(&registry, session_one, &conflict_one)
+                .expect("first disjoint growth writer should track only its real conflict surface");
         }
 
-        {
-            let registry = lock_unpoisoned(&conn.concurrent_registry);
-            let err = conn
-                .track_pending_commit_pages_with_registry(&registry, session_two, &predicted_two)
-                .expect_err("page 1 alone should serialize disjoint growth writers");
-            assert!(
-                matches!(err, FrankenError::Busy),
-                "expected page-one lock contention during concurrent planning, got {err:?}"
-            );
-        }
-
-        conn.concurrent_lock_table
-            .release_all(TxnId::new(session_one).unwrap());
         conn.concurrent_commit_index
             .update(PageNumber::ONE, CommitSeq::new(1));
 
         {
             let registry = lock_unpoisoned(&conn.concurrent_registry);
-            let err = conn
-                .track_pending_commit_pages_with_registry(&registry, session_three, &predicted_two)
-                .expect_err("after page-one publish, the stale disjoint writer should fail FCW");
-            match err {
-                FrankenError::BusySnapshot { conflicting_pages } => {
-                    assert_eq!(
-                        conflicting_pages, "1",
-                        "the stale commit should conflict on page 1 even though its data page was {}/{}",
-                        page_one_data.get(),
-                        page_two_data.get()
-                    );
-                }
-                other => panic!("expected BusySnapshot on page 1, got {other:?}"),
-            }
+            conn.track_pending_conflict_pages_with_registry(&registry, session_two, &conflict_two)
+                .expect(
+                    "stale page-one publish must not block the second disjoint growth writer once page 1 is removed from the FCW surface",
+                );
+        }
+
+        {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            let handle_one = registry
+                .get(session_one)
+                .expect("session one handle missing");
+            let handle_two = registry
+                .get(session_two)
+                .expect("session two handle missing");
+            assert!(
+                !handle_one.tracks_write_conflict_page(PageNumber::ONE),
+                "the first writer must not synthesize page 1 into its tracked FCW surface"
+            );
+            assert!(
+                !handle_two.tracks_write_conflict_page(PageNumber::ONE),
+                "the second writer must not synthesize page 1 into its tracked FCW surface"
+            );
+            assert!(
+                handle_one.tracks_write_conflict_page(page_one_data),
+                "the first writer must still track its real data page {}",
+                page_one_data.get()
+            );
+            assert!(
+                handle_two.tracks_write_conflict_page(page_two_data),
+                "the second writer must still track its real data page {}",
+                page_two_data.get()
+            );
         }
     }
 

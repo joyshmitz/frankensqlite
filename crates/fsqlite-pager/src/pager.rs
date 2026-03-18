@@ -2218,6 +2218,26 @@ impl<V: Vfs> SimpleTransaction<V> {
         pages
     }
 
+    fn predicted_conflict_pages_with_inner(&self, inner: &PagerInner<V::File>) -> Vec<PageNumber> {
+        let mut pages = self.predicted_commit_pages_with_inner(inner);
+
+        if self.mode == TransactionMode::Concurrent && self.journal_mode == JournalMode::Wal {
+            let committed_db_size = self.committed_db_size_with_inner(inner);
+            let freelist_dirty = self.freelist_metadata_dirty_with_inner(inner, committed_db_size);
+            let page_one_dirty = self.write_set.contains_key(&PageNumber::ONE);
+
+            // Pure WAL growth rewrites page 1 only for header metadata
+            // (change counter / page count) inside the serialized pager commit
+            // section. Treating that synthetic rewrite as a first-committer-wins
+            // page collapses disjoint growth writers onto page 1.
+            if !freelist_dirty && !page_one_dirty {
+                pages.retain(|page| *page != PageNumber::ONE);
+            }
+        }
+
+        pages
+    }
+
     fn publish_committed_state(&self, cx: &Cx, update: PublishedPagerUpdate) {
         self.published.publish(cx, update, |pages| {
             pages.retain(|page_no, _| page_no.get() <= update.db_size);
@@ -2936,6 +2956,17 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
         Ok(self.predicted_commit_pages_with_inner(&inner))
+    }
+
+    fn pending_conflict_pages(&self) -> Result<Vec<PageNumber>> {
+        if !self.has_pending_writes() {
+            return Ok(Vec::new());
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+        Ok(self.predicted_conflict_pages_with_inner(&inner))
     }
 
     fn page_size(&self) -> PageSize {
@@ -9386,6 +9417,49 @@ mod tests {
         assert!(
             predicted.contains(&PageNumber::ONE),
             "bead_id={BEAD_ID} case=concurrent_growth_pending_commit_surface_still_contains_page_one"
+        );
+    }
+
+    #[test]
+    fn test_pending_conflict_pages_exclude_synthetic_page_one_for_concurrent_wal_growth() {
+        let (pager, _) = wal_pager();
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let page = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page, &[0x7B; 32]).unwrap();
+
+        let pending_commit = txn.pending_commit_pages().unwrap();
+        let pending_conflict = txn.pending_conflict_pages().unwrap();
+
+        assert!(
+            pending_commit.contains(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=concurrent_wal_growth_commit_surface_still_contains_page_one"
+        );
+        assert!(
+            pending_commit.contains(&page),
+            "bead_id={BEAD_ID} case=concurrent_wal_growth_commit_surface_keeps_data_page"
+        );
+        assert!(
+            !pending_conflict.contains(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=concurrent_wal_growth_conflict_surface_excludes_synthetic_page_one"
+        );
+        assert!(
+            pending_conflict.contains(&page),
+            "bead_id={BEAD_ID} case=concurrent_wal_growth_conflict_surface_keeps_real_data_page"
+        );
+    }
+
+    #[test]
+    fn test_pending_conflict_pages_keep_explicit_page_one_write_for_concurrent_wal() {
+        let (pager, _) = wal_pager();
+        let cx = Cx::new();
+        let mut txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        txn.write_page(&cx, PageNumber::ONE, &[0x5A; 32]).unwrap();
+
+        let pending_conflict = txn.pending_conflict_pages().unwrap();
+        assert!(
+            pending_conflict.contains(&PageNumber::ONE),
+            "bead_id={BEAD_ID} case=explicit_page_one_write_remains_in_conflict_surface"
         );
     }
 

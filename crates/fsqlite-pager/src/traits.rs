@@ -514,6 +514,17 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         Ok(Vec::new())
     }
 
+    /// Return the subset of pending commit pages that must participate in
+    /// MVCC conflict tracking for concurrent commit planning.
+    ///
+    /// Pager-backed implementations may exclude commit-time-only synthetic
+    /// metadata pages here when those bytes are reconciled under a serialized
+    /// commit critical section and therefore do not represent true
+    /// user-visible overlap.
+    fn pending_conflict_pages(&self) -> Result<Vec<PageNumber>> {
+        self.pending_commit_pages()
+    }
+
     /// Whether page 1 is currently part of this transaction's pending commit
     /// surface, including commit-time allocator/header synthesis.
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
