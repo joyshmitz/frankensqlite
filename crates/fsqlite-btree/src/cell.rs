@@ -341,7 +341,10 @@ pub const fn local_payload_size(
         return payload_size;
     }
     let min_local = min_local_payload(usable_size);
-    let surplus = usable_size - 4;
+    let surplus = usable_size.saturating_sub(4);
+    if surplus == 0 {
+        return min_local;
+    }
     let local = min_local + (payload_size - min_local) % surplus;
     if local > max_local { min_local } else { local }
 }

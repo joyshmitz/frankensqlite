@@ -4375,6 +4375,64 @@ impl VdbeEngine {
         }
     }
 
+    /// Reset the engine for reuse, clearing per-statement state but keeping
+    /// allocated backing memory so subsequent executions avoid 21+ collection
+    /// re-allocations.
+    ///
+    /// After `reset()` the engine is equivalent to a freshly constructed one
+    /// with the same `register_count` — but all `Vec`/`HashMap`/`SmallVec`
+    /// retain their heap capacity.
+    pub fn reset_for_reuse(&mut self, register_count: i32, execution_cx: &Cx, page_size: PageSize) {
+        let count = register_count.max(0) as u32 + 1;
+        // Clear + resize registers to reuse the SmallVec's inline/heap buffer.
+        self.registers.clear();
+        #[allow(clippy::cast_possible_truncation)]
+        self.registers.resize(count as usize, SqliteValue::Null);
+        self.bindings.clear();
+        self.execution_cx = execution_cx.clone();
+        self.page_size = page_size;
+        self.trace_opcodes = opcode_trace_enabled();
+        self.collect_vdbe_metrics = false;
+        self.results.clear();
+        self.cursors.clear();
+        self.sorters.clear();
+        self.storage_cursors.clear();
+        self.pending_next_after_delete.clear();
+        self.storage_cursors_enabled = true;
+        self.txn_page_io = None;
+        self.reject_mem_fallback = true;
+        self.db = None;
+        self.func_registry = None;
+        // Keep the existing collation_registry Arc — don't allocate a new one.
+        self.aggregates.clear();
+        self.schema_cookie = 0;
+        self.last_compare_result = None;
+        self.changes = 0;
+        self.last_insert_rowid = 0;
+        self.last_insert_rowid_valid = false;
+        self.last_insert_cursor_id = None;
+        self.pending_update_restore = None;
+        self.pending_insert_rollback = None;
+        self.conflict_skip_idx = false;
+        self.pending_idx_entries.clear();
+        self.rowsets.clear();
+        self.fk_counter = 0;
+        self.autoincrement_seq_by_root_page.clear();
+        // Keep shared Arc refs — they'll be overwritten by set_*() calls.
+        self.sequence_counters.clear();
+        self.cursor_root_pages.clear();
+        self.vtab_cursors.clear();
+        self.vtab_instances.clear();
+        self.time_travel_cursors.clear();
+        self.version_store = None;
+        self.time_travel_commit_log = None;
+        self.time_travel_gc_horizon = None;
+        self.window_contexts.clear();
+        self.register_subtypes.clear();
+        self.bloom_filters.clear();
+        self.make_record_buf.clear();
+    }
+
     /// Returns the number of rows modified (inserted, deleted, or updated).
     pub fn changes(&self) -> usize {
         self.changes

@@ -1029,6 +1029,11 @@ impl SsiEvidenceLedger {
         self.len() == 0
     }
 
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+
     fn enqueue_pending(&self, draft: SsiDecisionCardDraft) {
         with_locked(&self.pending_queue, |queue| {
             queue.push_back(draft);

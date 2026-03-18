@@ -1542,7 +1542,12 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         #[allow(clippy::cast_possible_truncation)]
-        let bytes_per_page = (self.usable_size - 4) as usize;
+        let bytes_per_page = self.usable_size.saturating_sub(4) as usize;
+        if bytes_per_page == 0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "usable page size too small for overflow pages".to_owned(),
+            });
+        }
         #[allow(clippy::cast_possible_truncation)]
         let page_size = self.usable_size as usize;
         let num_pages = overflow_data.len().div_ceil(bytes_per_page);

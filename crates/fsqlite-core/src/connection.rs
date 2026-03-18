@@ -1546,7 +1546,8 @@ impl PreparedStatement<'_> {
                 None
             };
 
-            execute_table_program_with_db(
+            let cached = self.conn.cached_vdbe_engine.borrow_mut().take();
+            let ((result, txn_back), engine_back) = execute_table_program_with_db(
                 self.program.as_ref(),
                 params,
                 func_registry,
@@ -1564,7 +1565,10 @@ impl PreparedStatement<'_> {
                 reject_mem,
                 Some(Arc::clone(&self.conn.version_store)),
                 page_size,
-            )
+                cached,
+            );
+            *self.conn.cached_vdbe_engine.borrow_mut() = engine_back;
+            (result, txn_back)
         } else {
             let txn = self
                 .pager
@@ -1574,7 +1578,8 @@ impl PreparedStatement<'_> {
                         .begin_pager_txn_with_busy_timeout(p, op_cx, TransactionMode::ReadOnly)
                 })
                 .transpose()?;
-            execute_table_program_with_db(
+            let cached = self.conn.cached_vdbe_engine.borrow_mut().take();
+            let ((result, txn_back), engine_back) = execute_table_program_with_db(
                 self.program.as_ref(),
                 params,
                 func_registry,
@@ -1592,7 +1597,10 @@ impl PreparedStatement<'_> {
                 reject_mem,
                 Some(Arc::clone(&self.conn.version_store)),
                 page_size,
-            )
+                cached,
+            );
+            *self.conn.cached_vdbe_engine.borrow_mut() = engine_back;
+            (result, txn_back)
         };
 
         if had_active_txn {
@@ -2453,6 +2461,13 @@ pub struct Connection {
     /// Schema cookie at the time `cached_read_snapshot` was captured.
     /// Used to detect schema changes that invalidate the cached snapshot.
     cached_read_snapshot_cookie: Cell<u32>,
+    /// Cached VDBE engine for reuse across autocommit statements.
+    ///
+    /// Instead of allocating a fresh `VdbeEngine` (21+ collection allocs) for
+    /// every statement, we park the engine here after execution and `reset()`
+    /// it on the next call.  `clear()` on Vecs/HashMaps retains heap capacity,
+    /// making reuse essentially free.
+    cached_vdbe_engine: RefCell<Option<VdbeEngine>>,
     /// Schema registry: table metadata used by the code generator.
     schema: RefCell<Vec<TableSchema>>,
     /// View definitions stored in-memory.
@@ -2727,6 +2742,7 @@ impl Connection {
             active_txn: RefCell::new(None),
             cached_read_snapshot: RefCell::new(None),
             cached_read_snapshot_cookie: Cell::new(0),
+            cached_vdbe_engine: RefCell::new(None),
             schema: RefCell::new(Vec::new()),
             views: RefCell::new(Vec::new()),
             triggers: RefCell::new(Vec::new()),
@@ -9732,34 +9748,33 @@ impl Connection {
         // Fast path for isolated :memory: autocommit transactions: these
         // connections cannot observe external commits, so they do not need the
         // staleness/publication binding path that file-backed databases use.
+        //
+        // CRITICAL OPTIMIZATION: :memory: databases are connection-local — each
+        // connection has its own isolated in-memory B-tree with NO external
+        // writers.  The concurrent registry (Mutex locks, page-lock CAS, SSI
+        // witness tracking) is pure overhead for :memory: because there is
+        // nothing to coordinate.  We unconditionally use the serialized path
+        // for :memory: autocommit regardless of the concurrent_mode PRAGMA.
+        // The PRAGMA is still respected for file-backed databases where
+        // concurrent writers actually exist.
         if self.pager.is_memory() {
             if hot_path_profile_enabled() {
                 FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS.fetch_add(1, AtomicOrdering::Relaxed);
             }
-            let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, cx, mode)?;
-            let concurrent_session = if is_concurrent {
-                let snapshot = Snapshot::new(
-                    self.pager.published_snapshot().visible_commit_seq,
-                    SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
-                );
-                let begin_result =
-                    lock_unpoisoned(&self.concurrent_registry).begin_concurrent(snapshot);
-                match begin_result {
-                    Ok(session_id) => Some(session_id),
-                    Err(error) => {
-                        let _ = txn.rollback(cx);
-                        return Err(match error {
-                            MvccError::Busy => FrankenError::Busy,
-                            _ => FrankenError::Internal(format!("MVCC begin failed: {error}")),
-                        });
-                    }
-                }
+            // Force serialized mode for :memory: — skip concurrent registry entirely.
+            let effective_mode = if mode == TransactionMode::Concurrent {
+                TransactionMode::ReadWrite
             } else {
-                None
+                mode
             };
+            let txn = self.begin_pager_txn_with_busy_timeout(&self.pager, cx, effective_mode)?;
+            let concurrent_session: Option<u64> = None;
             *self.active_txn.borrow_mut() = Some(txn);
             *self.concurrent_session_id.borrow_mut() = concurrent_session;
-            *self.concurrent_txn.borrow_mut() = is_concurrent;
+            // :memory: fast path uses serialized mode internally — set
+            // concurrent_txn=false so VDBE dispatch skips ConcurrentExecContext
+            // setup (which would try to access the registry we bypassed).
+            *self.concurrent_txn.borrow_mut() = false;
             self.txn_metrics_mark_started();
             return Ok(true);
         }
@@ -15733,7 +15748,7 @@ impl Connection {
             });
         }
 
-        let bytes_per_overflow = usize::try_from(usable_size - 4).unwrap_or(0);
+        let bytes_per_overflow = usize::try_from(usable_size.saturating_sub(4)).unwrap_or(0);
         let mut remaining =
             usize::try_from(payload_size.saturating_sub(local_size)).unwrap_or(usize::MAX);
         let mut current = Some(first_overflow);
@@ -23695,7 +23710,9 @@ impl Connection {
             None
         };
 
-        let (result, txn_back) = execute_table_program_with_db(
+        // Take cached engine if available (avoids 21+ collection re-allocations).
+        let cached_engine = self.cached_vdbe_engine.borrow_mut().take();
+        let ((result, txn_back), engine_back) = execute_table_program_with_db(
             program,
             params,
             &func_reg,
@@ -23713,7 +23730,10 @@ impl Connection {
             reject_mem,
             Some(Arc::clone(&self.version_store)),
             PageSize::new(self.pragma_state.borrow().page_size).unwrap(),
+            cached_engine,
         );
+        // Park the engine for reuse by the next statement.
+        *self.cached_vdbe_engine.borrow_mut() = engine_back;
         // Always restore the transaction handle, even on error.
         if let Some(txn) = txn_back {
             *self.active_txn.borrow_mut() = Some(txn);
@@ -30108,6 +30128,34 @@ fn evaluate_having_value(
                         SqliteValue::Text(format!("{}{}", lv.to_text(), rv.to_text()).into())
                     }
                 }
+                fsqlite_ast::BinaryOp::BitAnd => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(lv.to_integer() & rv.to_integer())
+                    }
+                }
+                fsqlite_ast::BinaryOp::BitOr => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(lv.to_integer() | rv.to_integer())
+                    }
+                }
+                fsqlite_ast::BinaryOp::ShiftLeft => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(lv.to_integer().wrapping_shl(rv.to_integer() as u32))
+                    }
+                }
+                fsqlite_ast::BinaryOp::ShiftRight => {
+                    if is_null_op {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(lv.to_integer().wrapping_shr(rv.to_integer() as u32))
+                    }
+                }
                 _ => SqliteValue::Null,
             }
         }
@@ -31736,7 +31784,8 @@ fn execute_table_program_with_db(
     reject_mem_fallback: bool,
     version_store: Option<Arc<VersionStore>>,
     page_size: PageSize,
-) -> TableProgramExecOutcome {
+    cached_engine: Option<VdbeEngine>,
+) -> (TableProgramExecOutcome, Option<VdbeEngine>) {
     let execution_span = tracing::enabled!(target: "fsqlite.execution", tracing::Level::DEBUG)
         .then(|| {
             let span = tracing::span!(
@@ -31749,8 +31798,14 @@ fn execute_table_program_with_db(
             span
         });
     let _execution_guard = execution_span.as_ref().map(tracing::Span::enter);
-    let mut engine =
-        VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size);
+    // Reuse a cached engine if available (avoids 21+ collection allocations).
+    // If no cached engine exists, create a fresh one.
+    let mut engine = if let Some(mut cached) = cached_engine {
+        cached.reset_for_reuse(program.register_count(), execution_cx, page_size);
+        cached
+    } else {
+        VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx, page_size)
+    };
     if let Some(params) = params {
         if let Err(e) = validate_bound_parameters(program, params) {
             return (
@@ -31862,7 +31917,7 @@ fn execute_table_program_with_db(
             last_insert_rowid: engine_rowid,
         }),
     };
-    (result, txn_back)
+    ((result, txn_back), Some(engine))
 }
 
 fn build_expression_postprocess(select: &SelectStatement) -> ExpressionPostprocess {
@@ -36307,6 +36362,34 @@ fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) ->
             };
             SqliteValue::Integer(i64::from(!eq))
         }
+        BinaryOp::BitAnd => {
+            if left.is_null() || right.is_null() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Integer(left.to_integer() & right.to_integer())
+            }
+        }
+        BinaryOp::BitOr => {
+            if left.is_null() || right.is_null() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Integer(left.to_integer() | right.to_integer())
+            }
+        }
+        BinaryOp::ShiftLeft => {
+            if left.is_null() || right.is_null() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Integer(left.to_integer().wrapping_shl(right.to_integer() as u32))
+            }
+        }
+        BinaryOp::ShiftRight => {
+            if left.is_null() || right.is_null() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Integer(left.to_integer().wrapping_shr(right.to_integer() as u32))
+            }
+        }
         _ => SqliteValue::Null,
     }
 }
@@ -36692,11 +36775,18 @@ fn sqlite_value_to_text(v: &SqliteValue) -> String {
     clippy::cast_possible_wrap
 )]
 fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
-    let lower = name.to_ascii_lowercase();
+    // Avoid allocation when name is already lowercase (common case from parser).
+    let owned_lower;
+    let lower: &str = if name.bytes().all(|b| !b.is_ascii_uppercase()) {
+        name
+    } else {
+        owned_lower = name.to_ascii_lowercase();
+        &owned_lower
+    };
 
     // Standard SQL NULL propagation: if any argument is NULL, most scalar
     // functions return NULL.  Functions with special NULL handling are exempt.
-    match lower.as_str() {
+    match lower {
         "coalesce" | "ifnull" | "nullif" | "typeof" | "quote" | "iif" => {}
         _ => {
             if args.iter().any(SqliteValue::is_null) {
@@ -36705,7 +36795,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         }
     }
 
-    match lower.as_str() {
+    match lower {
         "length" | "len" => match args.first() {
             Some(SqliteValue::Text(s)) => {
                 // C SQLite: length() returns character count, not byte count.
@@ -36891,7 +36981,16 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             }
         }
         "substr" | "substring" => {
-            if let Some(SqliteValue::Text(s)) = args.first() {
+            // Coerce any non-NULL value to text first (C SQLite does this).
+            // E.g., SUBSTR(12345, 2, 3) should return '234'.
+            let coerced_text = args.first().and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    Some(sqlite_value_to_text(v))
+                }
+            });
+            if let Some(s) = coerced_text.as_deref() {
                 let chars: Vec<char> = s.chars().collect();
                 let n = chars.len() as i64;
                 let raw_start = args

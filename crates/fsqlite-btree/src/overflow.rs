@@ -88,7 +88,7 @@ where
 
     let mut current_page = first_overflow;
     let mut bytes_remaining = total_size.saturating_sub(local_data.len());
-    let bytes_per_overflow = (usable_size - 4) as usize;
+    let bytes_per_overflow = usable_size.saturating_sub(4) as usize;
     let mut chain_length = 0;
 
     while bytes_remaining > 0 {
@@ -172,7 +172,12 @@ where
         });
     }
 
-    let bytes_per_page = (usable_size - 4) as usize;
+    let bytes_per_page = usable_size.saturating_sub(4) as usize;
+    if bytes_per_page == 0 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "usable page size too small for overflow data".to_owned(),
+        });
+    }
     let page_size = usable_size as usize;
 
     // Calculate number of overflow pages needed.

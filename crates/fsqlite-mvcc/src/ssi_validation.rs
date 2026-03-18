@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use fsqlite_types::{CommitSeq, ObjectId, PageNumber, TxnToken, WitnessKey};
 use tracing::{debug, info, warn};
@@ -64,8 +64,11 @@ pub enum SsiAbortReason {
 
 static FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_EVIDENCE_RECORDS_TOTAL_BUDGET_COMPACT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_SSI_EVIDENCE_MODE: AtomicU8 =
     AtomicU8::new(SsiEvidenceRecordingMode::CompactCommit as u8);
+static FSQLITE_SSI_EVIDENCE_MAX_PENDING_FULL_COMMIT_RECORDS: AtomicUsize = AtomicUsize::new(32);
+static FSQLITE_SSI_EVIDENCE_MAX_FULL_COMMIT_BYTES: AtomicU64 = AtomicU64::new(4 * 1024);
 
 /// Commit-time evidence detail level.
 ///
@@ -76,6 +79,7 @@ static FSQLITE_SSI_EVIDENCE_MODE: AtomicU8 =
 pub enum SsiEvidenceRecordingMode {
     Full = 0,
     CompactCommit = 1,
+    BudgetedCommit = 2,
 }
 
 impl SsiEvidenceRecordingMode {
@@ -83,7 +87,24 @@ impl SsiEvidenceRecordingMode {
     const fn from_raw(raw: u8) -> Self {
         match raw {
             1 => Self::CompactCommit,
+            2 => Self::BudgetedCommit,
             _ => Self::Full,
+        }
+    }
+}
+
+/// Explicit caps used when `BudgetedCommit` mode is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SsiEvidenceBudgetConfig {
+    pub max_pending_records_before_compact: usize,
+    pub max_commit_evidence_bytes: u64,
+}
+
+impl Default for SsiEvidenceBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_records_before_compact: 32,
+            max_commit_evidence_bytes: 4 * 1024,
         }
     }
 }
@@ -93,6 +114,8 @@ impl SsiEvidenceRecordingMode {
 pub struct EvidenceRecordMetricsSnapshot {
     pub fsqlite_evidence_records_total_commit: u64,
     pub fsqlite_evidence_records_total_abort: u64,
+    pub fsqlite_evidence_records_total_budget_compact: u64,
+    pub fsqlite_evidence_pending_records: usize,
 }
 
 impl EvidenceRecordMetricsSnapshot {
@@ -127,6 +150,9 @@ pub fn ssi_evidence_metrics_snapshot() -> EvidenceRecordMetricsSnapshot {
             .load(Ordering::Relaxed),
         fsqlite_evidence_records_total_abort: FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT
             .load(Ordering::Relaxed),
+        fsqlite_evidence_records_total_budget_compact:
+            FSQLITE_EVIDENCE_RECORDS_TOTAL_BUDGET_COMPACT.load(Ordering::Relaxed),
+        fsqlite_evidence_pending_records: ssi_evidence_ledger().pending_count(),
     }
 }
 
@@ -134,6 +160,7 @@ pub fn ssi_evidence_metrics_snapshot() -> EvidenceRecordMetricsSnapshot {
 pub fn reset_ssi_evidence_metrics() {
     FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.store(0, Ordering::Relaxed);
     FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT.store(0, Ordering::Relaxed);
+    FSQLITE_EVIDENCE_RECORDS_TOTAL_BUDGET_COMPACT.store(0, Ordering::Relaxed);
 }
 
 /// Return the current SSI evidence recording mode.
@@ -147,6 +174,27 @@ pub fn set_ssi_evidence_recording_mode(mode: SsiEvidenceRecordingMode) -> SsiEvi
     SsiEvidenceRecordingMode::from_raw(
         FSQLITE_SSI_EVIDENCE_MODE.swap(mode as u8, Ordering::Relaxed),
     )
+}
+
+/// Return the current SSI evidence budget config.
+#[must_use]
+pub fn ssi_evidence_budget_config() -> SsiEvidenceBudgetConfig {
+    SsiEvidenceBudgetConfig {
+        max_pending_records_before_compact: FSQLITE_SSI_EVIDENCE_MAX_PENDING_FULL_COMMIT_RECORDS
+            .load(Ordering::Relaxed),
+        max_commit_evidence_bytes: FSQLITE_SSI_EVIDENCE_MAX_FULL_COMMIT_BYTES
+            .load(Ordering::Relaxed),
+    }
+}
+
+/// Update the SSI evidence budget config, returning the previous value.
+pub fn set_ssi_evidence_budget_config(config: SsiEvidenceBudgetConfig) -> SsiEvidenceBudgetConfig {
+    SsiEvidenceBudgetConfig {
+        max_pending_records_before_compact: FSQLITE_SSI_EVIDENCE_MAX_PENDING_FULL_COMMIT_RECORDS
+            .swap(config.max_pending_records_before_compact, Ordering::Relaxed),
+        max_commit_evidence_bytes: FSQLITE_SSI_EVIDENCE_MAX_FULL_COMMIT_BYTES
+            .swap(config.max_commit_evidence_bytes, Ordering::Relaxed),
+    }
 }
 
 fn default_t3_dro_matrix() -> &'static DroLossMatrix {
@@ -1180,6 +1228,46 @@ fn estimate_evidence_size_bytes(
     }
 }
 
+fn estimate_commit_evidence_budget_bytes(
+    read_keys: &[WitnessKey],
+    write_keys: &[WitnessKey],
+    edges: &[DiscoveredEdge],
+    rationale: &str,
+) -> u64 {
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        let words = read_keys.len() + write_keys.len() + (edges.len() * 2);
+        ((words * std::mem::size_of::<u64>()) + rationale.len()) as u64
+    }
+}
+
+fn commit_evidence_detail_level(
+    read_keys: &[WitnessKey],
+    write_keys: &[WitnessKey],
+    edges: &[DiscoveredEdge],
+    rationale: &str,
+) -> (bool, &'static str) {
+    match ssi_evidence_recording_mode() {
+        SsiEvidenceRecordingMode::Full => (false, "full"),
+        SsiEvidenceRecordingMode::CompactCommit => (true, "compact_commit"),
+        SsiEvidenceRecordingMode::BudgetedCommit => {
+            let budget = ssi_evidence_budget_config();
+            let pending_records = ssi_evidence_ledger().pending_count();
+            let estimated_bytes =
+                estimate_commit_evidence_budget_bytes(read_keys, write_keys, edges, rationale);
+            if pending_records >= budget.max_pending_records_before_compact {
+                FSQLITE_EVIDENCE_RECORDS_TOTAL_BUDGET_COMPACT.fetch_add(1, Ordering::Relaxed);
+                (true, "budget_compact_pending")
+            } else if estimated_bytes > budget.max_commit_evidence_bytes {
+                FSQLITE_EVIDENCE_RECORDS_TOTAL_BUDGET_COMPACT.fetch_add(1, Ordering::Relaxed);
+                (true, "budget_compact_size")
+            } else {
+                (false, "budget_full")
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_evidence_decision(
     decision_type: SsiDecisionType,
@@ -1191,11 +1279,12 @@ fn record_evidence_decision(
     edges: &[DiscoveredEdge],
     rationale: &str,
 ) {
-    let compact_commit_evidence = matches!(decision_type, SsiDecisionType::CommitAllowed)
-        && matches!(
-            ssi_evidence_recording_mode(),
-            SsiEvidenceRecordingMode::CompactCommit
-        );
+    let (compact_commit_evidence, detail_level) =
+        if matches!(decision_type, SsiDecisionType::CommitAllowed) {
+            commit_evidence_detail_level(read_keys, write_keys, edges, rationale)
+        } else {
+            (false, "full")
+        };
 
     let (read_pages, write_pages, conflict_pages, conflicting_txns, evidence_size_bytes) =
         if compact_commit_evidence {
@@ -1239,11 +1328,6 @@ fn record_evidence_decision(
     );
     let _guard = span.enter();
 
-    let detail_level = if compact_commit_evidence {
-        "compact_commit"
-    } else {
-        "full"
-    };
     let r_len = if compact_commit_evidence {
         read_keys.len()
     } else {
@@ -1317,6 +1401,42 @@ mod tests {
     use super::*;
     use fsqlite_types::{TxnEpoch, TxnId};
     use std::cell::Cell;
+
+    fn evidence_settings_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct EvidenceConfigRestore {
+        mode: SsiEvidenceRecordingMode,
+        budget: SsiEvidenceBudgetConfig,
+    }
+
+    impl Drop for EvidenceConfigRestore {
+        fn drop(&mut self) {
+            let _ = set_ssi_evidence_budget_config(self.budget);
+            let _ = set_ssi_evidence_recording_mode(self.mode);
+        }
+    }
+
+    fn with_ssi_evidence_test_config<T>(
+        mode: SsiEvidenceRecordingMode,
+        budget: SsiEvidenceBudgetConfig,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = evidence_settings_guard();
+        let restore = EvidenceConfigRestore {
+            mode: set_ssi_evidence_recording_mode(mode),
+            budget: set_ssi_evidence_budget_config(budget),
+        };
+        reset_ssi_evidence_metrics();
+        let result = f();
+        drop(restore);
+        result
+    }
 
     // -- Test ActiveTxnView implementation --
 
@@ -2973,41 +3093,134 @@ mod tests {
 
     #[test]
     fn test_commit_allowed_evidence_defaults_to_compact_mode() {
-        let txn = TxnToken::new(TxnId::new(90_202).unwrap(), TxnEpoch::new(0));
-        let result = ssi_validate_and_publish(
-            txn,
-            CommitSeq::new(3),
-            CommitSeq::new(4),
-            &[page_key(920)],
-            &[page_key(921)],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-        );
-        result.expect("commit should succeed");
+        with_ssi_evidence_test_config(
+            SsiEvidenceRecordingMode::CompactCommit,
+            SsiEvidenceBudgetConfig::default(),
+            || {
+                let txn = TxnToken::new(TxnId::new(90_202).unwrap(), TxnEpoch::new(0));
+                let result = ssi_validate_and_publish(
+                    txn,
+                    CommitSeq::new(3),
+                    CommitSeq::new(4),
+                    &[page_key(920)],
+                    &[page_key(921)],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                );
+                result.expect("commit should succeed");
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let snapshot = ssi_evidence_snapshot();
-        let rows = ssi_evidence_query(&SsiDecisionQuery {
-            txn_id: Some(txn.id.get()),
-            ..SsiDecisionQuery::default()
-        });
-        if rows.is_empty() {
-            assert!(
-                !snapshot.is_empty(),
-                "evidence ledger should not be completely empty"
-            );
-            for card in &snapshot {
-                assert!(card.decision_id > 0, "every card must have a decision_id");
-            }
-        } else {
-            let last = rows.last().unwrap();
-            assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
-            assert!(last.conflict_pages.is_empty());
-            assert!(last.write_set.is_empty());
-            assert_eq!(last.read_set_summary.page_count, 0);
-        }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let snapshot = ssi_evidence_snapshot();
+                let rows = ssi_evidence_query(&SsiDecisionQuery {
+                    txn_id: Some(txn.id.get()),
+                    ..SsiDecisionQuery::default()
+                });
+                if rows.is_empty() {
+                    assert!(
+                        !snapshot.is_empty(),
+                        "evidence ledger should not be completely empty"
+                    );
+                    for card in &snapshot {
+                        assert!(card.decision_id > 0, "every card must have a decision_id");
+                    }
+                } else {
+                    let last = rows.last().unwrap();
+                    assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
+                    assert!(last.conflict_pages.is_empty());
+                    assert!(last.write_set.is_empty());
+                    assert_eq!(last.read_set_summary.page_count, 0);
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn test_budgeted_commit_mode_keeps_full_evidence_when_within_budget() {
+        with_ssi_evidence_test_config(
+            SsiEvidenceRecordingMode::BudgetedCommit,
+            SsiEvidenceBudgetConfig {
+                max_pending_records_before_compact: usize::MAX,
+                max_commit_evidence_bytes: u64::MAX,
+            },
+            || {
+                let before = ssi_evidence_metrics_snapshot();
+                let txn = TxnToken::new(TxnId::new(90_203).unwrap(), TxnEpoch::new(0));
+                let result = ssi_validate_and_publish(
+                    txn,
+                    CommitSeq::new(5),
+                    CommitSeq::new(6),
+                    &[page_key(930)],
+                    &[page_key(931)],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                );
+                result.expect("commit should succeed");
+
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let rows = ssi_evidence_query(&SsiDecisionQuery {
+                    txn_id: Some(txn.id.get()),
+                    ..SsiDecisionQuery::default()
+                });
+                let last = rows.last().expect("budgeted full commit evidence row");
+                assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
+                assert_eq!(last.read_set_summary.page_count, 1);
+                assert_eq!(last.write_set, vec![PageNumber::new(931).unwrap()]);
+                let after = ssi_evidence_metrics_snapshot();
+                assert_eq!(
+                    after.fsqlite_evidence_records_total_budget_compact,
+                    before.fsqlite_evidence_records_total_budget_compact
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_budgeted_commit_mode_compacts_when_size_budget_is_exhausted() {
+        with_ssi_evidence_test_config(
+            SsiEvidenceRecordingMode::BudgetedCommit,
+            SsiEvidenceBudgetConfig {
+                max_pending_records_before_compact: usize::MAX,
+                max_commit_evidence_bytes: 0,
+            },
+            || {
+                let before = ssi_evidence_metrics_snapshot();
+                let txn = TxnToken::new(TxnId::new(90_204).unwrap(), TxnEpoch::new(0));
+                let result = ssi_validate_and_publish(
+                    txn,
+                    CommitSeq::new(7),
+                    CommitSeq::new(8),
+                    &[page_key(940)],
+                    &[page_key(941)],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                );
+                result.expect("commit should succeed");
+
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let rows = ssi_evidence_query(&SsiDecisionQuery {
+                    txn_id: Some(txn.id.get()),
+                    ..SsiDecisionQuery::default()
+                });
+                let last = rows.last().expect("budget-compacted commit evidence row");
+                assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
+                assert!(last.conflict_pages.is_empty());
+                assert!(last.write_set.is_empty());
+                assert_eq!(last.read_set_summary.page_count, 0);
+                let after = ssi_evidence_metrics_snapshot();
+                assert!(
+                    after.fsqlite_evidence_records_total_budget_compact
+                        >= before.fsqlite_evidence_records_total_budget_compact + 1
+                );
+            },
+        );
     }
 }

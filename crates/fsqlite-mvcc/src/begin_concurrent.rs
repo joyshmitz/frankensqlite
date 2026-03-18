@@ -1543,8 +1543,8 @@ struct HandleView {
     is_active: bool,
     read_pages: HashSet<PageNumber>,
     tracked_write_pages: HashSet<PageNumber>,
-    read_keys: Vec<WitnessKey>,
-    write_keys: Vec<WitnessKey>,
+    has_read_witnesses: bool,
+    has_write_witnesses: bool,
     has_global_read_witnesses: bool,
     has_global_write_witnesses: bool,
     has_in_rw: Cell<bool>,
@@ -1559,8 +1559,9 @@ impl HandleView {
             is_active: handle.is_active(),
             read_pages: handle.read_set().clone(),
             tracked_write_pages: handle.tracked_write_conflict_pages_iter().collect(),
-            read_keys: handle.read_witness_keys(),
-            write_keys: handle.write_witness_keys(),
+            has_read_witnesses: !handle.read_set().is_empty() || handle.has_global_read_witnesses(),
+            has_write_witnesses: !handle.write_index.is_empty()
+                || handle.has_global_write_witnesses(),
             has_global_read_witnesses: handle.has_global_read_witnesses(),
             has_global_write_witnesses: handle.has_global_write_witnesses(),
             has_in_rw: Cell::new(handle.has_in_rw()),
@@ -1648,7 +1649,7 @@ impl ActiveEdgeDiscoveryIndex {
     fn build(views: &[HandleView]) -> Self {
         let mut index = Self::default();
         for (idx, view) in views.iter().enumerate() {
-            if !view.read_keys.is_empty() {
+            if view.has_read_witnesses {
                 index.all_readers.push(idx);
                 if view.has_global_read_witnesses {
                     index.readers_with_global_keys.push(idx);
@@ -1657,7 +1658,7 @@ impl ActiveEdgeDiscoveryIndex {
                     index.readers_by_page.entry(page).or_default().push(idx);
                 }
             }
-            if !view.write_keys.is_empty() {
+            if view.has_write_witnesses {
                 index.all_writers.push(idx);
                 if view.has_global_write_witnesses {
                     index.writers_with_global_keys.push(idx);
@@ -1745,11 +1746,11 @@ impl ActiveTxnView for HandleView {
     }
 
     fn read_keys(&self) -> &[WitnessKey] {
-        &self.read_keys
+        &[]
     }
 
     fn write_keys(&self) -> &[WitnessKey] {
-        &self.write_keys
+        &[]
     }
 
     fn check_read_overlap(&self, key: &WitnessKey) -> bool {
@@ -2558,12 +2559,12 @@ mod tests {
     use crate::ssi_validation::ActiveTxnView;
 
     use super::{
-        CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle, ConcurrentRegistry, FcwResult,
-        HandleView, MAX_CONCURRENT_WRITERS, concurrent_abort, concurrent_clear_page_state,
-        concurrent_commit, concurrent_commit_with_ssi, concurrent_free_page,
-        concurrent_page_is_freed, concurrent_page_state, concurrent_read_page,
-        concurrent_restore_page_state, concurrent_rollback_to_savepoint, concurrent_savepoint,
-        concurrent_track_write_conflict_page, concurrent_write_page,
+        ActiveEdgeDiscoveryIndex, CommittedReaderInfo, CommittedWriterInfo, ConcurrentHandle,
+        ConcurrentRegistry, FcwResult, HandleView, MAX_CONCURRENT_WRITERS, concurrent_abort,
+        concurrent_clear_page_state, concurrent_commit, concurrent_commit_with_ssi,
+        concurrent_free_page, concurrent_page_is_freed, concurrent_page_state,
+        concurrent_read_page, concurrent_restore_page_state, concurrent_rollback_to_savepoint,
+        concurrent_savepoint, concurrent_track_write_conflict_page, concurrent_write_page,
         finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
         summarize_witness_keys, validate_first_committer_wins,
     };
@@ -4011,6 +4012,44 @@ mod tests {
             namespace: 6,
             bytes: b"candidate".to_vec(),
         }));
+    }
+
+    #[test]
+    fn test_active_edge_discovery_index_uses_presence_flags_without_materialized_keys() {
+        let mut page_reader = ConcurrentHandle::new(test_snapshot(10), test_token(311));
+        page_reader.record_read(test_page(7));
+
+        let mut global_reader = ConcurrentHandle::new(test_snapshot(10), test_token(312));
+        global_reader.record_read_witness(WitnessKey::Custom {
+            namespace: 7,
+            bytes: b"global-reader".to_vec(),
+        });
+
+        let mut unrelated_reader = ConcurrentHandle::new(test_snapshot(10), test_token(313));
+        unrelated_reader.record_read(test_page(9));
+
+        let views = vec![
+            HandleView::new(&page_reader),
+            HandleView::new(&global_reader),
+            HandleView::new(&unrelated_reader),
+        ];
+        let index = ActiveEdgeDiscoveryIndex::build(&views);
+        let write_summary = summarize_witness_keys(&[WitnessKey::Page(test_page(7))]);
+
+        let mut candidate_tokens = index
+            .incoming_candidate_refs(
+                &views,
+                test_token(399),
+                CommitSeq::new(10),
+                CommitSeq::new(20),
+                &write_summary,
+            )
+            .into_iter()
+            .map(|candidate| candidate.token())
+            .collect::<Vec<_>>();
+        candidate_tokens.sort_by_key(|token| token.id.get());
+
+        assert_eq!(candidate_tokens, vec![test_token(311), test_token(312)]);
     }
 
     #[test]
