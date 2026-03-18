@@ -227,7 +227,7 @@ fn sequential_writers_on_same_table() {
                 "INSERT INTO t1 VALUES (?, ?)",
                 &[
                     SqliteValue::Integer(id),
-                    SqliteValue::Text(format!("writer_{writer_id}")),
+                    SqliteValue::Text(format!("writer_{writer_id}").into()),
                 ],
             )
             .expect("insert");
@@ -374,7 +374,7 @@ fn interleaved_commit_rollback_across_connections() {
             "INSERT INTO t1 VALUES (?, ?)",
             &[
                 SqliteValue::Integer(id),
-                SqliteValue::Text(format!("step_{i}")),
+                SqliteValue::Text(format!("step_{i}").into()),
             ],
         )
         .expect("insert");
@@ -414,7 +414,7 @@ fn conn2_uses_index_created_by_conn1() {
                     "INSERT INTO t1 VALUES (?, ?)",
                     &[
                         SqliteValue::Integer(i),
-                        SqliteValue::Text(format!("val_{i}")),
+                        SqliteValue::Text(format!("val_{i}").into()),
                     ],
                 )
                 .expect("insert");
@@ -452,7 +452,7 @@ fn wal_mode_sequential_writers_persist() {
             "INSERT INTO t1 VALUES (?, ?)",
             &[
                 SqliteValue::Integer(i),
-                SqliteValue::Text(format!("wal_writer_{i}")),
+                SqliteValue::Text(format!("wal_writer_{i}").into()),
             ],
         )
         .expect("insert");
@@ -482,7 +482,7 @@ fn wal_mode_checkpoint_by_conn2_after_conn1_writes() {
                     "INSERT INTO t1 VALUES (?, ?)",
                     &[
                         SqliteValue::Integer(i),
-                        SqliteValue::Text(format!("wal_{i}")),
+                        SqliteValue::Text(format!("wal_{i}").into()),
                     ],
                 )
                 .expect("insert");
@@ -525,7 +525,7 @@ fn concurrent_mode_sequential_commits_across_connections() {
             "INSERT INTO t1 VALUES (?, ?)",
             &[
                 SqliteValue::Integer(i),
-                SqliteValue::Text(format!("concurrent_{i}")),
+                SqliteValue::Text(format!("concurrent_{i}").into()),
             ],
         )
         .expect("insert");

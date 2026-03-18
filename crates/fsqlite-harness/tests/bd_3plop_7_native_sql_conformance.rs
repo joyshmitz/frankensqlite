@@ -131,8 +131,8 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
             .unwrap();
         let rows = c.query("SELECT id, name FROM t1 ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("alice".to_owned())));
-        assert_eq!(rows[2].get(1), Some(&SqliteValue::Text("carol".to_owned())));
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("alice".into())));
+        assert_eq!(rows[2].get(1), Some(&SqliteValue::Text("carol".into())));
     })) {
         Ok(()) => results.push(ok("create_insert_select", cat.clone())),
         Err(e) => results.push(fail("create_insert_select", cat.clone(), format!("{e:?}"))),
@@ -161,7 +161,7 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
         c.execute("INSERT INTO t1 VALUES(1, 'old');").unwrap();
         c.execute("UPDATE t1 SET v = 'new' WHERE id = 1;").unwrap();
         let rows = c.query("SELECT v FROM t1 WHERE id = 1;").unwrap();
-        assert_eq!(rows[0].get(0), Some(&SqliteValue::Text("new".to_owned())));
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Text("new".into())));
     })) {
         Ok(()) => results.push(ok("update_basic", cat.clone())),
         Err(e) => results.push(fail("update_basic", cat.clone(), format!("{e:?}"))),

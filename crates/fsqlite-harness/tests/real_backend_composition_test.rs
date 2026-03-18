@@ -56,12 +56,12 @@ fn autocommit_persists_through_close_reopen() {
         );
         assert_eq!(
             rows[0].get(1).unwrap(),
-            &SqliteValue::Text("alpha".to_owned()),
+            &SqliteValue::Text("alpha".into()),
             "bead_id={BEAD_ID} case=autocommit_persist_val1"
         );
         assert_eq!(
             rows[2].get(1).unwrap(),
-            &SqliteValue::Text("gamma".to_owned()),
+            &SqliteValue::Text("gamma".into()),
             "bead_id={BEAD_ID} case=autocommit_persist_val3"
         );
     }
@@ -239,7 +239,7 @@ fn wal_mode_data_survives_reopen() {
                 "INSERT INTO t1 VALUES (?, ?)",
                 &[
                     SqliteValue::Integer(i),
-                    SqliteValue::Text(format!("row_{i}")),
+                    SqliteValue::Text(format!("row_{i}").into()),
                 ],
             )
             .expect("insert");
@@ -252,7 +252,7 @@ fn wal_mode_data_survives_reopen() {
         assert_eq!(rows.len(), 10, "bead_id={BEAD_ID} case=wal_reopen_count");
         assert_eq!(
             rows[4].get(1).unwrap(),
-            &SqliteValue::Text("row_5".to_owned()),
+            &SqliteValue::Text("row_5".into()),
             "bead_id={BEAD_ID} case=wal_reopen_val5"
         );
     }
@@ -276,7 +276,7 @@ fn btree_split_preserves_order_on_large_insert() {
                 "INSERT INTO t1 VALUES (?, ?)",
                 &[
                     SqliteValue::Integer(i),
-                    SqliteValue::Text(format!("payload_{i:04}")),
+                    SqliteValue::Text(format!("payload_{i:04}").into()),
                 ],
             )
             .expect("insert");
@@ -308,13 +308,13 @@ fn btree_split_preserves_order_on_large_insert() {
         // Spot check first and last
         assert_eq!(
             rows[0].get(1).unwrap(),
-            &SqliteValue::Text("payload_0000".to_owned()),
+            &SqliteValue::Text("payload_0000".into()),
             "bead_id={BEAD_ID} case=btree_first"
         );
         let last_idx = usize::try_from(row_count - 1).expect("usize");
         assert_eq!(
             rows[last_idx].get(1).unwrap(),
-            &SqliteValue::Text(format!("payload_{:04}", row_count - 1)),
+            &SqliteValue::Text(format!("payload_{:04}", row_count - 1).into()),
             "bead_id={BEAD_ID} case=btree_last"
         );
     }
@@ -331,7 +331,10 @@ fn btree_handles_delete_and_reinsert() {
         for i in 1..=10 {
             conn.execute_with_params(
                 "INSERT INTO t1 VALUES (?, ?)",
-                &[SqliteValue::Integer(i), SqliteValue::Text(format!("v{i}"))],
+                &[
+                    SqliteValue::Integer(i),
+                    SqliteValue::Text(format!("v{i}").into()),
+                ],
             )
             .expect("insert");
         }
@@ -346,7 +349,7 @@ fn btree_handles_delete_and_reinsert() {
                 "INSERT INTO t1 VALUES (?, ?)",
                 &[
                     SqliteValue::Integer(i),
-                    SqliteValue::Text(format!("new_v{i}")),
+                    SqliteValue::Text(format!("new_v{i}").into()),
                 ],
             )
             .expect("reinsert");
@@ -367,14 +370,14 @@ fn btree_handles_delete_and_reinsert() {
         // Odd rows should have original values
         assert_eq!(
             rows[0].get(1).unwrap(),
-            &SqliteValue::Text("v1".to_owned()),
+            &SqliteValue::Text("v1".into()),
             "bead_id={BEAD_ID} case=odd_preserved"
         );
 
         // Even rows should have new values
         assert_eq!(
             rows[1].get(1).unwrap(),
-            &SqliteValue::Text("new_v2".to_owned()),
+            &SqliteValue::Text("new_v2".into()),
             "bead_id={BEAD_ID} case=even_reinserted"
         );
     }
@@ -464,8 +467,8 @@ fn all_sqlite_types_round_trip_on_file_backend() {
             &[
                 SqliteValue::Integer(42),
                 SqliteValue::Float(PI),
-                SqliteValue::Text("hello".to_owned()),
-                SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                SqliteValue::Text("hello".into()),
+                SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into()),
                 SqliteValue::Null,
             ],
         )
@@ -495,12 +498,12 @@ fn all_sqlite_types_round_trip_on_file_backend() {
         }
         assert_eq!(
             rows[0].get(2).unwrap(),
-            &SqliteValue::Text("hello".to_owned()),
+            &SqliteValue::Text("hello".into()),
             "bead_id={BEAD_ID} case=type_text"
         );
         assert_eq!(
             rows[0].get(3).unwrap(),
-            &SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            &SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into()),
             "bead_id={BEAD_ID} case=type_blob"
         );
         assert_eq!(
@@ -657,7 +660,7 @@ fn index_persists_and_speeds_lookup() {
                 "INSERT INTO t1 VALUES (?, ?, ?)",
                 &[
                     SqliteValue::Integer(i),
-                    SqliteValue::Text(format!("name_{i}")),
+                    SqliteValue::Text(format!("name_{i}").into()),
                     SqliteValue::Integer(i * 10),
                 ],
             )
@@ -674,7 +677,7 @@ fn index_persists_and_speeds_lookup() {
         assert_eq!(rows.len(), 1, "bead_id={BEAD_ID} case=index_lookup_count");
         assert_eq!(
             rows[0].get(0).unwrap(),
-            &SqliteValue::Text("name_50".to_owned()),
+            &SqliteValue::Text("name_50".into()),
             "bead_id={BEAD_ID} case=index_lookup_val"
         );
 
@@ -712,7 +715,7 @@ fn update_within_transaction_visible_to_later_reads() {
         .expect("query");
     assert_eq!(
         rows[0].get(0).unwrap(),
-        &SqliteValue::Text("modified".to_owned()),
+        &SqliteValue::Text("modified".into()),
         "bead_id={BEAD_ID} case=read_your_writes"
     );
 
@@ -726,7 +729,7 @@ fn update_within_transaction_visible_to_later_reads() {
         .expect("query");
     assert_eq!(
         rows[0].get(0).unwrap(),
-        &SqliteValue::Text("modified".to_owned()),
+        &SqliteValue::Text("modified".into()),
         "bead_id={BEAD_ID} case=update_persisted"
     );
 }
@@ -802,9 +805,9 @@ fn database_file_grows_with_data() {
         for i in 0..100 {
             conn.execute_with_params(
                 "INSERT INTO t1 VALUES (?)",
-                &[SqliteValue::Text(format!(
-                    "row_{i}_padding_data_to_fill_pages"
-                ))],
+                &[SqliteValue::Text(
+                    format!("row_{i}_padding_data_to_fill_pages").into(),
+                )],
             )
             .expect("insert");
         }
@@ -862,7 +865,7 @@ fn aggregation_over_persisted_data() {
         // Alice: 90+95=185, Bob: 85+80=165, Charlie: 100
         assert_eq!(
             rows[0].get(0).unwrap(),
-            &SqliteValue::Text("Alice".to_owned()),
+            &SqliteValue::Text("Alice".into()),
             "bead_id={BEAD_ID} case=agg_first_student"
         );
         assert_eq!(

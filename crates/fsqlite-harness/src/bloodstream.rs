@@ -1351,7 +1351,7 @@ mod tests {
         let automaton = DifferentialAutomaton::new(vec![
             DifferentialOperator::FilterEq {
                 column: 0,
-                value: SqliteValue::Text("users".to_owned()),
+                value: SqliteValue::Text("users".into()),
             },
             DifferentialOperator::Project { columns: vec![1] },
             DifferentialOperator::ConsolidateByKey {
@@ -1361,31 +1361,19 @@ mod tests {
 
         let rows = vec![
             WeightedRow::new(
-                vec![
-                    SqliteValue::Text("users".to_owned()),
-                    SqliteValue::Integer(10),
-                ],
+                vec![SqliteValue::Text("users".into()), SqliteValue::Integer(10)],
                 1,
             ),
             WeightedRow::new(
-                vec![
-                    SqliteValue::Text("users".to_owned()),
-                    SqliteValue::Integer(10),
-                ],
+                vec![SqliteValue::Text("users".into()), SqliteValue::Integer(10)],
                 1,
             ),
             WeightedRow::new(
-                vec![
-                    SqliteValue::Text("users".to_owned()),
-                    SqliteValue::Integer(11),
-                ],
+                vec![SqliteValue::Text("users".into()), SqliteValue::Integer(11)],
                 -1,
             ),
             WeightedRow::new(
-                vec![
-                    SqliteValue::Text("orders".to_owned()),
-                    SqliteValue::Integer(10),
-                ],
+                vec![SqliteValue::Text("orders".into()), SqliteValue::Integer(10)],
                 1,
             ),
         ];
@@ -1459,10 +1447,7 @@ mod tests {
         let automaton = DifferentialAutomaton::new(vec![
             DifferentialOperator::DeltaJoinLeft {
                 stable_right: vec![WeightedRow::new(
-                    vec![
-                        SqliteValue::Integer(1),
-                        SqliteValue::Text("admin".to_owned()),
-                    ],
+                    vec![SqliteValue::Integer(1), SqliteValue::Text("admin".into())],
                     3,
                 )],
                 key_spec: JoinKeySpec::new(vec![0], vec![0]),
@@ -1472,10 +1457,7 @@ mod tests {
             },
         ]);
         let rows = vec![WeightedRow::new(
-            vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Text("alice".to_owned()),
-            ],
+            vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into())],
             1,
         )];
 
@@ -1483,8 +1465,8 @@ mod tests {
             automaton.execute(&rows).unwrap(),
             vec![WeightedRow::new(
                 vec![
-                    SqliteValue::Text("alice".to_owned()),
-                    SqliteValue::Text("admin".to_owned()),
+                    SqliteValue::Text("alice".into()),
+                    SqliteValue::Text("admin".into()),
                 ],
                 3,
             )]
@@ -1496,10 +1478,7 @@ mod tests {
         let automaton = DifferentialAutomaton::new(vec![
             DifferentialOperator::DeltaJoinRight {
                 stable_left: vec![WeightedRow::new(
-                    vec![
-                        SqliteValue::Integer(1),
-                        SqliteValue::Text("alice".to_owned()),
-                    ],
+                    vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into())],
                     2,
                 )],
                 key_spec: JoinKeySpec::new(vec![0], vec![0]),
@@ -1509,10 +1488,7 @@ mod tests {
             },
         ]);
         let rows = vec![WeightedRow::new(
-            vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Text("guest".to_owned()),
-            ],
+            vec![SqliteValue::Integer(1), SqliteValue::Text("guest".into())],
             -1,
         )];
 
@@ -1520,8 +1496,8 @@ mod tests {
             automaton.execute(&rows).unwrap(),
             vec![WeightedRow::new(
                 vec![
-                    SqliteValue::Text("alice".to_owned()),
-                    SqliteValue::Text("guest".to_owned()),
+                    SqliteValue::Text("alice".into()),
+                    SqliteValue::Text("guest".into()),
                 ],
                 -2,
             )]
@@ -1553,14 +1529,11 @@ mod tests {
             DifferentialAutomaton::from_vdbe_ops(program.ops(), schema[0].columns.len()).unwrap();
         let rows = vec![
             WeightedRow::new(
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".to_owned()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into())],
                 1,
             ),
             WeightedRow::new(
-                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())],
                 -1,
             ),
         ];
@@ -1568,8 +1541,8 @@ mod tests {
         assert_eq!(
             automaton.execute(&rows).unwrap(),
             vec![
-                WeightedRow::new(vec![SqliteValue::Text("alice".to_owned())], 1),
-                WeightedRow::new(vec![SqliteValue::Text("bob".to_owned())], -1),
+                WeightedRow::new(vec![SqliteValue::Text("alice".into())], 1),
+                WeightedRow::new(vec![SqliteValue::Text("bob".into())], -1),
             ]
         );
     }
@@ -1582,24 +1555,18 @@ mod tests {
             DifferentialAutomaton::from_vdbe_ops(program.ops(), schema[0].columns.len()).unwrap();
         let rows = vec![
             WeightedRow::new(
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".to_owned()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into())],
                 1,
             ),
             WeightedRow::new(
-                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())],
                 1,
             ),
         ];
 
         assert_eq!(
             automaton.execute(&rows).unwrap(),
-            vec![WeightedRow::new(
-                vec![SqliteValue::Text("bob".to_owned())],
-                1,
-            )]
+            vec![WeightedRow::new(vec![SqliteValue::Text("bob".into())], 1,)]
         );
     }
 
@@ -1623,8 +1590,8 @@ mod tests {
         let rows = vec![WeightedRow::new(
             vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("alice".to_owned()),
-                SqliteValue::Text("unexpected".to_owned()),
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Text("unexpected".into()),
             ],
             1,
         )];
@@ -1653,30 +1620,21 @@ mod tests {
     fn delta_join_left_multiplies_weights_and_concatenates_rows() {
         let delta_left = vec![
             WeightedRow::new(
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".to_owned()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into())],
                 1,
             ),
             WeightedRow::new(
-                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())],
                 -1,
             ),
         ];
         let stable_right = vec![
             WeightedRow::new(
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("admin".to_owned()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("admin".into())],
                 3,
             ),
             WeightedRow::new(
-                vec![
-                    SqliteValue::Integer(2),
-                    SqliteValue::Text("user".to_owned()),
-                ],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("user".into())],
                 2,
             ),
         ];
@@ -1689,18 +1647,18 @@ mod tests {
                 WeightedRow::new(
                     vec![
                         SqliteValue::Integer(1),
-                        SqliteValue::Text("alice".to_owned()),
+                        SqliteValue::Text("alice".into()),
                         SqliteValue::Integer(1),
-                        SqliteValue::Text("admin".to_owned()),
+                        SqliteValue::Text("admin".into()),
                     ],
                     3,
                 ),
                 WeightedRow::new(
                     vec![
                         SqliteValue::Integer(2),
-                        SqliteValue::Text("bob".to_owned()),
+                        SqliteValue::Text("bob".into()),
                         SqliteValue::Integer(2),
-                        SqliteValue::Text("user".to_owned()),
+                        SqliteValue::Text("user".into()),
                     ],
                     -2,
                 ),
@@ -1736,27 +1694,21 @@ mod tests {
     fn delta_join_right_uses_delta_weight_from_right_relation() {
         let stable_left = vec![
             WeightedRow::new(
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("alice".to_owned()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("alice".into())],
                 2,
             ),
             WeightedRow::new(
-                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())],
                 3,
             ),
         ];
         let delta_right = vec![
             WeightedRow::new(
-                vec![SqliteValue::Integer(2), SqliteValue::Text("pro".to_owned())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("pro".into())],
                 1,
             ),
             WeightedRow::new(
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("guest".to_owned()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("guest".into())],
                 -1,
             ),
         ];
@@ -1769,18 +1721,18 @@ mod tests {
                 WeightedRow::new(
                     vec![
                         SqliteValue::Integer(2),
-                        SqliteValue::Text("bob".to_owned()),
+                        SqliteValue::Text("bob".into()),
                         SqliteValue::Integer(2),
-                        SqliteValue::Text("pro".to_owned()),
+                        SqliteValue::Text("pro".into()),
                     ],
                     3,
                 ),
                 WeightedRow::new(
                     vec![
                         SqliteValue::Integer(1),
-                        SqliteValue::Text("alice".to_owned()),
+                        SqliteValue::Text("alice".into()),
                         SqliteValue::Integer(1),
-                        SqliteValue::Text("guest".to_owned()),
+                        SqliteValue::Text("guest".into()),
                     ],
                     -2,
                 ),

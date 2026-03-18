@@ -60,10 +60,7 @@ fn test_persistence_multiple_tables() {
         let users = conn.query("SELECT id, name FROM users;").unwrap();
         assert_eq!(users.len(), 2);
         assert_eq!(users[0].get(0), Some(&SqliteValue::Integer(1)));
-        assert_eq!(
-            users[0].get(1),
-            Some(&SqliteValue::Text("alice".to_owned()))
-        );
+        assert_eq!(users[0].get(1), Some(&SqliteValue::Text("alice".into())));
 
         let scores = conn.query("SELECT user_id, score FROM scores;").unwrap();
         assert_eq!(scores.len(), 2);
@@ -95,13 +92,10 @@ fn test_persistence_all_value_types() {
         let row = &rows[0];
         assert_eq!(row.get(0), Some(&SqliteValue::Integer(42)));
         assert_eq!(row.get(1), Some(&SqliteValue::Float(3.14)));
-        assert_eq!(
-            row.get(2),
-            Some(&SqliteValue::Text("hello world".to_owned()))
-        );
+        assert_eq!(row.get(2), Some(&SqliteValue::Text("hello world".into())));
         assert_eq!(
             row.get(3),
-            Some(&SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]))
+            Some(&SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into()))
         );
         assert_eq!(row.get(4), Some(&SqliteValue::Null));
     }
@@ -126,7 +120,7 @@ fn test_persistence_text_with_single_quotes() {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].get(0),
-            Some(&SqliteValue::Text("it's a test".to_owned()))
+            Some(&SqliteValue::Text("it's a test".into()))
         );
     }
 }
@@ -227,7 +221,7 @@ fn test_persistence_update_survives_reopen() {
         let conn = Connection::open(&path_str).unwrap();
         let rows = conn.query("SELECT val FROM t WHERE id = 1;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0), Some(&SqliteValue::Text("after".to_owned())));
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Text("after".into())));
     }
 }
 
@@ -286,11 +280,8 @@ fn test_persistence_reserved_word_column_unquoted_key() {
         let conn = Connection::open(&path_str).unwrap();
         let rows = conn.query("SELECT key, val FROM meta;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0),
-            Some(&SqliteValue::Text("version".to_owned()))
-        );
-        assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("2.0".to_owned())));
+        assert_eq!(rows[0].get(0), Some(&SqliteValue::Text("version".into())));
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("2.0".into())));
     }
 }
 
@@ -330,14 +321,14 @@ fn test_e2e_bd_121m_persistence_roundtrip() {
         let meta = conn.query("SELECT \"key\", val FROM meta;").unwrap();
         assert_eq!(meta.len(), 2);
         // Find the version row.
-        let version_key = SqliteValue::Text("version".to_owned());
+        let version_key = SqliteValue::Text("version".into());
         let version_row = meta
             .iter()
             .find(|r: &&fsqlite::Row| r.get(0) == Some(&version_key))
             .expect("version row should exist");
         assert_eq!(
             version_row.get(1),
-            Some(&SqliteValue::Text("2.0".to_owned())),
+            Some(&SqliteValue::Text("2.0".into())),
             "updated value should persist"
         );
 

@@ -106,7 +106,7 @@ fn multiple_reopen_cycles_no_data_loss() {
             "INSERT INTO t1 VALUES (?, ?)",
             &[
                 SqliteValue::Integer(id),
-                SqliteValue::Text(format!("cycle_{cycle}")),
+                SqliteValue::Text(format!("cycle_{cycle}").into()),
             ],
         )
         .expect("insert");
@@ -390,7 +390,7 @@ fn wal_mode_multiple_checkpoints_no_data_loss() {
                 "INSERT INTO t1 VALUES (?, ?)",
                 &[
                     SqliteValue::Integer(i),
-                    SqliteValue::Text(format!("val_{i}")),
+                    SqliteValue::Text(format!("val_{i}").into()),
                 ],
             )
             .expect("insert");
@@ -435,7 +435,7 @@ fn create_table_then_drop_then_recreate_reopen() {
     );
     assert_eq!(
         rows[0].get(0).unwrap(),
-        &SqliteValue::Text("hello".to_owned()),
+        &SqliteValue::Text("hello".into()),
         "bead_id={BEAD_ID} case=recreated_table_data"
     );
 }
@@ -454,7 +454,7 @@ fn create_index_persists_through_reopen() {
                 "INSERT INTO t1 VALUES (?, ?)",
                 &[
                     SqliteValue::Integer(i),
-                    SqliteValue::Text(format!("row_{i}")),
+                    SqliteValue::Text(format!("row_{i}").into()),
                 ],
             )
             .expect("insert");
@@ -495,7 +495,7 @@ fn alternating_commit_rollback_cycles_with_reopen() {
             "INSERT INTO t1 VALUES (?, ?)",
             &[
                 SqliteValue::Integer(id),
-                SqliteValue::Text(format!("cycle_{cycle}")),
+                SqliteValue::Text(format!("cycle_{cycle}").into()),
             ],
         )
         .expect("insert");
@@ -601,7 +601,7 @@ fn concurrent_begin_commit_reopen_cycle() {
                 "INSERT INTO t1 VALUES (?, ?)",
                 &[
                     SqliteValue::Integer(i),
-                    SqliteValue::Text(format!("concurrent_{i}")),
+                    SqliteValue::Text(format!("concurrent_{i}").into()),
                 ],
             )
             .expect("insert");
@@ -828,7 +828,7 @@ fn rapid_begin_commit_cycles_same_connection() {
             "INSERT INTO t1 VALUES (?, ?)",
             &[
                 SqliteValue::Integer(i),
-                SqliteValue::Text(format!("rapid_{i}")),
+                SqliteValue::Text(format!("rapid_{i}").into()),
             ],
         )
         .expect("insert");

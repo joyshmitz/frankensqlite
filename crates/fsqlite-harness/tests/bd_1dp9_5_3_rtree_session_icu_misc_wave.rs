@@ -330,19 +330,19 @@ fn test_unit_session_changeset_apply_invariants() -> Result<(), String> {
 fn test_unit_icu_collation_and_case_invariants() -> Result<(), String> {
     let upper = IcuUpperFunc
         .invoke(&[
-            SqliteValue::Text("stra\u{00DF}e".to_owned()),
-            SqliteValue::Text("de_DE".to_owned()),
+            SqliteValue::Text("stra\u{00DF}e".into()),
+            SqliteValue::Text("de_DE".into()),
         ])
         .map_err(|error| format!("bead_id={BEAD_ID} case=icu_upper_failed error={error}"))?;
-    assert_eq!(upper, SqliteValue::Text("STRASSE".to_owned()));
+    assert_eq!(upper, SqliteValue::Text("STRASSE".into()));
 
     let lower = IcuLowerFunc
         .invoke(&[
-            SqliteValue::Text("I\u{0130}".to_owned()),
-            SqliteValue::Text("tr_TR".to_owned()),
+            SqliteValue::Text("I\u{0130}".into()),
+            SqliteValue::Text("tr_TR".into()),
         ])
         .map_err(|error| format!("bead_id={BEAD_ID} case=icu_lower_failed error={error}"))?;
-    assert_eq!(lower, SqliteValue::Text("\u{0131}i".to_owned()));
+    assert_eq!(lower, SqliteValue::Text("\u{0131}i".into()));
 
     let locale = IcuLocale::parse("de_DE")
         .map_err(|error| format!("bead_id={BEAD_ID} case=icu_locale_parse_failed error={error}"))?;
@@ -366,21 +366,21 @@ fn test_unit_icu_collation_and_case_invariants() -> Result<(), String> {
 fn test_unit_misc_decimal_and_uuid_conversion_invariants() -> Result<(), String> {
     let sum = DecimalAddFunc
         .invoke(&[
-            SqliteValue::Text("123.450".to_owned()),
-            SqliteValue::Text("0.55".to_owned()),
+            SqliteValue::Text("123.450".into()),
+            SqliteValue::Text("0.55".into()),
         ])
         .map_err(|error| format!("bead_id={BEAD_ID} case=decimal_add_failed error={error}"))?;
-    assert_eq!(sum, SqliteValue::Text("124".to_owned()));
+    assert_eq!(sum, SqliteValue::Text("124".into()));
 
     let cmp = DecimalCmpFunc
         .invoke(&[
-            SqliteValue::Text("10.00".to_owned()),
-            SqliteValue::Text("9.99".to_owned()),
+            SqliteValue::Text("10.00".into()),
+            SqliteValue::Text("9.99".into()),
         ])
         .map_err(|error| format!("bead_id={BEAD_ID} case=decimal_cmp_failed error={error}"))?;
     assert_eq!(cmp, SqliteValue::Integer(1));
 
-    let canonical_uuid = SqliteValue::Text("123e4567-e89b-12d3-a456-426614174000".to_owned());
+    let canonical_uuid = SqliteValue::Text("123e4567-e89b-12d3-a456-426614174000".into());
     let blob = UuidBlobFunc
         .invoke(std::slice::from_ref(&canonical_uuid))
         .map_err(|error| format!("bead_id={BEAD_ID} case=uuid_blob_failed error={error}"))?;

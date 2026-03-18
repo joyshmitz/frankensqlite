@@ -898,7 +898,7 @@ mod function_tests {
         let reg = full_registry();
         let func = reg.find_scalar("length", 1).expect("length registered");
         let result = func
-            .invoke(&[SqliteValue::Text("hello".to_string())])
+            .invoke(&[SqliteValue::Text("hello".to_string().into())])
             .unwrap();
         let ctx = DiagContext::new(BEAD_ID)
             .case("length_text")
@@ -921,7 +921,9 @@ mod function_tests {
     fn func_length_blob() {
         let reg = full_registry();
         let func = reg.find_scalar("length", 1).expect("length registered");
-        let result = func.invoke(&[SqliteValue::Blob(vec![1, 2, 3, 4])]).unwrap();
+        let result = func
+            .invoke(&[SqliteValue::Blob(vec![1, 2, 3, 4].into())])
+            .unwrap();
         let ctx = DiagContext::new(BEAD_ID)
             .case("length_blob")
             .invariant("length(X'01020304') = 4");
@@ -938,18 +940,22 @@ mod function_tests {
             .case("upper_lower")
             .invariant("upper/lower transform correctly");
         let up_result = upper
-            .invoke(&[SqliteValue::Text("hello".to_string())])
+            .invoke(&[SqliteValue::Text("hello".to_string().into())])
             .unwrap();
         diag_assert_eq!(
             ctx.clone(),
             up_result,
-            SqliteValue::Text("HELLO".to_string())
+            SqliteValue::Text("HELLO".to_string().into())
         );
 
         let lo_result = lower
-            .invoke(&[SqliteValue::Text("HELLO".to_string())])
+            .invoke(&[SqliteValue::Text("HELLO".to_string().into())])
             .unwrap();
-        diag_assert_eq!(ctx, lo_result, SqliteValue::Text("hello".to_string()));
+        diag_assert_eq!(
+            ctx,
+            lo_result,
+            SqliteValue::Text("hello".to_string().into())
+        );
     }
 
     #[test]
@@ -965,8 +971,8 @@ mod function_tests {
             (SqliteValue::Null, "null"),
             (SqliteValue::Integer(42), "integer"),
             (SqliteValue::Float(3.14), "real"),
-            (SqliteValue::Text("hi".to_string()), "text"),
-            (SqliteValue::Blob(vec![1]), "blob"),
+            (SqliteValue::Text("hi".to_string().into()), "text"),
+            (SqliteValue::Blob(vec![1].into()), "blob"),
         ];
         for (val, expected) in &cases {
             let result = typeof_fn.invoke(std::slice::from_ref(val)).unwrap();
@@ -1157,10 +1163,12 @@ mod function_tests {
     fn func_hex() {
         let reg = full_registry();
         let func = reg.find_scalar("hex", 1).expect("hex registered");
-        let result = func.invoke(&[SqliteValue::Blob(vec![0xDE, 0xAD])]).unwrap();
+        let result = func
+            .invoke(&[SqliteValue::Blob(vec![0xDE, 0xAD].into())])
+            .unwrap();
         let ctx = DiagContext::new(BEAD_ID)
             .case("hex_blob")
             .invariant("hex(X'DEAD') = 'DEAD'");
-        diag_assert_eq!(ctx, result, SqliteValue::Text("DEAD".to_string()));
+        diag_assert_eq!(ctx, result, SqliteValue::Text("DEAD".to_string().into()));
     }
 }

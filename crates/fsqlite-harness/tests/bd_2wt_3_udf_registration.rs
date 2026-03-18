@@ -121,9 +121,9 @@ struct GreetFunc;
 impl ScalarFunction for GreetFunc {
     fn invoke(&self, args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
         match &args[0] {
-            SqliteValue::Text(name) => Ok(SqliteValue::Text(format!("Hello, {name}!"))),
-            SqliteValue::Null => Ok(SqliteValue::Text("Hello, stranger!".to_string())),
-            other => Ok(SqliteValue::Text(format!("Hello, {other:?}!"))),
+            SqliteValue::Text(name) => Ok(SqliteValue::Text(format!("Hello, {name}!").into())),
+            SqliteValue::Null => Ok(SqliteValue::Text("Hello, stranger!".to_string().into())),
+            other => Ok(SqliteValue::Text(format!("Hello, {other:?}!").into())),
         }
     }
 

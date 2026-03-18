@@ -274,12 +274,12 @@ fn unique_constraint_violation_does_not_corrupt_state() {
         );
         assert_eq!(
             rows[0].get(1).unwrap(),
-            &SqliteValue::Text("first".to_owned()),
+            &SqliteValue::Text("first".into()),
             "bead_id={BEAD_ID} case=original_preserved"
         );
         assert_eq!(
             rows[1].get(1).unwrap(),
-            &SqliteValue::Text("second".to_owned()),
+            &SqliteValue::Text("second".into()),
             "bead_id={BEAD_ID} case=after_violation_val"
         );
     }
@@ -335,7 +335,7 @@ fn insert_or_replace_conflict_resolution() {
         assert_eq!(rows.len(), 1, "bead_id={BEAD_ID} case=replace_count");
         assert_eq!(
             rows[0].get(0).unwrap(),
-            &SqliteValue::Text("replaced".to_owned()),
+            &SqliteValue::Text("replaced".into()),
             "bead_id={BEAD_ID} case=replace_val"
         );
     }
@@ -365,12 +365,12 @@ fn insert_or_ignore_silently_skips_conflict() {
         assert_eq!(rows.len(), 2, "bead_id={BEAD_ID} case=ignore_count");
         assert_eq!(
             rows[0].get(1).unwrap(),
-            &SqliteValue::Text("kept".to_owned()),
+            &SqliteValue::Text("kept".into()),
             "bead_id={BEAD_ID} case=ignore_original"
         );
         assert_eq!(
             rows[1].get(1).unwrap(),
-            &SqliteValue::Text("new".to_owned()),
+            &SqliteValue::Text("new".into()),
             "bead_id={BEAD_ID} case=ignore_new"
         );
     }

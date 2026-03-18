@@ -73,7 +73,7 @@ fn json_text_storage_round_trip() {
         assert!(!minified.is_empty());
 
         let name = json_ext::json_extract(&stored, &["$.name"]).expect("extract name");
-        assert_eq!(name, SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(name, SqliteValue::Text("Alice".into()));
 
         let age = json_ext::json_extract(&stored, &["$.age"]).expect("extract age");
         assert_eq!(age, SqliteValue::Integer(30));
@@ -120,7 +120,7 @@ fn json_mutation_persistence() {
         assert_eq!(font_size, SqliteValue::Integer(16));
 
         let theme = json_ext::json_extract(&stored, &["$.theme"]).expect("extract theme");
-        assert_eq!(theme, SqliteValue::Text("dark".to_owned()));
+        assert_eq!(theme, SqliteValue::Text("dark".into()));
     }
 
     eprintln!("[{BEAD_ID}][test=json_mutation_persistence] PASS");
@@ -136,8 +136,8 @@ fn json_array_storage_and_inspection() {
             .expect("create");
 
         let arr = json_ext::json_array(&[
-            SqliteValue::Text("apple".to_owned()),
-            SqliteValue::Text("banana".to_owned()),
+            SqliteValue::Text("apple".into()),
+            SqliteValue::Text("banana".into()),
             SqliteValue::Integer(42),
         ])
         .expect("json_array");
@@ -176,9 +176,9 @@ fn json_object_construction_round_trip() {
             .expect("create");
 
         let obj = json_ext::json_object(&[
-            SqliteValue::Text("x".to_owned()),
+            SqliteValue::Text("x".into()),
             SqliteValue::Integer(10),
-            SqliteValue::Text("y".to_owned()),
+            SqliteValue::Text("y".into()),
             SqliteValue::Float(PI),
         ])
         .expect("json_object");
@@ -498,14 +498,14 @@ fn icu_case_mapping_round_trip() {
 
     let upper = IcuUpperFunc
         .invoke(&[
-            SqliteValue::Text("straße".to_owned()),
-            SqliteValue::Text("de_DE".to_owned()),
+            SqliteValue::Text("straße".into()),
+            SqliteValue::Text("de_DE".into()),
         ])
         .expect("icu_upper");
     let lower = IcuLowerFunc
         .invoke(&[
-            SqliteValue::Text("Iİ".to_owned()),
-            SqliteValue::Text("tr_TR".to_owned()),
+            SqliteValue::Text("Iİ".into()),
+            SqliteValue::Text("tr_TR".into()),
         ])
         .expect("icu_lower");
 
@@ -564,8 +564,8 @@ fn icu_case_mapping_round_trip() {
 fn misc_decimal_precision_round_trip() {
     let (_dir, path) = temp_db();
 
-    let a = SqliteValue::Text("123456789.987654321".to_owned());
-    let b = SqliteValue::Text("0.000000001".to_owned());
+    let a = SqliteValue::Text("123456789.987654321".into());
+    let b = SqliteValue::Text("0.000000001".into());
     let sum = fsqlite_ext_misc::DecimalAddFunc
         .invoke(&[a.clone(), b.clone()])
         .expect("decimal_add");
@@ -987,7 +987,7 @@ fn jsonb_blob_storage_round_trip() {
         assert_eq!(json_ext::json_valid(&decoded, None), 1);
 
         let key_val = json_ext::json_extract(&decoded, &["$.key"]).expect("extract key");
-        assert_eq!(key_val, SqliteValue::Text("value".to_owned()));
+        assert_eq!(key_val, SqliteValue::Text("value".into()));
     }
 
     eprintln!("[{BEAD_ID}][test=jsonb_blob_storage_round_trip] PASS");

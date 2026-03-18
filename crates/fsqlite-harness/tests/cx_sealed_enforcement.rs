@@ -968,7 +968,7 @@ fn test_mock_scalar_function_fixed_value() {
     };
     assert_eq!(
         scalar
-            .invoke(&[SqliteValue::Text("ignored".to_owned())])
+            .invoke(&[SqliteValue::Text("ignored".into())])
             .expect("invoke should succeed"),
         SqliteValue::Integer(42)
     );

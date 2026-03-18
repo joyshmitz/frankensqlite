@@ -116,7 +116,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT 'hello';",
             expected_opcodes: vec!["String"],
-            validate: |_, rows| rows[0] == [SqliteValue::Text("hello".to_owned())],
+            validate: |_, rows| rows[0] == [SqliteValue::Text("hello".into())],
         },
         OpcodeTest {
             name: "null_constant",
@@ -165,7 +165,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT 'foo' || 'bar';",
             expected_opcodes: vec!["Concat"],
-            validate: |_, rows| rows[0] == [SqliteValue::Text("foobar".to_owned())],
+            validate: |_, rows| rows[0] == [SqliteValue::Text("foobar".into())],
         },
         OpcodeTest {
             name: "unary_minus",
@@ -325,7 +325,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             expected_opcodes: vec!["AggStep"],
             validate: |_, rows| {
                 rows.len() == 1
-                    && rows[0][0] == SqliteValue::Text("B".to_owned())
+                    && rows[0][0] == SqliteValue::Text("B".into())
                     && rows[0][1] == SqliteValue::Integer(12)
             },
         },
@@ -484,7 +484,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT CASE WHEN 1 > 0 THEN 'yes' ELSE 'no' END;",
             expected_opcodes: vec![],
-            validate: |_, rows| rows[0] == [SqliteValue::Text("yes".to_owned())],
+            validate: |_, rows| rows[0] == [SqliteValue::Text("yes".into())],
         },
         OpcodeTest {
             name: "coalesce",
@@ -500,7 +500,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT CAST(123 AS TEXT);",
             expected_opcodes: vec!["Cast"],
-            validate: |_, rows| rows[0] == [SqliteValue::Text("123".to_owned())],
+            validate: |_, rows| rows[0] == [SqliteValue::Text("123".into())],
         },
         OpcodeTest {
             name: "cast_text_to_int",
@@ -693,8 +693,8 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             validate: |_, rows| {
                 rows[0]
                     == [
-                        SqliteValue::Text("HELLO".to_owned()),
-                        SqliteValue::Text("world".to_owned()),
+                        SqliteValue::Text("HELLO".into()),
+                        SqliteValue::Text("world".into()),
                     ]
             },
         },
@@ -706,7 +706,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             expected_opcodes: vec!["PureFunc"],
             validate: |_, rows| {
                 rows[0][0] == SqliteValue::Integer(42)
-                    && rows[0][1] == SqliteValue::Text("real".to_owned())
+                    && rows[0][1] == SqliteValue::Text("real".into())
             },
         },
         OpcodeTest {
@@ -715,7 +715,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT SUBSTR('abcdef', 2, 3);",
             expected_opcodes: vec!["PureFunc"],
-            validate: |_, rows| rows[0] == [SqliteValue::Text("bcd".to_owned())],
+            validate: |_, rows| rows[0] == [SqliteValue::Text("bcd".into())],
         },
         OpcodeTest {
             name: "builtin_replace",
@@ -723,7 +723,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT REPLACE('hello world', 'world', 'rust');",
             expected_opcodes: vec!["PureFunc"],
-            validate: |_, rows| rows[0] == [SqliteValue::Text("hello rust".to_owned())],
+            validate: |_, rows| rows[0] == [SqliteValue::Text("hello rust".into())],
         },
         OpcodeTest {
             name: "builtin_hex_zeroblob",
@@ -731,7 +731,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT HEX(ZEROBLOB(4));",
             expected_opcodes: vec!["PureFunc"],
-            validate: |_, rows| rows[0] == [SqliteValue::Text("00000000".to_owned())],
+            validate: |_, rows| rows[0] == [SqliteValue::Text("00000000".into())],
         },
         OpcodeTest {
             name: "builtin_ifnull_nullif",
@@ -1388,7 +1388,7 @@ fn test_parameterized_queries() {
     let rows2 = conn
         .query_with_params(
             "SELECT score FROM pq WHERE name = ?1;",
-            &[SqliteValue::Text("bob".to_owned())],
+            &[SqliteValue::Text("bob".into())],
         )
         .expect("text param");
     assert_eq!(rows2[0].values()[0], SqliteValue::Integer(80));

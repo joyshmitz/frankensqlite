@@ -528,11 +528,11 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
     assert_eq!(json_rows.len(), 2);
     assert_eq!(
         json_rows[0].values(),
-        &[SqliteValue::Text("a".to_owned()), SqliteValue::Integer(10),]
+        &[SqliteValue::Text("a".into()), SqliteValue::Integer(10),]
     );
     assert_eq!(
         json_rows[1].values(),
-        &[SqliteValue::Text("b".to_owned()), SqliteValue::Integer(20),]
+        &[SqliteValue::Text("b".into()), SqliteValue::Integer(20),]
     );
 
     let series_rows = conn
@@ -551,10 +551,7 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
         .query("SELECT title FROM docs WHERE docs MATCH 'world';")
         .expect("FTS5 MATCH should dispatch through the connection path");
     assert_eq!(fts_rows.len(), 1);
-    assert_eq!(
-        fts_rows[0].values(),
-        &[SqliteValue::Text("hello".to_owned())]
-    );
+    assert_eq!(fts_rows[0].values(), &[SqliteValue::Text("hello".into())]);
 
     conn.execute("CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x, min_y, max_y)")
         .expect("R-tree virtual table should be creatable via default registry wiring");
@@ -576,10 +573,7 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
         .query("SELECT icu_upper('straße', 'de_DE'), uuid();")
         .expect("ICU and misc scalar functions should be reachable");
     assert_eq!(icu_rows.len(), 1);
-    assert_eq!(
-        icu_rows[0].values()[0],
-        SqliteValue::Text("STRASSE".to_owned())
-    );
+    assert_eq!(icu_rows[0].values()[0], SqliteValue::Text("STRASSE".into()));
     match &icu_rows[0].values()[1] {
         SqliteValue::Text(uuid) => assert_eq!(uuid.len(), 36, "uuid() should return RFC4122 text"),
         other => panic!("uuid() should return text, got {other:?}"),
@@ -599,8 +593,8 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
     assert_eq!(
         geopoly_rows[0].values(),
         &[
-            SqliteValue::Text("[[0,0],[2,0],[2,2],[0,2],[0,0]]".to_owned()),
-            SqliteValue::Text("M 0 0 L 2 0 L 2 2 L 0 2 Z".to_owned()),
+            SqliteValue::Text("[[0,0],[2,0],[2,2],[0,2],[0,0]]".into()),
+            SqliteValue::Text("M 0 0 L 2 0 L 2 2 L 0 2 Z".into()),
             SqliteValue::Float(4.0),
             SqliteValue::Integer(1),
             SqliteValue::Integer(1),

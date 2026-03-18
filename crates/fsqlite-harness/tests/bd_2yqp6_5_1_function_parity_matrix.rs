@@ -1572,7 +1572,10 @@ fn test_sqlite_meta_functions() {
 
     // typeof() basic sanity
     let rows = conn.query("SELECT typeof(sqlite_version())").unwrap();
-    assert_eq!(rows[0].values()[0], SqliteValue::Text("text".to_string()));
+    assert_eq!(
+        rows[0].values()[0],
+        SqliteValue::Text("text".to_string().into())
+    );
 
     // sqlite_compileoption_used should return 0 or 1
     let rows = conn
