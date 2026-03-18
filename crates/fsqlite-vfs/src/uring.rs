@@ -9,6 +9,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -149,8 +150,19 @@ fn open_asupersync_backend(path: &Path, flags: VfsOpenFlags) -> io::Result<Asupe
 struct IoUringRuntime {
     #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
     ring: Option<Mutex<uring_fs::IoUring>>,
-    status: String,
+    initial_status: String,
     disabled: AtomicBool,
+    disable_reason: OnceLock<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IoUringRuntimeStatus {
+    pub backend: &'static str,
+    pub available: bool,
+    pub disabled: bool,
+    pub initial_status: String,
+    pub status: String,
+    pub disable_reason: Option<&'static str>,
 }
 
 impl fmt::Debug for IoUringRuntime {
@@ -164,7 +176,8 @@ impl fmt::Debug for IoUringRuntime {
             .field("backend", &Self::backend_name())
             .field("backend_available", &backend_available)
             .field("disabled", &self.disabled.load(Ordering::Relaxed))
-            .field("status", &self.status)
+            .field("status", &self.status())
+            .field("disable_reason", &self.disable_reason())
             .finish_non_exhaustive()
     }
 }
@@ -178,18 +191,21 @@ impl IoUringRuntime {
             match init_result {
                 Ok(Ok(ring)) => Self {
                     ring: Some(Mutex::new(ring)),
-                    status: "available:uring-fs".to_owned(),
+                    initial_status: "available:uring-fs".to_owned(),
                     disabled: AtomicBool::new(false),
+                    disable_reason: OnceLock::new(),
                 },
                 Ok(Err(error)) => Self {
                     ring: None,
-                    status: format!("unavailable:uring-fs:{error}"),
+                    initial_status: format!("unavailable:uring-fs:{error}"),
                     disabled: AtomicBool::new(false),
+                    disable_reason: OnceLock::new(),
                 },
                 Err(_) => Self {
                     ring: None,
-                    status: "unavailable:uring-fs:init-panicked".to_owned(),
+                    initial_status: "unavailable:uring-fs:init-panicked".to_owned(),
                     disabled: AtomicBool::new(false),
+                    disable_reason: OnceLock::new(),
                 },
             }
         }
@@ -197,8 +213,9 @@ impl IoUringRuntime {
         #[cfg(feature = "linux-asupersync-uring")]
         {
             Self {
-                status: "available:asupersync".to_owned(),
+                initial_status: "available:asupersync".to_owned(),
                 disabled: AtomicBool::new(false),
+                disable_reason: OnceLock::new(),
             }
         }
     }
@@ -216,6 +233,7 @@ impl IoUringRuntime {
 
     fn disable(&self, reason: &'static str) {
         if !self.disabled.swap(true, Ordering::AcqRel) {
+            let _ = self.disable_reason.set(reason);
             if matches!(
                 reason,
                 IO_URING_READ_CONFORMAL_BREACH_MSG | IO_URING_WRITE_CONFORMAL_BREACH_MSG
@@ -230,6 +248,28 @@ impl IoUringRuntime {
                     reason, "io_uring backend disabled; falling back to unix path"
                 );
             }
+        }
+    }
+
+    fn disable_reason(&self) -> Option<&'static str> {
+        self.disable_reason.get().copied()
+    }
+
+    fn status(&self) -> String {
+        match self.disable_reason() {
+            Some(reason) => format!("disabled:{}:{reason}", Self::backend_name()),
+            None => self.initial_status.clone(),
+        }
+    }
+
+    fn snapshot(&self) -> IoUringRuntimeStatus {
+        IoUringRuntimeStatus {
+            backend: Self::backend_name(),
+            available: self.is_available(),
+            disabled: self.disabled.load(Ordering::Acquire),
+            initial_status: self.initial_status.clone(),
+            status: self.status(),
+            disable_reason: self.disable_reason(),
         }
     }
 
@@ -275,8 +315,14 @@ impl IoUringVfs {
 
     /// Human-readable runtime status.
     #[must_use]
-    pub fn status(&self) -> &str {
-        &self.runtime.status
+    pub fn status(&self) -> String {
+        self.runtime.status()
+    }
+
+    /// Runtime status snapshot including disable reason.
+    #[must_use]
+    pub fn status_snapshot(&self) -> IoUringRuntimeStatus {
+        self.runtime.snapshot()
     }
 }
 
@@ -819,10 +865,14 @@ mod tests {
     fn test_runtime_disable_is_sticky() {
         let runtime = IoUringRuntime::new();
         assert!(!runtime.is_disabled());
+        assert_eq!(runtime.disable_reason(), None);
         runtime.disable("test disable");
         assert!(runtime.is_disabled());
+        assert_eq!(runtime.disable_reason(), Some("test disable"));
+        assert_eq!(runtime.status(), "disabled:asupersync:test disable");
         runtime.disable("test disable again");
         assert!(runtime.is_disabled());
+        assert_eq!(runtime.disable_reason(), Some("test disable"));
     }
 
     #[test]
@@ -839,6 +889,32 @@ mod tests {
         );
 
         assert!(runtime.is_disabled());
+        assert_eq!(
+            runtime.disable_reason(),
+            Some(IO_URING_READ_CONFORMAL_BREACH_MSG)
+        );
+        assert_eq!(
+            runtime.status(),
+            format!("disabled:asupersync:{IO_URING_READ_CONFORMAL_BREACH_MSG}")
+        );
+    }
+
+    #[test]
+    fn test_vfs_status_snapshot_reflects_disable_reason() {
+        let vfs = IoUringVfs::new();
+        let initial = vfs.status_snapshot();
+        assert_eq!(initial.backend, "asupersync");
+        assert_eq!(initial.initial_status, "available:asupersync");
+        assert_eq!(initial.status, "available:asupersync");
+        assert_eq!(initial.disable_reason, None);
+
+        vfs.runtime.disable("manual test disable");
+
+        let disabled = vfs.status_snapshot();
+        assert!(disabled.disabled);
+        assert!(!disabled.available);
+        assert_eq!(disabled.disable_reason, Some("manual test disable"));
+        assert_eq!(disabled.status, "disabled:asupersync:manual test disable");
     }
 
     #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
@@ -903,6 +979,15 @@ mod tests {
 
         assert!(vfs.runtime.is_disabled());
         assert!(!vfs.is_available());
+        let status = vfs.status_snapshot();
+        assert_eq!(
+            status.disable_reason,
+            Some(IO_URING_ASUPERSYNC_INIT_FAILED_MSG)
+        );
+        assert_eq!(
+            status.status,
+            format!("disabled:asupersync:{IO_URING_ASUPERSYNC_INIT_FAILED_MSG}")
+        );
 
         file.write(&cx, b"fallback", 0)
             .expect("write should succeed via unix fallback");

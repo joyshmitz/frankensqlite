@@ -58,6 +58,11 @@ use fsqlite_pager::{
 };
 use fsqlite_parser::Parser;
 use fsqlite_parser::lexer::Lexer;
+use fsqlite_planner::{
+    AccessPathKind as PlannerAccessPathKind, IndexInfo as PlannerIndexInfo,
+    StatsSource as PlannerStatsSource, TableStats as PlannerTableStats, WhereTermKind,
+    best_access_path, classify_where_term, decompose_where,
+};
 use fsqlite_types::DATABASE_HEADER_SIZE;
 use fsqlite_types::cx::{CancelReason, Cx};
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
@@ -73,8 +78,9 @@ use fsqlite_types::{
     StrictColumnType, TextEncoding,
 };
 use fsqlite_vdbe::codegen::{
-    CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema, TableSchema,
-    codegen_delete, codegen_insert, codegen_select, codegen_update, emit_scan_filter,
+    CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
+    PlannerSelectAccessKind, SelectPlannerDirective, TableSchema, codegen_delete, codegen_insert,
+    codegen_select, codegen_update, emit_scan_filter,
 };
 use fsqlite_vdbe::engine::{
     ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine, VdbeMetricsSnapshot,
@@ -89,6 +95,8 @@ use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::{Vfs, VfsFile};
+#[cfg(target_os = "linux")]
+use fsqlite_vfs::uring::IoUringRuntimeStatus;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_wal::{
     WalFecRepairEvidenceCard, WalFecRepairEvidenceQuery, WalFecRepairSeverityBucket,
@@ -664,6 +672,14 @@ impl PagerBackend {
             Self::Unix(_) => "unix",
             #[cfg(target_os = "windows")]
             Self::Windows(_) => "windows",
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn io_uring_status(&self) -> Option<IoUringRuntimeStatus> {
+        match self {
+            Self::IoUring(p) => Some(p.vfs_handle().status_snapshot()),
+            Self::Memory(_) | Self::Unix(_) => None,
         }
     }
 
@@ -1876,7 +1892,15 @@ impl TriggerFrame {
                     || prefix.eq_ignore_ascii_case("new")
                     || prefix.eq_ignore_ascii_case(&self.table_name)
             }
-            None => true,
+            // Bare column references (no table prefix) must NOT be replaced
+            // with trigger pseudo-column values.  In a trigger body's DML
+            // (UPDATE/DELETE/INSERT), bare names like `id` in `WHERE id = ...`
+            // refer to the DML's target table columns, not to OLD/NEW rows.
+            // Only explicitly prefixed references (NEW.id, OLD.id) should
+            // resolve to trigger values.  The previous `None => true` caused
+            // `WHERE id = NEW.id` to become `WHERE 1 = 1` (both sides
+            // replaced with the same literal), updating all rows.
+            None => false,
         }
     }
 
@@ -5951,6 +5975,25 @@ impl Connection {
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_group_by_join_select(cx, &bound, None)?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
+                    }
+                    Ok(rows)
+                } else if (has_group_by(select) || ordered_aggregate)
+                    && has_window_functions(select)
+                {
+                    // GROUP BY + window functions: two-phase execution.
+                    // Phase 1: GROUP BY with non-window columns to get grouped rows.
+                    // Phase 2: apply window functions to the grouped result.
+                    self.log_mem_execution_fallback("select", "group_by_window_fallback")?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+                    let limit_clause = bound.limit.take();
+                    let mut rows = self.execute_group_by_window_select(&bound, None)?;
                     if distinct {
                         dedup_rows(&mut rows);
                     }
@@ -13395,6 +13438,20 @@ impl Connection {
             ));
         }
 
+        // PRAGMA recursive_triggers (default OFF): when disabled, a trigger
+        // body that modifies the same table must NOT re-fire triggers on
+        // that table.  Check if we are already inside a trigger for this
+        // table; if so, and recursive_triggers is off, skip firing.
+        if !self.pragma_state.borrow().recursive_triggers
+            && self
+                .trigger_frame_stack
+                .borrow()
+                .iter()
+                .any(|f| f.table_name.eq_ignore_ascii_case(table_name))
+        {
+            return Ok(false);
+        }
+
         let triggers = self.triggers.borrow();
         let matching: Vec<_> = triggers
             .iter()
@@ -13446,6 +13503,18 @@ impl Connection {
             return Err(FrankenError::Internal(
                 "too many levels of trigger recursion".to_owned(),
             ));
+        }
+
+        // PRAGMA recursive_triggers (default OFF): skip when already inside
+        // a trigger for the same table and recursion is disabled.
+        if !self.pragma_state.borrow().recursive_triggers
+            && self
+                .trigger_frame_stack
+                .borrow()
+                .iter()
+                .any(|f| f.table_name.eq_ignore_ascii_case(table_name))
+        {
+            return Ok(());
         }
 
         let triggers = self.triggers.borrow();
@@ -13702,8 +13771,16 @@ impl Connection {
         referenced
     }
 
-    /// Materialize sqlite_master/sqlite_schema as temporary in-memory tables,
+    /// Materialize sqlite_master/sqlite_schema as temporary tables,
     /// execute the query, then clean up.
+    ///
+    /// IMPORTANT: The temp table's root page in MemDatabase must not collide
+    /// with any page the pager has data for, because the VDBE's
+    /// `StorageCursor` reads from the pager B-tree first.  If the root page
+    /// collides with a stale pager page (e.g. from a previously-dropped
+    /// table), the VDBE would read that stale data instead of our virtual
+    /// rows.  We avoid this by bumping the MemDatabase's `next_root_page`
+    /// past the pager's page count before allocating.
     fn execute_with_materialized_sqlite_schema(
         &self,
         select: &SelectStatement,
@@ -13720,6 +13797,37 @@ impl Connection {
             let virtual_rows = self.build_sqlite_master_rows();
             let virtual_columns = sqlite_master_column_infos();
             let mut materialized: Vec<(String, i32)> = Vec::new();
+
+            // Ensure the MemDatabase allocates root pages above any pager-
+            // allocated page, so the VDBE's pager read returns zeros (not
+            // stale data from a dropped table) and falls through to the
+            // MemDatabase path.
+            //
+            // Probe via get_page: advance MemDatabase's next_root_page
+            // until we find a page the pager returns all-zeros for (or
+            // fails to read), guaranteeing the VDBE won't find a stale
+            // B-tree at the temp table's root page.
+            if let Some(txn) = self.active_txn.borrow().as_ref() {
+                let cx = self.op_cx()?;
+                let mut db = self.db.borrow_mut();
+                let mut candidate = db.next_root_page();
+                #[allow(clippy::cast_sign_loss)]
+                while let Some(pgno) = PageNumber::new(candidate as u32) {
+                    match txn.get_page(&cx, pgno) {
+                        Ok(page_data) => {
+                            if page_data.as_ref().iter().all(|&b| b == 0) {
+                                break; // Zero page — safe to use
+                            }
+                            // Non-zero: pager has stale data here, skip it.
+                            candidate += 1;
+                        }
+                        Err(_) => break, // Read error — page doesn't exist, safe
+                    }
+                }
+                if candidate > db.next_root_page() {
+                    db.set_next_root_page(candidate);
+                }
+            }
 
             for table_name in referenced {
                 let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
@@ -13746,7 +13854,60 @@ impl Connection {
                 materialized.push((table_name, root_page));
             }
 
-            let result = self.execute_statement(&Statement::Select(select.clone()), params);
+            // The materialized sqlite_master table lives at a fresh
+            // root_page that differs between calls.  Any VDBE programs
+            // cached for queries against "sqlite_master" reference the
+            // stale root_page from a prior materialization.  Clear the
+            // compiled cache so the inner query recompiles with the
+            // current root_page.
+            self.compiled_cache.borrow_mut().clear();
+
+            // Force the inner query to read from MemDatabase instead of the
+            // pager B-tree.  The VDBE StorageCursor reads from the pager, but
+            // the pager page at the materialized root_page may still contain
+            // stale data from a previously-dropped table (page recycling).
+            // Setting time_travel_active forces execute_join_select to read
+            // from self.db (MemDatabase) where the virtual rows were freshly
+            // inserted.
+            // Route the inner query through the connection-level interpreted
+            // path that reads from MemDatabase rather than the full dispatch
+            // chain (which reaches VDBE StorageCursor → pager B-tree where
+            // a recycled page may still hold stale data from a dropped table).
+            // Setting time_travel_active forces execute_join_select to read
+            // from self.db where the virtual rows were freshly inserted.
+            let bound = bind_placeholders_in_select_for_fallback(select, params)?;
+            let prev_time_travel = self.time_travel_active.get();
+            self.time_travel_active.set(true);
+            let implicit_agg = has_implicit_aggregation(select) && !has_group_by(select);
+            // Use execute_group_by_join_select (which scans rows via
+            // execute_join_select, respecting time_travel_active →
+            // MemDatabase reads) instead of execute_group_by_select
+            // (which uses compile_table_select → VDBE → pager and
+            // would fail with ReadOnly on a SELECT autocommit txn).
+            let cx = self.op_cx()?;
+            let mut result = if has_group_by(select)
+                || has_implicit_aggregation(select)
+                || has_ordered_aggregate(select)
+            {
+                self.execute_group_by_join_select(&cx, &bound, None)
+            } else if has_window_functions(select) {
+                self.execute_window_select(&bound, None)
+            } else {
+                self.execute_join_select(&bound, None)
+            };
+            self.time_travel_active.set(prev_time_travel);
+
+            // Naked aggregates (COUNT/SUM/etc. without GROUP BY) must always
+            // produce exactly one row, even when the source table is empty.
+            // The connection-level execute_group_by_select may return an empty
+            // result set for zero input rows; fix that up here.
+            if implicit_agg {
+                if let Ok(ref rows) = result {
+                    if rows.is_empty() {
+                        result = self.execute_fromless_aggregate(select);
+                    }
+                }
+            }
 
             for (name, root_page) in &materialized {
                 let mut schema = self.schema.borrow_mut();
@@ -16741,6 +16902,153 @@ impl Connection {
                     },
                 ])
             }
+            "fsqlite.io_uring_status" | "io_uring_status" | "fsqlite_io_uring_status" => {
+                #[cfg(target_os = "linux")]
+                {
+                    let status_rows = if let Some(snapshot) = self.pager.io_uring_status() {
+                        vec![
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("pager_backend_kind".into()),
+                                    SqliteValue::Text(self.pager_backend_kind().to_owned().into()),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("io_uring_backend".into()),
+                                    SqliteValue::Text(snapshot.backend.into()),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("available".into()),
+                                    SqliteValue::Integer(i64::from(snapshot.available)),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("disabled".into()),
+                                    SqliteValue::Integer(i64::from(snapshot.disabled)),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("initial_status".into()),
+                                    SqliteValue::Text(snapshot.initial_status.into()),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("status".into()),
+                                    SqliteValue::Text(snapshot.status.into()),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("disable_reason".into()),
+                                    snapshot.disable_reason.map_or(SqliteValue::Null, |reason| {
+                                        SqliteValue::Text(reason.into())
+                                    }),
+                                ],
+                            },
+                        ]
+                    } else {
+                        vec![
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("pager_backend_kind".into()),
+                                    SqliteValue::Text(self.pager_backend_kind().to_owned().into()),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("io_uring_backend".into()),
+                                    SqliteValue::Null,
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("available".into()),
+                                    SqliteValue::Integer(0),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("disabled".into()),
+                                    SqliteValue::Integer(0),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("initial_status".into()),
+                                    SqliteValue::Text("not_io_uring_backend".into()),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("status".into()),
+                                    SqliteValue::Text("not_io_uring_backend".into()),
+                                ],
+                            },
+                            Row {
+                                values: vec![
+                                    SqliteValue::Text("disable_reason".into()),
+                                    SqliteValue::Null,
+                                ],
+                            },
+                        ]
+                    };
+
+                    Ok(status_rows)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Ok(vec![
+                        Row {
+                            values: vec![
+                                SqliteValue::Text("pager_backend_kind".into()),
+                                SqliteValue::Text(self.pager_backend_kind().to_owned().into()),
+                            ],
+                        },
+                        Row {
+                            values: vec![
+                                SqliteValue::Text("io_uring_backend".into()),
+                                SqliteValue::Null,
+                            ],
+                        },
+                        Row {
+                            values: vec![
+                                SqliteValue::Text("available".into()),
+                                SqliteValue::Integer(0),
+                            ],
+                        },
+                        Row {
+                            values: vec![
+                                SqliteValue::Text("disabled".into()),
+                                SqliteValue::Integer(0),
+                            ],
+                        },
+                        Row {
+                            values: vec![
+                                SqliteValue::Text("initial_status".into()),
+                                SqliteValue::Text("not_io_uring_backend".into()),
+                            ],
+                        },
+                        Row {
+                            values: vec![
+                                SqliteValue::Text("status".into()),
+                                SqliteValue::Text("not_io_uring_backend".into()),
+                            ],
+                        },
+                        Row {
+                            values: vec![
+                                SqliteValue::Text("disable_reason".into()),
+                                SqliteValue::Null,
+                            ],
+                        },
+                    ])
+                }
+            }
             "fsqlite.io_uring_reset" | "io_uring_reset" | "fsqlite_io_uring_reset" => {
                 reset_io_uring_latency_metrics();
                 Ok(vec![Row {
@@ -17838,16 +18146,176 @@ impl Connection {
 
     // ── Compilation helpers ─────────────────────────────────────────────
 
+    fn planner_select_directive(
+        select: &SelectStatement,
+        schema: &[TableSchema],
+    ) -> Option<SelectPlannerDirective> {
+        const PLANNER_SURFACE: &str = "single_table_access_path_v1";
+        const PLAN_GENERATION: u64 = 1;
+        const HEURISTIC_TABLE_PAGES: u64 = 1024;
+        const HEURISTIC_TABLE_ROWS: u64 = 8192;
+        const HEURISTIC_INDEX_PAGES: u64 = 256;
+
+        let SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            distinct,
+            ..
+        } = &select.body.select
+        else {
+            return None;
+        };
+
+        if !select.order_by.is_empty()
+            || !group_by.is_empty()
+            || having.is_some()
+            || *distinct != Distinctness::All
+            || has_window_functions(select)
+            || columns.iter().any(|column| {
+                matches!(column, ResultColumn::Expr { expr, .. } if expr_has_aggregate(expr))
+            })
+        {
+            return None;
+        }
+
+        let from_clause = from.as_ref()?;
+        if !from_clause.joins.is_empty() {
+            return None;
+        }
+
+        let TableOrSubquery::Table {
+            name,
+            alias,
+            time_travel,
+            ..
+        } = &from_clause.source
+        else {
+            return None;
+        };
+        if time_travel.is_some() {
+            return None;
+        }
+
+        let table = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&name.name))?;
+        let table_alias = alias.as_deref();
+        let needed_columns = planner_needed_columns(columns, &table.name, table_alias);
+        let planner_table = PlannerTableStats {
+            name: table.name.clone(),
+            n_pages: HEURISTIC_TABLE_PAGES,
+            n_rows: HEURISTIC_TABLE_ROWS,
+            source: PlannerStatsSource::Heuristic,
+        };
+        let planner_indexes = table
+            .indexes
+            .iter()
+            .filter(|index| index.supports_direct_column_lookup())
+            .map(|index| PlannerIndexInfo {
+                name: index.name.clone(),
+                table: table.name.clone(),
+                columns: index.columns.clone(),
+                unique: index.is_unique,
+                n_pages: HEURISTIC_INDEX_PAGES,
+                source: PlannerStatsSource::Heuristic,
+                partial_where: None,
+                expression_columns: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let where_terms = where_clause
+            .as_ref()
+            .map(|expr| {
+                decompose_where(expr)
+                    .into_iter()
+                    .map(classify_where_term)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let access_path = best_access_path(
+            &planner_table,
+            &planner_indexes,
+            &where_terms,
+            needed_columns.as_deref(),
+        );
+
+        let (access_kind, index_name, index_column, covering) = match access_path.kind {
+            PlannerAccessPathKind::FullTableScan => {
+                (PlannerSelectAccessKind::FullTableScan, None, None, false)
+            }
+            PlannerAccessPathKind::RowidLookup => {
+                (PlannerSelectAccessKind::RowidLookup, None, None, false)
+            }
+            PlannerAccessPathKind::IndexScanEquality => {
+                let index_name = access_path.index.clone()?;
+                let index_column =
+                    planner_directive_index_column(table, table_alias, &where_terms, &index_name)?;
+                (
+                    PlannerSelectAccessKind::IndexEquality,
+                    Some(index_name),
+                    Some(index_column),
+                    false,
+                )
+            }
+            PlannerAccessPathKind::IndexScanRange { .. } => {
+                let index_name = access_path.index.clone()?;
+                let index_column =
+                    planner_directive_index_column(table, table_alias, &where_terms, &index_name)?;
+                (
+                    PlannerSelectAccessKind::IndexRange,
+                    Some(index_name),
+                    Some(index_column),
+                    false,
+                )
+            }
+            PlannerAccessPathKind::CoveringIndexScan { .. } => {
+                let index_name = access_path.index.clone()?;
+                let (access_kind, index_column) = planner_directive_covering_access_kind(
+                    table,
+                    table_alias,
+                    &where_terms,
+                    &index_name,
+                )?;
+                (access_kind, Some(index_name), Some(index_column), true)
+            }
+        };
+
+        let plan_fingerprint = format!(
+            "{PLANNER_SURFACE}|{}|{}|{}|{}|{}",
+            select,
+            table.name,
+            access_kind.label(),
+            index_name.as_deref().unwrap_or("(none)"),
+            covering,
+        );
+
+        Some(SelectPlannerDirective {
+            plan_id: format!("{:016x}", Self::sql_hash(&plan_fingerprint)),
+            plan_generation: PLAN_GENERATION,
+            planner_surface: PLANNER_SURFACE.to_owned(),
+            table_name: table.name.clone(),
+            index_name,
+            index_column,
+            covering,
+            access_kind,
+        })
+    }
+
     /// Compile a table-backed SELECT through the VDBE codegen.
     fn compile_table_select(&self, select: &SelectStatement) -> Result<VdbeProgram> {
         let schema = self.schema.borrow();
+        let canonical_select = canonicalize_select_placeholders(select)?;
+        let planner_select_directive = Self::planner_select_directive(&canonical_select, &schema);
         let mut builder = ProgramBuilder::new();
         let ctx = CodegenContext {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx: None,
+            planner_select_directive,
             ..CodegenContext::default()
         };
-        let canonical_select = canonicalize_select_placeholders(select)?;
         // Expose custom aggregate UDF names to the codegen so it emits
         // AggStep/AggFinal instead of PureFunc for registered aggregates.
         let extra_agg = self.extra_aggregate_names();
@@ -19537,6 +20005,13 @@ impl Connection {
         let program = self.compile_table_select(&raw_select)?;
         let (raw_rows, _, _) = self.execute_table_program(&program, params, false)?;
 
+        // SQL semantics: implicit aggregation (no GROUP BY) on an empty table
+        // must produce exactly one row with default aggregate values (COUNT→0,
+        // SUM/AVG/MIN/MAX→NULL, etc.).  If GROUP BY is absent and raw_rows is
+        // empty, synthesize a single empty group so the aggregation loop runs
+        // once and produces the correct defaults.
+        let is_implicit_aggregation = group_by_exprs.is_empty();
+
         // Build per-GROUP-BY-key collation info for collation-aware grouping.
         let group_collations: Vec<Option<String>> = group_by_exprs
             .iter()
@@ -19584,6 +20059,11 @@ impl Connection {
                 }
             }
             groups.push((key, vec![row_values]));
+        }
+
+        // Implicit aggregation on an empty table: synthesize one empty group.
+        if is_implicit_aggregation && groups.is_empty() {
+            groups.push((Vec::new(), Vec::new()));
         }
 
         // Build result rows from groups.
@@ -19949,6 +20429,575 @@ impl Connection {
 
     /// Execute a SELECT containing window functions at the connection level.
     ///
+    /// Execute a SELECT with both GROUP BY and window functions.
+    ///
+    /// Two-phase approach:
+    /// 1. Strip window function columns, add synthetic columns for aggregate
+    ///    expressions used in window ORDER BY / PARTITION BY, run GROUP BY.
+    /// 2. Apply window functions over the grouped result set.
+    #[allow(clippy::too_many_lines)]
+    fn execute_group_by_window_select(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let SelectCore::Select {
+            columns,
+            from,
+            group_by: group_by_exprs,
+            having,
+            windows,
+            where_clause,
+            distinct,
+        } = &select.body.select
+        else {
+            return Err(FrankenError::NotImplemented(
+                "GROUP BY + window on non-SELECT core".to_owned(),
+            ));
+        };
+
+        let registry = self.func_registry.borrow().clone();
+        // Build map of named windows for OVER w references.
+        let named_windows: std::collections::HashMap<String, &WindowSpec> = windows
+            .iter()
+            .map(|wd| (wd.name.to_ascii_uppercase(), &wd.spec))
+            .collect();
+        let resolve_window_spec = |spec: &WindowSpec| -> WindowSpec {
+            if let Some(ref base_name) = spec.base_window {
+                if let Some(base_spec) = named_windows.get(&base_name.to_ascii_uppercase()) {
+                    let partition_by = if spec.partition_by.is_empty() {
+                        base_spec.partition_by.clone()
+                    } else {
+                        spec.partition_by.clone()
+                    };
+                    let order_by = if spec.order_by.is_empty() {
+                        base_spec.order_by.clone()
+                    } else {
+                        spec.order_by.clone()
+                    };
+                    let frame = spec.frame.clone().or_else(|| base_spec.frame.clone());
+                    return WindowSpec {
+                        base_window: None,
+                        partition_by,
+                        order_by,
+                        frame,
+                    };
+                }
+            }
+            spec.clone()
+        };
+
+        // ── Phase 1: Classify columns and collect aggregate expressions ────
+
+        // Separate non-window columns from window function columns.
+        // For each window function, collect its ORDER BY / PARTITION BY
+        // expressions (which may reference aggregates like SUM(amount)).
+        struct WinInfo {
+            func: Arc<ErasedWindowFunction>,
+            args: Vec<Expr>,
+            order_by: Vec<(Expr, bool)>,
+            partition_by: Vec<Expr>,
+            two_pass: bool,
+            name: String,
+            frame: Option<FrameSpec>,
+            _filter: Option<Expr>,
+        }
+        // Track which output column indices are plain vs window.
+        #[allow(clippy::large_enum_variant)]
+        enum GbwColKind {
+            Plain(usize),  // index into grouped_columns
+            Window(usize), // index into win_infos
+            WrappedWindow(usize, Expr),
+        }
+
+        let mut grouped_columns: Vec<ResultColumn> = Vec::new();
+        let mut win_infos: Vec<WinInfo> = Vec::new();
+        let mut col_kinds: Vec<GbwColKind> = Vec::new();
+
+        // Collect aggregate expressions from window ORDER BY/PARTITION BY
+        // that need to be added as extra columns to the GROUP BY query.
+        let mut extra_agg_exprs: Vec<(String, Expr)> = Vec::new(); // (alias, expr)
+
+        for col in columns {
+            match col {
+                ResultColumn::Expr {
+                    expr:
+                        Expr::FunctionCall {
+                            name,
+                            args,
+                            filter,
+                            over: Some(raw_spec),
+                            ..
+                        },
+                    ..
+                } => {
+                    let spec = resolve_window_spec(raw_spec);
+                    let arg_exprs = match args {
+                        FunctionArgs::List(exprs) => exprs.clone(),
+                        FunctionArgs::Star => vec![],
+                    };
+                    #[allow(clippy::cast_possible_wrap)]
+                    let num_args = arg_exprs.len() as i32;
+                    let func = registry.find_window(name, num_args).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "no such window function: {name}/{num_args}"
+                        ))
+                    })?;
+                    let ob: Vec<(Expr, bool)> = spec
+                        .order_by
+                        .iter()
+                        .map(|t| {
+                            (
+                                t.expr.clone(),
+                                matches!(t.direction, Some(SortDirection::Desc)),
+                            )
+                        })
+                        .collect();
+                    let pb = spec.partition_by.clone();
+                    let upper = name.to_ascii_uppercase();
+                    let needs_full_partition = matches!(
+                        upper.as_str(),
+                        "LEAD"
+                            | "NTILE"
+                            | "PERCENT_RANK"
+                            | "CUME_DIST"
+                            | "FIRST_VALUE"
+                            | "LAST_VALUE"
+                            | "NTH_VALUE"
+                    );
+                    let aggregate_no_order = !needs_full_partition && spec.order_by.is_empty();
+                    let two_pass = needs_full_partition || aggregate_no_order;
+
+                    // Collect aggregate exprs from ORDER BY/PARTITION BY
+                    for (oexpr, _) in &ob {
+                        if expr_has_aggregate(oexpr) {
+                            let alias = format!("__win_ob_{}", extra_agg_exprs.len());
+                            extra_agg_exprs.push((alias, oexpr.clone()));
+                        }
+                    }
+                    for pexpr in &pb {
+                        if expr_has_aggregate(pexpr) {
+                            let alias = format!("__win_pb_{}", extra_agg_exprs.len());
+                            extra_agg_exprs.push((alias, pexpr.clone()));
+                        }
+                    }
+
+                    let idx = win_infos.len();
+                    win_infos.push(WinInfo {
+                        func,
+                        args: arg_exprs,
+                        order_by: ob,
+                        partition_by: pb,
+                        two_pass,
+                        name: upper,
+                        frame: spec.frame.clone(),
+                        _filter: filter.as_deref().cloned(),
+                    });
+                    col_kinds.push(GbwColKind::Window(idx));
+                }
+                ResultColumn::Expr { expr, .. } if expr_has_window_function(expr) => {
+                    let (inner_name, inner_args, raw_inner_spec, inner_filter) =
+                        extract_inner_window_function(expr).ok_or_else(|| {
+                            FrankenError::Internal(
+                                "expr_has_window_function=true but cannot extract".to_owned(),
+                            )
+                        })?;
+                    let inner_spec = resolve_window_spec(&raw_inner_spec);
+                    let arg_exprs = match &inner_args {
+                        FunctionArgs::List(exprs) => exprs.clone(),
+                        FunctionArgs::Star => vec![],
+                    };
+                    #[allow(clippy::cast_possible_wrap)]
+                    let num_args = arg_exprs.len() as i32;
+                    let func = registry.find_window(&inner_name, num_args).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "no such window function: {inner_name}/{num_args}"
+                        ))
+                    })?;
+                    let ob: Vec<(Expr, bool)> = inner_spec
+                        .order_by
+                        .iter()
+                        .map(|t| {
+                            (
+                                t.expr.clone(),
+                                matches!(t.direction, Some(SortDirection::Desc)),
+                            )
+                        })
+                        .collect();
+                    let pb = inner_spec.partition_by.clone();
+                    let upper = inner_name.to_ascii_uppercase();
+                    let needs_full_partition = matches!(
+                        upper.as_str(),
+                        "LEAD"
+                            | "NTILE"
+                            | "PERCENT_RANK"
+                            | "CUME_DIST"
+                            | "FIRST_VALUE"
+                            | "LAST_VALUE"
+                            | "NTH_VALUE"
+                    );
+                    let aggregate_no_order =
+                        !needs_full_partition && inner_spec.order_by.is_empty();
+                    let two_pass = needs_full_partition || aggregate_no_order;
+                    for (oexpr, _) in &ob {
+                        if expr_has_aggregate(oexpr) {
+                            let alias = format!("__win_ob_{}", extra_agg_exprs.len());
+                            extra_agg_exprs.push((alias, oexpr.clone()));
+                        }
+                    }
+                    for pexpr in &pb {
+                        if expr_has_aggregate(pexpr) {
+                            let alias = format!("__win_pb_{}", extra_agg_exprs.len());
+                            extra_agg_exprs.push((alias, pexpr.clone()));
+                        }
+                    }
+                    let idx = win_infos.len();
+                    win_infos.push(WinInfo {
+                        func,
+                        args: arg_exprs,
+                        order_by: ob,
+                        partition_by: pb,
+                        two_pass,
+                        name: upper,
+                        frame: inner_spec.frame.clone(),
+                        _filter: inner_filter,
+                    });
+                    let outer_with_placeholder = replace_window_with_placeholder(expr);
+                    col_kinds.push(GbwColKind::WrappedWindow(idx, outer_with_placeholder));
+                }
+                other => {
+                    let idx = grouped_columns.len();
+                    grouped_columns.push(other.clone());
+                    col_kinds.push(GbwColKind::Plain(idx));
+                }
+            }
+        }
+
+        // ── Phase 1b: Build and execute GROUP BY query ─────────────────────
+
+        // Build GROUP BY columns: non-window columns + extra aggregate columns.
+        let mut gb_columns = grouped_columns.clone();
+        for (alias, expr) in &extra_agg_exprs {
+            gb_columns.push(ResultColumn::Expr {
+                expr: expr.clone(),
+                alias: Some(alias.clone()),
+            });
+        }
+
+        let gb_select = SelectStatement {
+            with: select.with.clone(),
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: *distinct,
+                    columns: gb_columns,
+                    from: from.clone(),
+                    where_clause: where_clause.clone(),
+                    group_by: group_by_exprs.clone(),
+                    having: having.clone(),
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let grouped_rows = self.execute_group_by_select(&gb_select, params)?;
+
+        // ── Phase 2: Apply window functions to grouped rows ────────────────
+
+        // Build col_map from the grouped result. We assign synthetic column
+        // names: original column aliases/expressions for plain columns, and
+        // __win_ob_N / __win_pb_N for extra aggregate columns.
+        let total_gb_cols = grouped_columns.len() + extra_agg_exprs.len();
+        let mut col_map: Vec<(String, String, bool)> = Vec::with_capacity(total_gb_cols);
+
+        // For plain grouped columns, derive names from their alias or expr.
+        for col in &grouped_columns {
+            let name = match col {
+                ResultColumn::Expr { alias: Some(a), .. } => a.clone(),
+                ResultColumn::Expr { expr, .. } => expr_col_name(expr)
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("{expr:?}")),
+                ResultColumn::Star => "*".to_owned(),
+                ResultColumn::TableStar(t) => format!("{t}.*"),
+            };
+            col_map.push((String::new(), name, false));
+        }
+        // For extra aggregate columns.
+        for (alias, _) in &extra_agg_exprs {
+            col_map.push((String::new(), alias.clone(), false));
+        }
+
+        let row_values: Vec<Vec<SqliteValue>> =
+            grouped_rows.iter().map(|r| r.values().to_vec()).collect();
+        let total_rows = row_values.len();
+
+        // Compute window function values over grouped rows.
+        let mut window_results: Vec<Vec<SqliteValue>> =
+            vec![vec![SqliteValue::Null; total_rows]; win_infos.len()];
+
+        for (wi, info) in win_infos.iter().enumerate() {
+            // Rewrite aggregate ORDER BY/PARTITION BY expressions as column
+            // references into the extra aggregate columns.
+            let mut agg_idx = 0;
+            let rewritten_ob: Vec<(Expr, bool)> = info
+                .order_by
+                .iter()
+                .map(|(oexpr, desc)| {
+                    if expr_has_aggregate(oexpr) {
+                        // Find the matching extra_agg_expr
+                        let col_name = format!("__win_ob_{agg_idx}");
+                        // Find the actual alias - scan extra_agg_exprs for matching expr
+                        let alias = extra_agg_exprs
+                            .iter()
+                            .find(|(_, e)| format!("{e:?}") == format!("{oexpr:?}"))
+                            .map_or(col_name, |(a, _)| a.clone());
+                        agg_idx += 1;
+                        (Expr::Column(ColumnRef::bare(alias), Span::new(0, 0)), *desc)
+                    } else {
+                        (oexpr.clone(), *desc)
+                    }
+                })
+                .collect();
+            let rewritten_pb: Vec<Expr> = info
+                .partition_by
+                .iter()
+                .map(|pexpr| {
+                    if expr_has_aggregate(pexpr) {
+                        let alias = extra_agg_exprs
+                            .iter()
+                            .find(|(_, e)| format!("{e:?}") == format!("{pexpr:?}"))
+                            .map_or_else(|| format!("__win_pb_{agg_idx}"), |(a, _)| a.clone());
+                        Expr::Column(ColumnRef::bare(alias), Span::new(0, 0))
+                    } else {
+                        pexpr.clone()
+                    }
+                })
+                .collect();
+
+            // Sort grouped rows by partition + order.
+            let mut sorted_indices: Vec<usize> = (0..total_rows).collect();
+            sorted_indices.sort_by(|&a, &b| {
+                for pexpr in &rewritten_pb {
+                    let va = eval_join_expr(pexpr, &row_values[a], &col_map)
+                        .unwrap_or(SqliteValue::Null);
+                    let vb = eval_join_expr(pexpr, &row_values[b], &col_map)
+                        .unwrap_or(SqliteValue::Null);
+                    let ord = cmp_sqlite_values(&va, &vb);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                for (oexpr, desc) in &rewritten_ob {
+                    let va = eval_join_expr(oexpr, &row_values[a], &col_map)
+                        .unwrap_or(SqliteValue::Null);
+                    let vb = eval_join_expr(oexpr, &row_values[b], &col_map)
+                        .unwrap_or(SqliteValue::Null);
+                    let ord = cmp_sqlite_values(&va, &vb);
+                    let ord = if *desc { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+
+            // Build partitions.
+            let partitions: Vec<Vec<usize>> = if rewritten_pb.is_empty() {
+                vec![sorted_indices.clone()]
+            } else {
+                let mut parts: Vec<(Vec<SqliteValue>, Vec<usize>)> = Vec::new();
+                for &ri in &sorted_indices {
+                    let key: Vec<SqliteValue> = rewritten_pb
+                        .iter()
+                        .map(|e| {
+                            eval_join_expr(e, &row_values[ri], &col_map)
+                                .unwrap_or(SqliteValue::Null)
+                        })
+                        .collect();
+                    if let Some(part) = parts.iter_mut().find(|(k, _)| k == &key) {
+                        part.1.push(ri);
+                    } else {
+                        parts.push((key, vec![ri]));
+                    }
+                }
+                parts.into_iter().map(|(_, indices)| indices).collect()
+            };
+
+            // Evaluate window function across partitions.
+            let mut func_vals: Vec<SqliteValue> = Vec::with_capacity(total_rows);
+            let mut func_row_order: Vec<usize> = Vec::with_capacity(total_rows);
+            for partition_indices in &partitions {
+                func_row_order.extend_from_slice(partition_indices);
+                let mut state = info.func.initial_state();
+                let fname = &info.name;
+                let frame = &info.frame;
+                let has_order = !rewritten_ob.is_empty();
+                let frame_start_unbounded = frame
+                    .as_ref()
+                    .is_none_or(|f| matches!(f.start, FrameBound::UnboundedPreceding));
+                let frame_end_unbounded = frame.as_ref().map_or(!has_order, |f| {
+                    f.end
+                        .as_ref()
+                        .is_some_and(|e| matches!(e, FrameBound::UnboundedFollowing))
+                });
+                let is_peer_aware = matches!(fname.as_str(), "CUME_DIST" | "PERCENT_RANK");
+                let is_positional = matches!(
+                    fname.as_str(),
+                    "NTILE" | "LEAD" | "LAG" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
+                );
+
+                if info.two_pass && !is_positional {
+                    // Two-pass: step all rows, then value.
+                    for &ri in partition_indices {
+                        let args = build_window_args(
+                            &info.args,
+                            &rewritten_ob,
+                            &row_values[ri],
+                            &col_map,
+                        )?;
+                        info.func.step(&mut state, &args)?;
+                    }
+                    // Two-pass: value is the same for all rows in partition.
+                    let val = info.func.value(&state)?;
+                    for _ in partition_indices {
+                        func_vals.push(val.clone());
+                    }
+                } else if is_positional {
+                    // Positional functions need all row args.
+                    let all_args: Vec<Vec<SqliteValue>> = partition_indices
+                        .iter()
+                        .map(|&ri| {
+                            build_window_args(&info.args, &rewritten_ob, &row_values[ri], &col_map)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    for (pos, _) in partition_indices.iter().enumerate() {
+                        let mut st2 = info.func.initial_state();
+                        for (j, row_args) in all_args.iter().enumerate() {
+                            info.func.step(&mut st2, row_args)?;
+                            if j == pos && !info.two_pass {
+                                break;
+                            }
+                        }
+                        let val = info.func.value(&st2)?;
+                        func_vals.push(val);
+                    }
+                } else if is_peer_aware {
+                    // Peer-aware: compute over entire partition.
+                    for &ri in partition_indices {
+                        let args = build_window_args(
+                            &info.args,
+                            &rewritten_ob,
+                            &row_values[ri],
+                            &col_map,
+                        )?;
+                        info.func.step(&mut state, &args)?;
+                    }
+                    // Peer-aware: same value for all rows in partition.
+                    let val = info.func.value(&state)?;
+                    for _ in partition_indices {
+                        func_vals.push(val.clone());
+                    }
+                } else if frame_start_unbounded && !frame_end_unbounded {
+                    // Running aggregate (UNBOUNDED PRECEDING TO CURRENT ROW).
+                    for &ri in partition_indices {
+                        let args = build_window_args(
+                            &info.args,
+                            &rewritten_ob,
+                            &row_values[ri],
+                            &col_map,
+                        )?;
+                        info.func.step(&mut state, &args)?;
+                        func_vals.push(info.func.value(&state)?);
+                    }
+                } else {
+                    // Full-frame aggregate.
+                    for &ri in partition_indices {
+                        let args = build_window_args(
+                            &info.args,
+                            &rewritten_ob,
+                            &row_values[ri],
+                            &col_map,
+                        )?;
+                        info.func.step(&mut state, &args)?;
+                    }
+                    let val = info.func.value(&state)?;
+                    for _ in partition_indices {
+                        func_vals.push(val.clone());
+                    }
+                }
+            }
+
+            // Scatter results to raw row indices.
+            for (i, &ri) in func_row_order.iter().enumerate() {
+                if let Some(v) = func_vals.get(i) {
+                    window_results[wi][ri] = v.clone();
+                }
+            }
+        }
+
+        // ── Phase 3: Assemble final result rows ────────────────────────────
+
+        let mut result_rows: Vec<Row> = Vec::with_capacity(total_rows);
+        for ri in 0..total_rows {
+            let mut vals: Vec<SqliteValue> = Vec::with_capacity(col_kinds.len());
+            for ck in &col_kinds {
+                match ck {
+                    GbwColKind::Plain(idx) => {
+                        vals.push(
+                            row_values[ri]
+                                .get(*idx)
+                                .cloned()
+                                .unwrap_or(SqliteValue::Null),
+                        );
+                    }
+                    GbwColKind::Window(idx) => {
+                        vals.push(window_results[*idx][ri].clone());
+                    }
+                    GbwColKind::WrappedWindow(idx, outer_expr) => {
+                        // Replace __win_result__ placeholder with computed value.
+                        let win_val = window_results[*idx][ri].clone();
+                        let placeholder_col_map =
+                            vec![(String::new(), "__win_result__".to_owned(), false)];
+                        let val = eval_join_expr(outer_expr, &[win_val], &placeholder_col_map)
+                            .unwrap_or(SqliteValue::Null);
+                        vals.push(val);
+                    }
+                }
+            }
+            result_rows.push(Row { values: vals });
+        }
+
+        // Apply ORDER BY from the original select.
+        if !select.order_by.is_empty() {
+            // Build result columns matching the output for ORDER BY resolution.
+            let result_columns: Vec<ResultColumn> = columns
+                .iter()
+                .map(|col| match col {
+                    ResultColumn::Expr {
+                        expr,
+                        alias: Some(a),
+                    } => ResultColumn::Expr {
+                        expr: expr.clone(),
+                        alias: Some(a.clone()),
+                    },
+                    other => other.clone(),
+                })
+                .collect();
+            let empty_collations: Vec<Option<String>> = Vec::new();
+            sort_rows_by_order_terms(
+                &mut result_rows,
+                &select.order_by,
+                &result_columns,
+                &empty_collations,
+                self.collation_registry.as_ref(),
+            )?;
+        }
+
+        Ok(result_rows)
+    }
+
     /// Pipeline:
     /// 1. Materialize all rows via `SELECT *` raw scan
     /// 2. Sort by PARTITION BY then ORDER BY from the window spec
@@ -22360,16 +23409,19 @@ impl Connection {
     /// Execute `EXPLAIN QUERY PLAN` by describing the scan strategy of the
     /// inner statement at a high level.  Each row has four columns:
     ///   id | parent | notused | detail
-    #[allow(clippy::unused_self)] // &self reserved for future schema-aware EQP
     fn execute_explain_query_plan(&self, stmt: &Statement) -> Vec<Row> {
         let detail = match stmt {
             Statement::Select(select) => {
-                let core = &select.body.select;
-                let table_name = first_table_name_from_core(core);
-                match table_name {
-                    Some(name) => format!("SCAN {name}"),
-                    None => "SCAN CONSTANT ROW".to_owned(),
-                }
+                Self::planner_select_directive(select, &self.schema.borrow())
+                    .map(|directive| explain_query_plan_detail_from_directive(&directive))
+                    .unwrap_or_else(|| {
+                        let core = &select.body.select;
+                        let table_name = first_table_name_from_core(core);
+                        match table_name {
+                            Some(name) => format!("SCAN {name}"),
+                            None => "SCAN CONSTANT ROW".to_owned(),
+                        }
+                    })
             }
             Statement::Insert(insert) => {
                 format!("SCAN {} (INSERT)", insert.table.name)
@@ -26236,7 +27288,10 @@ fn expr_contains_rewritable_subquery(expr: &Expr) -> bool {
                 || expr_contains_rewritable_subquery(high)
         }
         Expr::In { expr, set, .. } => {
-            expr_contains_rewritable_subquery(expr)
+            // Multi-column IN (RowValue operand) needs rewriting into
+            // OR-chains because VDBE codegen cannot handle tuple comparison.
+            matches!(expr.as_ref(), Expr::RowValue(..))
+                || expr_contains_rewritable_subquery(expr)
                 || match set {
                     InSet::List(exprs) => exprs.iter().any(expr_contains_rewritable_subquery),
                     // Always mark IN subqueries as rewritable so the rewrite
@@ -27428,6 +28483,63 @@ fn rewrite_in_expr(
             if let InSet::List(exprs) = set {
                 for e in exprs.iter_mut() {
                     rewrite_in_expr(e, conn, rewrite_in_subqueries, params)?;
+                }
+            }
+            // Rewrite multi-column IN: (a, b) IN ((1, 10), (3, 30))
+            // → ((a = 1 AND b = 10) OR (a = 3 AND b = 30))
+            // This expansion lets the VDBE codegen and connection-level
+            // evaluator handle multi-column IN without dedicated RowValue
+            // comparison logic.
+            if let Expr::RowValue(rv_exprs, _) = inner.as_ref() {
+                if let InSet::List(list_items) = set {
+                    let span = fsqlite_ast::Span::new(0, 0);
+                    let mut or_arms: Vec<Expr> = Vec::with_capacity(list_items.len());
+                    for item in list_items.iter() {
+                        let rhs_exprs = match item {
+                            Expr::RowValue(rv, _) => rv.as_slice(),
+                            _ => std::slice::from_ref(item),
+                        };
+                        if rhs_exprs.len() != rv_exprs.len() {
+                            continue;
+                        }
+                        let and_terms: Vec<Expr> = rv_exprs
+                            .iter()
+                            .zip(rhs_exprs.iter())
+                            .map(|(l, r)| Expr::BinaryOp {
+                                left: Box::new(l.clone()),
+                                op: fsqlite_ast::BinaryOp::Eq,
+                                right: Box::new(r.clone()),
+                                span,
+                            })
+                            .collect();
+                        let conj = and_terms.into_iter().reduce(|acc, e| Expr::BinaryOp {
+                            left: Box::new(acc),
+                            op: fsqlite_ast::BinaryOp::And,
+                            right: Box::new(e),
+                            span,
+                        });
+                        if let Some(c) = conj {
+                            or_arms.push(c);
+                        }
+                    }
+                    if let Some(combined) = or_arms.into_iter().reduce(|acc, e| Expr::BinaryOp {
+                        left: Box::new(acc),
+                        op: fsqlite_ast::BinaryOp::Or,
+                        right: Box::new(e),
+                        span,
+                    }) {
+                        if let Expr::In { not, .. } = expr {
+                            *expr = if *not {
+                                Expr::UnaryOp {
+                                    op: fsqlite_ast::UnaryOp::Not,
+                                    expr: Box::new(combined),
+                                    span,
+                                }
+                            } else {
+                                combined
+                            };
+                        }
+                    }
                 }
             }
         }
@@ -29961,6 +31073,57 @@ fn sort_rows_by_order_terms(
     Ok(())
 }
 
+/// Sort rows by ORDER BY terms using a col_map for expression evaluation.
+/// Used by `execute_group_by_window_select` where result columns are
+/// described by a flat (table, col, _) map rather than `ResultColumn` AST nodes.
+#[allow(dead_code)]
+fn sort_rows_by_order_terms_with_col_map(
+    rows: &mut [Row],
+    order_by: &[OrderingTerm],
+    col_map: &[(String, String, bool)],
+) {
+    rows.sort_by(|a, b| {
+        for term in order_by {
+            let (av, bv) = if let Expr::Literal(Literal::Integer(n), _) = &term.expr {
+                let idx = (*n as usize).saturating_sub(1);
+                (
+                    a.values.get(idx).cloned().unwrap_or(SqliteValue::Null),
+                    b.values.get(idx).cloned().unwrap_or(SqliteValue::Null),
+                )
+            } else if let Some(col_name) = expr_col_name(&term.expr) {
+                if let Some(idx) = col_map
+                    .iter()
+                    .position(|(_, c, _)| c.eq_ignore_ascii_case(col_name))
+                {
+                    (
+                        a.values.get(idx).cloned().unwrap_or(SqliteValue::Null),
+                        b.values.get(idx).cloned().unwrap_or(SqliteValue::Null),
+                    )
+                } else {
+                    (
+                        eval_join_expr(&term.expr, a.values(), col_map)
+                            .unwrap_or(SqliteValue::Null),
+                        eval_join_expr(&term.expr, b.values(), col_map)
+                            .unwrap_or(SqliteValue::Null),
+                    )
+                }
+            } else {
+                (
+                    eval_join_expr(&term.expr, a.values(), col_map).unwrap_or(SqliteValue::Null),
+                    eval_join_expr(&term.expr, b.values(), col_map).unwrap_or(SqliteValue::Null),
+                )
+            };
+            let ord = cmp_sqlite_values(&av, &bv);
+            let desc = matches!(term.direction, Some(SortDirection::Desc));
+            let ord = if desc { ord.reverse() } else { ord };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+}
+
 /// Convert an AST `ForeignKeyClause` to a codegen `FkDef`.
 fn fk_clause_to_def(child_indices: &[usize], clause: &fsqlite_ast::ForeignKeyClause) -> FkDef {
     let mut on_delete = FkActionType::NoAction;
@@ -30169,6 +31332,119 @@ fn first_table_name_from_core(core: &SelectCore) -> Option<String> {
             }
         }
         SelectCore::Values(_) => None,
+    }
+}
+
+fn planner_needed_columns(
+    columns: &[ResultColumn],
+    table_name: &str,
+    table_alias: Option<&str>,
+) -> Option<Vec<String>> {
+    let mut needed = Vec::with_capacity(columns.len());
+    for column in columns {
+        let ResultColumn::Expr { expr, .. } = column else {
+            return None;
+        };
+        let Expr::Column(column_ref, _) = expr else {
+            return None;
+        };
+        if let Some(qualifier) = column_ref.table.as_deref()
+            && !qualifier.eq_ignore_ascii_case(table_name)
+            && !table_alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+        {
+            return None;
+        }
+        needed.push(column_ref.column.clone());
+    }
+    Some(needed)
+}
+
+fn planner_where_column_matches(
+    column: &fsqlite_planner::WhereColumn,
+    table_name: &str,
+    table_alias: Option<&str>,
+    expected_column: &str,
+) -> bool {
+    column.column.eq_ignore_ascii_case(expected_column)
+        && column.table.as_deref().is_none_or(|qualifier| {
+            qualifier.eq_ignore_ascii_case(table_name)
+                || table_alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+        })
+}
+
+fn planner_directive_index_column(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    where_terms: &[fsqlite_planner::WhereTerm<'_>],
+    index_name: &str,
+) -> Option<String> {
+    let index = table
+        .indexes
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(index_name))?;
+    let leading_column = index.columns.first()?.clone();
+    where_terms.iter().find_map(|term| {
+        term.column.as_ref().and_then(|column| {
+            planner_where_column_matches(column, &table.name, table_alias, &leading_column)
+                .then_some(leading_column.clone())
+        })
+    })
+}
+
+fn planner_directive_covering_access_kind(
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    where_terms: &[fsqlite_planner::WhereTerm<'_>],
+    index_name: &str,
+) -> Option<(PlannerSelectAccessKind, String)> {
+    let index_column = planner_directive_index_column(table, table_alias, where_terms, index_name)?;
+    let mut saw_equality = false;
+    let mut saw_range = false;
+    for term in where_terms {
+        let Some(column) = term.column.as_ref() else {
+            continue;
+        };
+        if !planner_where_column_matches(column, &table.name, table_alias, &index_column) {
+            continue;
+        }
+        match &term.kind {
+            WhereTermKind::Equality => saw_equality = true,
+            WhereTermKind::Range | WhereTermKind::Between => saw_range = true,
+            _ => {}
+        }
+    }
+    if saw_equality {
+        Some((PlannerSelectAccessKind::IndexEquality, index_column))
+    } else if saw_range {
+        Some((PlannerSelectAccessKind::IndexRange, index_column))
+    } else {
+        None
+    }
+}
+
+fn explain_query_plan_detail_from_directive(directive: &SelectPlannerDirective) -> String {
+    match directive.access_kind {
+        PlannerSelectAccessKind::FullTableScan => format!("SCAN {}", directive.table_name),
+        PlannerSelectAccessKind::RowidLookup => {
+            format!(
+                "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
+                directive.table_name
+            )
+        }
+        PlannerSelectAccessKind::IndexEquality => format!(
+            "SEARCH {} USING {}INDEX {} ({}=?)",
+            directive.table_name,
+            if directive.covering { "COVERING " } else { "" },
+            directive.index_name.as_deref().unwrap_or("(unknown)"),
+            directive.index_column.as_deref().unwrap_or("(expr)"),
+        ),
+        PlannerSelectAccessKind::IndexRange => format!(
+            "SEARCH {} USING {}INDEX {} ({} range)",
+            directive.table_name,
+            if directive.covering { "COVERING " } else { "" },
+            directive.index_name.as_deref().unwrap_or("(unknown)"),
+            directive.index_column.as_deref().unwrap_or("(expr)"),
+        ),
     }
 }
 
@@ -33460,6 +34736,7 @@ fn normalize_join_key_value(val: &SqliteValue) -> std::borrow::Cow<'_, SqliteVal
 }
 
 /// Hash a single normalized value (shared by Hash impl).
+#[allow(clippy::branches_sharing_code)]
 fn hash_normalized_value<H: std::hash::Hasher>(val: &SqliteValue, state: &mut H) {
     // Use a fixed discriminant scheme: numeric=1, text=2, blob=3, null=0.
     match val {
@@ -33475,8 +34752,7 @@ fn hash_normalized_value<H: std::hash::Hasher>(val: &SqliteValue, state: &mut H)
             #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
             if normalized.is_finite()
                 && normalized.fract() == 0.0
-                && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0)
-                    .contains(&normalized)
+                && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&normalized)
             {
                 1u8.hash(state);
                 (normalized as i64).hash(state);
@@ -33501,10 +34777,10 @@ impl PartialEq for HashableJoinKey {
         if self.0.len() != other.0.len() {
             return false;
         }
-        self.0
-            .iter()
-            .zip(other.0.iter())
-            .all(|(a, b)| cmp_values(&normalize_join_key_value(a), &normalize_join_key_value(b)) == std::cmp::Ordering::Equal)
+        self.0.iter().zip(other.0.iter()).all(|(a, b)| {
+            cmp_values(&normalize_join_key_value(a), &normalize_join_key_value(b))
+                == std::cmp::Ordering::Equal
+        })
     }
 }
 
@@ -34335,6 +35611,59 @@ fn eval_join_expr(
             not,
             ..
         } => {
+            // Multi-column IN: (a, b) IN ((1, 10), (3, 30))
+            if let Expr::RowValue(rv_exprs, _) = inner.as_ref() {
+                let InSet::List(list_exprs) = set else {
+                    return Err(FrankenError::NotImplemented(
+                        "multi-column IN with subquery not supported".to_owned(),
+                    ));
+                };
+                let lhs: Vec<SqliteValue> = rv_exprs
+                    .iter()
+                    .map(|e| eval_join_expr(e, row, col_map))
+                    .collect::<Result<Vec<_>>>()?;
+                // If any LHS element is NULL, result is NULL per SQL semantics.
+                if lhs.iter().any(SqliteValue::is_null) {
+                    return Ok(SqliteValue::Null);
+                }
+                let mut saw_null = false;
+                let mut found = false;
+                for list_item in list_exprs {
+                    let rhs_exprs = match list_item {
+                        Expr::RowValue(rv, _) => rv.as_slice(),
+                        // Single-element tuple: wrap in slice for uniform handling.
+                        _ => std::slice::from_ref(list_item),
+                    };
+                    if rhs_exprs.len() != lhs.len() {
+                        continue;
+                    }
+                    let rhs: Vec<SqliteValue> = rhs_exprs
+                        .iter()
+                        .map(|e| eval_join_expr(e, row, col_map))
+                        .collect::<Result<Vec<_>>>()?;
+                    if rhs.iter().any(SqliteValue::is_null) {
+                        saw_null = true;
+                        continue;
+                    }
+                    if lhs
+                        .iter()
+                        .zip(rhs.iter())
+                        .all(|(l, r)| cmp_values(l, r) == std::cmp::Ordering::Equal)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                return if found {
+                    Ok(SqliteValue::Integer(i64::from(!*not)))
+                } else if saw_null {
+                    Ok(SqliteValue::Null)
+                } else {
+                    Ok(SqliteValue::Integer(i64::from(*not)))
+                };
+            }
+
+            // Scalar IN: val IN (1, 2, 3)
             let val = eval_join_expr(inner, row, col_map)?;
             // Three-valued IN: NULL operand → NULL result.
             if val.is_null() {
@@ -56457,6 +57786,25 @@ mod schema_loading_tests {
             .collect()
     }
 
+    fn pragma_value_map(rows: &[Row]) -> HashMap<String, String> {
+        rows.iter()
+            .filter_map(|row| {
+                let name = match row.values().first() {
+                    Some(SqliteValue::Text(name)) => name.to_string(),
+                    _ => return None,
+                };
+                let value = match row.values().get(1) {
+                    Some(SqliteValue::Null) => "NULL".to_owned(),
+                    Some(SqliteValue::Integer(value)) => value.to_string(),
+                    Some(SqliteValue::Text(value)) => value.to_string(),
+                    Some(other) => format!("{other:?}"),
+                    None => return None,
+                };
+                Some((name, value))
+            })
+            .collect()
+    }
+
     #[test]
     fn test_pragma_flat_combining_stats_reports_htm_counters() {
         let conn = Connection::open(":memory:").unwrap();
@@ -56989,6 +58337,80 @@ mod schema_loading_tests {
         assert!(*after_reset.get("unix_fallbacks_total").unwrap_or(&0) <= 100);
         assert!(*after_reset.get("read_tail_violations_total").unwrap_or(&0) <= 100);
         assert!(*after_reset.get("write_tail_violations_total").unwrap_or(&0) <= 100);
+    }
+
+    #[test]
+    fn test_pragma_io_uring_status_reports_non_iouring_backend() {
+        let conn = Connection::open(":memory:").unwrap();
+        let status = pragma_value_map(&conn.query("PRAGMA fsqlite.io_uring_status;").unwrap());
+
+        assert_eq!(
+            status.get("pager_backend_kind").map(String::as_str),
+            Some("memory")
+        );
+        assert_eq!(
+            status.get("io_uring_backend").map(String::as_str),
+            Some("NULL")
+        );
+        assert_eq!(status.get("available").map(String::as_str), Some("0"));
+        assert_eq!(status.get("disabled").map(String::as_str), Some("0"));
+        assert_eq!(
+            status.get("status").map(String::as_str),
+            Some("not_io_uring_backend")
+        );
+        assert_eq!(
+            status.get("disable_reason").map(String::as_str),
+            Some("NULL")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pragma_io_uring_status_reports_live_backend_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("io_uring_status.db");
+        let conn = Connection::open(db_path.to_str().unwrap()).expect("open db");
+        let status = pragma_value_map(&conn.query("PRAGMA io_uring_status;").unwrap());
+
+        assert_eq!(
+            status.get("pager_backend_kind").map(String::as_str),
+            Some("iouring")
+        );
+        assert_eq!(
+            status.get("io_uring_backend").map(String::as_str),
+            Some("asupersync")
+        );
+        assert_eq!(
+            status.get("initial_status").map(String::as_str),
+            Some("available:asupersync")
+        );
+
+        match status.get("disabled").map(String::as_str) {
+            Some("0") => {
+                assert_eq!(status.get("available").map(String::as_str), Some("1"));
+                assert_eq!(
+                    status.get("status").map(String::as_str),
+                    Some("available:asupersync")
+                );
+                assert_eq!(
+                    status.get("disable_reason").map(String::as_str),
+                    Some("NULL")
+                );
+            }
+            Some("1") => {
+                assert_eq!(status.get("available").map(String::as_str), Some("0"));
+                assert!(
+                    status
+                        .get("status")
+                        .is_some_and(|value| value.starts_with("disabled:asupersync:"))
+                );
+                assert_ne!(
+                    status.get("disable_reason").map(String::as_str),
+                    Some("NULL")
+                );
+            }
+            other => panic!("unexpected disabled flag: {other:?}"),
+        }
     }
 
     #[test]
@@ -70922,6 +72344,37 @@ mod pager_routing_tests {
                 mismatches.len()
             );
         }
+    }
+
+    #[test]
+    fn test_explain_query_plan_reports_planner_selected_detail() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice', 30);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'Bob', 25);")
+            .unwrap();
+
+        let rowid_rows = conn
+            .query("EXPLAIN QUERY PLAN SELECT name FROM users WHERE rowid = 1")
+            .unwrap();
+        assert_eq!(
+            rowid_rows[0].values[3],
+            SqliteValue::Text("SEARCH users USING INTEGER PRIMARY KEY (rowid=?)".into()),
+        );
+
+        let index_rows = conn
+            .query("EXPLAIN QUERY PLAN SELECT name FROM users WHERE age = 25")
+            .unwrap();
+        assert_eq!(
+            index_rows[0].values[3],
+            SqliteValue::Text("SEARCH users USING INDEX idx_users_age (age=?)".into()),
+        );
     }
 
     #[test]

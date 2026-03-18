@@ -2457,6 +2457,20 @@ impl MemDatabase {
         count
     }
 
+    /// Return the next root page that would be assigned by `create_table`.
+    #[must_use]
+    pub fn next_root_page(&self) -> i32 {
+        self.next_root_page
+    }
+
+    /// Advance the root page counter so future allocations start at `val`.
+    ///
+    /// Used to prevent MemDatabase root pages from colliding with pager-
+    /// allocated pages (e.g. when materializing sqlite_master temp tables).
+    pub fn set_next_root_page(&mut self, val: i32) {
+        self.next_root_page = val;
+    }
+
     /// Allocate and return the next root page number without creating a table.
     ///
     /// Used by `OpenAutoindex` which needs a unique page number for a

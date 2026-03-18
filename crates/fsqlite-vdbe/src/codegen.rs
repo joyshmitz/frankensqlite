@@ -5,6 +5,7 @@
 //! UPDATE, and DELETE with correct opcode patterns matching C SQLite behavior.
 
 use std::cell::RefCell;
+use std::env;
 
 use crate::{Label, ProgramBuilder};
 use fsqlite_ast::{
@@ -223,6 +224,52 @@ impl IndexSchema {
             self.key_expressions.join(", ")
         }
     }
+}
+
+/// Planner-selected single-table access-path family that lowering may honor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerSelectAccessKind {
+    /// Lower as a plain table scan.
+    FullTableScan,
+    /// Lower as a direct rowid lookup.
+    RowidLookup,
+    /// Lower as an equality probe on a named index.
+    IndexEquality,
+    /// Lower as a bounded range scan on a named index.
+    IndexRange,
+}
+
+impl PlannerSelectAccessKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FullTableScan => "full_table_scan",
+            Self::RowidLookup => "rowid_lookup",
+            Self::IndexEquality => "index_equality",
+            Self::IndexRange => "index_range",
+        }
+    }
+}
+
+/// Planner-produced directive for a single-table SELECT lowering path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectPlannerDirective {
+    /// Deterministic planner artifact identity.
+    pub plan_id: String,
+    /// Planner artifact generation/version.
+    pub plan_generation: u64,
+    /// Human-readable planner surface name.
+    pub planner_surface: String,
+    /// Table the directive applies to.
+    pub table_name: String,
+    /// Index to use when the access path is index-backed.
+    pub index_name: Option<String>,
+    /// Leading index column the planner expects to drive the probe.
+    pub index_column: Option<String>,
+    /// Whether the planner expects a covering-index lowering.
+    pub covering: bool,
+    /// Access-path family lowering should consume.
+    pub access_kind: PlannerSelectAccessKind,
 }
 
 /// A foreign key constraint definition stored on the child table.
@@ -1084,6 +1131,10 @@ pub struct CodegenContext {
     /// Set to false for MemDatabase backends where indexes don't maintain
     /// key-sorted iteration order.
     pub index_ordered_scan_reliable: bool,
+    /// Optional planner-produced lowering directive for simple single-table
+    /// SELECT access paths. When present, lowering either honors it or emits
+    /// an explicit bypass reason before falling back to heuristic selection.
+    pub planner_select_directive: Option<SelectPlannerDirective>,
 }
 
 /// Errors during code generation.
@@ -1120,6 +1171,79 @@ fn find_table<'a>(schema: &'a [TableSchema], name: &str) -> Result<&'a TableSche
         .iter()
         .find(|t| t.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| CodegenError::TableNotFound(name.to_owned()))
+}
+
+fn find_index_named<'a>(table: &'a TableSchema, index_name: &str) -> Option<&'a IndexSchema> {
+    table
+        .indexes
+        .iter()
+        .find(|index| index.name.eq_ignore_ascii_case(index_name))
+}
+
+fn directive_index_contract_bypass_reason(
+    directive: &SelectPlannerDirective,
+    idx_schema: &IndexSchema,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    columns: &[ResultColumn],
+    actual_index_column: &str,
+) -> Option<&'static str> {
+    let Some(expected_index_column) = directive.index_column.as_deref() else {
+        return Some("missing_index_column");
+    };
+    let Some(leading_column) = idx_schema.columns.first() else {
+        return Some("index_has_no_leading_column");
+    };
+    if !leading_column.eq_ignore_ascii_case(actual_index_column)
+        || !leading_column.eq_ignore_ascii_case(expected_index_column)
+    {
+        return Some("index_column_mismatch");
+    }
+    if directive.covering
+        && resolve_covering_output_sources(columns, table, table_alias, idx_schema).is_none()
+    {
+        return Some("covering_contract_mismatch");
+    }
+    None
+}
+
+fn log_planner_select_directive_outcome(
+    directive: &SelectPlannerDirective,
+    honor_mode: &str,
+    bypass_reason: &str,
+    lowered_ops: &str,
+) {
+    if !tracing::enabled!(target: "fsqlite.planner_runtime", tracing::Level::INFO) {
+        return;
+    }
+
+    let run_id = env::var("RUN_ID").unwrap_or_else(|_| "(none)".to_owned());
+    let trace_id = env::var("TRACE_ID")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let scenario_id = env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
+    let index_name = directive.index_name.as_deref().unwrap_or("(none)");
+    let index_column = directive.index_column.as_deref().unwrap_or("(none)");
+
+    tracing::info!(
+        target: "fsqlite.planner_runtime",
+        run_id = %run_id,
+        trace_id,
+        scenario_id = %scenario_id,
+        plan_id = %directive.plan_id,
+        plan_generation = directive.plan_generation,
+        planner_surface = %directive.planner_surface,
+        table = %directive.table_name,
+        index = %index_name,
+        index_column = %index_column,
+        access_kind = %directive.access_kind.label(),
+        covering = directive.covering,
+        honor_mode = %honor_mode,
+        bypass_reason = %bypass_reason,
+        lowered_ops = %lowered_ops,
+        "vdbe.planner_select_directive"
+    );
 }
 
 fn table_name_from_qualified(qtr: &QualifiedTableRef) -> &str {
@@ -1494,37 +1618,188 @@ pub fn codegen_select(
     } else {
         extract_column_eq_target(where_clause.as_deref(), table, table_alias)
     };
-    let mut index_cursor_to_close = None;
+
+    if let Some(directive) = ctx.planner_select_directive.as_ref() {
+        let bypass_reason = if !directive.table_name.eq_ignore_ascii_case(&table.name) {
+            Some("table_mismatch")
+        } else {
+            match directive.access_kind {
+                PlannerSelectAccessKind::FullTableScan => {
+                    log_planner_select_directive_outcome(
+                        directive,
+                        "honored",
+                        "none",
+                        "full_table_scan",
+                    );
+                    return codegen_select_full_scan(
+                        b,
+                        cursor,
+                        table,
+                        table_alias,
+                        time_travel,
+                        schema,
+                        columns,
+                        where_clause.as_deref(),
+                        stmt.limit.as_ref(),
+                        out_regs,
+                        out_col_count,
+                        done_label,
+                        end_label,
+                    );
+                }
+                PlannerSelectAccessKind::RowidLookup => match rowid_target {
+                    Some(target_expr) => {
+                        log_planner_select_directive_outcome(
+                            directive,
+                            "honored",
+                            "none",
+                            "seek_rowid",
+                        );
+                        return codegen_select_rowid_lookup(
+                            b,
+                            cursor,
+                            table,
+                            table_alias,
+                            time_travel,
+                            schema,
+                            columns,
+                            out_regs,
+                            out_col_count,
+                            done_label,
+                            end_label,
+                            target_expr,
+                        );
+                    }
+                    None => Some("rowid_lookup_target_missing"),
+                },
+                PlannerSelectAccessKind::IndexEquality => {
+                    if let Some(index_name) = directive.index_name.as_deref() {
+                        if let Some((index_column_name, target_expr)) = index_eq.as_ref() {
+                            if let Some(idx_schema) = find_index_named(table, index_name) {
+                                if let Some(reason) = directive_index_contract_bypass_reason(
+                                    directive,
+                                    idx_schema,
+                                    table,
+                                    table_alias,
+                                    columns,
+                                    index_column_name,
+                                ) {
+                                    Some(reason)
+                                } else {
+                                    log_planner_select_directive_outcome(
+                                        directive,
+                                        "honored",
+                                        "none",
+                                        "index_equality_probe",
+                                    );
+                                    return codegen_select_index_equality_scan(
+                                        b,
+                                        cursor,
+                                        table,
+                                        table_alias,
+                                        schema,
+                                        columns,
+                                        where_clause.as_deref(),
+                                        out_regs,
+                                        out_col_count,
+                                        done_label,
+                                        end_label,
+                                        idx_schema,
+                                        target_expr,
+                                    );
+                                }
+                            } else {
+                                Some("index_not_found")
+                            }
+                        } else {
+                            Some("index_equality_target_missing")
+                        }
+                    } else {
+                        Some("missing_index_name")
+                    }
+                }
+                PlannerSelectAccessKind::IndexRange => {
+                    if let Some(index_name) = directive.index_name.as_deref() {
+                        if let Some((index_column_name, _candidate_idx, range_target)) =
+                            index_range.as_ref()
+                        {
+                            if let Some(idx_schema) = find_index_named(table, index_name) {
+                                if idx_schema.key_term_count() != 1
+                                    || idx_schema.key_term_descending(0)
+                                {
+                                    Some("index_shape_unsupported")
+                                } else if let Some(reason) = directive_index_contract_bypass_reason(
+                                    directive,
+                                    idx_schema,
+                                    table,
+                                    table_alias,
+                                    columns,
+                                    index_column_name,
+                                ) {
+                                    Some(reason)
+                                } else {
+                                    log_planner_select_directive_outcome(
+                                        directive,
+                                        "honored",
+                                        "none",
+                                        "index_range_scan",
+                                    );
+                                    return codegen_select_index_range_scan(
+                                        b,
+                                        cursor,
+                                        table,
+                                        table_alias,
+                                        schema,
+                                        columns,
+                                        stmt.limit.as_ref(),
+                                        out_regs,
+                                        out_col_count,
+                                        done_label,
+                                        end_label,
+                                        idx_schema,
+                                        *range_target,
+                                    );
+                                }
+                            } else {
+                                Some("index_not_found")
+                            }
+                        } else {
+                            Some("index_range_target_missing")
+                        }
+                    } else {
+                        Some("missing_index_name")
+                    }
+                }
+            }
+        };
+
+        if let Some(reason) = bypass_reason {
+            log_planner_select_directive_outcome(
+                directive,
+                "bypassed",
+                reason,
+                "heuristic_fallback",
+            );
+        }
+    }
 
     if let Some(target_expr) = rowid_target {
-        // --- Rowid-seek SELECT ---
-        let rowid_reg = b.alloc_reg();
-        emit_expr(b, target_expr, rowid_reg, None);
-        b.emit_op(
-            Opcode::OpenRead,
+        codegen_select_rowid_lookup(
+            b,
             cursor,
-            table.root_page,
-            0,
-            P4::Table(table.name.clone()),
-            0,
-        );
-        emit_set_snapshot(b, cursor, time_travel);
-        b.emit_jump_to_label(
-            Opcode::SeekRowid,
-            cursor,
-            rowid_reg,
+            table,
+            table_alias,
+            time_travel,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
             done_label,
-            P4::None,
-            0,
-        );
-
-        // Read columns.
-        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
-
-        // ResultRow.
-        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+            end_label,
+            target_expr,
+        )
     } else if let Some(rowid_range) = rowid_range {
-        return codegen_select_rowid_range_scan(
+        codegen_select_rowid_range_scan(
             b,
             cursor,
             table,
@@ -1538,9 +1813,9 @@ pub fn codegen_select(
             done_label,
             end_label,
             rowid_range,
-        );
+        )
     } else if let Some((_index_column_name, idx_schema, index_range)) = index_range {
-        return codegen_select_index_range_scan(
+        codegen_select_index_range_scan(
             b,
             cursor,
             table,
@@ -1554,148 +1829,29 @@ pub fn codegen_select(
             end_label,
             idx_schema,
             index_range,
-        );
+        )
     } else if let Some((col_name, target_expr)) = index_eq.filter(|_| stmt.order_by.is_empty()) {
         // --- Index-seek SELECT (only when no ORDER BY, since the index
         //     seek returns rows in index insertion order, not sort order) ---
         if let Some(idx_schema) = table.index_for_column(&col_name) {
-            let idx_cursor = 1_i32;
-            index_cursor_to_close = Some(idx_cursor);
-            let full_scan_fallback = b.emit_label();
-            let duplicate_run_done = b.emit_label();
-            let where_placeholder_base = b.current_anon_placeholder();
-
-            // Allocate param_reg and min_rowid_reg as contiguous pair for MakeRecord.
-            let param_reg = b.alloc_regs(2);
-            let min_rowid_reg = param_reg + 1;
-            emit_expr(b, target_expr, param_reg, None);
-
-            // SQL semantics: `WHERE col = NULL` is UNKNOWN (filters out all rows).
-            // If the bound parameter is NULL, skip the index scan entirely.
-            b.emit_jump_to_label(Opcode::IsNull, param_reg, 0, done_label, P4::None, 0);
-
-            let saw_index_match_reg = b.alloc_reg();
-            b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
-
-            // Build probe key: [bound_value, i64::MIN] so SeekGE lands on the
-            // first duplicate for the bound value.
-            b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
-            let probe_record_reg = b.alloc_reg();
-            b.emit_op(
-                Opcode::MakeRecord,
-                param_reg,
-                2,
-                probe_record_reg,
-                P4::None,
-                0,
-            );
-
-            b.emit_op(
-                Opcode::OpenRead,
+            codegen_select_index_equality_scan(
+                b,
                 cursor,
-                table.root_page,
-                0,
-                P4::Table(table.name.clone()),
-                0,
-            );
-            b.emit_op(
-                Opcode::OpenRead,
-                idx_cursor,
-                idx_schema.root_page,
-                0,
-                P4::Index(idx_schema.name.clone()),
-                0,
-            );
-            b.emit_jump_to_label(
-                Opcode::SeekGE,
-                idx_cursor,
-                probe_record_reg,
-                full_scan_fallback,
-                P4::None,
-                0,
-            );
-
-            // Loop over all matching index entries (non-unique indexes may
-            // have multiple rows for the same key value).
-            let idx_loop_top = b.current_addr();
-
-            // Guard: if the current key >= probe is not equal to the
-            // requested value, stop iterating.
-            let idx_key_reg = b.alloc_reg();
-            b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
-            b.emit_jump_to_label(
-                Opcode::Ne,
-                param_reg,
-                idx_key_reg,
-                duplicate_run_done,
-                P4::None,
-                0,
-            );
-
-            let rowid_reg = b.alloc_reg();
-            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-            // If SeekRowid can't find the data row, skip to next index entry.
-            let idx_skip_label = b.emit_label();
-            b.emit_jump_to_label(
-                Opcode::SeekRowid,
-                cursor,
-                rowid_reg,
-                idx_skip_label,
-                P4::None,
-                0,
-            );
-
-            // Read columns.
-            emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
-
-            // ResultRow.
-            b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
-            b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
-
-            // Advance to next index entry and loop back.
-            b.resolve_label(idx_skip_label);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            #[allow(clippy::cast_possible_wrap)]
-            let idx_loop_body = idx_loop_top as i32;
-            b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-
-            // A mismatched key after at least one verified hit means the
-            // duplicate run ended normally. Only fall back to a full scan if
-            // the index never yielded a verified match at all.
-            b.resolve_label(duplicate_run_done);
-            b.emit_jump_to_label(Opcode::If, saw_index_match_reg, 0, done_label, P4::None, 0);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, full_scan_fallback, P4::None, 0);
-
-            // Safety fallback: if index probe cannot produce a verified row
-            // (e.g. unavailable/stale index backend), run a full table scan.
-            b.resolve_label(full_scan_fallback);
-            let loop_start = b.current_addr();
-            b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
-            let skip_label = b.emit_label();
-            if let Some(where_expr) = where_clause.as_deref() {
-                // Reuse the original bind slots when the planner falls back
-                // from the indexed probe to the original WHERE filter.
-                b.set_next_anon_placeholder(where_placeholder_base);
-                emit_where_filter(
-                    b,
-                    where_expr,
-                    cursor,
-                    table,
-                    table_alias,
-                    schema,
-                    skip_label,
-                );
-            }
-            emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
-            b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
-            b.resolve_label(skip_label);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let loop_body = (loop_start + 1) as i32;
-            b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+                table,
+                table_alias,
+                schema,
+                columns,
+                where_clause.as_deref(),
+                out_regs,
+                out_col_count,
+                done_label,
+                end_label,
+                idx_schema,
+                target_expr,
+            )
         } else {
             // Fallback to full scan.
-            return codegen_select_full_scan(
+            codegen_select_full_scan(
                 b,
                 cursor,
                 table,
@@ -1709,11 +1865,11 @@ pub fn codegen_select(
                 out_col_count,
                 done_label,
                 end_label,
-            );
+            )
         }
     } else if has_aggregate_columns(columns) && !group_by.is_empty() {
         // --- Aggregate query WITH GROUP BY ---
-        return codegen_select_group_by_aggregate(
+        codegen_select_group_by_aggregate(
             b,
             cursor,
             table,
@@ -1728,10 +1884,10 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
-        );
+        )
     } else if has_aggregate_columns(columns) {
         // --- Aggregate query (single-group, no GROUP BY) ---
-        return codegen_select_aggregate(
+        codegen_select_aggregate(
             b,
             cursor,
             table,
@@ -1744,7 +1900,7 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
-        );
+        )
     } else if !stmt.order_by.is_empty() {
         if let Some(index_plan) = ctx
             .index_ordered_scan_reliable
@@ -1785,7 +1941,7 @@ pub fn codegen_select(
         }
 
         // --- Full table scan with ORDER BY (sorter path) ---
-        return codegen_select_ordered_scan(
+        codegen_select_ordered_scan(
             b,
             cursor,
             table,
@@ -1800,10 +1956,10 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
-        );
+        )
     } else if distinct == Distinctness::Distinct {
         // --- Full table scan with DISTINCT ---
-        return codegen_select_distinct_scan(
+        codegen_select_distinct_scan(
             b,
             cursor,
             table,
@@ -1816,10 +1972,10 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
-        );
+        )
     } else {
         // --- Full table scan ---
-        return codegen_select_full_scan(
+        codegen_select_full_scan(
             b,
             cursor,
             table,
@@ -1833,20 +1989,184 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
-        );
+        )
     }
+}
 
-    // Done: Close + Halt.
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_rowid_lookup(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    time_travel: Option<&TimeTravelClause>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    target_expr: &Expr,
+) -> Result<(), CodegenError> {
+    let rowid_reg = b.alloc_reg();
+    emit_expr(b, target_expr, rowid_reg, None);
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    emit_set_snapshot(b, cursor, time_travel);
+    b.emit_jump_to_label(
+        Opcode::SeekRowid,
+        cursor,
+        rowid_reg,
+        done_label,
+        P4::None,
+        0,
+    );
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     b.resolve_label(done_label);
-    if let Some(idx_cursor) = index_cursor_to_close {
-        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
-    }
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
-
-    // End target for Init jump.
     b.resolve_label(end_label);
+    Ok(())
+}
 
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_index_equality_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    idx_schema: &IndexSchema,
+    target_expr: &Expr,
+) -> Result<(), CodegenError> {
+    let idx_cursor = 1_i32;
+    let full_scan_fallback = b.emit_label();
+    let duplicate_run_done = b.emit_label();
+    let where_placeholder_base = b.current_anon_placeholder();
+
+    let param_reg = b.alloc_regs(2);
+    let min_rowid_reg = param_reg + 1;
+    emit_expr(b, target_expr, param_reg, None);
+    b.emit_jump_to_label(Opcode::IsNull, param_reg, 0, done_label, P4::None, 0);
+
+    let saw_index_match_reg = b.alloc_reg();
+    b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
+
+    b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+    let probe_record_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        param_reg,
+        2,
+        probe_record_reg,
+        P4::None,
+        0,
+    );
+
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+    b.emit_jump_to_label(
+        Opcode::SeekGE,
+        idx_cursor,
+        probe_record_reg,
+        full_scan_fallback,
+        P4::None,
+        0,
+    );
+
+    let idx_loop_top = b.current_addr();
+    let idx_key_reg = b.alloc_reg();
+    b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::Ne,
+        param_reg,
+        idx_key_reg,
+        duplicate_run_done,
+        P4::None,
+        0,
+    );
+
+    let rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+    let idx_skip_label = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekRowid,
+        cursor,
+        rowid_reg,
+        idx_skip_label,
+        P4::None,
+        0,
+    );
+
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
+
+    b.resolve_label(idx_skip_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let idx_loop_body = idx_loop_top as i32;
+    b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(duplicate_run_done);
+    b.emit_jump_to_label(Opcode::If, saw_index_match_reg, 0, done_label, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, full_scan_fallback, P4::None, 0);
+
+    b.resolve_label(full_scan_fallback);
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        b.set_next_anon_placeholder(where_placeholder_base);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
+    }
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(skip_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
     Ok(())
 }
 
@@ -15031,6 +15351,81 @@ mod tests {
             .find(|op| op.opcode == Opcode::ResultRow)
             .unwrap();
         assert_eq!(rr.p2, 2);
+    }
+
+    #[test]
+    fn test_codegen_select_honors_planner_full_scan_directive_over_index_probe() {
+        let stmt = simple_select(&["a"], "t", Some(col_cmp_param("b", AstBinaryOp::Eq, 1)));
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-full-scan".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "t".to_owned(),
+                index_name: None,
+                index_column: None,
+                covering: false,
+                access_kind: PlannerSelectAccessKind::FullTableScan,
+            }),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Rewind && op.p1 == 0),
+            "planner full-scan directive should bypass the index probe fast path"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")
+            }),
+            "planner full-scan directive should not open the candidate index"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "planner full-scan directive should not emit an index seek"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_bypasses_stale_planner_rowid_directive() {
+        let stmt = simple_select(&["a"], "t", Some(col_cmp_param("b", AstBinaryOp::Eq, 1)));
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-stale-rowid".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "t".to_owned(),
+                index_name: None,
+                index_column: None,
+                covering: false,
+                access_kind: PlannerSelectAccessKind::RowidLookup,
+            }),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")
+            }),
+            "stale rowid directive should be bypassed so heuristic index lowering can still run"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "stale rowid directive should fall back to the ordinary index-equality fast path"
+        );
     }
 
     #[test]
