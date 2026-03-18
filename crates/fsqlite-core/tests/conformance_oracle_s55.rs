@@ -18962,7 +18962,6 @@ fn test_conformance_trigger_after_insert_s74x() {
 }
 
 #[test]
-#[ignore = "BEFORE UPDATE trigger fires for non-matching rows: frank sets updated_at='modified' on row 2 even though UPDATE only targets id=1"]
 fn test_conformance_trigger_before_update_s74y() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

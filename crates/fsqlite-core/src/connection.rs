@@ -240,6 +240,8 @@ static FSQLITE_STATEMENT_DISPATCH_BACKGROUND_GATES: AtomicU64 = AtomicU64::new(0
 static FSQLITE_PREPARED_SCHEMA_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PAGER_PUBLICATION_REFRESHES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_MEMORY_AUTOCOMMIT_FAST_PATH_BEGINS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_CACHED_READ_SNAPSHOT_REUSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_CACHED_READ_SNAPSHOT_PARKS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_FRESH_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PREPARED_TABLE_ENGINE_REUSES: AtomicU64 = AtomicU64::new(0);
@@ -2433,6 +2435,16 @@ pub struct Connection {
     /// Active transaction handle (Phase 5/bd-1dqg).
     /// Stores the pager transaction state during BEGIN/COMMIT/ROLLBACK.
     active_txn: RefCell<Option<Box<dyn TransactionHandle>>>,
+    /// Cached read-only pager transaction for autocommit SELECT fast-path.
+    ///
+    /// When a read-only autocommit SELECT finishes, instead of committing the
+    /// pager transaction we park it here. The next autocommit read can reuse
+    /// this snapshot — skipping `pager.begin()` + `pager.commit()` entirely.
+    /// Invalidated on any write, DDL, explicit BEGIN, or schema change.
+    cached_read_snapshot: RefCell<Option<Box<dyn TransactionHandle>>>,
+    /// Schema cookie at the time `cached_read_snapshot` was captured.
+    /// Used to detect schema changes that invalidate the cached snapshot.
+    cached_read_snapshot_cookie: Cell<u32>,
     /// Schema registry: table metadata used by the code generator.
     schema: RefCell<Vec<TableSchema>>,
     /// View definitions stored in-memory.
@@ -2705,6 +2717,8 @@ impl Connection {
             db: Rc::new(RefCell::new(MemDatabase::new())),
             pager,
             active_txn: RefCell::new(None),
+            cached_read_snapshot: RefCell::new(None),
+            cached_read_snapshot_cookie: Cell::new(0),
             schema: RefCell::new(Vec::new()),
             views: RefCell::new(Vec::new()),
             triggers: RefCell::new(Vec::new()),
@@ -9674,6 +9688,31 @@ impl Connection {
         }
         let is_concurrent = mode == TransactionMode::Concurrent;
 
+        // Persistent read-only snapshot reuse: if we have a cached read-only
+        // pager transaction from a prior autocommit SELECT, reuse it instead
+        // of creating a new one.  This eliminates per-statement begin/commit
+        // overhead for consecutive reads.  Only valid when:
+        //   - Requested mode is ReadOnly (not write/concurrent)
+        //   - Schema cookie hasn't changed (no DDL since cache)
+        //   - No explicit transaction is active
+        if mode == TransactionMode::ReadOnly
+            && self.cached_read_snapshot.borrow().is_some()
+            && self.cached_read_snapshot_cookie.get() == *self.schema_cookie.borrow()
+        {
+            let txn = self.cached_read_snapshot.borrow_mut().take().unwrap();
+            *self.active_txn.borrow_mut() = Some(txn);
+            *self.concurrent_txn.borrow_mut() = false;
+            *self.concurrent_session_id.borrow_mut() = None;
+            self.txn_metrics_mark_started();
+            if hot_path_profile_enabled() {
+                FSQLITE_CACHED_READ_SNAPSHOT_REUSES.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            return Ok(true);
+        }
+
+        // Discard stale cached snapshot if present (mode mismatch or schema change).
+        self.invalidate_cached_read_snapshot(cx);
+
         // Fast path for isolated :memory: autocommit transactions: these
         // connections cannot observe external commits, so they do not need the
         // staleness/publication binding path that file-backed databases use.
@@ -9763,6 +9802,13 @@ impl Connection {
         registry.remove_and_recycle(session_id);
     }
 
+    /// Discard the cached read-only pager snapshot, rolling it back properly.
+    fn invalidate_cached_read_snapshot(&self, cx: &Cx) {
+        if let Some(mut txn) = self.cached_read_snapshot.borrow_mut().take() {
+            let _ = txn.rollback(cx);
+        }
+    }
+
     /// Finalize an implicit (autocommit) transaction: commit on success,
     /// rollback on error.  No-op when `was_auto` is `false`.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -9817,6 +9863,27 @@ impl Connection {
         };
 
         let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
+
+        // Persistent read-only snapshot: if the autocommit transaction was
+        // read-only and succeeded, park it for reuse by the next autocommit
+        // read instead of committing (which is a no-op for readers anyway).
+        if ok
+            && !txn_has_pending_writes
+            && !*self.concurrent_txn.borrow()
+            && self.live_vtab_transactions.borrow().is_empty()
+        {
+            let cookie = *self.schema_cookie.borrow();
+            *self.cached_read_snapshot.borrow_mut() = Some(txn);
+            self.cached_read_snapshot_cookie.set(cookie);
+            *self.concurrent_txn.borrow_mut() = false;
+            *self.concurrent_session_id.borrow_mut() = None;
+            self.txn_metrics_mark_finished();
+            if hot_path_profile_enabled() {
+                FSQLITE_CACHED_READ_SNAPSHOT_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            return Ok(());
+        }
+
         if ok && !self.live_vtab_transactions.borrow().is_empty() {
             if let Err(sync_error) = self.live_vtab_sync_all(cx) {
                 if *self.concurrent_txn.borrow() {
@@ -14073,6 +14140,12 @@ impl Connection {
             return Err(FrankenError::Internal(
                 "cannot start a transaction within a transaction".to_owned(),
             ));
+        }
+
+        // Invalidate cached read snapshot — explicit BEGIN starts a fresh txn.
+        {
+            let cx = self.op_cx()?;
+            self.invalidate_cached_read_snapshot(&cx);
         }
 
         // Determine effective mode: explicit mode wins; if absent, promote to
@@ -21038,7 +21111,7 @@ impl Connection {
 
         // Apply ORDER BY from the original select.
         if !select.order_by.is_empty() {
-            let result_columns: Vec<ResultColumn> = columns.to_vec();
+            let result_columns: Vec<ResultColumn> = columns.clone();
             let empty_collations: Vec<Option<String>> = Vec::new();
             sort_rows_by_order_terms(
                 &mut result_rows,
@@ -23692,6 +23765,11 @@ impl Connection {
         self.parse_cache.borrow_mut().clear();
         self.compiled_cache.borrow_mut().clear();
         self.table_execution_metadata_cache.borrow_mut().take();
+        // Invalidate cached read snapshot — DDL changed schema.
+        let cx_result = self.op_cx();
+        if let Ok(cx) = cx_result {
+            self.invalidate_cached_read_snapshot(&cx);
+        }
         Ok(())
     }
 

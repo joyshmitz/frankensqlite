@@ -2098,15 +2098,27 @@ fn codegen_select_index_equality_scan(
     });
     let covering_output = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
     let needs_table_lookup = covering_output.is_none();
+    let fast_path_done_label = if needs_table_lookup {
+        done_label
+    } else {
+        b.emit_label()
+    };
 
     if let Some(lim_r) = limit_reg {
-        emit_limit_zero_guard(b, lim_r, done_label);
+        emit_limit_zero_guard(b, lim_r, fast_path_done_label);
     }
 
     let param_reg = b.alloc_regs(2);
     let min_rowid_reg = param_reg + 1;
     emit_expr(b, target_expr, param_reg, None);
-    b.emit_jump_to_label(Opcode::IsNull, param_reg, 0, done_label, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::IsNull,
+        param_reg,
+        0,
+        fast_path_done_label,
+        P4::None,
+        0,
+    );
 
     let saw_index_match_reg = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
@@ -2122,14 +2134,16 @@ fn codegen_select_index_equality_scan(
         0,
     );
 
-    b.emit_op(
-        Opcode::OpenRead,
-        cursor,
-        table.root_page,
-        0,
-        P4::Table(table.name.clone()),
-        0,
-    );
+    if needs_table_lookup {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
     b.emit_op(
         Opcode::OpenRead,
         idx_cursor,
@@ -2183,20 +2197,44 @@ fn codegen_select_index_equality_scan(
     }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     if let Some(lim_r) = limit_reg {
-        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::DecrJumpZero,
+            lim_r,
+            0,
+            fast_path_done_label,
+            P4::None,
+            0,
+        );
     }
 
     b.resolve_label(idx_skip_label);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let idx_loop_body = idx_loop_top as i32;
     b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
-    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, fast_path_done_label, P4::None, 0);
 
     b.resolve_label(duplicate_run_done);
-    b.emit_jump_to_label(Opcode::If, saw_index_match_reg, 0, done_label, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::If,
+        saw_index_match_reg,
+        0,
+        fast_path_done_label,
+        P4::None,
+        0,
+    );
     b.emit_jump_to_label(Opcode::Goto, 0, 0, full_scan_fallback, P4::None, 0);
 
     b.resolve_label(full_scan_fallback);
+    if !needs_table_lookup {
+        b.emit_op(
+            Opcode::OpenRead,
+            cursor,
+            table.root_page,
+            0,
+            P4::Table(table.name.clone()),
+            0,
+        );
+    }
     let loop_start = b.current_addr();
     b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
     let skip_label = b.emit_label();
@@ -2229,6 +2267,11 @@ fn codegen_select_index_equality_scan(
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    if !needs_table_lookup {
+        b.resolve_label(fast_path_done_label);
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    }
     b.resolve_label(end_label);
     Ok(())
 }
@@ -15512,6 +15555,10 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
         let ops = prog.ops();
+        let seek_ge_idx = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::SeekGE)
+            .expect("covering equality fast path should probe the chosen index");
 
         assert!(
             ops.iter().any(|op| {
@@ -15523,6 +15570,18 @@ mod tests {
         assert!(
             !ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
             "covering planner directive should avoid table lookups in equality scans"
+        );
+        assert!(
+            !ops[..seek_ge_idx].iter().any(|op| {
+                op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(name) if name == "t")
+            }),
+            "covering equality fast path should defer opening the table cursor until fallback"
+        );
+        assert!(
+            ops[seek_ge_idx + 1..].iter().any(|op| {
+                op.opcode == Opcode::OpenRead && matches!(&op.p4, P4::Table(name) if name == "t")
+            }),
+            "covering equality fast path should retain a lazy table-open fallback"
         );
     }
 

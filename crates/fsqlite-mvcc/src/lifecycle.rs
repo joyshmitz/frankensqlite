@@ -28,9 +28,7 @@ use crate::core_types::{
 };
 use crate::ebr::{GLOBAL_EBR_METRICS, VersionGuardRegistry, VersionGuardTicket};
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
-use crate::observability::{
-    mvcc_snapshot_established, mvcc_snapshot_released, record_snapshot_read_versions_traversed,
-};
+use crate::observability::{mvcc_snapshot_established, mvcc_snapshot_released};
 use crate::shm::SharedMemoryLayout;
 
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 100;
@@ -639,28 +637,8 @@ impl TransactionManager {
             );
         }
 
-        // Resolve from version store with traversal diagnostics.
-        let snapshot_ts = txn.snapshot.high.get();
-        let span = tracing::span!(
-            tracing::Level::DEBUG,
-            "snapshot_read",
-            txn_id = txn.txn_id.get(),
-            snapshot_ts,
-            versions_traversed = tracing::field::Empty
-        );
-        let _entered = span.enter();
-        let resolve = self.version_store.resolve_with_trace(pgno, &txn.snapshot);
-        span.record("versions_traversed", resolve.versions_traversed);
-        record_snapshot_read_versions_traversed(resolve.versions_traversed);
-        tracing::debug!(
-            txn_id = %txn.txn_id,
-            page = pgno.get(),
-            snapshot_ts,
-            versions_traversed = resolve.versions_traversed,
-            "snapshot version chain traversal"
-        );
-
-        let idx = resolve.version_idx?;
+        // Resolve visible version from the version store.
+        let idx = self.version_store.resolve(pgno, &txn.snapshot)?;
         let version = self.version_store.get_version(idx)?;
         txn.record_page_read(pgno, version.commit_seq);
         Some(version.data)
@@ -1048,8 +1026,10 @@ impl TransactionManager {
         txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
 
         // No page lock needed (mutex provides exclusion).
-        // Track in write_set.
-        if !txn.write_set.contains(&pgno) {
+        // Track in write_set — check write_set_data (HashMap, O(1)) instead of
+        // write_set (Vec, O(n)) to avoid linear scan on repeated page writes.
+        let is_new_page = !txn.write_set_data.contains_key(&pgno);
+        if is_new_page {
             txn.write_set.push(pgno);
         }
         Arc::make_mut(&mut txn.write_set_data).insert(pgno, data);
@@ -1088,8 +1068,10 @@ impl TransactionManager {
 
         txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
 
-        // Track in write_set.
-        if !txn.write_set.contains(&pgno) {
+        // Track in write_set.  Use the page_locks insert result to avoid an
+        // O(n) Vec::contains scan — if the page was newly locked, it cannot
+        // already be in write_set (locks are acquired before writes).
+        if newly_locked {
             txn.write_set.push(pgno);
         }
         Arc::make_mut(&mut txn.write_set_data).insert(pgno, data);

@@ -249,24 +249,40 @@ impl std::fmt::Debug for VersionArena {
 /// Number of shards in the lock table (power of 2 for fast modular indexing).
 pub const LOCK_TABLE_SHARDS: usize = 64;
 
+/// Size of the flat atomic lock array covering page numbers 1..=FAST_LOCK_ARRAY_SIZE.
+/// 65536 entries × 8 bytes = 512 KiB, same footprint as the CommitIndex fast array.
+const FAST_LOCK_ARRAY_SIZE: usize = 65536;
+
 /// A single cache-line-aligned lock table shard.
 type LockShard = CacheAligned<Mutex<HashMap<PageNumber, TxnId, PageNumberBuildHasher>>>;
 
 /// In-process page-level exclusive write locks.
 ///
-/// Sharded into [`LOCK_TABLE_SHARDS`] buckets to reduce contention.
-/// Each shard maps `PageNumber -> TxnId` for the transaction holding the lock.
-/// Shards are wrapped in [`CacheAligned`] to prevent false sharing (§1.5).
+/// **Hekaton-style fast path (§8.10):** For page numbers 1..=65536, locks are
+/// stored in a flat `AtomicU64` array where 0 = unlocked and non-zero = the
+/// raw `TxnId` of the holder.  `try_acquire` is a single compare-and-swap
+/// (lock-free!), eliminating all Mutex contention on the hot path.
+///
+/// For page numbers > 65536, falls back to sharded Mutex+HashMap buckets
+/// (same as before).
 ///
 /// Supports a rolling rebuild protocol (§5.6.3.1) where the table can operate
 /// in dual-table mode: an **active** table for new acquisitions and a
 /// **draining** table that is consulted for existing locks during the drain
 /// phase. This avoids stop-the-world abort storms during maintenance.
 pub struct InProcessPageLockTable {
+    /// Lock-free fast path: flat atomic array for pages 1..=65536.
+    /// Slot value 0 = unlocked; non-zero = TxnId.get() of the holder.
+    fast_locks: Box<[AtomicU64]>,
+    /// Sharded fallback for pages > 65536.
     shards: Box<[LockShard; LOCK_TABLE_SHARDS]>,
     /// During rolling rebuild: the old shards being drained. Protected by
     /// `Mutex` for synchronization. `None` when no rebuild is in progress.
     draining: Mutex<Option<DrainingState>>,
+    /// Fast-path flag: `true` only when a rolling rebuild is in progress.
+    /// Avoids taking the `draining` mutex on every `try_acquire` call
+    /// (rebuilds are extremely rare — maintenance-only operations).
+    has_draining: std::sync::atomic::AtomicBool,
     /// Monotonic counter for waking parked page-lock waiters after releases.
     change_epoch: AtomicU64,
     /// Park/wake gate paired with [`change_epoch`] to avoid hot-path spin/yield
@@ -344,16 +360,26 @@ pub enum RebuildError {
 }
 
 impl InProcessPageLockTable {
+    /// Allocate the flat atomic lock array (shared by all constructors).
+    fn alloc_fast_locks() -> Box<[AtomicU64]> {
+        let v: Vec<AtomicU64> = (0..FAST_LOCK_ARRAY_SIZE)
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        v.into_boxed_slice()
+    }
+
     /// Create a new empty lock table with no observer.
     #[must_use]
     pub fn new() -> Self {
         Self {
+            fast_locks: Self::alloc_fast_locks(),
             shards: Box::new(std::array::from_fn(|_| {
                 CacheAligned::new(Mutex::new(HashMap::with_hasher(
                     PageNumberBuildHasher::default(),
                 )))
             })),
             draining: Mutex::new(None),
+            has_draining: std::sync::atomic::AtomicBool::new(false),
             change_epoch: AtomicU64::new(0),
             change_gate: Mutex::new(()),
             change_cv: Condvar::new(),
@@ -367,12 +393,14 @@ impl InProcessPageLockTable {
         observer: std::sync::Arc<dyn fsqlite_observability::ConflictObserver>,
     ) -> Self {
         Self {
+            fast_locks: Self::alloc_fast_locks(),
             shards: Box::new(std::array::from_fn(|_| {
                 CacheAligned::new(Mutex::new(HashMap::with_hasher(
                     PageNumberBuildHasher::default(),
                 )))
             })),
             draining: Mutex::new(None),
+            has_draining: std::sync::atomic::AtomicBool::new(false),
             change_epoch: AtomicU64::new(0),
             change_gate: Mutex::new(()),
             change_cv: Condvar::new(),
@@ -403,8 +431,10 @@ impl InProcessPageLockTable {
     /// first. A lock in the draining table is still valid and blocks new
     /// acquisitions by other transactions.
     pub fn try_acquire(&self, page: PageNumber, txn: TxnId) -> Result<(), TxnId> {
-        // Step 1: Check draining table first (§5.6.3.1 acquire step 1).
-        {
+        // Step 0: Check draining table — but ONLY if a rebuild is in progress.
+        // Rolling rebuilds are extremely rare (maintenance-only), so the
+        // AtomicBool fast-path avoids taking the draining mutex on every call.
+        if self.has_draining.load(std::sync::atomic::Ordering::Relaxed) {
             let draining_guard = self.draining.lock();
             if let Some(ref draining) = *draining_guard {
                 let shard_idx = Self::shard_index_static(page);
@@ -426,7 +456,38 @@ impl InProcessPageLockTable {
             }
         }
 
-        // Step 2: Acquire in active table.
+        let pgno = page.get() as usize;
+
+        // Step 1 (Hekaton fast path): For pages 1..=65536, use lock-free CAS
+        // on the flat atomic array — no Mutex, no HashMap, zero contention.
+        if pgno <= FAST_LOCK_ARRAY_SIZE {
+            let slot = &self.fast_locks[pgno - 1];
+            let txn_raw = txn.get();
+            // CAS: 0 (unlocked) → txn_raw (locked by us).
+            match slot.compare_exchange(0, txn_raw, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(()), // Lock acquired
+                Err(current) => {
+                    if current == txn_raw {
+                        return Ok(()); // Already held by this txn (re-entrant)
+                    }
+                    // Held by another txn — reconstruct the holder TxnId.
+                    // current != 0 (that was the CAS expected value), and the
+                    // value was stored by a prior try_acquire which used txn.get(),
+                    // so TxnId::new is guaranteed to succeed.
+                    let holder =
+                        TxnId::new(current).expect("page lock slot held non-zero non-TxnId");
+                    crate::observability::emit_page_lock_contention(
+                        &self.observer,
+                        page,
+                        txn,
+                        holder,
+                    );
+                    return Err(holder);
+                }
+            }
+        }
+
+        // Step 2 (fallback): Pages > 65536 use the sharded Mutex+HashMap.
         let shard = &self.shards[Self::shard_index_static(page)];
         let mut map = shard.lock();
         if let Some(&holder) = map.get(&page) {
@@ -446,56 +507,91 @@ impl InProcessPageLockTable {
     /// Checks both active and draining tables. Returns `true` if the lock was
     /// released from either table.
     pub fn release(&self, page: PageNumber, txn: TxnId) -> bool {
-        let shard_idx = Self::shard_index_static(page);
+        let pgno = page.get() as usize;
 
-        // Try active table first (most common case).
-        let shard = &self.shards[shard_idx];
-        let mut map = shard.lock();
-        if map.get(&page) == Some(&txn) {
-            map.remove(&page);
-            drop(map);
-            self.notify_waiters();
-            return true;
-        }
-        drop(map);
-
-        // Try draining table if present.
-        let draining_guard = self.draining.lock();
-        if let Some(ref draining) = *draining_guard {
-            let mut drain_map = draining.shards[shard_idx].lock();
-            if drain_map.get(&page) == Some(&txn) {
-                drain_map.remove(&page);
-                drop(drain_map);
-                drop(draining_guard);
+        // Fast path: pages 1..=65536 use lock-free CAS on the flat array.
+        if pgno <= FAST_LOCK_ARRAY_SIZE {
+            let slot = &self.fast_locks[pgno - 1];
+            let txn_raw = txn.get();
+            // CAS: txn_raw (our lock) → 0 (unlocked).
+            if slot
+                .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
                 self.notify_waiters();
                 return true;
             }
-            drop(drain_map);
+            // Not held by us — check draining table below.
         }
-        drop(draining_guard);
+
+        let shard_idx = Self::shard_index_static(page);
+
+        // Fallback: try sharded active table (for pages > 65536, or if the
+        // fast-path CAS failed because the lock wasn't held by this txn).
+        if pgno > FAST_LOCK_ARRAY_SIZE {
+            let shard = &self.shards[shard_idx];
+            let mut map = shard.lock();
+            if map.get(&page) == Some(&txn) {
+                map.remove(&page);
+                drop(map);
+                self.notify_waiters();
+                return true;
+            }
+            drop(map);
+        }
+
+        // Try draining table only if a rebuild is in progress.
+        if self.has_draining.load(std::sync::atomic::Ordering::Relaxed) {
+            let draining_guard = self.draining.lock();
+            if let Some(ref draining) = *draining_guard {
+                let mut drain_map = draining.shards[shard_idx].lock();
+                if drain_map.get(&page) == Some(&txn) {
+                    drain_map.remove(&page);
+                    drop(drain_map);
+                    drop(draining_guard);
+                    self.notify_waiters();
+                    return true;
+                }
+                drop(drain_map);
+            }
+            drop(draining_guard);
+        }
         false
     }
 
     /// Release all locks held by `txn` from both active and draining tables.
     pub fn release_all(&self, txn: TxnId) {
         let mut released_any = false;
+        // Scan the fast lock array for entries held by this txn.
+        let txn_raw = txn.get();
+        for slot in self.fast_locks.iter() {
+            if slot
+                .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                released_any = true;
+            }
+        }
+        // Scan sharded tables for pages > 65536.
         for shard in self.shards.iter() {
             let mut map = shard.lock();
             let before = map.len();
             map.retain(|_, &mut v| v != txn);
             released_any |= map.len() != before;
         }
-        // Also release from draining table.
-        let draining_guard = self.draining.lock();
-        if let Some(ref draining) = *draining_guard {
-            for shard in draining.shards.iter() {
-                let mut map = shard.lock();
-                let before = map.len();
-                map.retain(|_, &mut v| v != txn);
-                released_any |= map.len() != before;
+        // Also release from draining table (only if rebuild in progress).
+        if self.has_draining.load(std::sync::atomic::Ordering::Relaxed) {
+            let draining_guard = self.draining.lock();
+            if let Some(ref draining) = *draining_guard {
+                for shard in draining.shards.iter() {
+                    let mut map = shard.lock();
+                    let before = map.len();
+                    map.retain(|_, &mut v| v != txn);
+                    released_any |= map.len() != before;
+                }
             }
+            drop(draining_guard);
         }
-        drop(draining_guard);
 
         if released_any {
             self.notify_waiters();
@@ -504,19 +600,39 @@ impl InProcessPageLockTable {
 
     /// Release a specific set of page locks held by `txn`.
     pub fn release_set(&self, pages: impl IntoIterator<Item = PageNumber>, txn: TxnId) {
-        let draining_guard = self.draining.lock();
+        let has_drain = self.has_draining.load(std::sync::atomic::Ordering::Relaxed);
+        let draining_guard = if has_drain {
+            Some(self.draining.lock())
+        } else {
+            None
+        };
+        let txn_raw = txn.get();
         let mut released_any = false;
         for page in pages {
+            let pgno = page.get() as usize;
+            // Fast path for pages 1..=65536.
+            if pgno <= FAST_LOCK_ARRAY_SIZE {
+                if self.fast_locks[pgno - 1]
+                    .compare_exchange(txn_raw, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    released_any = true;
+                }
+                continue;
+            }
+            // Fallback for pages > 65536.
             let shard_idx = Self::shard_index_static(page);
             let mut map = self.shards[shard_idx].lock();
             if map.get(&page) == Some(&txn) {
                 map.remove(&page);
                 released_any = true;
-            } else if let Some(ref draining) = *draining_guard {
-                let mut drain_map = draining.shards[shard_idx].lock();
-                if drain_map.get(&page) == Some(&txn) {
-                    drain_map.remove(&page);
-                    released_any = true;
+            } else if let Some(ref guard) = draining_guard {
+                if let Some(ref draining) = **guard {
+                    let mut drain_map = draining.shards[shard_idx].lock();
+                    if drain_map.get(&page) == Some(&txn) {
+                        drain_map.remove(&page);
+                        released_any = true;
+                    }
                 }
             }
         }
@@ -604,7 +720,13 @@ impl InProcessPageLockTable {
     /// Total number of locks currently held across all shards (active table only).
     #[must_use]
     pub fn lock_count(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().len()).sum()
+        let fast_count = self
+            .fast_locks
+            .iter()
+            .filter(|s| s.load(Ordering::Relaxed) != 0)
+            .count();
+        let shard_count: usize = self.shards.iter().map(|s| s.lock().len()).sum();
+        fast_count + shard_count
     }
 
     /// Total number of locks in the draining table (0 if no rebuild in progress).
@@ -684,6 +806,8 @@ impl InProcessPageLockTable {
             initial_lock_count: initial_count,
             rebuild_epoch: epoch,
         });
+        self.has_draining
+            .store(true, std::sync::atomic::Ordering::Release);
         drop(draining_guard);
 
         Ok(epoch)
@@ -812,6 +936,8 @@ impl InProcessPageLockTable {
 
         // Clear the draining state.
         *draining_guard = None;
+        self.has_draining
+            .store(false, std::sync::atomic::Ordering::Release);
         drop(draining_guard);
 
         Ok(RebuildResult {
@@ -1524,10 +1650,15 @@ impl CommitIndex {
         );
         let pgno = page.get() as usize;
         if pgno <= FAST_COMMIT_ARRAY_SIZE {
-            // O(1) atomic write to flat array.
+            // O(1) atomic write to flat array — this is the hot path.
+            // Skip the sharded LeftRight write for hot pages since `latest()`
+            // reads exclusively from the fast array for pages ≤ 65536.
+            // The sharded path is only needed for len()/debug/diagnostics,
+            // which can lazily scan the fast array instead.
             self.fast_array[pgno - 1].store(seq.get(), Ordering::Release);
+            return;
         }
-        // Always update the sharded path for len()/debug/large-page correctness.
+        // Fallback: large page numbers use the sharded path.
         let shard = &self.shards[self.shard_index(page)];
         shard.update(page, seq);
     }
