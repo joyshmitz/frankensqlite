@@ -1218,10 +1218,7 @@ fn log_planner_select_directive_outcome(
     }
 
     let run_id = env::var("RUN_ID").unwrap_or_else(|_| "(none)".to_owned());
-    let trace_id = env::var("TRACE_ID")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
+    let trace_id = env::var("TRACE_ID").unwrap_or_else(|_| "(none)".to_owned());
     let scenario_id = env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
     let index_name = directive.index_name.as_deref().unwrap_or("(none)");
     let index_column = directive.index_column.as_deref().unwrap_or("(none)");
@@ -1667,6 +1664,7 @@ pub fn codegen_select(
                             out_col_count,
                             done_label,
                             end_label,
+                            stmt.limit.as_ref(),
                             target_expr,
                         );
                     }
@@ -1700,6 +1698,7 @@ pub fn codegen_select(
                                         schema,
                                         columns,
                                         where_clause.as_deref(),
+                                        stmt.limit.as_ref(),
                                         out_regs,
                                         out_col_count,
                                         done_label,
@@ -1796,6 +1795,7 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
+            stmt.limit.as_ref(),
             target_expr,
         )
     } else if let Some(rowid_range) = rowid_range {
@@ -1842,6 +1842,7 @@ pub fn codegen_select(
                 schema,
                 columns,
                 where_clause.as_deref(),
+                stmt.limit.as_ref(),
                 out_regs,
                 out_col_count,
                 done_label,
@@ -2006,8 +2007,26 @@ fn codegen_select_rowid_lookup(
     out_col_count: i32,
     done_label: crate::Label,
     end_label: crate::Label,
+    limit_clause: Option<&LimitClause>,
     target_expr: &Expr,
 ) -> Result<(), CodegenError> {
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
+
     let rowid_reg = b.alloc_reg();
     emit_expr(b, target_expr, rowid_reg, None);
     b.emit_op(
@@ -2027,8 +2046,16 @@ fn codegen_select_rowid_lookup(
         P4::None,
         0,
     );
+    let skip_label = b.emit_label();
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
     emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+    b.resolve_label(skip_label);
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
@@ -2045,6 +2072,7 @@ fn codegen_select_index_equality_scan(
     schema: &[TableSchema],
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
+    limit_clause: Option<&LimitClause>,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
@@ -2056,6 +2084,24 @@ fn codegen_select_index_equality_scan(
     let full_scan_fallback = b.emit_label();
     let duplicate_run_done = b.emit_label();
     let where_placeholder_base = b.current_anon_placeholder();
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+    let covering_output = resolve_covering_output_sources(columns, table, table_alias, idx_schema);
+    let needs_table_lookup = covering_output.is_none();
+
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
 
     let param_reg = b.alloc_regs(2);
     let min_rowid_reg = param_reg + 1;
@@ -2116,18 +2162,29 @@ fn codegen_select_index_equality_scan(
     let rowid_reg = b.alloc_reg();
     b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
     let idx_skip_label = b.emit_label();
-    b.emit_jump_to_label(
-        Opcode::SeekRowid,
-        cursor,
-        rowid_reg,
-        idx_skip_label,
-        P4::None,
-        0,
-    );
-
-    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
-    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     b.emit_op(Opcode::Integer, 1, saw_index_match_reg, 0, P4::None, 0);
+    if needs_table_lookup {
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            idx_skip_label,
+            P4::None,
+            0,
+        );
+    }
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, idx_skip_label, P4::None, 0);
+    }
+    if let Some(covering_output) = covering_output.as_ref() {
+        emit_covering_output_reads(b, idx_cursor, rowid_reg, covering_output, out_regs);
+    } else {
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
 
     b.resolve_label(idx_skip_label);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -2155,8 +2212,14 @@ fn codegen_select_index_equality_scan(
             skip_label,
         );
     }
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, skip_label, P4::None, 0);
+    }
     emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
     b.resolve_label(skip_label);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_body = (loop_start + 1) as i32;
@@ -15425,6 +15488,41 @@ mod tests {
         assert!(
             ops.iter().any(|op| op.opcode == Opcode::SeekGE),
             "stale rowid directive should fall back to the ordinary index-equality fast path"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_honors_covering_planner_index_directive_without_table_lookup() {
+        let stmt = simple_select(&["b"], "t", Some(col_cmp_param("b", AstBinaryOp::Eq, 1)));
+        let schema = test_schema_with_index();
+        let ctx = CodegenContext {
+            planner_select_directive: Some(SelectPlannerDirective {
+                plan_id: "plan-covering-equality".to_owned(),
+                plan_generation: 1,
+                planner_surface: "single_table_access_path_v1".to_owned(),
+                table_name: "t".to_owned(),
+                index_name: Some("idx_t_b".to_owned()),
+                index_column: Some("b".to_owned()),
+                covering: true,
+                access_kind: PlannerSelectAccessKind::IndexEquality,
+            }),
+            ..CodegenContext::default()
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+
+        assert!(
+            ops.iter().any(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")
+            }),
+            "covering planner directive should still open the chosen index"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "covering planner directive should avoid table lookups in equality scans"
         );
     }
 

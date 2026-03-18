@@ -1335,6 +1335,12 @@ fn finalize_hot_path_manifest(
     Ok(disk_manifest)
 }
 
+fn read_hot_path_disk_manifest(output_dir: &Path) -> io::Result<HotPathArtifactManifest> {
+    let manifest_json = fs::read_to_string(output_dir.join("manifest.json"))?;
+    serde_json::from_str(&manifest_json)
+        .map_err(|error| io::Error::other(format!("artifact manifest JSON: {error}")))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serialize_run_output(
     recorded_unix_ms: u64,
@@ -3922,15 +3928,19 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             return 1;
         }
     };
-    let manifest = match finalize_hot_path_manifest(
+    if let Err(error) = finalize_hot_path_manifest(
         &output_dir,
         manifest,
         counter_capture_summary,
         vec![command_pack_file],
     ) {
+        eprintln!("error: failed to finalize hot-path manifest: {error}");
+        return 1;
+    }
+    let disk_manifest = match read_hot_path_disk_manifest(&output_dir) {
         Ok(manifest) => manifest,
         Err(error) => {
-            eprintln!("error: failed to finalize hot-path manifest: {error}");
+            eprintln!("error: failed to read hot-path manifest: {error}");
             return 1;
         }
     };
@@ -3938,7 +3948,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
     if emit_inline_bundle {
         match serialize_hot_path_inline_bundle(
             &report,
-            &manifest,
+            &disk_manifest,
             &command_pack,
             Some(&microarchitectural_context),
         ) {
@@ -3959,7 +3969,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             }
         }
     } else {
-        match serde_json::to_string(&manifest) {
+        match serde_json::to_string(&disk_manifest) {
             Ok(json) => println!("{json}"),
             Err(error) => {
                 eprintln!("error: failed to serialize hot-path manifest: {error}");
@@ -6262,6 +6272,62 @@ mod tests {
             Some(counter_capture_summary)
         );
         assert_eq!(finalized.provenance, Some(provenance));
+    }
+
+    #[test]
+    fn hot_profile_stdout_manifest_matches_disk_manifest_semantics() {
+        let tempdir = tempfile::tempdir().expect("tempdir should succeed");
+        let report = sample_hot_path_report();
+        let replay_command = HotProfileReplayCommand {
+            db: "fixture-a",
+            workload: "mixed_read_write",
+            golden_dir: Path::new("/tmp/golden"),
+            working_base: Path::new("/tmp/working"),
+            concurrency: 4,
+            seed: 42,
+            scale: 50,
+            output_dir: Path::new("/tmp/out"),
+            mvcc: true,
+            run_integrity_check: false,
+        };
+        let command_pack = build_hot_path_command_pack(&report, &replay_command);
+        let counter_capture_summary = build_hot_path_counter_capture_summary(&command_pack);
+        let mut manifest = sample_hot_path_manifest();
+        write_sample_hot_path_artifacts(tempdir.path(), &manifest.files);
+        manifest.provenance = Some(build_hot_path_artifact_provenance(
+            &report,
+            &command_pack,
+            counter_capture_summary.as_ref(),
+            sample_hot_path_provenance_inputs(),
+        ));
+        let finalized = finalize_hot_path_manifest(
+            tempdir.path(),
+            manifest,
+            counter_capture_summary,
+            vec![HotPathArtifactFile {
+                path: HOT_PATH_COMMAND_PACK_NAME.to_owned(),
+                bytes: 77,
+                sha256: "0".repeat(64),
+                description: "command pack".to_owned(),
+            }],
+        )
+        .expect("manifest finalization should succeed");
+
+        let disk_manifest_json = fs::read_to_string(tempdir.path().join("manifest.json"))
+            .expect("disk manifest should be readable");
+        let disk_manifest_value: Value =
+            serde_json::from_str(&disk_manifest_json).expect("disk manifest should parse");
+        let stdout_manifest_json = serde_json::to_string(
+            &read_hot_path_disk_manifest(tempdir.path()).expect("stdout manifest should load"),
+        )
+        .expect("stdout manifest should serialize");
+        let stdout_manifest_value: Value =
+            serde_json::from_str(&stdout_manifest_json).expect("stdout manifest should parse");
+        assert_eq!(stdout_manifest_value, disk_manifest_value);
+        assert_ne!(
+            stdout_manifest_json,
+            serde_json::to_string(&finalized).expect("in-memory manifest should serialize")
+        );
     }
 
     #[test]

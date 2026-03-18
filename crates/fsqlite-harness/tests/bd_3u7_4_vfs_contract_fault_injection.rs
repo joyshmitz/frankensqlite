@@ -11,15 +11,15 @@ use fsqlite_error::FrankenError;
 use fsqlite_harness::fault_vfs::{
     FaultInjectingVfs, FaultMetricsSnapshot, FaultSpec, TEST_VFS_FAULT_COUNTER_NAME,
 };
+use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
-use fsqlite_types::LockLevel;
-use fsqlite_vfs::traits::{Vfs, VfsFile};
 #[cfg(target_os = "linux")]
 use fsqlite_vfs::IoUringVfs;
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
+use fsqlite_vfs::traits::{Vfs, VfsFile};
 use serde::Serialize;
 #[cfg(unix)]
 use tempfile::TempDir;
@@ -405,17 +405,18 @@ fn wait_unix_lock_probe_child(
     send_release: bool,
 ) -> Result<(std::process::ExitStatus, String, String), String> {
     let release_error = if send_release {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "unix_cross_child_missing_stdin".to_owned())?;
-        let release_line = format!("{UNIX_LOCK_CHILD_RELEASE_CMD}\n");
-        if let Err(error) = stdin.write_all(release_line.as_bytes()) {
-            Some(format!("write_failed error={error}"))
-        } else if let Err(error) = stdin.flush() {
-            Some(format!("flush_failed error={error}"))
-        } else {
-            None
+        match child.stdin.take() {
+            Some(mut stdin) => {
+                let release_line = format!("{UNIX_LOCK_CHILD_RELEASE_CMD}\n");
+                if let Err(error) = stdin.write_all(release_line.as_bytes()) {
+                    Some(format!("write_failed error={error}"))
+                } else if let Err(error) = stdin.flush() {
+                    Some(format!("flush_failed error={error}"))
+                } else {
+                    None
+                }
+            }
+            None => Some("missing_stdin".to_owned()),
         }
     } else {
         let _ = child.stdin.take();
@@ -437,6 +438,11 @@ fn wait_unix_lock_probe_child(
     }
 
     Ok((output.status, stdout, stderr))
+}
+
+#[cfg(unix)]
+fn stdout_has_marker_line(stdout: &str, marker: &str) -> bool {
+    stdout.lines().any(|line| line.trim_end() == marker)
 }
 
 #[cfg(unix)]
@@ -611,10 +617,11 @@ fn run_unix_cross_process_lock_probe() -> Result<String, String> {
             break false;
         }
         stdout_log.push_str(&line);
-        if line.contains(UNIX_LOCK_CHILD_READY) {
+        if line.trim_end() == UNIX_LOCK_CHILD_READY {
             break true;
         }
     };
+    stdout_log.push_str(&String::from_utf8_lossy(stdout.buffer()));
     child.stdout = Some(stdout.into_inner());
 
     if !ready_seen {
@@ -677,7 +684,7 @@ fn run_unix_cross_process_lock_probe() -> Result<String, String> {
             child_status, child_stdout, child_stderr
         ));
     }
-    if !child_stdout.contains(UNIX_LOCK_CHILD_RELEASED) {
+    if !stdout_has_marker_line(&child_stdout, UNIX_LOCK_CHILD_RELEASED) {
         return Err(format!(
             "unix_cross_child_missing_release_marker stdout={child_stdout}"
         ));

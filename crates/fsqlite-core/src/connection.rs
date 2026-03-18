@@ -1892,15 +1892,12 @@ impl TriggerFrame {
                     || prefix.eq_ignore_ascii_case("new")
                     || prefix.eq_ignore_ascii_case(&self.table_name)
             }
-            // Bare column references (no table prefix) must NOT be replaced
-            // with trigger pseudo-column values.  In a trigger body's DML
-            // (UPDATE/DELETE/INSERT), bare names like `id` in `WHERE id = ...`
-            // refer to the DML's target table columns, not to OLD/NEW rows.
-            // Only explicitly prefixed references (NEW.id, OLD.id) should
-            // resolve to trigger values.  The previous `None => true` caused
-            // `WHERE id = NEW.id` to become `WHERE 1 = 1` (both sides
-            // replaced with the same literal), updating all rows.
-            None => false,
+            // Bare column references (no table prefix) resolve to NEW/OLD
+            // in trigger SELECT bodies (e.g. SELECT RAISE(...) WHERE val > 10).
+            // DML trigger bodies (UPDATE/DELETE/INSERT) use the dedicated
+            // `bind_trigger_prefixed_only_in_expr` which skips bare names so
+            // they resolve against the DML's target table instead.
+            None => true,
         }
     }
 
@@ -13779,8 +13776,8 @@ impl Connection {
     /// `StorageCursor` reads from the pager B-tree first.  If the root page
     /// collides with a stale pager page (e.g. from a previously-dropped
     /// table), the VDBE would read that stale data instead of our virtual
-    /// rows.  We avoid this by bumping the MemDatabase's `next_root_page`
-    /// past the pager's page count before allocating.
+    /// rows.  We avoid this by probing candidate pages via `get_page` and
+    /// advancing `next_root_page` past any non-zero (occupied) pages.
     fn execute_with_materialized_sqlite_schema(
         &self,
         select: &SelectStatement,
@@ -13803,29 +13800,36 @@ impl Connection {
             // stale data from a dropped table) and falls through to the
             // MemDatabase path.
             //
-            // Probe via get_page: advance MemDatabase's next_root_page
-            // until we find a page the pager returns all-zeros for (or
-            // fails to read), guaranteeing the VDBE won't find a stale
-            // B-tree at the temp table's root page.
+            // Probe via get_page: find `need` consecutive zero (or
+            // unreadable) pages so every temp table created below lands
+            // on a clean page.
             if let Some(txn) = self.active_txn.borrow().as_ref() {
                 let cx = self.op_cx()?;
                 let mut db = self.db.borrow_mut();
-                let mut candidate = db.next_root_page();
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let need = referenced.len() as i32;
+                let mut start = db.next_root_page();
+                let mut clean = 0_i32;
                 #[allow(clippy::cast_sign_loss)]
-                while let Some(pgno) = PageNumber::new(candidate as u32) {
-                    match txn.get_page(&cx, pgno) {
-                        Ok(page_data) => {
-                            if page_data.as_ref().iter().all(|&b| b == 0) {
-                                break; // Zero page — safe to use
-                            }
-                            // Non-zero: pager has stale data here, skip it.
-                            candidate += 1;
-                        }
-                        Err(_) => break, // Read error — page doesn't exist, safe
+                while clean < need {
+                    let page = start + clean;
+                    let Some(pgno) = PageNumber::new(page as u32) else {
+                        break;
+                    };
+                    let is_clean = match txn.get_page(&cx, pgno) {
+                        Ok(data) => data.as_ref().iter().all(|&b| b == 0),
+                        Err(_) => true, // unreadable → page doesn't exist
+                    };
+                    if is_clean {
+                        clean += 1;
+                    } else {
+                        // Restart search after this occupied page.
+                        start = page + 1;
+                        clean = 0;
                     }
                 }
-                if candidate > db.next_root_page() {
-                    db.set_next_root_page(candidate);
+                if start > db.next_root_page() {
+                    db.set_next_root_page(start);
                 }
             }
 
@@ -13862,29 +13866,21 @@ impl Connection {
             // current root_page.
             self.compiled_cache.borrow_mut().clear();
 
-            // Force the inner query to read from MemDatabase instead of the
-            // pager B-tree.  The VDBE StorageCursor reads from the pager, but
-            // the pager page at the materialized root_page may still contain
-            // stale data from a previously-dropped table (page recycling).
+            // Route through connection-level interpreted paths that read from
+            // MemDatabase rather than the full dispatch chain (which reaches
+            // VDBE StorageCursor → pager B-tree where a recycled page may
+            // still hold stale data from a dropped table).
+            let bound = bind_placeholders_in_select_for_fallback(select, params)?;
+            let cx = self.op_cx()?;
+            let implicit_agg = has_implicit_aggregation(select) && !has_group_by(select);
             // Setting time_travel_active forces execute_join_select to read
             // from self.db (MemDatabase) where the virtual rows were freshly
-            // inserted.
-            // Route the inner query through the connection-level interpreted
-            // path that reads from MemDatabase rather than the full dispatch
-            // chain (which reaches VDBE StorageCursor → pager B-tree where
-            // a recycled page may still hold stale data from a dropped table).
-            // Setting time_travel_active forces execute_join_select to read
-            // from self.db where the virtual rows were freshly inserted.
-            let bound = bind_placeholders_in_select_for_fallback(select, params)?;
+            // inserted, rather than calling self.query() which goes through
+            // the pager and may return stale data from a recycled page.
+            // All fallible operations that use `?` must precede this flag
+            // change so that an early-return doesn't leave it stuck on.
             let prev_time_travel = self.time_travel_active.get();
             self.time_travel_active.set(true);
-            let implicit_agg = has_implicit_aggregation(select) && !has_group_by(select);
-            // Use execute_group_by_join_select (which scans rows via
-            // execute_join_select, respecting time_travel_active →
-            // MemDatabase reads) instead of execute_group_by_select
-            // (which uses compile_table_select → VDBE → pager and
-            // would fail with ReadOnly on a SELECT autocommit txn).
-            let cx = self.op_cx()?;
             let mut result = if has_group_by(select)
                 || has_implicit_aggregation(select)
                 || has_ordered_aggregate(select)
@@ -13899,12 +13895,33 @@ impl Connection {
 
             // Naked aggregates (COUNT/SUM/etc. without GROUP BY) must always
             // produce exactly one row, even when the source table is empty.
-            // The connection-level execute_group_by_select may return an empty
-            // result set for zero input rows; fix that up here.
+            // Build the row with empty-set aggregate defaults (COUNT→0,
+            // SUM/AVG→NULL, TOTAL→0.0).  We cannot use execute_fromless_aggregate
+            // here because it assumes one implicit input row (no FROM) and
+            // returns COUNT(*)=1, whereas we need COUNT(*)=0 for an empty table.
             if implicit_agg {
                 if let Ok(ref rows) = result {
                     if rows.is_empty() {
-                        result = self.execute_fromless_aggregate(select);
+                        if let SelectCore::Select { columns, .. } = &select.body.select {
+                            let defaults: Vec<SqliteValue> = columns
+                                .iter()
+                                .map(|col| {
+                                    if let ResultColumn::Expr {
+                                        expr: Expr::FunctionCall { name, .. },
+                                        ..
+                                    } = col
+                                    {
+                                        if is_agg_fn(name) {
+                                            return empty_aggregate_default(
+                                                &name.to_ascii_lowercase(),
+                                            );
+                                        }
+                                    }
+                                    SqliteValue::Null
+                                })
+                                .collect();
+                            result = Ok(vec![Row { values: defaults }]);
+                        }
                     }
                 }
             }
@@ -20497,6 +20514,11 @@ impl Connection {
             args: Vec<Expr>,
             order_by: Vec<(Expr, bool)>,
             partition_by: Vec<Expr>,
+            /// For each ORDER BY expr, if it's an aggregate, the index into
+            /// `extra_agg_exprs`; otherwise `None`.
+            ob_agg_map: Vec<Option<usize>>,
+            /// Same for PARTITION BY.
+            pb_agg_map: Vec<Option<usize>>,
             two_pass: bool,
             name: String,
             frame: Option<FrameSpec>,
@@ -20568,19 +20590,34 @@ impl Connection {
                     let aggregate_no_order = !needs_full_partition && spec.order_by.is_empty();
                     let two_pass = needs_full_partition || aggregate_no_order;
 
-                    // Collect aggregate exprs from ORDER BY/PARTITION BY
-                    for (oexpr, _) in &ob {
-                        if expr_has_aggregate(oexpr) {
-                            let alias = format!("__win_ob_{}", extra_agg_exprs.len());
-                            extra_agg_exprs.push((alias, oexpr.clone()));
-                        }
-                    }
-                    for pexpr in &pb {
-                        if expr_has_aggregate(pexpr) {
-                            let alias = format!("__win_pb_{}", extra_agg_exprs.len());
-                            extra_agg_exprs.push((alias, pexpr.clone()));
-                        }
-                    }
+                    // Collect aggregate exprs from ORDER BY/PARTITION BY,
+                    // tracking which index in extra_agg_exprs each maps to.
+                    let ob_agg_map: Vec<Option<usize>> = ob
+                        .iter()
+                        .map(|(oexpr, _)| {
+                            if expr_has_aggregate(oexpr) {
+                                let eidx = extra_agg_exprs.len();
+                                let alias = format!("__win_agg_{eidx}");
+                                extra_agg_exprs.push((alias, oexpr.clone()));
+                                Some(eidx)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let pb_agg_map: Vec<Option<usize>> = pb
+                        .iter()
+                        .map(|pexpr| {
+                            if expr_has_aggregate(pexpr) {
+                                let eidx = extra_agg_exprs.len();
+                                let alias = format!("__win_agg_{eidx}");
+                                extra_agg_exprs.push((alias, pexpr.clone()));
+                                Some(eidx)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
 
                     let idx = win_infos.len();
                     win_infos.push(WinInfo {
@@ -20588,6 +20625,8 @@ impl Connection {
                         args: arg_exprs,
                         order_by: ob,
                         partition_by: pb,
+                        ob_agg_map,
+                        pb_agg_map,
                         two_pass,
                         name: upper,
                         frame: spec.frame.clone(),
@@ -20639,24 +20678,40 @@ impl Connection {
                     let aggregate_no_order =
                         !needs_full_partition && inner_spec.order_by.is_empty();
                     let two_pass = needs_full_partition || aggregate_no_order;
-                    for (oexpr, _) in &ob {
-                        if expr_has_aggregate(oexpr) {
-                            let alias = format!("__win_ob_{}", extra_agg_exprs.len());
-                            extra_agg_exprs.push((alias, oexpr.clone()));
-                        }
-                    }
-                    for pexpr in &pb {
-                        if expr_has_aggregate(pexpr) {
-                            let alias = format!("__win_pb_{}", extra_agg_exprs.len());
-                            extra_agg_exprs.push((alias, pexpr.clone()));
-                        }
-                    }
+                    let ob_agg_map: Vec<Option<usize>> = ob
+                        .iter()
+                        .map(|(oexpr, _)| {
+                            if expr_has_aggregate(oexpr) {
+                                let eidx = extra_agg_exprs.len();
+                                let alias = format!("__win_agg_{eidx}");
+                                extra_agg_exprs.push((alias, oexpr.clone()));
+                                Some(eidx)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let pb_agg_map: Vec<Option<usize>> = pb
+                        .iter()
+                        .map(|pexpr| {
+                            if expr_has_aggregate(pexpr) {
+                                let eidx = extra_agg_exprs.len();
+                                let alias = format!("__win_agg_{eidx}");
+                                extra_agg_exprs.push((alias, pexpr.clone()));
+                                Some(eidx)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     let idx = win_infos.len();
                     win_infos.push(WinInfo {
                         func,
                         args: arg_exprs,
                         order_by: ob,
                         partition_by: pb,
+                        ob_agg_map,
+                        pb_agg_map,
                         two_pass,
                         name: upper,
                         frame: inner_spec.frame.clone(),
@@ -20708,7 +20763,7 @@ impl Connection {
 
         // Build col_map from the grouped result. We assign synthetic column
         // names: original column aliases/expressions for plain columns, and
-        // __win_ob_N / __win_pb_N for extra aggregate columns.
+        // __win_agg_N for extra aggregate columns.
         let total_gb_cols = grouped_columns.len() + extra_agg_exprs.len();
         let mut col_map: Vec<(String, String, bool)> = Vec::with_capacity(total_gb_cols);
 
@@ -20739,21 +20794,15 @@ impl Connection {
 
         for (wi, info) in win_infos.iter().enumerate() {
             // Rewrite aggregate ORDER BY/PARTITION BY expressions as column
-            // references into the extra aggregate columns.
-            let mut agg_idx = 0;
+            // references into the extra aggregate columns, using the
+            // tracked indices from Phase 1.
             let rewritten_ob: Vec<(Expr, bool)> = info
                 .order_by
                 .iter()
-                .map(|(oexpr, desc)| {
-                    if expr_has_aggregate(oexpr) {
-                        // Find the matching extra_agg_expr
-                        let col_name = format!("__win_ob_{agg_idx}");
-                        // Find the actual alias - scan extra_agg_exprs for matching expr
-                        let alias = extra_agg_exprs
-                            .iter()
-                            .find(|(_, e)| format!("{e:?}") == format!("{oexpr:?}"))
-                            .map_or(col_name, |(a, _)| a.clone());
-                        agg_idx += 1;
+                .zip(info.ob_agg_map.iter())
+                .map(|((oexpr, desc), agg_idx)| {
+                    if let Some(eidx) = agg_idx {
+                        let alias = extra_agg_exprs[*eidx].0.clone();
                         (Expr::Column(ColumnRef::bare(alias), Span::new(0, 0)), *desc)
                     } else {
                         (oexpr.clone(), *desc)
@@ -20763,12 +20812,10 @@ impl Connection {
             let rewritten_pb: Vec<Expr> = info
                 .partition_by
                 .iter()
-                .map(|pexpr| {
-                    if expr_has_aggregate(pexpr) {
-                        let alias = extra_agg_exprs
-                            .iter()
-                            .find(|(_, e)| format!("{e:?}") == format!("{pexpr:?}"))
-                            .map_or_else(|| format!("__win_pb_{agg_idx}"), |(a, _)| a.clone());
+                .zip(info.pb_agg_map.iter())
+                .map(|(pexpr, agg_idx)| {
+                    if let Some(eidx) = agg_idx {
+                        let alias = extra_agg_exprs[*eidx].0.clone();
                         Expr::Column(ColumnRef::bare(alias), Span::new(0, 0))
                     } else {
                         pexpr.clone()
@@ -20848,8 +20895,45 @@ impl Connection {
                     "NTILE" | "LEAD" | "LAG" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE"
                 );
 
-                if info.two_pass && !is_positional {
-                    // Two-pass: step all rows, then value.
+                if info.two_pass && is_peer_aware {
+                    // Peer-aware (CUME_DIST / PERCENT_RANK): direct
+                    // computation from peer-group positions.
+                    let psize = partition_indices.len();
+                    let mut pos = 0;
+                    while pos < psize {
+                        let mut peer_end = pos + 1;
+                        while peer_end < psize {
+                            let ri_a = partition_indices[pos];
+                            let ri_b = partition_indices[peer_end];
+                            let same = rewritten_ob.iter().all(|(oexpr, _)| {
+                                let va = eval_join_expr(oexpr, &row_values[ri_a], &col_map)
+                                    .unwrap_or(SqliteValue::Null);
+                                let vb = eval_join_expr(oexpr, &row_values[ri_b], &col_map)
+                                    .unwrap_or(SqliteValue::Null);
+                                cmp_sqlite_values(&va, &vb) == std::cmp::Ordering::Equal
+                            });
+                            if !same {
+                                break;
+                            }
+                            peer_end += 1;
+                        }
+                        #[allow(clippy::cast_precision_loss)]
+                        let val = if fname == "CUME_DIST" {
+                            SqliteValue::Float(peer_end as f64 / psize as f64)
+                        } else if psize <= 1 {
+                            SqliteValue::Float(0.0)
+                        } else {
+                            SqliteValue::Float(pos as f64 / (psize - 1) as f64)
+                        };
+                        for _ in pos..peer_end {
+                            func_vals.push(val.clone());
+                        }
+                        pos = peer_end;
+                    }
+                } else if info.two_pass && !is_positional {
+                    // Two-pass non-peer-aware: step all rows, then
+                    // single value repeated (full-frame aggregate without
+                    // ORDER BY, e.g. SUM() OVER ()).
                     for &ri in partition_indices {
                         let args = build_window_args(
                             &info.args,
@@ -20859,7 +20943,6 @@ impl Connection {
                         )?;
                         info.func.step(&mut state, &args)?;
                     }
-                    // Two-pass: value is the same for all rows in partition.
                     let val = info.func.value(&state)?;
                     for _ in partition_indices {
                         func_vals.push(val.clone());
@@ -20882,22 +20965,6 @@ impl Connection {
                         }
                         let val = info.func.value(&st2)?;
                         func_vals.push(val);
-                    }
-                } else if is_peer_aware {
-                    // Peer-aware: compute over entire partition.
-                    for &ri in partition_indices {
-                        let args = build_window_args(
-                            &info.args,
-                            &rewritten_ob,
-                            &row_values[ri],
-                            &col_map,
-                        )?;
-                        info.func.step(&mut state, &args)?;
-                    }
-                    // Peer-aware: same value for all rows in partition.
-                    let val = info.func.value(&state)?;
-                    for _ in partition_indices {
-                        func_vals.push(val.clone());
                     }
                 } else if frame_start_unbounded && !frame_end_unbounded {
                     // Running aggregate (UNBOUNDED PRECEDING TO CURRENT ROW).
@@ -20971,20 +21038,7 @@ impl Connection {
 
         // Apply ORDER BY from the original select.
         if !select.order_by.is_empty() {
-            // Build result columns matching the output for ORDER BY resolution.
-            let result_columns: Vec<ResultColumn> = columns
-                .iter()
-                .map(|col| match col {
-                    ResultColumn::Expr {
-                        expr,
-                        alias: Some(a),
-                    } => ResultColumn::Expr {
-                        expr: expr.clone(),
-                        alias: Some(a.clone()),
-                    },
-                    other => other.clone(),
-                })
-                .collect();
+            let result_columns: Vec<ResultColumn> = columns.to_vec();
             let empty_collations: Vec<Option<String>> = Vec::new();
             sort_rows_by_order_terms(
                 &mut result_rows,
@@ -28916,12 +28970,14 @@ fn eval_group_agg_join_expr(
         }
         Expr::Collate { expr: inner, .. } => eval_group_agg_join_expr(inner, group_rows, col_map),
         // No aggregate sub-expressions: delegate to per-row eval on first row.
+        // When group_rows is empty (implicit aggregation on an empty table),
+        // still try evaluating with an empty row — this correctly handles
+        // literals, constants, and expressions that don't reference columns
+        // (e.g. the `1` in `SELECT COUNT(*) + 1 FROM empty_table`).
         other => {
-            if let Some(first) = group_rows.first() {
-                eval_join_expr(other, first, col_map)
-            } else {
-                Ok(SqliteValue::Null)
-            }
+            let empty = Vec::new();
+            let row: &Vec<SqliteValue> = group_rows.first().copied().unwrap_or(&empty);
+            eval_join_expr(other, row, col_map).or(Ok(SqliteValue::Null))
         }
     }
 }
@@ -31071,57 +31127,6 @@ fn sort_rows_by_order_terms(
     });
 
     Ok(())
-}
-
-/// Sort rows by ORDER BY terms using a col_map for expression evaluation.
-/// Used by `execute_group_by_window_select` where result columns are
-/// described by a flat (table, col, _) map rather than `ResultColumn` AST nodes.
-#[allow(dead_code)]
-fn sort_rows_by_order_terms_with_col_map(
-    rows: &mut [Row],
-    order_by: &[OrderingTerm],
-    col_map: &[(String, String, bool)],
-) {
-    rows.sort_by(|a, b| {
-        for term in order_by {
-            let (av, bv) = if let Expr::Literal(Literal::Integer(n), _) = &term.expr {
-                let idx = (*n as usize).saturating_sub(1);
-                (
-                    a.values.get(idx).cloned().unwrap_or(SqliteValue::Null),
-                    b.values.get(idx).cloned().unwrap_or(SqliteValue::Null),
-                )
-            } else if let Some(col_name) = expr_col_name(&term.expr) {
-                if let Some(idx) = col_map
-                    .iter()
-                    .position(|(_, c, _)| c.eq_ignore_ascii_case(col_name))
-                {
-                    (
-                        a.values.get(idx).cloned().unwrap_or(SqliteValue::Null),
-                        b.values.get(idx).cloned().unwrap_or(SqliteValue::Null),
-                    )
-                } else {
-                    (
-                        eval_join_expr(&term.expr, a.values(), col_map)
-                            .unwrap_or(SqliteValue::Null),
-                        eval_join_expr(&term.expr, b.values(), col_map)
-                            .unwrap_or(SqliteValue::Null),
-                    )
-                }
-            } else {
-                (
-                    eval_join_expr(&term.expr, a.values(), col_map).unwrap_or(SqliteValue::Null),
-                    eval_join_expr(&term.expr, b.values(), col_map).unwrap_or(SqliteValue::Null),
-                )
-            };
-            let ord = cmp_sqlite_values(&av, &bv);
-            let desc = matches!(term.direction, Some(SortDirection::Desc));
-            let ord = if desc { ord.reverse() } else { ord };
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        std::cmp::Ordering::Equal
-    });
 }
 
 /// Convert an AST `ForeignKeyClause` to a codegen `FkDef`.
@@ -33919,14 +33924,19 @@ fn bind_trigger_columns_in_statement(statement: &mut Statement, frame: &TriggerF
                     bind_trigger_columns_in_select_statement(&mut cte.query, frame);
                 }
             }
+            // In DML trigger bodies, bare column references in SET values
+            // and WHERE clauses refer to the DML's target table columns,
+            // not to the trigger's NEW/OLD pseudo-columns.  Use the
+            // prefix-only variant so only explicit NEW.x / OLD.x refs
+            // are replaced with trigger values.
             for assignment in &mut update.assignments {
-                bind_trigger_columns_in_expr(&mut assignment.value, frame);
+                bind_trigger_prefixed_only_in_expr(&mut assignment.value, frame);
             }
             if let Some(from_clause) = &mut update.from {
                 bind_trigger_columns_in_from_clause(from_clause, frame);
             }
             if let Some(where_clause) = &mut update.where_clause {
-                bind_trigger_columns_in_expr(where_clause, frame);
+                bind_trigger_prefixed_only_in_expr(where_clause, frame);
             }
             for column in &mut update.returning {
                 if let ResultColumn::Expr { expr, .. } = column {
@@ -33934,12 +33944,12 @@ fn bind_trigger_columns_in_statement(statement: &mut Statement, frame: &TriggerF
                 }
             }
             for ordering in &mut update.order_by {
-                bind_trigger_columns_in_expr(&mut ordering.expr, frame);
+                bind_trigger_prefixed_only_in_expr(&mut ordering.expr, frame);
             }
             if let Some(limit_clause) = &mut update.limit {
-                bind_trigger_columns_in_expr(&mut limit_clause.limit, frame);
+                bind_trigger_prefixed_only_in_expr(&mut limit_clause.limit, frame);
                 if let Some(offset) = &mut limit_clause.offset {
-                    bind_trigger_columns_in_expr(offset, frame);
+                    bind_trigger_prefixed_only_in_expr(offset, frame);
                 }
             }
         }
@@ -33950,7 +33960,7 @@ fn bind_trigger_columns_in_statement(statement: &mut Statement, frame: &TriggerF
                 }
             }
             if let Some(where_clause) = &mut delete.where_clause {
-                bind_trigger_columns_in_expr(where_clause, frame);
+                bind_trigger_prefixed_only_in_expr(where_clause, frame);
             }
             for column in &mut delete.returning {
                 if let ResultColumn::Expr { expr, .. } = column {
@@ -34099,10 +34109,33 @@ fn bind_trigger_columns_in_frame_bound(bound: &mut fsqlite_ast::FrameBound, fram
 
 #[allow(clippy::too_many_lines)]
 fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
+    bind_trigger_columns_in_expr_inner(expr, frame, false);
+}
+
+/// Like `bind_trigger_columns_in_expr`, but only replaces column references
+/// that have an explicit `OLD.` / `NEW.` (or table-name) prefix.  Bare
+/// column references (no table qualifier) are left untouched so they resolve
+/// against the DML's target table at execution time.
+///
+/// Used for UPDATE/DELETE/INSERT WHERE and SET clauses inside trigger bodies,
+/// where bare `id` in `WHERE id = NEW.id` must scan the table column — not
+/// be replaced with the trigger pseudo-column value (which would turn the
+/// predicate into `WHERE 1 = 1`).
+fn bind_trigger_prefixed_only_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
+    bind_trigger_columns_in_expr_inner(expr, frame, true);
+}
+
+#[allow(clippy::too_many_lines)]
+fn bind_trigger_columns_in_expr_inner(expr: &mut Expr, frame: &TriggerFrame, prefix_only: bool) {
     match expr {
         Expr::Literal(_, _) | Expr::Raise { .. } | Expr::Placeholder(_, _) => {}
         Expr::Column(col_ref, _) => {
             let table_prefix = col_ref.table.as_deref();
+            // In prefix_only mode, skip bare column references (no table
+            // qualifier) so they resolve against the DML target table.
+            if prefix_only && table_prefix.is_none() {
+                return;
+            }
             let column_name = col_ref.column.clone();
             if frame.references_pseudo_column(table_prefix, &column_name) {
                 if let Some(value) = frame.lookup_value(table_prefix, &column_name) {
@@ -34111,14 +34144,14 @@ fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
             }
         }
         Expr::BinaryOp { left, right, .. } => {
-            bind_trigger_columns_in_expr(left, frame);
-            bind_trigger_columns_in_expr(right, frame);
+            bind_trigger_columns_in_expr_inner(left, frame, prefix_only);
+            bind_trigger_columns_in_expr_inner(right, frame, prefix_only);
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::Cast { expr: inner, .. }
         | Expr::Collate { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. } => {
-            bind_trigger_columns_in_expr(inner, frame);
+            bind_trigger_columns_in_expr_inner(inner, frame, prefix_only);
         }
         Expr::Between {
             expr: inner,
@@ -34126,18 +34159,18 @@ fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
             high,
             ..
         } => {
-            bind_trigger_columns_in_expr(inner, frame);
-            bind_trigger_columns_in_expr(low, frame);
-            bind_trigger_columns_in_expr(high, frame);
+            bind_trigger_columns_in_expr_inner(inner, frame, prefix_only);
+            bind_trigger_columns_in_expr_inner(low, frame, prefix_only);
+            bind_trigger_columns_in_expr_inner(high, frame, prefix_only);
         }
         Expr::In {
             expr: inner, set, ..
         } => {
-            bind_trigger_columns_in_expr(inner, frame);
+            bind_trigger_columns_in_expr_inner(inner, frame, prefix_only);
             match set {
                 InSet::List(values) => {
                     for value in values {
-                        bind_trigger_columns_in_expr(value, frame);
+                        bind_trigger_columns_in_expr_inner(value, frame, prefix_only);
                     }
                 }
                 InSet::Subquery(query) => {
@@ -34152,10 +34185,10 @@ fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
             escape,
             ..
         } => {
-            bind_trigger_columns_in_expr(inner, frame);
-            bind_trigger_columns_in_expr(pattern, frame);
+            bind_trigger_columns_in_expr_inner(inner, frame, prefix_only);
+            bind_trigger_columns_in_expr_inner(pattern, frame, prefix_only);
             if let Some(escape_expr) = escape {
-                bind_trigger_columns_in_expr(escape_expr, frame);
+                bind_trigger_columns_in_expr_inner(escape_expr, frame, prefix_only);
             }
         }
         Expr::Case {
@@ -34165,14 +34198,14 @@ fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
             ..
         } => {
             if let Some(base) = operand {
-                bind_trigger_columns_in_expr(base, frame);
+                bind_trigger_columns_in_expr_inner(base, frame, prefix_only);
             }
             for (when_expr, then_expr) in whens {
-                bind_trigger_columns_in_expr(when_expr, frame);
-                bind_trigger_columns_in_expr(then_expr, frame);
+                bind_trigger_columns_in_expr_inner(when_expr, frame, prefix_only);
+                bind_trigger_columns_in_expr_inner(then_expr, frame, prefix_only);
             }
             if let Some(else_branch) = else_expr {
-                bind_trigger_columns_in_expr(else_branch, frame);
+                bind_trigger_columns_in_expr_inner(else_branch, frame, prefix_only);
             }
         }
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
@@ -34183,11 +34216,11 @@ fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
         } => {
             if let FunctionArgs::List(arguments) = args {
                 for arg in arguments {
-                    bind_trigger_columns_in_expr(arg, frame);
+                    bind_trigger_columns_in_expr_inner(arg, frame, prefix_only);
                 }
             }
             if let Some(filter_expr) = filter {
-                bind_trigger_columns_in_expr(filter_expr, frame);
+                bind_trigger_columns_in_expr_inner(filter_expr, frame, prefix_only);
             }
             if let Some(window_spec) = over {
                 bind_trigger_columns_in_window_spec(window_spec, frame);
@@ -34196,12 +34229,12 @@ fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
         Expr::JsonAccess {
             expr: inner, path, ..
         } => {
-            bind_trigger_columns_in_expr(inner, frame);
-            bind_trigger_columns_in_expr(path, frame);
+            bind_trigger_columns_in_expr_inner(inner, frame, prefix_only);
+            bind_trigger_columns_in_expr_inner(path, frame, prefix_only);
         }
         Expr::RowValue(values, _) => {
             for value in values {
-                bind_trigger_columns_in_expr(value, frame);
+                bind_trigger_columns_in_expr_inner(value, frame, prefix_only);
             }
         }
     }
@@ -35622,16 +35655,11 @@ fn eval_join_expr(
                     .iter()
                     .map(|e| eval_join_expr(e, row, col_map))
                     .collect::<Result<Vec<_>>>()?;
-                // If any LHS element is NULL, result is NULL per SQL semantics.
-                if lhs.iter().any(SqliteValue::is_null) {
-                    return Ok(SqliteValue::Null);
-                }
                 let mut saw_null = false;
                 let mut found = false;
                 for list_item in list_exprs {
                     let rhs_exprs = match list_item {
                         Expr::RowValue(rv, _) => rv.as_slice(),
-                        // Single-element tuple: wrap in slice for uniform handling.
                         _ => std::slice::from_ref(list_item),
                     };
                     if rhs_exprs.len() != lhs.len() {
@@ -35641,17 +35669,26 @@ fn eval_join_expr(
                         .iter()
                         .map(|e| eval_join_expr(e, row, col_map))
                         .collect::<Result<Vec<_>>>()?;
-                    if rhs.iter().any(SqliteValue::is_null) {
-                        saw_null = true;
-                        continue;
+                    // Element-wise three-valued comparison:
+                    // - If any pair is FALSE (not equal), this tuple is FALSE.
+                    // - If no pair is FALSE but some are NULL, this tuple is NULL.
+                    // - If all pairs are TRUE (equal), this tuple matches.
+                    let mut tuple_has_null = false;
+                    let mut tuple_all_equal = true;
+                    for (l, r) in lhs.iter().zip(rhs.iter()) {
+                        if l.is_null() || r.is_null() {
+                            tuple_has_null = true;
+                        } else if cmp_values(l, r) != std::cmp::Ordering::Equal {
+                            tuple_all_equal = false;
+                            break;
+                        }
                     }
-                    if lhs
-                        .iter()
-                        .zip(rhs.iter())
-                        .all(|(l, r)| cmp_values(l, r) == std::cmp::Ordering::Equal)
-                    {
+                    if tuple_all_equal && !tuple_has_null {
                         found = true;
                         break;
+                    }
+                    if tuple_all_equal && tuple_has_null {
+                        saw_null = true;
                     }
                 }
                 return if found {
@@ -72375,6 +72412,49 @@ mod pager_routing_tests {
             index_rows[0].values[3],
             SqliteValue::Text("SEARCH users USING INDEX idx_users_age (age=?)".into()),
         );
+
+        let covering_rows = conn
+            .query("EXPLAIN QUERY PLAN SELECT age FROM users WHERE age = 25")
+            .unwrap();
+        assert_eq!(
+            covering_rows[0].values[3],
+            SqliteValue::Text("SEARCH users USING COVERING INDEX idx_users_age (age=?)".into()),
+        );
+    }
+
+    #[test]
+    fn test_single_row_fast_paths_honor_limit_and_offset() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_users_age ON users(age);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice', 30);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'Bob', 25);")
+            .unwrap();
+
+        let rowid_limit_zero = conn
+            .query("SELECT name FROM users WHERE rowid = 1 LIMIT 0")
+            .unwrap();
+        assert!(rowid_limit_zero.is_empty());
+
+        let rowid_offset_skip = conn
+            .query("SELECT name FROM users WHERE rowid = 1 LIMIT 1 OFFSET 1")
+            .unwrap();
+        assert!(rowid_offset_skip.is_empty());
+
+        let index_limit_zero = conn
+            .query("SELECT name FROM users WHERE age = 25 LIMIT 0")
+            .unwrap();
+        assert!(index_limit_zero.is_empty());
+
+        let index_offset_skip = conn
+            .query("SELECT name FROM users WHERE age = 25 LIMIT 1 OFFSET 1")
+            .unwrap();
+        assert!(index_offset_skip.is_empty());
     }
 
     #[test]

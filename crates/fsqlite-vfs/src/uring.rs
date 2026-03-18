@@ -63,9 +63,34 @@ static FORCE_ASUPERSYNC_INIT_FAIL: AtomicBool = AtomicBool::new(false);
 static FORCE_ASUPERSYNC_READ_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, feature = "linux-asupersync-uring"))]
+static FORCE_ASUPERSYNC_WRITE_ABORT: AtomicBool = AtomicBool::new(false);
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
+}
+
+fn should_fallback_to_unix_on_uring_error(err: &FrankenError) -> bool {
+    match err {
+        FrankenError::Abort => false,
+        FrankenError::Io(io_err) if io_err.kind() == io::ErrorKind::InvalidInput => false,
+        _ => true,
+    }
+}
+
+fn should_disable_runtime_on_uring_fallback(err: &FrankenError) -> bool {
+    match err {
+        FrankenError::Abort => false,
+        FrankenError::Io(io_err)
+            if matches!(
+                io_err.kind(),
+                io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            false
+        }
+        _ => true,
+    }
 }
 
 fn duration_to_micros_saturated(duration: std::time::Duration) -> u64 {
@@ -567,6 +592,10 @@ impl IoUringFile {
                     "forced asupersync write failure",
                 )));
             }
+            #[cfg(test)]
+            if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
+                return Err(FrankenError::Abort);
+            }
             let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pollster::block_on(backend.write_at(&buf[total..chunk_end], off))
             }));
@@ -672,21 +701,30 @@ impl VfsFile for IoUringFile {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
             let start = Instant::now();
-            if let Ok(bytes) = self.read_via_uring(cx, buf, offset) {
-                let elapsed = start.elapsed();
-                if record_io_uring_read_latency(elapsed) {
-                    let snapshot = io_uring_latency_snapshot();
-                    enforce_conformal_breach_policy(
-                        &self.runtime,
-                        "read",
-                        elapsed,
-                        snapshot.read_conformal_upper_bound_us,
-                        IO_URING_READ_CONFORMAL_BREACH_MSG,
-                    );
+            match self.read_via_uring(cx, buf, offset) {
+                Ok(bytes) => {
+                    let elapsed = start.elapsed();
+                    if record_io_uring_read_latency(elapsed) {
+                        let snapshot = io_uring_latency_snapshot();
+                        enforce_conformal_breach_policy(
+                            &self.runtime,
+                            "read",
+                            elapsed,
+                            snapshot.read_conformal_upper_bound_us,
+                            IO_URING_READ_CONFORMAL_BREACH_MSG,
+                        );
+                    }
+                    return Ok(bytes);
                 }
-                return Ok(bytes);
+                Err(err) => {
+                    if !should_fallback_to_unix_on_uring_error(&err) {
+                        return Err(err);
+                    }
+                    if should_disable_runtime_on_uring_fallback(&err) {
+                        self.runtime.disable(IO_URING_READ_ERROR_FALLBACK_MSG);
+                    }
+                }
             }
-            self.runtime.disable(IO_URING_READ_ERROR_FALLBACK_MSG);
         }
         record_io_uring_unix_fallback();
         self.inner.read(cx, buf, offset)
@@ -696,21 +734,30 @@ impl VfsFile for IoUringFile {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
             let start = Instant::now();
-            if matches!(self.write_via_uring(cx, buf, offset), Ok(())) {
-                let elapsed = start.elapsed();
-                if record_io_uring_write_latency(elapsed) {
-                    let snapshot = io_uring_latency_snapshot();
-                    enforce_conformal_breach_policy(
-                        &self.runtime,
-                        "write",
-                        elapsed,
-                        snapshot.write_conformal_upper_bound_us,
-                        IO_URING_WRITE_CONFORMAL_BREACH_MSG,
-                    );
+            match self.write_via_uring(cx, buf, offset) {
+                Ok(()) => {
+                    let elapsed = start.elapsed();
+                    if record_io_uring_write_latency(elapsed) {
+                        let snapshot = io_uring_latency_snapshot();
+                        enforce_conformal_breach_policy(
+                            &self.runtime,
+                            "write",
+                            elapsed,
+                            snapshot.write_conformal_upper_bound_us,
+                            IO_URING_WRITE_CONFORMAL_BREACH_MSG,
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                Err(err) => {
+                    if !should_fallback_to_unix_on_uring_error(&err) {
+                        return Err(err);
+                    }
+                    if should_disable_runtime_on_uring_fallback(&err) {
+                        self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
+                    }
+                }
             }
-            self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
         }
         record_io_uring_unix_fallback();
         self.inner.write(cx, buf, offset)
@@ -771,9 +818,38 @@ mod tests {
 
     use fsqlite_observability::{io_uring_latency_snapshot, reset_io_uring_latency_metrics};
     use fsqlite_types::flags::VfsOpenFlags;
+    use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard};
+
+    static IO_URING_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     fn open_flags_create() -> VfsOpenFlags {
         VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    struct ScopedAtomicFlag<'a> {
+        flag: &'a AtomicBool,
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    impl<'a> ScopedAtomicFlag<'a> {
+        fn enable(flag: &'a AtomicBool) -> Self {
+            flag.store(true, Ordering::Release);
+            Self { flag }
+        }
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    impl Drop for ScopedAtomicFlag<'_> {
+        fn drop(&mut self) {
+            self.flag.store(false, Ordering::Release);
+        }
+    }
+
+    fn io_uring_test_guard() -> StdMutexGuard<'static, ()> {
+        IO_URING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]
@@ -805,6 +881,7 @@ mod tests {
 
     #[test]
     fn test_io_uring_paths_emit_latency_or_fallback_metrics() {
+        let _guard = io_uring_test_guard();
         reset_io_uring_latency_metrics();
 
         let cx = Cx::new();
@@ -836,6 +913,7 @@ mod tests {
 
     #[test]
     fn test_disabled_runtime_records_unix_fallback_metrics() {
+        let _guard = io_uring_test_guard();
         reset_io_uring_latency_metrics();
 
         let cx = Cx::new();
@@ -873,6 +951,17 @@ mod tests {
         runtime.disable("test disable again");
         assert!(runtime.is_disabled());
         assert_eq!(runtime.disable_reason(), Some("test disable"));
+    }
+
+    #[test]
+    fn test_invalid_input_errors_propagate_without_fallback_or_disable() {
+        let err = FrankenError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "offset overflow during io_uring write",
+        ));
+
+        assert!(!should_fallback_to_unix_on_uring_error(&err));
+        assert!(!should_disable_runtime_on_uring_fallback(&err));
     }
 
     #[test]
@@ -915,6 +1004,80 @@ mod tests {
         assert!(!disabled.available);
         assert_eq!(disabled.disable_reason, Some("manual test disable"));
         assert_eq!(disabled.status, "disabled:asupersync:manual test disable");
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_temp_file_fallback_does_not_disable_runtime() {
+        let _guard = io_uring_test_guard();
+        reset_io_uring_latency_metrics();
+
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        if !vfs.is_available() {
+            return;
+        }
+
+        let flags = VfsOpenFlags::TEMP_DB
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::READWRITE
+            | VfsOpenFlags::DELETEONCLOSE;
+        let (mut file, _) = vfs.open(&cx, None, flags).expect("open temp file");
+
+        file.write(&cx, b"temp data", 0)
+            .expect("write should fall back without disabling runtime");
+        let mut buf = [0_u8; 9];
+        let n = file
+            .read(&cx, &mut buf, 0)
+            .expect("read should fall back without disabling runtime");
+
+        assert_eq!(n, 9);
+        assert_eq!(&buf, b"temp data");
+        assert!(
+            vfs.is_available(),
+            "temp-file fallback should not disable io_uring"
+        );
+        assert!(!vfs.runtime.is_disabled());
+
+        let snapshot = io_uring_latency_snapshot();
+        assert!(
+            snapshot.unix_fallbacks_total >= 2,
+            "temp-file fallback should record unix fallback metrics"
+        );
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_write_abort_propagates_without_disabling_runtime_or_fallback() {
+        let _guard = io_uring_test_guard();
+        reset_io_uring_latency_metrics();
+
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        if !vfs.is_available() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("asupersync_abort_propagation.db");
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open should succeed");
+
+        let _force_abort = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_WRITE_ABORT);
+        let err = file
+            .write(&cx, b"abort", 0)
+            .expect_err("write should propagate abort");
+
+        assert!(matches!(err, FrankenError::Abort));
+        assert!(vfs.is_available(), "abort should not disable io_uring");
+        assert!(!vfs.runtime.is_disabled());
+
+        let snapshot = io_uring_latency_snapshot();
+        assert_eq!(
+            snapshot.unix_fallbacks_total, 0,
+            "abort should not fall back to unix or record fallback metrics"
+        );
     }
 
     #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
@@ -966,16 +1129,16 @@ mod tests {
     #[cfg(feature = "linux-asupersync-uring")]
     #[test]
     fn test_asupersync_init_failure_disables_backend_and_falls_back() {
+        let _guard = io_uring_test_guard();
         let cx = Cx::new();
         let vfs = IoUringVfs::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("asupersync_forced_init_failure.db");
 
-        FORCE_ASUPERSYNC_INIT_FAIL.store(true, Ordering::Release);
+        let _force_init_fail = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_INIT_FAIL);
         let (mut file, _) = vfs
             .open(&cx, Some(&path), open_flags_create())
             .expect("open should succeed via unix fallback");
-        FORCE_ASUPERSYNC_INIT_FAIL.store(false, Ordering::Release);
 
         assert!(vfs.runtime.is_disabled());
         assert!(!vfs.is_available());
@@ -1002,6 +1165,7 @@ mod tests {
     #[cfg(feature = "linux-asupersync-uring")]
     #[test]
     fn test_asupersync_write_error_disables_runtime_and_falls_back() {
+        let _guard = io_uring_test_guard();
         let cx = Cx::new();
         let vfs = IoUringVfs::new();
         if !vfs.is_available() {
@@ -1013,10 +1177,9 @@ mod tests {
             .open(&cx, Some(&path), open_flags_create())
             .expect("open should succeed");
 
-        FORCE_ASUPERSYNC_WRITE_FAIL.store(true, Ordering::Release);
+        let _force_write_fail = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_WRITE_FAIL);
         file.write(&cx, b"fallback", 0)
             .expect("write should succeed via unix fallback");
-        FORCE_ASUPERSYNC_WRITE_FAIL.store(false, Ordering::Release);
 
         assert!(vfs.runtime.is_disabled());
         assert!(!vfs.is_available());
@@ -1032,6 +1195,7 @@ mod tests {
     #[cfg(feature = "linux-asupersync-uring")]
     #[test]
     fn test_asupersync_read_error_disables_runtime_and_falls_back() {
+        let _guard = io_uring_test_guard();
         let cx = Cx::new();
         let vfs = IoUringVfs::new();
         if !vfs.is_available() {
@@ -1046,12 +1210,11 @@ mod tests {
         file.write(&cx, b"fallback", 0)
             .expect("write should seed data");
 
-        FORCE_ASUPERSYNC_READ_FAIL.store(true, Ordering::Release);
+        let _force_read_fail = ScopedAtomicFlag::enable(&FORCE_ASUPERSYNC_READ_FAIL);
         let mut buf = [0_u8; 8];
         let n = file
             .read(&cx, &mut buf, 0)
             .expect("read should succeed via unix fallback");
-        FORCE_ASUPERSYNC_READ_FAIL.store(false, Ordering::Release);
 
         assert_eq!(n, 8);
         assert_eq!(&buf, b"fallback");
