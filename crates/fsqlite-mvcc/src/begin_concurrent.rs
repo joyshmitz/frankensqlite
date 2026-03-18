@@ -2248,18 +2248,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             committed_seq,
             write_keys,
             &active_reader_candidates,
-            &[],
-        ),
-    );
-    merge_unique_incoming_edges(
-        &mut incoming_edges,
-        &mut incoming_sources,
-        discover_incoming_edges(
-            prepared.txn_token,
-            prepared.begin_seq,
-            committed_seq,
-            write_keys,
-            &[],
             &committed_reader_candidates,
         ),
     );
@@ -2275,18 +2263,6 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
             committed_seq,
             read_keys,
             &active_writer_candidates,
-            &[],
-        ),
-    );
-    merge_unique_outgoing_edges(
-        &mut outgoing_edges,
-        &mut outgoing_targets,
-        discover_outgoing_edges(
-            prepared.txn_token,
-            prepared.begin_seq,
-            committed_seq,
-            read_keys,
-            &[],
             &committed_writer_candidates,
         ),
     );

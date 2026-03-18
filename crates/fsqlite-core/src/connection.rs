@@ -30301,6 +30301,7 @@ fn evaluate_having_value(
             pattern,
             op,
             not,
+            escape,
             ..
         } => {
             let val =
@@ -30312,8 +30313,12 @@ fn evaluate_having_value(
             }
             let s = val.to_text();
             let p = pat.to_text();
+            let esc_char = escape.as_deref().and_then(|e| {
+                let v = evaluate_having_value(e, values, descriptors, columns, group_rows, col_map);
+                v.to_text().chars().next()
+            });
             let matched = match op {
-                LikeOp::Like => simple_like_match(&p, &s),
+                LikeOp::Like => simple_like_match(&p, &s, esc_char),
                 LikeOp::Glob => simple_glob_match(&p, &s),
                 LikeOp::Match => {
                     let match_row = group_rows.first().map_or(&[][..], Vec::as_slice);
@@ -30795,11 +30800,17 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
             let mut has_int = false;
             let mut all_int = true;
             let mut int_sum = 0_i64;
+            let mut int_overflowed = false;
             for v in values {
                 match v {
                     SqliteValue::Integer(n) => {
                         has_int = true;
-                        int_sum = int_sum.wrapping_add(*n);
+                        if !int_overflowed {
+                            match int_sum.checked_add(*n) {
+                                Some(s) => int_sum = s,
+                                None => int_overflowed = true,
+                            }
+                        }
                         kbn_step(&mut sum, &mut err, *n as f64);
                     }
                     SqliteValue::Float(f) => {
@@ -30816,9 +30827,10 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
             }
             if name == "total" {
                 SqliteValue::Float(sum + err)
-            } else if has_int && all_int {
+            } else if has_int && all_int && !int_overflowed {
                 SqliteValue::Integer(int_sum)
             } else {
+                // Integer overflow or mixed types: return float.
                 SqliteValue::Float(sum + err)
             }
         }
@@ -35909,6 +35921,7 @@ fn eval_join_expr(
             pattern,
             op,
             not,
+            escape,
             ..
         } => {
             let val = eval_join_expr(inner, row, col_map)?;
@@ -35918,8 +35931,14 @@ fn eval_join_expr(
             }
             let s = val.to_text();
             let p = pat.to_text();
+            let esc_char = if let Some(esc_expr) = escape {
+                let esc_val = eval_join_expr(esc_expr, row, col_map)?;
+                esc_val.to_text().chars().next()
+            } else {
+                None
+            };
             let matched = match op {
-                LikeOp::Like => simple_like_match(&p, &s),
+                LikeOp::Like => simple_like_match(&p, &s, esc_char),
                 LikeOp::Glob => simple_glob_match(&p, &s),
                 LikeOp::Match => match_query_with_table_columns(inner, &p, &s, row, col_map),
                 LikeOp::Regexp => {
@@ -36285,22 +36304,35 @@ fn eval_join_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) ->
 }
 
 /// Simple case-insensitive LIKE pattern match (`%` = any sequence, `_` = any char).
-fn simple_like_match(pattern: &str, string: &str) -> bool {
+///
+/// `escape_char`: when `Some(ch)`, the character `ch` escapes the next
+/// pattern character (e.g., `LIKE '%!%%' ESCAPE '!'` treats `%` after `!`
+/// as a literal percent). A dangling trailing escape never matches.
+fn simple_like_match(pattern: &str, string: &str, escape_char: Option<char>) -> bool {
     let pat: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
     let txt: Vec<char> = string.to_ascii_lowercase().chars().collect();
-    like_dp(&pat, &txt, 0, 0)
+    let esc = escape_char.map(|c| c.to_ascii_lowercase());
+    like_dp(&pat, &txt, 0, 0, esc)
 }
 
-fn like_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
+fn like_dp(pat: &[char], txt: &[char], pi: usize, ti: usize, esc: Option<char>) -> bool {
     if pi == pat.len() {
         return ti == txt.len();
+    }
+    // Check for escape character: next pattern char is treated as literal.
+    if Some(pat[pi]) == esc {
+        if pi + 1 >= pat.len() {
+            return false;
+        }
+        let literal = pat[pi + 1];
+        return ti < txt.len() && txt[ti] == literal && like_dp(pat, txt, pi + 2, ti + 1, esc);
     }
     match pat[pi] {
         '%' => {
             // Match zero or more characters.
             let mut t = ti;
             loop {
-                if like_dp(pat, txt, pi + 1, t) {
+                if like_dp(pat, txt, pi + 1, t, esc) {
                     return true;
                 }
                 if t >= txt.len() {
@@ -36311,9 +36343,9 @@ fn like_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
         }
         '_' => {
             // Match exactly one character.
-            ti < txt.len() && like_dp(pat, txt, pi + 1, ti + 1)
+            ti < txt.len() && like_dp(pat, txt, pi + 1, ti + 1, esc)
         }
-        c => ti < txt.len() && txt[ti] == c && like_dp(pat, txt, pi + 1, ti + 1),
+        c => ti < txt.len() && txt[ti] == c && like_dp(pat, txt, pi + 1, ti + 1, esc),
     }
 }
 
@@ -45609,6 +45641,23 @@ mod tests {
         assert_eq!(rows[0].values()[0], SqliteValue::Text("eng".into()));
     }
 
+    #[test]
+    fn test_having_like_escape_dangling_escape_does_not_match() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (dept TEXT, salary INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('eng!', 100);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('sales', 50);").unwrap();
+
+        let rows = conn
+            .query("SELECT dept FROM t GROUP BY dept HAVING dept LIKE 'eng!' ESCAPE '!';")
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "HAVING should reject a dangling trailing ESCAPE character"
+        );
+    }
+
     /// bd-3ew8w: HAVING-only aggregate in no-GROUP-BY path.
     /// `SELECT COUNT(*) FROM t HAVING SUM(x) > N` must accumulate SUM(x) even
     /// though it does not appear in the SELECT list and there is no GROUP BY.
@@ -46122,6 +46171,28 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
+    }
+
+    #[test]
+    fn test_join_where_like_escape_dangling_escape_does_not_match() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'Alice!');")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 'admin');").unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT t1.name FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE t1.name LIKE 'Alice!' ESCAPE '!';",
+            )
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "JOIN/WHERE should reject a dangling trailing ESCAPE character"
+        );
     }
 
     #[test]

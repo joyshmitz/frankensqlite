@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use fsqlite_types::{CommitSeq, ObjectId, PageNumber, TxnToken, WitnessKey};
 use tracing::{debug, info, warn};
@@ -64,6 +64,29 @@ pub enum SsiAbortReason {
 
 static FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_SSI_EVIDENCE_MODE: AtomicU8 =
+    AtomicU8::new(SsiEvidenceRecordingMode::CompactCommit as u8);
+
+/// Commit-time evidence detail level.
+///
+/// `CompactCommit` keeps abort evidence rich while making the successful
+/// commit path cheap by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SsiEvidenceRecordingMode {
+    Full = 0,
+    CompactCommit = 1,
+}
+
+impl SsiEvidenceRecordingMode {
+    #[must_use]
+    const fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::CompactCommit,
+            _ => Self::Full,
+        }
+    }
+}
 
 /// Snapshot of SSI evidence-record counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -111,6 +134,19 @@ pub fn ssi_evidence_metrics_snapshot() -> EvidenceRecordMetricsSnapshot {
 pub fn reset_ssi_evidence_metrics() {
     FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.store(0, Ordering::Relaxed);
     FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT.store(0, Ordering::Relaxed);
+}
+
+/// Return the current SSI evidence recording mode.
+#[must_use]
+pub fn ssi_evidence_recording_mode() -> SsiEvidenceRecordingMode {
+    SsiEvidenceRecordingMode::from_raw(FSQLITE_SSI_EVIDENCE_MODE.load(Ordering::Relaxed))
+}
+
+/// Update the SSI evidence recording mode, returning the previous mode.
+pub fn set_ssi_evidence_recording_mode(mode: SsiEvidenceRecordingMode) -> SsiEvidenceRecordingMode {
+    SsiEvidenceRecordingMode::from_raw(
+        FSQLITE_SSI_EVIDENCE_MODE.swap(mode as u8, Ordering::Relaxed),
+    )
 }
 
 fn default_t3_dro_matrix() -> &'static DroLossMatrix {
@@ -1155,18 +1191,41 @@ fn record_evidence_decision(
     edges: &[DiscoveredEdge],
     rationale: &str,
 ) {
-    let read_pages = witness_keys_to_pages(read_keys);
-    let write_pages = witness_keys_to_pages(write_keys);
-    let conflict_pages = edge_conflict_pages(edges);
-    let conflicting_txns = edge_conflicting_txns(txn, edges);
+    let compact_commit_evidence = matches!(decision_type, SsiDecisionType::CommitAllowed)
+        && matches!(
+            ssi_evidence_recording_mode(),
+            SsiEvidenceRecordingMode::CompactCommit
+        );
 
-    let evidence_size_bytes = estimate_evidence_size_bytes(
-        &read_pages,
-        &write_pages,
-        &conflict_pages,
-        &conflicting_txns,
-        rationale,
-    );
+    let (read_pages, write_pages, conflict_pages, conflicting_txns, evidence_size_bytes) =
+        if compact_commit_evidence {
+            (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                u64::try_from(rationale.len()).unwrap_or(u64::MAX),
+            )
+        } else {
+            let read_pages = witness_keys_to_pages(read_keys);
+            let write_pages = witness_keys_to_pages(write_keys);
+            let conflict_pages = edge_conflict_pages(edges);
+            let conflicting_txns = edge_conflicting_txns(txn, edges);
+            let evidence_size_bytes = estimate_evidence_size_bytes(
+                &read_pages,
+                &write_pages,
+                &conflict_pages,
+                &conflicting_txns,
+                rationale,
+            );
+            (
+                read_pages,
+                write_pages,
+                conflict_pages,
+                conflicting_txns,
+                evidence_size_bytes,
+            )
+        };
     let outcome = decision_outcome(decision_type);
     let decision_id = fsqlite_observability::next_decision_id();
 
@@ -1180,14 +1239,28 @@ fn record_evidence_decision(
     );
     let _guard = span.enter();
 
-    let r_len = read_pages.len();
-    let w_len = write_pages.len();
+    let detail_level = if compact_commit_evidence {
+        "compact_commit"
+    } else {
+        "full"
+    };
+    let r_len = if compact_commit_evidence {
+        read_keys.len()
+    } else {
+        read_pages.len()
+    };
+    let w_len = if compact_commit_evidence {
+        write_keys.len()
+    } else {
+        write_pages.len()
+    };
     let cx_len = conflicting_txns.len();
     let cp_len = conflict_pages.len();
 
     info!(
         decision_id,
         outcome,
+        detail_level,
         decision_type = %decision_type,
         txn_id = txn.id.get(),
         read_pages = r_len,
@@ -1196,17 +1269,19 @@ fn record_evidence_decision(
         conflict_pages = cp_len,
         "ssi decision evidence recorded"
     );
-    debug!(
-        decision_id,
-        decision_type = %decision_type,
-        txn = ?txn,
-        read_pages = ?read_pages,
-        write_pages = ?write_pages,
-        conflicting_txns = ?conflicting_txns,
-        conflict_pages = ?conflict_pages,
-        rationale,
-        "ssi decision evidence details"
-    );
+    if !compact_commit_evidence {
+        debug!(
+            decision_id,
+            decision_type = %decision_type,
+            txn = ?txn,
+            read_pages = ?read_pages,
+            write_pages = ?write_pages,
+            conflicting_txns = ?conflicting_txns,
+            conflict_pages = ?conflict_pages,
+            rationale,
+            "ssi decision evidence details"
+        );
+    }
 
     let mut draft = SsiDecisionCardDraft::new(
         decision_type,
@@ -2893,6 +2968,46 @@ mod tests {
             let last = rows.last().unwrap();
             assert_eq!(last.txn.id.get(), target_txn_id);
             assert!(last.decision_id > 0, "decision_id must be populated");
+        }
+    }
+
+    #[test]
+    fn test_commit_allowed_evidence_defaults_to_compact_mode() {
+        let txn = TxnToken::new(TxnId::new(90_202).unwrap(), TxnEpoch::new(0));
+        let result = ssi_validate_and_publish(
+            txn,
+            CommitSeq::new(3),
+            CommitSeq::new(4),
+            &[page_key(920)],
+            &[page_key(921)],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        );
+        result.expect("commit should succeed");
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let snapshot = ssi_evidence_snapshot();
+        let rows = ssi_evidence_query(&SsiDecisionQuery {
+            txn_id: Some(txn.id.get()),
+            ..SsiDecisionQuery::default()
+        });
+        if rows.is_empty() {
+            assert!(
+                !snapshot.is_empty(),
+                "evidence ledger should not be completely empty"
+            );
+            for card in &snapshot {
+                assert!(card.decision_id > 0, "every card must have a decision_id");
+            }
+        } else {
+            let last = rows.last().unwrap();
+            assert_eq!(last.decision_type, SsiDecisionType::CommitAllowed);
+            assert!(last.conflict_pages.is_empty());
+            assert!(last.write_set.is_empty());
+            assert_eq!(last.read_set_summary.page_count, 0);
         }
     }
 }

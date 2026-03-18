@@ -2651,9 +2651,10 @@ mod tests {
         let table = InProcessPageLockTable::new();
         let txn = TxnId::new(1).unwrap();
 
-        // Acquire locks on pages 1..=128.
+        // Acquire locks on sharded pages only. Fast-array pages 1..=65536 do
+        // not contribute to shard_distribution().
         for i in 1..=128_u32 {
-            let page = PageNumber::new(i).unwrap();
+            let page = sharded_rebuild_page(i);
             table.try_acquire(page, txn).unwrap();
         }
 

@@ -216,6 +216,10 @@ pub struct Sqlite3Stmt {
     rows: Option<Vec<fsqlite::Row>>,
     /// Current row index (0-based, incremented by each `sqlite3_step`).
     cursor: usize,
+    /// Whether the most recent `sqlite3_step` returned `SQLITE_ROW`.
+    active_row: bool,
+    /// Last sqlite3_step-style result code for sqlite3_reset semantics.
+    last_step_code: c_int,
     /// Column count from the most recent result set.
     column_count: c_int,
     /// Cached CString values for text column accessors (kept alive until
@@ -784,6 +788,8 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
                 step_mode: info.step_mode,
                 rows: None,
                 cursor: 0,
+                active_row: false,
+                last_step_code: SQLITE_OK,
                 column_count: info.column_count,
                 text_cache: Vec::new(),
             });
@@ -857,12 +863,17 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
                 }
                 s.rows = Some(rows);
                 s.cursor = 0;
+                s.active_row = false;
+                s.last_step_code = SQLITE_OK;
+                s.text_cache.clear();
             }
             Ok(Ok(None)) => {
                 db.clear_error();
                 db.refresh_last_changes();
                 s.rows = Some(Vec::new());
                 s.cursor = 0;
+                s.active_row = false;
+                s.last_step_code = SQLITE_OK;
                 s.text_cache.clear();
             }
             Ok(Err(ref e)) if matches!(e, FrankenError::QueryReturnedNoRows) => {
@@ -870,17 +881,28 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
                 db.refresh_last_changes();
                 s.rows = Some(Vec::new());
                 s.cursor = 0;
+                s.active_row = false;
+                s.last_step_code = SQLITE_OK;
+                s.text_cache.clear();
             }
             Ok(Err(e)) => {
                 tracing::warn!(target: "fsqlite.compat", error = %e, "sqlite3_step failed");
+                s.active_row = false;
+                s.text_cache.clear();
+                let code = error_to_code(&e);
+                s.last_step_code = code;
                 db.set_error(&e);
-                return error_to_code(&e);
+                return code;
             }
             Err(_) => {
                 let e = FrankenError::Internal("Rust panic during statement execution".to_owned());
                 tracing::error!(target: "fsqlite.compat", error = %e, "sqlite3_step panicked");
+                s.active_row = false;
+                s.text_cache.clear();
+                let code = error_to_code(&e);
+                s.last_step_code = code;
                 db.set_error(&e);
-                return error_to_code(&e);
+                return code;
             }
         }
     }
@@ -897,11 +919,19 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
             s.text_cache = vec![None; ncols];
 
             s.cursor += 1;
+            s.active_row = true;
+            s.last_step_code = SQLITE_ROW;
             SQLITE_ROW
         } else {
+            s.active_row = false;
+            s.last_step_code = SQLITE_DONE;
+            s.text_cache.clear();
             SQLITE_DONE
         }
     } else {
+        s.active_row = false;
+        s.last_step_code = SQLITE_DONE;
+        s.text_cache.clear();
         SQLITE_DONE
     }
 }
@@ -945,10 +975,16 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut Sqlite3Stmt) -> c_int {
     }
 
     let s = &mut *stmt;
+    let rc = match s.last_step_code {
+        SQLITE_ROW | SQLITE_DONE => SQLITE_OK,
+        code => code,
+    };
     s.rows = None;
     s.cursor = 0;
+    s.active_row = false;
+    s.last_step_code = SQLITE_OK;
     s.text_cache.clear();
-    SQLITE_OK
+    rc
 }
 
 // ── Column accessors ────────────────────────────────────────────────
@@ -959,6 +995,9 @@ unsafe fn current_value_ref<'a>(stmt: *const Sqlite3Stmt, i_col: c_int) -> Optio
         return None;
     }
     let s = &*stmt;
+    if !s.active_row {
+        return None;
+    }
     let rows = s.rows.as_ref()?;
     let row_idx = s.cursor.checked_sub(1)?;
     let row = rows.get(row_idx)?;
@@ -1109,18 +1148,7 @@ pub unsafe extern "C" fn sqlite3_column_blob(
         return std::ptr::null();
     }
 
-    let s = &*stmt;
-    let Some(rows) = s.rows.as_ref() else {
-        return std::ptr::null();
-    };
-    let Some(row_idx) = s.cursor.checked_sub(1) else {
-        return std::ptr::null();
-    };
-    let Some(row) = rows.get(row_idx) else {
-        return std::ptr::null();
-    };
-
-    match row.get(i_col as usize) {
+    match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Blob(b)) => {
             if b.is_empty() {
                 std::ptr::null()
@@ -1152,6 +1180,9 @@ pub unsafe extern "C" fn sqlite3_column_bytes(stmt: *mut Sqlite3Stmt, i_col: c_i
     }
 
     let s = &*stmt;
+    if !s.active_row {
+        return 0;
+    }
     if let Some(Some(text)) = s.text_cache.get(i_col as usize) {
         return c_int::try_from(text.as_bytes().len()).unwrap_or(c_int::MAX);
     }
@@ -1592,6 +1623,35 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_returns_last_error_code_once() {
+        unsafe {
+            let db = open_memory();
+
+            let setup =
+                CString::new("CREATE TABLE t(x INTEGER PRIMARY KEY); INSERT INTO t VALUES(1);")
+                    .unwrap();
+            assert_eq!(
+                sqlite3_exec(db, setup.as_ptr(), None, ptr::null_mut(), ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            let sql = CString::new("INSERT INTO t VALUES(1);").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut()),
+                SQLITE_OK
+            );
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_CONSTRAINT);
+            assert_eq!(sqlite3_reset(stmt), SQLITE_CONSTRAINT);
+            assert_eq!(sqlite3_reset(stmt), SQLITE_OK);
+
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
     fn test_prepare_uses_first_statement_and_sets_tail() {
         unsafe {
             let db = open_memory();
@@ -1821,6 +1881,34 @@ mod tests {
             assert_eq!(sqlite3_column_int64(stmt, 99), 0);
             assert!((sqlite3_column_double(stmt, 99)).abs() < 0.001);
             assert!(sqlite3_column_text(stmt, 99).is_null());
+
+            sqlite3_finalize(stmt);
+            sqlite3_close(db);
+        }
+    }
+
+    #[test]
+    fn test_column_accessors_clear_after_done() {
+        unsafe {
+            let db = open_memory();
+
+            let sql = CString::new("SELECT 42, 'hello';").unwrap();
+            let mut stmt: *mut Sqlite3Stmt = ptr::null_mut();
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut stmt, ptr::null_mut());
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let text = sqlite3_column_text(stmt, 1);
+            assert!(!text.is_null());
+            assert_eq!(CStr::from_ptr(text).to_str().unwrap(), "hello");
+            assert_eq!(sqlite3_column_bytes(stmt, 1), 5);
+
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_column_type(stmt, 0), SQLITE_NULL);
+            assert_eq!(sqlite3_column_int64(stmt, 0), 0);
+            assert!((sqlite3_column_double(stmt, 0)).abs() < 0.001);
+            assert!(sqlite3_column_text(stmt, 1).is_null());
+            assert!(sqlite3_column_blob(stmt, 1).is_null());
+            assert_eq!(sqlite3_column_bytes(stmt, 1), 0);
 
             sqlite3_finalize(stmt);
             sqlite3_close(db);

@@ -690,16 +690,21 @@ impl TransactionManager {
             return Vec::new();
         }
 
-        let mut pages_touched = Vec::new();
+        let fallback_version = txn.snapshot.high;
         let mut visible_pages = Vec::new();
         for raw_page in start_page.get()..=end_page.get() {
             if let Some(page) = PageNumber::new(raw_page) {
-                pages_touched.push(page);
-                visible_pages.push((page, self.read_page(txn, page)));
+                let page_data = self.read_page(txn, page);
+                if page_data.is_none() {
+                    // Empty pages still need page-level predicate coverage so
+                    // SSI can reason about the scan footprint without a second
+                    // resolve/tracking pass.
+                    txn.record_page_read(page, fallback_version);
+                }
+                visible_pages.push((page, page_data));
             }
         }
 
-        self.record_range_scan(txn, &pages_touched);
         visible_pages
     }
 
