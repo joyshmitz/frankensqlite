@@ -6,6 +6,7 @@
 
 pub mod attach;
 pub mod commit_marker;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod commit_repair;
 pub mod compat_persist;
 pub mod connection;

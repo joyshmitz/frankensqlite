@@ -30,7 +30,6 @@ use fsqlite_types::StrictColumnType;
 use fsqlite_types::cx::Cx;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::record::{parse_record, serialize_record};
-#[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::value::SqliteValue;
 #[cfg(not(target_arch = "wasm32"))]
 use fsqlite_types::{PageNumber, PageSize};
@@ -162,7 +161,7 @@ pub fn persist_to_sqlite(
 
         for (rowid, (name, root_page_num, create_sql)) in master_entries.iter().enumerate() {
             let record = serialize_record(&[
-                SqliteValue::Text("table".to_owned().into()),
+                SqliteValue::Text("table".into()),
                 SqliteValue::Text(name.clone().into()),
                 SqliteValue::Text(name.clone().into()),
                 SqliteValue::Integer(i64::from(*root_page_num)),
@@ -1815,17 +1814,11 @@ mod tests {
         let table = db.tables.get_mut(&root).unwrap();
         table.insert_row(
             1,
-            vec![
-                SqliteValue::Integer(42),
-                SqliteValue::Text("hello".to_owned()),
-            ],
+            vec![SqliteValue::Integer(42), SqliteValue::Text("hello".into())],
         );
         table.insert_row(
             2,
-            vec![
-                SqliteValue::Integer(99),
-                SqliteValue::Text("world".to_owned()),
-            ],
+            vec![SqliteValue::Integer(99), SqliteValue::Text("world".into())],
         );
 
         let schema = vec![TableSchema {
@@ -1891,10 +1884,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 1); // rowid
         assert_eq!(rows[0].1[0], SqliteValue::Integer(42));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("hello".into()));
         assert_eq!(rows[1].0, 2);
         assert_eq!(rows[1].1[0], SqliteValue::Integer(99));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("world".to_owned()));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("world".into()));
     }
 
     #[test]
@@ -1970,9 +1963,9 @@ mod tests {
         let rows: Vec<_> = table.iter_rows().collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
     }
 
     #[test]
@@ -2004,10 +1997,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 10);
         assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[1].0, 20);
         assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
     }
 
     #[test]
@@ -2035,10 +2028,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 10);
         assert_eq!(rows[0].1[0], SqliteValue::Integer(10));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[1].0, 20);
         assert_eq!(rows[1].1[0], SqliteValue::Integer(20));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("beta".into()));
     }
 
     #[test]
@@ -2066,7 +2059,7 @@ mod tests {
         db.tables
             .get_mut(&root_a)
             .unwrap()
-            .insert_row(1, vec![SqliteValue::Text("row_a".to_owned())]);
+            .insert_row(1, vec![SqliteValue::Text("row_a".into())]);
 
         let root_b = db.create_table(1);
         db.tables
@@ -2132,7 +2125,7 @@ mod tests {
 
         let tbl_a = loaded.db.get_table(loaded.schema[0].root_page).unwrap();
         let rows_a: Vec<_> = tbl_a.iter_rows().collect();
-        assert_eq!(rows_a[0].1[0], SqliteValue::Text("row_a".to_owned()));
+        assert_eq!(rows_a[0].1[0], SqliteValue::Text("row_a".into()));
 
         let tbl_b = loaded.db.get_table(loaded.schema[1].root_page).unwrap();
         let rows_b: Vec<_> = tbl_b.iter_rows().collect();
@@ -2936,11 +2929,11 @@ mod tests {
         let rows: Vec<_> = mem_table.iter_rows().collect();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 1);
-        assert_eq!(rows[0].1[0], SqliteValue::Text("Hello".to_owned()));
-        assert_eq!(rows[0].1[1], SqliteValue::Text("Rust world".to_owned()));
+        assert_eq!(rows[0].1[0], SqliteValue::Text("Hello".into()));
+        assert_eq!(rows[0].1[1], SqliteValue::Text("Rust world".into()));
         assert_eq!(rows[1].0, 2);
-        assert_eq!(rows[1].1[0], SqliteValue::Text("Other".to_owned()));
-        assert_eq!(rows[1].1[1], SqliteValue::Text("Nothing".to_owned()));
+        assert_eq!(rows[1].1[0], SqliteValue::Text("Other".into()));
+        assert_eq!(rows[1].1[1], SqliteValue::Text("Nothing".into()));
     }
 
     #[test]

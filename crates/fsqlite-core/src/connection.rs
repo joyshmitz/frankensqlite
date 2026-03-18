@@ -122,6 +122,11 @@ use crate::wal_adapter::WalBackendAdapter;
 
 const WRITE_COORDINATOR_SERVICE_BEAD_ID: &str = "bd-2jpu6.4";
 
+#[cfg(not(target_arch = "wasm32"))]
+type WriteCoordinatorShutdownTx = asupersync::channel::oneshot::Sender<()>;
+#[cfg(target_arch = "wasm32")]
+type WriteCoordinatorShutdownTx = ();
+
 const EPROCESS_DEFAULT_CONFIG: EProcessConfig = EProcessConfig {
     p0: 0.1,
     lambda: 3.0,
@@ -1165,7 +1170,7 @@ fn flat_combining_stats_rows() -> Vec<Row> {
         .into_iter()
         .map(|(name, value)| Row {
             values: vec![
-                SqliteValue::Text(name.to_owned().into()),
+                SqliteValue::Text(name.into()),
                 SqliteValue::Integer(to_i64_clamped(value)),
             ],
         })
@@ -6015,31 +6020,18 @@ impl Connection {
                     }
                     Ok(rows)
                 } else if has_joins(select) || has_subquery_source(select) {
-                    // Try VDBE codegen for simple JOINs first — if it succeeds,
-                    // execute through the storage-cursor path (100-1000x faster
-                    // than the interpreted fallback for in-memory databases).
-                    if has_joins(select) && !has_subquery_source(select) {
-                        let rewritten_for_vdbe =
-                            self.rewrite_in_subqueries_select(select, params)?;
-                        let sql_text = rewritten_for_vdbe.to_string();
-                        let sql_key = Self::sql_hash(&sql_text);
-                        let vdbe_result = self.compile_with_cache(sql_key, &sql_text, |conn| {
-                            conn.compile_table_select(rewritten_for_vdbe.as_ref())
-                        });
-                        if let Ok(program) = vdbe_result {
-                            let (mut rows, _, _) =
-                                self.execute_table_program_with_cx(&program, params, false, cx)?;
-                            if distinct {
-                                dedup_rows(&mut rows);
-                            }
-                            if let Some(ref limit) = select.limit {
-                                apply_limit_clause(&mut rows, limit);
-                            }
-                            return Ok(rows);
-                        }
-                        // If VDBE codegen fails (Unsupported), fall through to
-                        // the interpreted join path.
-                    }
+                    // NOTE: VDBE codegen for JOINs exists (codegen_join_select)
+                    // but is not yet wired into the dispatch path because it
+                    // produces incorrect results for many JOIN shapes (NATURAL,
+                    // CROSS, multi-table, complex ON conditions). Once the
+                    // codegen is validated against the conformance oracle, enable
+                    // the fast path by uncommenting the routing below.
+                    //
+                    // TODO(perf): Enable VDBE JOIN routing when codegen_join_select
+                    // passes all conformance tests:
+                    // if has_joins(select) && !has_subquery_source(select) {
+                    //     ... try compile_table_select → execute_table_program ...
+                    // }
 
                     // Fallback path: eagerly rewrite IN subqueries.
                     // Also handles derived tables even without explicit JOINs.
@@ -7409,55 +7401,17 @@ impl Connection {
             Statement::Select(select) => {
                 let distinct = is_distinct_select(select);
                 let limit_clause = select.limit.clone();
-                let compile_result = if distinct && limit_clause.is_some() {
+                let program = if distinct && limit_clause.is_some() {
                     let mut unbounded = select.clone();
                     unbounded.limit = None;
                     let compiled_sql = unbounded.to_string();
                     let compiled_sql_key = Self::sql_hash(&compiled_sql);
                     self.compile_with_cache(compiled_sql_key, &compiled_sql, |conn| {
                         conn.compile_table_select(&unbounded)
-                    })
+                    })?
                 } else {
                     let sql_key = Self::sql_hash(sql);
-                    self.compile_with_cache(sql_key, sql, |conn| conn.compile_table_select(select))
-                };
-                // If VDBE compilation fails for a JOIN query (codegen_join_select
-                // returned Unsupported), fall back to the deferred dispatch path
-                // which uses the connection-level interpreted join instead of
-                // propagating the error.
-                let program = match compile_result {
-                    Ok(p) => p,
-                    // Only fall back to the interpreted JOIN for codegen
-                    // Unsupported errors (mapped to NotImplemented). Real
-                    // errors (TableNotFound, etc.) must propagate.
-                    Err(FrankenError::NotImplemented(_)) if has_joins(select) => {
-                        let placeholder_program =
-                            Arc::new(ProgramBuilder::new().finish().map_err(|e| {
-                                FrankenError::Internal(format!(
-                                    "failed to build placeholder program: {e}"
-                                ))
-                            })?);
-                        return Ok(PreparedStatement {
-                            sql: sql.to_owned(),
-                            program: placeholder_program,
-                            func_registry: registry,
-                            expression_postprocess: None,
-                            distinct: false,
-                            db: None,
-                            pager: None,
-                            post_distinct_limit: None,
-                            schema_cookie: self.schema_cookie(),
-                            schema_generation: self.schema_generation(),
-                            dml_dispatch: None,
-                            deferred_query_statement: Some(Arc::new(statement.clone())),
-                            deferred_query_column_count: Some(
-                                self.prepared_statement_column_count(statement),
-                            ),
-                            column_names: prepared_column_names,
-                            conn: self,
-                        });
-                    }
-                    Err(e) => return Err(e),
+                    self.compile_with_cache(sql_key, sql, |conn| conn.compile_table_select(select))?
                 };
                 Ok(PreparedStatement {
                     sql: sql.to_owned(),
@@ -7778,12 +7732,9 @@ impl Connection {
             || has_ordered_aggregate
             || has_window_functions(select)
             || select_contains_match_operator(select)
-            // JOINs require dispatch UNLESS the VDBE codegen can handle them.
-            // Note: has_grouping/has_window_functions are already checked above,
-            // so this guard only needs to test fallback-source and eligibility.
-            || (has_join_like_source
-                && (has_fallback_from_source(select)
-                    || !select_join_is_vdbe_eligible(select)))
+            // All JOINs go through deferred dispatch (interpreted path) until
+            // codegen_join_select is validated against the conformance oracle.
+            || has_join_like_source
             || select_has_correlated_join_subquery(select)
     }
 
@@ -8828,7 +8779,7 @@ impl Connection {
             .into_iter()
             .map(|(name, value)| Row {
                 values: vec![
-                    SqliteValue::Text(name.to_owned().into()),
+                    SqliteValue::Text(name.into()),
                     SqliteValue::Integer(to_i64(value)),
                 ],
             })
@@ -8935,8 +8886,8 @@ impl Connection {
             |code: &str, severity: &str, message: String, actual: u64, threshold: u64| {
                 rows.push(Row {
                     values: vec![
-                        SqliteValue::Text(code.to_owned().into()),
-                        SqliteValue::Text(severity.to_owned().into()),
+                        SqliteValue::Text(code.into()),
+                        SqliteValue::Text(severity.into()),
                         SqliteValue::Text(message.into()),
                         SqliteValue::Integer(to_i64(actual)),
                         SqliteValue::Integer(to_i64(threshold)),
@@ -9415,8 +9366,8 @@ impl Connection {
             |code: &str, severity: &str, message: String, actual: u64, threshold: u64| {
                 rows.push(Row {
                     values: vec![
-                        SqliteValue::Text(code.to_owned().into()),
-                        SqliteValue::Text(severity.to_owned().into()),
+                        SqliteValue::Text(code.into()),
+                        SqliteValue::Text(severity.into()),
                         SqliteValue::Text(message.into()),
                         SqliteValue::Integer(to_i64(actual)),
                         SqliteValue::Integer(to_i64(threshold)),
@@ -10112,13 +10063,11 @@ impl Connection {
             };
 
             let record = serialize_record(&[
-                SqliteValue::Text(type_.to_owned().into()),
-                SqliteValue::Text(name.to_owned().into()),
-                SqliteValue::Text(tbl_name.to_owned().into()),
+                SqliteValue::Text(type_.into()),
+                SqliteValue::Text(name.into()),
+                SqliteValue::Text(tbl_name.into()),
                 SqliteValue::Integer(i64::from(rootpage)),
-                sql.map_or(SqliteValue::Null, |s| {
-                    SqliteValue::Text(s.to_owned().into())
-                }),
+                sql.map_or(SqliteValue::Null, |s| SqliteValue::Text(s.into())),
             ]);
             cursor.table_insert(cx, rowid, &record)
         })?;
@@ -10215,7 +10164,7 @@ impl Connection {
                     if updated.len() < 5 {
                         updated.resize(5, SqliteValue::Null);
                     }
-                    updated[4] = SqliteValue::Text(new_sql.to_owned().into());
+                    updated[4] = SqliteValue::Text(new_sql.into());
                     let record = serialize_record(&updated);
 
                     // Delete old row then re-insert at the same rowid.
@@ -10702,7 +10651,7 @@ impl Connection {
         };
 
         let record = serialize_record(&[
-            SqliteValue::Text(table_name.to_owned().into()),
+            SqliteValue::Text(table_name.into()),
             SqliteValue::Integer(seq),
         ]);
         cursor.table_insert(cx, rowid, &record)?;
@@ -13843,7 +13792,7 @@ impl Connection {
                 .unwrap_or_else(|| render_create_table_sql(table, is_autoincrement));
 
             rows.push(vec![
-                SqliteValue::Text("table".to_owned().into()),
+                SqliteValue::Text("table".into()),
                 SqliteValue::Text(table.name.clone().into()),
                 SqliteValue::Text(table.name.clone().into()),
                 SqliteValue::Integer(i64::from(table.root_page)),
@@ -13857,7 +13806,7 @@ impl Connection {
                     .cloned()
                     .unwrap_or_else(|| render_create_index_sql(index, &table.name));
                 rows.push(vec![
-                    SqliteValue::Text("index".to_owned().into()),
+                    SqliteValue::Text("index".into()),
                     SqliteValue::Text(index.name.clone().into()),
                     SqliteValue::Text(table.name.clone().into()),
                     SqliteValue::Integer(i64::from(index.root_page)),
@@ -13872,7 +13821,7 @@ impl Connection {
                 .cloned()
                 .unwrap_or_else(|| format!("CREATE VIEW {}", view.name));
             rows.push(vec![
-                SqliteValue::Text("view".to_owned().into()),
+                SqliteValue::Text("view".into()),
                 SqliteValue::Text(view.name.clone().into()),
                 SqliteValue::Text(view.name.clone().into()),
                 SqliteValue::Integer(0),
@@ -13882,7 +13831,7 @@ impl Connection {
 
         for trigger in triggers.iter().filter(|t| !t.temporary) {
             rows.push(vec![
-                SqliteValue::Text("trigger".to_owned().into()),
+                SqliteValue::Text("trigger".into()),
                 SqliteValue::Text(trigger.name.clone().into()),
                 SqliteValue::Text(trigger.table_name.clone().into()),
                 SqliteValue::Integer(0),
@@ -16396,7 +16345,7 @@ impl Connection {
                         TextEncoding::Utf16le => "UTF-16le",
                         TextEncoding::Utf16be => "UTF-16be",
                     };
-                    SqliteValue::Text(encoding.to_owned().into())
+                    SqliteValue::Text(encoding.into())
                 }
                 _ => unreachable!("guarded by matches!"),
             };
@@ -17260,7 +17209,7 @@ impl Connection {
                                     values: vec![
                                         SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
                                         SqliteValue::Text(col.name.clone().into()),
-                                        SqliteValue::Text(type_str.to_owned().into()),
+                                        SqliteValue::Text(type_str.into()),
                                         SqliteValue::Integer(notnull),
                                         dflt,
                                         SqliteValue::Integer(pk),
@@ -17301,7 +17250,7 @@ impl Connection {
                                     SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
                                     SqliteValue::Text(idx.name.clone().into()),
                                     SqliteValue::Integer(i64::from(idx.is_unique)),
-                                    SqliteValue::Text("c".to_owned().into()),
+                                    SqliteValue::Text("c".into()),
                                     SqliteValue::Integer(0),
                                 ],
                             })
@@ -17397,7 +17346,7 @@ impl Connection {
                                             SqliteValue::Text(
                                                 fk_action_sql(fk.on_delete).to_owned().into(),
                                             ),
-                                            SqliteValue::Text("NONE".to_owned().into()),
+                                            SqliteValue::Text("NONE".into()),
                                         ],
                                     }
                                 })
@@ -17433,14 +17382,14 @@ impl Connection {
                     Row {
                         values: vec![
                             SqliteValue::Integer(0),
-                            SqliteValue::Text("main".to_owned().into()),
+                            SqliteValue::Text("main".into()),
                             SqliteValue::Text(self.path.clone().into()),
                         ],
                     },
                     Row {
                         values: vec![
                             SqliteValue::Integer(1),
-                            SqliteValue::Text("temp".to_owned().into()),
+                            SqliteValue::Text("temp".into()),
                             SqliteValue::Text(String::new().into()),
                         ],
                     },
@@ -17456,7 +17405,7 @@ impl Connection {
                     rows.push(Row {
                         values: vec![
                             SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
-                            SqliteValue::Text(schema_name.to_owned().into()),
+                            SqliteValue::Text(schema_name.into()),
                             SqliteValue::Text(path.into()),
                         ],
                     });
@@ -17473,9 +17422,9 @@ impl Connection {
                         let ncol = i64::try_from(t.columns.len()).unwrap_or(0);
                         Row {
                             values: vec![
-                                SqliteValue::Text("main".to_owned().into()),
+                                SqliteValue::Text("main".into()),
                                 SqliteValue::Text(t.name.clone().into()),
-                                SqliteValue::Text("table".to_owned().into()),
+                                SqliteValue::Text("table".into()),
                                 SqliteValue::Integer(ncol),
                                 SqliteValue::Integer(0),
                                 SqliteValue::Integer(i64::from(t.strict)),
@@ -17490,9 +17439,9 @@ impl Connection {
                     let ncol = i64::try_from(v.columns.len()).unwrap_or(0);
                     rows.push(Row {
                         values: vec![
-                            SqliteValue::Text("main".to_owned().into()),
+                            SqliteValue::Text("main".into()),
                             SqliteValue::Text(v.name.clone().into()),
-                            SqliteValue::Text("view".to_owned().into()),
+                            SqliteValue::Text("view".into()),
                             SqliteValue::Integer(ncol),
                             SqliteValue::Integer(0),
                             SqliteValue::Integer(0),
@@ -17528,7 +17477,7 @@ impl Connection {
             }
             // PRAGMA encoding — return the database text encoding.
             "encoding" if pragma.value.is_none() => Ok(vec![Row {
-                values: vec![SqliteValue::Text("UTF-8".to_owned().into())],
+                values: vec![SqliteValue::Text("UTF-8".into())],
             }]),
             // Unrecognised pragmas are silently ignored (SQLite compatibility).
             _ => Ok(Vec::new()),
@@ -21535,13 +21484,10 @@ impl Connection {
                     let tbl_schema = schema
                         .iter()
                         .find(|t| t.name.eq_ignore_ascii_case(&src.table_name));
-                    let (root_page, num_schema_cols) = tbl_schema
+                    let (root_page, _num_schema_cols) = tbl_schema
                         .map(|t| (t.root_page, t.columns.len()))
                         .unwrap_or((0, 0));
-                    // IPK (INTEGER PRIMARY KEY) columns are stored as the rowid,
-                    // not in the record payload. We need to splice the rowid back
-                    // at the IPK column position to match what SELECT would return.
-                    let ipk_idx = self
+                    let _ipk_idx = self
                         .rowid_alias_columns
                         .borrow()
                         .get(&src.table_name.to_ascii_lowercase())
@@ -21551,26 +21497,10 @@ impl Connection {
                         mem_table
                             .iter_rows()
                             .map(|(rowid, vals)| {
-                                let mut row = if let Some(ipk_col) = ipk_idx {
-                                    // The record payload has num_schema_cols - 1 values
-                                    // (IPK is not stored). Reconstruct the full row
-                                    // by inserting the rowid at the IPK position.
-                                    let mut full = Vec::with_capacity(num_schema_cols);
-                                    let mut val_idx = 0;
-                                    for col_idx in 0..num_schema_cols {
-                                        if col_idx == ipk_col {
-                                            full.push(SqliteValue::Integer(rowid));
-                                        } else if val_idx < vals.len() {
-                                            full.push(vals[val_idx].clone());
-                                            val_idx += 1;
-                                        } else {
-                                            full.push(SqliteValue::Null);
-                                        }
-                                    }
-                                    full
-                                } else {
-                                    vals.to_vec()
-                                };
+                                // MemDatabase rows already include all columns
+                                // (IPK values are in the record payload), so no
+                                // IPK reconstruction is needed.
+                                let mut row = vals.to_vec();
                                 if src.hidden_rowid_projection.is_some() {
                                     row.push(SqliteValue::Integer(rowid));
                                 }
@@ -23876,6 +23806,8 @@ fn has_joins(select: &SelectStatement) -> bool {
 /// Returns true if a JOIN query is eligible for VDBE codegen (simple INNER/CROSS
 /// JOINs on named tables with ON constraints — no LEFT/RIGHT/FULL/NATURAL,
 /// no USING, no subquery sources).
+/// Currently unused — will be enabled when codegen_join_select passes conformance.
+#[allow(dead_code)]
 fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
     let SelectCore::Select {
         from: Some(from), ..
@@ -26386,7 +26318,7 @@ struct SharedRuntimeState {
     write_coordinator_service_running: bool,
     write_coordinator_service_generation: u64,
     write_coordinator_service_launch_count: u64,
-    write_coordinator_shutdown: Option<asupersync::channel::oneshot::Sender<()>>,
+    write_coordinator_shutdown: Option<WriteCoordinatorShutdownTx>,
     open_connections: usize,
     poisoned: Option<String>,
 }
@@ -26587,7 +26519,7 @@ impl SharedMvccState {
     fn record_write_coordinator_service_launch(
         &self,
         reservation: &WriteCoordinatorServiceStart,
-        shutdown: asupersync::channel::oneshot::Sender<()>,
+        shutdown: WriteCoordinatorShutdownTx,
     ) {
         let mut state = lock_unpoisoned(&self.runtime_state);
         if !state.write_coordinator_service_starting
@@ -26604,6 +26536,7 @@ impl SharedMvccState {
         state.write_coordinator_shutdown = Some(shutdown);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn ensure_write_coordinator_service_started(&self) -> Result<()> {
         let wait_deadline = Instant::now()
             + if cfg!(test) {
@@ -26694,6 +26627,11 @@ impl SharedMvccState {
             );
         }
 
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn ensure_write_coordinator_service_started(&self) -> Result<()> {
         Ok(())
     }
 
@@ -35235,7 +35173,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 Some(SqliteValue::Blob(_)) => "blob",
                 _ => "null",
             };
-            SqliteValue::Text(type_name.to_owned().into())
+            SqliteValue::Text(type_name.into())
         }
         "strftime" => {
             use fsqlite_func::ScalarFunction;
@@ -35461,7 +35399,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             None => SqliteValue::Null,
         },
         "quote" => match args.first() {
-            Some(SqliteValue::Null) => SqliteValue::Text("NULL".to_owned().into()),
+            Some(SqliteValue::Null) => SqliteValue::Text("NULL".into()),
             Some(SqliteValue::Integer(n)) => SqliteValue::Text(n.to_string().into()),
             Some(v @ SqliteValue::Float(_)) => SqliteValue::Text(v.to_text().into()),
             Some(SqliteValue::Text(s)) => {
@@ -35614,7 +35552,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 SqliteValue::Null
             }
         }
-        "sqlite_version" => SqliteValue::Text("3.52.0".to_owned().into()),
+        "sqlite_version" => SqliteValue::Text("3.52.0".into()),
         "last_insert_rowid" => SqliteValue::Integer(get_last_insert_rowid()),
         "changes" => SqliteValue::Integer(get_last_changes()),
         "total_changes" => SqliteValue::Integer(get_total_changes()),
@@ -36023,7 +35961,7 @@ mod tests {
                 return Ok(());
             };
             if col == 0 {
-                ctx.set_value(SqliteValue::Text(value.clone()));
+                ctx.set_value(SqliteValue::Text(value.clone().into()));
             }
             Ok(())
         }
@@ -36932,8 +36870,8 @@ mod tests {
             row_values(&rows[0]),
             vec![
                 SqliteValue::Integer(3),
-                SqliteValue::Text("abcdef".to_owned()),
-                SqliteValue::Text("real".to_owned()),
+                SqliteValue::Text("abcdef".into()),
+                SqliteValue::Text("real".into()),
             ],
         );
     }
@@ -36953,7 +36891,7 @@ mod tests {
         let rows = conn.query("SELECT NULL, typeof(NULL);").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Null);
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("null".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("null".into()));
     }
 
     #[test]
@@ -36977,7 +36915,7 @@ mod tests {
             .query("SELECT CASE WHEN 1 > 0 THEN 'yes' ELSE 'no' END;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("yes".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("yes".into()));
     }
 
     #[test]
@@ -36986,7 +36924,7 @@ mod tests {
         let rows = conn.query("VALUES (1, 'hello', 3.14);").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".into()));
         assert_eq!(rows[0].values()[2], SqliteValue::Float(3.14));
     }
 
@@ -36996,11 +36934,11 @@ mod tests {
         let rows = conn.query("VALUES (1, 'a'), (2, 'b'), (3, 'c');").unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("a".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("b".into()));
         assert_eq!(rows[2].values()[0], SqliteValue::Integer(3));
-        assert_eq!(rows[2].values()[1], SqliteValue::Text("c".to_owned()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("c".into()));
     }
 
     #[test]
@@ -37114,10 +37052,7 @@ mod tests {
             .query("SELECT CASE WHEN 1 THEN 'yes' ELSE 'no' END;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("yes".to_owned())],
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("yes".into())],);
     }
 
     #[test]
@@ -37205,11 +37140,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("a".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("b".into())]
         );
     }
 
@@ -37222,11 +37157,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("a".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("b".into())]
         );
     }
 
@@ -37274,7 +37209,7 @@ mod tests {
                 &[
                     SqliteValue::Integer(2),
                     SqliteValue::Integer(5),
-                    SqliteValue::Text("ok".to_owned()),
+                    SqliteValue::Text("ok".into()),
                     SqliteValue::Integer(1),
                 ],
             )
@@ -37282,7 +37217,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(7), SqliteValue::Text("ok".to_owned())]
+            vec![SqliteValue::Integer(7), SqliteValue::Text("ok".into())]
         );
     }
 
@@ -37412,13 +37347,10 @@ mod tests {
             "simple derived table should flatten onto the table-backed VDBE path"
         );
         let rows = stmt
-            .query_with_params(&[SqliteValue::Text("cara".to_owned())])
+            .query_with_params(&[SqliteValue::Text("cara".into())])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("cara".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("cara".into())]);
     }
 
     #[test]
@@ -37445,10 +37377,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Text("alice".to_owned()),
-                SqliteValue::Integer(2),
-            ]
+            vec![SqliteValue::Text("alice".into()), SqliteValue::Integer(2),]
         );
     }
 
@@ -37501,11 +37430,11 @@ mod tests {
         assert_eq!(rows[0].values().len(), 8);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(10));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("integer".to_owned()));
-        assert_eq!(rows[0].values()[6], SqliteValue::Text("$[0]".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("integer".into()));
+        assert_eq!(rows[0].values()[6], SqliteValue::Text("$[0]".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(20));
-        assert_eq!(rows[1].values()[6], SqliteValue::Text("$[1]".to_owned()));
+        assert_eq!(rows[1].values()[6], SqliteValue::Text("$[1]".into()));
     }
 
     #[test]
@@ -37522,10 +37451,7 @@ mod tests {
             .unwrap();
         let rows = stmt.query_with_params(&[SqliteValue::Integer(2)]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("two".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("two".into())]);
     }
 
     #[test]
@@ -37540,14 +37466,11 @@ mod tests {
         let row = conn
             .query_row_with_params(
                 "SELECT title FROM issues WHERE id = ?",
-                &[SqliteValue::Text("bd-2".to_owned())],
+                &[SqliteValue::Text("bd-2".into())],
             )
             .unwrap();
 
-        assert_eq!(
-            row_values(&row),
-            vec![SqliteValue::Text("second".to_owned())]
-        );
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("second".into())]);
     }
 
     #[test]
@@ -37563,13 +37486,13 @@ mod tests {
             .prepare("SELECT title FROM issues WHERE id = ?")
             .unwrap();
         let rows = stmt
-            .query_with_params(&[SqliteValue::Text("bd-1".to_owned())])
+            .query_with_params(&[SqliteValue::Text("bd-1".into())])
             .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Text("first".to_owned())]
+            vec![SqliteValue::Text("first".into())]
         );
     }
 
@@ -37589,10 +37512,7 @@ mod tests {
 
         let rows = stmt.query().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("one".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("one".into())]);
 
         conn.execute("ROLLBACK;").unwrap();
     }
@@ -37615,7 +37535,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Text("fallback".to_owned())]
+            vec![SqliteValue::Text("fallback".into())]
         );
     }
 
@@ -37661,14 +37581,14 @@ mod tests {
                 &[
                     SqliteValue::Integer(2),
                     SqliteValue::Integer(5),
-                    SqliteValue::Text("ok".to_owned()),
+                    SqliteValue::Text("ok".into()),
                 ],
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(7), SqliteValue::Text("ok".to_owned())]
+            vec![SqliteValue::Integer(7), SqliteValue::Text("ok".into())]
         );
     }
 
@@ -37726,10 +37646,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("hit".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("hit".into())]);
     }
 
     #[test]
@@ -37766,10 +37683,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("a".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("a".into())]);
     }
 
     #[test]
@@ -37802,7 +37716,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Text("right".to_owned())]
+            vec![SqliteValue::Text("right".into())]
         );
     }
 
@@ -37866,8 +37780,8 @@ mod tests {
         assert_eq!(
             first.iter().map(row_values).collect::<Vec<_>>(),
             vec![
-                vec![SqliteValue::Text("beta".to_owned())],
-                vec![SqliteValue::Text("gamma".to_owned())],
+                vec![SqliteValue::Text("beta".into())],
+                vec![SqliteValue::Text("gamma".into())],
             ]
         );
 
@@ -37876,7 +37790,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             second.iter().map(row_values).collect::<Vec<_>>(),
-            vec![vec![SqliteValue::Text("gamma".to_owned())]]
+            vec![vec![SqliteValue::Text("gamma".into())]]
         );
 
         let third = conn
@@ -37905,18 +37819,15 @@ mod tests {
     fn test_query_with_params_named_placeholder_reuse_does_not_consume_extra_slot() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn
-            .query_with_params(
-                "SELECT :x, :x, :x;",
-                &[SqliteValue::Text("same".to_owned())],
-            )
+            .query_with_params("SELECT :x, :x, :x;", &[SqliteValue::Text("same".into())])
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
             vec![
-                SqliteValue::Text("same".to_owned()),
-                SqliteValue::Text("same".to_owned()),
-                SqliteValue::Text("same".to_owned()),
+                SqliteValue::Text("same".into()),
+                SqliteValue::Text("same".into()),
+                SqliteValue::Text("same".into()),
             ],
         );
     }
@@ -38008,17 +37919,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Text("hello".to_owned())
-            ]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("hello".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![
-                SqliteValue::Integer(2),
-                SqliteValue::Text("world".to_owned())
-            ]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("world".into())]
         );
     }
 
@@ -38319,7 +38224,7 @@ mod tests {
         conn.execute("INSERT INTO t VALUES (3, 'hello');").unwrap();
         let rows = conn.query("SELECT a, b FROM t WHERE a = 3;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".into()));
     }
 
     #[test]
@@ -39387,10 +39292,10 @@ mod tests {
         assert_eq!(
             visible.values(),
             &[
-                SqliteValue::Text("winner-hash".to_owned()),
+                SqliteValue::Text("winner-hash".into()),
                 SqliteValue::Integer(1),
-                SqliteValue::Text("2026-03-12T01:00:00Z".to_owned()),
-                SqliteValue::Text("closed".to_owned()),
+                SqliteValue::Text("2026-03-12T01:00:00Z".into()),
+                SqliteValue::Text("closed".into()),
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(0),
             ],
@@ -39503,7 +39408,7 @@ mod tests {
                 .query_row("SELECT content_hash FROM issues WHERE id = 'bd-040';")
                 .unwrap()
                 .get(0),
-            Some(&SqliteValue::Text("winner-hash".to_owned())),
+            Some(&SqliteValue::Text("winner-hash".into())),
             "loser must see winner content hash after rollback"
         );
 
@@ -40527,14 +40432,14 @@ mod tests {
         conn.execute_prepared_with_params(
             &stmt,
             &[
-                SqliteValue::Text("hash-a1".to_owned()),
+                SqliteValue::Text("hash-a1".into()),
                 SqliteValue::Integer(1),
-                SqliteValue::Text("2026-03-11 10:00:00".to_owned()),
-                SqliteValue::Text("closed".to_owned()),
-                SqliteValue::Text("2026-03-11 13:00:00".to_owned()),
-                SqliteValue::Text("2026-03-11 13:00:00".to_owned()),
-                SqliteValue::Text("completed".to_owned()),
-                SqliteValue::Text("bd-a".to_owned()),
+                SqliteValue::Text("2026-03-11 10:00:00".into()),
+                SqliteValue::Text("closed".into()),
+                SqliteValue::Text("2026-03-11 13:00:00".into()),
+                SqliteValue::Text("2026-03-11 13:00:00".into()),
+                SqliteValue::Text("completed".into()),
+                SqliteValue::Text("bd-a".into()),
             ],
         )
         .unwrap();
@@ -40542,14 +40447,14 @@ mod tests {
         conn.execute_prepared_with_params(
             &stmt,
             &[
-                SqliteValue::Text("hash-c1".to_owned()),
+                SqliteValue::Text("hash-c1".into()),
                 SqliteValue::Integer(1),
-                SqliteValue::Text("2026-03-11 14:00:00".to_owned()),
-                SqliteValue::Text("open".to_owned()),
-                SqliteValue::Text("2026-03-11 14:00:00".to_owned()),
+                SqliteValue::Text("2026-03-11 14:00:00".into()),
+                SqliteValue::Text("open".into()),
+                SqliteValue::Text("2026-03-11 14:00:00".into()),
                 SqliteValue::Null,
-                SqliteValue::Text(String::new()),
-                SqliteValue::Text("bd-c".to_owned()),
+                SqliteValue::Text("".into()),
+                SqliteValue::Text("bd-c".into()),
             ],
         )
         .unwrap();
@@ -40557,14 +40462,14 @@ mod tests {
         conn.execute_prepared_with_params(
             &stmt,
             &[
-                SqliteValue::Text("hash-b1".to_owned()),
+                SqliteValue::Text("hash-b1".into()),
                 SqliteValue::Integer(2),
-                SqliteValue::Text("2026-03-11 11:30:00".to_owned()),
-                SqliteValue::Text("open".to_owned()),
-                SqliteValue::Text("2026-03-11 11:30:00".to_owned()),
+                SqliteValue::Text("2026-03-11 11:30:00".into()),
+                SqliteValue::Text("open".into()),
+                SqliteValue::Text("2026-03-11 11:30:00".into()),
                 SqliteValue::Null,
-                SqliteValue::Text(String::new()),
-                SqliteValue::Text("bd-b".to_owned()),
+                SqliteValue::Text("".into()),
+                SqliteValue::Text("bd-b".into()),
             ],
         )
         .unwrap();
@@ -40627,11 +40532,11 @@ mod tests {
             conn.execute_prepared_with_params(
                 &insert,
                 &[
-                    SqliteValue::Text(format!("bd-{i:04}")),
-                    SqliteValue::Text(hash),
+                    SqliteValue::Text(format!("bd-{i:04}").into()),
+                    SqliteValue::Text(hash.into()),
                     SqliteValue::Integer(i % 5),
-                    SqliteValue::Text(ts.clone()),
-                    SqliteValue::Text(ts),
+                    SqliteValue::Text(ts.clone().into()),
+                    SqliteValue::Text(ts.into()),
                 ],
             )
             .unwrap();
@@ -40658,14 +40563,14 @@ mod tests {
         conn.execute_prepared_with_params(
             &stmt,
             &[
-                SqliteValue::Text(new_hash.to_owned()),
+                SqliteValue::Text(new_hash.into()),
                 SqliteValue::Integer(0),
-                SqliteValue::Text("2026-03-12T02:43:28Z".to_owned()),
-                SqliteValue::Text("closed".to_owned()),
-                SqliteValue::Text("2026-03-12T02:43:28Z".to_owned()),
-                SqliteValue::Text("2026-03-12T02:43:28Z".to_owned()),
-                SqliteValue::Text("closed during stress regression".to_owned()),
-                SqliteValue::Text(format!("bd-{target:04}")),
+                SqliteValue::Text("2026-03-12T02:43:28Z".into()),
+                SqliteValue::Text("closed".into()),
+                SqliteValue::Text("2026-03-12T02:43:28Z".into()),
+                SqliteValue::Text("2026-03-12T02:43:28Z".into()),
+                SqliteValue::Text("closed during stress regression".into()),
+                SqliteValue::Text(format!("bd-{target:04}").into()),
             ],
         )
         .unwrap();
@@ -41217,10 +41122,7 @@ mod tests {
         conn.execute("INSERT INTO t VALUES (1);").unwrap();
         let rows = conn.query("SELECT msg FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("fired".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("fired".into()));
     }
 
     #[test]
@@ -41244,10 +41146,7 @@ mod tests {
 
         let rows = conn.query("SELECT msg FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("fired".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("fired".into()));
     }
 
     #[test]
@@ -41291,10 +41190,7 @@ mod tests {
         let rows = conn.query("SELECT id, name FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("alice".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("alice".into()));
     }
 
     #[test]
@@ -41315,11 +41211,8 @@ mod tests {
 
         let rows = conn.query("SELECT old_name, new_name FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("alice".to_owned())
-        );
-        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("bob".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("alice".into()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("bob".into()));
     }
 
     #[test]
@@ -41340,10 +41233,7 @@ mod tests {
         let rows = conn.query("SELECT id, name FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("alice".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("alice".into()));
     }
 
     #[test]
@@ -41365,10 +41255,7 @@ mod tests {
 
         let rows = conn.query("SELECT msg FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("changed".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("changed".into()));
     }
 
     #[test]
@@ -41410,7 +41297,7 @@ mod tests {
 
         let rows = conn.query("SELECT msg FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("fired".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("fired".into()));
     }
 
     #[test]
@@ -41471,10 +41358,7 @@ mod tests {
 
         let rows = conn.query("SELECT msg FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("fired".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("fired".into()));
     }
 
     #[test]
@@ -41608,10 +41492,7 @@ mod tests {
         let rows = conn.query("SELECT id, name FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("alice".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("alice".into()));
         assert!(conn.trigger_frame_stack.borrow().is_empty());
     }
 
@@ -41633,11 +41514,8 @@ mod tests {
 
         let rows = conn.query("SELECT old_name, new_name FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("alice".to_owned())
-        );
-        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("bob".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("alice".into()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("bob".into()));
         assert!(conn.trigger_frame_stack.borrow().is_empty());
     }
 
@@ -41659,11 +41537,8 @@ mod tests {
 
         let rows = conn.query("SELECT old_name, new_name FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("alice".to_owned())
-        );
-        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("bob".to_owned()));
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("alice".into()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("bob".into()));
     }
 
     #[test]
@@ -41705,7 +41580,7 @@ mod tests {
         let rows = conn.query("SELECT old_note, new_note FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
-        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("set".to_owned()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("set".into()));
     }
 
     #[test]
@@ -41724,10 +41599,7 @@ mod tests {
 
         let rows = conn.query("SELECT msg FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0])[0],
-            SqliteValue::Text("fired".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("fired".into()));
     }
 
     #[test]
@@ -41883,10 +41755,7 @@ mod tests {
         let rows = conn.query("SELECT id, name FROM log;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
-        assert_eq!(
-            row_values(&rows[0])[1],
-            SqliteValue::Text("alice".to_owned())
-        );
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("alice".into()));
         assert!(conn.trigger_frame_stack.borrow().is_empty());
     }
 
@@ -41963,7 +41832,7 @@ mod tests {
 
         conn.execute_with_params(
             "VACUUM main INTO ?1;",
-            &[SqliteValue::Text(target_path_str.clone())],
+            &[SqliteValue::Text(target_path_str.clone().into())],
         )
         .unwrap();
 
@@ -41990,7 +41859,7 @@ mod tests {
         let err = conn
             .execute_with_params(
                 "VACUUM INTO ?1;",
-                &[SqliteValue::Text(target_path_str.clone())],
+                &[SqliteValue::Text(target_path_str.clone().into())],
             )
             .unwrap_err();
         assert!(
@@ -42383,17 +42252,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(2),
-                SqliteValue::Text("beta".to_owned()),
-            ]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into()),]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![
-                SqliteValue::Integer(3),
-                SqliteValue::Text("gamma".to_owned()),
-            ]
+            vec![SqliteValue::Integer(3), SqliteValue::Text("gamma".into()),]
         );
     }
 
@@ -42426,8 +42289,8 @@ mod tests {
         assert_eq!(
             log_rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![
-                vec![SqliteValue::Text("alpha".to_owned())],
-                vec![SqliteValue::Text("beta".to_owned())],
+                vec![SqliteValue::Text("alpha".into())],
+                vec![SqliteValue::Text("beta".into())],
             ],
             "INSERT ... SELECT fallback must fire AFTER triggers exactly once per inserted row",
         );
@@ -42452,10 +42315,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(7),
-                SqliteValue::Text("seven".to_owned()),
-            ]
+            vec![SqliteValue::Integer(7), SqliteValue::Text("seven".into()),]
         );
     }
 
@@ -42485,10 +42345,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(7),
-                SqliteValue::Text("seven".to_owned()),
-            ]
+            vec![SqliteValue::Integer(7), SqliteValue::Text("seven".into()),]
         );
     }
 
@@ -42523,7 +42380,7 @@ mod tests {
             vec![
                 SqliteValue::Integer(8),
                 SqliteValue::Integer(8),
-                SqliteValue::Text("x".to_owned()),
+                SqliteValue::Text("x".into()),
             ]
         );
         assert_eq!(
@@ -42531,7 +42388,7 @@ mod tests {
             vec![
                 SqliteValue::Integer(10),
                 SqliteValue::Integer(10),
-                SqliteValue::Text("y".to_owned()),
+                SqliteValue::Text("y".into()),
             ]
         );
 
@@ -42574,7 +42431,7 @@ mod tests {
             vec![
                 SqliteValue::Integer(7),
                 SqliteValue::Integer(7),
-                SqliteValue::Text("seven".to_owned()),
+                SqliteValue::Text("seven".into()),
             ]
         );
     }
@@ -42671,17 +42528,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Text("ten".to_owned()),
-                SqliteValue::Integer(10),
-            ]
+            vec![SqliteValue::Text("ten".into()), SqliteValue::Integer(10),]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![
-                SqliteValue::Text("twenty".to_owned()),
-                SqliteValue::Integer(20),
-            ]
+            vec![SqliteValue::Text("twenty".into()), SqliteValue::Integer(20),]
         );
     }
 
@@ -42698,10 +42549,7 @@ mod tests {
         let rows = conn.query("SELECT rowid, name FROM dst;").unwrap();
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(7),
-                SqliteValue::Text("seven".to_owned()),
-            ]
+            vec![SqliteValue::Integer(7), SqliteValue::Text("seven".into()),]
         );
     }
 
@@ -42719,10 +42567,7 @@ mod tests {
         let rows = conn.query("SELECT a, b FROM dst;").unwrap();
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Text("three".to_owned()),
-            ]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("three".into()),]
         );
     }
 
@@ -42748,7 +42593,7 @@ mod tests {
             row_values(&rows[0]),
             vec![
                 SqliteValue::Integer(7),
-                SqliteValue::Text("fallback".to_owned()),
+                SqliteValue::Text("fallback".into()),
                 SqliteValue::Integer(11),
             ]
         );
@@ -42756,7 +42601,7 @@ mod tests {
             row_values(&rows[1]),
             vec![
                 SqliteValue::Integer(7),
-                SqliteValue::Text("fallback".to_owned()),
+                SqliteValue::Text("fallback".into()),
                 SqliteValue::Integer(22),
             ]
         );
@@ -42784,7 +42629,7 @@ mod tests {
             row_values(&rows[0]),
             vec![
                 SqliteValue::Integer(3),
-                SqliteValue::Text("xy".to_owned()),
+                SqliteValue::Text("xy".into()),
                 SqliteValue::Integer(11),
             ]
         );
@@ -42792,7 +42637,7 @@ mod tests {
             row_values(&rows[1]),
             vec![
                 SqliteValue::Integer(3),
-                SqliteValue::Text("xy".to_owned()),
+                SqliteValue::Text("xy".into()),
                 SqliteValue::Integer(22),
             ]
         );
@@ -42899,7 +42744,7 @@ mod tests {
             vec![
                 SqliteValue::Integer(9),
                 SqliteValue::Integer(1),
-                SqliteValue::Text("ok".to_owned()),
+                SqliteValue::Text("ok".into()),
             ]
         );
     }
@@ -42923,14 +42768,14 @@ mod tests {
         assert_eq!(log_rows.len(), 1);
         assert_eq!(
             row_values(&log_rows[0]),
-            vec![SqliteValue::Text("xy".to_owned())]
+            vec![SqliteValue::Text("xy".into())]
         );
 
         let table_rows = conn.query("SELECT a, b FROM t;").unwrap();
         assert_eq!(table_rows.len(), 1);
         assert_eq!(
             row_values(&table_rows[0]),
-            vec![SqliteValue::Text("xy".to_owned()), SqliteValue::Integer(5)]
+            vec![SqliteValue::Text("xy".into()), SqliteValue::Integer(5)]
         );
     }
 
@@ -43175,7 +43020,7 @@ mod tests {
         assert_eq!(raw_master_rows.len(), 3);
         let trigger_row = raw_master_rows
             .iter()
-            .find(|(_, values)| values[0] == SqliteValue::Text("trigger".to_owned()))
+            .find(|(_, values)| values[0] == SqliteValue::Text("trigger".into()))
             .unwrap();
         let trigger_sql = match &trigger_row.1[4] {
             SqliteValue::Text(sql) => sql.clone(),
@@ -43310,7 +43155,7 @@ mod tests {
             row_values(&rows[0]),
             vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("existing".to_owned()),
+                SqliteValue::Text("existing".into()),
             ]
         );
 
@@ -43350,7 +43195,7 @@ mod tests {
             row_values(&rows[0]),
             vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("existing".to_owned()),
+                SqliteValue::Text("existing".into()),
             ]
         );
     }
@@ -43390,7 +43235,7 @@ mod tests {
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("existing".to_owned()),
+                SqliteValue::Text("existing".into()),
             ]],
             "full transaction rollback should discard rows written earlier in the transaction",
         );
@@ -43430,12 +43275,9 @@ mod tests {
             vec![
                 vec![
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("existing".to_owned()),
+                    SqliteValue::Text("existing".into()),
                 ],
-                vec![
-                    SqliteValue::Integer(2),
-                    SqliteValue::Text("beta".to_owned()),
-                ],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into()),],
             ],
             "OR FAIL must preserve rows inserted before the conflict",
         );
@@ -43477,15 +43319,12 @@ mod tests {
             vec![
                 vec![
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("existing".to_owned()),
+                    SqliteValue::Text("existing".into()),
                 ],
-                vec![
-                    SqliteValue::Integer(2),
-                    SqliteValue::Text("beta".to_owned()),
-                ],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("beta".into()),],
                 vec![
                     SqliteValue::Integer(9),
-                    SqliteValue::Text("txn_only".to_owned()),
+                    SqliteValue::Text("txn_only".into()),
                 ],
             ],
             "OR FAIL must preserve rows written before the conflict and keep the transaction open",
@@ -43563,7 +43402,7 @@ mod tests {
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("seed".to_owned()),
+                SqliteValue::Text("seed".into()),
             ]],
         );
     }
@@ -43597,14 +43436,8 @@ mod tests {
         assert_eq!(
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("seed".to_owned()),
-                ],
-                vec![
-                    SqliteValue::Integer(11),
-                    SqliteValue::Text("alpha".to_owned()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("seed".into()),],
+                vec![SqliteValue::Integer(11), SqliteValue::Text("alpha".into()),],
             ],
         );
     }
@@ -43640,18 +43473,9 @@ mod tests {
         assert_eq!(
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("seed".to_owned()),
-                ],
-                vec![
-                    SqliteValue::Integer(11),
-                    SqliteValue::Text("alpha".to_owned()),
-                ],
-                vec![
-                    SqliteValue::Integer(12),
-                    SqliteValue::Text("beta".to_owned()),
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("seed".into()),],
+                vec![SqliteValue::Integer(11), SqliteValue::Text("alpha".into()),],
+                vec![SqliteValue::Integer(12), SqliteValue::Text("beta".into()),],
             ],
         );
     }
@@ -43673,7 +43497,7 @@ mod tests {
         let err = conn
             .execute_prepared_with_params(
                 &stmt,
-                &[SqliteValue::Integer(1), SqliteValue::Text("dup".to_owned())],
+                &[SqliteValue::Integer(1), SqliteValue::Text("dup".into())],
             )
             .expect_err("duplicate primary key should fail prepared INSERT OR ROLLBACK");
         let err_text = err.to_string();
@@ -43692,7 +43516,7 @@ mod tests {
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("existing".to_owned()),
+                SqliteValue::Text("existing".into()),
             ]],
             "prepared direct-dispatch INSERT must honor OR ROLLBACK semantics",
         );
@@ -43715,7 +43539,7 @@ mod tests {
         let err = conn
             .execute_prepared_with_params(
                 &stmt,
-                &[SqliteValue::Integer(1), SqliteValue::Text("dup".to_owned())],
+                &[SqliteValue::Integer(1), SqliteValue::Text("dup".into())],
             )
             .expect_err("duplicate primary key should fail prepared INSERT OR FAIL");
         let err_text = err.to_string();
@@ -43741,11 +43565,11 @@ mod tests {
             vec![
                 vec![
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("existing".to_owned()),
+                    SqliteValue::Text("existing".into()),
                 ],
                 vec![
                     SqliteValue::Integer(9),
-                    SqliteValue::Text("txn_only".to_owned()),
+                    SqliteValue::Text("txn_only".into()),
                 ],
             ],
             "prepared direct-dispatch OR FAIL must preserve earlier transaction writes",
@@ -43775,10 +43599,7 @@ mod tests {
         assert_eq!(rows1.len(), 1);
         assert_eq!(rows2.len(), 1);
         assert_eq!(row_values(&rows1[0]), vec![SqliteValue::Integer(1)]);
-        assert_eq!(
-            row_values(&rows2[0]),
-            vec![SqliteValue::Text("x".to_owned())]
-        );
+        assert_eq!(row_values(&rows2[0]), vec![SqliteValue::Text("x".into())]);
     }
 
     #[test]
@@ -43792,12 +43613,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Text("alpha".to_owned())]
+            vec![SqliteValue::Text("alpha".into())]
         );
-        assert_eq!(
-            row_values(&rows[1]),
-            vec![SqliteValue::Text("beta".to_owned())]
-        );
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Text("beta".into())]);
     }
 
     #[test]
@@ -43815,14 +43633,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(1),
-                SqliteValue::Text("ALICE".to_owned())
-            ]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("ALICE".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())]
         );
     }
 
@@ -43841,14 +43656,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("bob".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![
-                SqliteValue::Integer(5),
-                SqliteValue::Text("alice".to_owned())
-            ]
+            vec![SqliteValue::Integer(5), SqliteValue::Text("alice".into())]
         );
 
         let old_rows = conn.query("SELECT id FROM t WHERE id = 1;").unwrap();
@@ -43869,14 +43681,17 @@ mod tests {
         let changed = conn
             .execute_with_params(
                 "UPDATE t SET payload = ?1 WHERE id = 1;",
-                &[SqliteValue::Text(large_payload.clone())],
+                &[SqliteValue::Text(large_payload.clone().into())],
             )
             .unwrap();
         assert_eq!(changed, 1);
 
         let rows = conn.query("SELECT payload FROM t WHERE id = 1;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text(large_payload)]);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text(large_payload.into())]
+        );
     }
 
     #[test]
@@ -43944,10 +43759,7 @@ mod tests {
             .unwrap();
         let rows = conn.query("SELECT name FROM users WHERE id = 2;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("BOB".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("BOB".into())]);
 
         // DELETE
         conn.execute("DELETE FROM users WHERE id = 1;").unwrap();
@@ -43955,7 +43767,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("BOB".to_owned())]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("BOB".into())]
         );
     }
 
@@ -43976,17 +43788,14 @@ mod tests {
 
         let rows = conn.query("SELECT b FROM t_alias_upd ORDER BY a;").unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("one".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("one".into())]);
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Text("updated".to_owned())]
+            vec![SqliteValue::Text("updated".into())]
         );
         assert_eq!(
             row_values(&rows[2]),
-            vec![SqliteValue::Text("updated".to_owned())]
+            vec![SqliteValue::Text("updated".into())]
         );
     }
 
@@ -44024,18 +43833,12 @@ mod tests {
 
         let rows = conn.query("SELECT val FROM items ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("a".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("a".into())]);
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Text("changed".to_owned())]
+            vec![SqliteValue::Text("changed".into())]
         );
-        assert_eq!(
-            row_values(&rows[2]),
-            vec![SqliteValue::Text("c".to_owned())]
-        );
+        assert_eq!(row_values(&rows[2]), vec![SqliteValue::Text("c".into())]);
     }
 
     #[test]
@@ -44053,14 +43856,8 @@ mod tests {
 
         let rows = conn.query("SELECT val FROM items2 ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("a".to_owned())]
-        );
-        assert_eq!(
-            row_values(&rows[1]),
-            vec![SqliteValue::Text("c".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("a".into())]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Text("c".into())]);
     }
 
     #[test]
@@ -44077,10 +43874,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("beta".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("beta".into())]);
     }
 
     #[test]
@@ -44098,24 +43892,15 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(30),
-                SqliteValue::Text("third".to_owned())
-            ]
+            vec![SqliteValue::Integer(30), SqliteValue::Text("third".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![
-                SqliteValue::Integer(10),
-                SqliteValue::Text("first".to_owned())
-            ]
+            vec![SqliteValue::Integer(10), SqliteValue::Text("first".into())]
         );
         assert_eq!(
             row_values(&rows[2]),
-            vec![
-                SqliteValue::Integer(20),
-                SqliteValue::Text("second".to_owned())
-            ]
+            vec![SqliteValue::Integer(20), SqliteValue::Text("second".into())]
         );
 
         // ORDER BY rowid DESC should return rows in reverse insertion order.
@@ -44125,17 +43910,11 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(20),
-                SqliteValue::Text("second".to_owned())
-            ]
+            vec![SqliteValue::Integer(20), SqliteValue::Text("second".into())]
         );
         assert_eq!(
             row_values(&rows[2]),
-            vec![
-                SqliteValue::Integer(30),
-                SqliteValue::Text("third".to_owned())
-            ]
+            vec![SqliteValue::Integer(30), SqliteValue::Text("third".into())]
         );
     }
 
@@ -44150,34 +43929,16 @@ mod tests {
         // _rowid_ alias
         let rows = conn.query("SELECT x FROM t2 ORDER BY _rowid_;").unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("c".to_owned())]
-        );
-        assert_eq!(
-            row_values(&rows[1]),
-            vec![SqliteValue::Text("a".to_owned())]
-        );
-        assert_eq!(
-            row_values(&rows[2]),
-            vec![SqliteValue::Text("b".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("c".into())]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Text("a".into())]);
+        assert_eq!(row_values(&rows[2]), vec![SqliteValue::Text("b".into())]);
 
         // oid alias
         let rows = conn.query("SELECT x FROM t2 ORDER BY oid;").unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("c".to_owned())]
-        );
-        assert_eq!(
-            row_values(&rows[1]),
-            vec![SqliteValue::Text("a".to_owned())]
-        );
-        assert_eq!(
-            row_values(&rows[2]),
-            vec![SqliteValue::Text("b".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("c".into())]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Text("a".into())]);
+        assert_eq!(row_values(&rows[2]), vec![SqliteValue::Text("b".into())]);
     }
 
     #[test]
@@ -44193,15 +43954,15 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("a".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("b".into())]
         );
         assert_eq!(
             row_values(&rows[2]),
-            vec![SqliteValue::Integer(3), SqliteValue::Text("c".to_owned())]
+            vec![SqliteValue::Integer(3), SqliteValue::Text("c".into())]
         );
     }
 
@@ -44249,7 +44010,7 @@ mod tests {
             .query("SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("eng".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("eng".into()));
     }
 
     #[test]
@@ -44265,7 +44026,7 @@ mod tests {
             .query("SELECT dept FROM t GROUP BY dept HAVING SUM(salary) > 100;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("eng".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("eng".into()));
     }
 
     /// bd-3ew8w: HAVING-only aggregate in no-GROUP-BY path.
@@ -44501,10 +44262,10 @@ mod tests {
             .query("SELECT cat, SUM(a + b) FROM t GROUP BY cat ORDER BY cat;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("x".into()));
         // x: (1+10) + (2+20) = 11 + 22 = 33
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(33));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("y".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("y".into()));
         // y: (3+30) + (4+40) = 33 + 44 = 77
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(77));
     }
@@ -44556,11 +44317,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(1), SqliteValue::Text("x".to_owned())]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("x".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("y".to_owned())]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("y".into())]
         );
     }
 
@@ -44578,11 +44339,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(1), SqliteValue::Text("x".to_owned())]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("x".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Integer(3), SqliteValue::Text("z".to_owned())]
+            vec![SqliteValue::Integer(3), SqliteValue::Text("z".into())]
         );
     }
 
@@ -44600,11 +44361,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Integer(1), SqliteValue::Text("x".to_owned())]
+            vec![SqliteValue::Integer(1), SqliteValue::Text("x".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Integer(2), SqliteValue::Text("y".to_owned())]
+            vec![SqliteValue::Integer(2), SqliteValue::Text("y".into())]
         );
     }
 
@@ -44694,17 +44455,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Text("alice".to_owned()),
-                SqliteValue::Integer(300)
-            ]
+            vec![SqliteValue::Text("alice".into()), SqliteValue::Integer(300)]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![
-                SqliteValue::Text("bob".to_owned()),
-                SqliteValue::Integer(50)
-            ]
+            vec![SqliteValue::Text("bob".into()), SqliteValue::Integer(50)]
         );
     }
 
@@ -44729,14 +44484,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Text("eng".to_owned()), SqliteValue::Integer(3)]
+            vec![SqliteValue::Text("eng".into()), SqliteValue::Integer(3)]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![
-                SqliteValue::Text("sales".to_owned()),
-                SqliteValue::Integer(1)
-            ]
+            vec![SqliteValue::Text("sales".into()), SqliteValue::Integer(1)]
         );
     }
 
@@ -44763,13 +44515,10 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Text("food".to_owned()),
-                SqliteValue::Integer(2)
-            ]
+            vec![SqliteValue::Text("food".into()), SqliteValue::Integer(2)]
         );
         // LEFT JOIN: toys appears but with COUNT = 0 (all NULLs from products).
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("toys".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("toys".into()));
         // COUNT of NULL product IDs should be 0.
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(0));
     }
@@ -44792,7 +44541,7 @@ mod tests {
             .query("SELECT t1.name FROM t1 INNER JOIN t2 ON t1.id = t2.id WHERE t1.name LIKE 'A%';")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
     }
 
     #[test]
@@ -44809,9 +44558,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("one".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("two".to_owned()));
-        assert_eq!(rows[2].values()[0], SqliteValue::Text("other".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("one".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("two".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("other".into()));
     }
 
     #[test]
@@ -44841,14 +44590,14 @@ mod tests {
             .query("SELECT name FROM t WHERE name LIKE 'A%' ORDER BY name;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("Anna".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Anna".into()));
 
         let rows = conn
             .query("SELECT name FROM t WHERE name NOT LIKE 'A%';")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".into()));
     }
 
     #[test]
@@ -44863,8 +44612,8 @@ mod tests {
             .query("SELECT code FROM t WHERE code LIKE 'A_' ORDER BY code;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("AB".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("AC".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("AB".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("AC".into()));
     }
 
     #[test]
@@ -44881,12 +44630,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("inactive".to_owned())
-        );
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("active".to_owned()));
-        assert_eq!(rows[2].values()[0], SqliteValue::Text("unknown".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("inactive".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("active".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("unknown".into()));
     }
 
     #[test]
@@ -45054,10 +44800,10 @@ mod tests {
             .query("SELECT users.name, orders.product FROM users JOIN orders ON users.id = orders.user_id;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("Alice".to_owned()));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("Gadget".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("Gadget".into()));
     }
 
     #[test]
@@ -45079,10 +44825,10 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         // Alice has a match.
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".into()));
         // Bob has no match: product is NULL.
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Bob".into()));
         assert_eq!(rows[1].values()[1], SqliteValue::Null);
     }
 
@@ -45119,7 +44865,7 @@ mod tests {
             .query("SELECT users.name, orders.amount FROM users JOIN orders ON users.id = orders.user_id WHERE orders.amount > 100;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(150));
     }
 
@@ -45139,9 +44885,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values().len(), 4); // a, b, c, d
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".into()));
         assert_eq!(rows[0].values()[2], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[3], SqliteValue::Text("y".to_owned()));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("y".into()));
     }
 
     #[test]
@@ -45164,8 +44910,8 @@ mod tests {
             .query("SELECT users.name, products.name FROM users JOIN orders ON users.id = orders.user_id JOIN products ON orders.product_id = products.id;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("Widget".into()));
     }
 
     // ── IN (SELECT ...) subquery tests ──────────────────────────────
@@ -45256,7 +45002,7 @@ mod tests {
         let names: Vec<&str> = rows
             .iter()
             .filter_map(|r| match &r.values()[0] {
-                SqliteValue::Text(s) => Some(s.as_str()),
+                SqliteValue::Text(s) => Some(&**s),
                 _ => None,
             })
             .collect();
@@ -45314,9 +45060,9 @@ mod tests {
 
         let rows = conn.query("SELECT a, flag FROM t1 ORDER BY a;").unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("orig".to_owned()));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("hit".to_owned()));
-        assert_eq!(rows[2].values()[1], SqliteValue::Text("hit".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("orig".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("hit".into()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("hit".into()));
     }
 
     #[test]
@@ -45562,7 +45308,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("y".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("y".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
     }
 
@@ -45638,9 +45384,9 @@ mod tests {
         let rows = conn.query("SELECT a, b FROM dst ORDER BY a;").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("y".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("y".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("z".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("z".into()));
     }
 
     #[test]
@@ -45698,7 +45444,7 @@ mod tests {
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(1),
-                SqliteValue::Text("c".to_owned()),
+                SqliteValue::Text("c".into()),
             ]
         );
         assert_eq!(
@@ -45707,7 +45453,7 @@ mod tests {
                 SqliteValue::Integer(2),
                 SqliteValue::Integer(2),
                 SqliteValue::Integer(2),
-                SqliteValue::Text("a".to_owned()),
+                SqliteValue::Text("a".into()),
             ]
         );
         assert_eq!(
@@ -45716,7 +45462,7 @@ mod tests {
                 SqliteValue::Integer(3),
                 SqliteValue::Integer(3),
                 SqliteValue::Integer(3),
-                SqliteValue::Text("b".to_owned()),
+                SqliteValue::Text("b".into()),
             ]
         );
 
@@ -45801,10 +45547,10 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![
-                SqliteValue::Text("visible".to_owned()),
+                SqliteValue::Text("visible".into()),
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(1),
-                SqliteValue::Text("x".to_owned()),
+                SqliteValue::Text("x".into()),
             ]
         );
     }
@@ -45832,10 +45578,10 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![
-                SqliteValue::Text("visible-rowid".to_owned()),
-                SqliteValue::Text("visible-hidden".to_owned()),
+                SqliteValue::Text("visible-rowid".into()),
+                SqliteValue::Text("visible-hidden".into()),
                 SqliteValue::Integer(1),
-                SqliteValue::Text("x".to_owned()),
+                SqliteValue::Text("x".into()),
             ]
         );
     }
@@ -45890,8 +45636,8 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![
-                SqliteValue::Text("HELLO".to_owned()),
-                SqliteValue::Text("world".to_owned()),
+                SqliteValue::Text("HELLO".into()),
+                SqliteValue::Text("world".into()),
             ],
         );
     }
@@ -45914,9 +45660,9 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![
-                SqliteValue::Text("integer".to_owned()),
-                SqliteValue::Text("text".to_owned()),
-                SqliteValue::Text("null".to_owned()),
+                SqliteValue::Text("integer".into()),
+                SqliteValue::Text("text".into()),
+                SqliteValue::Text("null".into()),
             ],
         );
     }
@@ -45940,7 +45686,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Text(r#"{"a":1,"b":2}"#.to_owned())]
+            vec![SqliteValue::Text(r#"{"a":1,"b":2}"#.into())]
         );
     }
 
@@ -46084,7 +45830,7 @@ mod tests {
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("keep".to_owned()),
+                SqliteValue::Text("keep".into()),
             ]],
         );
     }
@@ -46113,7 +45859,7 @@ mod tests {
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("after".to_owned()),
+                SqliteValue::Text("after".into()),
             ]],
             "failed multi-row live VTAB write must not leak earlier row mutations",
         );
@@ -46302,7 +46048,7 @@ mod tests {
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("keep".to_owned()),
+                SqliteValue::Text("keep".into()),
             ]],
             "ROLLBACK must restore the dropped VTAB contents"
         );
@@ -46351,7 +46097,7 @@ mod tests {
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("keep".to_owned()),
+                SqliteValue::Text("keep".into()),
             ]],
             "ROLLBACK TO SAVEPOINT must restore the dropped VTAB contents"
         );
@@ -46388,7 +46134,7 @@ mod tests {
             rows.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("keep".to_owned()),
+                SqliteValue::Text("keep".into()),
             ]],
             "ROLLBACK must restore the original VTAB after a rejected same-name recreate",
         );
@@ -46718,7 +46464,7 @@ mod tests {
             .query("SELECT name, sql FROM sqlite_master WHERE name = 'spatial';")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("spatial".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("spatial".into()));
         let SqliteValue::Text(sql) = &rows[0].values()[1] else {
             panic!("sqlite_master.sql should be TEXT");
         };
@@ -46802,13 +46548,13 @@ mod tests {
             vec![
                 vec![
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("Hello".to_owned()),
-                    SqliteValue::Text("Rust world".to_owned()),
+                    SqliteValue::Text("Hello".into()),
+                    SqliteValue::Text("Rust world".into()),
                 ],
                 vec![
                     SqliteValue::Integer(2),
-                    SqliteValue::Text("Other".to_owned()),
-                    SqliteValue::Text("Nothing".to_owned()),
+                    SqliteValue::Text("Other".into()),
+                    SqliteValue::Text("Nothing".into()),
                 ],
             ],
         );
@@ -46833,8 +46579,8 @@ mod tests {
             docs.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(1),
-                SqliteValue::Text("Hello".to_owned()),
-                SqliteValue::Text("Rust world".to_owned()),
+                SqliteValue::Text("Hello".into()),
+                SqliteValue::Text("Rust world".into()),
             ]],
         );
     }
@@ -46855,8 +46601,8 @@ mod tests {
             docs.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(7),
-                SqliteValue::Text("Hello".to_owned()),
-                SqliteValue::Text("Rust world".to_owned()),
+                SqliteValue::Text("Hello".into()),
+                SqliteValue::Text("Rust world".into()),
             ]],
         );
     }
@@ -46880,8 +46626,8 @@ mod tests {
             docs.iter().map(row_values).collect::<Vec<_>>(),
             vec![vec![
                 SqliteValue::Integer(7),
-                SqliteValue::Text("Hello".to_owned()),
-                SqliteValue::Text("Rust world".to_owned()),
+                SqliteValue::Text("Hello".into()),
+                SqliteValue::Text("Rust world".into()),
             ]],
         );
     }
@@ -46895,10 +46641,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Integer(36),
-                SqliteValue::Text("3.75".to_owned()),
-            ],
+            vec![SqliteValue::Integer(36), SqliteValue::Text("3.75".into()),],
         );
     }
 
@@ -47458,17 +47201,14 @@ mod tests {
             .unwrap();
 
         let rows = conn.query("SELECT name FROM t;").unwrap();
-        assert_eq!(
-            row_values(&rows[0]),
-            vec![SqliteValue::Text("bob".to_owned())]
-        );
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("bob".into())]);
 
         conn.execute("ROLLBACK;").unwrap();
 
         let rows = conn.query("SELECT name FROM t;").unwrap();
         assert_eq!(
             row_values(&rows[0]),
-            vec![SqliteValue::Text("alice".to_owned())]
+            vec![SqliteValue::Text("alice".into())]
         );
     }
 
@@ -47543,17 +47283,11 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(
                 row_values(&rows[0]),
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("hello".to_owned())
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("hello".into())],
             );
             assert_eq!(
                 row_values(&rows[1]),
-                vec![
-                    SqliteValue::Integer(2),
-                    SqliteValue::Text("world".to_owned())
-                ],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("world".into())],
             );
         }
     }
@@ -47582,20 +47316,14 @@ mod tests {
             assert_eq!(users.len(), 1);
             assert_eq!(
                 row_values(&users[0]),
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("Alice".to_owned())
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("Alice".into())],
             );
 
             let items = conn.query("SELECT id, label FROM items;").unwrap();
             assert_eq!(items.len(), 1);
             assert_eq!(
                 row_values(&items[0]),
-                vec![
-                    SqliteValue::Integer(10),
-                    SqliteValue::Text("widget".to_owned()),
-                ],
+                vec![SqliteValue::Integer(10), SqliteValue::Text("widget".into()),],
             );
         }
     }
@@ -47621,8 +47349,11 @@ mod tests {
             let vals = row_values(&rows[0]);
             assert_eq!(vals[0], SqliteValue::Integer(42));
             assert_eq!(vals[1], SqliteValue::Float(314.0 / 100.0));
-            assert_eq!(vals[2], SqliteValue::Text("it's a test".to_owned()));
-            assert_eq!(vals[3], SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+            assert_eq!(vals[2], SqliteValue::Text("it's a test".into()));
+            assert_eq!(
+                vals[3],
+                SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into())
+            );
             assert_eq!(vals[4], SqliteValue::Null);
         }
     }
@@ -47778,7 +47509,7 @@ mod tests {
         // Verify via normal query that data is readable (uses storage cursors
         // under the hood via the Connection's pager transaction).
         let rows = conn.query("SELECT bl FROM t;").unwrap();
-        let expected = vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF])];
+        let expected = vec![SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into())];
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values().to_vec(), expected);
     }
@@ -47798,8 +47529,8 @@ mod tests {
         let expected = vec![
             SqliteValue::Integer(42),
             SqliteValue::Float(314.0 / 100.0),
-            SqliteValue::Text("it's a test".to_owned()),
-            SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            SqliteValue::Text("it's a test".into()),
+            SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into()),
             SqliteValue::Null,
         ];
         assert_eq!(row_values(&rows[0]), expected,);
@@ -47812,8 +47543,8 @@ mod tests {
             vec![
                 SqliteValue::Integer(42),
                 SqliteValue::Float(314.0 / 100.0),
-                SqliteValue::Text("it's a test".to_owned()),
-                SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                SqliteValue::Text("it's a test".into()),
+                SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into()),
                 SqliteValue::Null,
             ],
         );
@@ -47908,14 +47639,11 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(
                 row_values(&rows[0]),
-                vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("a".into())],
             );
             assert_eq!(
                 row_values(&rows[1]),
-                vec![
-                    SqliteValue::Integer(2),
-                    SqliteValue::Text("updated".to_owned()),
-                ],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("updated".into()),],
             );
         }
     }
@@ -47996,8 +47724,8 @@ mod tests {
             assert_eq!(
                 row_values(&rows[0]),
                 vec![
-                    SqliteValue::Text("version".to_owned()),
-                    SqliteValue::Text("1.0".to_owned()),
+                    SqliteValue::Text("version".into()),
+                    SqliteValue::Text("1.0".into()),
                 ],
             );
         }
@@ -48023,10 +47751,7 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(
                 row_values(&rows[0]),
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("widget".to_owned())
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("widget".into())],
             );
         }
     }
@@ -48059,7 +47784,7 @@ mod tests {
                 row_values(&rows[0]),
                 vec![
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("apple".to_owned()),
+                    SqliteValue::Text("apple".into()),
                     SqliteValue::Integer(10),
                 ],
             );
@@ -48067,7 +47792,7 @@ mod tests {
                 row_values(&rows[2]),
                 vec![
                     SqliteValue::Integer(3),
-                    SqliteValue::Text("cherry".to_owned()),
+                    SqliteValue::Text("cherry".into()),
                     SqliteValue::Integer(30),
                 ],
             );
@@ -48101,17 +47826,11 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(
                 row_values(&rows[0]),
-                vec![
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("first".to_owned())
-                ],
+                vec![SqliteValue::Integer(1), SqliteValue::Text("first".into())],
             );
             assert_eq!(
                 row_values(&rows[1]),
-                vec![
-                    SqliteValue::Integer(2),
-                    SqliteValue::Text("updated".to_owned()),
-                ],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("updated".into()),],
             );
         }
     }
@@ -49913,12 +49632,12 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA quick_check;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".to_owned()));
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".into()));
 
         // SQLite accepts an optional limit argument; no issues still returns "ok".
         let rows = conn.query("PRAGMA quick_check(1);").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".to_owned()));
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -49926,7 +49645,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA main.quick_check;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".to_owned()));
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -49934,7 +49653,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".to_owned()));
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -49997,10 +49716,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA encoding;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            *rows[0].get(0).unwrap(),
-            SqliteValue::Text("UTF-8".to_owned())
-        );
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("UTF-8".into()));
     }
 
     #[test]
@@ -50008,10 +49724,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA main.encoding;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            *rows[0].get(0).unwrap(),
-            SqliteValue::Text("UTF-8".to_owned())
-        );
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("UTF-8".into()));
     }
 
     #[test]
@@ -50238,14 +49951,14 @@ mod tests {
         assert_eq!(reset_rows.len(), 1);
         assert_eq!(
             *reset_rows[0].get(0).unwrap(),
-            SqliteValue::Text("ok".to_owned())
+            SqliteValue::Text("ok".into())
         );
 
         let stats_after_reset = conn.query("PRAGMA raptorq_stats;").unwrap();
         let mut repairs_total = None;
         for row in stats_after_reset {
             if let SqliteValue::Text(key) = row.get(0).unwrap() {
-                if key == "repairs_total" {
+                if &**key == "repairs_total" {
                     repairs_total = match row.get(1).unwrap() {
                         SqliteValue::Integer(n) => Some(*n),
                         _ => None,
@@ -50336,7 +50049,7 @@ mod tests {
         assert_eq!(severity_rows.len(), 1);
         assert!(matches!(
             severity_rows[0].get(17),
-            Some(SqliteValue::Text(bucket)) if bucket == "6-10"
+            Some(SqliteValue::Text(bucket)) if &**bucket == "6-10"
         ));
 
         let min_ts = all_rows
@@ -50410,7 +50123,7 @@ mod tests {
             rows.iter().any(|row| {
                 matches!(
                     row.get(4),
-                    Some(SqliteValue::Text(decision)) if decision == "ABORT_WRITE_SKEW"
+                    Some(SqliteValue::Text(decision)) if &**decision == "ABORT_WRITE_SKEW"
                 )
             }),
             "write-skew abort decision card missing"
@@ -50421,7 +50134,7 @@ mod tests {
             .filter(|row| {
                 matches!(
                     row.get(4),
-                    Some(SqliteValue::Text(decision)) if decision == "ABORT_WRITE_SKEW"
+                    Some(SqliteValue::Text(decision)) if &**decision == "ABORT_WRITE_SKEW"
                 )
             })
             .collect::<Vec<_>>();
@@ -50528,7 +50241,7 @@ mod tests {
             .unwrap();
         assert!(
             type_rows.iter().all(
-                |row| matches!(row.get(4), Some(SqliteValue::Text(t)) if t == "ABORT_WRITE_SKEW")
+                |row| matches!(row.get(4), Some(SqliteValue::Text(t)) if &**t == "ABORT_WRITE_SKEW")
             ),
             "type filter should return only ABORT_WRITE_SKEW rows"
         );
@@ -50607,10 +50320,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA journal_mode;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            *rows[0].get(0).unwrap(),
-            SqliteValue::Text("wal".to_owned())
-        );
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("wal".into()));
         assert_eq!(conn.pager.journal_mode(), fsqlite_pager::JournalMode::Wal);
     }
 
@@ -50622,13 +50332,13 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             *rows[0].get(0).unwrap(),
-            SqliteValue::Text("truncate".to_owned())
+            SqliteValue::Text("truncate".into())
         );
         // Query reads back.
         let rows = conn.query("PRAGMA journal_mode;").unwrap();
         assert_eq!(
             *rows[0].get(0).unwrap(),
-            SqliteValue::Text("truncate".to_owned())
+            SqliteValue::Text("truncate".into())
         );
         assert_eq!(
             conn.pager.journal_mode(),
@@ -50638,10 +50348,7 @@ mod tests {
         // Pager mode should switch to WAL when requested.
         let rows = conn.query("PRAGMA journal_mode='wal';").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            *rows[0].get(0).unwrap(),
-            SqliteValue::Text("wal".to_owned())
-        );
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("wal".into()));
         assert_eq!(conn.pager.journal_mode(), fsqlite_pager::JournalMode::Wal);
     }
 
@@ -50650,10 +50357,7 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA synchronous;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            *rows[0].get(0).unwrap(),
-            SqliteValue::Text("NORMAL".to_owned())
-        );
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("NORMAL".into()));
     }
 
     #[test]
@@ -50661,17 +50365,11 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("PRAGMA synchronous=FULL;").unwrap();
         let rows = conn.query("PRAGMA synchronous;").unwrap();
-        assert_eq!(
-            *rows[0].get(0).unwrap(),
-            SqliteValue::Text("FULL".to_owned())
-        );
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("FULL".into()));
         // Integer code: 0 = OFF.
         conn.execute("PRAGMA synchronous=0;").unwrap();
         let rows = conn.query("PRAGMA synchronous;").unwrap();
-        assert_eq!(
-            *rows[0].get(0).unwrap(),
-            SqliteValue::Text("OFF".to_owned())
-        );
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("OFF".into()));
     }
 
     #[test]
@@ -50808,9 +50506,9 @@ mod tests {
                 assert_eq!(next_commit_seq, expected_snapshot_seq + 1);
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-                assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+                assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
                 assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-                assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".to_owned()));
+                assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
             }
             other => panic!("expected bootstrap snapshot, got {other:?}"),
         }
@@ -50843,7 +50541,7 @@ mod tests {
         let find_value = |key: &str| {
             status_rows
                 .iter()
-                .find(|row| row.values()[0] == SqliteValue::Text(key.to_owned()))
+                .find(|row| row.values()[0] == SqliteValue::Text(key.into()))
                 .map(|row| row.values()[1].clone())
                 .unwrap()
         };
@@ -50859,7 +50557,7 @@ mod tests {
         );
         assert_eq!(
             find_value("active_views"),
-            SqliteValue::Text("v_items".to_owned())
+            SqliteValue::Text("v_items".into())
         );
     }
 
@@ -50894,7 +50592,7 @@ mod tests {
 
         let status_rows = conn.query("PRAGMA fsqlite_differential_status;").unwrap();
         assert!(status_rows.iter().any(|row| {
-            row.values()[0] == SqliteValue::Text("active_subscriptions".to_owned())
+            row.values()[0] == SqliteValue::Text("active_subscriptions".into())
                 && row.values()[1] == SqliteValue::Integer(0)
         }));
     }
@@ -50977,14 +50675,8 @@ mod tests {
         // Verify data is still accessible after checkpoint.
         let rows = conn.query("SELECT value FROM t1 ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            *rows[0].get(0).unwrap(),
-            SqliteValue::Text("hello".to_owned())
-        );
-        assert_eq!(
-            *rows[1].get(0).unwrap(),
-            SqliteValue::Text("world".to_owned())
-        );
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("hello".into()));
+        assert_eq!(*rows[1].get(0).unwrap(), SqliteValue::Text("world".into()));
     }
 
     #[test]
@@ -50999,7 +50691,7 @@ mod tests {
         assert_eq!(default_rows.len(), 1);
         assert_eq!(
             *default_rows[0].get(0).unwrap(),
-            SqliteValue::Text("AUTO".to_owned())
+            SqliteValue::Text("AUTO".into())
         );
 
         let restart_rows = conn
@@ -51007,7 +50699,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             *restart_rows[0].get(0).unwrap(),
-            SqliteValue::Text("RESTART".to_owned())
+            SqliteValue::Text("RESTART".into())
         );
 
         let restart_first = conn.query("PRAGMA wal_checkpoint;").unwrap();
@@ -51023,7 +50715,7 @@ mod tests {
         let auto_rows = conn.query("PRAGMA checkpoint_schedule=AUTO;").unwrap();
         assert_eq!(
             *auto_rows[0].get(0).unwrap(),
-            SqliteValue::Text("AUTO".to_owned())
+            SqliteValue::Text("AUTO".into())
         );
 
         conn.execute("INSERT INTO ckpt_schedule_t VALUES (2, 'b');")
@@ -51055,7 +50747,7 @@ mod tests {
             rows.iter()
                 .filter_map(|row| {
                     let name = match row.values().first() {
-                        Some(SqliteValue::Text(name)) => name.clone(),
+                        Some(SqliteValue::Text(name)) => name.to_string(),
                         _ => return None,
                     };
                     let value = match row.values().get(1) {
@@ -51069,7 +50761,7 @@ mod tests {
         let advisor_codes = |rows: &[Row]| {
             rows.iter()
                 .filter_map(|row| match row.values().first() {
-                    Some(SqliteValue::Text(code)) => Some(code.clone()),
+                    Some(SqliteValue::Text(code)) => Some(code.to_string()),
                     _ => None,
                 })
                 .collect::<std::collections::HashSet<String>>()
@@ -51144,7 +50836,7 @@ mod tests {
             rows.iter()
                 .filter_map(|row| {
                     let name = match row.values().first() {
-                        Some(SqliteValue::Text(name)) => name.clone(),
+                        Some(SqliteValue::Text(name)) => name.to_string(),
                         _ => return None,
                     };
                     let value = match row.values().get(1) {
@@ -51209,7 +50901,7 @@ mod tests {
             rows.iter()
                 .filter_map(|row| {
                     let name = match row.values().first() {
-                        Some(SqliteValue::Text(name)) => name.clone(),
+                        Some(SqliteValue::Text(name)) => name.to_string(),
                         _ => return None,
                     };
                     let value = match row.values().get(1) {
@@ -51562,7 +51254,7 @@ mod tests {
             assert_eq!(rows.len(), 1, "mode={mode} should return 1 row");
             assert_eq!(
                 *rows[0].get(0).unwrap(),
-                SqliteValue::Text(mode.to_owned()),
+                SqliteValue::Text(mode.into()),
                 "mode={mode} response should echo back the mode"
             );
         }
@@ -51695,11 +51387,11 @@ mod tests {
             .query("SELECT users.name, orders.amount FROM users INNER JOIN orders ON users.id = orders.user_id ORDER BY orders.amount;")
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(50));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Alice".into()));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(100));
-        assert_eq!(rows[2].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("Alice".into()));
         assert_eq!(rows[2].values()[1], SqliteValue::Integer(200));
     }
 
@@ -51716,7 +51408,7 @@ mod tests {
         let names: Vec<String> = rows
             .iter()
             .filter_map(|r| match &r.values()[0] {
-                SqliteValue::Text(s) => Some(s.clone()),
+                SqliteValue::Text(s) => Some(s.to_string()),
                 _ => None,
             })
             .collect();
@@ -51751,7 +51443,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         // Only Alice's orders (100, 200) pass the filter.
         for r in &rows {
-            assert_eq!(r.values()[0], SqliteValue::Text("Alice".to_owned()));
+            assert_eq!(r.values()[0], SqliteValue::Text("Alice".into()));
         }
     }
 
@@ -51788,9 +51480,9 @@ mod tests {
         // SELECT * should include all columns from both tables.
         assert_eq!(rows[0].values().len(), 4);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".into()));
         assert_eq!(rows[0].values()[2], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[3], SqliteValue::Text("y".to_owned()));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("y".into()));
     }
 
     #[test]
@@ -51808,8 +51500,8 @@ mod tests {
             .query("SELECT t1.val1, t2.val2 FROM t1 INNER JOIN t2 USING (id);")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("b".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("b".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".into()));
     }
 
     #[test]
@@ -51820,7 +51512,7 @@ mod tests {
             .query("SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id ORDER BY o.amount;")
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(50));
     }
 
@@ -51930,9 +51622,9 @@ mod tests {
             .query("SELECT a.name, b.val, c.tag FROM a INNER JOIN b ON a.id = b.a_id INNER JOIN c ON a.id = c.a_id;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("x".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(42));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("alpha".into()));
     }
 
     #[test]
@@ -51954,14 +51646,14 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![
-                SqliteValue::Text("alice".to_owned()),
-                SqliteValue::Text("a".to_owned())
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Text("a".into())
             ]
         );
         // Unmatched right row: NULL, b
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Null, SqliteValue::Text("b".to_owned())]
+            vec![SqliteValue::Null, SqliteValue::Text("b".into())]
         );
     }
 
@@ -52003,12 +51695,12 @@ mod tests {
         assert_eq!(rows.len(), 3);
         let vals: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
         assert!(vals.contains(&vec![
-            SqliteValue::Text("alice".to_owned()),
-            SqliteValue::Text("a".to_owned())
+            SqliteValue::Text("alice".into()),
+            SqliteValue::Text("a".into())
         ]));
-        assert!(vals.contains(&vec![SqliteValue::Null, SqliteValue::Text("b".to_owned())]));
+        assert!(vals.contains(&vec![SqliteValue::Null, SqliteValue::Text("b".into())]));
         assert!(vals.contains(&vec![
-            SqliteValue::Text("charlie".to_owned()),
+            SqliteValue::Text("charlie".into()),
             SqliteValue::Null
         ]));
     }
@@ -52055,13 +51747,13 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![
-                SqliteValue::Text("alice".to_owned()),
-                SqliteValue::Text("a".to_owned())
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Text("a".into())
             ]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Null, SqliteValue::Text("b".to_owned())]
+            vec![SqliteValue::Null, SqliteValue::Text("b".into())]
         );
     }
 
@@ -52087,12 +51779,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let vals: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
         assert!(vals.contains(&vec![
-            SqliteValue::Text("left-one".to_owned()),
-            SqliteValue::Text("right-one".to_owned())
+            SqliteValue::Text("left-one".into()),
+            SqliteValue::Text("right-one".into())
         ]));
         assert!(vals.contains(&vec![
             SqliteValue::Null,
-            SqliteValue::Text("right-null".to_owned())
+            SqliteValue::Text("right-null".into())
         ]));
     }
 
@@ -52120,8 +51812,8 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![
-                SqliteValue::Text("alice".to_owned()),
-                SqliteValue::Text("eng".to_owned())
+                SqliteValue::Text("alice".into()),
+                SqliteValue::Text("eng".into())
             ]
         );
     }
@@ -52143,14 +51835,11 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             row_values(&rows[0]),
-            vec![
-                SqliteValue::Text("a".to_owned()),
-                SqliteValue::Text("x".to_owned())
-            ]
+            vec![SqliteValue::Text("a".into()), SqliteValue::Text("x".into())]
         );
         assert_eq!(
             row_values(&rows[1]),
-            vec![SqliteValue::Text("b".to_owned()), SqliteValue::Null]
+            vec![SqliteValue::Text("b".into()), SqliteValue::Null]
         );
     }
 
@@ -52621,7 +52310,7 @@ mod transaction_lifecycle_tests {
             vec![
                 SqliteValue::Integer(7),
                 SqliteValue::Integer(7),
-                SqliteValue::Text("seven".to_owned()),
+                SqliteValue::Text("seven".into()),
             ]
         );
     }
@@ -52898,11 +52587,11 @@ mod transaction_lifecycle_tests {
         let rows = conn.query("SELECT id, name FROM t ORDER BY id").unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alice".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alice".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("bob".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("bob".into()));
         assert_eq!(rows[2].values()[0], SqliteValue::Integer(3));
-        assert_eq!(rows[2].values()[1], SqliteValue::Text("carol".to_owned()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("carol".into()));
     }
 
     #[test]
@@ -52925,10 +52614,7 @@ mod transaction_lifecycle_tests {
         let rows = conn.query("SELECT id, name FROM t ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(2));
-        assert_eq!(
-            rows[0].get(1).unwrap(),
-            &SqliteValue::Text("alice".to_owned())
-        );
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("alice".into()));
         assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(3));
     }
 
@@ -52951,10 +52637,7 @@ mod transaction_lifecycle_tests {
 
         // Data should be unchanged after the error.
         let rows = conn.query("SELECT name FROM t WHERE id = 2").unwrap();
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &SqliteValue::Text("bob".to_owned())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("bob".into()));
     }
 
     #[test]
@@ -53225,7 +52908,7 @@ mod transaction_lifecycle_tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(2));
     }
 
@@ -53414,9 +53097,9 @@ mod sqlite_master_btree_tests {
         eprintln!("[5A2][test=create_inserts][step=verify] rowid={rowid} cols={cols:?}");
         assert_eq!(rowid, 1);
         assert_eq!(cols.len(), 5, "sqlite_master has 5 columns");
-        assert_eq!(cols[0], SqliteValue::Text("table".to_owned()));
-        assert_eq!(cols[1], SqliteValue::Text("t1".to_owned()));
-        assert_eq!(cols[2], SqliteValue::Text("t1".to_owned()));
+        assert_eq!(cols[0], SqliteValue::Text("table".into()));
+        assert_eq!(cols[1], SqliteValue::Text("t1".into()));
+        assert_eq!(cols[2], SqliteValue::Text("t1".into()));
         // rootpage should be a positive integer
         if let SqliteValue::Integer(rp) = &cols[3] {
             assert!(*rp > 0, "rootpage should be > 0, got {rp}");
@@ -53457,7 +53140,7 @@ mod sqlite_master_btree_tests {
             .iter()
             .filter_map(|(_, cols)| {
                 if let SqliteValue::Text(n) = &cols[1] {
-                    Some(n.as_str())
+                    Some(&**n)
                 } else {
                     None
                 }
@@ -53487,7 +53170,7 @@ mod sqlite_master_btree_tests {
             after.len()
         );
         assert_eq!(after.len(), 1, "one row should remain after DROP TABLE");
-        assert_eq!(after[0].1[1], SqliteValue::Text("t2".to_owned()));
+        assert_eq!(after[0].1[1], SqliteValue::Text("t2".into()));
     }
 
     #[test]
@@ -53534,15 +53217,15 @@ mod sqlite_master_btree_tests {
 
         // All five columns should be present and of the correct type.
         assert!(
-            matches!(&cols[0], SqliteValue::Text(t) if t == "table"),
+            matches!(&cols[0], SqliteValue::Text(t) if &**t == "table"),
             "col 0 (type) should be 'table'"
         );
         assert!(
-            matches!(&cols[1], SqliteValue::Text(n) if n == "fmt_test"),
+            matches!(&cols[1], SqliteValue::Text(n) if &**n == "fmt_test"),
             "col 1 (name) should be 'fmt_test'"
         );
         assert!(
-            matches!(&cols[2], SqliteValue::Text(t) if t == "fmt_test"),
+            matches!(&cols[2], SqliteValue::Text(t) if &**t == "fmt_test"),
             "col 2 (tbl_name) should be 'fmt_test'"
         );
         assert!(
@@ -53578,17 +53261,17 @@ mod sqlite_master_btree_tests {
         assert_eq!(
             rows[0].values(),
             &[
-                SqliteValue::Text("index".to_owned()),
-                SqliteValue::Text("idx_users_email".to_owned()),
-                SqliteValue::Text("users".to_owned()),
+                SqliteValue::Text("index".into()),
+                SqliteValue::Text("idx_users_email".into()),
+                SqliteValue::Text("users".into()),
             ]
         );
         assert_eq!(
             rows[1].values(),
             &[
-                SqliteValue::Text("table".to_owned()),
-                SqliteValue::Text("users".to_owned()),
-                SqliteValue::Text("users".to_owned()),
+                SqliteValue::Text("table".into()),
+                SqliteValue::Text("users".into()),
+                SqliteValue::Text("users".into()),
             ]
         );
 
@@ -54155,8 +53838,8 @@ mod autocommit_txn_tests {
         assert_eq!(
             rows[0].values().to_vec(),
             vec![
-                SqliteValue::Text("idx_name".to_owned()),
-                SqliteValue::Text("t".to_owned()),
+                SqliteValue::Text("idx_name".into()),
+                SqliteValue::Text("t".into()),
             ]
         );
     }
@@ -54224,8 +53907,8 @@ mod autocommit_txn_tests {
         assert_eq!(
             rows[0].values().to_vec(),
             vec![
-                SqliteValue::Text("idx_name".to_owned()),
-                SqliteValue::Text("t".to_owned()),
+                SqliteValue::Text("idx_name".into()),
+                SqliteValue::Text("t".into()),
             ]
         );
     }
@@ -55074,9 +54757,9 @@ mod schema_loading_tests {
             .unwrap();
         assert_eq!(rows.len(), 2, "regular table rows should survive reload");
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("foo".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("foo".into()));
 
         // The virtual table should NOT appear in the schema (skipped).
         let schema = conn.schema.borrow();
@@ -55097,7 +54780,7 @@ mod schema_loading_tests {
         assert_eq!(integrity_rows.len(), 1);
         assert_eq!(
             integrity_rows[0].values()[0],
-            SqliteValue::Text("ok".to_owned())
+            SqliteValue::Text("ok".into())
         );
     }
 
@@ -55152,14 +54835,11 @@ mod schema_loading_tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("Hello".to_owned()));
-        assert_eq!(
-            rows[0].values()[2],
-            SqliteValue::Text("Rust world".to_owned())
-        );
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("Hello".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("Rust world".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("Other".to_owned()));
-        assert_eq!(rows[1].values()[2], SqliteValue::Text("Nothing".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("Other".into()));
+        assert_eq!(rows[1].values()[2], SqliteValue::Text("Nothing".into()));
     }
 
     #[test]
@@ -55350,7 +55030,7 @@ mod schema_loading_tests {
             assert_eq!(quick_check_rows.len(), 1);
             assert_eq!(
                 quick_check_rows[0].values()[0],
-                SqliteValue::Text("ok".to_owned())
+                SqliteValue::Text("ok".into())
             );
         }
     }
@@ -55438,7 +55118,7 @@ mod schema_loading_tests {
         assert_eq!(quick_check_rows.len(), 1);
         assert_eq!(
             quick_check_rows[0].values()[0],
-            SqliteValue::Text("ok".to_owned())
+            SqliteValue::Text("ok".into())
         );
     }
 
@@ -55530,9 +55210,9 @@ mod schema_loading_tests {
                 .unwrap();
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
-            assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
             assert_eq!(rows[1].values()[0], SqliteValue::Integer(20));
-            assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".to_owned()));
+            assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
         }
     }
 
@@ -55560,10 +55240,10 @@ mod schema_loading_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(10));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(20));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(20));
-        assert_eq!(rows[1].values()[2], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[1].values()[2], SqliteValue::Text("beta".into()));
     }
 
     #[test]
@@ -55582,7 +55262,7 @@ mod schema_loading_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("hello".into()));
     }
 
     #[test]
@@ -55601,7 +55281,7 @@ mod schema_loading_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("hello".into()));
     }
 
     #[test]
@@ -55641,7 +55321,7 @@ mod schema_loading_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("hello".into()));
     }
 
     #[test]
@@ -55695,8 +55375,8 @@ mod schema_loading_tests {
             .query("SELECT id, val, note FROM t ORDER BY id;")
             .unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("one".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("one".into()));
     }
 
     #[test]
@@ -55719,7 +55399,7 @@ mod schema_loading_tests {
             .unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[0].values()[1], SqliteValue::Null);
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("one".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("one".into()));
     }
 
     #[test]
@@ -56503,14 +56183,14 @@ mod schema_loading_tests {
             .unwrap();
         assert_eq!(
             rows[0].values()[0],
-            SqliteValue::Text("literal_test".to_string())
+            SqliteValue::Text("literal_test".to_string().into())
         );
 
         // Test: UPDATE with numbered placeholder in WHERE
         let affected = conn
             .execute_with_params(
                 "UPDATE agents SET policy = 'param_test' WHERE name = ?1",
-                &[SqliteValue::Text("RedFox".to_string())],
+                &[SqliteValue::Text("RedFox".to_string().into())],
             )
             .unwrap();
         assert_eq!(affected, 1, "UPDATE WHERE name = ?1 should affect 1 row");
@@ -56520,7 +56200,7 @@ mod schema_loading_tests {
         rows.iter()
             .filter_map(|row| {
                 let name = match row.values().first() {
-                    Some(SqliteValue::Text(name)) => name.clone(),
+                    Some(SqliteValue::Text(name)) => name.to_string(),
                     _ => return None,
                 };
                 let value = match row.values().get(1) {
@@ -56566,7 +56246,7 @@ mod schema_loading_tests {
     fn txn_advisor_codes(rows: &[Row]) -> HashSet<String> {
         rows.iter()
             .filter_map(|row| match row.values().first() {
-                Some(SqliteValue::Text(code)) => Some(code.clone()),
+                Some(SqliteValue::Text(code)) => Some(code.to_string()),
                 _ => None,
             })
             .collect()
@@ -56747,7 +56427,7 @@ mod schema_loading_tests {
         let rollback_row = advisor_rows
             .iter()
             .find(|row| match row.values().first() {
-                Some(SqliteValue::Text(code)) => code == "rollback_pressure",
+                Some(SqliteValue::Text(code)) => &**code == "rollback_pressure",
                 _ => false,
             })
             .expect("rollback_pressure row should be present");
@@ -56959,7 +56639,7 @@ mod schema_loading_tests {
         let mut metric_names = rows
             .iter()
             .map(|row| match &row.values()[0] {
-                SqliteValue::Text(name) => name.clone(),
+                SqliteValue::Text(name) => name.to_string(),
                 _ => String::new(),
             })
             .collect::<Vec<_>>();
@@ -57054,7 +56734,7 @@ mod schema_loading_tests {
         assert_eq!(reset_rows.len(), 1);
         assert_eq!(
             *reset_rows[0].get(0).unwrap(),
-            SqliteValue::Text("ok".to_owned())
+            SqliteValue::Text("ok".into())
         );
 
         let after_reset = txn_metrics_map(&conn.query("PRAGMA io_uring_stats;").unwrap());
@@ -57135,7 +56815,7 @@ mod schema_loading_tests {
         assert_eq!(reset_rows.len(), 1);
         assert_eq!(
             *reset_rows[0].get(0).unwrap(),
-            SqliteValue::Text("ok".to_owned())
+            SqliteValue::Text("ok".into())
         );
         let after_reset = txn_metrics_map(&conn.query("PRAGMA jit_stats;").unwrap());
         // Delta-based: verify reset reduced counters rather than asserting
@@ -57254,7 +56934,7 @@ mod schema_loading_tests {
         assert_eq!(reset_rows.len(), 1);
         assert_eq!(
             *reset_rows[0].get(0).unwrap(),
-            SqliteValue::Text("ok".to_owned())
+            SqliteValue::Text("ok".into())
         );
 
         let after_reset = txn_metrics_map(&conn.query("PRAGMA cache_stats;").unwrap());
@@ -59470,10 +59150,7 @@ mod pager_routing_tests {
     fn test_zjisk1_pragma_backend_kind_reports_runtime_path() {
         let mem_conn = Connection::open(":memory:").unwrap();
         let mem_rows = mem_conn.query("PRAGMA fsqlite.backend_kind;").unwrap();
-        assert_eq!(
-            mem_rows[0].values()[0],
-            SqliteValue::Text("memory".to_owned())
-        );
+        assert_eq!(mem_rows[0].values()[0], SqliteValue::Text("memory".into()));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir
@@ -59494,7 +59171,7 @@ mod pager_routing_tests {
         };
         assert_eq!(
             file_rows[0].values()[0],
-            SqliteValue::Text(expected_file_kind.to_owned())
+            SqliteValue::Text(expected_file_kind.into())
         );
     }
 
@@ -59503,24 +59180,21 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
 
         let rows = conn.query("PRAGMA fsqlite.backend_mode;").unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("parity_cert".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("parity_cert".into()));
 
         conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
             .unwrap();
         let rows = conn.query("PRAGMA fsqlite.backend_mode;").unwrap();
         assert_eq!(
             rows[0].values()[0],
-            SqliteValue::Text("parity_cert_strict".to_owned())
+            SqliteValue::Text("parity_cert_strict".into())
         );
 
         conn.execute("PRAGMA fsqlite.parity_cert = OFF;").unwrap();
         let rows = conn.query("PRAGMA fsqlite.backend_mode;").unwrap();
         assert_eq!(
             rows[0].values()[0],
-            SqliteValue::Text("fallback_allowed".to_owned())
+            SqliteValue::Text("fallback_allowed".into())
         );
     }
 
@@ -59621,16 +59295,16 @@ mod pager_routing_tests {
         assert_eq!(
             rows[0].values(),
             vec![
-                SqliteValue::Text("alpha".to_owned()),
-                SqliteValue::Text("fruit".to_owned()),
+                SqliteValue::Text("alpha".into()),
+                SqliteValue::Text("fruit".into()),
             ]
             .as_slice()
         );
         assert_eq!(
             rows[1].values(),
             vec![
-                SqliteValue::Text("beta".to_owned()),
-                SqliteValue::Text("tool".to_owned()),
+                SqliteValue::Text("beta".into()),
+                SqliteValue::Text("tool".into()),
             ]
             .as_slice()
         );
@@ -59663,19 +59337,11 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].values(),
-            vec![
-                SqliteValue::Text("alice".to_owned()),
-                SqliteValue::Integer(30),
-            ]
-            .as_slice()
+            vec![SqliteValue::Text("alice".into()), SqliteValue::Integer(30),].as_slice()
         );
         assert_eq!(
             rows[1].values(),
-            vec![
-                SqliteValue::Text("cara".to_owned()),
-                SqliteValue::Integer(22),
-            ]
-            .as_slice()
+            vec![SqliteValue::Text("cara".into()), SqliteValue::Integer(22),].as_slice()
         );
     }
 
@@ -59707,19 +59373,11 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].values(),
-            vec![
-                SqliteValue::Text("alice".to_owned()),
-                SqliteValue::Integer(30),
-            ]
-            .as_slice()
+            vec![SqliteValue::Text("alice".into()), SqliteValue::Integer(30),].as_slice()
         );
         assert_eq!(
             rows[1].values(),
-            vec![
-                SqliteValue::Text("cara".to_owned()),
-                SqliteValue::Integer(22),
-            ]
-            .as_slice()
+            vec![SqliteValue::Text("cara".into()), SqliteValue::Integer(22),].as_slice()
         );
     }
 
@@ -60178,7 +59836,7 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO dv1 DEFAULT VALUES;").unwrap();
         let rows = conn.query("SELECT name, age FROM dv1;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("alice".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alice".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(30));
     }
 
@@ -60193,7 +59851,7 @@ mod pager_routing_tests {
         let rows = conn.query("SELECT id, val FROM dv2;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(100));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".into()));
     }
 
     #[test]
@@ -60217,7 +59875,7 @@ mod pager_routing_tests {
         assert!(id1 > 0);
         assert!(id2 > 0);
         assert_ne!(id1, id2);
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("row".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("row".into()));
     }
 
     #[test]
@@ -60228,8 +59886,8 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO dv4 DEFAULT VALUES;").unwrap();
         let rows = conn.query("SELECT typeof(a), typeof(b) FROM dv4;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("null".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("null".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("null".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("null".into()));
     }
 
     #[test]
@@ -60242,7 +59900,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alice".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alice".into()));
     }
 
     #[test]
@@ -60270,7 +59928,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("b".into()));
         // Verify row was actually deleted.
         let remaining = conn.query("SELECT count(*) FROM ret3;").unwrap();
         assert_eq!(remaining[0].values()[0], SqliteValue::Integer(2));
@@ -60287,7 +59945,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("new".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("new".into()));
     }
 
     // ── SQL pattern probes: identify gaps in VDBE codegen ──
@@ -60333,8 +59991,8 @@ mod pager_routing_tests {
             .query("SELECT name FROM ep3 WHERE name LIKE 'ali%' ORDER BY id;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("alice".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("alicia".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alice".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("alicia".into()));
     }
 
     #[test]
@@ -60363,8 +60021,8 @@ mod pager_routing_tests {
             .query("SELECT id, CASE WHEN val > 15 THEN 'high' ELSE 'low' END FROM ep5 ORDER BY id;")
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("low".to_owned()));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("high".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("low".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("high".into()));
     }
 
     #[test]
@@ -60378,8 +60036,8 @@ mod pager_routing_tests {
             .query("SELECT id, coalesce(val, 'default') FROM ep6 ORDER BY id;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("default".to_owned()));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("yes".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("default".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("yes".into()));
     }
 
     #[test]
@@ -61057,7 +60715,7 @@ mod pager_routing_tests {
             .query("SELECT cat, count(*) as cnt FROM ep11 GROUP BY cat HAVING count(*) > 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(2));
     }
 
@@ -61085,10 +60743,7 @@ mod pager_routing_tests {
             .unwrap();
         let rows = conn.query("SELECT val FROM ep13 WHERE id = 1;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("replaced".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("replaced".into()));
     }
 
     #[test]
@@ -61135,7 +60790,7 @@ mod pager_routing_tests {
             .query("SELECT a, b, c FROM ep16 ORDER BY a, b;")
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("x".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
     }
 
@@ -61244,7 +60899,7 @@ mod pager_routing_tests {
             .query("SELECT data ->> '$.name' FROM jt1 WHERE id = 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("alice".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alice".into()));
     }
 
     #[test]
@@ -61259,7 +60914,7 @@ mod pager_routing_tests {
             .query("SELECT data -> '$.x' FROM jt2 WHERE id = 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("42".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("42".into()));
     }
 
     #[test]
@@ -61273,10 +60928,7 @@ mod pager_routing_tests {
             .query("SELECT data -> '$.x' FROM jt2s WHERE id = 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text(r#""hello""#.to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text(r#""hello""#.into()));
     }
 
     #[test]
@@ -61290,7 +60942,7 @@ mod pager_routing_tests {
             .query("SELECT data -> 'a.b', data ->> 'a.b' FROM jt2k WHERE id = 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("1".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("1".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
     }
 
@@ -61305,7 +60957,7 @@ mod pager_routing_tests {
             .query("SELECT data -> 1, data ->> 1 FROM jt2i WHERE id = 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("20".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("20".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(20));
     }
 
@@ -61415,7 +61067,7 @@ mod pager_routing_tests {
             .query("SELECT upper(substr(val, 1, 3)) FROM nf1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("HEL".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("HEL".into()));
     }
 
     #[test]
@@ -61443,9 +61095,9 @@ mod pager_routing_tests {
             .unwrap();
         // a: sum=30 (>10), b: sum=105 (>10), c: sum=7 (not >10)
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(30));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".into()));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(105));
     }
 
@@ -61462,13 +61114,13 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         // x: count=2, sum=30, min=10, max=20
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("x".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(2));
         assert_eq!(rows[0].values()[2], SqliteValue::Integer(30));
         assert_eq!(rows[0].values()[3], SqliteValue::Integer(10));
         assert_eq!(rows[0].values()[4], SqliteValue::Integer(20));
         // y: count=1, sum=5, min=5, max=5
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("y".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("y".into()));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(1));
         assert_eq!(rows[1].values()[2], SqliteValue::Integer(5));
     }
@@ -61550,9 +61202,9 @@ mod pager_routing_tests {
             .query("SELECT DISTINCT val FROM sd1 ORDER BY val;")
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".to_owned()));
-        assert_eq!(rows[2].values()[0], SqliteValue::Text("c".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("c".into()));
     }
 
     #[test]
@@ -61675,10 +61327,7 @@ mod pager_routing_tests {
             .unwrap();
         let rows = conn.query("SELECT first || ' ' || last FROM sc1;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("John Doe".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("John Doe".into()));
     }
 
     #[test]
@@ -61880,7 +61529,7 @@ mod pager_routing_tests {
             .query("SELECT name FROM items WHERE name = 'widget';")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("widget".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("widget".into()));
     }
 
     #[test]
@@ -61911,7 +61560,7 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].values()[0],
-            SqliteValue::Text("a".to_owned()),
+            SqliteValue::Text("a".into()),
             "original value should be preserved"
         );
     }
@@ -61927,10 +61576,7 @@ mod pager_routing_tests {
             .unwrap();
         let rows = conn.query("SELECT val FROM rep WHERE id = 1;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("replaced".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("replaced".into()));
     }
 
     #[test]
@@ -61942,7 +61588,7 @@ mod pager_routing_tests {
             .unwrap();
         let rows = conn.query("SELECT a, b, c FROM mc WHERE id = 1;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(42));
         // REAL value may be stored as float.
         let c_val = &rows[0].values()[2];
@@ -61962,7 +61608,7 @@ mod pager_routing_tests {
         conn.execute("UPDATE um SET a = 'new', b = 99 WHERE id = 1;")
             .unwrap();
         let rows = conn.query("SELECT a, b FROM um WHERE id = 1;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(99));
     }
 
@@ -61989,7 +61635,7 @@ mod pager_routing_tests {
         conn.execute("COMMIT;").unwrap();
         let rows = conn.query("SELECT val FROM tx WHERE id = 1;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("inside".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("inside".into()));
     }
 
     #[test]
@@ -62006,7 +61652,7 @@ mod pager_routing_tests {
         let rows = conn.query("SELECT val FROM rb WHERE id = 1;").unwrap();
         assert_eq!(
             rows[0].values()[0],
-            SqliteValue::Text("before".to_owned()),
+            SqliteValue::Text("before".into()),
             "rollback should restore original value"
         );
     }
@@ -62016,11 +61662,11 @@ mod pager_routing_tests {
         // typeof() on expression-only SELECT (no table involved).
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT typeof(42);").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".into()));
         let rows = conn.query("SELECT typeof('hello');").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("text".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("text".into()));
         let rows = conn.query("SELECT typeof(NULL);").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("null".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("null".into()));
     }
 
     #[test]
@@ -62036,13 +61682,13 @@ mod pager_routing_tests {
             .unwrap();
 
         assert_eq!(row.values()[0], SqliteValue::Integer(0));
-        assert_eq!(row.values()[1], SqliteValue::Text("text".to_owned()));
+        assert_eq!(row.values()[1], SqliteValue::Text("text".into()));
         assert_eq!(row.values()[2], SqliteValue::Integer(10));
         assert_eq!(row.values()[3], SqliteValue::Integer(0));
-        assert_eq!(row.values()[4], SqliteValue::Text("text".to_owned()));
+        assert_eq!(row.values()[4], SqliteValue::Text("text".into()));
         assert_eq!(row.values()[5], SqliteValue::Integer(8));
         assert_eq!(row.values()[6], SqliteValue::Integer(0));
-        assert_eq!(row.values()[7], SqliteValue::Text("text".to_owned()));
+        assert_eq!(row.values()[7], SqliteValue::Text("text".into()));
         assert_eq!(row.values()[8], SqliteValue::Integer(19));
     }
 
@@ -62082,10 +61728,7 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT replace(val, 'world', 'rust') FROM rp;")
             .unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("hello rust".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello rust".into()));
     }
 
     // ─── HAVING edge-case probe tests ──────────────────────────
@@ -62122,7 +61765,7 @@ mod pager_routing_tests {
             .query("SELECT grp, sum(val) FROM hav2 GROUP BY grp HAVING sum(val) + 1 > 50;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("y".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("y".into()));
     }
 
     #[test]
@@ -62138,7 +61781,7 @@ mod pager_routing_tests {
             .query("SELECT grp FROM hav3 GROUP BY grp HAVING count(*) = 2;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
     }
 
     #[test]
@@ -62153,7 +61796,7 @@ mod pager_routing_tests {
             .query("SELECT grp FROM hav4 GROUP BY grp HAVING count(*) != 2;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("b".into()));
     }
 
     #[test]
@@ -62173,7 +61816,7 @@ mod pager_routing_tests {
             .query("SELECT grp FROM hav5 GROUP BY grp HAVING count(*) > 1 AND sum(val) < 100;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
     }
 
     #[test]
@@ -62207,9 +61850,9 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT CASE WHEN val > 15 THEN 'high' ELSE 'low' END FROM cw ORDER BY id;")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("low".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("high".to_owned()));
-        assert_eq!(rows[2].values()[0], SqliteValue::Text("high".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("low".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("high".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("high".into()));
     }
 
     #[test]
@@ -62224,7 +61867,7 @@ mod pager_routing_tests {
             .query("SELECT CASE WHEN val > 10 THEN 'yes' END FROM cw2 ORDER BY id;")
             .unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Null);
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("yes".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("yes".into()));
     }
 
     #[test]
@@ -62240,9 +61883,9 @@ mod pager_routing_tests {
                 "SELECT CASE val WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM cs ORDER BY id;",
             )
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("one".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("two".to_owned()));
-        assert_eq!(rows[2].values()[0], SqliteValue::Text("other".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("one".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("two".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("other".into()));
     }
 
     #[test]
@@ -62313,10 +61956,7 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT 'hello' || ' ' || 'world';").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("hello world".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello world".into()));
     }
 
     #[test]
@@ -62339,9 +61979,9 @@ mod pager_routing_tests {
                 "SELECT CASE WHEN val < 10 THEN CASE WHEN val < 8 THEN 'low' ELSE 'mid-low' END ELSE 'high' END FROM nc ORDER BY id;",
             )
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("low".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("high".to_owned()));
-        assert_eq!(rows[2].values()[0], SqliteValue::Text("high".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("low".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("high".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("high".into()));
     }
 
     #[test]
@@ -62412,11 +62052,11 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         // 'a': count=2, sum=30
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(2));
         assert_eq!(rows[0].values()[2], SqliteValue::Integer(30));
         // 'b': count=1, sum=30
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".into()));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(1));
         assert_eq!(rows[1].values()[2], SqliteValue::Integer(30));
     }
@@ -62469,7 +62109,7 @@ mod pager_routing_tests {
             .query("SELECT grp, group_concat(val, ',') FROM gc GROUP BY grp ORDER BY grp;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
         // group_concat for 'a' group
         let gc_val = &rows[0].values()[1];
         match gc_val {
@@ -62504,7 +62144,10 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT zeroblob(4);").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Blob(vec![0, 0, 0, 0]));
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Blob(vec![0, 0, 0, 0].into())
+        );
     }
 
     #[test]
@@ -62537,7 +62180,7 @@ mod pager_routing_tests {
             .unwrap();
         let rows = conn.query("SELECT a, b, c FROM nul;").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Null);
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("only_b".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("only_b".into()));
         assert_eq!(rows[0].values()[2], SqliteValue::Null);
     }
 
@@ -62564,10 +62207,7 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT date('2024-01-15');").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("2024-01-15".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("2024-01-15".into()));
     }
 
     #[test]
@@ -62575,10 +62215,7 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT time('2024-01-15 14:30:00');").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("14:30:00".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("14:30:00".into()));
     }
 
     #[test]
@@ -62590,7 +62227,7 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].values()[0],
-            SqliteValue::Text("2024-01-15 14:30:00".to_owned())
+            SqliteValue::Text("2024-01-15 14:30:00".into())
         );
     }
 
@@ -62616,7 +62253,7 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT strftime('%Y', '2024-06-15');").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("2024".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("2024".into()));
     }
 
     #[test]
@@ -62626,10 +62263,7 @@ mod pager_routing_tests {
             .query("SELECT date('2024-01-15', '+1 month');")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("2024-02-15".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("2024-02-15".into()));
     }
 
     // ─── String function probe tests ──────────────────────────
@@ -62638,28 +62272,28 @@ mod pager_routing_tests {
     fn test_trim_function() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT trim('  hello  ');").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".into()));
     }
 
     #[test]
     fn test_ltrim_function() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT ltrim('  hello');").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".into()));
     }
 
     #[test]
     fn test_rtrim_function() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT rtrim('hello  ');").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".into()));
     }
 
     #[test]
     fn test_char_function() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT char(72, 101, 108, 108, 111);").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Hello".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Hello".into()));
     }
 
     #[test]
@@ -62673,24 +62307,21 @@ mod pager_routing_tests {
     fn test_quote_function() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT quote('it''s');").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("'it''s'".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("'it''s'".into()));
     }
 
     #[test]
     fn test_printf_format_function() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT printf('%d items', 42);").unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("42 items".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("42 items".into()));
     }
 
     #[test]
     fn test_concat_function() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT concat('a', 'b', 'c');").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("abc".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("abc".into()));
     }
 
     #[test]
@@ -62699,14 +62330,14 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT concat_ws(', ', 'a', 'b', 'c');")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a, b, c".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a, b, c".into()));
     }
 
     #[test]
     fn test_iif_function() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT iif(1 > 2, 'yes', 'no');").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("no".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("no".into()));
     }
 
     #[test]
@@ -62764,18 +62395,18 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT typeof(42), typeof(3.14), typeof('hi'), typeof(NULL), typeof(x'01');")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("real".to_owned()));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("text".to_owned()));
-        assert_eq!(rows[0].values()[3], SqliteValue::Text("null".to_owned()));
-        assert_eq!(rows[0].values()[4], SqliteValue::Text("blob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("real".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("text".into()));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("null".into()));
+        assert_eq!(rows[0].values()[4], SqliteValue::Text("blob".into()));
     }
 
     #[test]
     fn test_soundex_function() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT soundex('Robert');").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("R163".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("R163".into()));
     }
 
     #[test]
@@ -62834,7 +62465,7 @@ mod pager_routing_tests {
             .unwrap();
         let rows = conn.query("SELECT id, a, b FROM cr;").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".into()));
         assert_eq!(rows[0].values()[2], SqliteValue::Integer(42));
     }
 
@@ -62858,7 +62489,7 @@ mod pager_routing_tests {
         let rows = conn.query("SELECT * FROM st;").unwrap();
         assert_eq!(rows[0].values().len(), 3);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".into()));
         assert_eq!(rows[0].values()[2], SqliteValue::Integer(42));
     }
 
@@ -62942,7 +62573,7 @@ mod pager_routing_tests {
             .query("SELECT CASE WHEN NULL THEN 'yes' ELSE 'no' END;")
             .unwrap();
         // NULL is falsy, so ELSE branch
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("no".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("no".into()));
     }
 
     #[test]
@@ -62957,11 +62588,11 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT typeof(val), val FROM tc ORDER BY id;")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(10));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("text".to_owned()));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("abc".to_owned()));
-        assert_eq!(rows[2].values()[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("text".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("abc".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("integer".into()));
         assert_eq!(rows[2].values()[1], SqliteValue::Integer(20));
     }
 
@@ -62982,7 +62613,7 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("INSERT INTO ta VALUES (1, '42');").unwrap();
         let rows = conn.query("SELECT typeof(val), val FROM ta;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(42));
     }
 
@@ -62994,8 +62625,8 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("INSERT INTO tt VALUES (1, 42);").unwrap();
         let rows = conn.query("SELECT typeof(val), val FROM tt;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("text".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("42".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("text".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("42".into()));
     }
 
     #[test]
@@ -63136,7 +62767,7 @@ mod pager_routing_tests {
             "GROUP BY + LIMIT 2 OFFSET 1 should return 2 groups"
         );
         // With alphabetical group ordering, offset 1 should skip 'a' group.
-        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("b".into()));
     }
 
     #[test]
@@ -63214,7 +62845,7 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("INSERT INTO na VALUES (1, '42');").unwrap();
         let rows = conn.query("SELECT typeof(val), val FROM na;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(42));
     }
 
@@ -63226,7 +62857,7 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("INSERT INTO nr VALUES (1, '3.14');").unwrap();
         let rows = conn.query("SELECT typeof(val), val FROM nr;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("real".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("real".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Float(3.14));
     }
 
@@ -63238,8 +62869,8 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("INSERT INTO ns VALUES (1, 'hello');").unwrap();
         let rows = conn.query("SELECT typeof(val), val FROM ns;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("text".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("text".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".into()));
     }
 
     #[test]
@@ -63250,7 +62881,7 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("INSERT INTO ra VALUES (1, 42);").unwrap();
         let rows = conn.query("SELECT typeof(val), val FROM ra;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("real".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("real".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Float(42.0));
     }
 
@@ -63262,7 +62893,7 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("INSERT INTO ia VALUES (1, '99');").unwrap();
         let rows = conn.query("SELECT typeof(val), val FROM ia;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(99));
     }
 
@@ -63275,7 +62906,7 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO ir VALUES (1, 5.0);").unwrap();
         let rows = conn.query("SELECT typeof(val), val FROM ir;").unwrap();
         // 5.0 can be losslessly converted to integer 5
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(5));
     }
 
@@ -63292,10 +62923,10 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT typeof(val) FROM ba ORDER BY id;")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("real".to_owned()));
-        assert_eq!(rows[2].values()[0], SqliteValue::Text("text".to_owned()));
-        assert_eq!(rows[3].values()[0], SqliteValue::Text("null".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("real".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("text".into()));
+        assert_eq!(rows[3].values()[0], SqliteValue::Text("null".into()));
     }
 
     #[test]
@@ -63309,9 +62940,9 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT typeof(a), typeof(b), typeof(c) FROM np;")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("null".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("null".to_owned()));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("null".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("null".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("null".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("null".into()));
     }
 
     // ─── PRAGMA probe tests ──────────────────────────────────
@@ -63325,7 +62956,7 @@ mod pager_routing_tests {
         // Should return 3 rows (one per column)
         assert_eq!(rows.len(), 3);
         // First column: cid=0, name="id", type="INTEGER", notnull=0, pk=1
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("id".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("id".into()));
     }
 
     #[test]
@@ -63384,7 +63015,7 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA encoding;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("UTF-8".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("UTF-8".into()));
     }
 
     // ─── Multi-statement and edge case tests ──────────────────
@@ -63417,7 +63048,7 @@ mod pager_routing_tests {
         // New name should work and data should be intact
         let rows = conn.query("SELECT val FROM new_name;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("data".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("data".into()));
     }
 
     #[test]
@@ -63432,7 +63063,7 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO acd (id, a) VALUES (1, 'hello');")
             .unwrap();
         let rows = conn.query("SELECT a, b FROM acd;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(0));
     }
 
@@ -63508,7 +63139,7 @@ mod pager_routing_tests {
             .query("SELECT name FROM li WHERE name LIKE 'alice';")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
     }
 
     // ── Parse cache regression tests (br-legjy.7.3) ────────────────────
@@ -63532,7 +63163,7 @@ mod pager_routing_tests {
         assert_eq!(rows1.len(), 1);
         assert_eq!(rows2.len(), 1);
         assert_eq!(rows1[0].values(), rows2[0].values());
-        assert_eq!(rows1[0].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows1[0].values()[0], SqliteValue::Text("b".into()));
     }
 
     #[test]
@@ -63567,7 +63198,7 @@ mod pager_routing_tests {
 
         // Populate cache.
         let rows = conn.query("SELECT x FROM pc2 WHERE id = 1").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("before".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("before".into()));
 
         // DDL invalidates cache (schema cookie increment).
         conn.execute("ALTER TABLE pc2 ADD COLUMN y TEXT DEFAULT 'new';")
@@ -63575,7 +63206,7 @@ mod pager_routing_tests {
 
         // After DDL, re-parsed query must still work.
         let rows = conn.query("SELECT x FROM pc2 WHERE id = 1").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("before".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("before".into()));
     }
 
     #[test]
@@ -63693,24 +63324,24 @@ mod pager_routing_tests {
         conn.execute_prepared_with_params(
             &stmt,
             &[
-                SqliteValue::Text("a".to_owned()),
-                SqliteValue::Text("Alice".to_owned()),
+                SqliteValue::Text("a".into()),
+                SqliteValue::Text("Alice".into()),
             ],
         )
         .unwrap();
         conn.execute_prepared_with_params(
             &stmt,
             &[
-                SqliteValue::Text("b".to_owned()),
-                SqliteValue::Text("Bob".to_owned()),
+                SqliteValue::Text("b".into()),
+                SqliteValue::Text("Bob".into()),
             ],
         )
         .unwrap();
 
         let rows = conn.query("SELECT name FROM prep_dml ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Bob".into()));
     }
 
     #[test]
@@ -63741,13 +63372,13 @@ mod pager_routing_tests {
         let affected = conn
             .execute_prepared_with_params(
                 &stmt,
-                &[SqliteValue::Text("new".to_owned()), SqliteValue::Integer(1)],
+                &[SqliteValue::Text("new".into()), SqliteValue::Integer(1)],
             )
             .unwrap();
         assert_eq!(affected, 1);
 
         let rows = conn.query("SELECT val FROM prep_upd WHERE id = 1").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".into()));
     }
 
     #[test]
@@ -63865,24 +63496,24 @@ mod pager_routing_tests {
         // execute_with_params should work directly on the PreparedStatement.
         let affected = stmt
             .execute_with_params(&[
-                SqliteValue::Text("a".to_owned()),
-                SqliteValue::Text("Alice".to_owned()),
+                SqliteValue::Text("a".into()),
+                SqliteValue::Text("Alice".into()),
             ])
             .unwrap();
         assert_eq!(affected, 1);
 
         let affected = stmt
             .execute_with_params(&[
-                SqliteValue::Text("b".to_owned()),
-                SqliteValue::Text("Bob".to_owned()),
+                SqliteValue::Text("b".into()),
+                SqliteValue::Text("Bob".into()),
             ])
             .unwrap();
         assert_eq!(affected, 1);
 
         let rows = conn.query("SELECT name FROM ps_exec ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Bob".into()));
     }
 
     #[test]
@@ -63898,12 +63529,12 @@ mod pager_routing_tests {
             .unwrap();
 
         let affected = stmt
-            .execute_with_params(&[SqliteValue::Text("new".to_owned()), SqliteValue::Integer(1)])
+            .execute_with_params(&[SqliteValue::Text("new".into()), SqliteValue::Integer(1)])
             .unwrap();
         assert_eq!(affected, 1);
 
         let rows = conn.query("SELECT val FROM ps_upd WHERE id = 1").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".into()));
     }
 
     #[test]
@@ -63941,7 +63572,7 @@ mod pager_routing_tests {
         assert_eq!(affected, 1);
 
         let rows = conn.query("SELECT val FROM ps_exec2 WHERE id = 1").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".into()));
     }
 
     // ── bd-1dp9.6.7.2.1: Prepared INSERT reuse tests ────────────────────
@@ -63975,7 +63606,7 @@ mod pager_routing_tests {
             let affected = stmt
                 .execute_with_params(&[
                     SqliteValue::Integer(i),
-                    SqliteValue::Text(format!("name_{i}")),
+                    SqliteValue::Text(format!("name_{i}").into()),
                 ])
                 .unwrap();
             assert_eq!(affected, 1);
@@ -63987,8 +63618,8 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT name FROM prep_reuse ORDER BY id")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("name_1".to_owned()));
-        assert_eq!(rows[4].values()[0], SqliteValue::Text("name_5".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("name_1".into()));
+        assert_eq!(rows[4].values()[0], SqliteValue::Text("name_5".into()));
     }
 
     #[test]
@@ -64019,7 +63650,7 @@ mod pager_routing_tests {
         let row = stmt2
             .query_row_with_params(&[SqliteValue::Integer(2)])
             .unwrap();
-        assert_eq!(row.values()[0], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(row.values()[0], SqliteValue::Text("beta".into()));
 
         conn.execute("CREATE TABLE prep_sel_reuse_bump (id INTEGER PRIMARY KEY);")
             .unwrap();
@@ -64055,19 +63686,13 @@ mod pager_routing_tests {
 
         assert_eq!(
             stmt1
-                .execute_with_params(&[
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("alpha".to_owned()),
-                ])
+                .execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("alpha".into()),])
                 .unwrap(),
             1
         );
         assert_eq!(
             stmt2
-                .execute_with_params(&[
-                    SqliteValue::Integer(2),
-                    SqliteValue::Text("beta".to_owned()),
-                ])
+                .execute_with_params(&[SqliteValue::Integer(2), SqliteValue::Text("beta".into()),])
                 .unwrap(),
             1
         );
@@ -64076,8 +63701,8 @@ mod pager_routing_tests {
             .query("SELECT val FROM prep_ins_reuse ORDER BY id")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".into()));
     }
 
     #[test]
@@ -64107,19 +63732,13 @@ mod pager_routing_tests {
 
         assert_eq!(
             stmt1
-                .execute_with_params(&[
-                    SqliteValue::Text("alpha".to_owned()),
-                    SqliteValue::Integer(1),
-                ])
+                .execute_with_params(&[SqliteValue::Text("alpha".into()), SqliteValue::Integer(1),])
                 .unwrap(),
             1
         );
         assert_eq!(
             stmt2
-                .execute_with_params(&[
-                    SqliteValue::Text("beta".to_owned()),
-                    SqliteValue::Integer(2),
-                ])
+                .execute_with_params(&[SqliteValue::Text("beta".into()), SqliteValue::Integer(2),])
                 .unwrap(),
             1
         );
@@ -64128,8 +63747,8 @@ mod pager_routing_tests {
             .query("SELECT val FROM prep_upd_reuse ORDER BY id")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("beta".into()));
     }
 
     #[test]
@@ -64174,24 +63793,24 @@ mod pager_routing_tests {
 
             for row in [
                 [
-                    SqliteValue::Text("a".to_owned()),
+                    SqliteValue::Text("a".into()),
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("2026-03-11 10:00:00".to_owned()),
-                    SqliteValue::Text("open".to_owned()),
+                    SqliteValue::Text("2026-03-11 10:00:00".into()),
+                    SqliteValue::Text("open".into()),
                     SqliteValue::Integer(0),
                 ],
                 [
-                    SqliteValue::Text("b".to_owned()),
+                    SqliteValue::Text("b".into()),
                     SqliteValue::Integer(1),
-                    SqliteValue::Text("2026-03-11 11:00:00".to_owned()),
-                    SqliteValue::Text("open".to_owned()),
+                    SqliteValue::Text("2026-03-11 11:00:00".into()),
+                    SqliteValue::Text("open".into()),
                     SqliteValue::Null,
                 ],
                 [
-                    SqliteValue::Text("c".to_owned()),
+                    SqliteValue::Text("c".into()),
                     SqliteValue::Integer(2),
-                    SqliteValue::Text("2026-03-11 12:00:00".to_owned()),
-                    SqliteValue::Text("closed".to_owned()),
+                    SqliteValue::Text("2026-03-11 12:00:00".into()),
+                    SqliteValue::Text("closed".into()),
                     SqliteValue::Integer(0),
                 ],
             ] {
@@ -64271,13 +63890,13 @@ mod pager_routing_tests {
         stmt.execute_with_params(&[
             SqliteValue::Integer(1),
             SqliteValue::Float(3.14),
-            SqliteValue::Text("hello".to_owned()),
+            SqliteValue::Text("hello".into()),
         ])
         .unwrap();
         stmt.execute_with_params(&[
             SqliteValue::Integer(2),
             SqliteValue::Null,
-            SqliteValue::Text("world".to_owned()),
+            SqliteValue::Text("world".into()),
         ])
         .unwrap();
 
@@ -64287,7 +63906,7 @@ mod pager_routing_tests {
             &[
                 SqliteValue::Integer(1),
                 SqliteValue::Float(3.14),
-                SqliteValue::Text("hello".to_owned()),
+                SqliteValue::Text("hello".into()),
             ],
         )
         .unwrap();
@@ -64296,7 +63915,7 @@ mod pager_routing_tests {
             &[
                 SqliteValue::Integer(2),
                 SqliteValue::Null,
-                SqliteValue::Text("world".to_owned()),
+                SqliteValue::Text("world".into()),
             ],
         )
         .unwrap();
@@ -64321,16 +63940,16 @@ mod pager_routing_tests {
             .unwrap();
 
         conn.execute("BEGIN;").unwrap();
-        stmt.execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())])
+        stmt.execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("a".into())])
             .unwrap();
-        stmt.execute_with_params(&[SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())])
+        stmt.execute_with_params(&[SqliteValue::Integer(2), SqliteValue::Text("b".into())])
             .unwrap();
         conn.execute("COMMIT;").unwrap();
 
         let rows = conn.query("SELECT val FROM prep_txn ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".into()));
     }
 
     #[test]
@@ -64349,7 +63968,7 @@ mod pager_routing_tests {
         conn.execute("BEGIN;").unwrap();
         stmt.execute_with_params(&[
             SqliteValue::Integer(2),
-            SqliteValue::Text("should_vanish".to_owned()),
+            SqliteValue::Text("should_vanish".into()),
         ])
         .unwrap();
         conn.execute("ROLLBACK;").unwrap();
@@ -64370,23 +63989,20 @@ mod pager_routing_tests {
             .prepare("INSERT OR IGNORE INTO prep_ign (id, val) VALUES (?1, ?2)")
             .unwrap();
 
-        stmt.execute_with_params(&[
-            SqliteValue::Integer(1),
-            SqliteValue::Text("first".to_owned()),
-        ])
-        .unwrap();
+        stmt.execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("first".into())])
+            .unwrap();
 
         // Duplicate key — should be silently ignored.
         let affected = stmt
             .execute_with_params(&[
                 SqliteValue::Integer(1),
-                SqliteValue::Text("duplicate".to_owned()),
+                SqliteValue::Text("duplicate".into()),
             ])
             .unwrap();
         assert_eq!(affected, 0);
 
         let rows = conn.query("SELECT val FROM prep_ign WHERE id = 1").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("first".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("first".into()));
     }
 
     #[test]
@@ -64413,7 +64029,7 @@ mod pager_routing_tests {
 
         let rows = conn.query("SELECT val FROM dst ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
     }
 
     #[test]
@@ -64467,7 +64083,7 @@ mod pager_routing_tests {
             .unwrap();
         let rows = stmt.query().unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
 
         conn.execute("CREATE TABLE prep_schema_sel_bump (id INTEGER PRIMARY KEY);")
             .unwrap();
@@ -64489,10 +64105,7 @@ mod pager_routing_tests {
             .unwrap();
 
         let err = stmt
-            .execute_with_params(&[
-                SqliteValue::Integer(1),
-                SqliteValue::Text("alpha".to_owned()),
-            ])
+            .execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())])
             .unwrap_err();
         assert!(matches!(err, FrankenError::SchemaChanged));
 
@@ -64548,10 +64161,7 @@ mod pager_routing_tests {
             .unwrap();
 
         let err = stmt
-            .execute_with_params(&[
-                SqliteValue::Integer(1),
-                SqliteValue::Text("alpha".to_owned()),
-            ])
+            .execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())])
             .expect_err("cross-connection DDL must invalidate prepared DML");
         assert!(matches!(err, FrankenError::SchemaChanged));
 
@@ -64577,10 +64187,7 @@ mod pager_routing_tests {
 
         reset_hot_path_profile();
         let affected = insert_stmt
-            .execute_with_params(&[
-                SqliteValue::Integer(1),
-                SqliteValue::Text("alpha".to_owned()),
-            ])
+            .execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())])
             .unwrap();
         assert_eq!(affected, 1);
         let insert_profile = hot_path_profile_snapshot();
@@ -64594,7 +64201,7 @@ mod pager_routing_tests {
             .query_with_params(&[SqliteValue::Integer(1)])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
         let select_profile = hot_path_profile_snapshot();
         assert_eq!(
             select_profile.prepared_schema_refreshes, 0,
@@ -64613,10 +64220,7 @@ mod pager_routing_tests {
         let affected = conn
             .execute_with_params(
                 "INSERT INTO mem_pub_fast (id, val) VALUES (?1, ?2)",
-                &[
-                    SqliteValue::Integer(1),
-                    SqliteValue::Text("alpha".to_owned()),
-                ],
+                &[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())],
             )
             .unwrap();
         assert_eq!(affected, 1);
@@ -64648,7 +64252,7 @@ mod pager_routing_tests {
             let affected = insert_stmt
                 .execute_with_params(&[
                     SqliteValue::Integer(id),
-                    SqliteValue::Text(format!("v{id}")),
+                    SqliteValue::Text(format!("v{id}").into()),
                 ])
                 .unwrap();
             assert_eq!(affected, 1);
@@ -64707,7 +64311,7 @@ mod pager_routing_tests {
             let affected = insert_stmt
                 .execute_with_params(&[
                     SqliteValue::Integer(id),
-                    SqliteValue::Text(format!("v{id}")),
+                    SqliteValue::Text(format!("v{id}").into()),
                 ])
                 .unwrap();
             assert_eq!(affected, 1);
@@ -64725,7 +64329,7 @@ mod pager_routing_tests {
                     "INSERT INTO no_defaults_fast (id, val) VALUES (?1, ?2)",
                     &[
                         SqliteValue::Integer(id),
-                        SqliteValue::Text(format!("v{id}")),
+                        SqliteValue::Text(format!("v{id}").into()),
                     ],
                 )
                 .unwrap();
@@ -64822,7 +64426,7 @@ mod pager_routing_tests {
         );
         assert_eq!(
             insert.column_defaults_by_root_page.get(&root_page),
-            Some(&vec![None, Some(SqliteValue::Text("fallback".to_owned())),]),
+            Some(&vec![None, Some(SqliteValue::Text("fallback".into())),]),
             "insert executions should still evaluate column defaults"
         );
     }
@@ -64880,7 +64484,7 @@ mod pager_routing_tests {
                     insert_sql,
                     &[
                         SqliteValue::Integer(id),
-                        SqliteValue::Text(format!("v{id}")),
+                        SqliteValue::Text(format!("v{id}").into()),
                     ],
                 )
                 .unwrap();
@@ -64892,7 +64496,7 @@ mod pager_routing_tests {
             let row = conn
                 .query_row_with_params(select_sql, &[SqliteValue::Integer(id)])
                 .unwrap();
-            assert_eq!(row.values()[0], SqliteValue::Text(format!("v{id}")));
+            assert_eq!(row.values()[0], SqliteValue::Text(format!("v{id}").into()));
         }
 
         let profile = hot_path_profile_snapshot();
@@ -64925,7 +64529,7 @@ mod pager_routing_tests {
             let affected = insert_stmt
                 .execute_with_params(&[
                     SqliteValue::Integer(id),
-                    SqliteValue::Text(format!("v{id}")),
+                    SqliteValue::Text(format!("v{id}").into()),
                 ])
                 .unwrap();
             assert_eq!(affected, 1);
@@ -64942,7 +64546,10 @@ mod pager_routing_tests {
                 .query_with_params(&[SqliteValue::Integer(id)])
                 .unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].values()[0], SqliteValue::Text(format!("v{id}")));
+            assert_eq!(
+                rows[0].values()[0],
+                SqliteValue::Text(format!("v{id}").into())
+            );
         }
         let prepared_select_profile = hot_path_profile_snapshot();
         assert_eq!(
@@ -64958,7 +64565,7 @@ mod pager_routing_tests {
                     &[SqliteValue::Integer(id)],
                 )
                 .unwrap();
-            assert_eq!(row.values()[0], SqliteValue::Text(format!("v{id}")));
+            assert_eq!(row.values()[0], SqliteValue::Text(format!("v{id}").into()));
         }
         let ad_hoc_select_profile = hot_path_profile_snapshot();
         assert_eq!(
@@ -64985,27 +64592,20 @@ mod pager_routing_tests {
             .unwrap();
 
         assert_eq!(
-            stmt.execute_with_params(&[
-                SqliteValue::Integer(1),
-                SqliteValue::Text("alpha".to_owned()),
-            ])
+            stmt.execute_with_params(
+                &[SqliteValue::Integer(1), SqliteValue::Text("alpha".into()),]
+            )
             .unwrap(),
             1
         );
         assert_eq!(
-            stmt.execute_with_params(&[
-                SqliteValue::Integer(2),
-                SqliteValue::Text("beta".to_owned()),
-            ])
-            .unwrap(),
+            stmt.execute_with_params(&[SqliteValue::Integer(2), SqliteValue::Text("beta".into()),])
+                .unwrap(),
             1
         );
 
         let err = stmt
-            .execute_with_params(&[
-                SqliteValue::Integer(3),
-                SqliteValue::Text("beta".to_owned()),
-            ])
+            .execute_with_params(&[SqliteValue::Integer(3), SqliteValue::Text("beta".into())])
             .expect_err("duplicate UNIQUE value should fail");
         let err_text = err.to_string();
         assert!(
@@ -65014,10 +64614,9 @@ mod pager_routing_tests {
         );
 
         assert_eq!(
-            stmt.execute_with_params(&[
-                SqliteValue::Integer(3),
-                SqliteValue::Text("gamma".to_owned()),
-            ])
+            stmt.execute_with_params(
+                &[SqliteValue::Integer(3), SqliteValue::Text("gamma".into()),]
+            )
             .unwrap(),
             1
         );
@@ -65045,7 +64644,7 @@ mod pager_routing_tests {
         assert_eq!(
             stmt.execute_with_params(&[
                 SqliteValue::Integer(1),
-                SqliteValue::Text("prepared-ok".to_owned()),
+                SqliteValue::Text("prepared-ok".into()),
             ])
             .unwrap(),
             1
@@ -65064,7 +64663,7 @@ mod pager_routing_tests {
                 "INSERT INTO sr_bind (id, val) VALUES (?1, ?2)",
                 &[
                     SqliteValue::Integer(2),
-                    SqliteValue::Text("adhoc-ok".to_owned()),
+                    SqliteValue::Text("adhoc-ok".into()),
                 ],
             )
             .unwrap(),
@@ -65073,14 +64672,8 @@ mod pager_routing_tests {
 
         let rows = conn.query("SELECT val FROM sr_bind ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("prepared-ok".to_owned())
-        );
-        assert_eq!(
-            rows[1].values()[0],
-            SqliteValue::Text("adhoc-ok".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("prepared-ok".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("adhoc-ok".into()));
     }
 
     #[test]
@@ -65158,19 +64751,15 @@ mod pager_routing_tests {
             .prepare("INSERT INTO sr_file (id, val) VALUES (?1, ?2)")
             .unwrap();
         assert_eq!(
-            stmt.execute_with_params(&[
-                SqliteValue::Integer(1),
-                SqliteValue::Text("alpha".to_owned()),
-            ])
+            stmt.execute_with_params(
+                &[SqliteValue::Integer(1), SqliteValue::Text("alpha".into()),]
+            )
             .unwrap(),
             1
         );
         assert_eq!(
-            stmt.execute_with_params(&[
-                SqliteValue::Integer(2),
-                SqliteValue::Text("beta".to_owned()),
-            ])
-            .unwrap(),
+            stmt.execute_with_params(&[SqliteValue::Integer(2), SqliteValue::Text("beta".into()),])
+                .unwrap(),
             1
         );
 
@@ -65179,7 +64768,7 @@ mod pager_routing_tests {
             conn.execute_with_params(
                 update_sql,
                 &[
-                    SqliteValue::Text("alpha-updated".to_owned()),
+                    SqliteValue::Text("alpha-updated".into()),
                     SqliteValue::Integer(1),
                 ],
             )
@@ -65190,7 +64779,7 @@ mod pager_routing_tests {
             conn.execute_with_params(
                 update_sql,
                 &[
-                    SqliteValue::Text("beta-updated".to_owned()),
+                    SqliteValue::Text("beta-updated".into()),
                     SqliteValue::Integer(2),
                 ],
             )
@@ -65205,22 +64794,13 @@ mod pager_routing_tests {
         let row_b = conn
             .query_row_with_params(select_sql, &[SqliteValue::Integer(2)])
             .unwrap();
-        assert_eq!(
-            row_a.values()[0],
-            SqliteValue::Text("alpha-updated".to_owned())
-        );
-        assert_eq!(
-            row_b.values()[0],
-            SqliteValue::Text("beta-updated".to_owned())
-        );
+        assert_eq!(row_a.values()[0], SqliteValue::Text("alpha-updated".into()));
+        assert_eq!(row_b.values()[0], SqliteValue::Text("beta-updated".into()));
 
         conn.execute("ALTER TABLE sr_file ADD COLUMN extra TEXT DEFAULT 'x';")
             .unwrap();
         let err = stmt
-            .execute_with_params(&[
-                SqliteValue::Integer(3),
-                SqliteValue::Text("gamma".to_owned()),
-            ])
+            .execute_with_params(&[SqliteValue::Integer(3), SqliteValue::Text("gamma".into())])
             .expect_err("schema change should invalidate prepared insert");
         assert!(matches!(err, FrankenError::SchemaChanged));
     }
@@ -65309,8 +64889,8 @@ mod pager_routing_tests {
         let rows_a = conn.query("SELECT a FROM pc4").unwrap();
         let rows_b = conn.query("SELECT b FROM pc4").unwrap();
 
-        assert_eq!(rows_a[0].values()[0], SqliteValue::Text("alpha".to_owned()));
-        assert_eq!(rows_b[0].values()[0], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows_a[0].values()[0], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows_b[0].values()[0], SqliteValue::Text("beta".into()));
     }
 
     #[test]
@@ -65335,7 +64915,7 @@ mod pager_routing_tests {
 
         // A hash-key match with different SQL text must not return wrong AST.
         let rows = conn.query(target_sql).unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
 
         let mut cache = conn.parse_cache.borrow_mut();
         let entry = cache
@@ -65364,7 +64944,7 @@ mod pager_routing_tests {
 
         // Cache must be invalidated: fresh parse succeeds.
         let rows = conn.query("SELECT v FROM pc5").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".into()));
     }
 
     // ── bd-1dp9.6.7.2.2: Compiled cache tests ────────────────────────
@@ -65384,8 +64964,8 @@ mod pager_routing_tests {
         // Second query should hit compiled cache (same SQL + schema).
         let rows2 = conn.query("SELECT val FROM cc_sel ORDER BY id").unwrap();
         assert_eq!(rows2.len(), 2);
-        assert_eq!(rows2[0].values()[0], SqliteValue::Text("a".to_owned()));
-        assert_eq!(rows2[1].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows2[0].values()[0], SqliteValue::Text("a".into()));
+        assert_eq!(rows2[1].values()[0], SqliteValue::Text("b".into()));
 
         // Compiled cache should have at least one entry from the queries.
         assert!(
@@ -65405,21 +64985,21 @@ mod pager_routing_tests {
         // First insert compiles fresh.
         conn.execute_with_params(
             sql,
-            &[SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())],
+            &[SqliteValue::Integer(1), SqliteValue::Text("a".into())],
         )
         .unwrap();
 
         // Second insert should hit compiled cache.
         conn.execute_with_params(
             sql,
-            &[SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())],
+            &[SqliteValue::Integer(2), SqliteValue::Text("b".into())],
         )
         .unwrap();
 
         let rows = conn.query("SELECT val FROM cc_ins ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".into()));
     }
 
     #[test]
@@ -65434,24 +65014,18 @@ mod pager_routing_tests {
 
         conn.execute_with_params(
             sql,
-            &[
-                SqliteValue::Text("new1".to_owned()),
-                SqliteValue::Integer(1),
-            ],
+            &[SqliteValue::Text("new1".into()), SqliteValue::Integer(1)],
         )
         .unwrap();
         conn.execute_with_params(
             sql,
-            &[
-                SqliteValue::Text("new2".to_owned()),
-                SqliteValue::Integer(2),
-            ],
+            &[SqliteValue::Text("new2".into()), SqliteValue::Integer(2)],
         )
         .unwrap();
 
         let rows = conn.query("SELECT val FROM cc_upd ORDER BY id").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("new1".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("new2".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new1".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("new2".into()));
     }
 
     #[test]
@@ -65501,8 +65075,8 @@ mod pager_routing_tests {
         // Should recompile fresh (schema changed).
         let rows = conn.query("SELECT val, extra FROM cc_ddl").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".into()));
     }
 
     #[test]
@@ -65624,8 +65198,8 @@ mod pager_routing_tests {
         let rows_a = conn.query("SELECT a FROM cc_diff").unwrap();
         let rows_b = conn.query("SELECT b FROM cc_diff").unwrap();
 
-        assert_eq!(rows_a[0].values()[0], SqliteValue::Text("alpha".to_owned()));
-        assert_eq!(rows_b[0].values()[0], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows_a[0].values()[0], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows_b[0].values()[0], SqliteValue::Text("beta".into()));
     }
 
     // ── Window function tests ──────────────────────────────────────
@@ -65771,7 +65345,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         // SUM = 23 > 10 → 'many'
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("many".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("many".into()));
     }
 
     #[test]
@@ -65803,7 +65377,7 @@ mod pager_routing_tests {
             other => panic!("expected Text, got {other:?}"),
         };
         assert!(
-            group1 == "Alice, Bob" || group1 == "Bob, Alice",
+            &*group1 == "Alice, Bob" || &*group1 == "Bob, Alice",
             "unexpected group_concat result: {group1}"
         );
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
@@ -65837,11 +65411,8 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Null);
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
-        assert_eq!(
-            rows[0].values()[2],
-            SqliteValue::Text("fallback".to_owned())
-        );
-        assert_eq!(rows[0].values()[3], SqliteValue::Text("value".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("fallback".into()));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("value".into()));
     }
 
     #[test]
@@ -65939,7 +65510,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("3.14".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("3.14".into()));
         assert_eq!(rows[0].values()[2], SqliteValue::Null);
     }
 
@@ -66026,7 +65597,7 @@ mod pager_routing_tests {
             let rows = conn.query("SELECT id, name FROM t;").unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-            assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+            assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".into()));
         }
         // Document: may error with "INSERT ... SELECT without FROM" in VDBE path.
     }
@@ -66048,8 +65619,8 @@ mod pager_routing_tests {
         // REPLACE should remove old row (id=1) and insert new (id=2).
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("a@b.com".to_owned()));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("a@b.com".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("Bob".into()));
     }
 
     #[test]
@@ -66074,7 +65645,7 @@ mod pager_routing_tests {
         // Both conflicting rows (1, 2) should be deleted; only row 3 remains.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
-        assert_eq!(rows[0].values()[3], SqliteValue::Text("third".to_owned()));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("third".into()));
     }
 
     #[test]
@@ -66350,8 +65921,8 @@ mod pager_routing_tests {
             2,
             "pager-backed reads should still see both rows"
         );
-        assert_eq!(rows[0].values(), &[SqliteValue::Text("hello".to_owned())]);
-        assert_eq!(rows[1].values(), &[SqliteValue::Text("world".to_owned())]);
+        assert_eq!(rows[0].values(), &[SqliteValue::Text("hello".into())]);
+        assert_eq!(rows[1].values(), &[SqliteValue::Text("world".into())]);
     }
 
     #[test]
@@ -66645,8 +66216,8 @@ mod pager_routing_tests {
         .unwrap();
         let rows = conn.query("SELECT id, val FROM t ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("a".to_owned()));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("a".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("b".into()));
     }
 
     #[test]
@@ -66685,8 +66256,8 @@ mod pager_routing_tests {
             .query("SELECT name FROM t1 WHERE id IN (SELECT ref_id FROM t2) ORDER BY name;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("Carol".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Carol".into()));
     }
 
     #[test]
@@ -66705,7 +66276,7 @@ mod pager_routing_tests {
             .query("SELECT name FROM t1 WHERE id NOT IN (SELECT ref_id FROM t2);")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".into()));
     }
 
     #[test]
@@ -66724,9 +66295,9 @@ mod pager_routing_tests {
             .unwrap();
 
         let rows = conn.query("SELECT id, val FROM t1 ORDER BY id;").unwrap();
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("new".to_owned()));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("old".to_owned()));
-        assert_eq!(rows[2].values()[1], SqliteValue::Text("new".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("new".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("old".into()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("new".into()));
     }
 
     #[test]
@@ -66822,8 +66393,8 @@ mod pager_routing_tests {
                 .map(|row| row.values()[0].clone())
                 .collect::<Vec<_>>(),
             vec![
-                SqliteValue::Text("alpha".to_owned()),
-                SqliteValue::Text("beta".to_owned()),
+                SqliteValue::Text("alpha".into()),
+                SqliteValue::Text("beta".into()),
             ]
         );
 
@@ -66837,8 +66408,8 @@ mod pager_routing_tests {
                 .map(|row| row.values()[0].clone())
                 .collect::<Vec<_>>(),
             vec![
-                SqliteValue::Text("alpha".to_owned()),
-                SqliteValue::Text("beta".to_owned()),
+                SqliteValue::Text("alpha".into()),
+                SqliteValue::Text("beta".into()),
             ]
         );
     }
@@ -66870,9 +66441,9 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("left".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("left".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("right".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("right".into()));
     }
 
     #[test]
@@ -66894,7 +66465,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
 
         let aux = rusqlite::Connection::open(&aux_path).unwrap();
         let table_count: i64 = aux
@@ -66983,7 +66554,7 @@ mod pager_routing_tests {
         let rows = conn.query("SELECT id, value FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("zero".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("zero".into()));
     }
 
     #[test]
@@ -67007,7 +66578,7 @@ mod pager_routing_tests {
         let rows = conn.query("SELECT id, value FROM t ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("zero".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("zero".into()));
     }
 
     #[test]
@@ -67034,7 +66605,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
     }
 
     #[test]
@@ -67061,7 +66632,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("zero".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("zero".into()));
     }
 
     #[test]
@@ -67094,7 +66665,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("dup".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("dup".into()));
     }
 
     #[test]
@@ -67176,11 +66747,11 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("omega".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("omega".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
         assert_eq!(rows[2].values()[0], SqliteValue::Integer(3));
-        assert_eq!(rows[2].values()[1], SqliteValue::Text("gamma".to_owned()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("gamma".into()));
     }
 
     #[test]
@@ -67276,11 +66847,11 @@ mod pager_routing_tests {
         let rows = conn.query("SELECT id, value FROM t ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("omega".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("omega".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
         assert_eq!(rows[2].values()[0], SqliteValue::Integer(3));
-        assert_eq!(rows[2].values()[1], SqliteValue::Text("gamma".to_owned()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("gamma".into()));
     }
 
     #[test]
@@ -67391,7 +66962,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
     }
 
     #[test]
@@ -67443,9 +67014,9 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("left".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("left".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("right".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("right".into()));
 
         let db1 = rusqlite::Connection::open(&db1_path).unwrap();
         let persisted_rows: Vec<(i64, String)> = db1
@@ -67487,9 +67058,9 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("gamma".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("gamma".into()));
 
         let aux = rusqlite::Connection::open(&aux_path).unwrap();
         let persisted_rows: Vec<(i64, String)> = aux
@@ -67529,7 +67100,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("beta".into()));
 
         let aux = rusqlite::Connection::open(&aux_path).unwrap();
         let persisted_rows: Vec<(i64, String)> = aux
@@ -67570,7 +67141,7 @@ mod pager_routing_tests {
 
         conn.execute_prepared_with_params(
             &stmt,
-            &[SqliteValue::Integer(1), SqliteValue::Text("aux".to_owned())],
+            &[SqliteValue::Integer(1), SqliteValue::Text("aux".into())],
         )
         .unwrap();
 
@@ -67582,7 +67153,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(aux_rows.len(), 1);
         assert_eq!(aux_rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(aux_rows[0].values()[1], SqliteValue::Text("aux".to_owned()));
+        assert_eq!(aux_rows[0].values()[1], SqliteValue::Text("aux".into()));
     }
 
     #[test]
@@ -67614,10 +67185,7 @@ mod pager_routing_tests {
         let affected = conn
             .execute_prepared_with_params(
                 &stmt,
-                &[
-                    SqliteValue::Text("beta".to_owned()),
-                    SqliteValue::Integer(1),
-                ],
+                &[SqliteValue::Text("beta".into()), SqliteValue::Integer(1)],
             )
             .unwrap();
         assert_eq!(affected, 1);
@@ -67627,10 +67195,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(aux_rows.len(), 1);
         assert_eq!(aux_rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(
-            aux_rows[0].values()[1],
-            SqliteValue::Text("beta".to_owned())
-        );
+        assert_eq!(aux_rows[0].values()[1], SqliteValue::Text("beta".into()));
     }
 
     #[test]
@@ -67701,8 +67266,8 @@ mod pager_routing_tests {
         let rows = conn.query("PRAGMA index_info(idx_ab);").unwrap();
         assert_eq!(rows.len(), 2);
         // First column should be 'a', second 'b'
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("a".to_owned()));
-        assert_eq!(rows[1].values()[2], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("a".into()));
+        assert_eq!(rows[1].values()[2], SqliteValue::Text("b".into()));
     }
 
     #[test]
@@ -67742,8 +67307,8 @@ mod pager_routing_tests {
                 }
             })
             .collect();
-        assert!(names.contains(&"main".to_owned()));
-        assert!(names.contains(&"temp".to_owned()));
+        assert!(names.iter().any(|n| &**n == "main"));
+        assert!(names.iter().any(|n| &**n == "temp"));
     }
 
     #[test]
@@ -67764,11 +67329,11 @@ mod pager_routing_tests {
             })
             .collect();
         assert!(
-            names.contains(&"foo".to_owned()),
+            names.iter().any(|n| &**n == "foo"),
             "expected foo in {names:?}"
         );
         assert!(
-            names.contains(&"bar".to_owned()),
+            names.iter().any(|n| &**n == "bar"),
             "expected bar in {names:?}"
         );
     }
@@ -67793,12 +67358,12 @@ mod pager_routing_tests {
                 SqliteValue::Text(s) => s,
                 _ => continue,
             };
-            if name == "t1" {
-                assert_eq!(obj_type, "table", "t1 should be reported as table");
+            if &**name == "t1" {
+                assert_eq!(&**obj_type, "table", "t1 should be reported as table");
                 found_table = true;
             }
-            if name == "v1" {
-                assert_eq!(obj_type, "view", "v1 should be reported as view");
+            if &**name == "v1" {
+                assert_eq!(&**obj_type, "view", "v1 should be reported as view");
                 found_view = true;
             }
         }
@@ -67855,9 +67420,9 @@ mod pager_routing_tests {
                 }
             })
             .collect();
-        assert!(names.contains(&"BINARY".to_owned()));
-        assert!(names.contains(&"NOCASE".to_owned()));
-        assert!(names.contains(&"RTRIM".to_owned()));
+        assert!(names.iter().any(|n| &**n == "BINARY"));
+        assert!(names.iter().any(|n| &**n == "NOCASE"));
+        assert!(names.iter().any(|n| &**n == "RTRIM"));
     }
 
     #[test]
@@ -67870,8 +67435,8 @@ mod pager_routing_tests {
         assert_eq!(
             rows[0].values(),
             &[
-                SqliteValue::Text("STRASSE".to_owned()),
-                SqliteValue::Text("ı".to_owned()),
+                SqliteValue::Text("STRASSE".into()),
+                SqliteValue::Text("ı".into()),
             ],
         );
     }
@@ -67887,7 +67452,7 @@ mod pager_routing_tests {
             .unwrap()
             .into_iter()
             .filter_map(|row| match &row.values()[1] {
-                SqliteValue::Text(name) => Some(name.clone()),
+                SqliteValue::Text(name) => Some(name.to_string()),
                 _ => None,
             })
             .collect();
@@ -67907,9 +67472,9 @@ mod pager_routing_tests {
                 .map(|row| row.values()[0].clone())
                 .collect::<Vec<_>>(),
             vec![
-                SqliteValue::Text("ad".to_owned()),
-                SqliteValue::Text("ä".to_owned()),
-                SqliteValue::Text("af".to_owned()),
+                SqliteValue::Text("ad".into()),
+                SqliteValue::Text("ä".into()),
+                SqliteValue::Text("af".into()),
             ],
         );
 
@@ -67922,8 +67487,8 @@ mod pager_routing_tests {
                 .map(|row| row.values()[0].clone())
                 .collect::<Vec<_>>(),
             vec![
-                SqliteValue::Text("ad".to_owned()),
-                SqliteValue::Text("ä".to_owned()),
+                SqliteValue::Text("ad".into()),
+                SqliteValue::Text("ä".into()),
             ],
         );
     }
@@ -67950,9 +67515,9 @@ mod pager_routing_tests {
                 .map(|row| row.values()[0].clone())
                 .collect::<Vec<_>>(),
             vec![
-                SqliteValue::Text("ad".to_owned()),
-                SqliteValue::Text("ä".to_owned()),
-                SqliteValue::Text("af".to_owned()),
+                SqliteValue::Text("ad".into()),
+                SqliteValue::Text("ä".into()),
+                SqliteValue::Text("af".into()),
             ],
         );
     }
@@ -67984,7 +67549,7 @@ mod pager_routing_tests {
         let vals: Vec<&str> = rows
             .iter()
             .filter_map(|r| match r.values().first() {
-                Some(SqliteValue::Text(s)) => Some(s.as_str()),
+                Some(SqliteValue::Text(s)) => Some(&**s),
                 _ => None,
             })
             .collect();
@@ -68013,18 +67578,18 @@ mod pager_routing_tests {
         // IIF (3-arg)
         assert_eq!(
             q("SELECT IIF(1 > 0, 'yes', 'no');"),
-            SqliteValue::Text("yes".to_owned())
+            SqliteValue::Text("yes".into())
         );
         assert_eq!(
             q("SELECT IIF(0, 'yes', 'no');"),
-            SqliteValue::Text("no".to_owned())
+            SqliteValue::Text("no".into())
         );
 
         // CAST
         assert_eq!(q("SELECT CAST(3.14 AS INTEGER);"), SqliteValue::Integer(3));
         assert_eq!(
             q("SELECT TYPEOF(CAST(3.14 AS INTEGER));"),
-            SqliteValue::Text("integer".to_owned())
+            SqliteValue::Text("integer".into())
         );
 
         // IN operator
@@ -68042,37 +67607,34 @@ mod pager_routing_tests {
         // String functions
         assert_eq!(
             q("SELECT UPPER('hello');"),
-            SqliteValue::Text("HELLO".to_owned())
+            SqliteValue::Text("HELLO".into())
         );
         assert_eq!(
             q("SELECT LOWER('HELLO');"),
-            SqliteValue::Text("hello".to_owned())
+            SqliteValue::Text("hello".into())
         );
         assert_eq!(q("SELECT LENGTH('hello');"), SqliteValue::Integer(5));
         assert_eq!(
             q("SELECT SUBSTR('hello', 2, 3);"),
-            SqliteValue::Text("ell".to_owned())
+            SqliteValue::Text("ell".into())
         );
         assert_eq!(
             q("SELECT REPLACE('hello world', 'world', 'rust');"),
-            SqliteValue::Text("hello rust".to_owned())
+            SqliteValue::Text("hello rust".into())
         );
         assert_eq!(q("SELECT INSTR('hello', 'ell');"), SqliteValue::Integer(2));
         assert_eq!(
             q("SELECT TRIM('  hello  ');"),
-            SqliteValue::Text("hello".to_owned())
+            SqliteValue::Text("hello".into())
         );
 
         // QUOTE
         assert_eq!(
             q("SELECT QUOTE('hello');"),
-            SqliteValue::Text("'hello'".to_owned())
+            SqliteValue::Text("'hello'".into())
         );
-        assert_eq!(q("SELECT QUOTE(42);"), SqliteValue::Text("42".to_owned()));
-        assert_eq!(
-            q("SELECT QUOTE(NULL);"),
-            SqliteValue::Text("NULL".to_owned())
-        );
+        assert_eq!(q("SELECT QUOTE(42);"), SqliteValue::Text("42".into()));
+        assert_eq!(q("SELECT QUOTE(NULL);"), SqliteValue::Text("NULL".into()));
 
         // Scalar MIN/MAX (multi-arg)
         assert_eq!(q("SELECT MAX(1, 2, 3);"), SqliteValue::Integer(3));
@@ -68085,7 +67647,7 @@ mod pager_routing_tests {
         // HEX
         assert_eq!(
             q("SELECT HEX(X'48454C4C4F');"),
-            SqliteValue::Text("48454C4C4F".to_owned())
+            SqliteValue::Text("48454C4C4F".into())
         );
 
         // UNICODE
@@ -68118,8 +67680,8 @@ mod pager_routing_tests {
             .query("SELECT val FROM t1 ORDER BY id LIMIT 2 OFFSET 1;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("beta".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("gamma".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("beta".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("gamma".into()));
 
         // COUNT with WHERE
         let rows = conn
@@ -68144,9 +67706,9 @@ mod pager_routing_tests {
             .query("SELECT cat, SUM(val) AS s FROM t2 GROUP BY cat HAVING s > 3 ORDER BY cat;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("b".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(7));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("c".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("c".into()));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(5));
 
         // INSERT OR REPLACE
@@ -68156,10 +67718,7 @@ mod pager_routing_tests {
         conn.execute("INSERT OR REPLACE INTO t3 VALUES (1, 'replaced');")
             .unwrap();
         let rows = conn.query("SELECT val FROM t3 WHERE id = 1;").unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("replaced".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("replaced".into()));
 
         // DELETE with returning count
         let affected = conn.execute("DELETE FROM t2 WHERE cat = 'a';").unwrap();
@@ -68183,7 +67742,7 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT CASE WHEN val IS NULL THEN 'unknown' ELSE val END FROM t1 WHERE id = 4;")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("unknown".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("unknown".into()));
 
         // EXISTS subquery
         let rows = conn
@@ -68284,10 +67843,7 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("INSERT INTO defs (id) VALUES (1);").unwrap();
         let rows = conn.query("SELECT val FROM defs WHERE id = 1;").unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("default_val".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("default_val".into()));
 
         // UPSERT (INSERT ... ON CONFLICT)
         conn.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER);")
@@ -68337,11 +67893,8 @@ mod pager_routing_tests {
             .query("SELECT e.name, d.name FROM employees e INNER JOIN departments d ON e.dept_id = d.id ORDER BY e.id;")
             .unwrap();
         assert_eq!(rows.len(), 4);
-        assert_eq!(
-            rows[0].values()[1],
-            SqliteValue::Text("Engineering".to_owned())
-        );
-        assert_eq!(rows[2].values()[1], SqliteValue::Text("Sales".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("Engineering".into()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("Sales".into()));
 
         // LEFT JOIN with NULL
         conn.execute("INSERT INTO employees VALUES (5, 'Eve', 999, 80);")
@@ -68372,10 +67925,7 @@ mod pager_routing_tests {
             .query("SELECT d.name, SUM(e.salary) FROM employees e JOIN departments d ON e.dept_id = d.id GROUP BY d.name ORDER BY d.name;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("Engineering".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Engineering".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(220));
     }
 
@@ -68387,7 +67937,7 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO t VALUES (1, 'Alice');").unwrap();
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -68418,7 +67968,7 @@ mod pager_routing_tests {
         let SqliteValue::Text(message) = &rows[0].values()[0] else {
             panic!("integrity_check should return a text diagnostic row");
         };
-        assert_ne!(message, "ok");
+        assert_ne!(&**message, "ok");
         assert!(
             message.contains("invalid B-tree page type")
                 || message.contains("root page")
@@ -68474,7 +68024,7 @@ mod pager_routing_tests {
         let SqliteValue::Text(message) = &rows[0].values()[0] else {
             panic!("integrity_check should return a text diagnostic row");
         };
-        assert_ne!(message, "ok");
+        assert_ne!(&**message, "ok");
         assert!(
             message.contains("idx_t_name")
                 || message.contains("stale rowid")
@@ -68508,7 +68058,7 @@ mod pager_routing_tests {
         let SqliteValue::Text(message) = &rows[0].values()[0] else {
             panic!("integrity_check should return a text diagnostic row");
         };
-        assert_ne!(message, "ok");
+        assert_ne!(&**message, "ok");
         assert!(
             message.contains("freelist header claims"),
             "unexpected integrity_check diagnostic: {message}"
@@ -68525,7 +68075,7 @@ mod pager_routing_tests {
 
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -68548,7 +68098,7 @@ mod pager_routing_tests {
 
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -68594,7 +68144,7 @@ mod pager_routing_tests {
         conn.set_strict_mem_fallback_rejection(true);
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -68610,7 +68160,7 @@ mod pager_routing_tests {
 
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -68618,7 +68168,7 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA quick_check;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".into()));
     }
 
     #[test]
@@ -68634,7 +68184,7 @@ mod pager_routing_tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA encoding;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("UTF-8".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("UTF-8".into()));
     }
 
     /// Probe test: edge cases in type coercion, NULL handling, and expressions.
@@ -68646,11 +68196,11 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT typeof(1), typeof(1.5), typeof('hi'), typeof(NULL), typeof(X'AB');")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("real".to_owned()));
-        assert_eq!(rows[0].values()[2], SqliteValue::Text("text".to_owned()));
-        assert_eq!(rows[0].values()[3], SqliteValue::Text("null".to_owned()));
-        assert_eq!(rows[0].values()[4], SqliteValue::Text("blob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("real".into()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("text".into()));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("null".into()));
+        assert_eq!(rows[0].values()[4], SqliteValue::Text("blob".into()));
 
         // CAST conversions
         assert_eq!(
@@ -68663,7 +68213,7 @@ mod pager_routing_tests {
         );
         assert_eq!(
             conn.query("SELECT CAST(42 AS TEXT);").unwrap()[0].values()[0],
-            SqliteValue::Text("42".to_owned())
+            SqliteValue::Text("42".into())
         );
 
         // NULL propagation in arithmetic
@@ -68780,13 +68330,10 @@ mod pager_routing_tests {
             .query("SELECT c.name, p.name FROM items c INNER JOIN items p ON c.parent_id = p.id ORDER BY c.id;")
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("child1".to_owned()));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("root".to_owned()));
-        assert_eq!(
-            rows[2].values()[0],
-            SqliteValue::Text("grandchild".to_owned())
-        );
-        assert_eq!(rows[2].values()[1], SqliteValue::Text("child1".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("child1".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("root".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Text("grandchild".into()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("child1".into()));
 
         // Multi-column INSERT from SELECT
         conn.execute(
@@ -68810,17 +68357,14 @@ mod pager_routing_tests {
         let rows = conn.query("SELECT name FROM items WHERE id = 1;").unwrap();
         assert_eq!(
             rows[0].values()[0],
-            SqliteValue::Text("root_updated".to_owned())
+            SqliteValue::Text("root_updated".into())
         );
 
         // REPLACE (INSERT OR REPLACE)
         conn.execute("INSERT OR REPLACE INTO items VALUES (1, 'new_root', NULL);")
             .unwrap();
         let rows = conn.query("SELECT name FROM items WHERE id = 1;").unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("new_root".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new_root".into()));
     }
 
     /// Probe test: complex WHERE predicates and subqueries.
@@ -68848,10 +68392,10 @@ mod pager_routing_tests {
             .query("SELECT name FROM products WHERE price BETWEEN 10.0 AND 25.0 ORDER BY name;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Gadget".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Gadget".into()));
         assert_eq!(
             rows[1].values()[0],
-            SqliteValue::Text("Whatchamacallit".to_owned())
+            SqliteValue::Text("Whatchamacallit".into())
         );
 
         // IN list
@@ -68869,13 +68413,10 @@ mod pager_routing_tests {
         // Category A: avg = (9.99+5.99+14.99)/3 ≈ 10.32 → Whatchamacallit (14.99)
         // Category B: avg = (19.99+29.99)/2 = 24.99 → Thingamajig (29.99)
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("Thingamajig".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Thingamajig".into()));
         assert_eq!(
             rows[1].values()[0],
-            SqliteValue::Text("Whatchamacallit".to_owned())
+            SqliteValue::Text("Whatchamacallit".into())
         );
 
         // NOT IN subquery
@@ -68898,7 +68439,7 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT UPPER(SUBSTR('hello world', 1, 5));")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("HELLO".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("HELLO".into()));
 
         // Multiple ORDER BY columns
         let rows = conn
@@ -68909,12 +68450,9 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 5);
         assert_eq!(
             rows[0].values()[1],
-            SqliteValue::Text("Whatchamacallit".to_owned())
+            SqliteValue::Text("Whatchamacallit".into())
         );
-        assert_eq!(
-            rows[3].values()[1],
-            SqliteValue::Text("Thingamajig".to_owned())
-        );
+        assert_eq!(rows[3].values()[1], SqliteValue::Text("Thingamajig".into()));
     }
 
     /// Probe test: views, indexes, and schema operations.
@@ -68938,14 +68476,14 @@ mod pager_routing_tests {
             .query("SELECT * FROM v_high_scores ORDER BY name;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("Charlie".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Charlie".into()));
 
         // CREATE INDEX + verify it's used (just make sure no error)
         conn.execute("CREATE INDEX idx_score ON t(score);").unwrap();
         let rows = conn.query("SELECT name FROM t WHERE score = 85;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".into()));
 
         // UNIQUE INDEX + conflict
         conn.execute("CREATE UNIQUE INDEX idx_name ON t(name);")
@@ -68970,7 +68508,7 @@ mod pager_routing_tests {
         conn.execute("ALTER TABLE t ADD COLUMN grade TEXT DEFAULT 'N/A';")
             .unwrap();
         let rows = conn.query("SELECT grade FROM t WHERE id = 1;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("N/A".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("N/A".into()));
 
         // PRAGMA table_info
         let rows = conn.query("PRAGMA table_info(t);").unwrap();
@@ -68993,7 +68531,7 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("COMMIT;").unwrap();
         let rows = conn.query("SELECT val FROM t WHERE id = 1;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("updated".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("updated".into()));
 
         // Transaction rollback
         conn.execute("BEGIN;").unwrap();
@@ -69001,7 +68539,7 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("ROLLBACK;").unwrap();
         let rows = conn.query("SELECT val FROM t WHERE id = 1;").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("updated".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("updated".into()));
 
         // Savepoint + release
         conn.execute("BEGIN;").unwrap();
@@ -69077,7 +68615,7 @@ mod pager_routing_tests {
             .query("SELECT s.name, SUM(sa.amount) FROM stores s JOIN sales sa ON s.id = sa.store_id GROUP BY s.name ORDER BY s.name;")
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("StoreA".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("StoreA".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(300));
         assert_eq!(rows[2].values()[1], SqliteValue::Integer(300));
 
@@ -69094,9 +68632,9 @@ mod pager_routing_tests {
             .query("SELECT r.name, COUNT(*) FROM regions r JOIN stores s ON r.id = s.region_id JOIN sales sa ON s.id = sa.store_id GROUP BY r.name ORDER BY r.name;")
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("North".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("North".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(3)); // 3 sales in North
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("South".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("South".into()));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(1)); // 1 sale in South
     }
 
@@ -69208,7 +68746,7 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT name, score FROM defaults_test WHERE id = 1;")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("unnamed".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("unnamed".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(0));
 
         // UPDATE with CASE expression
@@ -69227,9 +68765,9 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT id, grade FROM grading ORDER BY id;")
             .unwrap();
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("A".to_owned()));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("B".to_owned()));
-        assert_eq!(rows[2].values()[1], SqliteValue::Text("C".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("A".into()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("B".into()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("C".into()));
 
         // UPDATE with subquery
         conn.execute("CREATE TABLE config (key TEXT PRIMARY KEY, val TEXT);")
@@ -69268,7 +68806,7 @@ mod pager_routing_tests {
             conn.query("SELECT REPLACE('hello world', 'world', 'rust');")
                 .unwrap()[0]
                 .values()[0],
-            SqliteValue::Text("hello rust".to_owned())
+            SqliteValue::Text("hello rust".into())
         );
 
         // INSTR
@@ -69284,33 +68822,30 @@ mod pager_routing_tests {
         // LTRIM / RTRIM / TRIM
         assert_eq!(
             conn.query("SELECT LTRIM('  hello  ');").unwrap()[0].values()[0],
-            SqliteValue::Text("hello  ".to_owned())
+            SqliteValue::Text("hello  ".into())
         );
         assert_eq!(
             conn.query("SELECT RTRIM('  hello  ');").unwrap()[0].values()[0],
-            SqliteValue::Text("  hello".to_owned())
+            SqliteValue::Text("  hello".into())
         );
         assert_eq!(
             conn.query("SELECT TRIM('  hello  ');").unwrap()[0].values()[0],
-            SqliteValue::Text("hello".to_owned())
+            SqliteValue::Text("hello".into())
         );
 
         // HEX / UNHEX
         assert_eq!(
             conn.query("SELECT HEX('ABC');").unwrap()[0].values()[0],
-            SqliteValue::Text("414243".to_owned())
+            SqliteValue::Text("414243".into())
         );
 
         // ZEROBLOB
         let rows = conn.query("SELECT typeof(ZEROBLOB(4));").unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("blob".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("blob".into()));
 
         // PRINTF / FORMAT
         let rows = conn.query("SELECT PRINTF('%d items', 42);").unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("42 items".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("42 items".into()));
 
         // GROUP_CONCAT with ORDER BY (via CTE)
         conn.execute("CREATE TABLE words (id INTEGER PRIMARY KEY, word TEXT);")
@@ -69434,7 +68969,7 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 3);
         // c: 16, b: 15, a: 15
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("c".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("c".into()));
     }
 
     #[test]
@@ -69450,9 +68985,9 @@ mod pager_routing_tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("F".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("F".into()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[0], SqliteValue::Text("V".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("V".into()));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(1));
     }
 
@@ -69469,7 +69004,7 @@ mod pager_routing_tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".into()));
     }
 
     /// Probe deeper SQL patterns against C SQLite to find execution gaps.
@@ -93367,8 +92902,8 @@ mod pager_routing_tests {
             .execute_with_params(
                 "UPDATE child SET val = ?1, extra = ?2 WHERE id = ?3",
                 &[
-                    SqliteValue::Text("world".to_owned()),
-                    SqliteValue::Text("extra_val".to_owned()),
+                    SqliteValue::Text("world".into()),
+                    SqliteValue::Text("extra_val".into()),
                     SqliteValue::Integer(1),
                 ],
             )
@@ -93379,11 +92914,8 @@ mod pager_routing_tests {
             .query("SELECT val, extra FROM child WHERE id = 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("world".to_owned()));
-        assert_eq!(
-            rows[0].values()[1],
-            SqliteValue::Text("extra_val".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("world".into()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("extra_val".into()));
     }
 
     /// Regression test for issue #24: UPDATE on parent table with FK enforcement
@@ -93423,8 +92955,8 @@ mod pager_routing_tests {
         conn.execute_with_params(
             "UPDATE parent SET name = ?1 WHERE id = ?2",
             &[
-                SqliteValue::Text("updated".to_owned()),
-                SqliteValue::Text("p1".to_owned()),
+                SqliteValue::Text("updated".into()),
+                SqliteValue::Text("p1".into()),
             ],
         )
         .expect("UPDATE non-PK column should succeed");
@@ -93443,7 +92975,7 @@ mod pager_routing_tests {
         let rows = conn
             .query("SELECT name FROM parent WHERE id = 'p1';")
             .unwrap();
-        assert_eq!(rows[0].values()[0], SqliteValue::Text("updated".to_owned()));
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("updated".into()));
     }
 
     /// Regression test for issue #24 with INTEGER PRIMARY KEY parent table.
