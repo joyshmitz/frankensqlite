@@ -1605,7 +1605,7 @@ mod tests {
             name: "MAX".to_owned(),
             args: vec![
                 RebaseExpr::ColumnRef(col),
-                RebaseExpr::Literal(SqliteValue::Text("hello".to_owned())),
+                RebaseExpr::Literal(SqliteValue::Text("hello".into())),
             ],
         };
         assert!(!is_join_max_int_update(col, &expr5));

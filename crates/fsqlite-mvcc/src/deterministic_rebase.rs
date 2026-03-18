@@ -847,10 +847,7 @@ mod tests {
         let mut rows = HashMap::new();
         rows.insert(
             (1, 1),
-            record_bytes(&[
-                SqliteValue::Integer(1),
-                SqliteValue::Text("hello".to_owned()),
-            ]),
+            record_bytes(&[SqliteValue::Integer(1), SqliteValue::Text("hello".into())]),
         );
         let reader = MemBaseReader { rows };
 
@@ -897,7 +894,7 @@ mod tests {
             (1, 1),
             record_bytes(&[
                 SqliteValue::Integer(1),
-                SqliteValue::Text("new_base".to_owned()),
+                SqliteValue::Text("new_base".into()),
             ]),
         );
         let reader = MemBaseReader { rows };
@@ -931,7 +928,7 @@ mod tests {
         // SET col1 = 'updated'.
         let column_updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("updated".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("updated".into())),
         )];
 
         let result = replay_update_expression(
@@ -964,7 +961,7 @@ mod tests {
             let parsed = parse_record(key).unwrap();
             assert_eq!(
                 parsed[0],
-                SqliteValue::Text("updated".to_owned()),
+                SqliteValue::Text("updated".into()),
                 "bead_id={BEAD_ID} key_from_new_base"
             );
         }
@@ -998,7 +995,7 @@ mod tests {
             (1, 1),
             record_bytes(&[
                 SqliteValue::Integer(1),
-                SqliteValue::Text("original".to_owned()),
+                SqliteValue::Text("original".into()),
             ]),
         );
         let reader = MemBaseReader { rows };
@@ -1034,7 +1031,7 @@ mod tests {
             &index_def,
             &[
                 SqliteValue::Integer(1),
-                SqliteValue::Text("conflict_value".to_owned()),
+                SqliteValue::Text("conflict_value".into()),
             ],
         )
         .unwrap();
@@ -1045,7 +1042,7 @@ mod tests {
 
         let column_updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("conflict_value".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("conflict_value".into())),
         )];
 
         let result = replay_update_expression(

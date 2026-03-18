@@ -874,9 +874,9 @@ mod tests {
     #[test]
     fn test_index_regen_ordinary_index_key_change() {
         let base = record_bytes(&[
-            SqliteValue::Integer(1),             // col 0: id
-            SqliteValue::Text("old".to_owned()), // col 1: name (indexed)
-            SqliteValue::Integer(42),            // col 2: value
+            SqliteValue::Integer(1),         // col 0: id
+            SqliteValue::Text("old".into()), // col 1: name (indexed)
+            SqliteValue::Integer(42),        // col 2: value
         ]);
 
         let indexes = vec![ordinary_index(
@@ -893,7 +893,7 @@ mod tests {
 
         let updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("new".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("new".into())),
         )];
 
         let result =
@@ -957,7 +957,7 @@ mod tests {
         let base = record_bytes(&[
             SqliteValue::Integer(1),
             SqliteValue::Integer(5),
-            SqliteValue::Text("foo".to_owned()),
+            SqliteValue::Text("foo".into()),
         ]);
 
         // Partial index on col1 where col1 (truthy = non-zero).
@@ -981,7 +981,7 @@ mod tests {
         // Update col2 (name), NOT col1 (the indexed column).
         let updates = vec![(
             ColumnIdx::new(2),
-            RebaseExpr::Literal(SqliteValue::Text("bar".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("bar".into())),
         )];
 
         let result =
@@ -1008,10 +1008,7 @@ mod tests {
             }
         }
 
-        let base = record_bytes(&[
-            SqliteValue::Integer(1),
-            SqliteValue::Text("alpha".to_owned()),
-        ]);
+        let base = record_bytes(&[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())]);
 
         let indexes = vec![ordinary_index(
             40,
@@ -1023,7 +1020,7 @@ mod tests {
 
         let updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("beta".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("beta".into())),
         )];
 
         let result =
@@ -1049,10 +1046,7 @@ mod tests {
     // Test 5: Expression index produces correct key.
     #[test]
     fn test_index_regen_expression_index() {
-        let base = record_bytes(&[
-            SqliteValue::Integer(1),
-            SqliteValue::Text("Hello".to_owned()),
-        ]);
+        let base = record_bytes(&[SqliteValue::Integer(1), SqliteValue::Text("Hello".into())]);
 
         // Expression index: lower(col1).
         let indexes = vec![IndexDef {
@@ -1074,7 +1068,7 @@ mod tests {
         // Update col1 from "Hello" to "World".
         let updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("World".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("World".into())),
         )];
 
         let result =
@@ -1091,7 +1085,7 @@ mod tests {
             let parsed = parse_record(key).unwrap();
             assert_eq!(
                 parsed,
-                vec![SqliteValue::Text("hello".to_owned())],
+                vec![SqliteValue::Text("hello".into())],
                 "bead_id={BEAD_ID} old_key_lower"
             );
         } else {
@@ -1102,7 +1096,7 @@ mod tests {
             let parsed = parse_record(key).unwrap();
             assert_eq!(
                 parsed,
-                vec![SqliteValue::Text("world".to_owned())],
+                vec![SqliteValue::Text("world".into())],
                 "bead_id={BEAD_ID} new_key_lower"
             );
         } else {
@@ -1114,7 +1108,7 @@ mod tests {
     #[test]
     fn test_index_regen_no_op_when_key_unchanged() {
         // col0=id (indexed), col1=name (updated but not indexed).
-        let base = record_bytes(&[SqliteValue::Integer(1), SqliteValue::Text("foo".to_owned())]);
+        let base = record_bytes(&[SqliteValue::Integer(1), SqliteValue::Text("foo".into())]);
 
         let indexes = vec![ordinary_index(
             60,
@@ -1127,7 +1121,7 @@ mod tests {
         // Update col1 (not indexed).
         let updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("bar".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("bar".into())),
         )];
 
         let result =
@@ -1142,7 +1136,7 @@ mod tests {
     fn test_index_regen_multiple_indexes_same_table() {
         let base = record_bytes(&[
             SqliteValue::Integer(1),
-            SqliteValue::Text("alice".to_owned()),
+            SqliteValue::Text("alice".into()),
             SqliteValue::Integer(30),
         ]);
 
@@ -1161,7 +1155,7 @@ mod tests {
         let updates = vec![
             (
                 ColumnIdx::new(1),
-                RebaseExpr::Literal(SqliteValue::Text("bob".to_owned())),
+                RebaseExpr::Literal(SqliteValue::Text("bob".into())),
             ),
             (
                 ColumnIdx::new(2),
@@ -1199,7 +1193,7 @@ mod tests {
         let large_text = "x".repeat(4000);
         let base = record_bytes(&[
             SqliteValue::Integer(1),
-            SqliteValue::Text(large_text.clone()),
+            SqliteValue::Text(large_text.clone().into()),
         ]);
 
         let indexes = vec![ordinary_index(
@@ -1213,7 +1207,7 @@ mod tests {
         let new_large_text = "y".repeat(4000);
         let updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text(new_large_text.clone())),
+            RebaseExpr::Literal(SqliteValue::Text(new_large_text.clone().into())),
         )];
 
         let result =
@@ -1225,11 +1219,11 @@ mod tests {
         // Verify keys encode the large values correctly.
         if let IntentOpKind::IndexDelete { key, .. } = &result.ops[0] {
             let parsed = parse_record(key).unwrap();
-            assert_eq!(parsed[0], SqliteValue::Text(large_text));
+            assert_eq!(parsed[0], SqliteValue::Text(large_text.into()));
         }
         if let IntentOpKind::IndexInsert { key, .. } = &result.ops[1] {
             let parsed = parse_record(key).unwrap();
-            assert_eq!(parsed[0], SqliteValue::Text(new_large_text));
+            assert_eq!(parsed[0], SqliteValue::Text(new_large_text.into()));
         }
     }
 
@@ -1316,10 +1310,7 @@ mod tests {
     // Test 11: NOCASE collation normalizes keys.
     #[test]
     fn test_nocase_collation_key_normalization() {
-        let base = record_bytes(&[
-            SqliteValue::Integer(1),
-            SqliteValue::Text("hello".to_owned()),
-        ]);
+        let base = record_bytes(&[SqliteValue::Integer(1), SqliteValue::Text("hello".into())]);
 
         let indexes = vec![IndexDef {
             index_id: IndexId::new(100),
@@ -1336,7 +1327,7 @@ mod tests {
         // Update from "hello" to "HELLO" — NOCASE means these are the SAME key.
         let updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("HELLO".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("HELLO".into())),
         )];
 
         let result =
@@ -1431,10 +1422,7 @@ mod tests {
     // Test: UNIQUE index with no conflict passes.
     #[test]
     fn test_index_regen_unique_no_conflict() {
-        let base = record_bytes(&[
-            SqliteValue::Integer(1),
-            SqliteValue::Text("alpha".to_owned()),
-        ]);
+        let base = record_bytes(&[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())]);
 
         let indexes = vec![ordinary_index(
             120,
@@ -1446,7 +1434,7 @@ mod tests {
 
         let updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("beta".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("beta".into())),
         )];
 
         let result =
@@ -1461,7 +1449,7 @@ mod tests {
     fn test_apply_column_updates() {
         let base = vec![
             SqliteValue::Integer(1),
-            SqliteValue::Text("old".to_owned()),
+            SqliteValue::Text("old".into()),
             SqliteValue::Float(3.125),
         ];
         let affinities = vec![
@@ -1473,7 +1461,7 @@ mod tests {
         let updates = vec![
             (
                 ColumnIdx::new(1),
-                RebaseExpr::Literal(SqliteValue::Text("new".to_owned())),
+                RebaseExpr::Literal(SqliteValue::Text("new".into())),
             ),
             (
                 ColumnIdx::new(2),
@@ -1483,7 +1471,7 @@ mod tests {
 
         let result = apply_column_updates(&base, &updates, &affinities).unwrap();
         assert_eq!(result[0], SqliteValue::Integer(1));
-        assert_eq!(result[1], SqliteValue::Text("new".to_owned()));
+        assert_eq!(result[1], SqliteValue::Text("new".into()));
         assert_eq!(result[2], SqliteValue::Float(2.72));
     }
 
@@ -1518,7 +1506,7 @@ mod tests {
     fn test_composite_index_key() {
         let base = record_bytes(&[
             SqliteValue::Integer(1),
-            SqliteValue::Text("alice".to_owned()),
+            SqliteValue::Text("alice".into()),
             SqliteValue::Integer(30),
         ]);
 
@@ -1563,7 +1551,7 @@ mod tests {
         if let IntentOpKind::IndexInsert { key, .. } = &result.ops[1] {
             let parsed = parse_record(key).unwrap();
             assert_eq!(parsed.len(), 2, "bead_id={BEAD_ID} composite_2_cols");
-            assert_eq!(parsed[0], SqliteValue::Text("alice".to_owned()));
+            assert_eq!(parsed[0], SqliteValue::Text("alice".into()));
             assert_eq!(parsed[1], SqliteValue::Integer(40));
         } else {
             panic!("bead_id={BEAD_ID} expected insert");
@@ -1592,10 +1580,7 @@ mod tests {
             }
         }
 
-        let base = record_bytes(&[
-            SqliteValue::Integer(1),
-            SqliteValue::Text("alice".to_owned()),
-        ]);
+        let base = record_bytes(&[SqliteValue::Integer(1), SqliteValue::Text("alice".into())]);
 
         let indexes = vec![ordinary_index(
             150,
@@ -1607,13 +1592,13 @@ mod tests {
 
         let updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("bob".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("bob".into())),
         )];
 
         // Pre-populate: "bob" key already exists for rowid 42.
         let new_key = compute_index_key(
             &indexes[0],
-            &[SqliteValue::Integer(1), SqliteValue::Text("bob".to_owned())],
+            &[SqliteValue::Integer(1), SqliteValue::Text("bob".into())],
         )
         .unwrap();
         let mut entries = BTreeMap::new();

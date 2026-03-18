@@ -18,17 +18,17 @@ crossbeam-epoch = { workspace = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-observability = { workspace = true }
-fsqlite-pager = { workspace = true }
-fsqlite-wal = { workspace = true }
+fsqlite-pager = { version = "0.1.1", path = "../fsqlite-pager", default-features = false }
+fsqlite-wal = { version = "0.1.1", path = "../fsqlite-wal", default-features = false }
 smallvec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 serde_json.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 nix = { workspace = true }
-parking_lot = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
