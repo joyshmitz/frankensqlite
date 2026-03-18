@@ -18882,12 +18882,7 @@ impl Connection {
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
         for (key, row_values) in keyed_rows {
             if let Some(last_group) = groups.last_mut() {
-                if group_keys_equal_collated(
-                    &last_group.0,
-                    &key,
-                    &group_collations,
-                    self.collation_registry.as_ref(),
-                ) {
+                if group_keys_equal_collated(&last_group.0, &key, &group_collations, &coll_snap) {
                     last_group.1.push(row_values);
                     continue;
                 }
@@ -19025,12 +19020,12 @@ impl Connection {
                             });
                             if *distinct {
                                 let coll = collation.as_deref();
-                                let cr = &self.collation_registry;
                                 let mut seen = Vec::new();
                                 entries.retain(|e| {
                                     let dup = seen.iter().any(|s: &SqliteValue| {
-                                        cmp_sqlite_values_collated(s, &e.0, coll, cr)
-                                            == std::cmp::Ordering::Equal
+                                        cmp_sqlite_values_collated_snapshot(
+                                            s, &e.0, coll, &coll_snap,
+                                        ) == std::cmp::Ordering::Equal
                                     });
                                     if !dup {
                                         seen.push(e.0.clone());
@@ -19717,16 +19712,27 @@ impl Connection {
                 let val = self.eval_expr_with_subqueries(e, row, col_map, params)?;
                 let lo = self.eval_expr_with_subqueries(low, row, col_map, params)?;
                 let hi = self.eval_expr_with_subqueries(high, row, col_map, params)?;
-                if val.is_null() || lo.is_null() || hi.is_null() {
-                    return Ok(SqliteValue::Null);
-                }
-                let in_range = cmp_values(&val, &lo) != std::cmp::Ordering::Less
-                    && cmp_values(&val, &hi) != std::cmp::Ordering::Greater;
-                Ok(SqliteValue::Integer(i64::from(if *not {
-                    !in_range
+                // Three-valued BETWEEN: `x BETWEEN y AND z` ≡ `x >= y AND x <= z`.
+                // NULL propagates per comparison, then through AND.
+                // Crucially, `FALSE AND NULL = FALSE` (short-circuit), so
+                // `5 BETWEEN 10 AND NULL` is FALSE, not NULL.
+                let ge_low = if val.is_null() || lo.is_null() {
+                    None
                 } else {
-                    in_range
-                })))
+                    Some(cmp_values(&val, &lo) != std::cmp::Ordering::Less)
+                };
+                let le_high = if val.is_null() || hi.is_null() {
+                    None
+                } else {
+                    Some(cmp_values(&val, &hi) != std::cmp::Ordering::Greater)
+                };
+                match (ge_low, le_high) {
+                    (Some(false), _) | (_, Some(false)) => {
+                        Ok(SqliteValue::Integer(i64::from(*not)))
+                    }
+                    (Some(true), Some(true)) => Ok(SqliteValue::Integer(i64::from(!*not))),
+                    _ => Ok(SqliteValue::Null),
+                }
             }
             Expr::In {
                 expr: e,
@@ -20181,12 +20187,7 @@ impl Connection {
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
         for (key, row_values) in keyed_rows {
             if let Some(last_group) = groups.last_mut() {
-                if group_keys_equal_collated(
-                    &last_group.0,
-                    &key,
-                    &group_collations,
-                    self.collation_registry.as_ref(),
-                ) {
+                if group_keys_equal_collated(&last_group.0, &key, &group_collations, &coll_snap) {
                     last_group.1.push(row_values);
                     continue;
                 }
@@ -20321,12 +20322,12 @@ impl Connection {
                             });
                             if *distinct {
                                 let coll = collation.as_deref();
-                                let cr = &self.collation_registry;
                                 let mut seen = Vec::new();
                                 entries.retain(|e| {
                                     let dup = seen.iter().any(|s: &SqliteValue| {
-                                        cmp_sqlite_values_collated(s, &e.0, coll, cr)
-                                            == std::cmp::Ordering::Equal
+                                        cmp_sqlite_values_collated_snapshot(
+                                            s, &e.0, coll, &coll_snap,
+                                        ) == std::cmp::Ordering::Equal
                                     });
                                     if !dup {
                                         seen.push(e.0.clone());
@@ -30949,8 +30950,7 @@ fn dedup_values_collated(
     let mut seen: Vec<&SqliteValue> = Vec::new();
     values.retain(|v| {
         let already = seen.iter().any(|s| {
-            cmp_sqlite_values_collated_snapshot(v, s, collation, &snap)
-                == std::cmp::Ordering::Equal
+            cmp_sqlite_values_collated_snapshot(v, s, collation, &snap) == std::cmp::Ordering::Equal
         });
         if already {
             false
