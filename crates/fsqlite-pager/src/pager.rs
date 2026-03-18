@@ -3030,12 +3030,18 @@ where
                 inner.writer_active = false;
             }
         } else {
-            // Return unused lease pages to the freelist.
-            inner.freelist.append(&mut self.page_lease);
             // Restore pages allocated from the freelist.
             return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
 
             if self.is_writer && self.mode != TransactionMode::Concurrent {
+                // Non-concurrent: next_page will be reset below, so lease
+                // pages (which were EOF allocations) will be re-issued
+                // naturally by future transactions. Just drop them — putting
+                // them on the freelist would create sparse page holes since
+                // the freelist consumer could pick a high page number while
+                // next_page restarts from db_size+1.
+                self.page_lease.clear();
+
                 inner.db_size = self.original_db_size;
 
                 // Reset next_page to avoid holes if we allocated pages that are now discarded.
@@ -3049,14 +3055,17 @@ where
 
                 inner.writer_active = false;
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
-                // Aborted EOF allocations must return to the in-memory freelist
-                // even if they lie beyond the current db_size. Otherwise
-                // next_page skips over them permanently and a later commit can
-                // grow page_count past those holes, yielding "Page N: never
-                // used" corruption. The durable freelist serialized into page
-                // 1 filters those EOF-only pages back out, because SQLite
-                // forbids freelist entries beyond db_size.
+                // Concurrent: next_page is NOT reset, so lease pages and
+                // aborted EOF allocations must return to the in-memory
+                // freelist. Otherwise next_page skips over them permanently
+                // and a later commit can grow page_count past those holes,
+                // yielding "Page N: never used" corruption.
+                inner.freelist.append(&mut self.page_lease);
                 return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+            } else {
+                // Read-only transaction: lease should be empty (only writers
+                // allocate pages), but clear defensively.
+                self.page_lease.clear();
             }
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
@@ -3183,11 +3192,14 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
             return;
         }
         if let Ok(mut inner) = self.inner.lock() {
-            // Return unused lease pages and restore freelist allocations.
-            inner.freelist.append(&mut self.page_lease);
+            // Restore freelist allocations.
             return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
 
             if self.is_writer && self.mode != TransactionMode::Concurrent {
+                // Non-concurrent: next_page will be reset, so lease pages
+                // are re-issued naturally. Just drop them to avoid holes.
+                self.page_lease.clear();
+
                 inner.db_size = self.original_db_size;
 
                 // Reset next_page to avoid holes if we allocated pages that are now discarded.
@@ -3201,7 +3213,13 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
 
                 inner.writer_active = false;
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
+                // Concurrent: next_page stays advanced, so return lease
+                // pages and EOF allocations to the freelist.
+                inner.freelist.append(&mut self.page_lease);
                 return_pages_to_freelist(&mut inner.freelist, self.allocated_from_eof.drain(..));
+            } else {
+                // Read-only: lease should be empty, clear defensively.
+                self.page_lease.clear();
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             let preserve_level =
