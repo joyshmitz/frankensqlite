@@ -46,7 +46,7 @@ fn query_first_float(conn: &Connection, sql: &str) -> f64 {
 
 fn query_first_text(conn: &Connection, sql: &str) -> String {
     match &conn.query(sql).expect("query")[0].values()[0] {
-        SqliteValue::Text(v) => v.clone(),
+        SqliteValue::Text(v) => v.to_string(),
         other => panic!("expected text, got {other:?}"),
     }
 }
@@ -72,7 +72,7 @@ impl ScalarFunction for DoubleFunc {
             SqliteValue::Integer(v) => Ok(SqliteValue::Integer(v * 2)),
             SqliteValue::Float(v) => Ok(SqliteValue::Float(v * 2.0)),
             SqliteValue::Null => Ok(SqliteValue::Null),
-            other => Ok(SqliteValue::Text(format!("double({other:?})"))),
+            other => Ok(SqliteValue::Text(format!("double({other:?})").into())),
         }
     }
 
@@ -173,7 +173,7 @@ impl ScalarFunction for ConcatAllFunc {
                 SqliteValue::Blob(b) => result.push_str(&format!("[{}b]", b.len())),
             }
         }
-        Ok(SqliteValue::Text(result))
+        Ok(SqliteValue::Text(result.into()))
     }
 
     fn num_args(&self) -> i32 {
@@ -238,7 +238,7 @@ impl AggregateFunction for StringConcatAgg {
     }
 
     fn finalize(&self, state: Self::State) -> fsqlite_error::Result<SqliteValue> {
-        Ok(SqliteValue::Text(state))
+        Ok(SqliteValue::Text(state.into()))
     }
 
     fn num_args(&self) -> i32 {

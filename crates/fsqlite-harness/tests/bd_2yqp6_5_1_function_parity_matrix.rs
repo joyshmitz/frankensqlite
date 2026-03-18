@@ -137,7 +137,7 @@ fn format_sqlite_value(v: &SqliteValue) -> String {
         SqliteValue::Null => "NULL".to_string(),
         SqliteValue::Integer(i) => i.to_string(),
         SqliteValue::Float(f) => format_float(*f),
-        SqliteValue::Text(s) => s.clone(),
+        SqliteValue::Text(s) => s.to_string(),
         SqliteValue::Blob(b) => format!("x'{}'", hex_encode(b)),
     }
 }
@@ -1562,7 +1562,7 @@ fn test_sqlite_meta_functions() {
     // sqlite_version() should return a version string
     let rows = conn.query("SELECT sqlite_version()").unwrap();
     let version = match &rows[0].values()[0] {
-        SqliteValue::Text(s) => s.clone(),
+        SqliteValue::Text(s) => s.to_string(),
         other => panic!("expected text, got {other:?}"),
     };
     assert!(

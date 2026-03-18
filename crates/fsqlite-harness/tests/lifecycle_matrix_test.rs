@@ -56,7 +56,7 @@ fn read_val(conn: &Connection, id: i64) -> Option<String> {
         None
     } else {
         match rows[0].get(0).unwrap() {
-            SqliteValue::Text(s) => Some(s.clone()),
+            SqliteValue::Text(s) => Some(s.to_string()),
             SqliteValue::Null => None,
             other => panic!("expected text, got {other:?}"),
         }

@@ -53,7 +53,7 @@ fn query_first_int(conn: &Connection, sql: &str) -> i64 {
 
 fn _query_first_text(conn: &Connection, sql: &str) -> String {
     match &conn.query(sql).expect("query")[0].values()[0] {
-        SqliteValue::Text(v) => v.clone(),
+        SqliteValue::Text(v) => v.to_string(),
         _ => panic!("expected text"),
     }
 }
@@ -132,7 +132,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT x'DEADBEEF';",
             expected_opcodes: vec!["Blob"],
-            validate: |_, rows| matches!(&rows[0][0], SqliteValue::Blob(b) if b == &[0xDE, 0xAD, 0xBE, 0xEF]),
+            validate: |_, rows| matches!(&rows[0][0], SqliteValue::Blob(b) if &**b == &[0xDE, 0xAD, 0xBE, 0xEF]),
         },
         // ── Arithmetic ───────────────────────────────────────────
         OpcodeTest {
@@ -403,7 +403,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
                 let names: HashSet<String> = rows
                     .iter()
                     .filter_map(|r| match &r[0] {
-                        SqliteValue::Text(t) => Some(t.clone()),
+                        SqliteValue::Text(t) => Some(t.to_string()),
                         _ => None,
                     })
                     .collect();
@@ -1378,7 +1378,7 @@ fn test_parameterized_queries() {
     let names: Vec<String> = rows
         .iter()
         .filter_map(|r| match &r.values()[0] {
-            SqliteValue::Text(t) => Some(t.clone()),
+            SqliteValue::Text(t) => Some(t.to_string()),
             _ => None,
         })
         .collect();
@@ -1403,7 +1403,7 @@ fn test_parameterized_queries() {
     let names3: Vec<String> = rows3
         .iter()
         .filter_map(|r| match &r.values()[0] {
-            SqliteValue::Text(t) => Some(t.clone()),
+            SqliteValue::Text(t) => Some(t.to_string()),
             _ => None,
         })
         .collect();

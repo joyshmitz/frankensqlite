@@ -976,11 +976,7 @@ mod function_tests {
         ];
         for (val, expected) in &cases {
             let result = typeof_fn.invoke(std::slice::from_ref(val)).unwrap();
-            diag_assert_eq!(
-                ctx.clone(),
-                result,
-                SqliteValue::Text((*expected).to_string())
-            );
+            diag_assert_eq!(ctx.clone(), result, SqliteValue::Text((*expected).into()));
         }
     }
 

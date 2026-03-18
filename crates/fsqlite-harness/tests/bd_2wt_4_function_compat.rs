@@ -90,7 +90,7 @@ fn format_sqlite_value(v: &SqliteValue) -> String {
         SqliteValue::Null => "NULL".to_string(),
         SqliteValue::Integer(i) => i.to_string(),
         SqliteValue::Float(f) => format_float(*f),
-        SqliteValue::Text(s) => s.clone(),
+        SqliteValue::Text(s) => s.to_string(),
         SqliteValue::Blob(b) => format!("x'{}'", hex_encode(b)),
     }
 }

@@ -399,7 +399,7 @@ fn large_blob_overflow_pages_round_trip() {
             .expect("ddl");
         conn.execute_with_params(
             "INSERT INTO t1 VALUES (1, ?)",
-            &[SqliteValue::Blob(large_blob.clone())],
+            &[SqliteValue::Blob(large_blob.clone().into())],
         )
         .expect("insert blob");
     }
@@ -417,7 +417,11 @@ fn large_blob_overflow_pages_round_trip() {
                 large_blob.len(),
                 "bead_id={BEAD_ID} case=overflow_size"
             );
-            assert_eq!(data, &large_blob, "bead_id={BEAD_ID} case=overflow_content");
+            assert_eq!(
+                &**data,
+                &large_blob[..],
+                "bead_id={BEAD_ID} case=overflow_content"
+            );
         } else {
             panic!("bead_id={BEAD_ID} case=overflow_type expected Blob, got {retrieved:?}");
         }
@@ -436,7 +440,7 @@ fn large_text_payload_round_trip() {
             .expect("ddl");
         conn.execute_with_params(
             "INSERT INTO t1 VALUES (1, ?)",
-            &[SqliteValue::Text(large_text.clone())],
+            &[SqliteValue::Text(large_text.clone().into())],
         )
         .expect("insert text");
     }
@@ -446,7 +450,7 @@ fn large_text_payload_round_trip() {
         let rows = conn.query("SELECT txt FROM t1").expect("query");
         assert_eq!(
             rows[0].get(0).unwrap(),
-            &SqliteValue::Text(large_text),
+            &SqliteValue::Text(large_text.into()),
             "bead_id={BEAD_ID} case=large_text_content"
         );
     }
@@ -847,7 +851,7 @@ fn aggregation_over_persisted_data() {
             conn.execute_with_params(
                 "INSERT INTO scores VALUES (?, ?)",
                 &[
-                    SqliteValue::Text((*name).to_owned()),
+                    SqliteValue::Text((*name).into()),
                     SqliteValue::Integer(i64::from(*score)),
                 ],
             )

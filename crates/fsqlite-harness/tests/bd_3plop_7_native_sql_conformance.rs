@@ -82,7 +82,7 @@ fn query_int(conn: &Connection, sql: &str) -> i64 {
 fn query_text(conn: &Connection, sql: &str) -> String {
     match conn.query_row(sql) {
         Ok(row) => match row.get(0) {
-            Some(SqliteValue::Text(s)) => s.clone(),
+            Some(SqliteValue::Text(s)) => s.to_string(),
             other => panic!("expected text, got {other:?} for: {sql}"),
         },
         Err(e) => panic!("query_row failed for '{sql}': {e}"),
@@ -256,11 +256,11 @@ fn core_sql_tests() -> Vec<ConformanceResult> {
             .iter()
             .map(|r| {
                 let name = match r.get(0) {
-                    Some(SqliteValue::Text(s)) => s.clone(),
+                    Some(SqliteValue::Text(s)) => s.to_string(),
                     _ => String::new(),
                 };
                 let item = match r.get(1) {
-                    Some(SqliteValue::Text(s)) => s.clone(),
+                    Some(SqliteValue::Text(s)) => s.to_string(),
                     _ => String::new(),
                 };
                 (name, item)

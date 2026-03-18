@@ -29,7 +29,7 @@ fn query_col_text(conn: &Connection, sql: &str) -> String {
     let rows = conn.query(sql).expect("query should succeed");
     assert!(!rows.is_empty(), "expected at least one row from: {sql}");
     match rows[0].get(0).expect("column 0") {
-        SqliteValue::Text(s) => s.clone(),
+        SqliteValue::Text(s) => s.to_string(),
         other => panic!("expected Text, got {other:?}"),
     }
 }
@@ -38,7 +38,7 @@ fn query_col_blob(conn: &Connection, sql: &str) -> Vec<u8> {
     let rows = conn.query(sql).expect("query should succeed");
     assert!(!rows.is_empty(), "expected at least one row from: {sql}");
     match rows[0].get(0).expect("column 0") {
-        SqliteValue::Blob(b) => b.clone(),
+        SqliteValue::Blob(b) => b.to_vec(),
         other => panic!("expected Blob, got {other:?}"),
     }
 }
@@ -380,7 +380,7 @@ fn session_changeset_encode_store_decode() {
             .expect("create");
         conn.execute_with_params(
             "INSERT INTO changesets VALUES (1, ?1)",
-            &[SqliteValue::Blob(encoded)],
+            &[SqliteValue::Blob(encoded.into())],
         )
         .expect("insert changeset blob");
     }
@@ -428,7 +428,7 @@ fn session_changeset_invert_round_trip() {
             .expect("create");
         conn.execute_with_params(
             "INSERT INTO inv VALUES (1, ?1)",
-            &[SqliteValue::Blob(inv_encoded)],
+            &[SqliteValue::Blob(inv_encoded.into())],
         )
         .expect("insert");
     }
@@ -474,7 +474,7 @@ fn session_patchset_round_trip() {
             .expect("create");
         conn.execute_with_params(
             "INSERT INTO patches VALUES (1, ?1)",
-            &[SqliteValue::Blob(patchset.clone())],
+            &[SqliteValue::Blob(patchset.clone().into())],
         )
         .expect("insert");
     }
@@ -571,7 +571,7 @@ fn misc_decimal_precision_round_trip() {
         .expect("decimal_add");
 
     let sum_text = match &sum {
-        SqliteValue::Text(s) => s.clone(),
+        SqliteValue::Text(s) => s.to_string(),
         other => panic!("expected Text from decimal_add, got {other:?}"),
     };
 
@@ -593,7 +593,7 @@ fn misc_decimal_precision_round_trip() {
             .invoke(&[a, b])
             .expect("recompute");
         if let SqliteValue::Text(ref s) = recomputed {
-            assert_eq!(&stored, s);
+            assert_eq!(stored, &**s);
         }
     }
 
@@ -606,7 +606,7 @@ fn misc_uuid_round_trip() {
 
     let uuid_val = fsqlite_ext_misc::UuidFunc.invoke(&[]).expect("uuid()");
     let uuid_str = match &uuid_val {
-        SqliteValue::Text(s) => s.clone(),
+        SqliteValue::Text(s) => s.to_string(),
         other => panic!("expected Text from uuid(), got {other:?}"),
     };
 
@@ -666,7 +666,7 @@ fn misc_uuid_blob_text_conversion_round_trip() {
 
         // Convert back to string
         let recovered = fsqlite_ext_misc::UuidStrFunc
-            .invoke(&[SqliteValue::Blob(stored_blob)])
+            .invoke(&[SqliteValue::Blob(stored_blob.into())])
             .expect("uuid_str");
         assert_eq!(recovered, uuid_text, "uuid blob->text should round-trip");
     }
@@ -802,7 +802,7 @@ fn multi_extension_data_on_single_db() {
         });
         conn.execute_with_params(
             "INSERT INTO change_log VALUES (1, ?1)",
-            &[SqliteValue::Blob(cs.encode())],
+            &[SqliteValue::Blob(cs.encode().into())],
         )
         .expect("insert changeset");
 
@@ -970,7 +970,7 @@ fn jsonb_blob_storage_round_trip() {
             .expect("create");
         conn.execute_with_params(
             "INSERT INTO jsonb_store VALUES (1, ?1)",
-            &[SqliteValue::Blob(jsonb_bytes.clone())],
+            &[SqliteValue::Blob(jsonb_bytes.clone().into())],
         )
         .expect("insert");
     }
@@ -1044,7 +1044,7 @@ fn session_concat_multi_table_round_trip() {
             .expect("create");
         conn.execute_with_params(
             "INSERT INTO multi_cs VALUES (1, ?1)",
-            &[SqliteValue::Blob(encoded)],
+            &[SqliteValue::Blob(encoded.into())],
         )
         .expect("insert");
     }

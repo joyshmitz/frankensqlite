@@ -36,7 +36,7 @@ fn int(row: &fsqlite::Row, col: usize) -> i64 {
 
 fn text(row: &fsqlite::Row, col: usize) -> String {
     match row.get(col) {
-        Some(SqliteValue::Text(s)) => s.clone(),
+        Some(SqliteValue::Text(s)) => s.to_string(),
         other => unreachable!("expected Text at col {col}, got {other:?}"),
     }
 }
