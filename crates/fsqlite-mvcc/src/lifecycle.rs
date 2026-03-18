@@ -1183,28 +1183,24 @@ impl TransactionManager {
                     self.abort(txn);
                     return Err(MvccError::BusySnapshot);
                 }
-                MergeDecision::IntentReplay => {
-                    // Intent replay is currently handled at a higher layer. At this
-                    // storage layer, we must abort because raw XOR merging is forbidden
-                    // for structured pages.
-                    tracing::info!(
-                        txn_id = %txn.txn_id,
-                        pgno = pgno.get(),
-                        ?decision,
-                        "FCW conflict: intent replay required but unavailable at storage layer, aborting"
-                    );
-                    self.abort(txn);
-                    return Err(MvccError::BusySnapshot);
-                }
-                MergeDecision::StructuredPatch | MergeDecision::RawXorLab => {
-                    // Attempt deterministic rebase (§5.10) using physical page patch.
-                    if self.try_rebase_page(txn, pgno) {
+                MergeDecision::IntentReplay | MergeDecision::StructuredPatch | MergeDecision::RawXorLab => {
+                    // Attempt structured page patch merge (Level 3) or raw XOR patch.
+                    if self.try_structured_rebase_page(txn, pgno, page_kind) {
                         tracing::info!(
                             txn_id = %txn.txn_id,
                             pgno = pgno.get(),
                             ?page_kind,
                             ?decision,
-                            "FCW conflict resolved via disjoint rebase"
+                            "FCW conflict resolved via structured rebase"
+                        );
+                        rebased = true;
+                    } else if page_kind == MergePageKind::Opaque && self.try_rebase_page(txn, pgno) {
+                        tracing::info!(
+                            txn_id = %txn.txn_id,
+                            pgno = pgno.get(),
+                            ?page_kind,
+                            ?decision,
+                            "FCW conflict resolved via raw disjoint rebase fallback"
                         );
                         rebased = true;
                     } else {
@@ -1213,7 +1209,7 @@ impl TransactionManager {
                             pgno = pgno.get(),
                             ?page_kind,
                             ?decision,
-                            "FCW conflict: rebase failed, aborting"
+                            "FCW conflict: structured rebase failed, aborting"
                         );
                         self.abort(txn);
                         return Err(MvccError::BusySnapshot);
@@ -1312,6 +1308,69 @@ impl TransactionManager {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Attempt structured page patch merge (Level 3) or intent replay via evaluate_merge_ladder.
+    fn try_structured_rebase_page(
+        &self,
+        txn: &mut Transaction,
+        pgno: PageNumber,
+        page_kind: MergePageKind,
+    ) -> bool {
+        let base_data = match self.version_store.resolve(pgno, &txn.snapshot) {
+            Some(idx) => match self.version_store.get_version(idx) {
+                Some(v) => v.data,
+                None => return false,
+            },
+            None => return false,
+        };
+
+        let (latest_data, latest_seq) = match self.version_store.chain_head(pgno) {
+            Some(idx) => match self.version_store.get_version(idx) {
+                Some(v) => (v.data.clone(), v.commit_seq),
+                None => return false,
+            },
+            None => return false,
+        };
+
+        let ours = match txn.write_set_data.get(&pgno) {
+            Some(data) => data.clone(),
+            None => return false,
+        };
+
+        let btree_ref = fsqlite_types::BtreeRef::Table(fsqlite_types::TableId::new(0));
+
+        let result = crate::physical_merge::evaluate_merge_ladder(
+            self.write_merge_policy,
+            base_data.as_bytes(),
+            latest_data.as_bytes(),
+            ours.as_bytes(),
+            self.shm.page_size(),
+            0,
+            pgno.get() == 1,
+            page_kind,
+            btree_ref,
+            txn.snapshot.schema_epoch.get(),
+            self.schema_epoch.get(),
+            Some(&txn.intent_log),
+            None,
+            None,
+        );
+
+        match result {
+            Ok(crate::physical_merge::MergeLadderResult::StructuredMergeSucceeded {
+                merged_page,
+            }) => {
+                Arc::make_mut(&mut txn.write_set_data)
+                    .insert(pgno, PageData::from_vec(merged_page));
+                txn.record_page_read(pgno, latest_seq);
+                if let Some(entry) = txn.write_set_versions.get_mut(&pgno) {
+                    entry.old_version = Some(latest_seq);
+                }
+                true
+            }
+            _ => false,
         }
     }
 
