@@ -709,9 +709,9 @@ mod tests {
         let rows = stmt.query().expect("query should succeed");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
-        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
-        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
     }
 
     #[test]

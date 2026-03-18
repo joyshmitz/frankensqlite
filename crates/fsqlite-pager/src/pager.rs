@@ -3022,6 +3022,10 @@ where
             inner.rollback_journal_recovery_pending = false;
             self.allocated_from_freelist.clear();
             self.allocated_from_eof.clear();
+            // Lease pages were EOF allocations that were never written to
+            // disk. After journal recovery rebuilds committed state, these
+            // page numbers don't exist — just drop them.
+            self.page_lease.clear();
             if self.mode != TransactionMode::Concurrent {
                 inner.writer_active = false;
             }
@@ -3137,7 +3141,17 @@ where
             if self.mode != TransactionMode::Concurrent {
                 inner.next_page = entry.next_page_snapshot;
                 inner.freelist.clone_from(&entry.freelist_snapshot);
+                // Lease pages reference the rolled-back next_page range
+                // and will be re-allocated by future EOF allocations, so
+                // just drop them.
+                self.page_lease.clear();
             } else {
+                // Return unused lease pages to the freelist before
+                // returning post-savepoint EOF/freelist allocations.
+                // These are valid EOF page numbers that next_page has
+                // already advanced past (concurrent mode doesn't roll
+                // back next_page).
+                inner.freelist.append(&mut self.page_lease);
                 return_pages_to_freelist(
                     &mut inner.freelist,
                     self.allocated_from_eof

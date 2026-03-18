@@ -2160,7 +2160,7 @@ fn parse_value(s: &str) -> SqliteValue {
             return SqliteValue::Float(f);
         }
     }
-    SqliteValue::Text(s.to_owned().into())
+    SqliteValue::Text(s.into())
 }
 
 fn classify_fsqlite_error_as_batch(err: FrankenError) -> BatchError {

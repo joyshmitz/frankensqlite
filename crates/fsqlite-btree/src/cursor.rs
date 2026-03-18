@@ -3698,10 +3698,7 @@ mod tests {
         let cx = Cx::new();
         let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
-        let key = serialize_record(&[
-            SqliteValue::Text("beacon".to_owned()),
-            SqliteValue::Integer(73),
-        ]);
+        let key = serialize_record(&[SqliteValue::Text("beacon".into()), SqliteValue::Integer(73)]);
 
         cursor.index_insert(&cx, &key).unwrap();
         assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());
@@ -3717,7 +3714,7 @@ mod tests {
         let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let key = serialize_record(&[
-            SqliteValue::Blob(vec![0xAB; 2_500]),
+            SqliteValue::Blob(vec![0xAB; 2_500].into()),
             SqliteValue::Integer(901),
         ]);
 
@@ -3777,7 +3774,7 @@ mod tests {
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
 
-        let key = serialize_record(&[SqliteValue::Text("missing-rowid".to_owned())]);
+        let key = serialize_record(&[SqliteValue::Text("missing-rowid".into())]);
 
         cursor.index_insert(&cx, &key).unwrap();
         assert!(cursor.index_move_to(&cx, &key).unwrap().is_found());
