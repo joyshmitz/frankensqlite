@@ -132,7 +132,7 @@ fn build_opcode_tests() -> Vec<OpcodeTest> {
             setup: vec![],
             sql: "SELECT x'DEADBEEF';",
             expected_opcodes: vec!["Blob"],
-            validate: |_, rows| matches!(&rows[0][0], SqliteValue::Blob(b) if &**b == &[0xDE, 0xAD, 0xBE, 0xEF]),
+            validate: |_, rows| matches!(&rows[0][0], SqliteValue::Blob(b) if **b == [0xDE, 0xAD, 0xBE, 0xEF]),
         },
         // ── Arithmetic ───────────────────────────────────────────
         OpcodeTest {
