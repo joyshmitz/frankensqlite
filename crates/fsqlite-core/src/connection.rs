@@ -120,6 +120,7 @@ use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
 use crate::region::{RegionKind, RegionTree, TaskHandle};
 use crate::wal_adapter::WalBackendAdapter;
 
+#[cfg(not(target_arch = "wasm32"))]
 const WRITE_COORDINATOR_SERVICE_BEAD_ID: &str = "bd-2jpu6.4";
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -26316,18 +26317,22 @@ struct SharedRuntimeState {
     write_coordinator_region: Region,
     write_coordinator_service_starting: bool,
     write_coordinator_service_running: bool,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     write_coordinator_service_generation: u64,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     write_coordinator_service_launch_count: u64,
     write_coordinator_shutdown: Option<WriteCoordinatorShutdownTx>,
     open_connections: usize,
     poisoned: Option<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct WriteCoordinatorServiceStart {
     generation: u64,
     path_key: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 enum WriteCoordinatorServiceReservation {
     Running,
     Starting,
@@ -26469,6 +26474,7 @@ impl SharedMvccState {
         Ok((connection_region, connection_cx))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn reserve_write_coordinator_service_start(
         &self,
     ) -> Result<WriteCoordinatorServiceReservation> {
@@ -26503,6 +26509,7 @@ impl SharedMvccState {
         ))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn revert_write_coordinator_service_start(&self, reservation: &WriteCoordinatorServiceStart) {
         let mut state = lock_unpoisoned(&self.runtime_state);
         if !state.write_coordinator_service_starting
@@ -26516,6 +26523,7 @@ impl SharedMvccState {
         state.write_coordinator_shutdown = None;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn record_write_coordinator_service_launch(
         &self,
         reservation: &WriteCoordinatorServiceStart,
@@ -26740,7 +26748,7 @@ impl SharedMvccState {
         if state.open_connections == 0 {
             state.write_coordinator_service_starting = false;
             state.write_coordinator_service_running = false;
-            drop(state.write_coordinator_shutdown.take());
+            let _ = state.write_coordinator_shutdown.take();
             let db_root_region = state.db_root_region;
             let root_close_started = Instant::now();
             tracing::info!(
@@ -36389,6 +36397,7 @@ mod tests {
         drop(runtime_a);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn test_write_coordinator_service_starting_timeout_returns_error() {
         let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {

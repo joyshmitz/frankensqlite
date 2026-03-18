@@ -1751,6 +1751,7 @@ mod tests {
 
     // ── PRAGMA handling (bd-iwu.5) ───────────────────────────────────────
 
+    #[cfg(not(target_arch = "wasm32"))]
     use std::fs;
 
     use fsqlite_ast::Statement;
@@ -1764,6 +1765,7 @@ mod tests {
         build_source_page_hashes, generate_wal_fec_repair_symbols,
         recover_wal_fec_group_with_decoder, scan_wal_fec,
     };
+    #[cfg(not(target_arch = "wasm32"))]
     use tempfile::tempdir;
 
     fn parse_pragma(sql: &str) -> std::result::Result<fsqlite_ast::PragmaStatement, String> {
@@ -1984,6 +1986,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn test_bd_1hi_12_unit_compliance_gate() {
         let dir = tempdir().expect("tempdir");
@@ -2050,6 +2053,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn prop_bd_1hi_12_structure_compliance() {
         let dir = tempdir().expect("tempdir");
@@ -2071,6 +2075,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_e2e_bd_1hi_12_compliance() {
